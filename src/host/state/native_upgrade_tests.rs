@@ -33,6 +33,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
     let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
     let cleanup_proof = Arc::new(Mutex::new(proof.clone()));
     for fail_final_save in [false, true] {
+        let ownership_path = root.join(format!("ownership-{fail_final_save}.sqlite3"));
         let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
             proof.clone(),
         )));
@@ -73,12 +74,9 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
         wait_durable(&handle);
         // A committed upgrade transfers delegated capability ownership; the
         // normal-shutdown retirement hook must not erase this live source.
-        host.lock().unwrap().install_model(
-            crate::host::model::Registry::at(
-                &root.join(format!("ownership-{fail_final_save}.sqlite3")),
-            )
-            .unwrap(),
-        );
+        host.lock()
+            .unwrap()
+            .install_model(crate::host::model::Registry::at(&ownership_path).unwrap());
         let execution = super::super::agent_execution::registry(&host).unwrap();
         let source = crate::agent_execution::HostedSession::Chat(
             host.lock().unwrap().chats[&id].session.clone(),
@@ -181,9 +179,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             lease = Some(crate::daemon::HostLease::acquire(&paths, &next).unwrap());
             *cleanup_proof.lock().unwrap() = next.clone();
             let mut state = HostState::new(next);
-            state.install_model(
-                crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
-            );
+            state.install_model(crate::host::model::Registry::at(&ownership_path).unwrap());
             let successor = Arc::new(crate::host::state::HostLock::new(state));
             // Startup discovery failed before the UI asked for an upgrade
             // mapping. Preserve the precise refusal for every issued alias.
@@ -257,7 +253,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 terminal,
                 TerminalSpawnOptions::default(),
                 None,
-                false,
+                true,
             )
             .unwrap();
             let current_proof = successor.lock().unwrap().proof().clone();
@@ -272,6 +268,25 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     terminal_handle.holder_identity().cloned(),
                 )
                 .unwrap();
+            // Reopen the original durable capability, then advance it only
+            // through the holder-authenticated native lineage. Paired views
+            // inherit it; they cannot replace its owner with Terminal.
+            let execution = super::super::agent_execution::registry(&successor).unwrap();
+            let retained_sources: Vec<_> = retained
+                .previous_sources
+                .iter()
+                .chain(std::iter::once(&retained.source))
+                .cloned()
+                .map(crate::agent_execution::HostedSession::Chat)
+                .collect();
+            execution
+                .lock()
+                .unwrap()
+                .adopt_authenticated_agent_session(
+                    &retained_sources,
+                    &crate::agent_execution::HostedSession::Chat(paired_source.clone()),
+                )
+                .unwrap();
             let detached = holder.preserve();
             terminal_handle
                 .close_with_receipt(&descriptor.session, &current_proof)
@@ -283,7 +298,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 descriptor.session.clone(),
                 TerminalSpawnOptions::default(),
                 None,
-                false,
+                true,
             )
             .unwrap();
             assert_eq!(
@@ -313,16 +328,18 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                 .close_with_receipt(&replacement.session, &current_proof)
                 .unwrap();
             successor.lock().unwrap().retire_terminal(id);
-            // Persist only the successor authority, then close through its old
-            // issued alias. A retry must reconcile the current descriptor too.
-            let execution = super::super::agent_execution::registry(&successor).unwrap();
-            execution
-                .lock()
-                .unwrap()
-                .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
-                    paired_source.clone(),
+            // Closing the replaced views must retain that exact successor
+            // authority. A retry through an old alias must reconcile it too.
+            assert_eq!(
+                execution
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(id)
+                    .unwrap(),
+                Some(crate::agent_execution::HostedSession::Chat(
+                    paired_source.clone()
                 ))
-                .unwrap();
+            );
             detached.close_retaining_receipt().unwrap();
             // Crash exactly after both process owners released but before the
             // native paired-complete receipt was saved or any SQL retired.
@@ -340,14 +357,12 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             lease = Some(crate::daemon::HostLease::acquire(&paths, &retry_proof).unwrap());
             *cleanup_proof.lock().unwrap() = retry_proof.clone();
             let mut state = HostState::new(retry_proof);
-            state.install_model(
-                crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
-            );
+            state.install_model(crate::host::model::Registry::at(&ownership_path).unwrap());
             let successor = Arc::new(crate::host::state::HostLock::new(state));
             let close = crate::terminal::ipc::ClientRequest::ChatCloseRetained {
                 session: paired_source,
             };
-            let fault = rusqlite::Connection::open(root.join("recovery.sqlite3")).unwrap();
+            let fault = rusqlite::Connection::open(&ownership_path).unwrap();
             fault.execute_batch("CREATE TRIGGER refuse_native_retirement BEFORE DELETE ON agent_authorities BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
             let failure = super::super::client::process_request(&successor, 0, close).unwrap_err();
             assert!(
@@ -376,9 +391,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             lease = Some(crate::daemon::HostLease::acquire(&paths, &last).unwrap());
             *cleanup_proof.lock().unwrap() = last.clone();
             let mut state = HostState::new(last);
-            state.install_model(
-                crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
-            );
+            state.install_model(crate::host::model::Registry::at(&ownership_path).unwrap());
             let restarted = Arc::new(crate::host::state::HostLock::new(state));
             assert!(matches!(
                 super::super::client::process_request(
