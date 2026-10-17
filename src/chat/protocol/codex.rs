@@ -2270,7 +2270,10 @@ impl Adapter for Codex {
                     // cannot assign that lifecycle to its acknowledged turn.
                     let owns_lifecycle = owns_current
                         && (revision == self.lifecycle_revision
-                            || self.notification_turn.as_deref() == Some(id));
+                            || self.notification_turn.as_deref() == Some(id)
+                            // Scalar idle can follow this early completion.
+                            // It announces no newer work to protect from replay.
+                            || !self.busy);
                     let early_completion = early.remove(id).filter(|_| owns_lifecycle);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
