@@ -481,6 +481,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         let state = tree.state.downcast_mut::<State>();
         if std::mem::take(&mut state.dirty) {
             shell.invalidate_layout();
+            shell.request_redraw();
         }
         if state.managed {
             return;
@@ -488,6 +489,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.dragging = false;
         }
+        let previous = state.anchor.min(state.end)..state.anchor.max(state.end);
         state.validate_selection(&self.plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -553,6 +555,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
             }
             _ => {}
+        }
+        if previous != (state.anchor.min(state.end)..state.anchor.max(state.end)) {
+            shell.request_redraw();
         }
     }
     fn mouse_interaction(
