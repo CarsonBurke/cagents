@@ -11,7 +11,7 @@ use std::{
 };
 
 #[path = "editor_widget.rs"]
-mod text_editor;
+pub(crate) mod text_editor;
 
 mod diff_layout;
 mod preview;
@@ -516,6 +516,29 @@ pub enum RepositoryAction {
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
+    OpenLocation {
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    OpenGoToLine {
+        card: CardId,
+    },
+    GoToLineChanged {
+        card: CardId,
+        value: String,
+    },
+    SubmitGoToLine {
+        card: CardId,
+    },
+    CloseGoToLine {
+        card: CardId,
+    },
+    NavigateLocation {
+        card: CardId,
+        forward: bool,
+    },
     Reload {
         card: CardId,
     },
@@ -536,6 +559,26 @@ pub enum RepositoryAction {
     OpenExternal {
         card: CardId,
         editor_id: String,
+    },
+    OpenSystem {
+        card: CardId,
+    },
+    RevealFile {
+        card: CardId,
+    },
+    BinaryPage {
+        card: CardId,
+        offset: u64,
+    },
+    BinaryPageLoaded {
+        identity: AsyncIdentity,
+        request: u64,
+        result: Result<crate::editor::BinaryPreview, FileIoError>,
+    },
+    ConfiguredFileLoaded {
+        identity: AsyncIdentity,
+        result: Result<LoadedFile, FileIoError>,
+        indentation: crate::editor_indent::Overrides,
     },
     StageSelected {
         card: CardId,
@@ -688,11 +731,20 @@ impl RepositoryAction {
             | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
             | Self::Reload { card }
+            | Self::OpenGoToLine { card }
+            | Self::OpenLocation { card, .. }
+            | Self::GoToLineChanged { card, .. }
+            | Self::SubmitGoToLine { card }
+            | Self::CloseGoToLine { card }
+            | Self::NavigateLocation { card, .. }
             | Self::DiscardEdits { card }
             | Self::Undo { card }
             | Self::Redo { card }
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
+            | Self::OpenSystem { card }
+            | Self::RevealFile { card }
+            | Self::BinaryPage { card, .. }
             | Self::StageSelected { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
@@ -732,6 +784,8 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::ConfiguredFileLoaded { identity, .. }
+            | Self::BinaryPageLoaded { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
@@ -800,6 +854,7 @@ struct EditorDocument {
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
     /// a document loaded afresh starts a history of its own.
     history: History,
+    indentation: crate::editor_indent::Overrides,
     #[cfg(test)]
     history_time: Option<Instant>,
 }
@@ -854,6 +909,7 @@ impl EditorDocument {
             error: None,
             durability_warning: None,
             history: History::default(),
+            indentation: crate::editor_indent::Overrides::default(),
             #[cfg(test)]
             history_time: None,
         }
@@ -877,6 +933,21 @@ impl EditorDocument {
     /// re-parsed at a debounce boundary instead.
     fn apply(&mut self, action: text_editor::Action) -> Applied {
         match action {
+            text_editor::Action::Edit(
+                edit @ (text_editor::Edit::Indent | text_editor::Edit::Unindent),
+            ) => {
+                let before = self.content.cursor();
+                let changes = self
+                    .content
+                    .indent_recorded(matches!(edit, text_editor::Edit::Unindent));
+                if changes.is_empty() {
+                    return Applied::Unchanged;
+                }
+                self.history
+                    .record_group(changes, before, self.content.cursor(), Instant::now());
+                self.text_changed();
+                Applied::Changed(None)
+            }
             text_editor::Action::Edit(edit) => {
                 let kind = edit_kind(&edit, self.content.cursor());
                 let trailing_cr = trailing_carriage_return(&self.content).is_some();
@@ -1843,6 +1914,15 @@ pub struct RepositoryRuntime {
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
+    editor_tab_width: u16,
+    editor_auto_close: bool,
+    undo_lru: crate::editor_navigation::UndoLru,
+    locations: crate::editor_navigation::Locations,
+    navigating_history: bool,
+    pending_jump_origin: Option<crate::editor_navigation::Location>,
+    go_to_line: Option<String>,
+    pending_scalar_location: Option<(PathBuf, usize, usize)>,
+    pending_source_location: Option<(PathBuf, usize)>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -1923,6 +2003,7 @@ pub struct RepositoryRuntime {
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     pending_fragment: Option<String>,
+    binary_page_request: u64,
     diff_mode: DiffMode,
     committed_selection: Option<(DiffBasis, Option<PathBuf>)>,
     diff_basis: DiffBasis,
@@ -2042,6 +2123,13 @@ pub enum RepositoryRuntimeStatus {
     Unavailable,
 }
 
+/// Parse a compiler-style path:line[:column] using one-based scalar columns.
+/// Frontends should search by the returned path and defer the coordinates
+/// with the exact file-open request instead of including them in the query.
+pub fn parse_file_location(input: &str) -> Option<(String, usize, usize)> {
+    crate::editor_navigation::parse_location(input)
+}
+
 impl RepositoryRuntime {
     fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
         if self
@@ -2064,6 +2152,15 @@ impl RepositoryRuntime {
             worktree_protection: None,
             standalone: false,
             external_editors: Vec::new(),
+            editor_tab_width: 4,
+            editor_auto_close: true,
+            undo_lru: crate::editor_navigation::UndoLru::default(),
+            locations: crate::editor_navigation::Locations::default(),
+            navigating_history: false,
+            pending_jump_origin: None,
+            go_to_line: None,
+            pending_scalar_location: None,
+            pending_source_location: None,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2103,6 +2200,7 @@ impl RepositoryRuntime {
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
             pending_fragment: None,
+            binary_page_request: 0,
             committed_selection: None,
             diff_mode: DiffMode::Inline,
             diff_basis: DiffBasis::IndexToWorktree,
@@ -2154,6 +2252,26 @@ impl RepositoryRuntime {
 
     pub fn set_external_editors(&mut self, editors: Vec<crate::sidebar::SidebarEditor>) {
         self.external_editors = editors;
+    }
+
+    pub fn set_editor_auto_close(&mut self, enabled: bool) {
+        self.editor_auto_close = enabled;
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.content.set_auto_close(enabled);
+        }
+    }
+
+    pub fn set_editor_tab_width(&mut self, width: u16) {
+        self.editor_tab_width = width.clamp(1, 16);
+        if let DocumentState::Editable(document) = &mut self.document {
+            document
+                .content
+                .configure_indentation(crate::editor_indent::Indentation::detect(
+                    &document.saved_text,
+                    self.editor_tab_width,
+                    document.indentation,
+                ));
+        }
     }
 
     /// Changes presentation without replacing the open buffer or its edit history.
@@ -2814,6 +2932,10 @@ impl RepositoryRuntime {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
         }
+        if self.descriptor.worktree != view.worktree {
+            self.undo_lru = crate::editor_navigation::UndoLru::default();
+            self.locations = crate::editor_navigation::Locations::default();
+        }
         self.descriptor = view;
         self.retained_viewports.clear();
         self.initial_load(card)
@@ -3026,20 +3148,37 @@ impl RepositoryRuntime {
     /// carries UTF-16 code units, and this runtime has no way to tell the two
     /// apart from an [`LspPosition`] alone.
     pub fn move_cursor_to(&mut self, at: LspPosition) -> bool {
-        let DocumentState::Editable(document) = &mut self.document else {
-            return false;
+        let (position, path) = match &self.document {
+            DocumentState::Editable(document) => {
+                let Some(position) = caret_for_position(&document.content, at) else {
+                    return false;
+                };
+                (position, document.path.clone())
+            }
+            _ => return false,
         };
-        let Some(position) = caret_for_position(&document.content, at) else {
-            return false;
-        };
-        // Typing after a jump is a new undo step, like typing after a click.
-        document.history.seal();
-        document.content.set_cursor(text_editor::Cursor {
-            position,
-            selection: None,
+        self.record_location_jump(crate::editor_navigation::Location {
+            path,
+            cursor: text_editor::Cursor {
+                position,
+                selection: None,
+            },
+            scroll: text_editor::ScrollPosition {
+                line: position.line.saturating_sub(10),
+                vertical: 0.0,
+                horizontal: 0.0,
+            },
         });
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.history.seal();
+            document.content.set_cursor(text_editor::Cursor {
+                position,
+                selection: None,
+            });
+        }
         true
     }
+
     /// Marks the editor as search-owned: document edits are ignored while the
     /// native viewport continues to accept scrolling actions.
     pub fn set_search_mode(&mut self, enabled: bool) {
@@ -3065,6 +3204,7 @@ impl RepositoryRuntime {
     }
 
     fn select_cached_match(&mut self, occurrence: usize) -> Option<usize> {
+        let origin = self.current_location();
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
@@ -3081,6 +3221,11 @@ impl RepositoryRuntime {
             position: end,
             selection: Some(start),
         });
+        if let Some(origin) = origin
+            && let Some(target) = self.current_location()
+        {
+            self.locations.jump(origin, target);
+        }
         Some(total)
     }
 
@@ -3140,6 +3285,10 @@ impl RepositoryRuntime {
     pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
         self.editor_focus_target(card)
             .map_or_else(Task::none, iced::widget::operation::focus)
+    }
+
+    pub fn go_to_line_is_open(&self) -> bool {
+        self.go_to_line.is_some()
     }
 
     /// Whether the find strip is mounted over the open buffer.
@@ -3624,6 +3773,45 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    /// One-based scalar coordinates for callers which do not select a launcher.
+    pub fn editor_caret(&self) -> Option<(usize, usize)> {
+        self.editor_caret_for("")
+    }
+
+    /// Converts native rows and UTF-8 columns into the launcher's coordinates.
+    pub fn editor_caret_for(&self, editor: &str) -> Option<(usize, usize)> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let cursor = document.content.cursor().position;
+        let column = document.content.with_line(cursor.line, |line, _| {
+            let prefix = &line[..char_boundary(line, cursor.column)];
+            // Code and Zed remove a document-start BOM from their models. A U+FEFF
+            // elsewhere is ordinary content and must still contribute a unit.
+            let prefix = if cursor.line == 0
+                && crate::external_editor::normalizes_text_coordinates(editor)
+            {
+                prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
+            } else {
+                prefix
+            };
+            crate::external_editor::column_for_prefix(editor, prefix)
+        })?;
+        let line = if crate::external_editor::normalizes_text_coordinates(editor) {
+            // cosmic-text folds LFCR into one native terminator. Code and Zed split
+            // CRLF, CR and LF, so LFCR contributes two model lines. Inspect
+            // only ending metadata; do not serialize or clone source text.
+            (0..cursor.line).try_fold(1usize, |row, index| {
+                document.content.with_line(index, |_, ending| {
+                    row.saturating_add(if ending.as_str() == "\n\r" { 2 } else { 1 })
+                })
+            })?
+        } else {
+            cursor.line.saturating_add(1)
+        };
+        Some((line, column))
+    }
+
     /// The file the open buffer really is, when the selected path is a
     /// symbolic link to it; `None` for a buffer that is its own file.
     ///
@@ -3753,6 +3941,21 @@ impl RepositoryRuntime {
     }
 
     /// The live buffer, or nothing while no editable document is open.
+    pub fn editor_formatting_options(&self) -> (u32, bool) {
+        let DocumentState::Editable(document) = &self.document else {
+            return (self.editor_tab_width as u32, true);
+        };
+        let indentation = document.content.indentation();
+        (
+            if indentation.tabs {
+                indentation.tab_width as u32
+            } else {
+                indentation.size as u32
+            },
+            !indentation.tabs,
+        )
+    }
+
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
             DocumentState::Editable(document) => Some(document.content.text()),
@@ -4698,6 +4901,76 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::ConfiguredFileLoaded {
+                identity,
+                result,
+                indentation,
+            } => {
+                let current = self.accepts_selected(&identity);
+                let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
+                if current && let DocumentState::Editable(document) = &mut self.document {
+                    document.indentation = indentation;
+                    document.content.configure_indentation(
+                        crate::editor_indent::Indentation::detect(
+                            &document.saved_text,
+                            self.editor_tab_width,
+                            indentation,
+                        ),
+                    );
+                }
+                task
+            }
+            RepositoryAction::BinaryPage { card, offset } => {
+                let DocumentState::ReadOnly {
+                    path,
+                    reason: ReadOnlyReason::BinaryPreview(_),
+                } = &self.document
+                else {
+                    return Task::none();
+                };
+                let identity =
+                    self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
+                let worktree = self.descriptor.worktree.clone();
+                let path = path.clone();
+                self.binary_page_request = self.binary_page_request.wrapping_add(1);
+                let request = self.binary_page_request;
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::editor::load_binary_page(&worktree, &path, offset)
+                    })
+                    .await
+                    .map_err(|error| FileIoError::Io(error.to_string()))
+                    .and_then(|result| result);
+                    RepositoryAction::BinaryPageLoaded {
+                        identity,
+                        request,
+                        result,
+                    }
+                })
+            }
+            RepositoryAction::BinaryPageLoaded {
+                identity,
+                request,
+                result,
+            } => {
+                if request == self.binary_page_request
+                    && self.accepts_selected(&identity)
+                    && let DocumentState::ReadOnly { reason, .. } = &mut self.document
+                {
+                    match result {
+                        Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview),
+                        Err(error) => {
+                            if let ReadOnlyReason::BinaryPreview(preview) = reason {
+                                preview.error = Some(error.to_string());
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. } => {
+                Task::none()
+            }
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
             RepositoryAction::SearchDirectory { card, query } => self.search_directory(card, query),
@@ -4822,13 +5095,21 @@ impl RepositoryRuntime {
                                 content_hash,
                                 markdown,
                             },
-                    }) => DocumentState::Editable(EditorDocument::new(
-                        identity.path,
-                        source,
-                        text,
-                        content_hash,
-                        markdown,
-                    )),
+                    }) => {
+                        let retained = self.undo_lru.take(&identity.path, &source, content_hash);
+                        let mut document = EditorDocument::new(
+                            identity.path,
+                            source,
+                            text,
+                            content_hash,
+                            markdown,
+                        );
+                        if let Some(retained) = retained {
+                            document.history = retained.history;
+                            document.content.set_cursor(retained.cursor);
+                        }
+                        DocumentState::Editable(document)
+                    }
                     Ok(LoadedFile {
                         source,
                         content:
@@ -4894,6 +5175,40 @@ impl RepositoryRuntime {
                     },
                 };
                 if let DocumentState::Editable(document) = &mut self.document {
+                    document.content.set_auto_close(self.editor_auto_close);
+                    if let Some((path, source_line)) = self.pending_source_location.take()
+                        && document.path == path
+                        && let Some((pending_path, navigation)) =
+                            &mut self.pending_editor_navigation
+                        && *pending_path == path
+                    {
+                        let line = document
+                            .content
+                            .source_line_ranges()
+                            .get(source_line)
+                            .map_or_else(
+                                || document.content.line_count().saturating_sub(1),
+                                |range| range.start,
+                            );
+                        navigation.caret.line = line;
+                        navigation.caret.column = 0;
+                        navigation.scroll_line = line.saturating_sub(10);
+                    }
+                    if let Some((path, line, column)) = self.pending_scalar_location.take()
+                        && document.path == path
+                        && let Some((pending_path, navigation)) =
+                            &mut self.pending_editor_navigation
+                        && *pending_path == path
+                    {
+                        navigation.caret.column = document
+                            .content
+                            .with_line(line, |text, _| {
+                                text.char_indices()
+                                    .nth(column)
+                                    .map_or(text.len(), |(byte, _)| byte)
+                            })
+                            .unwrap_or(column);
+                    }
                     if let Some((path, editor)) = self.pending_editor_navigation.take()
                         && self.selected.as_ref().is_some_and(|file| file.path == path)
                     {
@@ -5334,6 +5649,86 @@ impl RepositoryRuntime {
                 } else {
                     Task::none()
                 }
+            }
+            RepositoryAction::OpenLocation {
+                card,
+                path,
+                line,
+                column,
+            } => {
+                let loaded = self.selected_path() == Some(path.as_path())
+                    && matches!(self.document, DocumentState::Editable(_));
+                let byte = if loaded {
+                    match &self.document {
+                        DocumentState::Editable(document) => document
+                            .content
+                            .with_line(line, |text, _| {
+                                text.char_indices()
+                                    .nth(column)
+                                    .map_or(text.len(), |(byte, _)| byte)
+                            })
+                            .unwrap_or(column),
+                        _ => column,
+                    }
+                } else {
+                    column
+                };
+                let task = self.open_file_location(card, path.clone(), line, byte, 0);
+                if !loaded
+                    && self.selected_path() == Some(path.as_path())
+                    && matches!(self.document, DocumentState::Loading)
+                {
+                    self.pending_scalar_location = Some((path, line, column));
+                }
+                task
+            }
+            RepositoryAction::OpenGoToLine { card } => {
+                if !self.editable_surface_visible() {
+                    return Task::none();
+                }
+                let line = self
+                    .current_location()
+                    .map_or(1, |location| location.cursor.position.line + 1);
+                self.go_to_line = Some(line.to_string());
+                iced::widget::operation::focus(widget::Id::new(format!(
+                    "repository.{card}.go-to-line"
+                )))
+            }
+            RepositoryAction::GoToLineChanged { value, .. } => {
+                self.go_to_line = Some(value);
+                Task::none()
+            }
+            RepositoryAction::SubmitGoToLine { card } => {
+                let Some((line, column)) = self
+                    .go_to_line
+                    .as_deref()
+                    .and_then(crate::editor_navigation::parse_line_column)
+                else {
+                    return Task::none();
+                };
+                let Some(path) = self.selected_path().map(Path::to_path_buf) else {
+                    return Task::none();
+                };
+                let byte_column = match &self.document {
+                    DocumentState::Editable(document) => document
+                        .content
+                        .with_line(line, |text, _| {
+                            text.char_indices()
+                                .nth(column)
+                                .map_or(text.len(), |(byte, _)| byte)
+                        })
+                        .unwrap_or(column),
+                    _ => column,
+                };
+                self.go_to_line = None;
+                self.open_file_location(card, path, line, byte_column, 0)
+            }
+            RepositoryAction::CloseGoToLine { card } => {
+                self.go_to_line = None;
+                self.focus_editor(card)
+            }
+            RepositoryAction::NavigateLocation { card, forward } => {
+                self.navigate_location(card, forward)
             }
             RepositoryAction::Reload { card } => {
                 if self.is_saving() {
@@ -6070,6 +6465,222 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+    fn current_location(&self) -> Option<crate::editor_navigation::Location> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some(crate::editor_navigation::Location {
+            path: document.path.clone(),
+            cursor: document.content.cursor(),
+            scroll: document.content.scroll_position(),
+        })
+    }
+
+    pub fn remember_jump_origin(&mut self) {
+        self.pending_jump_origin = self.current_location();
+    }
+
+    fn record_location_jump(&mut self, target: crate::editor_navigation::Location) {
+        if self.navigating_history {
+            return;
+        }
+        if let Some(origin) = self
+            .pending_jump_origin
+            .take()
+            .or_else(|| self.current_location())
+        {
+            self.locations.jump(origin, target);
+        }
+    }
+
+    fn navigate_location(&mut self, card: CardId, forward: bool) -> Task<RepositoryAction> {
+        let Some(target) = self.locations.peek(forward) else {
+            return Task::none();
+        };
+        if self.blocks_navigation() && self.selected_path() != Some(target.path.as_path()) {
+            return Task::none();
+        }
+        let Some(from) = self.current_location() else {
+            return Task::none();
+        };
+        let Some(target) = self.locations.navigate(from, forward) else {
+            return Task::none();
+        };
+        self.navigating_history = true;
+        let task = self.open_file_location(
+            card,
+            target.path.clone(),
+            target.cursor.position.line,
+            target.cursor.position.column,
+            0,
+        );
+        self.navigating_history = false;
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.content.set_cursor(target.cursor);
+            document.content.restore_scroll_position(target.scroll);
+        } else {
+            self.pending_editor_navigation = Some((
+                target.path,
+                crate::model::EditorNavigation {
+                    caret: crate::model::EditorPosition {
+                        line: target.cursor.position.line,
+                        column: target.cursor.position.column,
+                    },
+                    selection: target.cursor.selection.map(|position| {
+                        crate::model::EditorPosition {
+                            line: position.line,
+                            column: position.column,
+                        }
+                    }),
+                    scroll_line: target.scroll.line,
+                    scroll_vertical: target.scroll.vertical,
+                    scroll_horizontal: target.scroll.horizontal,
+                },
+            ));
+        }
+        task
+    }
+
+    /// Opens a Git/diff source line counted by LF separators. Native editor
+    /// lines also split bare CR, so defer mapping until the actual file loads.
+    pub fn open_source_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        source_line: usize,
+    ) -> Task<RepositoryAction> {
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &self.document
+        {
+            let line = document
+                .content
+                .source_line_ranges()
+                .get(source_line)
+                .map_or_else(
+                    || document.content.line_count().saturating_sub(1),
+                    |range| range.start,
+                );
+            return self.open_file_location(card, path, line, 0, 0);
+        }
+        let task = self.open_file_location(card, path.clone(), 0, 0, 0);
+        if self.selected_path() == Some(path.as_path()) {
+            match &mut self.document {
+                DocumentState::Loading => self.pending_source_location = Some((path, source_line)),
+                DocumentState::Editable(document) => {
+                    let line = document
+                        .content
+                        .source_line_ranges()
+                        .get(source_line)
+                        .map_or_else(
+                            || document.content.line_count().saturating_sub(1),
+                            |range| range.start,
+                        );
+                    document.content.set_cursor(text_editor::Cursor {
+                        position: text_editor::Position { line, column: 0 },
+                        selection: None,
+                    });
+                    document
+                        .content
+                        .restore_scroll_position(text_editor::ScrollPosition {
+                            line: line.saturating_sub(10),
+                            vertical: 0.0,
+                            horizontal: 0.0,
+                        });
+                }
+                _ => {}
+            }
+        }
+        task
+    }
+
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
+        let caret = text_editor::Position { line, column };
+        if self.blocks_navigation() && self.selected_path() != Some(path.as_path()) {
+            return Task::none();
+        }
+        self.pending_source_location = None;
+        self.pending_scalar_location = None;
+        self.record_location_jump(crate::editor_navigation::Location {
+            path: path.clone(),
+            cursor: text_editor::Cursor {
+                position: caret,
+                selection: None,
+            },
+            scroll: text_editor::ScrollPosition {
+                line: line.saturating_sub(10),
+                vertical: 0.0,
+                horizontal: 0.0,
+            },
+        });
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            document.history.seal();
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
+            self.open_file_entry(card, file)
+        };
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
+        task
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
@@ -6099,6 +6710,8 @@ impl RepositoryRuntime {
             return Task::none();
         }
         self.pending_fragment = None;
+        self.pending_scalar_location = None;
+        self.pending_source_location = None;
         self.pending_editor_navigation = None;
         self.pending_editor_focus = None;
         if self.descriptor.selected_file.is_some() {
@@ -6309,6 +6922,21 @@ impl RepositoryRuntime {
     fn retain_viewports(&mut self) {
         if self.selected.is_none() {
             return;
+        }
+        if let DocumentState::Editable(document) = &mut self.document
+            && !document.dirty
+            && document.active_save.is_none()
+            && document.durability_warning.is_none()
+        {
+            self.undo_lru.insert(
+                document.path.clone(),
+                crate::editor_navigation::SavedUndo {
+                    source: document.source.clone(),
+                    disk_hash: document.disk_hash,
+                    history: std::mem::take(&mut document.history),
+                    cursor: document.content.cursor(),
+                },
+            );
         }
         self.capture_native_viewport();
         self.capture_diff_viewport();
@@ -6683,11 +7311,19 @@ fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<Repo
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
-            .await
-            .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
-            .and_then(|result| result);
-        RepositoryAction::FileLoaded { identity, result }
+        let loaded = tokio::task::spawn_blocking(move || {
+            let indentation = crate::editor_indent::read(&worktree, &path);
+            (load_file(&worktree, &path, tone), indentation)
+        })
+        .await
+        .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")));
+        let (result, indentation) =
+            loaded.unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default()));
+        RepositoryAction::ConfiguredFileLoaded {
+            identity,
+            result,
+            indentation,
+        }
     })
 }
 
@@ -7992,6 +8628,10 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         DocumentState::Failed { path, message } => {
             information_state(format!("Could not open {}", path.display()), message)
         }
+        DocumentState::ReadOnly {
+            path,
+            reason: ReadOnlyReason::BinaryPreview(preview),
+        } => binary_file_view(card, path, preview),
         DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
         DocumentState::Editable(document) => editable_document_view(card, runtime, document),
         DocumentState::Image {
@@ -8278,6 +8918,48 @@ fn editable_document_view<'a>(
     document: &'a EditorDocument,
 ) -> Element<'a, RepositoryAction> {
     let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
+    let (line, column, selected) = document.content.cursor_metrics();
+    error_rows.push(
+        widget::button::custom(crate::design::caption(if selected == 0 {
+            format!("Ln {line}, Col {column}")
+        } else {
+            format!("Ln {line}, Col {column} ({selected} selected)")
+        }))
+        .class(crate::ui_controls::control_style(false, None))
+        .on_press(RepositoryAction::OpenGoToLine { card })
+        .into(),
+    );
+    if let Some(value) = &runtime.go_to_line {
+        let valid = crate::editor_navigation::parse_line_column(value).is_some();
+        error_rows.push(
+            widget::container(widget::column::with_children(vec![
+                crate::ui_controls::field::text("Line or line:column", value)
+                    .id(widget::Id::new(format!("repository.{card}.go-to-line")))
+                    .on_input(move |value| RepositoryAction::GoToLineChanged { card, value })
+                    .on_submit(move |_| RepositoryAction::SubmitGoToLine { card })
+                    .into(),
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Go")
+                        .on_press_maybe(valid.then_some(RepositoryAction::SubmitGoToLine { card }))
+                        .into(),
+                    crate::ui_controls::button::secondary("Cancel")
+                        .on_press(RepositoryAction::CloseGoToLine { card })
+                        .into(),
+                    crate::design::caption(if valid {
+                        "One-based line and column"
+                    } else {
+                        "Enter a positive line or line:column"
+                    })
+                    .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            ]))
+            .padding(space::M)
+            .into(),
+        );
+    }
+
     if let Some(error) = document
         .error
         .as_ref()
@@ -8522,6 +9204,7 @@ fn editable_document_view<'a>(
                     at.and_then(|at| caret_position(&document.content, at)),
                 ),
             })
+            .on_navigation(move |forward| RepositoryAction::NavigateLocation { card, forward })
             .on_definition(move |at| RepositoryAction::Language {
                 card,
                 action: EditorLspAction::Definition(caret_position(&document.content, at)),
@@ -8541,6 +9224,46 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
+                if matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    if press.modifiers.command()
+                        && !press.modifiers.alt()
+                        && press
+                            .key
+                            .to_latin(press.physical_key)
+                            .is_some_and(|key| key.eq_ignore_ascii_case(&'g'))
+                    {
+                        return Some(text_editor::Binding::Custom(
+                            RepositoryAction::OpenGoToLine { card },
+                        ));
+                    }
+                    if press.modifiers.alt()
+                        && !press.modifiers.command()
+                        && !press.modifiers.shift()
+                    {
+                        match press.key {
+                            Key::Named(Named::ArrowLeft) => {
+                                return Some(text_editor::Binding::Custom(
+                                    RepositoryAction::NavigateLocation {
+                                        card,
+                                        forward: false,
+                                    },
+                                ));
+                            }
+                            Key::Named(Named::ArrowRight) => {
+                                return Some(text_editor::Binding::Custom(
+                                    RepositoryAction::NavigateLocation {
+                                        card,
+                                        forward: true,
+                                    },
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
                     press.physical_key,
@@ -10396,6 +11119,87 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     }
 }
 
+fn binary_file_view<'a>(
+    card: CardId,
+    path: &Path,
+    preview: &'a crate::editor::BinaryPreview,
+) -> Element<'a, RepositoryAction> {
+    let modified = preview
+        .modified
+        .and_then(|time| jiff::Timestamp::try_from(time).ok())
+        .map(|time| time.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let actions = widget::row::with_children(vec![
+        crate::ui_controls::button::secondary("Open with system app")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Reveal in file manager")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Previous 64 KiB")
+            .on_press_maybe(
+                (preview.offset > 0).then_some(RepositoryAction::BinaryPage {
+                    card,
+                    offset: preview
+                        .offset
+                        .saturating_sub(crate::editor::BINARY_PREVIEW_BYTES),
+                }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Load more (next 64 KiB)")
+            .on_press_maybe(
+                (preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(
+                    RepositoryAction::BinaryPage {
+                        card,
+                        offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES,
+                    },
+                ),
+            )
+            .into(),
+    ])
+    .spacing(space::S);
+    widget::container(
+        widget::column::with_children(vec![
+            crate::design::body(format!(
+                "{} · {} bytes · {}",
+                path.display(),
+                preview.bytes,
+                preview.mime
+            ))
+            .into(),
+            crate::design::caption(format!(
+                "Modified {modified} · bytes {}–{}",
+                preview.offset,
+                preview.offset + preview.data.len() as u64
+            ))
+            .into(),
+            crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
+            actions.into(),
+            widget::scrollable(
+                widget::text(preview.hex.as_ref())
+                    .font(cosmic::iced::Font::MONOSPACE)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .direction(iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ])
+        .spacing(space::M),
+    )
+    .padding(space::M)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
 /// The sentence under the read-only title, about the file that was classified.
 fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
     match reason {
@@ -10411,6 +11215,12 @@ fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
                 LinkRefusal::Dangling => "which does not exist.",
                 LinkRefusal::TooManyLinks => "which leads through too many links to follow.",
             }
+        ),
+        ReadOnlyReason::BinaryPreview(preview) => format!(
+            "{} · {} bytes · {}",
+            path.display(),
+            preview.bytes,
+            preview.mime
         ),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
@@ -11832,6 +12642,182 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn async_diff_source_locations_map_lf_lines_across_bare_cr_and_crlf() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("mixed.rs"),
+            "first\rcontinued\nsecond\r\nthird\n",
+        )
+        .unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().into(),
+            worktree: root.path().into(),
+            selected_file: None,
+        });
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 1);
+        assert!(matches!(&runtime.document, DocumentState::Loading));
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 2, column: 0 }
+        );
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), 2);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 3, column: 0 }
+        );
+        let task = runtime.open_source_file_location(card, "mixed.rs".into(), usize::MAX);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position.line,
+            document.content.line_count() - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_source_or_native_location_supersedes_a_pending_scalar_column() {
+        for source in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join("mixed.rs"),
+                "😀abcde\rcontinued\nsecond\nthird\n",
+            )
+            .unwrap();
+            let card = CardId::new();
+            let path = PathBuf::from("mixed.rs");
+            let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+                project: ProjectId::new(),
+                repository: root.path().into(),
+                worktree: root.path().into(),
+                selected_file: None,
+            });
+            let first = runtime.update(RepositoryAction::OpenLocation {
+                card,
+                path: path.clone(),
+                line: 0,
+                column: 5,
+            });
+            assert!(runtime.pending_scalar_location.is_some());
+            let latest = if source {
+                runtime.open_source_file_location(card, path, 2)
+            } else {
+                runtime.open_file_location(card, path, 2, 1, 0)
+            };
+            assert!(runtime.pending_scalar_location.is_none());
+            finish_navigation_task(&mut runtime, first).await;
+            finish_navigation_task(&mut runtime, latest).await;
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("source editor");
+            };
+            assert_eq!(
+                document.content.cursor().position,
+                if source {
+                    text_editor::Position { line: 3, column: 0 }
+                } else {
+                    text_editor::Position { line: 2, column: 1 }
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_switches_retain_undo_until_the_disk_hash_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "one").unwrap();
+        std::fs::write(root.path().join("b.rs"), "two").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        });
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), "one");
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        std::fs::write(root.path().join("a.rs"), "outside").unwrap();
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), "outside");
+        assert!(!document.history.can_undo());
+    }
+
+    #[test]
+    fn go_to_line_and_location_history_work_for_large_source_files() {
+        let card = CardId::new();
+        let text = "abcdef\n".repeat(50_000);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "huge.rs", &text);
+        drop(runtime.update(RepositoryAction::OpenGoToLine { card }));
+        drop(runtime.update(RepositoryAction::GoToLineChanged {
+            card,
+            value: "30000:5".into(),
+        }));
+        drop(runtime.update(RepositoryAction::SubmitGoToLine { card }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 29999,
+                character: 4
+            })
+        );
+        drop(runtime.update(RepositoryAction::NavigateLocation {
+            card,
+            forward: false,
+        }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 0,
+                character: 0
+            })
+        );
+        drop(runtime.update(RepositoryAction::NavigateLocation {
+            card,
+            forward: true,
+        }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 29999,
+                character: 4
+            })
+        );
+    }
 
     #[test]
     fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {
@@ -13575,6 +14561,56 @@ mod tests {
             runtime.diff_state(&DiffBasis::IndexToWorktree),
             Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) if model.additions == 2
         ));
+    }
+
+    #[test]
+    fn binary_page_completions_keep_the_latest_requested_page() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "blob.bin", "");
+        let page = |offset| crate::editor::BinaryPreview {
+            bytes: 200_000,
+            modified: None,
+            mime: "application/octet-stream",
+            error: None,
+            offset,
+            data: vec![0; 16].into(),
+            hex: "preview".into(),
+        };
+        runtime.document = DocumentState::ReadOnly {
+            path: "blob.bin".into(),
+            reason: ReadOnlyReason::BinaryPreview(page(0)),
+        };
+        drop(runtime.update(RepositoryAction::BinaryPage {
+            card,
+            offset: 65536,
+        }));
+        let older = runtime.binary_page_request;
+        drop(runtime.update(RepositoryAction::BinaryPage { card, offset: 0 }));
+        let latest = runtime.binary_page_request;
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity: identity.clone(),
+            request: latest,
+            result: Ok(page(0)),
+        }));
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity: identity.clone(),
+            request: older,
+            result: Ok(page(65536)),
+        }));
+        drop(runtime.update(RepositoryAction::BinaryPageLoaded {
+            identity,
+            request: older,
+            result: Err(FileIoError::Io("stale".into())),
+        }));
+        let DocumentState::ReadOnly {
+            reason: ReadOnlyReason::BinaryPreview(preview),
+            ..
+        } = runtime.document
+        else {
+            panic!("binary preview");
+        };
+        assert_eq!(preview.offset, 0);
+        assert_eq!(preview.error, None);
     }
 
     #[test]
@@ -15842,6 +16878,162 @@ mod tests {
                     position_for_offset(text, addressed),
                     at,
                     "{text:?} offset {offset} must survive a second conversion unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_cr_files_keep_tab_style_when_the_runtime_indents() {
+        for ending in ["\r", "\n\r", "\r\n", "\n"] {
+            let text = format!("root{ending}\tchild{ending}\tchild2");
+            let card = CardId::new();
+            let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "file.txt");
+            drop(runtime.update(RepositoryAction::ConfiguredFileLoaded {
+                identity: identity.clone(),
+                result: Ok(LoadedFile {
+                    source: identity.path,
+                    content: FileContent::Editable {
+                        content_hash: blake3::hash(text.as_bytes()),
+                        text: text.clone(),
+                        markdown: false,
+                    },
+                }),
+                indentation: crate::editor_indent::Overrides::default(),
+            }));
+            assert_eq!(runtime.editor_formatting_options(), (4, false));
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                panic!("editor");
+            };
+            assert_eq!(document.content.line_count(), 3);
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 1, column: 0 },
+                selection: None,
+            });
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Indent),
+            }));
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("editor");
+            };
+            assert_eq!(
+                document
+                    .content
+                    .with_line(1, |line, _| line.to_owned())
+                    .as_deref(),
+                Some("\t\tchild")
+            );
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
+    fn external_editor_caret_translates_native_utf8_to_selected_column_units() {
+        let card = CardId::new();
+        let text = format!("{}a😀ébcdeX\n", "\n".repeat(119));
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "unicode.rs", &text);
+        assert!(runtime.move_cursor_to(LspPosition::new(119, 7)));
+        assert_eq!(runtime.editor_caret_for("code"), Some((120, 9)));
+        assert_eq!(runtime.editor_caret_for("zed"), Some((120, 8)));
+        assert_eq!(runtime.editor_caret(), Some((120, 8)));
+    }
+
+    #[test]
+    fn external_editor_caret_maps_actual_mixed_native_line_endings_for_launchers() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "mixed.rs", "α\n\rβ\r\nγ\rδ\né😀X");
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editable");
+        };
+        assert_eq!(document.content.line_count(), 5);
+        assert_eq!(
+            document.content.with_line(0, |_, ending| ending.as_str()),
+            Some("\n\r")
+        );
+        for (native_line, byte_column, code_line, code_column, scalar_column) in [
+            (0, 0, 1, 1, 1),
+            (1, 0, 3, 1, 1),
+            (2, 0, 4, 1, 1),
+            (3, 0, 5, 1, 1),
+            (4, 6, 6, 4, 3),
+        ] {
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: native_line,
+                    column: byte_column,
+                },
+                selection: None,
+            });
+            for editor in ["code", "codium", "cursor"] {
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some((code_line, code_column)),
+                    "{editor}"
+                );
+            }
+            for editor in ["zed", "zeditor"] {
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some((code_line, scalar_column))
+                );
+            }
+            assert_eq!(
+                runtime.editor_caret(),
+                Some((native_line + 1, scalar_column))
+            );
+        }
+    }
+
+    #[test]
+    fn external_editor_caret_excludes_only_the_document_bom_for_launchers() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "bom.rs", "\u{feff}a😀b\n\u{feff}x");
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editable");
+        };
+        assert_eq!(
+            document
+                .content
+                .with_line(0, |line, _| line.starts_with('\u{feff}')),
+            Some(true)
+        );
+        for (line, bytes, expected) in [
+            (0, 0, (1, 1)),
+            (0, 3, (1, 1)),
+            (0, 4, (1, 2)),
+            (0, 8, (1, 4)),
+            (1, 3, (2, 2)),
+        ] {
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position {
+                    line,
+                    column: bytes,
+                },
+                selection: None,
+            });
+            for editor in ["code", "codium", "cursor"] {
+                assert_eq!(runtime.editor_caret_for(editor), Some(expected), "{editor}");
+            }
+            let scalar_expected = if line == 0 && bytes == 8 {
+                (1, 3)
+            } else {
+                expected
+            };
+            for editor in ["zed", "zeditor"] {
+                assert_eq!(
+                    runtime.editor_caret_for(editor),
+                    Some(scalar_expected),
+                    "{editor}"
                 );
             }
         }
