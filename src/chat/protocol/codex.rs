@@ -562,6 +562,8 @@ struct Codex {
 #[derive(Clone, Default)]
 struct EarlyNotification {
     completed: Option<Value>,
+    /// Later activity cannot be undone by an old RPC reply after scalar idle.
+    superseded: bool,
     preview: crate::chat::notification::Preview,
     preview_transferred: bool,
 }
@@ -2265,6 +2267,7 @@ impl Adapter for Codex {
                     let id = string(&result["turn"], "id")?;
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
+                    let early_completion = early.remove(id);
                     // An active-status update may announce newer work before
                     // its turn ID arrives. The old request's correlation alone
                     // cannot assign that lifecycle to its acknowledged turn.
@@ -2273,8 +2276,9 @@ impl Adapter for Codex {
                             || self.notification_turn.as_deref() == Some(id)
                             // Scalar idle can follow this early completion.
                             // It announces no newer work to protect from replay.
-                            || !self.busy);
-                    let early_completion = early.remove(id).filter(|_| owns_lifecycle);
+                            || (!self.busy
+                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
+                    let early_completion = early_completion.filter(|_| owns_lifecycle);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
@@ -2962,6 +2966,10 @@ impl Adapter for Codex {
                 }));
             }
             "thread/closed" | "thread/deleted" => {
+                // Close revokes current notification ownership. Pending exact
+                // managed outcomes may still settle independently at their ACK.
+                self.notification_revision = self.notification_revision.wrapping_add(1);
+                self.notification_turn = None;
                 self.ready = false;
                 self.attached = false;
                 self.subagent_waiting = false;
@@ -3086,6 +3094,15 @@ fn session_notice(text: String) -> Event {
 }
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
+        if matches!(status["type"].as_str(), Some("active" | "systemError")) {
+            for pending in self.pending.values_mut() {
+                if let Pending::Turn { early, .. } = pending {
+                    for entry in early.values_mut().filter(|entry| entry.completed.is_some()) {
+                        entry.superseded = true;
+                    }
+                }
+            }
+        }
         self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
         self.busy = status["type"] == "active";
         self.subagent_waiting = waiting_on_user(status);
