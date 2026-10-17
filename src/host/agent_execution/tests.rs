@@ -949,25 +949,52 @@ fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup
     };
     let source = agent.session.as_ref().unwrap().id();
     let handle = host.lock().unwrap().chats[&source].handle.clone();
+    let authority = store
+        .lock()
+        .unwrap()
+        .retained_agent_authority_source(source)
+        .unwrap();
+    assert!(matches!(authority, Some(HostedSession::Chat(_))));
     // Exercise the public checked-close dispatcher with a real live PTY,
     // rather than only calling the actor helper after terminal teardown.
     let console = agent.console.as_ref().unwrap().clone();
-    let terminal =
-        crate::terminal::TerminalHandle::spawn(console.clone(), Default::default(), |_| {})
-            .unwrap();
     {
         let mut state = host.lock().unwrap();
         state.register_client(29);
-        state.reserve_spawn(source).unwrap();
-        state
-            .finish_spawn(29, console.clone(), terminal.clone(), true)
-            .unwrap();
+        assert_eq!(
+            state.reserve_spawn(source).unwrap_err().code,
+            crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists
+        );
         let record = state.chats.get_mut(&source).unwrap();
         record.console_recipe = Some(console.launch.clone());
-        record.session.terminal = Some(console);
+    }
+    // Follow the execution service's private recipe admission. An unpaired
+    // spawn must still refuse while the native provider owns this session.
+    let (descriptor, terminal) = super::super::state::spawn_terminal_view_owned(
+        &host,
+        29,
+        console,
+        Default::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source).unwrap();
+        record.session.terminal = Some(descriptor.session);
         record.paired_terminal = Some(terminal.clone());
     }
     assert!(!terminal.is_completed());
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(source)
+            .unwrap(),
+        authority,
+        "a paired console must retain the native provider's authority"
+    );
     let before = store.lock().unwrap().model().unwrap();
     let prompts = std::fs::read(path.parent().unwrap().join("prompts")).unwrap();
     assert!(

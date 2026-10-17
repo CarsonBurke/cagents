@@ -730,6 +730,7 @@ impl Cagents {
             return;
         }
         self.shared_views = super::shared_views::State::for_workspace(&self.durable);
+        self.clear_closed_chat_drafts();
         let durable = Arc::make_mut(&mut self.durable);
         durable.workspace_model_identity = Some(identity);
         for channel in durable.channels.iter_mut() {
