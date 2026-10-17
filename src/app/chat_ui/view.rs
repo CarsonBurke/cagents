@@ -1138,6 +1138,9 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
     ) -> Element<'a, Message> {
+        if self.awaiting_admission() {
+            return self.pending_admission_view();
+        }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
         let available = !transitioning

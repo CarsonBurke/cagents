@@ -265,6 +265,7 @@ pub struct WorkspaceManifest {
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub local_only_cards: HashSet<CardId>,
+    pub pending_chat_admissions: HashMap<CardId, crate::chat::Session>,
     pub pending_terminal_creations: HashSet<CardId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
@@ -1747,8 +1748,16 @@ impl StateStore {
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
             local_only_cards: manifest.local_only_cards,
+            pending_chat_admissions: manifest.pending_chat_admissions,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
+        state.pending_chat_admissions.retain(|id, source| {
+            state.cards.iter().any(|card| {
+                card.id == *id
+                    && card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(session) if session == source)
+            })
+        });
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -3320,6 +3329,22 @@ fn save_workspace_transaction(
         &to_json(&state.workspace_model_identity)?,
     )?;
 
+    let pending = state
+        .pending_chat_admissions
+        .iter()
+        .filter(|(id, source)| {
+            state.cards.iter().any(|card| {
+                card.id == **id
+                    && card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(session) if session == *source)
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:pending_chat_admissions"),
+        &to_json(&pending)?,
+    )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:local_only_cards"),
@@ -4666,6 +4691,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("local-only pane identities", &value))
         .transpose()?
         .unwrap_or_default(),
+        pending_chat_admissions: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:pending_chat_admissions"),
+        )?
+        .map(|value| from_json("pending shared chat admission", &value))
+        .transpose()?
+        .unwrap_or_default(),
         pending_terminal_creations: metadata(
             connection,
             &format!("workspace:{id}:navigation:pending_terminal_creations"),
@@ -5284,6 +5316,7 @@ mod tests {
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
     }
