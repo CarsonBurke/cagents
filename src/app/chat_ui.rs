@@ -26,6 +26,7 @@ mod images;
 mod layout;
 mod markdown_source;
 mod monospace;
+mod pending_admission;
 mod permissions;
 mod prose;
 mod retained;
@@ -182,6 +183,8 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    /// Lets the laid-out editor move Up before starting prompt history.
+    ComposerUp(Target),
     ComposerCursor(Target, text_editor::Cursor),
     Paste(Target),
     PastedImage(Target, Option<clipboard_image::Image>),
@@ -1463,6 +1466,10 @@ enum Connection {
     /// choices that cost nothing to change, and an unused card leaves no
     /// process behind.
     Draft,
+    /// A cached shared descriptor has not been admitted by the current view.
+    AwaitingAdmission,
+    /// Canonical admission has started an attachment, with no handle yet.
+    Connecting,
     Live(Arc<ClientHandle>),
 }
 
@@ -2063,8 +2070,9 @@ impl Runtime {
         self.replace_draft(composer);
     }
 
-    /// Recalled prompts are complete history entries, including multiline
-    /// ones. Both arrows keep walking that history until the draft returns.
+    /// Whether Up may reach history, and Down is browsing it. Logical line
+    /// zero is only a candidate: the native editor resolves its wrapped rows
+    /// when handling ComposerUp. Recalled prompts remain whole entries.
     fn history_navigation(&self) -> (bool, bool) {
         let browsing = self.history_cursor.is_some();
         let older =
@@ -2304,7 +2312,7 @@ impl Runtime {
     /// The live connection, once the conversation has started.
     fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
-            Connection::Draft => None,
+            Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
             Connection::Live(handle) => Some(handle),
         }
     }
@@ -4593,6 +4601,9 @@ impl Cagents {
         session: chat::Session,
         intent: chat::Intent,
     ) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            return Task::none();
+        }
         if !session.is_unstarted() {
             return self.start_chat(card, session, intent, None, false);
         }
@@ -4975,6 +4986,15 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            let Some(remove) = self.remove_chat_card(card, None) else {
+                return Task::none();
+            };
+            Arc::make_mut(&mut self.durable)
+                .pending_chat_admissions
+                .remove(&card);
+            return remove;
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -5275,6 +5295,9 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
+        if self.chat_awaiting_admission(card) {
+            return Task::none();
+        }
         let selection = None;
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
@@ -5814,7 +5837,7 @@ impl Cagents {
         snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
-            Connection::Draft => None,
+            Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
         };
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
@@ -6083,7 +6106,8 @@ impl Cagents {
     }
     fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
-            && (self.chat_start_pending(target.card)
+            && (self.chat_awaiting_admission(target.card)
+                || self.chat_start_pending(target.card)
                 || self
                     .card_state(target.card)
                     .is_none_or(|state| !state.existence.is_open()))
@@ -6091,7 +6115,9 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
-            && (self.chat_closed_elsewhere(card) || self.refuse_for_deleting_card(card))
+            && (self.chat_awaiting_admission(card)
+                || self.chat_closed_elsewhere(card)
+                || self.refuse_for_deleting_card(card))
         {
             return Task::none();
         }
@@ -7039,6 +7065,32 @@ impl Cagents {
                         return view::completion_scroll(target, 0.0);
                     }
                 }
+            }
+            Action::ComposerUp(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.history_cursor.is_some() {
+                    runtime.recall(true);
+                    return Task::none();
+                }
+                let before = runtime.composer.cursor();
+                // Movement belongs to the native editor, including wrapping,
+                // preferred column, scrolling and selection collapse. Only a
+                // press that cannot move beyond its first rendered row starts
+                // history; reaching that row still takes a normal caret step.
+                let task = self.handle_chat_ui(Action::Composer(
+                    target,
+                    text_editor::Action::Move(text_editor::Motion::Up),
+                ));
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && before.selection.is_none()
+                    && before.position.line == 0
+                    && runtime.composer.cursor() == before
+                {
+                    runtime.recall(true);
+                }
+                return task;
             }
             Action::Composer(target, action) => {
                 let mut files = None;
@@ -12583,6 +12635,224 @@ mod tests {
             target,
             text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.to_owned()))),
         )));
+    }
+
+    /// Lay out the real chat and dispatch a key through its focused composer.
+    /// This uses native text shaping and widget bindings, without host input.
+    fn composer_history_key(
+        app: &mut Cagents,
+        card: CardId,
+        width: f32,
+        key: keyboard::key::Named,
+        renderer: &cosmic::Renderer,
+    ) {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let viewport = iced::Rectangle::with_size(iced::Size::new(width, 720.0));
+        let mut messages = Vec::new();
+        {
+            let mut element = app.chat_view(card);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                    card,
+                    "chat-composer",
+                )),
+            );
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(permission_key(key, keyboard::Modifiers::empty())),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            !messages.is_empty(),
+            "the focused native composer must handle the arrow"
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+    }
+
+    #[test]
+    fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft() {
+        use keyboard::key::Named;
+        let renderer = crate::app::tests::headless_renderer();
+        for width in [240.0, 420.0, 760.0] {
+            for paragraph in [
+                "A paragraph whose soft wrapped rows belong to the unsent draft. ".repeat(12),
+                "Unicode café 🦀 日本語 Ελληνικά keeps its native shaped rows. ".repeat(12),
+                format!(
+                    "explicit first line\n{}",
+                    "a long second line wraps too ".repeat(20)
+                ),
+            ] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some("wrapped-history"));
+                write(&mut app, card, &paragraph);
+                let target = chat_runtime(&app, card).target;
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.history = vec!["previous sent prompt".into()];
+                runtime
+                    .composer
+                    .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+
+                let mut moved = 0;
+                let mut boundary = None;
+                for _ in 0..256 {
+                    let before = chat_runtime(&app, card).composer.cursor();
+                    composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
+                    let runtime = chat_runtime(&app, card);
+                    if runtime.history_cursor.is_some() {
+                        assert!(
+                            moved > 1,
+                            "Up must traverse multiple native rows at {width}"
+                        );
+                        boundary = Some(before);
+                        break;
+                    }
+                    assert_eq!(runtime.composer.text(), paragraph);
+                    assert_ne!(
+                        runtime.composer.cursor(),
+                        before,
+                        "Up must move within the draft"
+                    );
+                    moved += 1;
+                }
+                let boundary = boundary.expect("Up eventually reaches native history");
+                assert_eq!(
+                    chat_runtime(&app, card).composer.text(),
+                    "previous sent prompt"
+                );
+                composer_history_key(&mut app, card, width, Named::ArrowDown, &renderer);
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.composer.text(), paragraph);
+                assert_eq!(runtime.composer.cursor(), boundary);
+                assert_eq!(runtime.history_cursor, None);
+            }
+        }
+    }
+
+    #[test]
+    fn native_composer_up_collapses_a_selection_before_starting_history() {
+        use keyboard::key::Named;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("selected-history"));
+        write(&mut app, card, "selected draft");
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.history = vec!["sent prompt".into()];
+        runtime.composer.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        runtime
+            .composer
+            .perform(text_editor::Action::Select(text_editor::Motion::Right));
+        composer_history_key(&mut app, card, 420.0, Named::ArrowUp, &renderer);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "selected draft");
+        assert_eq!(runtime.composer.cursor().selection, None);
+        assert_eq!(runtime.history_cursor, None);
+        composer_history_key(&mut app, card, 420.0, Named::ArrowUp, &renderer);
+        assert_eq!(chat_runtime(&app, card).composer.text(), "sent prompt");
+    }
+
+    #[test]
+    fn native_composer_up_keeps_whitespace_drafts_out_of_queue_take_back() {
+        let renderer = crate::app::tests::headless_renderer();
+        for text in [" ".repeat(1200), "\n\n\n".into()] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("whitespace-queue"));
+            write(&mut app, card, &text);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.followups.push(Followup {
+                id: 1,
+                text: "waiting follow-up".into(),
+                attachments: Vec::new(),
+            });
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            let before = runtime.composer.cursor();
+            composer_history_key(
+                &mut app,
+                card,
+                240.0,
+                keyboard::key::Named::ArrowUp,
+                &renderer,
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(runtime.followups.len(), 1);
+            if text.contains('\n') {
+                assert_ne!(runtime.composer.cursor(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn native_composer_up_uses_native_layout_at_different_font_sizes() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        // The app currently fixes the composer to TEXT_PROSE; there is no
+        // chat-font setting to vary. Exercise the native field's supported
+        // size API against the same Content and controller, in addition to
+        // the full chat-view key-binding regressions above.
+        for font_size in [13.0, 23.0] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("font-size-history"));
+            let draft = "Unicode café 🦀 日本語 remains a draft while moving through native rows. "
+                .repeat(12);
+            write(&mut app, card, &draft);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["previous prompt".into()];
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            {
+                let mut field: iced::Element<'_, Message, cosmic::Theme, cosmic::Renderer> =
+                    crate::ui_controls::field::editor("Message", &runtime.composer)
+                        .size(font_size)
+                        .on_action(move |event| Message::ChatUi(Action::Composer(target, event)))
+                        .into();
+                let mut tree = Tree::new(field.as_widget());
+                let _ = field.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 200.0)),
+                );
+            }
+            let before = chat_runtime(&app, card).composer.cursor();
+            drop(app.update(Message::ChatUi(Action::ComposerUp(target))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), draft);
+            assert_ne!(runtime.composer.cursor(), before);
+            assert_eq!(runtime.history_cursor, None);
+
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .composer
+                .perform(text_editor::Action::Move(
+                    text_editor::Motion::DocumentStart,
+                ));
+            drop(app.update(Message::ChatUi(Action::ComposerUp(target))));
+            assert_eq!(chat_runtime(&app, card).composer.text(), "previous prompt");
+        }
     }
 
     #[test]

@@ -321,6 +321,193 @@ fn is_effect(command: &CommandSpec) -> bool {
         .is_some_and(|mode| mode == "effect")
 }
 
+/// Wrap only the synthetic operation's hook, preserving its actual native
+/// phase argument and stdin before invoking the production script unchanged.
+fn observe_transaction_phases(fixture: &Fixture) {
+    let mut wrapped = false;
+    fixture.intercept(move |command| {
+        if !wrapped
+            && command
+                .environment
+                .contains_key(OsStr::new("CAGENTS_PR_MODE"))
+        {
+            wrapped = true;
+            let private = Path::new(&command.environment[OsStr::new("CAGENTS_PR_PRIVATE")]);
+            let hook = private.join("reference-transaction");
+            fs::rename(&hook, private.join("observed-transaction")).unwrap();
+            fs::write(
+                &hook,
+                r#"#!/bin/sh
+set -eu
+evidence="$CAGENTS_PR_WORKTREE/.git/observed-$CAGENTS_PR_MODE-$1"
+/bin/cat > "$evidence"
+printf '%s:%s\n' "$CAGENTS_PR_MODE" "$1" >> "$CAGENTS_PR_WORKTREE/.git/observed-phases"
+exec /bin/sh "$CAGENTS_PR_PRIVATE/observed-transaction" "$@" < "$evidence"
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    });
+}
+
+#[test]
+fn native_transaction_phases_preserve_current_and_fast_forward_checkouts() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(native_transaction_phases_preserve_current_and_fast_forward_checkouts)
+    )) {
+        return;
+    }
+    for advance in [false, true] {
+        let fixture = Fixture::new(true);
+        let expected = if advance {
+            fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap())
+        } else {
+            fixture.original.clone()
+        };
+        if !advance {
+            fs::write(fixture.root.join("other"), "local draft\n").unwrap();
+        }
+        let plan = fixture.prepare(&fixture.request(expected.clone()));
+        observe_transaction_phases(&fixture);
+        let verified = fixture.apply(&plan).unwrap();
+        assert_eq!(verified.head(), &expected);
+        let phases = fs::read_to_string(fixture.root.join(".git/observed-phases")).unwrap();
+        eprintln!("actual native transaction phases (advance={advance}): {phases}");
+        assert!(phases.lines().any(|phase| phase == "probe:prepared"));
+        // Earlier Git versions emit no preparing notification. When native
+        // Git emits it, retain proof that symbolic HEAD was still unresolved.
+        if phases.lines().any(|phase| phase == "probe:preparing") {
+            let preparing =
+                fs::read_to_string(fixture.root.join(".git/observed-probe-preparing")).unwrap();
+            let prepared =
+                fs::read_to_string(fixture.root.join(".git/observed-probe-prepared")).unwrap();
+            assert!(preparing.lines().any(|line| line.ends_with(" HEAD")));
+            assert!(
+                prepared
+                    .lines()
+                    .any(|line| line.ends_with(" refs/heads/feature"))
+            );
+            assert!(
+                phases.find("probe:preparing").unwrap() < phases.find("probe:prepared").unwrap()
+            );
+        }
+        assert_eq!(
+            git_text(&fixture.root, &["rev-parse", "HEAD"]),
+            expected.as_str()
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("file")).unwrap(),
+            if advance {
+                b"new\n".as_slice()
+            } else {
+                b"old\n".as_slice()
+            }
+        );
+        if !advance {
+            assert_eq!(
+                fs::read(fixture.root.join("other")).unwrap(),
+                b"local draft\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn preparing_notifications_preserve_policy_refusal_without_prepared_proof() {
+    let temporary = tempfile::tempdir().unwrap();
+    let hook = temporary.path().join("transaction");
+    fs::write(&hook, include_bytes!("transaction.sh")).unwrap();
+    let policy = temporary.path().join("policy");
+    fs::write(&policy, "#!/bin/sh\n[ \"$1\" = preparing ] || exit 2\n/bin/cat > \"$CAGENTS_PR_PRIVATE/policy-input\"\nexit 7\n").unwrap();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o700)).unwrap();
+    let input = format!("{} {} HEAD\n", "0".repeat(40), "1".repeat(40));
+    for (mode, success) in [("probe", true), ("effect", false)] {
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .arg("preparing")
+            .env("CAGENTS_PR_PRIVATE", temporary.path())
+            .env("CAGENTS_PR_MODE", mode)
+            .env("CAGENTS_PR_PREVIOUS_HOOK", &policy)
+            .env("CAGENTS_PR_PREVIOUS_CONFIG", "")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.success(), success);
+        assert!(!temporary.path().join("probe").exists());
+        assert!(!temporary.path().join("effect-prepared").exists());
+        assert_eq!(
+            temporary.path().join("policy-input").exists(),
+            mode == "effect"
+        );
+        assert_eq!(
+            temporary.path().join("policy-failed").exists(),
+            mode == "effect"
+        );
+        if mode == "effect" {
+            assert_eq!(
+                fs::read(temporary.path().join("policy-input")).unwrap(),
+                input.as_bytes()
+            );
+            assert_eq!(
+                fs::read(temporary.path().join("policy-failed")).unwrap(),
+                b"preparing\n"
+            );
+        }
+    }
+    let unknown = Command::new("/bin/sh")
+        .arg(&hook)
+        .arg("unknown-phase")
+        .output()
+        .unwrap();
+    assert!(
+        !unknown.status.success(),
+        "unknown phases must remain fail-closed"
+    );
+}
+
+#[test]
+fn native_prepared_config_guard_still_refuses_after_policy_edits() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::",
+        stringify!(native_prepared_config_guard_still_refuses_after_policy_edits)
+    )) {
+        return;
+    }
+    let fixture = Fixture::new(true);
+    let expected = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
+    let policy = fixture.root.join(".git/hooks/reference-transaction");
+    fs::write(&policy, "#!/bin/sh\n/bin/cat >/dev/null\nif [ \"${CAGENTS_PR_MODE:-}\" = effect ] && [ \"$1\" = prepared ]; then printf '\\n[fixture]\\n concurrent = retained\\n' >> \"$CAGENTS_PR_WORKTREE/.git/config\"; fi\n").unwrap();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = fixture.prepare(&fixture.request(expected));
+    observe_transaction_phases(&fixture);
+    let failure = fixture.apply(&plan).unwrap_err();
+    assert_eq!(failure.kind, PrCheckoutFailureKind::Refused);
+    let phases = fs::read_to_string(fixture.root.join(".git/observed-phases")).unwrap();
+    assert!(phases.lines().any(|phase| phase == "effect:prepared"));
+    assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
+    assert_eq!(
+        git_text(&fixture.root, &["rev-parse", "HEAD"]),
+        fixture.original.as_str()
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "fixture.concurrent"]),
+        "retained"
+    );
+}
+
 #[test]
 fn missing_tracking_is_confirmed_atomically_and_bare_push_updates_pr() {
     if isolated_fixture_case(concat!(

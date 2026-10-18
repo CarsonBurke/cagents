@@ -4673,6 +4673,14 @@ impl History {
             .map_err(|e| e.to_string())?;
         let mut frame: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+        // The provider can rewrite this inode after indexing. Revalidate the
+        // record being published, including off-page tool-call dependencies.
+        if frame["sessionId"]
+            .as_str()
+            .is_some_and(|id| id != self.session_id)
+        {
+            return Err("Claude history changed session identity while reading".into());
+        }
         frame["_cagents_block_base"] = json!(base);
         frame
             .as_object_mut()
@@ -5065,6 +5073,9 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
     }
     Ok(value)
 }
+
+#[cfg(test)]
+mod history_tests;
 
 #[cfg(test)]
 mod tests {

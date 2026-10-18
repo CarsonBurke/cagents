@@ -1428,7 +1428,7 @@ impl Cagents {
         &mut self,
         view: &View,
         owned: &HashSet<CardId>,
-        current: Vec<CardId>,
+        mut current: Vec<CardId>,
     ) -> Task<Message> {
         let index = match &view.scope {
             Scope::Channel(id) => {
@@ -1555,6 +1555,11 @@ impl Cagents {
                 }
             }
             self.shared_views.attached.insert(pane.id);
+            if self.chat_awaiting_admission(pane.id) {
+                let (task, saved_copy) = self.admit_shared_chat(pane);
+                tasks.push(task);
+                current.extend(saved_copy);
+            }
             match &pane.user_title {
                 Some(title) => {
                     self.chrome_ui.user_titles.insert(pane.id, title.clone());
@@ -1965,6 +1970,8 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod startup_admission;
+
     use super::*;
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId, ProjectChannel, ProjectId,

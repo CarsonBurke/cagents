@@ -105,6 +105,8 @@ pub(crate) enum Update {
     },
     /// The provider began taking prompts, which leaves activity unchanged.
     Ready,
+    /// The parent can accept a new prompt, independently of running children.
+    PromptAvailable,
     /// The provider reported on the account the conversation runs on. It
     /// concerns every surface showing the account, whatever this
     /// conversation's visibility, and changes nothing in the snapshot.
@@ -397,6 +399,7 @@ impl Handle {
                     dirty: false,
                     activity: ActivityState::Idle,
                     ready: false,
+                    prompt_available: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
@@ -1042,13 +1045,7 @@ impl Handle {
     /// a turn or passing over a question it put to the user.
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.ready
-            && !state.busy
-            && !state.waiting
-            && !state.exited
-            && state.requests.is_empty()
-            && !self.is_completed()
-            && !self.0.draining.load(Ordering::Acquire)
+        accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
     }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
@@ -1614,6 +1611,7 @@ struct Actor {
     activity: ActivityState,
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
+    prompt_available: bool,
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
@@ -1681,6 +1679,11 @@ impl TurnAttention {
         false
     }
 }
+/// Parent admission deliberately excludes aggregate background-child activity.
+fn accepts_prompt(state: &Snapshot) -> bool {
+    state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
+}
+
 impl Actor {
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
@@ -2568,6 +2571,9 @@ impl Actor {
         self.waiting_fingerprint = waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
+        let prompt_available = accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
+        let became_available = prompt_available && !self.prompt_available;
+        self.prompt_available = prompt_available;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
@@ -2592,6 +2598,9 @@ impl Actor {
         }
         if became_ready {
             (self.notify)(Update::Ready);
+        }
+        if became_available {
+            (self.notify)(Update::PromptAvailable);
         }
     }
     fn touch(&mut self) {
@@ -3378,6 +3387,157 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
+        struct Frames(VecDeque<Vec<Event>>);
+        impl Adapter for Frames {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Status {
+                            busy: true,
+                            detail: String::new(),
+                        },
+                        Event::Subagent {
+                            id: "child".into(),
+                            kind: String::new(),
+                            description: String::new(),
+                            status: Some(ToolStatus::Running),
+                            background: Some(true),
+                            model: None,
+                            waiting: None,
+                            detail: None,
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    events: self.0.pop_front().ok_or("frames exhausted")?,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let status = |busy| Event::Status {
+            busy,
+            detail: String::new(),
+        };
+        let request = || {
+            Event::Request(super::super::Request {
+                kind: super::super::RequestKind::Approval,
+                id: "approval".into(),
+                title: String::new(),
+                description: String::new(),
+                fields: vec![],
+                actions: vec![],
+            })
+        };
+        let child = || Event::Subagent {
+            id: "child".into(),
+            kind: String::new(),
+            description: "Still working".into(),
+            status: Some(ToolStatus::Running),
+            background: Some(true),
+            model: None,
+            waiting: None,
+            detail: None,
+        };
+        let mut adapter = Frames(VecDeque::from([
+            vec![child()],
+            vec![status(false), request()], // End-of-step request defeats transient eligibility.
+            vec![child()],
+            vec![Event::RequestResolved {
+                id: "approval".into(),
+            }],
+            vec![child()],
+            vec![status(true)],
+            vec![status(false)],
+            vec![Event::Waiting(true)],
+            vec![Event::Waiting(false)],
+            vec![Event::Ready(false)],
+            vec![Event::Ready(true)],
+        ]));
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = updates.clone();
+        let handle = Handle::start(
+            spec,
+            Box::new(adapter),
+            initial,
+            store,
+            None,
+            move |update| {
+                observed.lock().unwrap().push(update);
+            },
+        )
+        .unwrap();
+        handle.check_update_readiness().unwrap(); // Actor initialization barrier.
+        let available = || {
+            updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::PromptAvailable))
+                .count()
+        };
+        assert_eq!(available(), 0);
+        for (count, expected_idle) in [
+            (0, false),
+            (0, false),
+            (0, false),
+            (1, true),
+            (1, true),
+            (1, false),
+            (2, true),
+            (2, false),
+            (3, true),
+            (3, false),
+            (4, true),
+        ] {
+            handle.command(Command::Compact).unwrap();
+            assert_eq!(available(), count);
+            assert_eq!(handle.is_idle(), expected_idle);
+        }
+        assert_eq!(
+            handle.activity(),
+            ActivityState::Working,
+            "child activity remains authoritative"
+        );
+        assert_eq!(
+            updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(
+                    update,
+                    Update::Activity {
+                        state: ActivityState::Idle,
+                        ..
+                    }
+                ))
+                .count(),
+            0
+        );
+        handle.close().unwrap();
+    }
+
     #[test]
     fn notification_title_matches_resident_session_identity_across_metadata_only_frames() {
         struct Names;
@@ -6200,6 +6360,7 @@ mod tests {
                 | Update::Attention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready
+                | Update::PromptAvailable
                 | Update::Execution { .. } => None,
             })
             .collect();
