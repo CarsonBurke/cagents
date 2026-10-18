@@ -564,27 +564,93 @@ async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline
     }
     let directory = Checkout::new();
     std::fs::write(directory.path().join("file.txt"), "baseline").unwrap();
-    let (mut runtime, card, _) = loaded(directory.path()).await;
+    let (mut runtime, card, custody) = loaded(directory.path()).await;
     runtime.set_auto_save(false);
-    // This reducer contract starts with an independently unconfirmed Save
-    // durability observation. Cleanup completion alone cannot replace it.
-    let slot = crate::recovery_authority::RecoverySlot::reserve().unwrap();
-    let artifact = directory.path().join("owned-cleanup-fixture");
-    std::fs::write(&artifact, b"owned fixture").unwrap();
-    let removed = artifact.clone();
-    let authority = slot.retain("owning cleanup fixture".into(), move || {
-        std::fs::remove_file(&removed).map_err(|error| error.to_string())
-    });
-    let DocumentState::Editable(document) = &mut runtime.document else {
+    insert(&mut runtime, card, '!');
+    let submitted = runtime.editor_text().unwrap();
+    let extra = Arc::new(std::sync::Mutex::new(None));
+    let captured = extra.clone();
+    // The normal Runtime worker still qualifies the original baseline,
+    // publishes, finishes context/custody and delivers its typed completion.
+    let save = runtime.request_save_with_writer(
+        card,
+        false,
+        true,
+        move |root, path, text, hash, overwrite, context| {
+            crate::editor::retained_save::save_file_with_cleanup_warning_at(
+                root,
+                path,
+                text,
+                hash,
+                overwrite,
+                context,
+                |_, holding| {
+                    let (file, name) = crate::fs_safety::create_temporary_in(holding, 0o600)
+                        .map_err(std::io::Error::other)?;
+                    *captured.lock().unwrap() = Some((holding.try_clone()?, name, file));
+                    Ok(())
+                },
+            )
+        },
+    );
+    assert!(runtime.is_saving());
+    finish(&mut runtime, save).await;
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
+        submitted
+    );
+    assert!(!runtime.is_dirty());
+    assert!(
+        runtime
+            .save_error()
+            .unwrap()
+            .contains("injected source-parent directory sync failure")
+    );
+    let DocumentState::Editable(document) = &runtime.document else {
         panic!("editable");
     };
-    document.durability_warning = Some("Earlier directory durability was not confirmed".into());
-    document.cleanup_recovery = Some(authority.clone());
-    authority.retry().unwrap();
-    assert!(!artifact.exists());
+    let authority = document
+        .cleanup_recovery
+        .clone()
+        .expect("producer cleanup authority");
+    assert!(!authority.is_resolved());
+    assert!(custody.lock().unwrap().is_pending());
+    let (holding, name, file) = extra.lock().unwrap().take().expect("owned extra entry");
+    drop(file);
+    crate::fs_safety::unlink_within(&holding, &name).unwrap();
+    let retry = custody
+        .lock()
+        .unwrap()
+        .update(crate::operation_recovery::Action::Retry(authority.clone()));
+    let mut stream = iced::runtime::task::into_stream(retry).expect("actual Retry worker");
+    let finished = loop {
+        match stream.next().await.expect("actual Finished output") {
+            iced::runtime::Action::Output(action) => break action,
+            _ => {}
+        }
+    };
+    assert!(matches!(
+        &finished,
+        crate::operation_recovery::Action::Finished { result: Ok(()), .. }
+    ));
+    // Hold the actual worker completion before State/App reconciliation: the
+    // shared authority has resolved, while the document still retains its marker.
+    assert!(authority.is_resolved());
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("editable");
+    };
+    assert!(document.cleanup_recovery.as_ref().unwrap().is_resolved());
+    assert!(
+        runtime.has_durability_warning(),
+        "resolved cleanup hid the Save durability warning before Finished routing"
+    );
+    assert!(runtime.blocks_navigation());
+    assert!(runtime.can_save());
+    drop(custody.lock().unwrap().update(finished));
     drop(runtime.reconcile_operation_recovery(card));
     assert!(runtime.has_durability_warning());
     assert!(runtime.blocks_navigation());
+    assert!(runtime.can_save());
     let DocumentState::Editable(document) = &runtime.document else {
         panic!("editable");
     };
@@ -596,7 +662,7 @@ async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline
     finish(&mut runtime, retry).await;
     assert_eq!(
         std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
-        "baseline"
+        submitted
     );
     assert!(!runtime.has_durability_warning());
     assert!(!runtime.is_dirty());

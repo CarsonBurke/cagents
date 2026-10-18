@@ -185,6 +185,60 @@ fn save_file_with_read_hook(
     before_publish: impl FnOnce() -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+    save_file_with_pipeline_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        context,
+        after_read,
+        before_publish,
+        |_, _| Ok(()),
+        sync_parent,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn save_file_with_cleanup_warning_at(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &FilesystemRecoveryContext,
+    after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
+) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+    save_file_with_pipeline_hooks(
+        root,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        context,
+        || Ok(()),
+        || Ok(()),
+        after_publish,
+        |_| {
+            Err(io::Error::other(
+                "injected source-parent directory sync failure",
+            ))
+        },
+    )
+}
+
+fn save_file_with_pipeline_hooks(
+    root: &Root,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    context: &FilesystemRecoveryContext,
+    after_read: impl FnOnce() -> io::Result<()>,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<RetainedSaveOutcome, RetainedSaveError> {
     validate_repo_path(relative_path).map_err(io_error)?;
     context.validate_for_source(root).map_err(io_error)?;
     let named = Root::open(root.path()).map_err(io_error)?;
@@ -240,7 +294,7 @@ fn save_file_with_read_hook(
             validate_target_parent(root, relative_path, &parent)
         },
         |parent, _| validate_target_parent(root, relative_path, parent),
-        |_, _| Ok(()),
+        after_publish,
         sync_parent,
     )?;
     let (durability, recovery) = match durability {

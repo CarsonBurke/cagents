@@ -858,15 +858,9 @@ struct SaveTicket {
 
 impl EditorDocument {
     fn durability_warning(&self) -> Option<&str> {
-        if self
-            .cleanup_recovery
-            .as_ref()
-            .is_some_and(|authority| authority.is_resolved())
-        {
-            None
-        } else {
-            self.durability_warning.as_deref()
-        }
+        // Cleanup resolution does not qualify the earlier disk durability.
+        // Keep the warning visible until Reload or a successful Save does.
+        self.durability_warning.as_deref()
     }
     fn new(
         path: PathBuf,
@@ -4771,6 +4765,32 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        self.request_save_with_writer(
+            card,
+            overwrite,
+            reveal_editor,
+            crate::editor::retained_save::save_file_at,
+        )
+    }
+
+    fn request_save_with_writer(
+        &mut self,
+        card: CardId,
+        overwrite: bool,
+        reveal_editor: bool,
+        write: impl FnOnce(
+            &crate::fs_safety::Root,
+            &Path,
+            &str,
+            blake3::Hash,
+            bool,
+            &crate::filesystem_recovery_context::FilesystemRecoveryContext,
+        ) -> Result<
+            crate::editor::retained_save::RetainedSaveOutcome,
+            crate::editor::retained_save::RetainedSaveError,
+        > + Send
+        + 'static,
+    ) -> Task<RepositoryAction> {
         self.clear_resolved_operation_recovery();
         if self.has_editor_recovery() {
             return Task::none();
@@ -4864,7 +4884,7 @@ impl RepositoryRuntime {
                         None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
                     })
                     .and_then(|context| {
-                        let result = crate::editor::retained_save::save_file_at(
+                        let result = write(
                             &root,
                             &destination,
                             &text,
