@@ -13,6 +13,8 @@ mod retained_admission_tests;
 #[cfg(test)]
 mod retained_converted_cleanup_tests;
 #[cfg(test)]
+mod retained_execution_exit_tests;
+#[cfg(test)]
 mod retained_identity_tests;
 #[cfg(test)]
 mod retained_pending_cleanup_tests;
@@ -2335,9 +2337,17 @@ fn process_inner(
             if !source.has_valid_native_continuity() || source.launch.session_id.is_none() {
                 return Err(error("Saved conversation has invalid continuity evidence"));
             }
+            // Classify retained Claude execution before generic discovery:
+            // an exited helper may still await its original parent's wait.
+            // Errors/unproved exit never fall back to treating it as live.
+            let retirement = if source.launch.provider == Provider::Claude {
+                retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
+            } else {
+                None
+            };
             // A present owner must be restored, not replaced. Missing evidence
             // is never proof of a completed close.
-            if has_native_owner(&source)? {
+            if retirement.is_none() && has_native_owner(&source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session: source });
             }
             // A kernel boot change proves every process from the saved boot
@@ -2349,7 +2359,8 @@ fn process_inner(
             let closed = if previous_boot {
                 true
             } else if source.launch.provider == Provider::Claude {
-                retained_resume::prepare_resume(host, &source).map_err(unavailable)?
+                retained_resume::prepare_resume_verified(host, &source, retirement)
+                    .map_err(unavailable)?
             } else {
                 chat::native_holder::closed_source(&source, &proof)
                     .map_err(unavailable)?

@@ -2,6 +2,7 @@
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
+use crate::chat::runtime::{RetirementInspection, VerifiedRetirement};
 use crate::host::model::NativeActorEvent;
 use std::{
     collections::BTreeSet,
@@ -727,6 +728,9 @@ fn close_with_target(
         .chats
         .contains_key(&requested.id);
     if !present {
+        if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
+            return close_verified_unattached(host, requested, &proof, verified);
+        }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
             return Err(
@@ -817,28 +821,36 @@ fn close_with_target(
     let identity = handle
         .actor_identity()
         .ok_or("Retained cleanup lost its actor identity")?;
-    let (issued, lineage, scope) = if identity.record.holder.is_current() {
-        let inspection = Handle::inspect_remote(&identity.record, proof.clone())?;
-        if inspection.identity != identity {
-            return Err("The retained cleanup actor changed during inspection".into());
-        }
-        (
-            inspection.source,
-            inspection.previous_sources,
-            inspection.launch_account_scope,
-        )
-    } else {
-        let receipt = Handle::retired_actor_receipt(&identity.record, &proof)?
-            .ok_or("The closed helper lacks its exact semantic-retirement receipt")?;
-        if receipt.identity != identity {
-            return Err("The retained cleanup receipt belongs to another actor".into());
-        }
-        (
-            receipt.source,
-            receipt.previous_sources,
-            receipt.launch_account_scope,
-        )
-    };
+    let (issued, lineage, scope, retired) =
+        match Handle::inspect_retained_retirement(&identity.record, &proof)? {
+            RetirementInspection::Running => {
+                let inspection = Handle::inspect_remote(&identity.record, proof.clone())?;
+                if inspection.identity != identity {
+                    return Err("The retained cleanup actor changed during inspection".into());
+                }
+                (
+                    inspection.source,
+                    inspection.previous_sources,
+                    inspection.launch_account_scope,
+                    None,
+                )
+            }
+            RetirementInspection::Verified(verified) => {
+                let receipt = verified.receipt();
+                if receipt.identity != identity {
+                    return Err("The retained cleanup receipt belongs to another actor".into());
+                }
+                (
+                    receipt.source.clone(),
+                    receipt.previous_sources.clone(),
+                    receipt.launch_account_scope.clone(),
+                    Some(verified),
+                )
+            }
+            RetirementInspection::ExitedUnproved => {
+                return Err("The closed helper lacks its exact semantic-retirement receipt".into());
+            }
+        };
     verify_close_ownership(
         host,
         &identity,
@@ -864,7 +876,9 @@ fn close_with_target(
     target
         .require_current(host)
         .map_err(|error| error.message)?;
-    handle.close()?;
+    if retired.is_none() {
+        handle.close()?;
+    }
     target
         .require_current(host)
         .map_err(|error| error.message)?;
@@ -887,7 +901,11 @@ fn close_with_target(
     target
         .require_current(host)
         .map_err(|error| error.message)?;
-    finish_close(host, &handle, &source)?;
+    if let Some(verified) = retired {
+        publish_verified_retirement(host, &handle, &source, verified)?;
+    } else {
+        finish_close(host, &handle, &source)?;
+    }
     target
         .require_current(host)
         .map_err(|error| error.message)?;
@@ -925,6 +943,191 @@ fn close_with_target(
     };
     drop(removed);
     super::super::state::retire_unattached_upgrade_chat(host, source.id);
+    Ok(())
+}
+
+/// Discovery disappears at retirement, before the durable HOST transaction.
+/// Consult only this pane's durable owners; absence never authorizes relaunch.
+fn cleanup_retirement(
+    host: &SharedHost,
+    requested: &Session,
+    proof: &HostSessionProof,
+    discovered: Option<&crate::daemon::holder_registry::Record>,
+) -> Result<Option<VerifiedRetirement>, String> {
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut after = None;
+    let mut matched = None;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            return Ok(matched);
+        }
+        for owner in page {
+            after = Some(owner.actor());
+            if owner.source().id != requested.id
+                || discovered.is_some_and(|record| record != owner.owner())
+            {
+                continue;
+            }
+            match Handle::inspect_retained_retirement(owner.owner(), proof)? {
+                RetirementInspection::Running => {}
+                RetirementInspection::ExitedUnproved => {
+                    return Err(
+                        "The retained cleanup helper exited without verified retirement".into(),
+                    );
+                }
+                RetirementInspection::Verified(verified) => {
+                    let receipt = verified.receipt();
+                    if receipt.identity.instance != owner.actor()
+                        || &receipt.identity.record != owner.owner()
+                        || (&receipt.source != requested
+                            && !receipt.previous_sources.contains(requested))
+                    {
+                        return Err(
+                            "The retired actor does not recognize this exact cleanup descriptor"
+                                .into(),
+                        );
+                    }
+                    if matched.replace(verified).is_some() {
+                        return Err(
+                            "The cleanup descriptor matches more than one retired actor".into()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A verified capsule grants no live attachment, input or account access.
+/// Its paired tuple still needs the terminal holder's independent close proof.
+fn close_verified_unattached(
+    host: &SharedHost,
+    requested: &Session,
+    proof: &HostSessionProof,
+    verified: VerifiedRetirement,
+) -> Result<(), String> {
+    let receipt = verified.receipt();
+    verify_close_ownership(
+        host,
+        &receipt.identity,
+        &receipt.source,
+        &receipt.previous_sources,
+        receipt
+            .launch_account_scope
+            .as_ref()
+            .map_err(String::as_str),
+    )?;
+    match (&receipt.source.terminal, &receipt.paired_holder) {
+        (None, None) => {}
+        (Some(terminal), Some(pair))
+            if terminal.id == pair.terminal && pair.terminal == requested.id =>
+        {
+            let role = crate::daemon::holder_registry::OriginalRole::authenticated(
+                pair,
+                &receipt.proof,
+                proof,
+            )?;
+            if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                pair,
+                proof,
+                role.as_ref(),
+            )? {
+                return Err(
+                    "The retired actor's exact paired terminal has no confirmed close proof".into(),
+                );
+            }
+        }
+        _ => return Err("Retired cleanup lost its exact original paired terminal evidence".into()),
+    }
+    let pair =
+        {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down
+                || state.proof() != proof
+                || state.chats.contains_key(&requested.id)
+                || state.chat_spawning.get(&requested.id) != Some(requested)
+            {
+                return Err("Daemon ownership changed before retired cleanup".into());
+            }
+            match (&receipt.source.terminal, state.terminals.get(&requested.id)) {
+                (Some(terminal), Some(record))
+                    if record.handle.is_completed()
+                        && super::matches_paired_terminal(&record.session, terminal, proof) =>
+                {
+                    Some(record.handle.clone())
+                }
+                (_, None) => None,
+                _ => return Err(
+                    "The paired worker changed before retired cleanup; replacement was preserved"
+                        .into(),
+                ),
+            }
+        };
+    let registry = super::super::agent_execution::registry(host)?;
+    let aliases = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(requested.id)?;
+    for retained in &aliases {
+        let crate::agent_execution::HostedSession::Chat(source) = retained else {
+            return Err("Retained cleanup execution changed to another surface".into());
+        };
+        if source != &receipt.source && !receipt.previous_sources.contains(source) {
+            return Err("Retained cleanup execution is outside the exact issued lineage".into());
+        }
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .preflight_agent_retirement(retained)?;
+    }
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .commit_native_actor_retirement(
+            receipt.identity.instance,
+            &receipt.identity.record,
+            &receipt.source,
+            receipt
+                .launch_account_scope
+                .as_ref()
+                .map_err(String::as_str),
+            receipt.confirmed_session.as_deref(),
+        )?;
+    for retained in &aliases {
+        if let crate::agent_execution::HostedSession::Chat(source) = retained {
+            super::super::agent_execution::retired(host, source)?;
+        }
+    }
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down
+            || state.proof() != proof
+            || state.chats.contains_key(&requested.id)
+            || state.chat_spawning.get(&requested.id) != Some(requested)
+            || match (&pair, state.terminals.get(&requested.id)) {
+                (None, None) => false,
+                (Some(expected), Some(record)) => !record.handle.same_worker(expected),
+                _ => true,
+            }
+        {
+            return Err(
+                "Retired cleanup ownership changed; replacement metadata was preserved".into(),
+            );
+        }
+        if pair.is_some() {
+            state.retire_terminal(requested.id);
+        }
+        state.native_adoption_failures.clear(requested.id);
+        if let Some(notifications) = &state.notifications {
+            notifications.retire(requested.id);
+        }
+        state.inventory_generation += 1;
+    }
+    super::super::state::retire_unattached_upgrade_chat(host, requested.id);
     Ok(())
 }
 
@@ -1039,7 +1242,15 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
             {
                 continue;
             }
-            if ownership.owner().holder.is_current() || ownership.owner().root.is_current() {
+            let retirement = Handle::inspect_retained_retirement(ownership.owner(), &proof)?;
+            if matches!(retirement, RetirementInspection::ExitedUnproved) {
+                // This actor remains unavailable, but its unproved exit does
+                // not make unrelated agents or daemon startup unavailable.
+                // Do not enter the live cleanup branch or commit retirement.
+                tracing::warn!(actor=%ownership.actor(), "Retained helper exited without verified retirement; exact ownership remains retained");
+                continue;
+            }
+            if matches!(retirement, RetirementInspection::Running) {
                 // Ordinary orphan recovery had its opportunity first. A durable
                 // Pending row left without a HOST record is cleanup-only, even
                 // when its Agent was closed or its captured home was replaced.
@@ -1103,11 +1314,13 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                 }
                 continue;
             }
-            // The private, bounded reader authenticates both durable receipts,
-            // exact dead process identities, old attachment and retired discovery.
-            let Some(receipt) = Handle::retired_actor_receipt(ownership.owner(), &proof)? else {
-                continue;
+            // Execution exit and parent wait collection are distinct. Only the
+            // authenticated capsule, never the holder's numeric PID lifetime,
+            // authorizes consuming this exact final publication.
+            let RetirementInspection::Verified(verified) = retirement else {
+                unreachable!("running and unproved retirements were handled above")
             };
+            let receipt = verified.receipt();
             if receipt.identity.instance != ownership.actor()
                 || &receipt.identity.record != ownership.owner()
                 || (&receipt.source != ownership.source()
@@ -1166,16 +1379,19 @@ pub(in crate::host) fn finish_close(
     let Some(identity) = handle.actor_identity() else {
         return Ok(());
     };
-    if !identity.record.holder.is_current() {
-        // A failed terminal spawn may retry after the previous close already
-        // committed every outcome and retired the helper. Only its separate
-        // exact semantic-retirement receipt can authorize this fast path.
-        return publish_retirement(host, handle, requested);
-    }
     let (proof, notifications) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (state.proof().clone(), state.notifications.clone())
     };
+    match Handle::inspect_retained_retirement(&identity.record, &proof)? {
+        RetirementInspection::Verified(verified) => {
+            return publish_verified_retirement(host, handle, requested, verified);
+        }
+        RetirementInspection::ExitedUnproved => {
+            return Err("The closing helper exited without verified semantic retirement".into());
+        }
+        RetirementInspection::Running => {}
+    }
     let registry = super::super::agent_execution::registry(host)?;
     let source = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -1318,7 +1534,6 @@ pub(super) fn publish_retirement(
     handle: &Handle,
     source: &Session,
 ) -> Result<(), String> {
-    handle.finish_retained_close()?;
     let identity = handle
         .actor_identity()
         .ok_or("Final retirement lost its exact retained actor identity")?;
@@ -1327,8 +1542,40 @@ pub(super) fn publish_retirement(
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let receipt = Handle::retired_actor_receipt(&identity.record, &proof)?
-        .ok_or("Exact semantic retirement receipt is unavailable; ownership remains retained")?;
+    let verified = match Handle::inspect_retained_retirement(&identity.record, &proof)? {
+        RetirementInspection::Verified(verified) => verified,
+        RetirementInspection::Running => {
+            handle.finish_retained_close()?;
+            match Handle::inspect_retained_retirement(&identity.record, &proof)? {
+                RetirementInspection::Verified(verified) => verified,
+                RetirementInspection::Running | RetirementInspection::ExitedUnproved => {
+                    return Err(
+                        "Exact semantic retirement remains unproved; ownership remains retained"
+                            .into(),
+                    );
+                }
+            }
+        }
+        RetirementInspection::ExitedUnproved => {
+            return Err(
+                "Exact semantic retirement receipt is unavailable; ownership remains retained"
+                    .into(),
+            );
+        }
+    };
+    publish_verified_retirement(host, handle, source, verified)
+}
+
+fn publish_verified_retirement(
+    host: &SharedHost,
+    handle: &Handle,
+    source: &Session,
+    verified: VerifiedRetirement,
+) -> Result<(), String> {
+    let identity = handle
+        .actor_identity()
+        .ok_or("Final retirement lost its exact retained actor identity")?;
+    let receipt = verified.receipt();
     if receipt.identity != identity
         || (&receipt.source != source && !receipt.previous_sources.contains(source))
         || receipt

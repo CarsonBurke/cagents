@@ -26,7 +26,9 @@ mod child_text_copy;
 mod execution;
 mod handle;
 pub use handle::Handle;
-pub(crate) use retained_actor::transport::ActorIdentity;
+pub(crate) use retained_actor::transport::{
+    ActorIdentity, RetirementInspection, VerifiedRetirement,
+};
 mod retained_actor;
 mod store;
 mod websocket;

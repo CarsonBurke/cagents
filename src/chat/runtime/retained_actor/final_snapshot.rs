@@ -1,8 +1,8 @@
 //! Exact bounded final publication retained until host cleanup is acknowledged.
-use super::MAX_FRAME;
 #[cfg(test)]
 use super::transport::RemoteActor;
 use super::transport::{ActorIdentity, PROTOCOL, RetirementReceipt};
+use super::{MAX_FRAME, execution_exit};
 use crate::{
     chat::{self, Snapshot},
     daemon::holder_registry::{self as registry, Kind, Record},
@@ -15,6 +15,25 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
 };
+/// Observation is not retirement authority. Only the validated capsule grants
+/// a caller access to the authenticated, fully joined retirement descriptor.
+#[derive(Debug)]
+pub(crate) enum RetirementInspection {
+    Running,
+    ExitedUnproved,
+    Verified(VerifiedRetirement),
+}
+#[derive(Debug)]
+pub(crate) struct VerifiedRetirement(RetirementReceipt);
+impl VerifiedRetirement {
+    pub(crate) fn receipt(&self) -> &RetirementReceipt {
+        &self.0
+    }
+    pub(crate) fn into_receipt(self) -> RetirementReceipt {
+        self.0
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Receipt {
     #[serde(
@@ -150,7 +169,7 @@ fn validate_publication(
             .is_none_or(|issued| issued.boot_id != proof.boot_id)
         || (source != &receipt.source && !receipt.previous_sources.contains(source))
         || !receipt.snapshot.exited
-        || identity.record.root.is_current()
+        || !execution_exit::identity_absent(&identity.record.root)?
     {
         return Err("Final retained snapshot belongs to another actor, source, attachment, or still-live provider".into());
     }
@@ -162,7 +181,7 @@ pub(super) fn close_proved(
     proof: &HostSessionProof,
     source: &chat::Session,
 ) -> Result<bool, String> {
-    if identity.record.root.is_current() {
+    if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
     read(identity, proof, source).map(|_| true)
@@ -210,13 +229,53 @@ fn retirement_proved_inner(
     proof: &HostSessionProof,
     expected_identity: Option<&ActorIdentity>,
 ) -> Result<bool, String> {
-    if record.holder.is_current() || record.root.is_current() {
-        return Ok(false);
+    Ok(matches!(
+        inspect_retirement_with_proof(
+            record,
+            proof,
+            expected_identity,
+            AttachmentProof::ExactCurrent
+        )?,
+        RetirementInspection::Verified(_)
+    ))
+}
+
+enum AttachmentProof {
+    ExactCurrent,
+    SavedSameBoot,
+}
+
+pub(super) fn inspect_retirement(
+    record: &Record,
+    current: &HostSessionProof,
+) -> Result<RetirementInspection, String> {
+    inspect_retirement_with_proof(record, current, None, AttachmentProof::SavedSameBoot)
+}
+
+fn inspect_retirement_with_proof(
+    record: &Record,
+    current: &HostSessionProof,
+    expected_identity: Option<&ActorIdentity>,
+    authority: AttachmentProof,
+) -> Result<RetirementInspection, String> {
+    if !current.is_complete() || record.boot != current.boot_id {
+        return Err(
+            "Retained retirement inspection names another boot or incomplete current lease".into(),
+        );
+    }
+    let _exit = match execution_exit::observe(&record.holder)? {
+        execution_exit::Observation::Running => return Ok(RetirementInspection::Running),
+        execution_exit::Observation::Exited(exit) => exit,
+    };
+    if !execution_exit::identity_absent(&record.root)? {
+        return Ok(RetirementInspection::ExitedUnproved);
     }
     let file =
         match crate::secure_file::open_existing_private_file_readonly(&retirement_path(record)?) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RetirementInspection::ExitedUnproved);
+            }
             Err(error) => return Err(error.to_string()),
         };
     let mut bytes = Vec::new();
@@ -226,10 +285,26 @@ fn retirement_proved_inner(
     if bytes.len() > MAX_RETIREMENT {
         return Err("Retained semantic retirement proof is oversized".into());
     }
-    let receipt: Retirement = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    validate_retirement(&receipt, record, proof, expected_identity)?;
-    validate_retired_final(&receipt.receipt)?;
-    Ok(!registry::retirement_pending(record).map_err(|error| error.to_string())?)
+    let saved: Retirement = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if saved.receipt.proof.boot_id != current.boot_id || !saved.receipt.proof.is_complete() {
+        return Err(
+            "Retained semantic retirement belongs to another boot or incomplete attachment".into(),
+        );
+    }
+    // A live attachment requires its exact lease; a cold reader separately
+    // authenticates the current lease and the receipt's historical lease.
+    let proof = match authority {
+        AttachmentProof::ExactCurrent => current,
+        AttachmentProof::SavedSameBoot => &saved.receipt.proof,
+    };
+    validate_retirement(&saved, record, proof, expected_identity)?;
+    validate_retired_final(&saved.receipt)?;
+    if registry::retirement_pending(record).map_err(|error| error.to_string())? {
+        return Ok(RetirementInspection::ExitedUnproved);
+    }
+    Ok(RetirementInspection::Verified(VerifiedRetirement(
+        saved.receipt,
+    )))
 }
 
 fn validate_retirement(
@@ -331,35 +406,12 @@ pub(super) fn retired_actor_receipt(
     record: &Record,
     current: &HostSessionProof,
 ) -> Result<Option<RetirementReceipt>, String> {
-    if record.holder.is_current() || record.root.is_current() {
-        return Ok(None);
+    match inspect_retirement(record, current)? {
+        RetirementInspection::Verified(receipt) => Ok(Some(receipt.into_receipt())),
+        RetirementInspection::Running | RetirementInspection::ExitedUnproved => Ok(None),
     }
-    let file =
-        match crate::secure_file::open_existing_private_file_readonly(&retirement_path(record)?) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
-    let mut bytes = Vec::new();
-    file.take((MAX_RETIREMENT + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_RETIREMENT {
-        return Err("Retained semantic retirement proof is oversized".into());
-    }
-    let saved: Retirement = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if saved.receipt.proof.boot_id != current.boot_id || !saved.receipt.proof.is_complete() {
-        return Err(
-            "Retained semantic retirement belongs to another boot or incomplete attachment".into(),
-        );
-    }
-    validate_retirement(&saved, record, &saved.receipt.proof, None)?;
-    validate_retired_final(&saved.receipt)?;
-    if registry::retirement_pending(record).map_err(|error| error.to_string())? {
-        return Ok(None);
-    }
-    Ok(Some(saved.receipt))
 }
+
 pub(crate) fn remove(record: &Record) -> Result<(), String> {
     let path = path(record)?;
     match std::fs::remove_file(retirement_path(record)?) {
@@ -379,6 +431,27 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reaped_process() -> registry::Process {
+        struct Owner(std::process::Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owner(
+            std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let identity = registry::Process::read(child.0.id() as i32).unwrap();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        identity
+    }
+
     #[test]
     fn final_close_proof_requires_exact_source_attachment_and_dead_provider() {
         let actor = RemoteActor::fixture();
@@ -402,7 +475,7 @@ mod tests {
             },
         };
         assert!(validate_publication(&live, &identity, &proof, &source).is_err());
-        identity.record.root.pid = -1;
+        identity.record.root = reaped_process();
         let mut receipt = Receipt {
             installed: true,
             identity: identity.clone(),
@@ -452,8 +525,8 @@ mod tests {
         };
         let actor = RemoteActor::fixture();
         let mut identity = actor.identity();
-        identity.record.root.pid = -1;
-        identity.record.holder.pid = -2;
+        identity.record.root = reaped_process();
+        identity.record.holder = reaped_process();
         let proof = actor.proof();
         let mut source = super::super::transport::fixture_source();
         source.id = identity.record.terminal;
@@ -601,6 +674,221 @@ mod tests {
         let mut expected = identity.clone();
         expected.instance = uuid::Uuid::new_v4();
         assert!(validate_retirement(&make(), &identity.record, &proof, Some(&expected)).is_err());
+    }
+
+    #[test]
+    fn external_unreaped_helper_requires_joined_retirement_without_consuming_parent_custody() {
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Child, Command, Stdio},
+            time::{Duration, Instant},
+        };
+        const EXACT: &str = "chat::runtime::retained_actor::final_snapshot::tests::external_unreaped_helper_requires_joined_retirement_without_consuming_parent_custody";
+        const ROOT: &str = "CAGENTS_EXECUTION_EXIT_READER_FIXTURE";
+        if std::env::var_os(ROOT).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXACT, "--nocapture"])
+                .env_clear()
+                .env(ROOT, directory.path())
+                .env("HOME", directory.path())
+                .env("XDG_RUNTIME_DIR", directory.path())
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated retirement reader failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let gate = root.join("exit-helper");
+        struct Parent {
+            child: Child,
+            gate: PathBuf,
+        }
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.gate, b"exit");
+                drop(self.child.stdin.take());
+                let _ = self.child.wait();
+            }
+        }
+        // The simulated helper is an unreaped grandchild: this reader cannot
+        // wait for it. Its actual parent keeps custody until stdin closes.
+        let script = r#"import os,sys,time
+pid=os.fork()
+if pid==0:
+ for _ in range(2000):
+  if os.path.exists(sys.argv[1]): break
+  time.sleep(.005)
+ os._exit(73)
+print(pid,flush=True)
+sys.stdin.readline()
+os.waitpid(pid,0)
+"#;
+        let mut parent = Parent {
+            child: Command::new("/usr/bin/python3")
+                .args(["-c", script])
+                .arg(&gate)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            gate: gate.clone(),
+        };
+        let mut line = String::new();
+        BufReader::new(parent.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let helper = registry::Process::read(line.trim().parse().unwrap()).unwrap();
+        let actor = RemoteActor::fixture();
+        let mut identity = actor.identity();
+        identity.record.holder = helper.clone();
+        identity.record.root = reaped_process();
+        let proof = actor.proof();
+        let mut source = super::super::transport::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        source.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
+        std::fs::create_dir_all(registry::directory(Kind::Native).unwrap()).unwrap();
+        let snapshot = Snapshot {
+            exited: true,
+            session_id: source.launch.session_id.clone(),
+            ..Default::default()
+        };
+        save(
+            true,
+            &identity,
+            &proof,
+            &source,
+            &[],
+            None,
+            Err("fixture unknown account"),
+            source.launch.session_id.as_deref(),
+            &snapshot,
+        )
+        .unwrap();
+        let receipt = RetirementReceipt {
+            installed: true,
+            identity: identity.clone(),
+            proof: proof.clone(),
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            launch_account_scope: Err("fixture unknown account".into()),
+            confirmed_session: source.launch.session_id.clone(),
+            paired_holder: None,
+        };
+        publish_retirement(receipt.clone()).unwrap();
+        assert!(matches!(
+            inspect_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::Running
+        ));
+        std::fs::write(&gate, b"exit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(
+            execution_exit::observe(&helper).unwrap(),
+            execution_exit::Observation::Running
+        ) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            helper.is_current(),
+            "the external parent must still own its unreaped child's status"
+        );
+        assert!(matches!(
+            inspect_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::Verified(_)
+        ));
+        assert!(retirement_proved(&identity, &proof).unwrap());
+        assert!(
+            retired_actor_receipt(&identity.record, &proof)
+                .unwrap()
+                .is_some()
+        );
+        let mut successor = proof.clone();
+        successor.host_incarnation = crate::model::HostIncarnation::new("successor");
+        assert!(
+            retirement_proved_for_record(&identity.record, &successor).is_err(),
+            "strict attachment reader must not adopt historical proof"
+        );
+        assert!(
+            matches!(
+                inspect_retirement(&identity.record, &successor).unwrap(),
+                RetirementInspection::Verified(_)
+            ),
+            "cold current-lease reader may validate same-boot historical proof"
+        );
+        let mut other_boot = proof.clone();
+        other_boot.boot_id = crate::model::BootId::new("another-boot");
+        assert!(inspect_retirement(&identity.record, &other_boot).is_err());
+        let mut foreign_boot_record = identity.record.clone();
+        foreign_boot_record.boot = other_boot.boot_id.clone();
+        assert!(inspect_retirement(&foreign_boot_record, &proof).is_err());
+        let mut foreign = identity.clone();
+        foreign.instance = uuid::Uuid::new_v4();
+        assert!(retirement_proved(&foreign, &proof).is_err());
+        identity
+            .record
+            .create(&registry::directory(Kind::Native).unwrap())
+            .unwrap();
+        assert!(matches!(
+            inspect_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::ExitedUnproved
+        ));
+        identity
+            .record
+            .remove_record(&registry::directory(Kind::Native).unwrap())
+            .unwrap();
+        let mut unacked = Retirement {
+            protocol: PROTOCOL,
+            semantic_acknowledged: false,
+            receipt: receipt.clone(),
+        };
+        save_at(
+            &retirement_path(&identity.record).unwrap(),
+            &serde_json::to_vec(&unacked).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect_retirement(&identity.record, &proof).is_err());
+        unacked.semantic_acknowledged = true;
+        unacked.receipt.identity.record.holder.start += 1;
+        save_at(
+            &retirement_path(&identity.record).unwrap(),
+            &serde_json::to_vec(&unacked).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect_retirement(&identity.record, &proof).is_err());
+        publish_retirement(receipt).unwrap();
+        let mut invalid_provider = identity.record.clone();
+        invalid_provider.root.pid = -1;
+        assert!(inspect_retirement(&invalid_provider, &proof).is_err());
+        invalid_provider.root = identity.record.root.clone();
+        invalid_provider.root.start = 0;
+        assert!(inspect_retirement(&invalid_provider, &proof).is_err());
+        let mut live_provider = identity.record.clone();
+        live_provider.root = registry::Process::read(std::process::id() as i32).unwrap();
+        assert!(matches!(
+            inspect_retirement(&live_provider, &proof).unwrap(),
+            RetirementInspection::ExitedUnproved
+        ));
+        std::fs::remove_file(retirement_path(&identity.record).unwrap()).unwrap();
+        assert!(matches!(
+            inspect_retirement(&identity.record, &proof).unwrap(),
+            RetirementInspection::ExitedUnproved
+        ));
+        assert!(
+            helper.is_current(),
+            "no receipt reader may reap another parent's child"
+        );
+        drop(parent);
+        assert!(!helper.is_current());
     }
 
     #[test]

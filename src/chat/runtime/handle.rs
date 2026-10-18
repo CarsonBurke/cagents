@@ -126,6 +126,12 @@ impl Handle {
             Owner::Local(_) => Ok(false),
         }
     }
+    pub(crate) fn inspect_retained_retirement(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<super::RetirementInspection, String> {
+        RemoteActor::inspect_retained_retirement(record, proof)
+    }
     pub(crate) fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,

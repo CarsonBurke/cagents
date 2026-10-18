@@ -27,6 +27,8 @@ fn same_scope(left: &LaunchAccountScope, right: &LaunchAccountScope) -> bool {
         && left.inode == right.inode
 }
 
+// Evidence is projected only from a VerifiedRetirement on the production path.
+// A holder awaiting its parent's wait is not executing provider work.
 fn validate_evidence(
     source: &Session,
     ownership: &NativeActorOwnership,
@@ -49,7 +51,6 @@ fn validate_evidence(
         || retirement.confirmed_session() != evidence.confirmed
         || evidence.confirmed != source.launch.session_id.as_deref()
         || evidence.confirmed.is_none()
-        || evidence.owner.holder.is_current()
         || evidence.owner.root.is_current()
     {
         return Err(
@@ -98,9 +99,87 @@ fn current_admission(
     Ok(())
 }
 
+/// Classify this exact durable pane before generic discovery can mistake an
+/// exited, unreaped helper for a live owner. Carry the single verified read
+/// through the later account/registry checks rather than reopening its files.
+pub(super) fn inspect_resume_retirement(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<crate::chat::runtime::VerifiedRetirement>, String> {
+    if !matches!(
+        source.native_continuity,
+        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) {
+        return Ok(None);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    // Cross-boot resume has its own public path: no old runtime receipt can
+    // authenticate current-boot execution, and this classifier must not veto it.
+    if source
+        .proof
+        .as_ref()
+        .is_some_and(|saved| saved.boot_id != proof.boot_id)
+    {
+        return Ok(None);
+    }
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut after = None;
+    let mut verified = None;
+    let mut running = false;
+    loop {
+        let page = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownerships(after, 128)?;
+        if page.is_empty() {
+            // The census is keyed by actor, not pane. A historical retired
+            // actor cannot hide a current owner of the same pane allocation.
+            // Scan every row first so Running never swallows an unproved exit,
+            // receipt error, pending owner or ambiguous verified history.
+            return Ok(if running { None } else { verified });
+        }
+        for ownership in page {
+            after = Some(ownership.actor());
+            if ownership.source().id != source.id {
+                continue;
+            }
+            if ownership.is_pending() {
+                return Err("Pending cleanup intent never grants disk resume authority".into());
+            }
+            match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
+                crate::chat::runtime::RetirementInspection::Running => running = true,
+                crate::chat::runtime::RetirementInspection::ExitedUnproved => {
+                    return Err("The saved Claude actor exited without verified retirement".into());
+                }
+                crate::chat::runtime::RetirementInspection::Verified(receipt) => {
+                    if receipt.receipt().identity.instance != ownership.actor()
+                        || verified.replace(receipt).is_some()
+                    {
+                        return Err(
+                            "The saved Claude pane has ambiguous retired actor ownership".into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Called only for explicit resume, before the separate Codex close reader.
 /// Returning true grants no provider start, account override or input replay.
 pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool, String> {
+    prepare_resume_verified(host, source, None)
+}
+
+pub(super) fn prepare_resume_verified(
+    host: &SharedHost,
+    source: &Session,
+    mut verified: Option<crate::chat::runtime::VerifiedRetirement>,
+) -> Result<bool, String> {
     if source.launch.provider != Provider::Claude {
         return Ok(false);
     }
@@ -176,8 +255,28 @@ pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool
             }
             let retirement =
                 retirement.ok_or("The saved Claude actor has no committed retirement")?;
-            let receipt = Handle::retired_actor_receipt(ownership.owner(), &proof)?
-                .ok_or("The saved Claude actor has no authenticated final retirement proof")?;
+            let inspection = if verified
+                .as_ref()
+                .is_some_and(|receipt| receipt.receipt().identity.instance == ownership.actor())
+            {
+                crate::chat::runtime::RetirementInspection::Verified(verified.take().unwrap())
+            } else {
+                Handle::inspect_retained_retirement(ownership.owner(), &proof)?
+            };
+            let verified = match inspection {
+                crate::chat::runtime::RetirementInspection::Verified(verified) => verified,
+                crate::chat::runtime::RetirementInspection::Running => {
+                    return Err(
+                        "The saved Claude actor still executes; no replacement was prepared".into(),
+                    );
+                }
+                crate::chat::runtime::RetirementInspection::ExitedUnproved => {
+                    return Err(
+                        "The saved Claude actor has no authenticated final retirement proof".into(),
+                    );
+                }
+            };
+            let receipt = verified.receipt();
             let evidence = Evidence {
                 actor: receipt.identity.instance,
                 owner: &receipt.identity.record,

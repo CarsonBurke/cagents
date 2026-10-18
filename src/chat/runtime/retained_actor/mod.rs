@@ -6,6 +6,7 @@
 const MAX_FRAME: usize = 34 * 1024 * 1024;
 
 mod deadline_io;
+mod execution_exit;
 mod final_snapshot;
 pub(super) mod journal;
 pub(super) mod transport;

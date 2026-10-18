@@ -1,5 +1,6 @@
 //! Authenticated retained Claude helper and bounded attachment transport.
 use super::super::{LocalHandle, Rejection, Update};
+pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState};
 use super::{MAX_FRAME, deadline_io, final_snapshot, journal};
@@ -423,6 +424,14 @@ impl RemoteActor {
     /// Authenticate the new daemon separately from the saved attachment which
     /// committed retirement. The caller must compare the returned tuple with
     /// its durable roster before recording retirement.
+    pub fn inspect_retained_retirement(
+        record: &Record,
+        proof: &HostSessionProof,
+    ) -> Result<RetirementInspection, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        final_snapshot::inspect_retirement(record, proof)
+    }
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,
