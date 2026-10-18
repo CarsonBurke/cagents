@@ -295,7 +295,7 @@ pub(super) fn fixture_source() -> chat::Session {
 }
 impl RemoteActor {
     #[cfg(test)]
-    pub(super) fn fixture() -> Self {
+    pub(in crate::chat::runtime) fn fixture() -> Self {
         use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalId};
         let process = Process::read(std::process::id() as i32).unwrap();
         let boot = BootId::new("fixture-boot");
