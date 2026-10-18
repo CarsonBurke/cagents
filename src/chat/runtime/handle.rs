@@ -15,6 +15,14 @@ enum Owner {
     Remote(RemoteActor),
 }
 impl Handle {
+    /// Same retained actor identity, distinct proxy attachment allocations.
+    /// Neither fixture has a live helper or permits real provider operations.
+    #[cfg(test)]
+    pub(crate) fn fixture_remote_attachment_pair() -> (Self, Self) {
+        let first = RemoteActor::fixture();
+        let second = first.distinct_attachment_fixture();
+        (Self(Owner::Remote(first)), Self(Owner::Remote(second)))
+    }
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,

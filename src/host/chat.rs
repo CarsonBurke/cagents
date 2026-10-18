@@ -2883,139 +2883,209 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
-            let (handle, source, closing) = {
-                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if state.chat_handoffs.contains_key(&chat_id) {
-                    return Err(error(
-                        "This chat already returned to terminal; complete the retained handoff before closing its card",
-                    ));
-                }
-                let record = attached(&state, client, chat_id)?;
-                let (handle, source) = (record.handle.clone(), record.session.clone());
-                let closing = capacity::Reservation::closing(host, &mut state, &source)?;
-                (handle, source, closing)
-            };
-            super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-            handle.close_for_resume().map_err(unavailable)?;
-            let snapshot = handle.snapshot(None).ok_or_else(|| {
-                unavailable(
-                    "Exact native final snapshot is unavailable; retirement remains unconfirmed",
-                )
-            })?;
-            let (retained, pending_cleanup) = {
+            let target = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let retained = state
-                    .chats
-                    .get(&chat_id)
-                    .filter(|record| record.handle.same_actor(&handle))
-                    .map(|record| record.session.clone())
-                    .ok_or_else(|| {
-                        unavailable("The thread changed while its previous actor was closing.")
-                    })?;
-                (retained, state.native_closing.contains_key(&chat_id))
+                CloseTarget::capture(&state, attached(&state, client, chat_id)?)?
             };
-            if handle.actor_identity().is_some() {
-                retained_actor::finish_close(host, &handle, &retained).map_err(unavailable)?;
-            }
-            let closed_receipt = if matches!(
-                retained.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            ) {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                chat::native_holder::closed_source(&retained, state.proof())
-                    .map_err(unavailable)?
-                    .is_some()
-            } else {
-                false
-            };
-            if pending_cleanup || closed_receipt || has_native_owner(&retained)? {
-                // Closing an exited attachment proves only that local actor is
-                // gone. A server preserved by an earlier failed adoption must
-                // also acknowledge exact cleanup before this close can succeed.
-                native_cleanup::close_retained_with_reservation(host, &retained, &closing)
-                    .map_err(unavailable)?;
-                return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
-            }
-            let terminal = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let record = state
-                    .chats
-                    .get(&chat_id)
-                    .filter(|record| record.handle.same_actor(&handle));
-                let paired = record
-                    .and_then(|record| record.session.terminal.as_ref())
-                    .filter(|terminal| terminal.id == chat_id);
-                match paired.and_then(|source| {
-                    state
-                        .terminals
-                        .get(&source.id)
-                        .map(|record| (source, record))
-                }) {
-                    Some((source, record))
-                        if matches_paired_terminal(&record.session, source, state.proof())
-                            && state.chats[&chat_id]
-                                .paired_terminal
-                                .as_ref()
-                                .is_some_and(|expected| record.handle.same_worker(expected)) =>
-                    {
-                        Some((record.session.clone(), record.handle.clone()))
-                    }
-                    Some(_) => {
-                        return Err(unavailable(
-                            "The paired terminal descriptor changed; its replacement was not stopped.",
-                        ));
-                    }
-                    None => None,
-                }
-            };
-            // A console is part of the owned execution. Retain both records
-            // until its shutdown is proved, so a failed close remains retryable.
-            if let Some((_, terminal)) = &terminal {
-                terminal
-                    .shutdown()
-                    .map_err(|error| unavailable(error.to_string()))?;
-            }
-            let record = {
-                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if !closing.holds(&state, chat_id)
-                    || !state
-                        .chats
-                        .get(&chat_id)
-                        .is_some_and(|record| record.handle.same_actor(&handle))
-                {
-                    return Err(unavailable(
-                        "The thread changed while its previous actor was closing.",
-                    ));
-                }
-                if let Some((source, handle)) = &terminal
-                    && state.terminals.get(&source.id).is_none_or(|record| {
-                        !matches_paired_terminal(&record.session, source, state.proof())
-                            || !record.handle.same_worker(handle)
-                    })
-                {
-                    return Err(unavailable(
-                        "The paired terminal changed while its previous worker was closing.",
-                    ));
-                }
-                state.inventory_generation += 1;
-                let record = state.chats.remove(&chat_id);
-                if let Some(notifications) = &state.notifications {
-                    notifications.retire(chat_id);
-                }
-                if let Some((source, _)) = terminal {
-                    state.retire_terminal(source.id);
-                }
-                record
-            };
-            if let Some(record) = &record {
-                super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
-            }
-            drop(record);
-            super::state::retire_recovered_upgrade_chat(host, chat_id);
-            Ok(ServerResponse::ChatClosed { chat_id, snapshot })
+            close_captured(host, target)
         }
         _ => Err(error("Not a native chat request")),
     }
+}
+
+/// A close capability captures one hosted attachment, not just its reusable ID.
+/// Execution callers authenticate their model origin before obtaining it; UI
+/// callers must pass the ordinary subscriber admission above.
+pub(super) struct CloseTarget {
+    source: Session,
+    handle: Handle,
+    instance: uuid::Uuid,
+}
+
+impl CloseTarget {
+    fn capture(state: &HostState, record: &Record) -> Result<Self, ProtocolError> {
+        if state.shutting_down || state.chat_handoffs.contains_key(&record.session.id) {
+            return Err(unavailable(
+                "Native ownership is shutting down or returning to terminal",
+            ));
+        }
+        if record.handle.is_close_only() {
+            return Err(unavailable(
+                "This exact retained actor is reserved for cleanup",
+            ));
+        }
+        Ok(Self::from_record(record))
+    }
+
+    fn from_record(record: &Record) -> Self {
+        Self {
+            source: record.session.clone(),
+            handle: record.handle.clone(),
+            instance: record.execution_instance,
+        }
+    }
+
+    pub(super) fn for_execution(
+        state: &HostState,
+        record: &Record,
+        expected: &Session,
+    ) -> Result<Self, ProtocolError> {
+        if !crate::agent_execution::same_chat_process(&record.session, expected) {
+            return Err(unavailable(
+                "The agent ownership changed before close; its successor was not stopped",
+            ));
+        }
+        Self::capture(state, record)
+    }
+
+    fn matches(&self, record: &Record) -> bool {
+        record.session == self.source
+            && record.execution_instance == self.instance
+            && record.handle.same_attachment(&self.handle)
+    }
+
+    fn require_current(&self, host: &SharedHost) -> Result<(), ProtocolError> {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down
+            || state.chat_handoffs.contains_key(&self.source.id)
+            || !state
+                .chats
+                .get(&self.source.id)
+                .is_some_and(|record| self.matches(record))
+        {
+            return Err(unavailable(
+                "The thread changed while its previous actor was closing.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn close_captured(
+    host: &SharedHost,
+    target: CloseTarget,
+) -> Result<ServerResponse, ProtocolError> {
+    let chat_id = target.source.id;
+    let handle = target.handle.clone();
+    let source = target.source.clone();
+    super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    target.require_current(host)?;
+    handle.close_for_resume().map_err(unavailable)?;
+    let snapshot = handle.snapshot(None).ok_or_else(|| {
+        unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
+    })?;
+    target.require_current(host)?;
+    let (retained, pending_cleanup) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let retained = state
+            .chats
+            .get(&chat_id)
+            .filter(|record| target.matches(record))
+            .map(|record| record.session.clone())
+            .ok_or_else(|| {
+                unavailable("The thread changed while its previous actor was closing.")
+            })?;
+        (retained, state.native_closing.contains_key(&chat_id))
+    };
+    if handle.actor_identity().is_some() {
+        retained_actor::finish_close(host, &handle, &retained).map_err(unavailable)?;
+        target.require_current(host)?;
+    }
+    let closed_receipt = if matches!(
+        retained.native_continuity,
+        chat::NativeContinuity::Durable { .. }
+    ) {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        chat::native_holder::closed_source(&retained, state.proof())
+            .map_err(unavailable)?
+            .is_some()
+    } else {
+        false
+    };
+    if pending_cleanup || closed_receipt || has_native_owner(&retained)? {
+        // Closing an exited attachment proves only that local actor is
+        // gone. A server preserved by an earlier failed adoption must
+        // also acknowledge exact cleanup before this close can succeed.
+        target.require_current(host)?;
+        native_cleanup::close_captured(host, &retained, &target).map_err(unavailable)?;
+        return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
+    }
+    let terminal = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&chat_id)
+            .filter(|record| target.matches(record));
+        let paired = record
+            .and_then(|record| record.session.terminal.as_ref())
+            .filter(|terminal| terminal.id == chat_id);
+        match paired.and_then(|source| {
+            state
+                .terminals
+                .get(&source.id)
+                .map(|record| (source, record))
+        }) {
+            Some((source, record))
+                if matches_paired_terminal(&record.session, source, state.proof())
+                    && state.chats[&chat_id]
+                        .paired_terminal
+                        .as_ref()
+                        .is_some_and(|expected| record.handle.same_worker(expected)) =>
+            {
+                Some((record.session.clone(), record.handle.clone()))
+            }
+            Some(_) => {
+                return Err(unavailable(
+                    "The paired terminal descriptor changed; its replacement was not stopped.",
+                ));
+            }
+            None => None,
+        }
+    };
+    // A console is part of the owned execution. Retain both records
+    // until its shutdown is proved, so a failed close remains retryable.
+    target.require_current(host)?;
+    if let Some((_, terminal)) = &terminal {
+        terminal
+            .shutdown()
+            .map_err(|error| unavailable(error.to_string()))?;
+    }
+    let record = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state
+            .chats
+            .get(&chat_id)
+            .is_some_and(|record| target.matches(record))
+        {
+            return Err(unavailable(
+                "The thread changed while its previous actor was closing.",
+            ));
+        }
+        if let Some((source, handle)) = &terminal
+            && state.terminals.get(&source.id).is_none_or(|record| {
+                !matches_paired_terminal(&record.session, source, state.proof())
+                    || !record.handle.same_worker(handle)
+            })
+        {
+            return Err(unavailable(
+                "The paired terminal changed while its previous worker was closing.",
+            ));
+        }
+        state.inventory_generation += 1;
+        let record = state.chats.remove(&chat_id);
+        if let Some(notifications) = &state.notifications {
+            notifications.retire(chat_id);
+        }
+        if let Some((source, _)) = terminal {
+            state.retire_terminal(source.id);
+        }
+        record
+    };
+    if let Some(record) = &record {
+        super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
+    }
+    drop(record);
+    Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
 
 pub(super) fn resolve_upgrade(

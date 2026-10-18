@@ -24,7 +24,7 @@ struct RetainedPair {
 /// authority. Exact ownership and the current daemon lease authorize either
 /// route; disappearance never proves a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
-    close_retained_inner(host, source, None)
+    close_retained_inner(host, source, None, None)
 }
 
 pub(super) fn close_retained_with_reservation(
@@ -32,14 +32,26 @@ pub(super) fn close_retained_with_reservation(
     source: &Session,
     closing: &capacity::Reservation,
 ) -> Result<(), String> {
-    close_retained_inner(host, source, Some(closing))
+    close_retained_inner(host, source, Some(closing), None)
+}
+
+pub(super) fn close_captured(
+    host: &SharedHost,
+    source: &Session,
+    target: &super::CloseTarget,
+) -> Result<(), String> {
+    close_retained_inner(host, source, None, Some(target))
 }
 
 fn close_retained_inner(
     host: &SharedHost,
     source: &Session,
     closing: Option<&capacity::Reservation>,
+    expected: Option<&super::CloseTarget>,
 ) -> Result<(), String> {
+    if let Some(expected) = expected {
+        expected.require_current(host).map_err(|error| error.message)?;
+    }
     super::super::agent_execution::preflight_retirement(host, source)?;
     if source.launch.provider == Provider::Claude {
         if matches!(source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { protocol } if protocol != 2)
@@ -72,7 +84,11 @@ fn close_retained_inner(
                     })
             })
         {
-            return super::retained_actor::close_unattached(host, source, owner);
+            return if let Some(expected) = expected {
+                super::retained_actor::close_captured(host, source, expected)
+            } else {
+                super::retained_actor::close_unattached(host, source, owner)
+            };
         }
     }
     let (proof, pending, actor) = {
@@ -86,6 +102,14 @@ fn close_retained_inner(
             || state.chat_handoffs.contains_key(&source.id)
         {
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
+        }
+        if expected.is_some_and(|expected| {
+            !state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| expected.matches(record))
+        }) {
+            return Err("The exact hosted attachment changed before native cleanup".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
             if record.handle.owns_work() {
@@ -218,6 +242,11 @@ fn close_retained_inner(
                 );
             }
         }
+        if let Some(expected) = expected {
+            expected
+                .require_current(host)
+                .map_err(|error| error.message)?;
+        }
         if !pending.closed {
             pending.owner.close_retaining_receipt()?;
             pending.closed = true;
@@ -225,6 +254,11 @@ fn close_retained_inner(
                 .unwrap_or_else(|p| p.into_inner())
                 .native_closing
                 .insert(source.id, pending.clone());
+        }
+        if let Some(expected) = expected {
+            expected
+                .require_current(host)
+                .map_err(|error| error.message)?;
         }
         if let Some(pair) = &pending.paired {
             if let Some(handle) = &pair.handle {
@@ -273,6 +307,14 @@ fn close_retained_inner(
         state.inventory_generation += 1;
     }
     if result.is_ok() {
+        if expected.is_some_and(|expected| {
+            !state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| expected.matches(record))
+        }) {
+            return Err("The exact hosted attachment changed during native cleanup; replacement was preserved".into());
+        }
         if let Some(actor) = actor {
             if state
                 .chats

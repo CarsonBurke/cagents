@@ -665,6 +665,24 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
+    close_with_target(host, requested, discovered, None)
+}
+
+/// A hosted close must retain its exact admission capability across cleanup.
+pub(super) fn close_captured(
+    host: &SharedHost,
+    requested: &Session,
+    target: &super::CloseTarget,
+) -> Result<(), String> {
+    close_with_target(host, requested, None, Some(target))
+}
+
+fn close_with_target(
+    host: &SharedHost,
+    requested: &Session,
+    discovered: Option<crate::daemon::holder_registry::Record>,
+    expected: Option<&super::CloseTarget>,
+) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
         source: Session,
@@ -686,6 +704,14 @@ pub(super) fn close_unattached(
             || state.native_closing.contains_key(&requested.id)
         {
             return Err("Native ownership changed or another exact transition is pending".into());
+        }
+        if let Some(expected) = expected
+            && !state
+                .chats
+                .get(&requested.id)
+                .is_some_and(|record| expected.matches(record))
+        {
+            return Err("The exact hosted attachment changed before retained cleanup".into());
         }
         state.chat_spawning.insert(requested.id, requested.clone());
         state.inventory_generation += 1;
@@ -710,12 +736,17 @@ pub(super) fn close_unattached(
         }
         restore_actor(host, 0, requested, &proof, owner.clone(), false)?;
     }
-    let (handle, source, paired) = {
+    let (handle, source, paired, target) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get(&requested.id)
             .ok_or("The retained actor changed during cleanup admission")?;
+        if expected.is_some_and(|expected| !expected.matches(record)) {
+            return Err(
+                "The exact hosted attachment changed during retained cleanup admission".into(),
+            );
+        }
         let identity = record
             .handle
             .actor_identity()
@@ -769,7 +800,12 @@ pub(super) fn close_unattached(
             }
             _ => return Err("Retained Claude pairing lacks its exact worker evidence".into()),
         };
-        (record.handle.clone(), record.session.clone(), paired)
+        (
+            record.handle.clone(),
+            record.session.clone(),
+            paired,
+            super::CloseTarget::from_record(record),
+        )
     };
     super::super::agent_execution::preflight_retirement(host, &source)?;
     // Authenticate all managed execution aliases before a destructive effect.
@@ -825,11 +861,36 @@ pub(super) fn close_unattached(
             .unwrap_or_else(|p| p.into_inner())
             .preflight_agent_retirement(retained)?;
     }
+    target
+        .require_current(host)
+        .map_err(|error| error.message)?;
     handle.close()?;
+    target
+        .require_current(host)
+        .map_err(|error| error.message)?;
     if let Some((terminal, worker)) = &paired {
+        let current = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.terminals.get(&terminal.id).is_some_and(|current| {
+                current.handle.same_worker(worker)
+                    && super::matches_paired_terminal(&current.session, terminal, state.proof())
+            })
+        };
+        if !current {
+            return Err(
+                "The paired worker changed before retained cleanup; replacement was preserved"
+                    .into(),
+            );
+        }
         worker.close_with_receipt(terminal, &proof)?;
     }
+    target
+        .require_current(host)
+        .map_err(|error| error.message)?;
     finish_close(host, &handle, &source)?;
+    target
+        .require_current(host)
+        .map_err(|error| error.message)?;
     // Keep the closed record retryable until durable process retirement succeeds.
     super::super::agent_execution::retired(host, &source)?;
     let removed = {
@@ -838,7 +899,7 @@ pub(super) fn close_unattached(
             || !state
                 .chats
                 .get(&source.id)
-                .is_some_and(|record| record.handle.same_actor(&handle))
+                .is_some_and(|record| target.matches(record))
             || paired.as_ref().is_some_and(|(terminal, worker)| {
                 state
                     .terminals

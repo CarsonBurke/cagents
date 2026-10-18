@@ -731,22 +731,14 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                     state
                         .chats
                         .get(&session.id)
-                        .map(|record| record.session.clone())
+                        .map(|record| {
+                            super::chat::CloseTarget::for_execution(&state, record, session)
+                        })
+                        .transpose()
+                        .map_err(|error| error.message)?
                 };
-                if let Some(current) = hosted {
-                    if current.proof != session.proof
-                        || current.launch.recipe != session.launch.recipe
-                    {
-                        return Err("The agent ownership changed before close; its successor was not stopped".into());
-                    }
-                    super::chat::process(
-                        host,
-                        EXECUTION_CLIENT,
-                        ClientRequest::ChatClose {
-                            chat_id: session.id,
-                        },
-                    )
-                    .map_err(|error| error.message)?;
+                if let Some(target) = hosted {
+                    super::chat::close_captured(host, target).map_err(|error| error.message)?;
                 } else {
                     let startup = host
                         .lock()
