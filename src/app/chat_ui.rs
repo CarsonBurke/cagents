@@ -19792,20 +19792,24 @@ mod tests {
     /// rather than assuming that a no-op task has no stream representation.
     fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
         use iced::futures::StreamExt;
-        let effects = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    match iced::runtime::task::into_stream(task) {
-                        Some(stream) => stream.collect::<Vec<_>>().await,
-                        None => Vec::new(),
-                    }
-                })
-                .await
-                .expect("a rejected copy must settle without asynchronous work")
-            });
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                match iced::runtime::task::into_stream(task) {
+                    Some(stream) => stream.collect::<Vec<_>>().await,
+                    None => Vec::new(),
+                }
+            })
+            .await
+        });
+        // A regression may have started blocking copy work. Bound teardown
+        // before asserting: timeout does not cancel an already running worker.
+        // The owning process supervisor retains its separate hard deadline.
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        let effects = result.expect("a rejected copy must settle without asynchronous work");
         assert!(effects.is_empty(), "{reason}");
     }
 
