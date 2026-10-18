@@ -7005,7 +7005,8 @@ mod tests {
                 .chat_drafts
                 .insert(original, "Canonical draft untouched".into());
             workspace.agent_updates.insert(original, None);
-            SaveLane::default().save(&store, &workspace).unwrap();
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
             let mut canonical = source.clone();
             if stage != "source" {
                 canonical.proof.as_mut().unwrap().host_incarnation = "new".into();
@@ -7016,15 +7017,19 @@ mod tests {
             if stage == "replaced" {
                 let expected = canonical.id;
                 canonical.id = TerminalId::new();
-                canonical.launch.session_id = Some("replacement-thread".into());
-                canonical
-                    .launch
-                    .recipe
-                    .arguments
-                    .push("--different-recipe".into());
+                // An explicit replacement first installs an unstarted
+                // conversation; its first confirmed snapshot names the thread.
+                let proof = canonical.proof.take();
+                canonical.launch.session_id = None;
+                canonical.launch.recipe.arguments = vec!["--verbose".into()];
                 store
                     .replace_chat_identity(original, expected, &canonical)
                     .unwrap();
+                canonical.launch.session_id = Some("replacement-thread".into());
+                canonical.proof = proof;
+                let mut started = workspace.clone();
+                started.cards[0].kind = CardKind::Chat(canonical.clone());
+                lane.save(&store, &started).unwrap();
             }
             let before = store.load_card(original, None).unwrap().unwrap();
             let mut card = workspace.cards[0].clone();
