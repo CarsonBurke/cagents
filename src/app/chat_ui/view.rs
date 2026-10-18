@@ -3270,6 +3270,7 @@ impl Runtime {
         card: impl Fn(&'s chat::Item, &'s CachedItem, &'s Coordinated) -> Element<'a, Message>,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
+        let _stage = chat_stage::scope(Stage::TurnBuild);
         let items = &self.snapshot.items;
         let placed = |index: usize| {
             let item = items.get(index)?;
