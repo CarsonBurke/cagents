@@ -5287,6 +5287,62 @@ mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
 
+    // Kept byte-identical to the separately pinned native Find fixture by its
+    // offline preflight. This is tracked test data, never an external include.
+    const NATIVE_FIND_FIXTURE_SETTINGS: &str =
+        "schema_version = 3\neditor_auto_save = false\nlanguage_servers = []\n";
+
+    #[test]
+    fn native_find_fixture_settings_load_and_disable_runtime_autosave() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(settings::SETTINGS_SCHEMA_VERSION, 3);
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let write = |document: &str| {
+            std::fs::write(&settings_path, document).unwrap();
+            std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        };
+        // Valid TOML alone did not qualify the original native fixture: the
+        // actual loader requires its schema header before decoding settings.
+        write("editor_auto_save = false\nlanguage_servers = []\n");
+        assert!(settings::load(&settings_path).is_err());
+        write(NATIVE_FIND_FIXTURE_SETTINGS);
+        let loaded = settings::load(&settings_path).expect("native fixture must load, not fall back");
+        assert_eq!(loaded.schema_version, settings::SETTINGS_SCHEMA_VERSION);
+        assert!(!loaded.editor_auto_save);
+        assert!(loaded.language_servers.is_empty());
+
+        let root = directory.path().join("document");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("find.rs");
+        let original = "fn target() {}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut app = editor();
+        app.settings_path = settings_path;
+        app.settings = loaded;
+        // The local fixture keeps preference tasks disabled; all file load
+        // and edit actions below use the actual Ceditor/runtime boundary.
+        assert!(!app.settings_writable);
+        let id = add(&mut app, root.to_str().unwrap(), Some("find.rs"));
+        file_loaded(&mut app, id, &root, "find.rs");
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
+            card: id,
+            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                Arc::new("changed".into()),
+            )),
+        })));
+        let runtime = &mut app.tab_mut(id).unwrap().runtime;
+        assert!(runtime.is_dirty());
+        assert!(iced::runtime::task::into_stream(runtime.auto_save_task(id)).is_none());
+        // A positive control distinguishes disabled scheduling from an editor
+        // that could never schedule a save. Neither task is polled here.
+        runtime.set_auto_save(true);
+        assert!(iced::runtime::task::into_stream(runtime.auto_save_task(id)).is_some());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .current_dir(root)
