@@ -357,8 +357,8 @@ fn retained_pair(
     if terminal.is_some_and(|terminal| terminal.id != holder.terminal) {
         return Err("The paired source differs from its authenticated holder identity".into());
     }
-    // The caller has already matched this native source against the live
-    // holder's full recovery or its exact durable source-digest receipt.
+    // This source was authenticated against exact live recovery or the
+    // immutable source-digest receipt, including its original package role.
     let original_role = registry::OriginalRole::authenticated(
         holder,
         native_source
