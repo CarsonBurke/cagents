@@ -568,7 +568,17 @@ impl Claude {
                     .is_some_and(|status| status != ToolStatus::Running)
             })
     }
-    fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
+    fn task_rows_for_agent(&mut self, parent: Option<&str>, tool: &str) -> Vec<String> {
+        let incoming = ScopedId::new(parent, tool);
+        if self
+            .tools
+            .keys()
+            .any(|known| known.id == tool && known.parent != incoming.parent)
+        {
+            // Task notifications carry no transcript. Keep their fallback row
+            // while more than one scope could own the reported tool ID.
+            return Vec::new();
+        }
         self.agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
@@ -1252,7 +1262,8 @@ impl Claude {
                         if !self.completed_tool(child, &item.id) {
                             self.remember_tool_input(child, &tool_id, &block["input"])?;
                             if string(block, "name") == "Agent" {
-                                global_task_removals.extend(self.task_rows_for_agent(&tool_id));
+                                global_task_removals
+                                    .extend(self.task_rows_for_agent(child, &tool_id));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -7137,6 +7148,40 @@ mod tests {
             adapter.visible_task_rows.contains("claude-task:root"),
             "evicting a child must preserve the colliding root task row"
         );
+    }
+
+    #[test]
+    fn ambiguous_nested_agents_preserve_the_root_task_fallback_on_replay() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("agent-{parent}"),
+                    "same",
+                    "Agent",
+                    json!({"description":parent}),
+                ))
+                .unwrap();
+        }
+        let task = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"taskB","tool_use_id":"same","task_type":"local_agent"})).unwrap();
+        assert!(
+            task.events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:taskB")),
+            "ambiguous task must keep its root fallback"
+        );
+        let replay = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "agent-one-replay",
+                "same",
+                "Agent",
+                json!({"description":"one"}),
+            ))
+            .unwrap();
+        assert!(!replay.events.iter().any(|event|matches!(event,Event::ItemsRemoved{ids} if ids.iter().any(|id|id=="claude-task:taskB"))), "ambiguous replay must not retract the root task fallback");
+        assert!(adapter.visible_task_rows.contains("claude-task:taskB"));
     }
 
     #[test]
