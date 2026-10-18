@@ -6364,7 +6364,9 @@ mod tests {
             let reservation = Arc::clone(&manager.discovery_admissions)
                 .try_acquire_owned()
                 .unwrap();
-            let fake = install_fake(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let mut capabilities = incremental_capabilities();
+            capabilities["textDocumentSync"]["save"] = json!({ "includeText": true });
+            let fake = install_fake(&mut manager, capabilities, |_| Vec::new());
             let doc = LspDocumentId(17);
             assert!(matches!(
                 manager.open(doc, &file, &worktree, rust_language(), 1, "original"),
