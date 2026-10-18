@@ -138,6 +138,8 @@ impl Cagents {
             return Task::none();
         };
         let binding = window::run(parent_id, move |parent| {
+            tracing::info!(target: "cagents::browser_capability", %generation,
+                phase = "binding_callback", "browser capability progress");
             let result = (|| {
                 let display = parent
                     .display_handle()
