@@ -15,7 +15,7 @@ use crate::{
         Authority, Lineage, Origin,
         mailbox::{Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To},
     },
-    chat::{self, Command, PromptMode, runtime::Rejection},
+    chat::{self, runtime::Rejection},
     model::{MessageId, TerminalId},
 };
 use std::{
@@ -626,12 +626,7 @@ impl Handle {
         {
             return Ok(());
         }
-        let prompt = Command::Prompt {
-            text: self.0.seal.seal(message, super::now()),
-            attachments: Vec::new(),
-            mode: PromptMode::Send,
-        };
-        match handle.try_command(prompt) {
+        match handle.try_idle_prompt(self.0.seal.seal(message, super::now())) {
             Ok(()) => {}
             Err(Rejection::Refused(error)) => {
                 // Most often a person's own prompt won the idle conversation;
@@ -653,6 +648,122 @@ impl Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn courier_requeues_a_claim_if_a_request_arrives_after_its_idle_scan() {
+        use crate::{
+            agent_execution::mailbox::Party, chat::runtime::courier_tests::RequestRaceFixture,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        ));
+        let session = TerminalId::new();
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: Some(Lineage(session)),
+                session: None,
+                title: None,
+            },
+            reply_to: None,
+            body: "Deliver exactly once after the outstanding approval clears".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: super::super::now(),
+        };
+        registry.lock().unwrap().post_message(&message).unwrap();
+        let courier = Handle(Arc::new(Inner {
+            host: Weak::new(),
+            registry: registry.clone(),
+            seal: Arc::new(Seal::new([7; 32])),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            scanned_generation: Mutex::new(None),
+            scanned: Condvar::new(),
+        }));
+        let stored = || {
+            registry
+                .lock()
+                .unwrap()
+                .message(message.id)
+                .unwrap()
+                .unwrap()
+        };
+        let mut actor = RequestRaceFixture::new();
+        // This is the courier's real eligibility observation. Compact's gated
+        // adapter step will publish a request before the queued prompt runs.
+        assert!(actor.handle.is_idle());
+        actor.begin_request();
+        let delivery_courier = courier.clone();
+        let delivery_handle = actor.handle.clone();
+        let delivery_message = message.clone();
+        struct Delivery(Option<std::thread::JoinHandle<Result<(), String>>>);
+        impl Delivery {
+            fn finish(mut self) {
+                self.0.take().unwrap().join().unwrap().unwrap();
+            }
+        }
+        impl Drop for Delivery {
+            fn drop(&mut self) {
+                if let Some(worker) = self.0.take() {
+                    // The actor gate has a bounded failure path even if an
+                    // earlier assertion unwinds before explicit release.
+                    let _ = worker.join();
+                }
+            }
+        }
+        let delivery = Delivery(Some(std::thread::spawn(move || {
+            delivery_courier.hand_over(&delivery_message, session, &delivery_handle)
+        })));
+        actor.wait_for_queued_prompt();
+        assert_eq!(
+            stored().state,
+            State::Delivered,
+            "the real claim preceded dequeue"
+        );
+        actor.release_request();
+        delivery.finish();
+        let refused = stored();
+        assert_eq!(refused.id, message.id);
+        assert_eq!(
+            refused.state,
+            State::Pending,
+            "refused mail must remain retryable"
+        );
+        assert_eq!(refused.to.session, None);
+        assert_eq!(
+            actor.prompt_count(),
+            0,
+            "an unanswered request cannot admit mail"
+        );
+        assert_eq!(actor.handle.requests().len(), 1);
+
+        courier.hand_over(&message, session, &actor.handle).unwrap();
+        assert_eq!(stored().state, State::Pending);
+        assert_eq!(
+            actor.prompt_count(),
+            0,
+            "an unchanged request stays protected"
+        );
+        actor.clear_request();
+        assert!(actor.handle.is_idle());
+        courier.hand_over(&message, session, &actor.handle).unwrap();
+        let delivered = stored();
+        assert_eq!(delivered.state, State::Delivered);
+        assert_eq!(delivered.to.session, Some(session));
+        assert_eq!(actor.prompt_count(), 1);
+        courier.hand_over(&message, session, &actor.handle).unwrap();
+        assert_eq!(stored(), delivered);
+        assert_eq!(
+            actor.prompt_count(),
+            1,
+            "a settled message cannot be resubmitted"
+        );
+        actor.close();
+    }
 
     #[test]
     fn terminal_attention_requires_a_unique_live_provider_and_tracks_successor() {
