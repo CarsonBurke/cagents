@@ -26,7 +26,10 @@ fn isolated(name: &str) -> bool {
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return false;
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("chs-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -76,6 +79,7 @@ struct Preflight {
 struct Daemon {
     starts: Arc<Mutex<Vec<Session>>>,
     attaches: Arc<Mutex<Vec<Session>>>,
+    refusals: Arc<Mutex<Vec<String>>>,
     stopped: Arc<AtomicBool>,
     connections: Arc<Mutex<Vec<UnixStream>>>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -112,11 +116,13 @@ impl Daemon {
         listener.set_nonblocking(true).unwrap();
         let starts = Arc::new(Mutex::new(Vec::new()));
         let attaches = Arc::new(Mutex::new(Vec::new()));
+        let refusals = Arc::new(Mutex::new(Vec::new()));
         let admitted = Arc::new(Mutex::new(Vec::<Session>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let (recorded, stop, sockets) = (starts.clone(), stopped.clone(), connections.clone());
         let attached = attaches.clone();
+        let rejected = refusals.clone();
         let worker = std::thread::spawn(move || {
             let mut workers = Vec::new();
             while !stop.load(Ordering::Acquire) {
@@ -137,21 +143,39 @@ impl Daemon {
                 let (recorded, stop) = (recorded.clone(), stop.clone());
                 let (admitted, attached) = (admitted.clone(), attached.clone());
                 let preflight = preflight.clone();
+                let rejected = rejected.clone();
                 workers.push(std::thread::spawn(move || {
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
-                    let proof = HostSessionProof { host_session_id: "history-host".into(),
-                        boot_id: "history-boot".into(), host_incarnation: "history-incarnation".into() };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let proof = HostSessionProof {
+                        host_session_id: "history-host".into(),
+                        boot_id: "history-boot".into(),
+                        host_incarnation: "history-incarnation".into(),
+                    };
                     loop {
                         let request = match read_frame::<ClientEnvelope>(&mut stream) {
                             Ok(Some(request)) => request,
                             Ok(None) => break,
                             Err(_) if stop.load(Ordering::Acquire) => break,
-                            Err(crate::terminal_ipc::FrameError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                            Err(crate::terminal_ipc::FrameError::Io(error))
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
                             Err(error) => panic!("History daemon read: {error}"),
                         };
                         let response = match request.request {
-                            ClientRequest::Connect { .. } => ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() },
+                            ClientRequest::Connect { .. } => ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
                             // The first provider is already admitted when its
                             // Ready is held at the UI boundary. Keep inventory
                             // faithful: a duplicate Restore must attach to it,
@@ -163,53 +187,108 @@ impl Daemon {
                                     // is blocked, before its reservation exists.
                                     assert!(sessions.is_empty());
                                     script.release.send(true).unwrap();
-                                    script.reservation.recv_timeout(Duration::from_secs(5)).unwrap();
+                                    script
+                                        .reservation
+                                        .recv_timeout(Duration::from_secs(5))
+                                        .unwrap();
                                 }
                                 ServerResponse::ChatListed { sessions }
                             }
                             ClientRequest::ChatAttach { session } => {
                                 assert!(admitted.lock().unwrap().contains(&session));
                                 attached.lock().unwrap().push(session.clone());
-                                ServerResponse::ChatAttached { snapshot: crate::chat::Snapshot {
-                                    ready: true, session_id: session.launch.session_id.clone(), ..Default::default()
-                                }, session }
+                                ServerResponse::ChatAttached {
+                                    snapshot: crate::chat::Snapshot {
+                                        ready: true,
+                                        session_id: session.launch.session_id.clone(),
+                                        ..Default::default()
+                                    },
+                                    session,
+                                }
                             }
                             ClientRequest::ChatStart { mut session, .. } => {
-                                let count = { let mut starts = recorded.lock().unwrap(); starts.push(session.clone()); starts.len() };
-                                let duplicate = admitted.lock().unwrap().iter().any(|old| old.id == session.id);
+                                let count = {
+                                    let mut starts = recorded.lock().unwrap();
+                                    starts.push(session.clone());
+                                    starts.len()
+                                };
+                                let duplicate = admitted
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|old| old.id == session.id);
                                 if (fail_first && count == 1) || duplicate {
+                                    let message = if duplicate {
+                                        "Chat is already starting"
+                                    } else {
+                                        "History fixture first start deliberately refused"
+                                    };
+                                    rejected.lock().unwrap().push(message.to_owned());
+                                    write_frame(
+                                        &mut stream,
+                                        &ServerEnvelope {
+                                            version: PROTOCOL_VERSION,
+                                            request_id: Some(request.request_id),
+                                            proof: proof.clone(),
+                                            message: ServerMessage::Error(ProtocolError::new(
+                                                ProtocolErrorCode::TerminalUnavailable,
+                                                message,
+                                                false,
+                                            )),
+                                        },
+                                    )
+                                    .unwrap();
+                                    // The duplicate's actual guard error is on
+                                    // the wire before the first Ready releases.
                                     if let Some(script) = &preflight {
                                         script.rejected.send(()).unwrap();
                                     }
-                                    write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION,
-                                        request_id: Some(request.request_id), proof: proof.clone(),
-                                        message: ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
-                                            "History fixture start already pending or deliberately refused", false)) }).unwrap();
                                     continue;
                                 }
                                 let await_duplicate = if let Some(script) = &preflight {
                                     assert_eq!(count, 1);
                                     script.seen.send(()).unwrap();
-                                    script.released.recv_timeout(Duration::from_secs(5)).unwrap()
-                                } else { false };
+                                    script
+                                        .released
+                                        .recv_timeout(Duration::from_secs(5))
+                                        .unwrap()
+                                } else {
+                                    false
+                                };
                                 session.proof = Some(proof.clone());
                                 admitted.lock().unwrap().push(session.clone());
                                 if let Some(script) = &preflight {
                                     script.reserved.send(()).unwrap();
                                     if await_duplicate {
-                                        script.rejection.recv_timeout(Duration::from_secs(5)).unwrap();
+                                        script
+                                            .rejection
+                                            .recv_timeout(Duration::from_secs(5))
+                                            .unwrap();
                                     }
                                 }
-                                ServerResponse::ChatAttached { snapshot: crate::chat::Snapshot {
-                                    ready: true, session_id: session.launch.session_id.clone(), ..Default::default()
-                                }, session }
+                                ServerResponse::ChatAttached {
+                                    snapshot: crate::chat::Snapshot {
+                                        ready: true,
+                                        session_id: session.launch.session_id.clone(),
+                                        ..Default::default()
+                                    },
+                                    session,
+                                }
                             }
-                            ClientRequest::ChatVisibility { .. } | ClientRequest::ChatAcknowledge { .. } => ServerResponse::Accepted,
+                            ClientRequest::ChatVisibility { .. }
+                            | ClientRequest::ChatAcknowledge { .. } => ServerResponse::Accepted,
                             other => panic!("unexpected History request: {other:?}"),
                         };
-                        write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION,
-                            request_id: Some(request.request_id), proof: proof.clone(),
-                            message: ServerMessage::Response { response } }).unwrap();
+                        write_frame(
+                            &mut stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
                     }
                 }));
             }
@@ -220,6 +299,7 @@ impl Daemon {
         Self {
             starts,
             attaches,
+            refusals,
             stopped,
             connections,
             worker: Some(worker),
@@ -227,6 +307,9 @@ impl Daemon {
     }
     fn starts(&self) -> Vec<Session> {
         self.starts.lock().unwrap().clone()
+    }
+    fn refusals(&self) -> Vec<String> {
+        self.refusals.lock().unwrap().clone()
     }
     fn activations(&self) -> usize {
         self.starts.lock().unwrap().len() + self.attaches.lock().unwrap().len()
@@ -526,6 +609,22 @@ fn history_echo_during_preflight_preserves_the_only_start_receipt() {
         super::startup_admission::settle_observing(&mut app, task, |_, message| Some(message));
     }
     let original = original.expect("first start returns its genuine Ready");
+    let ready_installed = matches!(app.cards.get(&original.card), Some(CardRuntime::Chat(runtime))
+        if runtime.target == original && runtime.session.proof.as_ref().is_some_and(HostSessionProof::is_complete));
+    if daemon.starts().len() > 1 {
+        assert_eq!(
+            daemon.refusals(),
+            vec!["Chat is already starting".to_owned()],
+            "control must observe the real duplicate-start guard error"
+        );
+        assert!(
+            !ready_installed,
+            "control must lose the first successful UI receipt"
+        );
+        eprintln!(
+            "preflight control: Chat is already starting; first successful Ready was fenced out"
+        );
+    }
     assert_eq!(
         daemon.starts().len(),
         1,
