@@ -7300,6 +7300,7 @@ mod tests {
             fs::write(root.join("ignored #1.log"), "ignored").unwrap();
             fs::write(root.join("keep.log"), "included").unwrap();
             fs::write(root.join("private.txt"), "local ignore").unwrap();
+            fs::create_dir_all(root.join(".git/info")).unwrap();
             fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
             let files = service()
                 .ignored_files(
@@ -7384,6 +7385,7 @@ mod tests {
             fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
             fs::create_dir(root.join("ignored-dir")).unwrap();
             fs::write(root.join("ignored-dir/nested.txt"), "ignored\n").unwrap();
+            fs::create_dir_all(root.join(".git/info")).unwrap();
             fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
             fs::write(root.join("private.txt"), "ignored\n").unwrap();
             let cancel = CancellationToken::new();
@@ -7537,6 +7539,7 @@ mod tests {
             git(root, &["add", "-A"]);
             fs::write(root.join("new.txt"), b"working rename\n").unwrap();
             fs::write(root.join(unusual.as_os_str()), b"working unusual\n").unwrap();
+            fs::create_dir_all(root.join(".git/hooks")).unwrap();
             let hook = root.join(".git/hooks/post-checkout");
             fs::write(&hook, b"#!/bin/sh\nprintf invoked > hook-ran\nexit 1\n").unwrap();
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
