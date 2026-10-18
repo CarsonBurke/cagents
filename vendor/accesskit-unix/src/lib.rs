@@ -18,6 +18,9 @@ compile_error!(
     "Both \"async-io\" (default) and \"tokio\" features cannot be enabled at the same time."
 );
 
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 mod adapter;
 mod atspi;
 mod context;
