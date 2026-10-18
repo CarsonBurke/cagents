@@ -550,7 +550,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         crate::agent_execution::Operation::Close(accepted.agent.id),
     )
     .unwrap();
-    wait_until(
+    wait_until_with_diagnostic(
         || {
             !identity.record.holder.is_current()
                 && !identity.record.root.is_current()
@@ -558,8 +558,64 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
                 && !pair.root.is_current()
         },
         "explicit close left a native or paired owner",
+        || close_owner_diagnostic(&identity.record, &pair),
     );
     drop(lease);
+}
+
+// Failure-only inspection of the four process incarnations admitted by this
+// fixture. No discovery, RPC, signal, wait, account read or ownership mutation.
+fn close_owner_diagnostic(
+    native: &crate::daemon::holder_registry::Record,
+    paired: &crate::daemon::holder_registry::Record,
+) -> String {
+    use std::io::Read;
+    let observe =
+        |role: &str, expected: &crate::daemon::holder_registry::Process, custody_contract: &str| {
+            let observed = fs::File::open(format!("/proc/{}/stat", expected.pid))
+                .and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(4096).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                })
+                .map(|bytes| {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let fields = text
+                        .rsplit_once(')')
+                        .map(|(_, tail)| tail.split_whitespace().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let start = crate::model::agent_recovery::process_identity(&bytes)
+                        .map(|(_, start)| start);
+                    serde_json::json!({
+                        "state": fields.first().copied(),
+                        "parent_pid": fields.get(1).and_then(|value| value.parse::<i32>().ok()),
+                        "observed_start": start,
+                        "matches_admitted_start": start == Some(expected.start),
+                    })
+                })
+                .unwrap_or_else(|error| serde_json::json!({"read_error": error.to_string()}));
+            serde_json::json!({
+                "role": role,
+                "admitted_pid": expected.pid,
+                "admitted_start": expected.start,
+                "observed_stat": observed,
+                "source_custody_contract_not_a_live_child_handle_observation": custody_contract,
+            })
+        };
+    serde_json::json!({
+        "fixture_pid": std::process::id(),
+        "scope": "One bounded stat read per admitted role after the unchanged close deadline; no RPC, signal, wait or scan. Missing or mismatched identities are reported without reuse as authority.",
+        "roles": [
+            observe("native helper", &native.holder,
+                "The original helper Child was assigned to the cagents-actor-owner wait thread in this fixture process."),
+            observe("native provider", &native.root,
+                "The retained helper runtime owns the provider Child."),
+            observe("paired holder", &paired.holder,
+                "This fixture process spawned the original terminal Child, then detached its Holder. The adopted Holder has no original Child; this describes source custody, not a newly observed wait handle."),
+            observe("paired root", &paired.root,
+                "The paired holder owns its PTY root Child; successful close receipt requires that exact root reaped."),
+        ],
+    }).to_string()
 }
 
 fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
