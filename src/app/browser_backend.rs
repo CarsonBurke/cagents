@@ -341,11 +341,7 @@ impl Cagents {
                 .trace_check("probe_result_timeout", Instant::now());
             return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         }
-        let Phase::Checking {
-            probe_pending,
-            ..
-        } = &mut self.browser_backend.phase
-        else {
+        let Phase::Checking { probe_pending, .. } = &mut self.browser_backend.phase else {
             return Task::none();
         };
         if *probe_pending != Some(operation) {
@@ -357,15 +353,15 @@ impl Cagents {
         }
         match result {
             CapabilityProbe::Pending => {
-                let first_pending = self
-                    .browser_backend
-                    .progress
-                    .as_mut()
-                    .is_some_and(|progress| {
-                        let first = !progress.pending_reported;
-                        progress.pending_reported = true;
-                        first
-                    });
+                let first_pending =
+                    self.browser_backend
+                        .progress
+                        .as_mut()
+                        .is_some_and(|progress| {
+                            let first = !progress.pending_reported;
+                            progress.pending_reported = true;
+                            first
+                        });
                 if first_pending {
                     self.browser_backend
                         .trace_check("first_probe_pending", Instant::now());
@@ -597,7 +593,11 @@ mod action_tests {
         assert!(matches!(&app.browser_backend.phase,
             Phase::Checking { probe_pending: Some(current), .. } if *current == operation));
         assert_eq!(
-            app.browser_backend.progress.as_ref().unwrap().probes_completed,
+            app.browser_backend
+                .progress
+                .as_ref()
+                .unwrap()
+                .probes_completed,
             0
         );
         let _ = app.browser_factory_probed(generation, operation, CapabilityProbe::Pending);
