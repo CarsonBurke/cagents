@@ -1,6 +1,7 @@
 # Performance measurements
 
 - [Redraw scheduling](#redraw-scheduling)
+- [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
@@ -47,6 +48,81 @@ non-gating until a named reference baseline is accepted.
 in-process terminal scroll workload (no compositor, daemon, or release build).
 It reports what one viewport scroll command costs, and so what applying one
 coalesced move per frame saves over applying every wheel notch.
+
+## Native chat stage attribution
+
+Development UI builds can record bounded, content-free **inclusive wall time**
+for selected chat stages. Set `CAGENTS_CHAT_STAGE_OUTPUT` before startup to a
+fresh absolute filename in an existing directory owned by the effective user
+with mode `0700`. Use a dedicated private fixture and the normal development
+runner; the variable does not grant a build or native testing slot. The runner
+selects the `development` feature explicitly, including in `dev-runtime`;
+`debug_assertions` does not control this recorder. Ordinary builds ignore the
+variable and compile the recording path out. Development builds with the variable
+unset keep an inert hot path with no clock read or allocation.
+
+Startup reads the setting once and retains the private parent directory FD.
+Normal application close writes an exclusive `0600` file relative to that FD,
+without replacing an existing file or following a leaf symlink. A later rename
+of the parent does not redirect output to a replacement directory. Output is
+not written from `Drop`, per frame, or by a timer. A failed or abnormal close
+can leave no report or a partial report; do not interpret it as zero work.
+
+Schema `1`, clock `1` means Linux `CLOCK_MONOTONIC` nanoseconds. The report has
+fixed stage indices, numeric counts and timing fields; it contains no chat text,
+paths, entity IDs or event payloads:
+
+| Index | Stage | Measured caller |
+| --- | --- | --- |
+| 0 | Refresh | `Runtime::refresh`, including its early returns |
+| 1 | Parent preparation | Parent `prepare_items` in refresh |
+| 2 | Child preparation | `prepare_child_cache`, including empty selection |
+| 3 | Parse | Markdown source advance and content append/restart |
+| 4 | Highlight | Fence scan and syntax-block update |
+| 5 | Turn build | Actual `turn_rows` construction, including retained cache misses |
+| 6 | Shape | Cold selectable-prose `ParagraphBuffer::with_spans` |
+| 7 | Retained clone | Cached layout `Node::clone` on a retained layout hit |
+
+These hooks cover named synchronous stages, not every text renderer, widget
+layout, event, GPU operation or application task. A quiet cache hit can have no
+turn construction or shaping calls. Missing stage time is not evidence that the
+remaining work costs nothing.
+
+The recorder retains at most 1024 one-second buckets relative to
+`origin_monotonic_ns`. Elapsed spans are split by overlap across bucket
+boundaries, with a loop bounded by that capacity. Started and ended endpoints
+belong to their own half-open buckets. `crossing_calls` marks a span touching a
+bucket without being wholly contained in it; an endpoint at the right boundary
+belongs to the next bucket. Per-bucket maxima describe overlap in that bucket;
+summary maxima describe whole calls. Summary counts, wall time, clock failures
+and outside-horizon values saturate. Unmatched endpoints or failed clocks must
+remain visible in analysis.
+
+Join complete bucket ranges to the fixture's actual emission timestamps and
+the sampler's actual read timestamps. Do not assign an entire cross-boundary
+span to its finishing bucket. Nested stages overlap: refresh includes parsing
+and highlighting. Their totals are not exclusive
+time and cannot be summed into CPU utilization. Wall time includes scheduler
+delay; these are not on-CPU stacks, input latency or presentation timestamps.
+
+Before claiming a CPU improvement, compare fresh identical-corpus cases using
+the same optimized instrumentable binary with the variable unset and set.
+Keep source, provider rate, selected scope, focus preparation, observer actions
+and process identity receipts fixed. Record sampler overhead and ambient
+pressure; repeat controls separately when needed to measure variance. Source
+tests and headless `frame_cost` workloads do not replace native measurements,
+selection/Copy/accessibility validation, or complete history preservation.
+
+The focused recorder tests require the UI lane; include `development` for
+output-custody tests:
+
+```sh
+cargo test --locked --no-default-features --features development,ui --lib performance::chat_stage::recording::tests
+```
+
+Run builds and tests only through the repository's serialized admission process.
+This command is a test reference, not an automatic workload or a current
+performance qualification.
 
 ## Pane open
 

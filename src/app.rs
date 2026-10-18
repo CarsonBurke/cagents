@@ -12057,6 +12057,10 @@ impl Cagents {
         if self.exit.is_some() {
             return Task::none();
         }
+        if let Err(error) = crate::performance::chat_stage::flush() {
+            tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
+                "Could not flush opt-in chat stage measurements");
+        }
         // The process outlives its window by the reap and the teardown below.
         // An activation acknowledged in that time would tell `cagents ui` a
         // window is being raised, and it would open none. Refused, the
@@ -13154,6 +13158,10 @@ impl Application for Cagents {
     }
 
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
+        if let Err(error) = crate::performance::chat_stage::initialize_from_environment() {
+            tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
+                "Could not enable opt-in chat stage measurements");
+        }
         std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
