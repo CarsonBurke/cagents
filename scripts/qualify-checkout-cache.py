@@ -254,7 +254,12 @@ def main():
     args = parser.parse_args()
     config = tomllib.loads((ROOT / ".cargo/config.toml").read_text())
     assert config["env"][IDENTITY] == {"value": ".", "relative": True, "force": True}
-    for source in ("src/lib.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs"):
+    # Both compilation roots share the unconditional anchor in modules.rs.
+    for source in ("src/lib.rs", "src/hot-ui.rs"):
+        assert (ROOT / source).read_text().splitlines().count(
+            'include!("modules.rs");'
+        ) == 1, source
+    for source in ("src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs"):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
     guard_vendor_hooks()
     if args.evidence:
