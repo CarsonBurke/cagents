@@ -1,3 +1,6 @@
+// Track the build-script compilation as well as its runtime rerun watch.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 use std::env;
 use std::path::Path;
 
