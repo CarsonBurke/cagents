@@ -215,6 +215,23 @@ impl Disclosure {
     pub(super) fn manual_turn(&mut self, key: &str) {
         self.turns.remove(key);
     }
+    /// Choice pruning retires the corresponding temporary search ownership.
+    /// Keeping an evicted ID here would retain it for the whole query and could
+    /// later undo a new choice made under the same opaque identity.
+    pub(super) fn retain(
+        &mut self,
+        expanded: &HashSet<String>,
+        unfolded: &HashSet<String>,
+        opened: &HashMap<String, bool>,
+    ) {
+        self.items.retain(|id| expanded.contains(id));
+        self.parts.retain(|key| unfolded.contains(key));
+        self.turns.retain(|key, _| opened.contains_key(key));
+    }
+    #[cfg(test)]
+    pub(super) fn owned_count(&self) -> usize {
+        self.items.len() + self.parts.len() + self.turns.len()
+    }
     pub(super) fn restore(
         &mut self,
         expanded: &mut HashSet<String>,
@@ -240,6 +257,28 @@ impl Disclosure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pruning_choices_retires_search_owners_without_undoing_live_manual_choices() {
+        let mut disclosure = Disclosure::default();
+        let mut expanded = HashSet::from(["manual".to_owned()]);
+        let mut unfolded = HashSet::new();
+        let mut opened = HashMap::from([("live-turn".to_owned(), false)]);
+        for item in ["retired", "live"] {
+            disclosure.item(item, &mut expanded);
+            disclosure.part(&format!("{item}#body"), &mut unfolded);
+            disclosure.turn(&format!("{item}-turn"), &mut opened);
+        }
+        expanded.remove("retired");
+        unfolded.remove("retired#body");
+        opened.remove("retired-turn");
+        disclosure.retain(&expanded, &unfolded, &opened);
+        assert_eq!(disclosure.owned_count(), 3);
+        disclosure.restore(&mut expanded, &mut unfolded, &mut opened);
+        assert_eq!(expanded, HashSet::from(["manual".to_owned()]));
+        assert!(unfolded.is_empty());
+        assert_eq!(opened, HashMap::from([("live-turn".to_owned(), false)]));
+    }
+
     #[test]
     fn matching_uses_unicode_fold_and_preserves_original_byte_boundaries() {
         assert_eq!(ranges("Straße CAFÉ", "STRASSE"), vec![0..7]);
