@@ -596,6 +596,8 @@ fn history_echo_during_preflight_preserves_the_only_start_receipt() {
     // ChatStart hits that reservation. The server rejects that second start
     // before releasing the first Ready. All ordering uses explicit barriers.
     super::startup_admission::settle_observing(&mut app, echoed, |_, message| Some(message));
+    let duplicate_notice_before_first_ready = app.cards.values().any(|runtime|
+        matches!(runtime, CardRuntime::Failed(error) if error.contains("Chat is already starting")));
     // Fixed projection schedules no second activation. Release the first
     // preflight explicitly now; it must never depend on a duplicate request.
     let _ = release_first.try_send(false);
@@ -616,6 +618,10 @@ fn history_echo_during_preflight_preserves_the_only_start_receipt() {
             daemon.refusals(),
             vec!["Chat is already starting".to_owned()],
             "control must observe the real duplicate-start guard error"
+        );
+        assert!(
+            duplicate_notice_before_first_ready,
+            "the duplicate error must reach UI before applying first Ready"
         );
         assert!(
             !ready_installed,
