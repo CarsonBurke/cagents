@@ -329,7 +329,7 @@ pub struct PendingOperation {
 
 /// A fresh local view of saved bytes. This grants no provider, retirement,
 /// descriptor replacement, or canonical-pane ownership authority.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct RetainedChatCopy {
     pub workspace: WorkspaceId,
     pub source_card: CardId,

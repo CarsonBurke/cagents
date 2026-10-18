@@ -44,7 +44,7 @@ impl Cagents {
     /// An exact retained local copy is saved data, not a hosted pane admitted
     /// by this window. A pending marker on a shared pane alone cannot waive
     /// its original attachment/readiness requirement.
-    fn retained_startup_draft(&self, card: CardId, session: &chat::Session) -> bool {
+    fn retained_startup_draft(&self, card: CardId, session: &crate::chat::Session) -> bool {
         self.durable.local_only_cards.contains(&card)
             && self.durable.pending_chat_admissions.get(&card) == Some(session)
             && self.chat_awaiting_admission(card)
