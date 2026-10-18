@@ -437,6 +437,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     for client in clients {
         let _ = client.join();
     }
+    // Healthy originals deliberately handed to a successor may outlive us.
+    // A suspended or failed handoff must not be reported as proved cleanup.
+    if let Some(error) = crate::daemon::child_reaper::retained_custody_error() {
+        tracing::error!(%error, "daemon shutdown retained unconfirmed original child custody");
+        runtime_error.get_or_insert_with(|| io::Error::other(error));
+    }
     match runtime_error {
         Some(error) => Err(error.into()),
         None => Ok(()),

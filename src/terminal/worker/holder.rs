@@ -186,6 +186,18 @@ pub(super) fn spawn_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Held, String> {
+    let reservation = crate::daemon::child_reaper::reserve()
+        .map_err(|error| format!("reserve terminal holder child custody: {error}"))?;
+    spawn_reserved(command, size, exits, recovery, reservation)
+}
+
+fn spawn_reserved(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    reservation: crate::daemon::child_reaper::Reservation,
+) -> Result<Held, String> {
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -218,18 +230,19 @@ pub(super) fn spawn_recoverable(
     crate::host::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
-    let process = process
-        .spawn()
+    let process = spawn_original(&mut process, reservation)
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
-    let pidfd = open_pidfd(process.id() as libc::pid_t);
+    let pidfd = open_pidfd(process.child.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(process));
+    // Preserve the captured descriptor in the cleanup owner before any other
+    // fallible setup step can return through Holder::drop.
+    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
     let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
-    let owner = registry::Process::read(holder.process.as_ref().unwrap().id() as i32)
+    let owner = registry::Process::read(holder.process.as_ref().unwrap().child.id() as i32)
         .map_err(|error| error.to_string())?;
     holder.registered = recovery.is_some();
-    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
@@ -485,13 +498,46 @@ fn exit_status(wait_status: libc::c_int) -> ExitStatus {
     ExitStatus::from(std::process::ExitStatus::from_raw(wait_status))
 }
 
+/// Spawn-time credit and original wait authority must never be separated by a
+/// fallible ownership transfer. Adopted holders do not have this authority.
+struct OriginalChild {
+    child: Child,
+    reservation: crate::daemon::child_reaper::Reservation,
+}
+
+fn spawn_original(
+    command: &mut Command,
+    reservation: crate::daemon::child_reaper::Reservation,
+) -> io::Result<OriginalChild> {
+    Ok(OriginalChild {
+        child: command.spawn()?,
+        reservation,
+    })
+}
+
+impl OriginalChild {
+    fn retain(self, pidfd: Option<File>, reason: &str) {
+        let Self { child, reservation } = self;
+        reservation.quarantine();
+        let Some(pidfd) = pidfd else {
+            reservation.preserve_suspended(child, None, reason);
+            return;
+        };
+        if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+            // retain returns every original operand intact on validation,
+            // wakeup or service failure. No second reaper or PID lookup.
+            reservation.preserve_suspended(child, Some(pidfd), &format!("{reason}: {error}"));
+        }
+    }
+}
+
 /// The daemon's end of a holder: its control socket and its process.
 /// Dropping it releases the holder, unless the holder was detached.
 pub(super) struct Holder {
     control: UnixStream,
     /// A holder this daemon started is its child, which it reaps. An adopted
     /// holder's parent is whoever inherited it from the daemon that started it.
-    process: Option<Child>,
+    process: Option<OriginalChild>,
     pidfd: Option<File>,
     protocol: u32,
     watch: Option<Watch>,
@@ -568,7 +614,7 @@ impl Holder {
         self.adoption_pending = false;
         Ok(())
     }
-    fn new(control: UnixStream, process: Option<Child>) -> Self {
+    fn new(control: UnixStream, process: Option<OriginalChild>) -> Self {
         Self {
             control,
             process,
@@ -663,18 +709,17 @@ impl Drop for Holder {
                 // A proved release may still be fsyncing its receipt. Keep
                 // that exact owner alive; killing it would erase the only
                 // authority for a retry after the daemon exits.
-                if let Some(mut process) = self.process.take() {
-                    let _ = thread::Builder::new()
-                        .name("terminal-release".into())
-                        .spawn(move || {
-                            let _ = process.wait();
-                        });
+                if let Some(process) = self.process.take() {
+                    process.retain(
+                        self.pidfd.take(),
+                        "Terminal receipt release remains pending",
+                    );
                 }
             } else if !exited {
                 tracing::warn!("killing a terminal holder that did not exit when released");
                 match (&mut self.process, &self.pidfd) {
                     (Some(process), _) => {
-                        let _ = process.kill();
+                        let _ = process.child.kill();
                     }
                     (None, Some(pidfd)) => {
                         let _ = signal(pidfd, libc::SIGKILL);
@@ -683,11 +728,22 @@ impl Drop for Holder {
                 }
             }
             if let Some(mut process) = self.process.take() {
-                let _ = process.wait();
+                if let Err(error) = process.child.wait() {
+                    process.retain(
+                        self.pidfd.take(),
+                        &format!("Terminal child wait failed: {error}"),
+                    );
+                }
+                // Successful exact wait drops its reservation normally.
             }
+        } else if let Some(process) = self.process.take() {
+            process.retain(
+                self.pidfd.take(),
+                "Detached terminal child custody transfer",
+            );
         }
-        // A released holder is gone, and a detached one outlives this daemon,
-        // which reaps it only by exiting; either way its watch is ending.
+        // Ending a watch does not end original child custody. A detached
+        // original is now owned by the bounded exact-child reaper.
         drop(self.release.take());
         if let Some(watch) = self.watch.take() {
             watch.stop();
@@ -1889,7 +1945,7 @@ mod tests {
     }
 
     fn holder_pid(held: &Held) -> u32 {
-        held.holder.process.as_ref().unwrap().id()
+        held.holder.process.as_ref().unwrap().child.id()
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -2046,6 +2102,182 @@ mod tests {
     }
 
     #[test]
+    fn same_parent_detach_adopt_close_reaps_the_original_holder_without_other_waits() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        struct Unrelated(Child);
+        impl Drop for Unrelated {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut unrelated = Unrelated(
+            Command::new("/bin/sh")
+                .args(["-c", "exit 23"])
+                .spawn()
+                .unwrap(),
+        );
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        assert_eq!(reaper.free(), 0);
+        let socket = directory.path().join("custody.sock");
+        held.holder.detach(&socket, b"screen").unwrap();
+        drop(held);
+        assert!(owner.is_current());
+        assert!(root.is_current());
+        assert_eq!(reaper.retained_custody_error(), None);
+        assert_eq!(
+            reaper.free(),
+            0,
+            "live original child still owns its spawn credit"
+        );
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt(&socket, exits).unwrap().held;
+        assert!(
+            adopted.holder.process.is_none(),
+            "adoption must not invent original wait authority"
+        );
+        assert_eq!(adopted.child.pid(), root.pid);
+        adopted.child.kill().unwrap();
+        exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(adopted);
+        reaper.await_free(1);
+        assert!(
+            !owner.is_current(),
+            "same-parent holder was observed but not reaped"
+        );
+        assert!(
+            !root.is_current(),
+            "the terminal holder did not reap its own root"
+        );
+        assert_eq!(
+            unrelated.0.wait().unwrap().code(),
+            Some(23),
+            "another owner's child status was consumed"
+        );
+    }
+
+    #[test]
+    fn detached_holder_transfer_failure_preserves_custody_until_explicit_exact_retry() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        let socket = directory.path().join("retry.sock");
+        held.holder.detach(&socket, b"screen").unwrap();
+        reaper.fail_wake(true);
+        drop(held);
+        assert!(reaper.is_suspended(owner.pid as u32));
+        assert!(
+            reaper
+                .retained_custody_error()
+                .unwrap()
+                .contains("injected")
+        );
+        assert_eq!(reaper.free(), 0);
+        assert!(
+            reaper.reserve().is_err(),
+            "failed handoff must not release admission credit"
+        );
+        assert!(owner.is_current() && root.is_current());
+        // The failure preserves the helper without signalling it. A real
+        // successor can still use its socket, close its root, and release it.
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt(&socket, exits).unwrap().held;
+        assert!(adopted.holder.process.is_none());
+        let exact_exit = adopted.holder.pidfd.as_ref().unwrap().try_clone().unwrap();
+        adopted.child.kill().unwrap();
+        exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(adopted);
+        assert!(exits_within(&exact_exit, Duration::from_secs(5)).unwrap());
+        assert!(
+            owner.is_current(),
+            "suspended service must not silently reap before recovery"
+        );
+        assert!(reaper.is_suspended(owner.pid as u32));
+        reaper.fail_wake(false);
+        let retry = reaper.retry_preserved().unwrap();
+        assert_eq!((retry.rearmed, retry.retained), (1, 0));
+        assert_eq!(reaper.retained_custody_error(), None);
+        reaper.await_free(1);
+        assert!(!owner.is_current() && !root.is_current());
+        assert!(reaper.reserve().is_ok());
+    }
+
+    #[test]
+    fn failed_terminal_holder_spawn_returns_its_preallocated_child_credit() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let directory = tempfile::tempdir().unwrap();
+        let reservation = reaper.reserve().unwrap();
+        assert_eq!(reaper.free(), 0);
+        let result = spawn_original(
+            &mut Command::new(directory.path().join("missing-holder")),
+            reservation,
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
+        assert_eq!(reaper.free(), 1);
+        assert!(reaper.reserve().is_ok());
+    }
+
+    #[test]
+    fn normal_terminal_holder_close_returns_its_original_child_credit() {
+        let reaper = crate::daemon::child_reaper::TestService::new(1);
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let held = spawn_reserved(
+            command("echo ready; read line"),
+            size(),
+            exits,
+            None,
+            reaper.reserve().unwrap(),
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
+        let root = registry::Process::read(held.child.pid()).unwrap();
+        assert_eq!(reaper.free(), 0);
+        drop(held);
+        assert_eq!(reaper.free(), 1);
+        assert!(!owner.is_current());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while root.is_current() {
+            assert!(
+                Instant::now() < deadline,
+                "normal holder close left its root"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn releasing_a_holder_hangs_up_its_terminal() {
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let Held {
@@ -2054,7 +2286,7 @@ mod tests {
             holder,
         } = spawn(command("while :; do sleep 1; done"), size(), exits).unwrap();
         let root = child.pid();
-        let holder_pid = holder.process.as_ref().unwrap().id() as libc::pid_t;
+        let holder_pid = holder.process.as_ref().unwrap().child.id() as libc::pid_t;
         // The terminal hangs up once its last master closes.
         drop(master);
         drop(holder);
@@ -2076,7 +2308,7 @@ mod tests {
         drop(master);
         let _ = holder.control.shutdown(std::net::Shutdown::Both);
         drop(holder);
-        let status = process.wait().unwrap();
+        let status = process.child.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
     }

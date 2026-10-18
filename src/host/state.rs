@@ -1562,6 +1562,9 @@ impl HostState {
         if self.shutting_down
             || self.upgrade.is_some()
             || self.inventory_count() != 0
+            // An original Child can remain ours after its hosted record is
+            // detached or removed, including before holder discovery exists.
+            || crate::daemon::child_reaper::has_outstanding_ownership()
             || !self.browser_logins_spawning.is_empty()
             || !self.execution_startups.is_empty()
             || !self.chat_bindings.is_empty()
