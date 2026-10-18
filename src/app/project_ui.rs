@@ -1026,6 +1026,7 @@ impl Cagents {
                 }
                 match command {
                     ProjectCommand::CopyPath => {
+                        chat_ui::invalidate_copy_intent();
                         return iced::clipboard::write(target.path.display().to_string());
                     }
                     ProjectCommand::CopyBranch
@@ -1052,6 +1053,7 @@ impl Cagents {
                             return Task::none();
                         };
                         if matches!(command, ProjectCommand::CopyBranch) {
+                            chat_ui::invalidate_copy_intent();
                             return iced::clipboard::write(branch);
                         }
                         return self.open_worktree_dialog(

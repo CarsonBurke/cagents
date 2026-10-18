@@ -1376,6 +1376,7 @@ impl Cagents {
                     .map(Path::to_path_buf),
             }
             .map_or_else(Task::none, |path| {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(path.display().to_string())
             }),
             Action::Reveal(id) => {

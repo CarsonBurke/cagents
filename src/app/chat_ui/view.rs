@@ -3584,7 +3584,17 @@ impl Runtime {
                 Icon::Copy
             },
             "Copy this message",
-            Action::Copy(self.target, item.id.clone(), CopyPart::Text),
+            if matches!(item.content, ItemContent::Text { .. })
+                && !self
+                    .presentation_cache()
+                    .get(&item.id)
+                    .and_then(|cached| cached.coordination.as_deref())
+                    .is_some_and(|card| card.is_card())
+            {
+                Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+            } else {
+                Action::Copy(self.target, item.id.clone(), CopyPart::Text)
+            },
         )];
         if let Some((at, stamp, full)) = self
             .presentation_cache()
@@ -5006,7 +5016,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             drop(footer);
             if child_selected {
@@ -5292,7 +5302,7 @@ mod tests {
             }
             assert_eq!(messages.len(), 1);
             assert!(
-                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
             );
             let after = element
                 .as_widget_mut()
@@ -6502,7 +6512,7 @@ mod tests {
                 let copied = dispatch(event(copy.clone(), A11yAction::Click));
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
@@ -6539,7 +6549,7 @@ mod tests {
                 let copied = dispatch(enter.clone());
                 assert_eq!(copied.len(), 1);
                 assert!(
-                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text))
+                    matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
                     if *actual == runtime.target && id == &item.id)
                 );
                 assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());
