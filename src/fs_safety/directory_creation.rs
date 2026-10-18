@@ -116,6 +116,10 @@ impl StickyParent {
         }
         sticky_parent_effective_access(&self.directory)
     }
+    /// The exact retained parent proof; Arc aliases add no native handle.
+    pub(crate) fn directory(&self) -> &Arc<Root> {
+        &self.directory
+    }
     /// One native parent handle; Arc aliases do not add descriptors.
     pub(crate) fn retained_descriptor_count(&self) -> usize {
         1

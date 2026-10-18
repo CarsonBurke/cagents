@@ -337,7 +337,21 @@ fn lock_path(runtime: &Path, directory: &Path) -> io::Result<PathBuf> {
 }
 
 fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
-    use std::os::unix::{fs::MetadataExt, fs::OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    acquire_with_directory_pin(runtime, directory, exclusive, |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+fn acquire_with_directory_pin(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+    pin: impl Fn(&Path) -> io::Result<std::fs::File>,
+) -> io::Result<Protection> {
+    use std::os::unix::fs::MetadataExt;
     crate::secure_file::reject_symlink_components(directory)?;
     let directory = directory.canonicalize()?;
     // A nested folder or submodule editor also protects containing Git worktrees.
@@ -355,10 +369,7 @@ fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Prot
     let mut locks = Vec::with_capacity(roots.len() * 2);
     let mut directories = Vec::with_capacity(roots.len());
     for root in roots {
-        let held_directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&root)?;
+        let held_directory = pin(&root)?;
         let identity = held_directory.metadata()?;
         let path = lock_path(runtime, &root)?;
         let inode_path = path.with_file_name(format!(
@@ -473,7 +484,11 @@ fn protect_root_operation_in_runtime(
     runtime: &Path,
     root: &crate::fs_safety::Root,
 ) -> io::Result<Protection> {
-    let protection = acquire(runtime, root.path(), false)?;
+    // An operation needs a physical directory pin, not enumeration rights.
+    // Keep the ordinary path/host protection API's read-capable pins intact.
+    let protection = acquire_with_directory_pin(runtime, root.path(), false, |path| {
+        crate::fs_safety::Root::open(path)?.retained_directory()
+    })?;
     if !protection.protects_root(root)? {
         return Err(io::Error::other(
             "The operation source root changed while acquiring cleanup protection; no file was changed.",
@@ -914,6 +929,25 @@ mod tests {
         );
         drop(guards);
         acquire(runtime.path(), worktree.path(), true).unwrap();
+    }
+
+    #[test]
+    fn root_operation_protection_uses_path_pins_for_write_search_only_parents() {
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("parent");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        let protection = protect_root_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        for pin in &protection._directories {
+            let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::O_PATH, 0);
+        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

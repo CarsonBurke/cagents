@@ -104,7 +104,8 @@ fn resolve_error(error: ResolveError) -> FileIoError {
 }
 
 /// The blocking worker supplies the ORIGINAL read root and a real local
-/// outside-checkout context. No path recapture or unprotected fallback exists.
+/// qualified context: outside placement or Save-only actual-parent
+/// custody. No path recapture or unprotected fallback exists.
 pub(crate) fn save_file_at(
     root: &Root,
     relative_path: &Path,
@@ -167,6 +168,9 @@ fn save_file_with_read_hook(
     }
     let (parent, name) =
         fs_safety::open_parent_beneath(root, relative_path).map_err(resolve_error)?;
+    context
+        .validate_save_parent(&parent, relative_path, &name)
+        .map_err(io_error)?;
     let name = Path::new(&name);
     let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
     if !listed.is_file() {

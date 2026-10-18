@@ -355,3 +355,140 @@ async fn rejected_sticky_candidate_does_not_hide_a_safe_outside_ancestor() {
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());
 }
+
+// Root `/` is model scope only. Drive OpenFile directly, keep Editor surface,
+// and never call initial_load/directory listing or application LSP drains.
+// Mutations are confined to the caller's exclusively owned fixture names.
+async fn root_scope_owned_file_round_trip(path: &Path) {
+    let source = PathBuf::from("/");
+    let relative = path.strip_prefix(&source).unwrap().to_owned();
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+        project: ProjectId::new(),
+        repository: source.clone(),
+        worktree: source.clone(),
+        selected_file: None,
+    });
+    runtime.set_auto_save(false);
+    let load = runtime.update(RepositoryAction::OpenFile {
+        card,
+        path: relative,
+    });
+    finish(&mut runtime, load).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
+    assert_eq!(runtime.source_surface, SourceSurface::Editor);
+    assert!(!runtime.mutation_refresh_pending);
+    assert!(!runtime.saves_elsewhere());
+    assert!(runtime.original_read_attested);
+    let custody = crate::operation_recovery::Shared::default();
+    assert!(runtime.configure_save_recovery(
+        custody.clone(),
+        vec![source, path.parent().unwrap().to_owned()]
+    ));
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+    }));
+    let submitted = runtime.editor_text().unwrap();
+    assert_ne!(submitted, "baseline");
+    assert!(runtime.is_dirty());
+    let save = runtime.request_save(card, false);
+    assert!(runtime.is_saving());
+    finish(&mut runtime, save).await;
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        submitted,
+        "Save must use the actual qualified edited-file parent despite Root scope"
+    );
+    assert!(!runtime.is_dirty());
+    assert!(runtime.save_error().is_none());
+    assert!(!custody.lock().unwrap().is_pending());
+}
+
+#[tokio::test]
+async fn root_scope_saves_owned_private_and_sticky_parent_files() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::root_scope_saves_owned_private_and_sticky_parent_files",
+    ) {
+        return;
+    }
+    use std::io::Write;
+    for parent in ["/tmp", "/var/tmp"] {
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        let inner = directory.path().join("nested-checkout");
+        std::fs::create_dir(&inner).unwrap();
+        // The marker exercises nested checkout ancestor cleanup leasing; no
+        // Git subprocess or host repository discovery is involved.
+        std::fs::create_dir(inner.join(".git")).unwrap();
+        let path = inner.join("file.txt");
+        std::fs::write(&path, "baseline").unwrap();
+        root_scope_owned_file_round_trip(&path).await;
+
+        let mut file = tempfile::Builder::new()
+            .prefix(".cagents-save-owned-file-")
+            .suffix(".txt")
+            .tempfile_in(parent)
+            .unwrap();
+        file.write_all(b"baseline").unwrap();
+        file.flush().unwrap();
+        root_scope_owned_file_round_trip(file.path()).await;
+    }
+}
+
+#[tokio::test]
+async fn root_scope_can_publish_to_a_write_search_only_parent() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::root_scope_can_publish_to_a_write_search_only_parent",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let owner = tempfile::tempdir_in("/tmp").unwrap();
+    let parent = owner.path().join("write-search-only");
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join("file.txt");
+    std::fs::write(&path, "baseline").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let source = PathBuf::from("/");
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+        project: ProjectId::new(),
+        repository: source.clone(),
+        worktree: source.clone(),
+        selected_file: None,
+    });
+    runtime.set_auto_save(false);
+    let load = runtime.update(RepositoryAction::OpenFile {
+        card,
+        path: path.strip_prefix(&source).unwrap().to_owned(),
+    });
+    finish(&mut runtime, load).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("baseline"));
+    assert_eq!(runtime.source_surface, SourceSurface::Editor);
+    assert!(!runtime.mutation_refresh_pending);
+    assert!(!runtime.saves_elsewhere());
+    let custody = crate::operation_recovery::Shared::default();
+    assert!(runtime.configure_save_recovery(custody.clone(), vec![source]));
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+    }));
+    let submitted = runtime.editor_text().unwrap();
+    assert_ne!(submitted, "baseline");
+    assert!(runtime.is_dirty());
+    let save = runtime.request_save(card, false);
+    finish(&mut runtime, save).await;
+    // Publication is supported; read-restricted directory fsync can still
+    // honestly report unconfirmed durability, as it did on production base.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), submitted);
+    assert!(!runtime.is_dirty());
+    assert!(runtime.save_error().is_none());
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if let DocumentState::Editable(document) = &runtime.document
+        && let Some(authority) = document.cleanup_recovery.clone()
+    {
+        authority.retry().unwrap();
+    }
+    drop(runtime.reconcile_operation_recovery(card));
+    assert!(!custody.lock().unwrap().is_pending());
+}

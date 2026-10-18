@@ -4849,8 +4849,8 @@ impl RepositoryRuntime {
             let result = tokio::task::spawn_blocking(move || {
                 operation.start();
                 let result =
-                    crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(
-                        &root, &known,
+                    crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire_for_save(
+                        &root, &destination, &known,
                     )
                     .map_err(|error| match error.authority {
                         Some(authority) => {

@@ -1,7 +1,9 @@
 //! Local blocking-worker ownership for recoverable filesystem operations.
 //!
 //! The supplied paths are a captured negative checkout census, not global root
-//! registration. Original source/parent descriptors and cleanup protection
+//! registration. General acquisition stays outside captured roots; the Save
+//! entry alone may use local custody bound to the actual edited parent. Original
+//! source/parent descriptors and cleanup protection
 //! remain held through the transaction and unresolved recovery. New external
 //! repositories and topology changes after the last check are explicit limits.
 use crate::{
@@ -17,6 +19,83 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+
+mod save_local;
+use save_local::{SaveLocalPlacement, SaveTargetAuthority};
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilesystemRecoveryPlacement(Placement);
+#[derive(Debug, Clone)]
+enum Placement {
+    Outside(Arc<RecoveryPlacement>, Option<Arc<SaveTargetAuthority>>),
+    SaveLocal(Arc<SaveLocalPlacement>),
+}
+impl FilesystemRecoveryPlacement {
+    fn target(&self) -> Option<&Arc<SaveTargetAuthority>> {
+        match &self.0 {
+            Placement::Outside(_, target) => target.as_ref(),
+            Placement::SaveLocal(p) => Some(p.target()),
+        }
+    }
+    pub(crate) fn directory(&self) -> &Root {
+        match &self.0 {
+            Placement::Outside(p, _) => p.directory(),
+            Placement::SaveLocal(p) => p.directory(),
+        }
+    }
+    pub(crate) fn namespace(&self) -> &crate::fs_safety::DirectoryNamespace {
+        match &self.0 {
+            Placement::Outside(p, _) => p.namespace(),
+            Placement::SaveLocal(p) => p.namespace(),
+        }
+    }
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        match &self.0 {
+            Placement::Outside(p, target) => {
+                if let Some(target) = target {
+                    target.validate()?;
+                }
+                p.validate()
+            }
+            Placement::SaveLocal(p) => p.validate(),
+        }
+    }
+    fn validate_for_source(&self, source: &Root) -> io::Result<()> {
+        match &self.0 {
+            Placement::Outside(p, target) => {
+                if let Some(target) = target {
+                    target.validate_for_source(source)?;
+                }
+                p.validate_for_source(source)
+            }
+            Placement::SaveLocal(p) => p.validate_for_source(source),
+        }
+    }
+    fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
+        match &self.0 {
+            Placement::Outside(p, target) => {
+                if let Some(target) = target {
+                    target.validate()?;
+                }
+                p.validate_payload_root(payload)
+            }
+            Placement::SaveLocal(p) => p.validate_payload_root(payload),
+        }
+    }
+}
+
+enum BootstrapPlacement {
+    Outside(Option<Arc<SaveTargetAuthority>>),
+    SaveLocal(Arc<SaveTargetAuthority>),
+}
+impl BootstrapPlacement {
+    fn target(&self) -> Option<&Arc<SaveTargetAuthority>> {
+        match self {
+            Self::Outside(target) => target.as_ref(),
+            Self::SaveLocal(target) => Some(target),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RecoveryAcquireError {
@@ -67,7 +146,7 @@ impl FilesystemRecoveryReservation {
 
 #[derive(Clone)]
 pub(crate) struct FilesystemRecoveryContext {
-    placement: Arc<RecoveryPlacement>,
+    placement: FilesystemRecoveryPlacement,
     context: RecoveryContext,
     bootstrap: Option<Arc<Mutex<BootstrapCleanup>>>,
 }
@@ -81,14 +160,24 @@ impl std::fmt::Debug for FilesystemRecoveryContext {
 impl FilesystemRecoveryContext {
     /// No recovery directory is created until a protected, same-filesystem
     /// parent outside the source and captured known checkout roots is held.
-    pub(crate) fn acquire(source: &Root, known: &[PathBuf]) -> Result<Self, RecoveryAcquireError> {
+    fn acquire_outside(
+        source: &Root,
+        known: &[PathBuf],
+        target: Option<Arc<SaveTargetAuthority>>,
+    ) -> Result<Self, RecoveryAcquireError> {
+        if let Some(target) = &target {
+            target.validate_for_source(source)?;
+        }
         if known.len() > 256 {
             return Err(io::Error::other(
                 "The known checkout census exceeds the bounded recovery inspection; no file was changed",
             ).into());
         }
         let protection = crate::worktree_cleanup::protect_root_operation(source)?;
-        let source = Arc::new(source.try_clone()?);
+        let source = match &target {
+            Some(target) => target.source().clone(),
+            None => Arc::new(source.try_clone()?),
+        };
         let mut excluded = Vec::with_capacity(known.len());
         for path in known {
             match Root::open(path) {
@@ -106,8 +195,14 @@ impl FilesystemRecoveryContext {
             let parent = parent?;
             match RecoveryPlacement::acquire(parent.clone(), source.clone(), excluded.clone()) {
                 Ok(placement) => {
-                    return Self::from_placement(&source, protection, placement, ())
-                        .map_err(Into::into);
+                    return Self::from_placement(
+                        &source,
+                        protection,
+                        placement,
+                        (),
+                        target.clone(),
+                    )
+                    .map_err(Into::into);
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -131,11 +226,76 @@ impl FilesystemRecoveryContext {
         // Release every unselected candidate before reserving the measured
         // bootstrap capacity and performing its first filesystem effect.
         if let Some(sticky) = selected_sticky {
-            return Self::bootstrap(source, excluded, protection, sticky);
+            return Self::bootstrap(
+                source,
+                excluded,
+                protection,
+                sticky,
+                BootstrapPlacement::Outside(target),
+            );
         }
         Err(last_error.unwrap_or_else(|| io::Error::other(
             "No protected recovery parent outside the captured checkout roots exists on the source filesystem; no file was changed",
         )).into())
+    }
+
+    /// Bind custody to the actual retained edited parent, while original
+    /// checkout identity/path and both cleanup leases remain authoritative.
+    pub(crate) fn acquire_for_save(
+        source: &Root,
+        relative: &std::path::Path,
+        known: &[PathBuf],
+    ) -> Result<Self, RecoveryAcquireError> {
+        if known.len() > 256 {
+            return Err(
+                io::Error::other("Save recovery exceeds the bounded checkout census").into(),
+            );
+        }
+        let target = SaveTargetAuthority::acquire(Arc::new(source.try_clone()?), relative)?;
+        let root_stamp = crate::fs_safety::recovery_directory_stamp(source)?;
+        let parent_stamp = crate::fs_safety::recovery_directory_stamp(target.parent())?;
+        if root_stamp.device == parent_stamp.device && root_stamp.mount_id == parent_stamp.mount_id
+        {
+            match Self::acquire_outside(source, known, Some(target.clone())) {
+                Ok(context) => return Ok(context),
+                Err(error) if error.authority.is_some() => return Err(error),
+                Err(_) => {} // No unresolved effect: qualified local custody may work.
+            }
+        }
+        target.validate()?;
+        let protection = crate::worktree_cleanup::protect_root_operation(source)?;
+        match SaveLocalPlacement::acquire(target.clone()) {
+            Ok(local) => {
+                let descriptors = target
+                    .retained_descriptor_count()
+                    .checked_add(local.retained_descriptor_count())
+                    .and_then(|count| count.checked_add(protection.retained_descriptor_count()))
+                    .ok_or_else(|| {
+                        io::Error::other("Save-local descriptor accounting overflowed")
+                    })?;
+                let context =
+                    RecoveryContext::with_guard((protection, target, local.clone()), descriptors)
+                        .map_err(|message| RecoveryAcquireError {
+                        message,
+                        authority: None,
+                    })?;
+                Ok(Self {
+                    placement: FilesystemRecoveryPlacement(Placement::SaveLocal(local)),
+                    context,
+                    bootstrap: None,
+                })
+            }
+            Err(_) => {
+                let sticky = StickyParent::acquire(target.parent().clone())?;
+                Self::bootstrap(
+                    target.source().clone(),
+                    Arc::from([]),
+                    protection,
+                    sticky,
+                    BootstrapPlacement::SaveLocal(target),
+                )
+            }
+        }
     }
 
     fn bootstrap(
@@ -143,7 +303,12 @@ impl FilesystemRecoveryContext {
         excluded: Arc<[Arc<Root>]>,
         protection: Protection,
         sticky: Arc<StickyParent>,
+        policy: BootstrapPlacement,
     ) -> Result<Self, RecoveryAcquireError> {
+        let target = policy.target().cloned();
+        if let Some(target) = &target {
+            target.validate()?;
+        }
         let owner = Arc::new(Mutex::new(BootstrapOwner::default()));
         let mut descriptors = std::collections::HashSet::from([source.descriptor()]);
         descriptors.extend(excluded.iter().map(|root| root.descriptor()));
@@ -154,6 +319,9 @@ impl FilesystemRecoveryContext {
         let capacity = descriptors.len()
             + protection.retained_descriptor_count()
             + sticky.retained_descriptor_count()
+            + target.as_ref().map_or(0, |target| {
+                target.retained_descriptor_count().saturating_sub(1)
+            })
             + 5;
         let context = RecoveryContext::with_guard(
             (
@@ -162,6 +330,7 @@ impl FilesystemRecoveryContext {
                 protection,
                 sticky.clone(),
                 owner.clone(),
+                target,
             ),
             capacity,
         )
@@ -173,7 +342,7 @@ impl FilesystemRecoveryContext {
             message,
             authority: None,
         })?;
-        let sibling = match sticky.create_private_sibling() {
+        let sibling = match sticky.clone().create_private_sibling() {
             Ok(sibling) => sibling,
             Err(PrivateSiblingCreateError::Rejected(error)) => return Err(error.into()),
             Err(PrivateSiblingCreateError::Retained { cause, sibling }) => {
@@ -197,13 +366,22 @@ impl FilesystemRecoveryContext {
                 });
             }
         };
-        let directory = sibling.directory_arc();
+        let placement = match policy {
+            BootstrapPlacement::Outside(target) => sibling
+                .directory_arc()
+                .and_then(|directory| RecoveryPlacement::acquire(directory, source, excluded))
+                .map(|placement| {
+                    FilesystemRecoveryPlacement(Placement::Outside(placement, target))
+                }),
+            BootstrapPlacement::SaveLocal(target) => {
+                SaveLocalPlacement::from_sibling(target, &sibling, sticky)
+                    .map(|placement| FilesystemRecoveryPlacement(Placement::SaveLocal(placement)))
+            }
+        };
         owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sibling = Some(sibling);
-        let placement =
-            directory.and_then(|directory| RecoveryPlacement::acquire(directory, source, excluded));
         let cleanup = Arc::new(Mutex::new(BootstrapCleanup {
             owner,
             slot: Some(slot),
@@ -270,6 +448,7 @@ impl FilesystemRecoveryContext {
         protection: Protection,
         placement: Arc<RecoveryPlacement>,
         owner: impl Send + Sync + 'static,
+        target: Option<Arc<SaveTargetAuthority>>,
     ) -> io::Result<Self> {
         placement.validate_for_source(source)?;
         if !protection.protects_root(source)? {
@@ -280,23 +459,51 @@ impl FilesystemRecoveryContext {
         let descriptors = placement
             .retained_descriptor_count()
             .checked_add(protection.retained_descriptor_count())
+            .and_then(|count| {
+                count.checked_add(target.as_ref().map_or(0, |target| {
+                    target.retained_descriptor_count().saturating_sub(1)
+                }))
+            })
             .ok_or_else(|| io::Error::other("Recovery descriptor accounting overflowed"))?;
         // The SAME context owns these actual native handles. Its charge stays
         // until the guard tuple has dropped, including unresolved leaf retries.
-        let context =
-            RecoveryContext::with_guard((owner, protection, placement.clone()), descriptors)
-                .map_err(io::Error::other)?;
+        let context = RecoveryContext::with_guard(
+            (owner, protection, placement.clone(), target.clone()),
+            descriptors,
+        )
+        .map_err(io::Error::other)?;
         Ok(Self {
-            placement,
+            placement: FilesystemRecoveryPlacement(Placement::Outside(placement, target)),
             context,
             bootstrap: None,
         })
     }
 
+    pub(crate) fn validate_save_parent(
+        &self,
+        parent: &Root,
+        relative: &std::path::Path,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        if let Some(target) = self.placement.target() {
+            target.validate()?;
+            if relative != target.relative_path()
+                || name != target.name()
+                || crate::fs_safety::recovery_directory_stamp(parent)?
+                    != crate::fs_safety::recovery_directory_stamp(target.parent())?
+            {
+                return Err(io::Error::other(
+                    "Save parent no longer matches its captured original target",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_for_source(&self, source: &Root) -> io::Result<()> {
         self.placement.validate_for_source(source)
     }
-    pub(crate) fn placement(&self) -> &Arc<RecoveryPlacement> {
+    pub(crate) fn placement(&self) -> &FilesystemRecoveryPlacement {
         &self.placement
     }
     pub(crate) fn validate_payload_root(&self, payload: &Root) -> io::Result<()> {
@@ -348,6 +555,7 @@ pub(crate) mod fixtures {
             protection,
             placement,
             (guard, runtime, outside),
+            None,
         )
     }
 }
@@ -378,6 +586,7 @@ mod tests {
             Arc::from([source]),
             protection,
             sticky,
+            BootstrapPlacement::Outside(None),
         )
         .unwrap();
         let owned = context.placement().directory().path().to_owned();
@@ -403,6 +612,7 @@ mod tests {
             Arc::from([source]),
             protection,
             sticky,
+            BootstrapPlacement::Outside(None),
         )
         .unwrap();
         let owned = context.placement().directory().path().to_owned();
@@ -439,6 +649,7 @@ mod tests {
             Arc::from([source]),
             protection,
             sticky,
+            BootstrapPlacement::Outside(None),
         )
         .unwrap();
         let owned = context.placement().directory().path().to_owned();
@@ -476,6 +687,7 @@ mod tests {
             protection,
             placement,
             Charge(released.clone()),
+            None,
         )
         .unwrap();
         let original_file = Arc::new(tempfile::tempfile().unwrap());
