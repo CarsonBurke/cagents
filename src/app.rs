@@ -25,6 +25,7 @@ mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod operation_recovery_ui;
 mod palette_ui;
 mod pr_checkout_ui;
 mod project_ui;
@@ -2367,9 +2368,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         action,
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::RetainedSaveFinished { .. }
             // A dropped page render leaves the viewer reading "Rendering
             // page" for a page it will never draw, because the fence that
             // accepts the result is the only thing that clears it.
@@ -4061,6 +4064,7 @@ pub enum Message {
     /// One shared sidebar model update, from the daemon observer or publisher.
     WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
     Repository(RepositoryAction),
+    OperationRecovery(crate::operation_recovery::Action),
     ResolvedDiffBasis {
         card: CardId,
         basis: DiffBasis,
@@ -4959,6 +4963,7 @@ pub struct Cagents {
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
+    operation_recovery: crate::operation_recovery::Shared,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     automation_approval: automation_approval::State,
@@ -11964,6 +11969,13 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.operation_recovery_pending() {
+            self.status = Some(TransientNotice::error(
+                "Finish or resolve retained file operations before closing this window.",
+            ));
+            return Task::none();
+        }
+
         if self.exit.is_some() {
             return Task::none();
         }
@@ -12101,6 +12113,10 @@ impl Cagents {
     }
 
     fn window_close_transient_blocker(&self) -> Option<&'static str> {
+        if self.operation_recovery_pending() {
+            return Some("Finish or resolve retained file operations before closing this window.");
+        }
+
         if let Some(blocker) = self.automation_ui.draft_close_blocker() {
             return Some(blocker);
         }
@@ -13212,6 +13228,7 @@ impl Application for Cagents {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
+            operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
@@ -14243,7 +14260,34 @@ impl Application for Cagents {
                     value,
                 })
             }
+            Message::OperationRecovery(action) => {
+                let task = self
+                    .operation_recovery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .update(action);
+
+                let mut tasks = vec![
+                    task.map(Message::OperationRecovery)
+                        .map(cosmic::Action::App),
+                ];
+                for (card, runtime) in &mut self.cards {
+                    if let CardRuntime::Repository(runtime) = runtime {
+                        tasks.push(repository_task(runtime.reconcile_operation_recovery(*card)));
+                    }
+                }
+                Task::batch(tasks)
+            }
             Message::Repository(action) => {
+                self.retain_repository_operation(&action);
+                if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }) && !self.prepare_editor_save(action.card()) {
+                    if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&identity.card)
+                    {
+                        runtime.retire_auto_save_due(identity, *revision, *ticket);
+                    }
+                    return Task::none();
+                }
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -14268,10 +14312,10 @@ impl Application for Cagents {
                     _ => None,
                 };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
-                let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                let save_finished = matches!(action, RepositoryAction::SaveFinished { .. } | RepositoryAction::RetainedSaveFinished { .. });
                 let saved = matches!(
                     &action,
-                    RepositoryAction::SaveFinished { result: Ok(_), .. }
+                    RepositoryAction::SaveFinished { result: Ok(_), .. } | RepositoryAction::RetainedSaveFinished { result: Ok(_), .. }
                 );
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
@@ -15360,28 +15404,18 @@ impl Application for Cagents {
                 session,
                 result,
             } => self.completed_terminal_closed(card, session, result),
-            Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
-                Some(CardRuntime::Repository(runtime))
-                    if self
-                        .dirty_repository_close
-                        .as_ref()
-                        .is_some_and(|close| close.card == id) =>
-                {
-                    repository_task(runtime.request_save(id, false))
+            action @ (Message::SaveAndCloseRepository(id) | Message::OverwriteAndCloseRepository(id)) => {
+                if self.dirty_repository_close.as_ref().is_none_or(|close| close.card != id) {
+                    return Task::none();
                 }
-                _ => Task::none(),
-            },
-            Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
-                Some(CardRuntime::Repository(runtime))
-                    if self
-                        .dirty_repository_close
-                        .as_ref()
-                        .is_some_and(|close| close.card == id) =>
-                {
-                    repository_task(runtime.request_save(id, true))
+                if !self.prepare_editor_save(id) {
+                    return Task::none();
                 }
-                _ => Task::none(),
-            },
+                match self.cards.get_mut(&id) {
+                    Some(CardRuntime::Repository(runtime)) => repository_task(runtime.request_save(id, matches!(action, Message::OverwriteAndCloseRepository(_)))),
+                    _ => Task::none(),
+                }
+            }
             Message::DiscardAndCloseRepository(id) => {
                 if self
                     .dirty_repository_close
@@ -17674,6 +17708,11 @@ impl Application for Cagents {
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
         let surface: Element<'_, Message> = widget::column::with_children(vec![
             surface,
+            self.operation_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .view()
+                .map(Message::OperationRecovery),
             self.daemon_health_banner(),
             self.automation_approval_banner(),
             bar,
@@ -25777,6 +25816,7 @@ mod tests {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
+            operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
@@ -26694,6 +26734,77 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn save_and_close_prepares_original_read_custody_without_prior_save() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::save_and_close_prepares_original_read_custody_without_prior_save",
+        ) {
+            return;
+        }
+        for overwrite in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let checkout = directory.path().join("checkout");
+            std::fs::create_dir(&checkout).unwrap();
+            let path = checkout.join("file.txt");
+            std::fs::write(&path, "baseline").unwrap();
+            let card = CardId::new();
+            let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+                project: ProjectId::new(),
+                repository: checkout.clone(),
+                worktree: checkout.clone(),
+                selected_file: None,
+            });
+            runtime.set_auto_save(false);
+            let read = task_app_message(repository_task(runtime.update(
+                RepositoryAction::OpenFile {
+                    card,
+                    path: "file.txt".into(),
+                },
+            )));
+            let Message::Repository(read) = read else {
+                panic!("actual file read callback")
+            };
+            assert!(matches!(&read, RepositoryAction::FileLoadedAt { .. }));
+            drop(runtime.update(read));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: repository_widget::EditorAction::Edit(
+                    repository_widget::EditorEdit::Insert('!'),
+                ),
+            }));
+            let expected = runtime.editor_text().unwrap();
+            assert!(runtime.is_dirty());
+            let mut app = context_inspector_test_app(false);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            app.dirty_repository_close = Some(DirtyRepositoryClose {
+                card,
+                remaining: VecDeque::new(),
+                intent: DirtyCloseIntent::Card(card),
+                focused: DirtyCloseControl::Save,
+                restore_card: None,
+            });
+            let task = app.update(if overwrite {
+                Message::OverwriteAndCloseRepository(card)
+            } else {
+                Message::SaveAndCloseRepository(card)
+            });
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+            );
+            assert!(app.operation_recovery_pending());
+            let completed = task_app_message(task);
+            assert!(matches!(
+                &completed,
+                Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(_), .. })
+            ));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert!(!app.operation_recovery_pending());
+            // Completion is intentionally not routed into card-close effects;
+            // this regression owns Save admission/publication from the close dialog.
+        }
     }
 
     pub(super) fn task_app_message(task: Task<Message>) -> Message {

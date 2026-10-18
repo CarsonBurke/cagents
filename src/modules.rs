@@ -80,6 +80,8 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
