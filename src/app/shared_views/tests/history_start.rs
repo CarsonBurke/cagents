@@ -225,6 +225,11 @@ impl Daemon {
                                     } else {
                                         "History fixture first start deliberately refused"
                                     };
+                                    let code = if already_pending || already_admitted {
+                                        ProtocolErrorCode::InvalidRequest
+                                    } else {
+                                        ProtocolErrorCode::TerminalUnavailable
+                                    };
                                     rejected.lock().unwrap().push(message.to_owned());
                                     write_frame(
                                         &mut stream,
@@ -233,7 +238,7 @@ impl Daemon {
                                             request_id: Some(request.request_id),
                                             proof: proof.clone(),
                                             message: ServerMessage::Error(ProtocolError::new(
-                                                ProtocolErrorCode::TerminalUnavailable,
+                                                code,
                                                 message,
                                                 false,
                                             )),
