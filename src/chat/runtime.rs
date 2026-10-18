@@ -22,6 +22,7 @@ use std::{
 };
 #[cfg(test)]
 pub(crate) mod courier_tests;
+mod child_text_copy;
 mod execution;
 mod store;
 mod websocket;
@@ -810,11 +811,19 @@ impl Handle {
         source: &super::TextCopySource,
         offset: u64,
     ) -> Result<super::TextCopyPage, String> {
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .text_copy(source, offset)
+        match &source.scope {
+            super::TextCopyScope::Conversation => self
+                .0
+                .store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .text_copy(source, offset),
+            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
+                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
+                source,
+                offset,
+            ),
+        }
     }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
@@ -2852,6 +2861,7 @@ fn apply_projected_event(
     if !preview_observed {
         Arc::make_mut(&mut state.notification_preview).observe(&event);
     }
+    let child_copy_update = child_text_copy::prepare(state, &event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -3309,6 +3319,7 @@ fn apply_projected_event(
     if child_changed {
         trim_subagents(state);
     }
+    child_text_copy::finish(state, child_copy_update);
 }
 
 /// Running task identities authorize interruption and idle waits. Retiring
@@ -7012,7 +7023,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_copy_retains_parent_and_trimmed_child_source_after_provider_exit() {
+    fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after_exit() {
         struct CopyFixture;
         let body = format!("{}{}", "a".repeat(128 * 1024 - 1), "🦀界".repeat(30_000));
         fn message(text: &str) -> Item {
@@ -7054,6 +7065,10 @@ mod tests {
                 Event::Item(message("parent")),
                 Event::SubagentItem {
                     id: "child".into(),
+                    item: message("complete child 🦀"),
+                },
+                Event::SubagentItem {
+                    id: "trimmed".into(),
                     item: message(&body),
                 },
             ],
@@ -7073,8 +7088,18 @@ mod tests {
             .iter()
             .find(|child| child.id == "child")
             .unwrap();
-        assert!(child.items[0].content.byte_len() < 64 * 1024);
-        assert_ne!(child.items[0].content, message(&body).content);
+        assert_eq!(child.items[0].content, message("complete child 🦀").content);
+        let trimmed = snapshot
+            .subagents
+            .iter()
+            .find(|child| child.id == "trimmed")
+            .unwrap();
+        assert!(trimmed.items[0].content.byte_len() < 64 * 1024);
+        assert_ne!(trimmed.items[0].content, message(&body).content);
+        assert!(
+            snapshot.text_copy_sources.children["trimmed"][0].is_none(),
+            "a presentation placeholder is not complete text"
+        );
         let parent_source = snapshot.text_copy_sources.conversation[0].as_ref().unwrap();
         let child_source = snapshot.text_copy_sources.children["child"][0]
             .as_ref()
@@ -7087,7 +7112,10 @@ mod tests {
             child_source.scope,
             super::super::TextCopyScope::Subagent { id: "child".into() }
         );
-        for (source, expected) in [(parent_source, "parent"), (child_source, body.as_str())] {
+        for (source, expected) in [
+            (parent_source, "parent"),
+            (child_source, "complete child 🦀"),
+        ] {
             let mut copied = String::new();
             loop {
                 let page = handle.text_copy(source, copied.len() as u64).unwrap();
@@ -7098,6 +7126,11 @@ mod tests {
             }
             assert_eq!(copied.as_bytes(), expected.as_bytes());
         }
+        let mut unavailable = child_source.clone();
+        unavailable.scope = super::super::TextCopyScope::Subagent {
+            id: "trimmed".into(),
+        };
+        assert!(handle.text_copy(&unavailable, 0).is_err());
         assert!(
             handle
                 .command(Command::ReadTextCopy {

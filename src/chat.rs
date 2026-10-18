@@ -1199,7 +1199,7 @@ pub enum TextCopyScope {
     Subagent { id: String },
 }
 
-/// Store-issued authority for the exact committed prefix shown by a publication.
+/// Owned-source authority for the exact committed prefix shown by a publication.
 /// Appends preserve the revision; authoritative replacement invalidates it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopySource {
