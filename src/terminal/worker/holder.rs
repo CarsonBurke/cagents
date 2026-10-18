@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn normal_terminal_holder_close_returns_its_original_child_credit() {
         let reaper = crate::daemon::child_reaper::TestService::new(1);
-        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let (exits, exited) = crossbeam_channel::bounded(1);
         let held = spawn_reserved(
             command("echo ready; read line"),
             size(),
@@ -2264,6 +2264,17 @@ mod tests {
         let owner = registry::Process::read(holder_pid(&held) as i32).unwrap();
         let root = registry::Process::read(held.child.pid()).unwrap();
         assert_eq!(reaper.free(), 0);
+        // Normal worker shutdown waits for the holder's post-reap root report
+        // before releasing the holder. Raw Held drop only promises a hangup.
+        let root_identity = super::super::RootIdentity::capture(root.pid, None).unwrap();
+        super::super::shutdown_child_exit(&held.child, Some(&root_identity), &exited, false)
+            .expect("normal shutdown must confirm the exact root was reaped");
+        assert!(!held.child.unreaped());
+        assert_eq!(
+            reaper.free(),
+            0,
+            "the original holder still owns its credit"
+        );
         drop(held);
         assert_eq!(reaper.free(), 1);
         assert!(!owner.is_current());
