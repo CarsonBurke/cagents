@@ -29,6 +29,17 @@ struct RemovalCard {
     channels: Vec<ChannelId>,
 }
 
+/// Terminal status and authenticated host evidence evolve while deletion waits
+/// for sessions to close. The terminal ID identifies that source incarnation;
+/// the card generation, document, scope and channel fences are checked separately.
+/// Other descriptor contracts remain exact until they define a stable identity.
+fn same_removal_source(captured: &CardKind, current: &CardKind) -> bool {
+    match (captured, current) {
+        (CardKind::Terminal(captured), CardKind::Terminal(current)) => captured.id == current.id,
+        _ => captured == current,
+    }
+}
+
 fn removal_device_key() -> Option<(String, String, String)> {
     crate::device::selected().map(|device| {
         (
@@ -296,7 +307,7 @@ impl Cagents {
         capture.cards.iter().filter(|owner| {
             self.card_state(owner.state.id).is_some_and(|current| {
                 current.existence.is_open() && current.generation == owner.state.generation
-                    && current.kind == owner.state.kind
+                    && same_removal_source(&owner.state.kind, &current.kind)
             })
                 && self.lsp_document(owner.state.id) == owner.document
                 && self.durable.card_scopes.get(&owner.state.id) == owner.scope.as_ref()
@@ -2715,6 +2726,72 @@ mod tests {
                 panic!("reopened card")
             };
             assert_eq!(runtime.lsp_document(), Some(reopened));
+        });
+    }
+
+    #[test]
+    fn worktree_removal_callback_retires_original_terminal_after_normal_exit() {
+        removal_callback_test(|| {
+            for (changed_source, changed_generation) in
+                [(false, false), (true, false), (false, true)]
+            {
+                let (mut app, _root, target) = removal_lsp_app();
+                let mut card = super::super::tests::terminal_card_state();
+                let id = card.id;
+                let CardKind::Terminal(session) = &mut card.kind else {
+                    panic!("terminal fixture")
+                };
+                session.launch.working_directory = target.path.clone();
+                session.continuity = TerminalContinuity::Live {
+                    host_session_id: "removal-fixture".into(),
+                    boot_id: "removal-boot".into(),
+                    host_incarnation: "removal-host".into(),
+                };
+                card.residency = Residency::Hot;
+                let original = card.kind.clone();
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards.push(card);
+                durable.card_scopes.insert(id, target.path.clone());
+                app.cards.insert(id, CardRuntime::Loading);
+                app.workspace = Cagents::rebuild_workspace(&app.durable);
+                let capture = app.capture_worktree_removal(&target);
+                assert_eq!(capture.cards.len(), 1);
+
+                if changed_source {
+                    let CardKind::Terminal(session) = &mut app.card_state_mut(id).unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    session.id = TerminalId::new();
+                }
+                if changed_generation {
+                    app.card_state_mut(id).unwrap().generation += 1;
+                }
+                // This is the production transition used by Completed and
+                // nonclean Exited events, before the queued Deleted callback.
+                app.retire_ended_terminal(id, 0, None, true);
+                assert_ne!(app.card_state(id).unwrap().kind, original);
+                assert!(matches!(app.cards.get(&id), Some(CardRuntime::Loading)));
+                assert!(matches!(
+                    app.card_state(id).unwrap().kind,
+                    CardKind::Terminal(TerminalSession {
+                        continuity: TerminalContinuity::RelaunchAvailable { .. },
+                        ..
+                    })
+                ));
+                drop(app.update(Message::ProjectUi(Action::Deleted {
+                    target: target.clone(),
+                    capture,
+                    result: Ok(()),
+                })));
+                let replacement = changed_source || changed_generation;
+                assert_eq!(app.card_state(id).unwrap().existence.is_open(), replacement);
+                assert_eq!(app.cards.contains_key(&id), replacement);
+                assert_eq!(app.durable.card_scopes.contains_key(&id), replacement);
+                if replacement {
+                    assert_eq!(app.durable.card_scopes.get(&id), Some(&target.path));
+                }
+            }
         });
     }
 
