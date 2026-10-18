@@ -14123,6 +14123,8 @@ mod tests {
 
     #[test]
     fn explicit_save_seals_typing_when_autosave_is_clean_or_in_flight() {
+        use cosmic::iced::futures::{FutureExt, StreamExt};
+
         for complete_before_explicit_save in [true, false] {
             let card = CardId::new();
             let (mut runtime, identity) = RepositoryRuntime::lsp_open_fixture(card, "target\n");
@@ -14153,8 +14155,25 @@ mod tests {
             }
             // The explicit gesture cannot start another write in either
             // state, but must still separate the user's next typing group.
+            let next_save_ticket = runtime.next_save_ticket;
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!();
+            };
+            let active_save = document.active_save.clone();
             let task = runtime.update(RepositoryAction::Save { card, overwrite: false });
-            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(runtime.next_save_ticket, next_save_ticket);
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!();
+            };
+            assert_eq!(document.active_save, active_save);
+            // update batches its inner task with Find maintenance. Iced can
+            // represent no work as Some(empty stream), so check the actual
+            // contract instead of requiring a particular Option encoding.
+            // Reject work before polling: this fixture never writes to /repo.
+            assert_eq!(task.units(), 0);
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                assert!(matches!(stream.next().now_or_never(), Some(None)));
+            }
             if !complete_before_explicit_save {
                 drop(runtime.update(completion));
             }
