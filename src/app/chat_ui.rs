@@ -1567,6 +1567,7 @@ pub(super) struct Runtime {
     find_focused: bool,
     find_matches: Vec<String>,
     find_disclosure: find::Disclosure,
+    child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
     copied: Option<(String, Instant)>,
     /// When a cancel that would also stop background subagents was pressed,
@@ -2198,6 +2199,7 @@ impl Runtime {
             find_focused: false,
             find_matches: Vec::new(),
             find_disclosure: find::Disclosure::default(),
+            child_find_disclosure: HashMap::new(),
             find_index: 0,
             copied: None,
             interrupt_armed: None,
@@ -2272,6 +2274,7 @@ impl Runtime {
         self.asked_after.clear();
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
+        self.child_find_disclosure.clear();
         self.opened.clear();
         self.expanded.clear();
         self.child_expanded.clear();
@@ -2623,7 +2626,10 @@ impl Runtime {
             .as_ref()
             .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
         {
+            self.restore_find_disclosures();
             self.selected_subagent = None;
+            self.find_matches.clear();
+            self.find_index = 0;
         }
         let child_ids: HashSet<&str> = snapshot
             .subagents
@@ -2774,27 +2780,123 @@ impl Runtime {
             .count()
     }
 
+    fn restore_find_disclosures(&mut self) {
+        self.find_disclosure
+            .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        for (child, mut disclosure) in self.child_find_disclosure.drain() {
+            disclosure.restore(
+                self.child_expanded.entry(child.clone()).or_default(),
+                self.child_unfolded.entry(child).or_default(),
+                &mut HashMap::new(),
+            );
+        }
+    }
+
+    fn find_anchor(&self, key: &str) -> iced::advanced::widget::Id {
+        iced::advanced::widget::Id::new(match &self.selected_subagent {
+            // Length framing keeps opaque child/item IDs collision-free.
+            Some(child) => format!(
+                "chat-child-item-{}-{}:{child}{key}",
+                self.target.card,
+                child.len()
+            ),
+            None => format!("chat-turn-{}-{key}", self.target.card),
+        })
+    }
+
+    fn reveal_child_find_match(&mut self, key: &str) {
+        let Some(child) = self.selected_subagent.clone() else {
+            return;
+        };
+        let Some(item) = self.active_item(key).cloned() else {
+            return;
+        };
+        let query = self.find.as_deref().unwrap_or_default();
+        let coordinated = self
+            .child_cache
+            .get(key)
+            .and_then(|cached| cached.coordination.as_deref());
+        let parts: Vec<_> = coordinated
+            .map(coordination::Coordinated::parts)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, text)| find::contains(text, query))
+            .map(|(part, _)| format!("{key}#{part}"))
+            .collect();
+        let raw = match coordinated {
+            Some(card) if card.is_card() => parts.is_empty(),
+            _ => {
+                item.content.is_step()
+                    || turn::slot_of(&item) == turn::Slot::Thinking
+                    || (item.role == chat::Role::User
+                        && matches!(item.content, ItemContent::Text { .. }))
+            }
+        };
+        let delivery = matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query));
+        let expand = (raw && contains_text(&item.content, query)) || delivery;
+        let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
+        for part in parts {
+            disclosure.part(&part, self.child_unfolded.entry(child.clone()).or_default());
+        }
+        if expand && disclosure.item(key, self.child_expanded.entry(child).or_default()) {
+            let previous = self.child_cache.remove(key);
+            self.child_cache.insert(
+                key.to_owned(),
+                CachedItem::updated(
+                    &item.content,
+                    self.syntax_theme,
+                    previous,
+                    true,
+                    false,
+                    chat::coordination::recognize(&item, self.session.launch.provider),
+                ),
+            );
+        }
+    }
+
     fn refresh_find(&mut self) {
         let previous = self.find_matches.get(self.find_index).cloned();
         let query = self.find.as_deref().unwrap_or_default();
-        self.find_matches = self
-            .turns
-            .iter()
-            .filter(|turn| {
-                !query.is_empty()
-                    && turn
-                        .prompt
-                        .iter()
-                        .copied()
-                        .chain(
-                            turn.steps
-                                .iter()
-                                .chain(&turn.prose)
-                                .map(|placed| placed.index),
-                        )
-                        .filter_map(|index| self.snapshot.items.get(index))
-                        .any(|item| {
-                            contains_text(&item.content, query)
+        self.find_matches = if let Some(child) = self.selected_subagent.as_ref() {
+            self.snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+                .into_iter()
+                .flat_map(|agent| &agent.items)
+                .filter(|item| {
+                    !query.is_empty()
+                        && (contains_text(&item.content, query)
+                            || self
+                                .child_cache
+                                .get(&item.id)
+                                .and_then(|cached| cached.coordination.as_deref())
+                                .is_some_and(|card| {
+                                    card.parts()
+                                        .iter()
+                                        .any(|(_, text)| find::contains(text, query))
+                                }))
+                })
+                .map(|item| item.id.clone())
+                .collect()
+        } else {
+            self.turns
+                .iter()
+                .filter(|turn| {
+                    !query.is_empty()
+                        && turn
+                            .prompt
+                            .iter()
+                            .copied()
+                            .chain(
+                                turn.steps
+                                    .iter()
+                                    .chain(&turn.prose)
+                                    .map(|placed| placed.index),
+                            )
+                            .filter_map(|index| self.snapshot.items.get(index))
+                            .any(|item| {
+                                contains_text(&item.content, query)
                                 // A card shows its words unquoted, as no
                                 // command line or tool input writes them.
                                 || self
@@ -2807,10 +2909,11 @@ impl Runtime {
                                             .iter()
                                             .any(|(_, text)| find::contains(text, query))
                                     })
-                        })
-            })
-            .map(|turn| turn.key.clone())
-            .collect();
+                            })
+                })
+                .map(|turn| turn.key.clone())
+                .collect()
+        };
         self.find_index = previous
             .and_then(|key| {
                 self.find_matches
@@ -3697,6 +3800,14 @@ impl Cagents {
             (runtime.find_index + runtime.find_matches.len() - 1) % runtime.find_matches.len()
         };
         let key = runtime.find_matches[runtime.find_index].clone();
+        if runtime.selected_subagent.is_some() {
+            runtime.reveal_child_find_match(&key);
+            return crate::document_link::scroll_to_heading_anchored(
+                card_control_id(target.card, "chat-transcript"),
+                runtime.find_anchor(&key),
+                true,
+            );
+        }
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
             runtime.find_disclosure.turn(&key, &mut runtime.opened);
             let query = runtime.find.as_deref().unwrap_or_default();
@@ -3748,11 +3859,15 @@ impl Cagents {
                     );
                 }
             }
-            // A delivery folded to its opening would hide a match in its body;
-            // its heading is always shown.
+            // Both long user prompts and deliveries may hide their matching
+            // body beneath an opening. Search owns only its temporary reveal.
             for index in &turn.prompt {
                 if let Some(item) = runtime.snapshot.items.get(*index)
-                    && matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query))
+                    && match &item.content {
+                        ItemContent::Text { text, .. } => find::contains(text, query),
+                        ItemContent::Delivery { body, .. } => find::contains(body, query),
+                        _ => false,
+                    }
                 {
                     runtime
                         .find_disclosure
@@ -7741,11 +7856,7 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.restore(
-                        &mut runtime.expanded,
-                        &mut runtime.unfolded,
-                        &mut runtime.opened,
-                    );
+                    runtime.restore_find_disclosures();
                     runtime.find = Some(query);
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
@@ -7755,11 +7866,7 @@ impl Cagents {
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.restore(
-                        &mut runtime.expanded,
-                        &mut runtime.unfolded,
-                        &mut runtime.opened,
-                    );
+                    runtime.restore_find_disclosures();
                     runtime.find = None;
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
@@ -8060,6 +8167,9 @@ impl Cagents {
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let expanded = if let Some(child) = &runtime.selected_subagent {
+                        if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
+                            disclosure.manual_item(&id);
+                        }
                         runtime.child_expanded.entry(child.clone()).or_default()
                     } else {
                         runtime.find_disclosure.manual_item(&id);
@@ -8106,6 +8216,9 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     if selected != runtime.selected_subagent {
+                        runtime.restore_find_disclosures();
+                        runtime.find_matches.clear();
+                        runtime.find_index = 0;
                         runtime.selected_subagent = selected;
                         runtime.child_cache.clear();
                         runtime.child_cache_context = None;
@@ -8115,6 +8228,7 @@ impl Cagents {
                             let snapshot = runtime.snapshot.clone();
                             runtime.prepare_child_cache(&snapshot);
                         }
+                        runtime.refresh_find();
                     }
                     runtime.deferred_page = None;
                     images::sync(runtime);
@@ -8158,6 +8272,9 @@ impl Cagents {
             Action::Unfold(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     let unfolded = if let Some(child) = &runtime.selected_subagent {
+                        if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
+                            disclosure.manual_part(&key);
+                        }
                         runtime.child_unfolded.entry(child.clone()).or_default()
                     } else {
                         runtime.find_disclosure.manual_part(&key);
@@ -11832,6 +11949,173 @@ mod tests {
             started_at: None,
         })
     }
+    fn child_find_tool(text: &str) -> Arc<chat::Item> {
+        Arc::new(chat::Item {
+            id: "same#opaque-id".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Inspect".into(),
+                input: "{}".into(),
+                output: text.into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+            started_at: None,
+        })
+    }
+
+    #[test]
+    fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![child_find_tool("parent-only needle")];
+        snapshot.subagents = vec![
+            presentation_child("one", child_find_tool("child-one-only needle")),
+            presentation_child("two", child_find_tool("child-two-only needle")),
+        ];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "child-one-only".into())));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.find_matches,
+            vec!["same#opaque-id"],
+            "Find must search the visible child, not the parent"
+        );
+        assert!(runtime.child_expanded["one"].contains("same#opaque-id"));
+        assert!(!runtime.expanded.contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::FindNext(target, false)));
+        assert_eq!(chat_runtime(&app, card).find_index, 0);
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        assert!(chat_runtime(&app, card).find_matches.is_empty());
+        assert!(!chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
+        assert_eq!(
+            chat_runtime(&app, card).find_matches,
+            vec!["same#opaque-id"]
+        );
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        assert!(chat_runtime(&app, card).child_expanded["two"].contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.child_expanded["two"].contains("same#opaque-id"));
+        assert!(runtime.child_expanded["one"].contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        assert!(!chat_runtime(&app, card).find_matches.is_empty());
+        assert!(chat_runtime(&app, card).expanded.contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        assert!(chat_runtime(&app, card).find_matches.is_empty());
+        assert!(!chat_runtime(&app, card).expanded.contains("same#opaque-id"));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
+        assert!(
+            chat_runtime(&app, card).pending.is_none(),
+            "Find is local UI state"
+        );
+    }
+
+    #[test]
+    fn selected_child_find_restores_coordination_parts_only_in_their_original_scope() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .session
+            .launch
+            .provider = Provider::Claude;
+        let card_item = |scope: &str| {
+            Arc::new(chat::Item {
+            id: "same#opaque-id".into(), role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "SendMessage".into(),
+                input: serde_json::json!({"to":"reviewer", "message": format!("{} {scope}-only", "Long coordination body\n\n".repeat(32))}).to_string(),
+                output: String::new(), status: chat::ToolStatus::Succeeded,
+            }, at: None, started_at: None,
+        })
+        };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![card_item("parent")];
+        snapshot.subagents = vec![
+            presentation_child("one", card_item("one")),
+            presentation_child("two", card_item("two")),
+        ];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        let part = "same#opaque-id#body";
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "one-only".into())));
+        assert!(chat_runtime(&app, card).child_unfolded["one"].contains(part));
+        assert!(!chat_runtime(&app, card).unfolded.contains(part));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
+        assert!(!chat_runtime(&app, card).child_unfolded["one"].contains(part));
+        drop(app.handle_chat_ui(Action::Find(target, "two-only".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        assert!(chat_runtime(&app, card).unfolded.contains(part));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(!chat_runtime(&app, card).unfolded.contains(part));
+        assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
+    }
+
+    #[test]
+    fn selected_child_find_refreshes_on_live_changes_and_child_retirement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![child_find_tool("parent-only")];
+        snapshot.subagents = vec![presentation_child("one", child_find_tool("before"))];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "streamed-needle".into())));
+        assert!(chat_runtime(&app, card).find_matches.is_empty());
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents[0].items = vec![child_find_tool("before streamed-needle")];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        assert_eq!(
+            chat_runtime(&app, card).find_matches,
+            vec!["same#opaque-id"]
+        );
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        assert!(chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents[0].items.clear();
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        assert!(chat_runtime(&app, card).find_matches.is_empty());
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.clear();
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.selected_subagent.is_none());
+        assert!(
+            !runtime.find_matches.is_empty(),
+            "retirement recomputes parent matches"
+        );
+        assert!(
+            !runtime.expanded.contains("same#opaque-id"),
+            "retired child's temporary choice must not open colliding parent"
+        );
+        assert!(runtime.child_expanded.is_empty());
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(chat_runtime(&app, card).find_matches.is_empty());
+    }
+
     #[test]
     fn selected_presentation_admits_only_current_child_and_prunes_old_backing() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
