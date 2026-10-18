@@ -10650,16 +10650,19 @@ mod tests {
             history: Some(history),
             ..Claude::default()
         };
-        adapter.tool(Item {
-            id: "confirmed".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Changes {
-                changes: vec![],
-                status: ToolStatus::Succeeded,
+        adapter.tool(
+            None,
+            Item {
+                id: "confirmed".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Changes {
+                    changes: vec![],
+                    status: ToolStatus::Succeeded,
+                },
             },
-        });
+        );
         assert!(adapter.command(Command::LoadEarlier).is_err());
         assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
         assert_eq!(
