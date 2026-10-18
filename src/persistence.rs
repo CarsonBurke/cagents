@@ -32,7 +32,11 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+// Format 12 introduces retained Claude descriptors that older readers cannot
+// decode safely. Admission must reject them before partial workspace loading
+// can omit a card and a later snapshot can tombstone it. This supplements the
+// normal local IPC startup gate; it also fences permitted old-set/remote opens.
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -3357,6 +3361,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             transaction
                 .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN predecessor TEXT;")?;
         }
+        // Version 12 is a reader-admission boundary for payloads in existing
+        // columns. The v11 layout needs no additional DDL or data rewrite.
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -5859,6 +5865,287 @@ mod tests {
             pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
+    }
+
+    const RETAINED_UI_DRAFT: &str = "Unsent λ thought\n  café — preserve spacing  ";
+
+    fn retained_ui_format_workspace() -> (WorkspaceState, HostSessionProof) {
+        let boot_id = boot("retained-ui-format-boot");
+        let proof = HostSessionProof {
+            host_session_id: "retained-ui-format-host".into(),
+            boot_id: boot_id.clone(),
+            host_incarnation: "retained-ui-format-incarnation".into(),
+        };
+        let mut state = workspace_with_terminal(&boot_id);
+        state.id = "10000000-0000-4000-8000-000000000001".parse().unwrap();
+        state.cards[0].id = "20000000-0000-4000-8000-000000000001".parse().unwrap();
+        state.cards[0].title = "Unrelated shell".into();
+        let CardKind::Terminal(terminal) = &mut state.cards[0].kind else {
+            unreachable!()
+        };
+        terminal.id = "30000000-0000-4000-8000-000000000001".parse().unwrap();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let mut retained = state.cards[0].clone();
+        retained.id = "20000000-0000-4000-8000-000000000002".parse().unwrap();
+        retained.title = "Retained Claude with unsent draft".into();
+        retained.kind = CardKind::Chat(crate::chat::Session {
+            id: "30000000-0000-4000-8000-000000000002".parse().unwrap(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec!["--model".into(), "fixture-model".into()],
+                    working_directory: "/private/retained-fixture".into(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        "/private/retained-account".into(),
+                    )]),
+                    unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                },
+                session_id: Some("40000000-0000-4000-8000-000000000002".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        });
+        let mut ordinary = retained.clone();
+        ordinary.id = "20000000-0000-4000-8000-000000000003".parse().unwrap();
+        ordinary.title = "Ordinary Codex conversation".into();
+        let CardKind::Chat(chat) = &mut ordinary.kind else {
+            unreachable!()
+        };
+        chat.id = "30000000-0000-4000-8000-000000000003".parse().unwrap();
+        chat.launch.provider = crate::agent::Provider::Codex;
+        chat.launch.recipe.program = "codex".into();
+        chat.launch.recipe.arguments = vec!["--remote".into(), "unix://fixture".into()];
+        chat.launch.recipe.environment =
+            BTreeMap::from([("CODEX_HOME".into(), "/private/codex-account".into())]);
+        chat.launch.recipe.unset_environment.clear();
+        chat.launch.session_id = Some("40000000-0000-4000-8000-000000000003".into());
+        chat.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+        let mut browser = retained.clone();
+        browser.id = "20000000-0000-4000-8000-000000000004".parse().unwrap();
+        browser.title = "Saved browser".into();
+        browser.kind = CardKind::Browser(BrowserSession {
+            id: "50000000-0000-4000-8000-000000000004".parse().unwrap(),
+            current_url: Url::parse("https://example.org/retained-fixture").unwrap(),
+            history: vec![
+                Url::parse("https://example.org/").unwrap(),
+                Url::parse("https://example.org/retained-fixture").unwrap(),
+            ],
+            history_index: 1,
+            scroll_x: 3.0,
+            scroll_y: 127.0,
+            fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+        });
+        state.focused = Some(retained.id);
+        state
+            .chat_drafts
+            .insert(retained.id, RETAINED_UI_DRAFT.into());
+        state
+            .chat_drafts
+            .insert(ordinary.id, "ordinary draft".into());
+        state.cards.extend([retained, ordinary, browser]);
+        (state, proof)
+    }
+
+    fn write_retained_ui_fixture(path: &Path) -> (WorkspaceState, HostSessionProof) {
+        let (state, proof) = retained_ui_format_workspace();
+        let store = StateStore::open(path, proof.boot_id.clone()).unwrap();
+        SaveLane::default().save(&store, &state).unwrap();
+        store.save_window_view("unrelated-window-view-λ").unwrap();
+        store
+            .save_dismissed_update("unrelated-update-marker")
+            .unwrap();
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        store.shutdown().unwrap();
+        drop(store);
+        assert_eq!(
+            fs::metadata(sqlite_sidecar_path(path, "-wal"))
+                .map(|file| file.len())
+                .unwrap_or(0),
+            0
+        );
+        (state, proof)
+    }
+
+    fn assert_retained_ui_fixture(
+        store: &StateStore,
+        state: &WorkspaceState,
+        proof: &HostSessionProof,
+    ) {
+        let restored = store
+            .load_workspace_restored(state.id, Some(proof))
+            .unwrap()
+            .unwrap();
+        assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+        assert_eq!(
+            restored
+                .state
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>(),
+            state.cards.iter().map(|card| card.id).collect::<Vec<_>>()
+        );
+        for (before, after) in state.cards.iter().zip(&restored.state.cards) {
+            assert_eq!(after.kind, before.kind);
+            assert_eq!(after.title, before.title);
+            assert_eq!(after.existence, before.existence);
+        }
+        assert_eq!(restored.state.chat_drafts, state.chat_drafts);
+        assert_eq!(
+            store.load_window_view().unwrap().as_deref(),
+            Some("unrelated-window-view-λ")
+        );
+        assert_eq!(
+            store.load_dismissed_update().unwrap().as_deref(),
+            Some("unrelated-update-marker")
+        );
+    }
+
+    #[test]
+    fn retained_ui_format_normal_writer_reopens_and_exports_only_when_requested() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::DirBuilderExt;
+        let temporary = tempdir().unwrap();
+        let export = std::env::var_os("CAGENTS_TEST_RETAINED_UI_EXPORT_DIR").map(PathBuf::from);
+        let root = export.as_deref().unwrap_or(temporary.path());
+        let head = export.as_ref().map(|_| {
+            assert!(
+                root.is_absolute(),
+                "fixture export requires an absolute private path"
+            );
+            let head = std::env::var("CAGENTS_TEST_RETAINED_UI_PRODUCER_HEAD")
+                .expect("fixture export requires a full producer head pinned by the runner");
+            assert!(
+                head.len() == 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "full producer head required"
+            );
+            fs::DirBuilder::new().mode(0o700).create(root).expect(
+                "fixture export must own a new directory; existing artifacts are never overwritten",
+            );
+            head
+        });
+        let path = root.join("state.sqlite3");
+        let (state, proof) = write_retained_ui_fixture(&path);
+        let reopened = StateStore::open(&path, proof.boot_id.clone()).unwrap();
+        assert_retained_ui_fixture(&reopened, &state, &proof);
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        if let Some(head) = head {
+            assert_eq!(
+                fs::metadata(sqlite_sidecar_path(&path, "-wal"))
+                    .map(|file| file.len())
+                    .unwrap_or(0),
+                0
+            );
+            let digest = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
+            let manifest = serde_json::json!({
+                "head": head, "schema_version": CURRENT_SCHEMA_VERSION,
+                "producer_version": crate::VERSION,
+                "boot_id": proof.boot_id, "workspace_id": state.id,
+                "retained_card_id": state.cards[1].id, "ordinary_card_id": state.cards[2].id,
+                "retained_draft": RETAINED_UI_DRAFT,
+                "card_order": state.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+                "sha256": digest,
+            });
+            let manifest_path = root.join("manifest.json");
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&manifest_path)
+                .unwrap();
+            use std::io::Write;
+            output
+                .write_all(&serde_json::to_vec_pretty(&manifest).unwrap())
+                .unwrap();
+            output.sync_all().unwrap();
+            drop(output);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400)).unwrap();
+            File::open(root).unwrap().sync_all().unwrap();
+            fs::set_permissions(root, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+    }
+
+    fn logical_ui_rows(connection: &Connection) -> BTreeMap<String, Vec<Vec<String>>> {
+        let tables = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let mut result = BTreeMap::new();
+        for table in tables {
+            let quoted = table.replace('"', "\"\"");
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{quoted}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get_ref(column).map(|value| format!("{value:?}")))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.sort();
+            result.insert(table, rows);
+        }
+        result
+    }
+
+    #[test]
+    fn synthetic_v11_layout_migration_is_format_only_and_preserves_rows() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        write_retained_ui_fixture(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        // Synthetic layout test only. Exported before/after compatibility
+        // fixtures above always use actual normal-writer schema admission.
+        connection.pragma_update(None, "user_version", 11).unwrap();
+        let before = logical_ui_rows(&connection);
+        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(logical_ui_rows(&connection), before);
+        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
+    }
+
+    #[test]
+    fn future_ui_format_refuses_before_startup_reconciliation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        write_retained_ui_fixture(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        let before = logical_ui_rows(&connection);
+        drop(connection);
+        assert!(
+            matches!(StateStore::open(&path, boot("different-boot")), Err(StoreError::UnsupportedSchema { found, supported }) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        assert_eq!(
+            logical_ui_rows(&connection),
+            before,
+            "refusal precedes logical recovery/load/write effects; SQLite setup may still touch files"
+        );
     }
 
     #[test]
