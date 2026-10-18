@@ -1910,6 +1910,16 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        // Metadata can become a public descriptor through ChatList without
+        // hydrating a snapshot. Retain the exact sampled IDs before sending
+        // them, even if the reducer concurrently advances to another thread.
+        let continuity = if self.installed {
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        } else {
+            chat::NativeContinuity::ReconnectOnly
+        };
+        self.remember_publication(session_id.as_deref(), &continuity)?;
+        self.remember_publication(confirmed_session.as_deref(), &continuity)?;
         let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
         let continuity_loss = journal.continuity_loss()?;
         let failure = continuity_loss
@@ -1963,6 +1973,16 @@ impl Server {
             chat::NativeContinuity::ReconnectOnly
         };
         let mut sources = self.lineage.clone();
+        for source in self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .published_sources()
+        {
+            if !sources.contains(source) {
+                sources.push(source.clone());
+            }
+        }
         for source in self.lineage.iter().chain(std::iter::once(&self.source)) {
             let projected = published_source(source, confirmed.as_deref(), &continuity);
             if projected != self.source && !sources.contains(&projected) {
@@ -1971,7 +1991,48 @@ impl Server {
         }
         sources
     }
+    /// Journal commit precedes every public identity-bearing response. The
+    /// journal skips exact duplicates, so ordinary observation does not write.
+    fn remember_publication(
+        &self,
+        confirmed: Option<&str>,
+        continuity: &chat::NativeContinuity,
+    ) -> Result<chat::Session, String> {
+        let source = published_source(&self.source, confirmed, continuity);
+        self.remember_descriptor(&source)?;
+        Ok(source)
+    }
+    fn remember_descriptor(&self, source: &chat::Session) -> Result<(), String> {
+        if self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .published_sources()
+            .contains(source)
+        {
+            return Ok(());
+        }
+        let mut lineage = self.published_sources();
+        if !lineage.contains(source) {
+            lineage.push(source.clone());
+        }
+        validate_source_lineage(&lineage)?;
+        self.journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remember_published_source(source)
+    }
+    fn retained_sources_for_publication(&self) -> Result<Vec<chat::Session>, String> {
+        // The reducer can advance between sampling fields of one response.
+        // Commit this exact captured list, not a later current-ID projection.
+        let sources = self.published_sources();
+        for source in &sources {
+            self.remember_descriptor(source)?;
+        }
+        Ok(sources)
+    }
     fn attached(&self) -> Result<Attached, String> {
+        self.remember_descriptor(&self.source)?;
         Ok(Attached {
             protocol: PROTOCOL,
             close_only: self.close_only,
@@ -2008,10 +2069,14 @@ impl Server {
     }
     fn invoke(&mut self, request: Invocation) -> Result<Value, String> {
         if request.method == "inspect" {
+            self.remember_descriptor(&self.source)?;
+            let previous_sources = self.retained_sources_for_publication()?;
+            #[cfg(test)]
+            tests::after_inspection_sources();
             return serde_json::to_value(ActorInspection {
                 identity: self.identity.clone(),
                 source: self.source.clone(),
-                previous_sources: self.published_sources(),
+                previous_sources,
                 execution_console: self.execution_console.clone(),
                 paired_holder: self.paired_holder.clone(),
                 state: self.resident()?,
@@ -2117,11 +2182,10 @@ impl Server {
                         "Retained source resolution requires an exact issued descriptor".into(),
                     );
                 }
-                value!(published_source(
-                    &self.source,
+                value!(self.remember_publication(
                     self.actor.confirmed_session_id().as_deref(),
                     &chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
-                ))
+                )?)
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
@@ -2295,6 +2359,12 @@ impl Server {
                 {
                     snapshot.error = Some(loss.reason.clone());
                 }
+                if let Some(snapshot) = &snapshot {
+                    self.remember_publication(
+                        snapshot.session_id.as_deref(),
+                        &snapshot.native_continuity,
+                    )?;
+                }
                 value!(snapshot)
             }
             "presentation" => {
@@ -2302,7 +2372,24 @@ impl Server {
                 if id != self.source.id {
                     return Err("Retained presentation names another chat".into());
                 }
-                value!(self.actor.presentation(id, after))
+                let response = self.actor.presentation(id, after);
+                let snapshot = match &response {
+                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                        snapshot: Some(snapshot),
+                        ..
+                    }) => Some(snapshot),
+                    Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                        Some(&update.metadata)
+                    }
+                    _ => None,
+                };
+                if let Some(snapshot) = snapshot {
+                    self.remember_publication(
+                        snapshot.session_id.as_deref(),
+                        &snapshot.native_continuity,
+                    )?;
+                }
+                value!(response)
             }
             "file_query" => {
                 let (command,) = decode!((Command,));
@@ -2334,6 +2421,9 @@ impl Server {
                     lineage.push(published);
                 }
                 validate_source_lineage(&lineage)?;
+                for source in &lineage {
+                    self.remember_descriptor(source)?;
+                }
                 self.lineage = lineage;
                 self.installed = true;
                 confirm_installed_snapshot(
@@ -2399,6 +2489,10 @@ impl Server {
                     lineage.push(self.source.clone());
                 }
                 validate_source_lineage(&lineage)?;
+                for previous in &lineage {
+                    self.remember_descriptor(previous)?;
+                }
+                self.remember_descriptor(&source)?;
                 self.lineage = lineage;
                 self.source = source;
                 self.execution_console = console;
@@ -2428,10 +2522,26 @@ impl Server {
                 // Keep the journal locked/sealed across the exact retirement
                 // receipt and cache disposition. A failed publication retains
                 // both helper ownership and the non-disposable evidence.
+                self.remember_publication(
+                    self.actor.confirmed_session_id().as_deref(),
+                    &if self.installed {
+                        chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+                    } else {
+                        chat::NativeContinuity::ReconnectOnly
+                    },
+                )?;
                 self.session_stopping = true;
+                // Publication is single-threaded in this helper and the actor
+                // is already closed. Collect aliases before holding the journal
+                // lock across the retirement receipt/cache disposition.
+                self.remember_descriptor(&self.source)?;
+                let mut previous_sources = self.retained_sources_for_publication()?;
+                if !previous_sources.contains(&self.source) {
+                    previous_sources.push(self.source.clone());
+                }
+                let confirmed = self.actor.confirmed_session_id();
                 let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
                 journal.seal_for_retirement()?;
-                let confirmed = self.actor.confirmed_session_id();
                 let source = published_source(
                     &self.source,
                     confirmed.as_deref(),
@@ -2441,10 +2551,6 @@ impl Server {
                         chat::NativeContinuity::ReconnectOnly
                     },
                 );
-                let mut previous_sources = self.published_sources();
-                if !previous_sources.contains(&self.source) {
-                    previous_sources.push(self.source.clone());
-                }
                 final_snapshot::publish_retirement(RetirementReceipt {
                     installed: self.installed,
                     identity: self.identity.clone(),
@@ -2503,15 +2609,17 @@ impl Server {
             }
             snapshot
         };
+        self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
         // A closing actor may be adopted by a new authenticated daemon before
         // its last semantic ACK. Refresh receipt authority without changing
         // the exact immutable final publication.
+        let previous_sources = self.retained_sources_for_publication()?;
         final_snapshot::save(
             self.installed,
             &self.identity,
             &self.proof,
             &self.source,
-            &self.published_sources(),
+            &previous_sources,
             self.paired_holder.as_ref(),
             self.actor.launch_account_scope(),
             self.actor.confirmed_session_id().as_deref(),
@@ -2831,6 +2939,16 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    thread_local! {
+        static INSPECT_SOURCES_CAPTURED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn after_inspection_sources() {
+        INSPECT_SOURCES_CAPTURED.with(|slot| {
+            if let Some(cutpoint) = slot.borrow_mut().take() {
+                cutpoint();
+            }
+        });
+    }
     struct Fixture {
         server: Server,
         _root: tempfile::TempDir,
@@ -3429,6 +3547,163 @@ mod tests {
         assert!(identity.record.root.is_current());
         assert!(original.pending_inputs().is_empty());
     }
+    #[test]
+    fn inspection_commits_the_exact_captured_alias_before_a_concurrent_reset() {
+        let mut fixture = resident_fixture();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        {
+            let mut state = fixture.server.actor.0.state.lock().unwrap();
+            state.session_id = Some(a.into());
+            confirm_installed_snapshot(&mut state);
+        }
+        *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(a.into());
+        let expected_a = published_source(
+            &fixture.server.source,
+            Some(a),
+            &chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL },
+        );
+        let actor = fixture.server.actor.clone();
+        INSPECT_SOURCES_CAPTURED.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                actor.0.state.lock().unwrap().session_id = Some(b.into());
+                *actor.0.confirmed_session.lock().unwrap() = Some(b.into());
+            }))
+        });
+        let response = fixture
+            .server
+            .invoke(Invocation {
+                proof: fixture.server.proof.clone(),
+                epoch: None,
+                method: "inspect".into(),
+                args: json!([]),
+            })
+            .unwrap();
+        let inspection: ActorInspection = serde_json::from_value(response).unwrap();
+        assert!(inspection.previous_sources.contains(&expected_a));
+        assert_eq!(inspection.state.session_id.as_deref(), Some(b));
+        let db = rusqlite::Connection::open_with_flags(
+            fixture._root.path().join("journal/actor-journal.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let bytes: Vec<u8> = db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='published_sources'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let durable: Vec<chat::Session> = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            durable.contains(&expected_a),
+            "the exact outgoing alias A must commit before resident B is sampled"
+        );
+    }
+
+    #[test]
+    fn public_identity_responses_commit_aliases_before_returning_and_skip_unchanged_writes() {
+        for method in [
+            "inspect",
+            "state",
+            "snapshot",
+            "presentation",
+            "resolve_source",
+        ] {
+            let mut fixture = resident_fixture();
+            let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+            {
+                let mut state = fixture.server.actor.0.state.lock().unwrap();
+                state.session_id = Some(a.into());
+                confirm_installed_snapshot(&mut state);
+            }
+            *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(a.into());
+            let source = fixture.server.source.clone();
+            let expected_a = published_source(
+                &source,
+                Some(a),
+                &chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL },
+            );
+            let path = fixture._root.path().join("journal/actor-journal.sqlite");
+            let fault = rusqlite::Connection::open(&path).unwrap();
+            fault.execute_batch("CREATE TRIGGER refuse_publication BEFORE INSERT ON metadata WHEN NEW.key='published_sources' BEGIN SELECT RAISE(ABORT,'fixture publication refusal'); END;").unwrap();
+            let invoke = |server: &mut Server| {
+                let args = match method {
+                    "inspect" => json!([]),
+                    "state" => json!([0]),
+                    "snapshot" => json!([null]),
+                    "presentation" => json!([source.id, null]),
+                    "resolve_source" => json!([source]),
+                    _ => unreachable!(),
+                };
+                server.invoke(Invocation {
+                    proof: server.proof.clone(),
+                    epoch: Some(server.epoch),
+                    method: method.into(),
+                    args,
+                })
+            };
+            assert!(
+                invoke(&mut fixture.server)
+                    .unwrap_err()
+                    .contains("fixture publication refusal"),
+                "no identity-bearing {method} response may precede the journal commit"
+            );
+            assert!(
+                fixture
+                    .server
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .published_sources()
+                    .is_empty()
+            );
+            fault
+                .execute_batch("DROP TRIGGER refuse_publication;")
+                .unwrap();
+            invoke(&mut fixture.server).unwrap();
+            let bytes: Vec<u8> = fault
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='published_sources'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let durable: Vec<chat::Session> = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                durable.contains(&expected_a),
+                "the returned {method} identity must already be durable"
+            );
+            fault.execute_batch("CREATE TRIGGER refuse_publication BEFORE INSERT ON metadata WHEN NEW.key='published_sources' BEGIN SELECT RAISE(ABORT,'unchanged publication wrote'); END; CREATE TRIGGER refuse_publication_update BEFORE UPDATE ON metadata WHEN NEW.key='published_sources' BEGIN SELECT RAISE(ABORT,'unchanged publication updated'); END;").unwrap();
+            invoke(&mut fixture.server).expect("unchanged public identities must not write again");
+            fault
+                .execute_batch(
+                    "DROP TRIGGER refuse_publication; DROP TRIGGER refuse_publication_update;",
+                )
+                .unwrap();
+            {
+                let mut state = fixture.server.actor.0.state.lock().unwrap();
+                state.session_id = Some(b.into());
+                state.generation += 1;
+            }
+            *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(b.into());
+            let resolved = fixture
+                .server
+                .invoke(Invocation {
+                    proof: fixture.server.proof.clone(),
+                    epoch: Some(fixture.server.epoch),
+                    method: "resolve_source".into(),
+                    args: json!([expected_a]),
+                })
+                .unwrap();
+            let resolved: chat::Session = serde_json::from_value(resolved).unwrap();
+            assert_eq!(resolved.launch.session_id.as_deref(), Some(b));
+            assert!(fixture.server.published_sources().contains(&expected_a));
+            assert!(fixture.server.published_sources().contains(&resolved));
+        }
+    }
+
     #[test]
     fn source_resolution_checks_issued_membership_before_returning_current_thread() {
         let mut fixture = resident_fixture();

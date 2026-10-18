@@ -157,6 +157,7 @@ impl Fixture {
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
         let mut state = HostState::new(proof);
+        state.register_client(0);
         state.install_model(
             super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap(),
         );
@@ -264,6 +265,68 @@ impl Fixture {
                 session: session.clone(),
             },
         )
+    }
+
+    fn publicly_attached_identity(&self, expected: Option<&str>, reason: &str) -> Session {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let listed = loop {
+            assert!(
+                Instant::now() < deadline,
+                "{reason}: metadata deadline exhausted"
+            );
+            // ChatList reads cached resident metadata; do not issue a blocking
+            // helper RPC inside the absolute identity-publication deadline.
+            let (response, _, _) =
+                super::super::client::process_request(&self.host, 0, ClientRequest::ChatList)
+                    .expect("public ChatList must remain available");
+            let ServerResponse::ChatListed { sessions } = response else {
+                panic!("wrong public ChatList response")
+            };
+            let current = sessions
+                .into_iter()
+                .find(|session| session.id == self.original.id)
+                .expect("the public roster must retain the original actor");
+            let confirmed = self.handle().confirmed_session_id();
+            let matched = current.launch.session_id.is_some()
+                && current.launch.session_id == confirmed
+                && expected
+                    .is_none_or(|expected| current.launch.session_id.as_deref() == Some(expected));
+            assert!(
+                Instant::now() < deadline,
+                "{reason}: public_id={:?} confirmed_id={confirmed:?} issued_id={:?} provider_done={}",
+                current.launch.session_id,
+                self.original.launch.session_id,
+                self.root.join("provider-done").exists()
+            );
+            if matched {
+                break current;
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        // Exercise the actual attachment/snapshot projection separately from
+        // the bounded metadata wait. Do not mutate Record.session or manually
+        // update the helper source to manufacture historical authority.
+        let (response, _, _) = super::super::client::process_request(
+            &self.host,
+            0,
+            ClientRequest::ChatAttach {
+                session: listed.clone(),
+            },
+        )
+        .expect("public attachment must preserve the published identity");
+        let ServerResponse::ChatAttached { session, snapshot } = response else {
+            panic!("wrong public ChatAttach response")
+        };
+        assert_eq!(session.launch.session_id, listed.launch.session_id);
+        assert_eq!(snapshot.session_id, listed.launch.session_id);
+        assert_eq!(snapshot.native_continuity, session.native_continuity);
+        assert_eq!(
+            self.handle().confirmed_session_id(),
+            session.launch.session_id
+        );
+        session
     }
 
     fn spent(&self, client: ClientId) -> bool {
@@ -599,19 +662,16 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
         || fixture.root.join("provider-done").exists(),
         "initial provider turn did not finish",
     );
-    wait(
-        || {
-            fixture.host.lock().unwrap().chats[&fixture.original.id]
-                .session
-                .launch
-                .session_id
-                .is_some()
-        },
-        "HOST never published actual identity A",
+    let issued_a =
+        fixture.publicly_attached_identity(None, "HOST never published actual identity A");
+    assert!(
+        fixture.host.lock().unwrap().chats[&fixture.original.id]
+            .session
+            .launch
+            .session_id
+            .is_none(),
+        "issued startup descriptor remains immutable"
     );
-    let issued_a = fixture.host.lock().unwrap().chats[&fixture.original.id]
-        .session
-        .clone();
     let a = issued_a.launch.session_id.clone().unwrap();
     assert_eq!(
         fixture.handle().confirmed_session_id().as_deref(),
@@ -624,19 +684,13 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
     );
     let b = fs::read_to_string(fixture.root.join("reset-id")).unwrap();
     assert_ne!(a, b);
-    wait(
-        || {
-            fixture.host.lock().unwrap().chats[&fixture.original.id]
-                .session
-                .launch
-                .session_id
-                .as_deref()
-                == Some(b.as_str())
-        },
-        "semantic broker did not publish identity B after actual reset",
-    );
+    let issued_b =
+        fixture.publicly_attached_identity(Some(&b), "HOST never published actual identity B");
+    assert_eq!(issued_b.launch.session_id.as_deref(), Some(b.as_str()));
     fixture.rotate_host();
-    let resolved = fixture.resolve(11, &issued_a).unwrap();
+    let resolved = fixture
+        .resolve(11, &issued_a)
+        .expect("RETAINED_PUBLIC_ISSUED_A_MUST_RESOLVE_AFTER_RESET_AND_HOST_LOSS");
     assert_eq!(resolved.launch.session_id.as_deref(), Some(b.as_str()));
     assert_eq!(resolved.launch.recipe, issued_a.launch.recipe);
     assert!(

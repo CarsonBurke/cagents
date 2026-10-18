@@ -56,6 +56,7 @@ pub(super) struct Journal {
     acknowledged_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
@@ -106,8 +107,47 @@ impl Journal {
             acknowledged_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            published_sources: Vec::new(),
         })
     }
+    /// Exact descriptors issued by this live helper. This is not a provider
+    /// replay/adoption log: each helper creates its own journal exclusively.
+    pub fn remember_published_source(
+        &mut self,
+        source: &crate::chat::Session,
+    ) -> Result<(), String> {
+        // Known aliases remain available after sealing, with no transaction or
+        // fsync on the repeated publication/inspection path.
+        if self.published_sources.contains(source) {
+            return Ok(());
+        }
+        self.ensure_writable()?;
+        if self.published_sources.len() >= 1024 {
+            return Err("Retained source lineage capacity reached".into());
+        }
+        let mut sources = self.published_sources.clone();
+        sources.push(source.clone());
+        let bytes = serde_json::to_vec(&sources).map_err(|error| error.to_string())?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("Retained source lineage capacity reached".into());
+        }
+        // synchronous=FULL is established at journal creation. Publish the
+        // in-memory view only after the exact aggregate commits successfully.
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO metadata(key,value) VALUES('published_sources',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [bytes],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        self.published_sources = sources;
+        Ok(())
+    }
+
+    pub fn published_sources(&self) -> &[crate::chat::Session] {
+        &self.published_sources
+    }
+
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
         Ok(self.last_loss.clone())
     }
@@ -648,6 +688,116 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn durable_sources(directory: &Path) -> Vec<crate::chat::Session> {
+        let db = Connection::open_with_flags(
+            directory.join("actor-journal.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let bytes: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='published_sources'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        bytes
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn published_sources_preserve_exact_pre_id_and_thread_aliases_durably() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let pre_id = super::super::transport::fixture_source();
+        let mut a = pre_id.clone();
+        a.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut b = a.clone();
+        b.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        for source in [&pre_id, &a, &b] {
+            journal.remember_published_source(source).unwrap();
+        }
+        assert_eq!(
+            journal.published_sources(),
+            &[pre_id.clone(), a.clone(), b.clone()]
+        );
+        assert_eq!(durable_sources(root.path()), journal.published_sources());
+        journal.db.execute_batch(
+            "CREATE TRIGGER no_publication_insert BEFORE INSERT ON metadata WHEN NEW.key='published_sources' BEGIN SELECT RAISE(ABORT,'unexpected publication write'); END;
+             CREATE TRIGGER no_publication_update BEFORE UPDATE ON metadata WHEN NEW.key='published_sources' BEGIN SELECT RAISE(ABORT,'unexpected publication write'); END;",
+        ).unwrap();
+        // Neither repeated publication nor a known post-seal lookup may write.
+        journal.remember_published_source(&a).unwrap();
+        journal.seal_for_retirement().unwrap();
+        journal.remember_published_source(&b).unwrap();
+        let mut unknown = b;
+        unknown.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(journal.remember_published_source(&unknown).is_err());
+        assert_eq!(durable_sources(root.path()), journal.published_sources());
+    }
+
+    #[test]
+    fn failed_publication_commit_leaves_cache_and_durable_aliases_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let source = super::super::transport::fixture_source();
+        journal.remember_published_source(&source).unwrap();
+        // The metadata statement succeeds, but its deferred constraint fails
+        // at COMMIT, exercising rollback rather than an admission-only error.
+        journal.db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE publication_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE publication_fault(parent INTEGER REFERENCES publication_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_publication_commit AFTER UPDATE ON metadata WHEN NEW.key='published_sources' BEGIN INSERT INTO publication_fault VALUES(1); END;",
+        ).unwrap();
+        let mut next = source.clone();
+        next.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(journal.remember_published_source(&next).is_err());
+        assert_eq!(journal.published_sources(), &[source]);
+        assert_eq!(durable_sources(root.path()), journal.published_sources());
+        journal
+            .db
+            .execute_batch("DROP TRIGGER fail_publication_commit;")
+            .unwrap();
+        journal.remember_published_source(&next).unwrap();
+        assert_eq!(durable_sources(root.path()), journal.published_sources());
+    }
+
+    #[test]
+    fn published_source_count_and_aggregate_byte_bounds_preserve_prior_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let source = super::super::transport::fixture_source();
+        for index in 0..1024 {
+            let mut alias = source.clone();
+            alias.launch.session_id = Some(uuid::Uuid::from_u128(index + 1).to_string());
+            journal.remember_published_source(&alias).unwrap();
+        }
+        let before = journal.published_sources().to_vec();
+        assert!(journal.remember_published_source(&source).is_err());
+        assert_eq!(journal.published_sources(), before);
+        assert_eq!(durable_sources(root.path()), before);
+
+        let byte_root = tempfile::tempdir().unwrap();
+        let mut bytes = Journal::open(byte_root.path()).unwrap();
+        let mut large = source.clone();
+        large
+            .launch
+            .recipe
+            .arguments
+            .push("x".repeat(2 * 1024 * 1024));
+        bytes.remember_published_source(&large).unwrap();
+        let mut next_large = large.clone();
+        next_large.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(serde_json::to_vec(&[&next_large]).unwrap().len() < 4 * 1024 * 1024);
+        assert!(bytes.remember_published_source(&next_large).is_err());
+        assert_eq!(bytes.published_sources(), &[large]);
+        assert_eq!(durable_sources(byte_root.path()), bytes.published_sources());
+        bytes.seal_for_retirement().unwrap();
+    }
+
     #[test]
     fn unacknowledged_sqlite_journal_survives_actual_store_drop() {
         let store = super::super::super::Store::new().unwrap();
