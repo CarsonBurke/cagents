@@ -805,6 +805,12 @@ enum MarkdownMode {
     Preview,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveTrigger {
+    Explicit,
+    Automatic,
+}
+
 struct EditorDocument {
     /// The selected path: the name the reader opened and the file list rows.
     path: PathBuf,
@@ -5202,14 +5208,14 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
-        self.request_save_inner(card, overwrite, true)
+        self.request_save_inner(card, overwrite, SaveTrigger::Explicit)
     }
 
     fn request_save_inner(
         &mut self,
         card: CardId,
         overwrite: bool,
-        reveal_editor: bool,
+        trigger: SaveTrigger,
     ) -> Task<RepositoryAction> {
         let (path, destination, text, disk_hash, revision, history_revision, snapshot_source) =
             match &self.document {
@@ -5242,13 +5248,18 @@ impl RepositoryRuntime {
             snapshot: text.clone(),
         };
         if let DocumentState::Editable(document) = &mut self.document {
-            document.history.seal();
+            // Background persistence is not a new editing gesture. Its
+            // 800 ms debounce can expire while the one-second typing group
+            // is still open; only an explicit Save ends that group.
+            if trigger == SaveTrigger::Explicit {
+                document.history.seal();
+            }
             document.active_save = Some(ticket.clone());
             document.error = None;
         }
         // Keep diff review mounted while saving. Only a real save failure or
         // conflict reveals recovery; explicit saves may still leave preview.
-        if reveal_editor && self.source_surface != SourceSurface::Diff {
+        if trigger == SaveTrigger::Explicit && self.source_surface != SourceSurface::Diff {
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
         }
@@ -5835,7 +5846,7 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.auto_save_pending = None;
-                self.request_save_inner(identity.card, false, false)
+                self.request_save_inner(identity.card, false, SaveTrigger::Automatic)
             }
             RepositoryAction::SaveFinished {
                 identity,
@@ -14007,6 +14018,93 @@ mod tests {
         };
         assert_eq!(document.saved_text, "latest\n");
         assert!(!runtime.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn autosave_preserves_a_selection_replacement_typing_group_but_explicit_save_seals_it() {
+        const ORIGINAL: &str = "// fixture header\npub fn target() -> i32 { 42 }\n\npub fn caller() -> i32 { target() }\n";
+        for automatic in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let path = root.join("find.rs");
+            std::fs::write(&path, ORIGINAL).unwrap();
+            let card = CardId::new();
+            let view = RepositoryView {
+                selected_file: None,
+                project: ProjectId::new(),
+                repository: root.clone(),
+                worktree: root,
+            };
+            let mut runtime = RepositoryRuntime::new_directory(view);
+            let task = runtime.update(RepositoryAction::OpenFile {
+                card,
+                path: "find.rs".into(),
+            });
+            finish_navigation_task(&mut runtime, task).await;
+            let now = Instant::now();
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                panic!("native editable fixture");
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 1, column: 13 },
+                selection: Some(text_editor::Position { line: 1, column: 7 }),
+            });
+            document.history_time = Some(now);
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('c')),
+            }));
+            let first = ORIGINAL.replacen("target", "c", 1);
+            assert_eq!(buffer_text(&runtime), first);
+
+            let save = if automatic {
+                // Deliver the accepted 800 ms timer through its real reducer;
+                // the following input is still within the 1,000 ms history
+                // group. The injected edit clock avoids scheduler-dependent
+                // grouping and no test sleeps or background timer runs.
+                drop(runtime.auto_save_task(card));
+                let selected = runtime.selected.as_ref().unwrap();
+                let identity = runtime.current_identity(card, selected.path.clone());
+                runtime.update(RepositoryAction::AutoSaveDue {
+                    identity,
+                    revision: document_revision(&runtime),
+                    ticket: runtime.next_auto_save_ticket,
+                })
+            } else {
+                runtime.update(RepositoryAction::Save { card, overwrite: false })
+            };
+            finish_navigation_task(&mut runtime, save).await;
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+            assert!(!runtime.is_dirty());
+
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.history_time = Some(now + Duration::from_millis(900));
+            for character in "hanged".chars() {
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+                }));
+            }
+            let changed = ORIGINAL.replacen("target", "changed", 1);
+            assert_eq!(buffer_text(&runtime), changed);
+            assert!(runtime.is_dirty());
+            let save = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            finish_navigation_task(&mut runtime, save).await;
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            let expected = if automatic { ORIGINAL } else { &first };
+            assert_eq!(buffer_text(&runtime), expected, "automatic={automatic}");
+            let save = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            finish_navigation_task(&mut runtime, save).await;
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert!(!runtime.is_dirty());
+            drop(runtime.update(RepositoryAction::Redo { card }));
+            assert_eq!(buffer_text(&runtime), changed);
+            assert!(runtime.is_dirty());
+        }
     }
 
     #[test]

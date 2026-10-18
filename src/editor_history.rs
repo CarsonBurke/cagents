@@ -171,7 +171,8 @@ impl History {
     }
 
     /// Identifies this exact point in the undo graph, independent of stack
-    /// length, pruning and coalescing. Saving seals the active transaction.
+    /// length, pruning and coalescing. Explicit Save seals the active
+    /// transaction; background autosave preserves the current typing group.
     pub fn revision(&self) -> u64 {
         self.revision
     }
