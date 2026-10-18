@@ -1381,6 +1381,22 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
+    /// Consume only the immutable witness minted by the authenticated client
+    /// handshake. Two descriptor values cannot authorize a retained reset.
+    #[cfg(feature = "ui")]
+    pub(crate) fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<()> {
+        if !recovery.validate() {
+            return Err(StoreError::InvalidState(
+                "Invalid authenticated chat recovery witness".into(),
+            ));
+        }
+        self.rebind_chat_descriptor(card_id, recovery.source(), recovery.replacement())
+    }
+
     fn rebind_chat_descriptor(
         &self,
         card_id: CardId,

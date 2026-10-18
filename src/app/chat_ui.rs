@@ -6911,13 +6911,14 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        if let Some((source, resolved)) = handle.upgrade_recovery() {
+                        if let Some(recovery) = handle.authenticated_upgrade_recovery() {
+                            let source = recovery.source();
+                            let resolved = recovery.replacement();
                             let replacement = handle.session();
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || &replacement != resolved
-                                || !(chat::is_upgrade_recovery(source, &replacement)
-                                    || chat::is_upgrade_identity_learning(source, &replacement))
+                                || !recovery.validate()
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6931,10 +6932,9 @@ impl Cagents {
                                     .as_ref()
                                     .ok_or_else(|| "Session storage is unavailable".to_owned())
                                     .and_then(|writer| {
-                                        writer.rebind_chat_upgrade(
+                                        writer.rebind_authenticated_chat_upgrade(
                                             target.card,
-                                            source.clone(),
-                                            replacement,
+                                            recovery.clone(),
                                         )
                                     });
                                 self.chat_ui
@@ -20288,9 +20288,17 @@ mod tests {
     }
     #[test]
     fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for (stale_reply, codex_resume) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        // pre-ID learning, Codex normalization, and grant-bound retained reset.
+        for (stale_reply, mode, refused) in [
+            (false, 0, false),
+            (true, 0, false),
+            (false, 1, false),
+            (true, 1, false),
+            (false, 2, false),
+            (true, 2, false),
+            (false, 2, true),
+        ] {
+            let codex_resume = mode == 1;
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
             let mut source = chat_runtime(&app, card).session.clone();
@@ -20311,11 +20319,13 @@ mod tests {
             } else {
                 source.launch.provider = Provider::Claude;
                 source.launch.recipe.program = "claude".into();
-                source.launch.session_id = None;
+                source.launch.session_id = (mode == 2).then(|| KNOWN_THREAD.into());
                 source.native_continuity =
                     chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
             }
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let draft = "Keep this unsent thought\n  with λ and spacing";
+            write(&mut app, card, draft);
             let directory = tempfile::tempdir().unwrap();
             let (writer, _) = crate::session::SessionRuntime::open(
                 directory.path().join("state.sqlite3"),
@@ -20329,6 +20339,10 @@ mod tests {
                 .unwrap()
                 .flush(Duration::from_secs(10))
                 .unwrap();
+            let fault = rusqlite::Connection::open(directory.path().join("state.sqlite3")).unwrap();
+            if refused {
+                fault.execute_batch("CREATE TRIGGER refuse_upgrade BEFORE UPDATE OF content_json ON cards BEGIN SELECT RAISE(ABORT, 'fixture refused upgraded identity'); END;").unwrap();
+            }
             let mut replacement = source.clone();
             replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
             if codex_resume {
@@ -20339,6 +20353,17 @@ mod tests {
                     .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
             } else {
                 replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            }
+            if mode == 2 {
+                assert!(
+                    app.session
+                        .as_ref()
+                        .unwrap()
+                        .operation_store()
+                        .rebind_chat_upgrade(card, &source, &replacement)
+                        .is_err(),
+                    "raw Session values cannot authorize a retained reset"
+                );
             }
             let handle = Arc::new(
                 ClientHandle::fixture_upgrade_handshake(
@@ -20352,6 +20377,7 @@ mod tests {
                 )
                 .unwrap(),
             );
+            app.chat_forget(card);
             let target = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
@@ -20373,7 +20399,56 @@ mod tests {
                 CardKind::Chat(source.clone())
             );
             assert!(!app.cards.contains_key(&card));
+            assert_eq!(app.chat_ui.drafts.get(&card).unwrap(), draft);
+            // This changed old-source autosave must translate only after the ordered CAS succeeds.
+            app.card_state_mut(card).unwrap().title = "Edited while recovery waits".into();
+            app.persist();
             let receipt = account_commit_reply(task);
+            if refused {
+                assert!(matches!(
+                    &receipt,
+                    Message::ChatUi(Action::UpgradeCommitted(_, _, Err(_)))
+                ));
+                let _ = app.update(receipt);
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(source.clone())
+                );
+                assert!(!app.chat_start_pending(card));
+                assert!(!matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+                assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+                fault.execute_batch("DROP TRIGGER refuse_upgrade;").unwrap();
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_card(card, None)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(source.clone())
+                );
+                drop(app.session.take());
+                let reopened = crate::persistence::StateStore::open(
+                    directory.path().join("state.sqlite3"),
+                    crate::model::BootId::new("boot-test"),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.load_card(card, None).unwrap().unwrap().kind,
+                    CardKind::Chat(source)
+                );
+                assert_eq!(
+                    reopened
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
+                );
+                continue;
+            }
             assert!(matches!(
                 receipt,
                 Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
@@ -20402,6 +20477,7 @@ mod tests {
                     CardKind::Chat(replacement.clone())
                 );
                 assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                assert_eq!(chat_runtime(&app, card).composer.text(), draft);
                 app.persist();
                 let writer = app.session.as_ref().unwrap();
                 writer.flush(Duration::from_secs(10)).unwrap();
@@ -20413,7 +20489,34 @@ mod tests {
                         .unwrap()
                         .unwrap()
                         .kind,
+                    CardKind::Chat(replacement.clone())
+                );
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
+                );
+                drop(app.session.take());
+                let reopened = crate::persistence::StateStore::open(
+                    directory.path().join("state.sqlite3"),
+                    crate::model::BootId::new("boot-test"),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.load_card(card, None).unwrap().unwrap().kind,
                     CardKind::Chat(replacement)
+                );
+                assert_eq!(
+                    reopened
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
                 );
             }
         }

@@ -386,6 +386,8 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    #[cfg(feature = "ui")]
+    AuthenticatedUpgrade(crate::chat::client::UpgradeRecovery),
 }
 
 #[derive(Debug)]
@@ -803,6 +805,25 @@ impl SessionRuntime {
             });
         changed.notify_one();
         Ok(receiver)
+    }
+
+    /// Queue a grant-bound attachment and await the same one-shot durable
+    /// receipt as ordinary recovery. Descriptor arguments come only from it.
+    #[cfg(feature = "ui")]
+    pub(crate) fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: crate::chat::client::UpgradeRecovery,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let source = recovery.source().clone();
+        let replacement = recovery.replacement().clone();
+        self.rebind_chat(
+            ChatRecoveryKind::AuthenticatedUpgrade(recovery),
+            card_id,
+            source,
+            replacement,
+        )
     }
 
     fn rebind_chat(
@@ -1387,6 +1408,17 @@ trait SessionStore {
             "This store does not support retained chat copies".into(),
         ))
     }
+
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        _card_id: CardId,
+        _recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support authenticated chat recovery".into(),
+        ))
+    }
     fn rebind_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1482,6 +1514,14 @@ impl SessionStore for StateStore {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_authenticated_chat_upgrade(self, card_id, recovery)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1586,6 +1626,14 @@ impl SessionStore for Arc<StateStore> {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    #[cfg(feature = "ui")]
+    fn rebind_authenticated_chat_upgrade(
+        &self,
+        card_id: CardId,
+        recovery: &crate::chat::client::UpgradeRecovery,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_authenticated_chat_upgrade(self, card_id, recovery)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -2020,6 +2068,18 @@ impl PendingWrites {
                             &recovery.source,
                             &recovery.replacement,
                         ),
+                        #[cfg(feature = "ui")]
+                        ChatRecoveryKind::AuthenticatedUpgrade(witness) => {
+                            if witness.source() != &recovery.source
+                                || witness.replacement() != &recovery.replacement
+                            {
+                                Err(StoreError::InvalidState(
+                                    "Authenticated recovery payload changed before commit".into(),
+                                ))
+                            } else {
+                                store.rebind_authenticated_chat_upgrade(recovery.card, &witness)
+                            }
+                        }
                     };
                     if result.is_ok() {
                         self.chat_rebindings

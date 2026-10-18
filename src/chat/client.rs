@@ -141,10 +141,99 @@ impl SourceClock {
     }
 }
 
+/// An exact recovery authenticated on one daemon stream and confirmed by its
+/// grant-bound attachment. This is deliberately neither serializable nor
+/// constructible from descriptors outside the handshake.
+#[derive(Clone, Debug)]
+pub(crate) struct UpgradeRecovery {
+    sessions: (Session, Session),
+    kind: UpgradeRecoveryKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UpgradeRecoveryKind {
+    Exact,
+    FirstIdentity,
+    BoundRetainedReset,
+}
+
+impl UpgradeRecovery {
+    fn candidate(source: &Session, replacement: &Session) -> Option<UpgradeRecoveryKind> {
+        if super::is_upgrade_recovery(source, replacement) {
+            return Some(UpgradeRecoveryKind::Exact);
+        }
+        if super::is_upgrade_identity_learning(source, replacement) {
+            return Some(UpgradeRecoveryKind::FirstIdentity);
+        }
+        if !matches!(
+            source.native_continuity,
+            super::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !source.has_valid_native_continuity()
+            || source.launch.session_id.is_none()
+            || replacement.launch.session_id.is_none()
+            || source.launch.session_id == replacement.launch.session_id
+        {
+            return None;
+        }
+        // Shape validation alone grants no authority. The HOST must resolve
+        // the exact issued alias and bind this stream's attachment to that
+        // helper, including its actor identity and attachment epoch.
+        let mut normalized = source.clone();
+        normalized.launch.session_id = replacement.launch.session_id.clone();
+        super::is_upgrade_recovery(&normalized, replacement)
+            .then_some(UpgradeRecoveryKind::BoundRetainedReset)
+    }
+
+    fn confirmed(
+        source: Session,
+        replacement: Session,
+        attached: &Session,
+        snapshot: &Snapshot,
+    ) -> Result<Self, StartFailure> {
+        if attached != &replacement || snapshot.session_id != replacement.launch.session_id {
+            return Err(
+                "The attached conversation did not confirm the daemon's exact upgrade replacement"
+                    .into(),
+            );
+        }
+        let kind = Self::candidate(&source, &replacement)
+            .ok_or("The authenticated upgrade changed the saved conversation configuration")?;
+        Ok(Self {
+            sessions: (source, replacement),
+            kind,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &Session {
+        &self.sessions.0
+    }
+    pub(crate) fn replacement(&self) -> &Session {
+        &self.sessions.1
+    }
+
+    pub(crate) fn validate(&self) -> bool {
+        matches!(
+            (
+                self.kind,
+                Self::candidate(self.source(), self.replacement())
+            ),
+            (UpgradeRecoveryKind::Exact, Some(UpgradeRecoveryKind::Exact))
+                | (
+                    UpgradeRecoveryKind::FirstIdentity,
+                    Some(UpgradeRecoveryKind::FirstIdentity)
+                )
+                | (
+                    UpgradeRecoveryKind::BoundRetainedReset,
+                    Some(UpgradeRecoveryKind::BoundRetainedReset)
+                )
+        )
+    }
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
-    upgrade_recovery: Option<(Session, Session)>,
+    upgrade_recovery: Option<UpgradeRecovery>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -511,9 +600,7 @@ fn restore(
                     && restored.launch.provider == session.launch.provider =>
             {
                 if session != restored {
-                    if !(super::is_upgrade_recovery(&session, &restored)
-                        || super::is_upgrade_identity_learning(&session, &restored))
-                    {
+                    if UpgradeRecovery::candidate(&session, &restored).is_none() {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
                     *upgrade_recovery = Some((session, restored.clone()));
@@ -621,7 +708,7 @@ impl ClientHandle {
         let mut handle = Self::fixture(session.clone(), snapshot);
         let inner = Arc::get_mut(&mut handle.inner).unwrap();
         inner.proof = proof;
-        inner.upgrade_recovery = Some((source, session));
+        inner.upgrade_recovery = Some(UpgradeRecovery { sessions: (source, session), kind: UpgradeRecoveryKind::Exact });
         handle
     }
 
@@ -1117,14 +1204,11 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
-        if let Some((_, resolved)) = &upgrade_recovery
-            && (&session != resolved || initial.session_id != resolved.launch.session_id)
-        {
-            return Err(
-                "The attached conversation did not confirm the daemon's exact upgrade replacement"
-                    .into(),
-            );
-        }
+        let upgrade_recovery = upgrade_recovery
+            .map(|(source, resolved)| {
+                UpgradeRecovery::confirmed(source, resolved, &session, &initial)
+            })
+            .transpose()?;
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
@@ -1399,6 +1483,12 @@ impl ClientHandle {
         session
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+        self.inner
+            .upgrade_recovery
+            .as_ref()
+            .map(|recovery| &recovery.sessions)
+    }
+    pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
     }
     pub(crate) fn is_connected(&self) -> bool {
@@ -3089,6 +3179,108 @@ mod tests {
                 assert_eq!(handle.upgrade_recovery(), Some(&(source, expected)));
             } else {
                 assert!(result.is_err(), "case {case} must refuse");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_reset_candidates_reject_changed_configuration_before_attach() {
+        let live = host_proof("live");
+        let mut source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "claude".into();
+        source.native_continuity =
+            super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let mut resolved = source.clone();
+        resolved.proof = Some(live.clone());
+        resolved.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        for mutation in 0..9 {
+            let mut changed = resolved.clone();
+            match mutation {
+                0 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                1 => changed.launch.recipe.working_directory = "/other-project".into(),
+                2 => changed.launch.recipe.program = "other-provider".into(),
+                3 => changed.launch.recipe.arguments.push("--other-model".into()),
+                4 => changed.launch.provider = crate::agent::Provider::Omp,
+                5 => {
+                    changed.native_continuity =
+                        super::super::NativeContinuity::RetainedClaudeActor { protocol: 1 }
+                }
+                6 => changed.launch.session_id = Some("invalid-uuid".into()),
+                7 => changed.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                _ => changed.id = TerminalId::new(),
+            }
+            let (outcome, _, candidate) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved { session: changed },
+                },
+            );
+            assert!(outcome.is_err(), "mutation {mutation}");
+            assert!(
+                candidate.is_none(),
+                "invalid resolution cannot become a recovery candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_reset_witness_requires_exact_attachment_and_snapshot_confirmation() {
+        for mismatch in 0..3 {
+            let mut source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.native_continuity =
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let mut resolved = source.clone();
+            resolved.proof = Some(host_proof("live"));
+            resolved.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+            assert!(!super::super::is_upgrade_recovery(&source, &resolved));
+            assert!(!super::super::is_upgrade_identity_learning(
+                &source, &resolved
+            ));
+            let result =
+                restore_with_lineage(source.clone(), Some(resolved.clone()), move |request| {
+                    let ClientRequest::ChatAttach { mut session } = request else {
+                        panic!("resolved recovery must attach without starting");
+                    };
+                    let mut snapshot = Snapshot {
+                        session_id: session.launch.session_id.clone(),
+                        ..Default::default()
+                    };
+                    match mismatch {
+                        1 => {
+                            session
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                        }
+                        2 => snapshot.session_id = Some(CONVERSATION.into()),
+                        _ => {}
+                    }
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached { session, snapshot },
+                    }
+                });
+            if mismatch == 0 {
+                let handle = result.unwrap();
+                let witness = handle.authenticated_upgrade_recovery().unwrap();
+                assert_eq!(witness.source(), &source);
+                assert_eq!(witness.replacement(), &resolved);
+                assert!(matches!(
+                    witness.kind,
+                    UpgradeRecoveryKind::BoundRetainedReset
+                ));
+            } else {
+                assert!(result.is_err(), "mismatch {mismatch}");
             }
         }
     }
