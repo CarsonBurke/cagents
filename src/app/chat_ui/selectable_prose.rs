@@ -1,5 +1,6 @@
 //! Owned selectable rich text: selection uses the same shaped paragraph as prose.
 use super::*;
+use iced::advanced::Renderer as _;
 use iced::advanced::text::{Paragraph, Renderer as TextRenderer};
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
@@ -7,6 +8,7 @@ use iced::advanced::{
 };
 use iced::widget::text::{Span, Wrapping};
 use iced::{Event, Point, Rectangle, Size};
+use unicode_segmentation::UnicodeSegmentation;
 
 type ParagraphBuffer = <cosmic::Renderer as TextRenderer>::Paragraph;
 
@@ -24,9 +26,8 @@ pub(super) struct State {
     /// How the spans were last laid out, which is what they are shaped as
     /// when something asks where a point falls among them.
     shape: Option<Shape>,
-    /// The spans shaped for hit testing, the first time a pointer needs them.
-    /// The child draws from a paragraph of its own, so a block that is only
-    /// read - a streaming one above all - is shaped once rather than twice.
+    /// One paragraph supplies drawing, links and selection hit testing.
+    /// Selection and Find backgrounds do not change the shaped spans.
     paragraph: std::cell::OnceCell<ParagraphBuffer>,
     pub(super) anchor: usize,
     pub(super) end: usize,
@@ -141,7 +142,6 @@ pub(super) fn text(
         font,
         target,
         matches: highlights.ranges,
-        child: widget::text("").into(),
     });
     if truncated {
         widget::column::with_children(vec![
@@ -178,65 +178,88 @@ struct Selectable {
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
-    child: Element<'static, Message>,
 }
 
 impl Selectable {
-    fn selected_spans(&self, state: &State) -> Arc<[Span<'static, String>]> {
-        let start = state.anchor.min(state.end);
-        let end = state.anchor.max(state.end);
-        if start == end && self.matches.is_empty() {
-            return self.spans.clone();
-        }
-        let mut offset = 0;
-        let mut result = Vec::new();
-        for span in self.spans.iter() {
-            let next = offset + span.text.len();
-            let lo = start.clamp(offset, next) - offset;
-            let hi = end.clamp(offset, next) - offset;
-            let mut boundaries = vec![0, lo, hi, span.text.len()];
-            let first = self.matches.partition_point(|found| found.end <= offset);
-            let last = self.matches.partition_point(|found| found.start < next);
-            let matching = &self.matches[first..last];
-            for found in matching {
-                boundaries.push(found.start.clamp(offset, next) - offset);
-                boundaries.push(found.end.clamp(offset, next) - offset);
-            }
-            boundaries.sort_unstable();
-            boundaries.dedup();
-            for pair in boundaries.windows(2) {
-                let range = pair[0]..pair[1];
-                let selected = range.start >= lo && range.end <= hi && lo != hi;
-                let position = offset + range.start;
-                let candidate = matching.partition_point(|found| found.end <= position);
-                let found = matching
-                    .get(candidate)
-                    .is_some_and(|found| found.contains(&position));
-                if range.is_empty() {
-                    continue;
-                }
-                let mut part = span.clone();
-                part.text = span.text[range].to_owned().into();
-                if selected || found {
-                    part.highlight = Some(iced::advanced::text::Highlight {
-                        background: if selected {
-                            design::accent_color(&cosmic::theme::active())
-                        } else {
-                            design::accent_wash(&cosmic::theme::active())
-                        }
-                        .into(),
-                        border: iced::Border::default(),
-                    });
-                }
-                result.push(part);
-            }
-            offset = next;
-        }
-        result.into()
-    }
-
     fn hit(&self, state: &State, position: Point) -> usize {
         hit(state.paragraph(), &self.plain, position)
+    }
+}
+
+/// Paint byte-range backgrounds against the existing shaped glyph runs. This
+/// is independent of syntax span count and never reshapes selected text.
+fn paint_ranges(
+    renderer: &mut cosmic::Renderer,
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    translation: iced::Vector,
+    color: iced::Color,
+) {
+    visit_range_bounds(paragraph, ranges, |bounds| {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: Rectangle {
+                    x: bounds.x + translation.x,
+                    y: bounds.y + translation.y,
+                    ..bounds
+                },
+                ..Default::default()
+            },
+            color,
+        );
+    });
+}
+
+fn visit_range_bounds(
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    mut paint: impl FnMut(Rectangle),
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
+    let mut offset = 0;
+    for line in &paragraph.buffer().lines {
+        starts.push(offset);
+        offset += line.text().len() + line.ending().as_str().len();
+    }
+    for run in paragraph.buffer().layout_runs() {
+        let prefix = starts[run.line_i];
+        let mut bounds: Option<(f32, f32)> = None;
+        let mut flush = |bounds: &mut Option<(f32, f32)>| {
+            if let Some((left, right)) = bounds.take() {
+                paint(Rectangle::new(
+                    Point::new(left, run.line_top),
+                    Size::new(right - left, run.line_height),
+                ));
+            }
+        };
+        for glyph in run.glyphs {
+            // Buffer::hit divides a shaped cluster into equal-width grapheme
+            // regions. Paint those same regions so a partial ligature copies
+            // and highlights the same text, without reshaping the paragraph.
+            let cluster = &run.text[glyph.start..glyph.end];
+            let width = glyph.w / cluster.graphemes(true).count().max(1) as f32;
+            for (index, (byte, grapheme)) in cluster.grapheme_indices(true).enumerate() {
+                let start = prefix + glyph.start + byte;
+                let end = start + grapheme.len();
+                let found = ranges.partition_point(|range| range.end <= start);
+                if ranges.get(found).is_some_and(|range| range.start < end) {
+                    let left = glyph.x + index as f32 * width;
+                    let right = left + width;
+                    if let Some((lo, hi)) = bounds.as_mut() {
+                        *lo = lo.min(left);
+                        *hi = hi.max(right);
+                    } else {
+                        bounds = Some((left, right));
+                    }
+                } else {
+                    flush(&mut bounds);
+                }
+            }
+        }
+        flush(&mut bounds);
     }
 }
 
@@ -290,10 +313,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn state(&self) -> tree::State {
         tree::State::new(State::default())
     }
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.child)]
-    }
-    fn diff(&mut self, _tree: &mut Tree) {}
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
     }
@@ -343,16 +362,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        self.child = iced::widget::rich_text(self.selected_spans(state))
-            .size(self.size)
-            .font(self.font)
-            .wrapping(Wrapping::WordOrGlyph)
-            .into();
-        tree.children[0].diff(&mut self.child);
-        self.child
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
+        layout::Node::new(limits.resolve(
+            Length::Shrink,
+            Length::Shrink,
+            state.paragraph().min_bounds(),
+        ))
     }
+
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -370,18 +386,86 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         theme: &cosmic::Theme,
         defaults: &renderer::Style,
         layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.child.as_widget().draw(
-            &tree.children[0],
+        if !layout.bounds().intersects(viewport) {
+            return;
+        }
+        let state = tree.state.downcast_ref::<State>();
+        let paragraph = state.paragraph();
+        let translation = layout.position() - Point::ORIGIN;
+        // Preserve inline code surfaces, emphasis, links and strike-throughs
+        // without allocating a second rich-text widget or shaped buffer.
+        for (index, span) in self.spans.iter().enumerate() {
+            if span.highlight.is_none() {
+                continue;
+            }
+            for bounds in paragraph.span_bounds(index) {
+                if let Some(highlight) = span.highlight {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle::new(
+                                bounds.position()
+                                    - iced::Vector::new(span.padding.left, span.padding.top),
+                                bounds.size() + Size::new(span.padding.x(), span.padding.y()),
+                            ) + translation,
+                            border: highlight.border,
+                            ..Default::default()
+                        },
+                        highlight.background,
+                    );
+                }
+            }
+        }
+        paint_ranges(
             renderer,
-            theme,
-            defaults,
-            layout,
-            cursor,
-            viewport,
+            paragraph,
+            &self.matches,
+            translation,
+            design::accent_wash(theme),
         );
+        let selection = state.anchor.min(state.end)..state.anchor.max(state.end);
+        if !selection.is_empty() {
+            paint_ranges(
+                renderer,
+                paragraph,
+                &[selection],
+                translation,
+                design::accent_color(theme),
+            );
+        }
+        // Decorations remain visible over opaque selection/Find backgrounds.
+        for (index, span) in self.spans.iter().enumerate() {
+            if !span.underline && !span.strikethrough {
+                continue;
+            }
+            for bounds in paragraph.span_bounds(index) {
+                let size = span.size.unwrap_or(self.size);
+                let line_height = span.line_height.unwrap_or_default().to_absolute(size).0;
+                let baseline = size.0 + (line_height - size.0) / 2.0;
+                for (draw, shift) in [
+                    (span.underline, size.0 * 0.08),
+                    (span.strikethrough, size.0 / 2.0),
+                ] {
+                    if draw {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle::new(
+                                    bounds.position()
+                                        + translation
+                                        + iced::Vector::new(0.0, baseline - shift),
+                                    Size::new(bounds.width, 1.0),
+                                ),
+                                ..Default::default()
+                            },
+                            span.color.unwrap_or(defaults.text_color),
+                        );
+                    }
+                }
+            }
+        }
+        renderer.fill_paragraph(paragraph, layout.position(), defaults.text_color, *viewport);
     }
     fn update(
         &mut self,
@@ -397,6 +481,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         let state = tree.state.downcast_mut::<State>();
         if std::mem::take(&mut state.dirty) {
             shell.invalidate_layout();
+            shell.request_redraw();
         }
         if state.managed {
             return;
@@ -404,6 +489,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.dragging = false;
         }
+        let previous = state.anchor.min(state.end)..state.anchor.max(state.end);
         state.validate_selection(&self.plain);
         let position = cursor.position_in(layout.bounds());
         match event {
@@ -470,6 +556,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
             _ => {}
         }
+        if previous != (state.anchor.min(state.end)..state.anchor.max(state.end)) {
+            shell.request_redraw();
+        }
     }
     fn mouse_interaction(
         &self,
@@ -497,6 +586,289 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_and_find_preserve_markdown_strikes_and_span_underlines() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "~~x       x~~".to_owned(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let markdown::Item::Paragraph(text) = &cached.markdown.items()[0] else {
+            panic!("fixture must render as an ordinary Markdown paragraph");
+        };
+        let authored = text.spans(markdown::Style::from(iced::Theme::Light));
+        assert!(authored.iter().all(|span| span.strikethrough));
+        for underline in [false, true] {
+            // Integer decoration positions isolate an opaque foreground pixel
+            // inside whitespace, where text glyphs cannot hide a lost stroke.
+            let (size, line_height, stroke_y) = if underline {
+                (25.0_f32, 31.0_f32, 26)
+            } else {
+                (20.0_f32, 24.0_f32, 12)
+            };
+            for mode in 0..3 {
+                let mut renderer = crate::app::tests::headless_renderer();
+                let spans: Arc<[_]> = authored
+                    .iter()
+                    .cloned()
+                    .map(|mut span| {
+                        span.color = Some(iced::Color::BLACK);
+                        span.underline = underline;
+                        span.strikethrough = !underline;
+                        span.line_height =
+                            Some(iced::widget::text::LineHeight::Absolute(line_height.into()));
+                        span
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                let plain: Arc<str> = spans
+                    .iter()
+                    .map(|span| span.text.as_ref())
+                    .collect::<String>()
+                    .into();
+                let mut selectable = Selectable {
+                    plain: plain.clone(),
+                    spans,
+                    matches: vec![],
+                    size: size.into(),
+                    font: iced::Font::default(),
+                    target: Target {
+                        card: CardId::new(),
+                        generation: 0,
+                    },
+                };
+                let mut tree =
+                    Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+                let node = selectable.layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0)),
+                );
+                let state = tree.state.downcast_mut::<State>();
+                let x = state
+                    .paragraph()
+                    .buffer()
+                    .layout_runs()
+                    .find_map(|run| {
+                        run.glyphs
+                            .iter()
+                            .find(|glyph| run.text[glyph.start..glyph.end].trim().is_empty())
+                            .map(|glyph| (glyph.x + glyph.w * 0.5) as usize)
+                    })
+                    .expect("fixture must contain a shaped whitespace region");
+                match mode {
+                    1 => {
+                        state.anchor = 0;
+                        state.end = plain.len();
+                    }
+                    2 => selectable.matches = vec![0..plain.len()],
+                    _ => {}
+                }
+                let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+                renderer.reset(viewport);
+                selectable.draw(
+                    &tree,
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+                assert_eq!(
+                    &pixels[(stroke_y * 400 + x) * 4..][..4],
+                    &[0, 0, 0, 255],
+                    "decoration disappears over highlight: underline={underline}, mode={mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_paints_every_selected_glyph_across_bidirectional_visual_runs() {
+        assert_bidirectional_paint(false);
+    }
+
+    #[test]
+    fn find_paints_every_matching_glyph_across_bidirectional_visual_runs() {
+        assert_bidirectional_paint(true);
+    }
+
+    #[test]
+    fn selection_and_find_paint_only_the_hit_testable_part_of_a_ligature() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        for (source, expected, rtl) in [("office affinity", "f", false), ("لا", "ل", true)] {
+            for find in [false, true] {
+                let mut renderer = crate::app::tests::headless_renderer();
+                let mut selectable = Selectable {
+                    plain: source.into(),
+                    spans: vec![Span::new(source)].into(),
+                    matches: vec![],
+                    size: 32.0.into(),
+                    font: iced::Font::with_name("DejaVu Sans"),
+                    target: Target {
+                        card: CardId::new(),
+                        generation: 0,
+                    },
+                };
+                let mut tree =
+                    Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+                let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0));
+                let node = selectable.layout(&mut tree, &renderer, &limits);
+                let state = tree.state.downcast_mut::<State>();
+                let (start, end, x, y, width, count) = state
+                    .paragraph()
+                    .buffer()
+                    .layout_runs()
+                    .find_map(|run| {
+                        run.glyphs.iter().find_map(|glyph| {
+                            let cluster = &run.text[glyph.start..glyph.end];
+                            let count = cluster.graphemes(true).count();
+                            (count > 1).then(|| {
+                                (
+                                    glyph.start,
+                                    glyph.start + cluster.graphemes(true).next().unwrap().len(),
+                                    glyph.x,
+                                    run.line_top,
+                                    glyph.w / count as f32,
+                                    count,
+                                )
+                            })
+                        })
+                    })
+                    .expect("fixture font must shape a real multi-grapheme ligature");
+                assert_eq!(
+                    state.hit(Point::new(
+                        x + width * if rtl { 0.25 } else { 0.75 },
+                        y + 1.0
+                    )),
+                    end,
+                    "the first ligature component must expose its own caret endpoint"
+                );
+                assert_eq!(&source[start..end], expected);
+                if find {
+                    selectable.matches = vec![start..end];
+                } else {
+                    state.anchor = start;
+                    state.end = end;
+                }
+                let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+                renderer.reset(viewport);
+                selectable.draw(
+                    &tree,
+                    &mut renderer,
+                    &cosmic::theme::active(),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &viewport,
+                );
+                let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+                let color = if find {
+                    design::accent_wash(&cosmic::theme::active())
+                } else {
+                    design::accent_color(&cosmic::theme::active())
+                }
+                .into_rgba8();
+                for part in 0..count {
+                    let px = (x + width * (part as f32 + 0.5)) as usize;
+                    let py = (y + 1.0) as usize;
+                    let painted = pixels[(py * 400 + px) * 4..][..4]
+                        .iter()
+                        .zip(color)
+                        .all(|(actual, expected)| actual.abs_diff(expected) <= 1);
+                    assert_eq!(painted, part == 0, "ligature component {part}, find={find}");
+                }
+            }
+        }
+    }
+
+    fn assert_bidirectional_paint(find: bool) {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let source = "hello שלום world";
+        let mut selectable = Selectable {
+            plain: source.into(),
+            spans: vec![Span::new(source)].into(),
+            matches: vec![],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+        };
+        let mut tree =
+            Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 100.0));
+        selectable.layout(&mut tree, &renderer, &limits);
+        // A logical selection cuts the RTL word and continues into LTR text.
+        // Its selected glyphs are separated by an unselected visual glyph.
+        let start = "hello ש".len();
+        let state = tree.state.downcast_mut::<State>();
+        if find {
+            selectable.matches = vec![start..source.len()];
+        } else {
+            state.anchor = start;
+            state.end = source.len();
+        }
+        let node = selectable.layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        let probes: Vec<_> = state
+            .paragraph()
+            .buffer()
+            .layout_runs()
+            .flat_map(|run| {
+                run.glyphs.iter().map(move |glyph| {
+                    (
+                        glyph.start,
+                        (glyph.x + glyph.w * 0.5) as usize,
+                        (run.line_top + 1.0) as usize,
+                    )
+                })
+            })
+            .collect();
+        let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
+        renderer.reset(viewport);
+        selectable.draw(
+            &tree,
+            &mut renderer,
+            &cosmic::theme::active(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let pixels = renderer.screenshot(Size::new(400, 100), 1.0, iced::Color::WHITE);
+        let selected = if find {
+            design::accent_wash(&cosmic::theme::active())
+        } else {
+            design::accent_color(&cosmic::theme::active())
+        }
+        .into_rgba8();
+        for (byte, x, y) in probes {
+            let pixel = &pixels[(y * 400 + x) * 4..][..4];
+            let painted = pixel
+                .iter()
+                .zip(selected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1);
+            assert_eq!(
+                painted,
+                byte >= start,
+                "selection paint disagrees at source byte {byte}, pixel ({x}, {y}): {pixel:?}"
+            );
+        }
+    }
+
     #[test]
     fn prose_exposes_full_text_and_stable_accessible_identity() {
         let element = text(
@@ -545,7 +917,6 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
         };
         let state = State {
             spans: Some(spans),
@@ -589,7 +960,6 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
-            child: widget::text("").into(),
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -687,103 +1057,5 @@ mod tests {
         };
         state.validate_selection("new");
         assert_eq!((state.anchor, state.end, state.dragging), (0, 0, false));
-    }
-
-    #[test]
-    fn selection_preserves_links_fonts_and_unicode_across_span_boundaries() {
-        let spans: Arc<[Span<'static, String>]> = vec![
-            Span::new("before α").font(iced::Font::MONOSPACE),
-            Span::new("β linked").link("src/app.rs:42"),
-        ]
-        .into();
-        let selectable = Selectable {
-            plain: "before αβ linked".into(),
-            spans,
-            matches: vec![],
-            size: design::TEXT_PROSE.into(),
-            font: iced::Font::default(),
-            target: Target {
-                card: CardId::new(),
-                generation: 0,
-            },
-            child: widget::text("").into(),
-        };
-        let state = State {
-            anchor: "before ".len(),
-            end: "before αβ".len(),
-            ..State::default()
-        };
-        let selected = selectable.selected_spans(&state);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|span| span.text.as_ref())
-                .collect::<String>(),
-            selectable.plain.as_ref()
-        );
-        assert_eq!(
-            selected
-                .iter()
-                .filter(|span| span.highlight.is_some())
-                .map(|span| span.text.as_ref())
-                .collect::<String>(),
-            "αβ"
-        );
-        assert!(
-            selected
-                .iter()
-                .any(|span| span.link.as_deref() == Some("src/app.rs:42"))
-        );
-        assert_eq!(selected[0].font, Some(iced::Font::MONOSPACE));
-    }
-
-    #[test]
-    fn unicode_find_highlights_original_text_across_syntax_spans() {
-        let selectable = Selectable {
-            plain: "Straße CAFÉ".into(),
-            spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
-            matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
-            size: design::TEXT_PROSE.into(),
-            font: iced::Font::default(),
-            target: Target {
-                card: CardId::new(),
-                generation: 0,
-            },
-            child: widget::text("").into(),
-        };
-        assert_eq!(
-            selectable
-                .selected_spans(&State::default())
-                .iter()
-                .filter(|span| span.highlight.is_some())
-                .map(|span| span.text.as_ref())
-                .collect::<String>(),
-            "Straße"
-        );
-    }
-
-    #[test]
-    fn find_marks_only_the_matching_text() {
-        let selectable = Selectable {
-            plain: "one needle two".into(),
-            spans: vec![Span::new("one needle two")].into(),
-            matches: vec![4..10],
-            size: design::TEXT_PROSE.into(),
-            font: iced::Font::default(),
-            target: Target {
-                card: CardId::new(),
-                generation: 0,
-            },
-            child: widget::text("").into(),
-        };
-        let spans = selectable.selected_spans(&State::default());
-        assert_eq!(
-            spans
-                .iter()
-                .filter(|span| span.highlight.is_some())
-                .map(|span| span.text.as_ref())
-                .collect::<String>(),
-            "needle"
-        );
     }
 }

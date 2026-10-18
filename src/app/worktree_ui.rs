@@ -197,6 +197,7 @@ fn scope_descriptor(
         // was shared with which registry.
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
+        pending_chat_admissions: Default::default(),
         pending_terminal_creations: HashSet::new(),
     }
 }

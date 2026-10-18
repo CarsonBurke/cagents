@@ -1138,6 +1138,9 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
     ) -> Element<'a, Message> {
+        if self.awaiting_admission() {
+            return self.pending_admission_view();
+        }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
         let available = !transitioning
@@ -1893,7 +1896,7 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
-            // Up on a draft's first line starts browsing sent messages.
+            // Up first asks the native editor to resolve its rendered rows.
             // While browsing, both arrows walk whole history entries so a
             // multiline recalled prompt cannot trap the original draft.
             let (recall_older, recall_newer) = self.history_navigation();
@@ -1984,14 +1987,14 @@ impl Runtime {
                             target, mode,
                         ))));
                     }
-                    if take_back && queue_key(&press, !has_text) {
+                    if take_back && queue_key(&press, self.composer.is_empty()) {
                         return Some(text_editor::Binding::Custom(action(
                             Action::TakeBackQueued(target, None),
                         )));
                     }
                     if let Some(older) = history_key(&press, recall_older, recall_newer) {
                         return Some(text_editor::Binding::Custom(action(if older {
-                            Action::HistoryOlder(target)
+                            Action::ComposerUp(target)
                         } else {
                             Action::HistoryNewer(target)
                         })));
@@ -7318,10 +7321,10 @@ mod tests {
     }
 
     #[test]
-    fn up_reaches_the_queue_from_the_first_line_and_alt_up_from_anywhere() {
+    fn up_reaches_the_queue_from_an_empty_draft_and_alt_up_from_anywhere() {
         use keyboard::Modifiers;
         use keyboard::key::Named;
-        for (named, modifiers, first_line, expected) in [
+        for (named, modifiers, empty, expected) in [
             (Named::ArrowUp, Modifiers::empty(), true, true),
             (Named::ArrowUp, Modifiers::empty(), false, false),
             (Named::ArrowUp, Modifiers::ALT, false, true),
@@ -7338,9 +7341,9 @@ mod tests {
             (Named::ArrowDown, Modifiers::ALT, true, false),
         ] {
             assert_eq!(
-                queue_key(&key(named, modifiers), first_line),
+                queue_key(&key(named, modifiers), empty),
                 expected,
-                "{named:?} {modifiers:?} first_line={first_line}"
+                "{named:?} {modifiers:?} empty={empty}"
             );
         }
         let mut unfocused = key(Named::ArrowUp, Modifiers::empty());

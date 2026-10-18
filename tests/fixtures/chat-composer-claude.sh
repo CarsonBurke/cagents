@@ -42,6 +42,34 @@ persist_record() {
     parent=$(printf '%s' "$record" | jq -r '.uuid')
 }
 
+# Optional tool-heavy transcript for compact activity/disclosure acceptance.
+# Every final frame is recorded through the same history path as live frames.
+emit_record() {
+    persist_record "$1"
+    printf '%s\n' "$1"
+}
+verbosity_turn() {
+    input=$(jq -cn '{path:"src/app.rs",prompt:("Internal skill and protocol framing.\n" * 80)}')
+    first=$(printf '%s' "$input" | jq -Rs '.[0:30]')
+    rest=$(printf '%s' "$input" | jq -Rs '.[30:]')
+    jq -cn --arg id "verbosity-inspect-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+    jq -cn --arg id "inspect-$turn" '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:$id,name:"mcp__fixture__inspect",input:{}}}}'
+    for delta in "$first" "$rest"; do
+        jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:$delta}}}'
+        # Leave each partial state observable by the native UI.
+        sleep 1
+    done
+    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+    emit_record "$(jq -cn --arg turn "$turn" --argjson input "$input" '{type:"assistant",uuid:("verbosity-inspect-"+$turn),message:{id:("verbosity-inspect-"+$turn),role:"assistant",content:[{type:"tool_use",id:("inspect-"+$turn),name:"mcp__fixture__inspect",input:$input}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-inspect-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("inspect-"+$turn),content:"Complete document\nInternal successful protocol framing"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("verbosity-skill-"+$turn),message:{id:("verbosity-skill-"+$turn),role:"assistant",content:[{type:"tool_use",id:("skill-"+$turn),name:"Skill",input:{skill:"writing-copy",args:("Internal skill instructions. " * 80)}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-skill-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("skill-"+$turn),content:"Internal skill instructions loaded"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("verbosity-denied-"+$turn),message:{id:("verbosity-denied-"+$turn),role:"assistant",content:[{type:"tool_use",id:("denied-"+$turn),name:"mcp__fixture__inspect",input:{path:"private.txt",prompt:"Internal framing"}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-denied-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("denied-"+$turn),is_error:true,content:"Attempted read\nPermission denied"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("verbosity-shell-"+$turn),message:{id:("verbosity-shell-"+$turn),role:"assistant",content:[{type:"tool_use",id:("shell-"+$turn),name:"Bash",input:{command:"cat <<EOF\nheredoc payload stays in detail\nEOF"}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-shell-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("shell-"+$turn),content:"Shell fixture complete"}]}}')"
+}
+
 busy=false
 fast=off
 fast_fixture=${CAGENTS_FIXTURE_FAST_MODE:-0}
@@ -92,6 +120,7 @@ while IFS= read -r frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                if [ "${CAGENTS_FIXTURE_VERBOSITY:-0}" = 1 ]; then verbosity_turn; fi
                 assistant=$(jq -cn --arg turn "$turn" \
                     '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"

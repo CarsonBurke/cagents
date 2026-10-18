@@ -1078,17 +1078,21 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     }
                 }
             }
+            let mut apply = Apply {
+                ranges: ranges.as_deref().unwrap_or(&[]),
+                index: 0,
+                changed: 0,
+                exchanges: Vec::new(),
+            };
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
                 renderer,
-                &mut Apply {
-                    ranges: ranges.as_deref().unwrap_or(&[]),
-                    index: 0,
-                    changed: 0,
-                    exchanges: Vec::new(),
-                },
+                &mut apply,
             );
+            if apply.changed > 0 {
+                shell.request_redraw();
+            }
         }
         // Let changed prose invalidate its retained exchange through its own
         // shell before consuming the event at the transcript boundary.
@@ -1140,6 +1144,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             );
             if apply.changed > 0 {
                 shell.invalidate_layout();
+                shell.request_redraw();
             }
         }
         if captured {
@@ -1213,6 +1218,275 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_selection_schedules_frames_before_painting_managed_and_standalone_text() {
+        use iced::advanced::renderer::Headless;
+        use iced::runtime::{
+            UserInterface,
+            user_interface::{Cache, State as UiState},
+        };
+
+        // Ctrl+A/C ownership is process-global; keep this contract independent
+        // of other tests that focus a different transcript concurrently.
+        const CHILD: &str = "CAGENTS_TEST_SELECTION_FRAME";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", concat!("app::chat_ui::selection::tests::",
+                    "idle_selection_schedules_frames_before_painting_managed_and_standalone_text"), "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        for managed in [true, false] {
+            let mut renderer = crate::app::tests::headless_renderer();
+            let body = widget::column::with_children(vec![
+                retained::kept(1, || prose("Old block")),
+                retained::kept(2, || prose("hello שלום world")),
+            ])
+            .spacing(20);
+            let element: Element<'_, Message> = if managed { surface(body) } else { body.into() };
+            let size = Size::new(400.0, 120.0);
+            let mut ui = UserInterface::build(element, size, Cache::new(), &mut renderer);
+            let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let bounds = |value: &str| {
+                let r = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| node.node().value() == Some(value))
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap();
+                Rectangle::new(
+                    Point::new(r.x0 as f32, r.y0 as f32),
+                    Size::new((r.x1 - r.x0) as f32, (r.y1 - r.y0) as f32),
+                )
+            };
+            let old = bounds("Old block");
+            let bidi = bounds("hello שלום world");
+            let first = Point::new(old.x, old.y + 2.0);
+            let first_end = Point::new(old.x + old.width - 0.1, first.y);
+            let start = Point::new(bidi.x, bidi.y + 2.0);
+            let end = Point::new(bidi.x + bidi.width - 0.1, start.y);
+            let mut clipboard = ClipboardText::default();
+            let mut pointer = first;
+            let mut event =
+                |ui: &mut UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+                 renderer: &mut cosmic::Renderer,
+                 clipboard: &mut ClipboardText,
+                 event: Event,
+                 expected: Option<iced::window::RedrawRequest>| {
+                    if let Event::Mouse(mouse::Event::CursorMoved { position }) = &event {
+                        pointer = *position;
+                    }
+                    let mut messages = Vec::new();
+                    let (state, _) = ui.update(
+                        &[event],
+                        mouse::Cursor::Available(pointer),
+                        renderer,
+                        clipboard,
+                        &mut messages,
+                    );
+                    assert!(
+                        messages.is_empty(),
+                        "application messages must not supply the missing redraw"
+                    );
+                    let UiState::Updated {
+                        redraw_request,
+                        mouse_interaction,
+                        ..
+                    } = state
+                    else {
+                        panic!("widget-only selection must keep the UI current")
+                    };
+                    assert_eq!(
+                        mouse_interaction,
+                        mouse::Interaction::Text,
+                        "cursor changes must not supply the missing redraw"
+                    );
+                    if let Some(expected) = expected {
+                        assert_eq!(redraw_request, expected, "managed={managed}");
+                    }
+                };
+            let next = Some(iced::window::RedrawRequest::NextFrame);
+            let wait = Some(iced::window::RedrawRequest::Wait);
+            let motion = |position| Event::Mouse(mouse::Event::CursorMoved { position });
+            let press = || Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+            let release = || Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+            // Prime the Text cursor before checking the runtime's frame request.
+            event(&mut ui, &mut renderer, &mut clipboard, motion(first), None);
+            event(&mut ui, &mut renderer, &mut clipboard, press(), None);
+            event(
+                &mut ui,
+                &mut renderer,
+                &mut clipboard,
+                motion(first_end),
+                next,
+            );
+            event(&mut ui, &mut renderer, &mut clipboard, release(), wait);
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let before = renderer.screenshot(Size::new(400, 120), 1.0, iced::Color::WHITE);
+            event(&mut ui, &mut renderer, &mut clipboard, motion(start), None);
+            event(
+                &mut ui,
+                &mut renderer,
+                &mut clipboard,
+                press(),
+                if managed { next } else { None },
+            );
+            event(&mut ui, &mut renderer, &mut clipboard, motion(end), next);
+            event(&mut ui, &mut renderer, &mut clipboard, release(), wait);
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let after = renderer.screenshot(Size::new(400, 120), 1.0, iced::Color::WHITE);
+            let accent = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let painted = |pixels: &[u8], bounds: Rectangle| {
+                let y = (bounds.y + 1.0) as usize;
+                (bounds.x.ceil() as usize..(bounds.x + bounds.width).floor() as usize).any(|x| {
+                    pixels[(y * 400 + x) * 4..][..4]
+                        .iter()
+                        .zip(accent)
+                        .all(|(a, b)| a.abs_diff(b) <= 1)
+                })
+            };
+            assert!(painted(&before, old));
+            assert!(!painted(&before, bidi));
+            assert!(painted(&after, bidi));
+            if managed {
+                assert!(
+                    !painted(&after, old),
+                    "the scheduled frame must clear the previous block"
+                );
+            }
+            event(&mut ui, &mut renderer, &mut clipboard, command("c"), wait);
+            assert_eq!(clipboard.0, "hello שלום world");
+            event(&mut ui, &mut renderer, &mut clipboard, motion(start), None);
+            event(&mut ui, &mut renderer, &mut clipboard, press(), next);
+            event(&mut ui, &mut renderer, &mut clipboard, release(), wait);
+            event(&mut ui, &mut renderer, &mut clipboard, command("a"), next);
+            event(&mut ui, &mut renderer, &mut clipboard, command("a"), wait);
+        }
+    }
+
+    #[test]
+    fn markdown_drag_paints_and_copies_mixed_blocks_in_both_directions() {
+        use iced::advanced::renderer::{Headless, Renderer};
+
+        let source = "# Heading\n\nParagraph α with **bold** and `inline`.\n\n- First item\n- Second item\n\n> Quoted text\n\n| A | B |\n|---|---|\n| left | right |\n\n```rust\nlet value = 42;\n```\n\nLast paragraph.";
+        let expected = "Heading\n\nParagraph α with bold and inline.\n\n- First item\n- Second item\n\nQuoted text\n\nA\tB\nleft\tright\n\nlet value = 42;\n\n\nLast paragraph.";
+        for reverse in [false, true] {
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut element = surface(rendered_markdown(source, |_| {}));
+            let mut tree = Tree::new(&element);
+            let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 1400.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let viewport = Rectangle::with_size(Size::new(600.0, 1400.0));
+            let mut read = Read::new(None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+            assert_eq!(read.blocks.len(), 11, "fixture must mount each block type");
+            let first = read.blocks.first().unwrap().bounds;
+            let last = read.blocks.last().unwrap().bounds;
+            let beginning = Point::new(first.x, first.y + 1.0);
+            let end = Point::new(last.x + last.width - 0.1, last.y + last.height - 1.0);
+            let (start, end) = if reverse {
+                (end, beginning)
+            } else {
+                (beginning, end)
+            };
+            let mut clipboard = ClipboardText::default();
+            for (event, point) in [
+                (
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    start,
+                ),
+                (
+                    Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                    end,
+                ),
+                (
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    end,
+                ),
+            ] {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(point),
+                    &renderer,
+                    &mut clipboard,
+                    &mut shell,
+                    &viewport,
+                );
+                assert!(
+                    shell.is_event_captured(),
+                    "drag must use transcript selection"
+                );
+                if shell.is_layout_invalid() {
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+            }
+            let state = tree.state.downcast_ref::<State>();
+            let ranges = read
+                .ranges(state.anchor.unwrap(), state.end.unwrap())
+                .unwrap();
+            assert_eq!(read.copy(&ranges), expected);
+            renderer.reset(viewport);
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            let pixels = renderer.screenshot(Size::new(600, 1400), 1.0, iced::Color::WHITE);
+            let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            for block in &read.blocks {
+                let y = (block.bounds.y + 1.0) as usize;
+                let painted = (block.bounds.x.ceil() as usize
+                    ..(block.bounds.x + block.bounds.width).floor() as usize)
+                    .any(|x| {
+                        pixels[(y * 600 + x) * 4..][..4]
+                            .iter()
+                            .zip(selected)
+                            .all(|(actual, expected)| actual.abs_diff(expected) <= 1)
+                    });
+                assert!(
+                    painted,
+                    "selected block has no visible highlight (reverse={reverse}): {}",
+                    block.plain
+                );
+            }
+        }
+    }
+
     fn rendered_markdown(
         body: &str,
         change: impl FnOnce(&mut Vec<markdown::Item>),
