@@ -25106,24 +25106,111 @@ mod tests {
     /// puts one file's errors on another file's card.
     #[test]
     fn diagnostics_land_on_the_card_that_owns_the_document() {
+        // Enter without driving: production open registers a manager-owned
+        // version, but discovery and language-server processes never run.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
         let mut app = lsp_test_app();
-        let first = repository_card(&mut app, "/repo/first");
-        let second = repository_card(&mut app, "/repo/second");
-        lsp_state(&mut app, first).document = Some(LspDocumentId(1));
-        lsp_state(&mut app, second).document = Some(LspDocumentId(2));
-        app.lsp_documents.insert(LspDocumentId(1), first);
-        app.lsp_documents.insert(LspDocumentId(2), second);
-
-        app.apply_lsp_event(LspEvent::Diagnostics {
-            doc: LspDocumentId(2),
-            version: 1,
-            items: vec![diagnostic("undefined name")],
-        });
-
-        assert_eq!(app.lsp_contexts[&second].context.diagnostics.len(), 1);
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let first = repository_card(&mut app, "/repo");
+        let second = repository_card(&mut app, "/repo");
+        for (card, name, text) in [
+            (first, "first.rs", "first\n"),
+            (second, "second.rs", "second\n"),
+        ] {
+            let (runtime, _) = RepositoryRuntime::open_fixture(card, name, text);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            drop(app.drain_lsp_intents(card));
+            let doc = app.lsp_document(card).unwrap();
+            assert_eq!(app.lsp.document_version(doc), Some(1));
+            assert_eq!(app.lsp_documents.get(&doc), Some(&card));
+            assert_eq!(app.lsp_contexts[&card].document, Some(doc));
+        }
+        let first_doc = app.lsp_document(first).unwrap();
+        let second_doc = app.lsp_document(second).unwrap();
+        assert_ne!(first_doc, second_doc);
+        let publish = |doc, message: &str| {
+            Message::Lsp(LspEvent::Diagnostics {
+                doc,
+                version: 1,
+                items: vec![diagnostic(message)],
+            })
+        };
+        drop(app.update(publish(second_doc, "second diagnostic")));
+        assert_eq!(
+            app.lsp_contexts[&second].context.diagnostics,
+            vec![diagnostic("second diagnostic")]
+        );
         assert_eq!(app.lsp_contexts[&second].diagnostics_version, Some(1));
         assert!(app.lsp_contexts[&first].context.diagnostics.is_empty());
         assert_eq!(app.lsp_contexts[&first].diagnostics_version, None);
+        for (card, expected) in [(first, false), (second, true)] {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.diagnostic_navigation_available(), expected);
+        }
+
+        drop(app.update(publish(first_doc, "first diagnostic")));
+        assert_eq!(
+            app.lsp_contexts[&first].context.diagnostics,
+            vec![diagnostic("first diagnostic")]
+        );
+        assert_eq!(app.lsp_contexts[&first].diagnostics_version, Some(1));
+        assert_eq!(
+            app.lsp_contexts[&second].context.diagnostics,
+            vec![diagnostic("second diagnostic")]
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&first) else {
+            unreachable!()
+        };
+        assert!(runtime.diagnostic_navigation_available());
+
+        app.close_lsp_document(second);
+        assert_eq!(app.lsp.document_version(second_doc), None);
+        assert!(!app.lsp_documents.contains_key(&second_doc));
+        drop(app.update(publish(second_doc, "late closed diagnostic")));
+        assert!(app.lsp_contexts[&second].context.diagnostics.is_empty());
+        assert_eq!(app.lsp_contexts[&second].diagnostics_version, None);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&second) else {
+            unreachable!()
+        };
+        assert!(!runtime.diagnostic_navigation_available());
+        assert_eq!(
+            app.lsp_contexts[&first].context.diagnostics,
+            vec![diagnostic("first diagnostic")]
+        );
+    }
+
+    #[test]
+    fn diagnostics_for_an_unregistered_document_cannot_install_answers() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        let doc = LspDocumentId(1);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "first.rs", "first\n");
+        runtime.set_lsp_document(Some(doc));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        // Deliberately retain the old test's incomplete App-only registration.
+        // It is not authority to publish when the manager has no document.
+        lsp_state(&mut app, card).document = Some(doc);
+        app.lsp_documents.insert(doc, card);
+        assert_eq!(app.lsp.document_version(doc), None);
+        drop(app.update(Message::Lsp(LspEvent::Diagnostics {
+            doc,
+            version: 1,
+            items: vec![diagnostic("unregistered diagnostic")],
+        })));
+        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+        assert_eq!(app.lsp_contexts[&card].diagnostics_version, None);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(!runtime.diagnostic_navigation_available());
     }
 
     /// An event for a document nobody holds any more has no surface to land on.
