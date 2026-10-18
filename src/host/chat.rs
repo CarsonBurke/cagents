@@ -20,9 +20,12 @@ mod retained_pending_cleanup_tests;
 mod retained_pending_installation_tests;
 #[cfg(test)]
 mod retained_publication_tests;
+#[cfg(test)]
+mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
 mod startup_tests;
+pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
     chat::{
@@ -2479,6 +2482,9 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
+            if let Some(response) = upgrade_resolution::attach(host, client, &session)? {
+                return Ok(response);
+            }
             let missing = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(session.proof.as_ref(), state.proof())?;

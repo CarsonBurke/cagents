@@ -313,6 +313,7 @@ pub(crate) struct HostState {
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
+    pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
     /// retained conversations a restore could not reattach.
     pub(super) upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
@@ -380,6 +381,7 @@ impl HostState {
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
+            chat_resolutions: BTreeMap::new(),
             upgrade_evidence: None,
         }
     }
@@ -417,6 +419,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -790,6 +793,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {

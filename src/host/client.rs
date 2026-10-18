@@ -691,7 +691,7 @@ pub(super) fn process_request(
             ))
         }
         ClientRequest::ResolveUpgradeChat { source } => {
-            let session = super::chat::resolve_upgrade(host, &source)?;
+            let session = super::chat::upgrade_resolution::resolve(host, client_id, &source)?;
             Ok((
                 ServerResponse::UpgradeChatResolved { session },
                 Vec::new(),
