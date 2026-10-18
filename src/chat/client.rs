@@ -16,7 +16,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -86,6 +86,10 @@ type Pending = Arc<
 >;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
+type TextCopyPending =
+    Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::TextCopyPage, String>>>>>;
+const TEXT_COPY_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
 /// display machine's wall clock.
@@ -145,6 +149,8 @@ struct Inner {
     reader: Mutex<Option<JoinHandle<()>>>,
     pending: Pending,
     file_pending: FilePending,
+    text_copy_pending: TextCopyPending,
+    text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -245,6 +251,109 @@ fn transmit(
         )
         .map_err(|e| e.to_string())
 }
+fn text_copy_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "Text copy request timed out".into())
+}
+
+/// Bound waiting for the shared writer as well as every partial socket write.
+/// A failed frame must close the connection so later writes cannot continue it.
+fn transmit_text_copy(
+    wire: &Mutex<Wire>,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut wire = loop {
+        text_copy_remaining(deadline)?;
+        match wire.try_lock() {
+            Ok(wire) => break wire,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(text_copy_remaining(deadline)?.min(Duration::from_millis(1)));
+            }
+        }
+    };
+    struct DeadlineWriter<'a> {
+        stream: &'a mut UnixStream,
+        deadline: Instant,
+    }
+    impl io::Write for DeadlineWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let remaining = text_copy_remaining(self.deadline)
+                .map_err(|message| io::Error::new(io::ErrorKind::TimedOut, message))?;
+            self.stream.set_write_timeout(Some(remaining))?;
+            io::Write::write(self.stream, bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(self.stream)
+        }
+    }
+    let Wire { stream, codec } = &mut *wire;
+    let previous_timeout = stream.write_timeout().map_err(|error| error.to_string())?;
+    let result = codec
+        .write(
+            &mut DeadlineWriter { stream, deadline },
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: id,
+                proof: Some(proof.clone()),
+                request,
+            },
+        )
+        .map_err(|error| error.to_string());
+    let restored = stream
+        .set_write_timeout(previous_timeout)
+        .map_err(|error| error.to_string());
+    if result.is_err() || restored.is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    result.and(restored)
+}
+
+fn text_copy_response(
+    chat: TerminalId,
+    message: ServerMessage,
+) -> Result<super::TextCopyPage, String> {
+    match message {
+        ServerMessage::Response {
+            response: ServerResponse::ChatTextCopy { chat_id, page },
+        } if chat_id == chat => Ok(page),
+        ServerMessage::Error(error) => Err(error.message),
+        _ => Err("Unexpected text copy reply".into()),
+    }
+}
+
+fn append_text_copy_page(
+    source: &super::TextCopySource,
+    text: &mut String,
+    page: super::TextCopyPage,
+) -> Result<(), String> {
+    if source.bytes > super::TEXT_COPY_LIMIT_BYTES as u64 {
+        return Err("Text copy exceeds the supported byte limit".into());
+    }
+    if page.source != *source || page.offset != text.len() as u64 {
+        return Err("Text copy source or page offset changed".into());
+    }
+    let bytes = page.text.len();
+    let end = page
+        .offset
+        .checked_add(bytes as u64)
+        .ok_or("Text copy page overflow")?;
+    if bytes > super::TEXT_COPY_PAGE_BYTES
+        || end > source.bytes
+        || page.done != (end == source.bytes)
+        || (!page.done && bytes == 0)
+    {
+        return Err("Invalid text copy page length or completion marker".into());
+    }
+    text.push_str(&page.text);
+    Ok(())
+}
+
 fn receive(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -489,6 +598,8 @@ impl ClientHandle {
                 reader: Mutex::new(None),
                 pending: Arc::new(Mutex::new(BTreeMap::new())),
                 file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                text_copy_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
             }),
@@ -934,6 +1045,7 @@ impl ClientHandle {
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
+        let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
@@ -954,6 +1066,8 @@ impl ClientHandle {
             reader: Mutex::new(None),
             pending: pending.clone(),
             file_pending: file_pending.clone(),
+            text_copy_pending: text_copy_pending.clone(),
+            text_copies: AtomicUsize::new(0),
             visibility_tx,
             visibility_worker: Mutex::new(None),
         });
@@ -1040,8 +1154,14 @@ impl ClientHandle {
                         let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
+                    for (_,reply) in std::mem::take(&mut *text_copy_pending.lock().unwrap_or_else(|p|p.into_inner())) {let _=reply.try_send(Err("Chat was explicitly closed".into()));}
                     wake(Wake::Changed);
                     return;
+                }
+                if let Some(reply)=envelope.request_id.and_then(|request|text_copy_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
+                    let result = text_copy_response(id, envelope.message);
+                    let _=reply.try_send(result);
+                    continue;
                 }
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
@@ -1137,6 +1257,9 @@ impl ClientHandle {
                 let _ = reply.try_send(Err(failure.clone()));
             }
             for (_,reply) in std::mem::take(&mut *file_pending.lock().unwrap_or_else(|p|p.into_inner())) {
+                let _=reply.try_send(Err(failure.clone()));
+            }
+            for (_,reply) in std::mem::take(&mut *text_copy_pending.lock().unwrap_or_else(|p|p.into_inner())) {
                 let _=reply.try_send(Err(failure.clone()));
             }
             wake(Wake::Disconnected(failure));
@@ -1332,6 +1455,82 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id);
         result
+    }
+    /// Assemble one immutable logical body over this connection's own replies.
+    /// Call off the UI thread: all pages share one total deadline and never
+    /// publish snapshots or dispatch commands to the provider.
+    pub fn copy_text(&self, source: super::TextCopySource) -> Result<String, String> {
+        let deadline = Instant::now() + TEXT_COPY_TIMEOUT;
+        if source.bytes > super::TEXT_COPY_LIMIT_BYTES as u64 {
+            return Err("Text copy exceeds the supported byte limit".into());
+        }
+        self.inner
+            .text_copies
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 2).then_some(count + 1)
+            })
+            .map_err(|_| "Text copy request capacity reached".to_string())?;
+        struct Reservation<'a>(&'a AtomicUsize);
+        impl Drop for Reservation<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _reservation = Reservation(&self.inner.text_copies);
+        let mut text = String::new();
+        text.try_reserve_exact(source.bytes as usize)
+            .map_err(|_| "Could not allocate text copy buffer".to_string())?;
+        loop {
+            if !self.inner.alive.load(Ordering::Acquire) {
+                return Err("Chat is disconnected; text copy is unavailable".into());
+            }
+            text_copy_remaining(deadline)?;
+            let offset = text.len() as u64;
+            let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+            let (reply, response) = crossbeam_channel::bounded(1);
+            {
+                let mut pending = self
+                    .inner
+                    .text_copy_pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                // Disconnect sets alive before draining this same map. Recheck
+                // under its lock so a request cannot be stranded after the drain.
+                if !self.inner.alive.load(Ordering::Acquire) {
+                    return Err("Chat is disconnected; text copy is unavailable".into());
+                }
+                pending.insert(id, reply);
+            }
+            let result = transmit_text_copy(
+                &self.inner.wire,
+                &self.inner.proof,
+                id,
+                ClientRequest::ChatCommand {
+                    chat_id: self.inner.id,
+                    command: Command::ReadTextCopy {
+                        source: source.clone(),
+                        offset,
+                    },
+                },
+                deadline,
+            )
+            .and_then(|()| {
+                response
+                    .recv_timeout(text_copy_remaining(deadline)?)
+                    .map_err(|_| "Text copy request timed out or disconnected".to_string())?
+            });
+            self.inner
+                .text_copy_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            let page = result?;
+            text_copy_remaining(deadline)?;
+            append_text_copy_page(&source, &mut text, page)?;
+            if text.len() as u64 == source.bytes {
+                return Ok(text);
+            }
+        }
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {
@@ -2909,6 +3108,454 @@ mod tests {
         );
         advance_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    fn text_copy_source(token: u64, bytes: u64) -> super::super::TextCopySource {
+        super::super::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: super::super::TextCopyScope::Subagent { id: "child".into() },
+            token,
+            revision: 7,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn text_copy_pages_require_exact_identity_contiguous_bytes_and_completion() {
+        let source = text_copy_source(1, 6);
+        let first = super::super::TextCopyPage {
+            source: source.clone(),
+            offset: 0,
+            text: "猫".into(),
+            done: false,
+        };
+        let mut text = String::new();
+        append_text_copy_page(&source, &mut text, first.clone()).unwrap();
+        assert_eq!(text, "猫");
+        let last = super::super::TextCopyPage {
+            source: source.clone(),
+            offset: 3,
+            text: "犬".into(),
+            done: true,
+        };
+        let mut bad_pages = vec![first]; // Duplicate offset.
+        let mut changed = last.clone();
+        changed.offset = 4;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.source.cache = uuid::Uuid::new_v4();
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.source.scope = super::super::TextCopyScope::Conversation;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.source.token += 1;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.source.revision += 1;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.source.bytes += 1;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.done = false;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.text.clear();
+        changed.done = false;
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.text = "longer".into();
+        bad_pages.push(changed);
+        let mut changed = last.clone();
+        changed.text = "x".into();
+        bad_pages.push(changed);
+        for page in bad_pages {
+            assert!(append_text_copy_page(&source, &mut text, page).is_err());
+            assert_eq!(text, "猫", "invalid pages must not publish partial data");
+        }
+        append_text_copy_page(&source, &mut text, last).unwrap();
+        assert_eq!(text, "猫犬");
+
+        let large = text_copy_source(2, (super::super::TEXT_COPY_PAGE_BYTES + 1) as u64);
+        assert!(
+            append_text_copy_page(
+                &large,
+                &mut String::new(),
+                super::super::TextCopyPage {
+                    source: large.clone(),
+                    offset: 0,
+                    text: "x".repeat(super::super::TEXT_COPY_PAGE_BYTES + 1),
+                    done: true,
+                }
+            )
+            .is_err()
+        );
+        let empty = text_copy_source(3, 0);
+        append_text_copy_page(
+            &empty,
+            &mut String::new(),
+            super::super::TextCopyPage {
+                source: empty.clone(),
+                offset: 0,
+                text: String::new(),
+                done: true,
+            },
+        )
+        .unwrap();
+        let over_limit = text_copy_source(4, super::super::TEXT_COPY_LIMIT_BYTES as u64 + 1);
+        assert!(
+            append_text_copy_page(
+                &over_limit,
+                &mut String::new(),
+                super::super::TextCopyPage {
+                    source: over_limit.clone(),
+                    offset: 0,
+                    text: String::new(),
+                    done: false,
+                }
+            )
+            .is_err()
+        );
+        assert!(text_copy_remaining(Instant::now()).is_err());
+    }
+
+    #[test]
+    fn text_copy_replies_refuse_other_chat_and_other_response_types() {
+        let chat_id = TerminalId::new();
+        let source = text_copy_source(1, 0);
+        let message = ServerMessage::Response {
+            response: ServerResponse::ChatTextCopy {
+                chat_id: TerminalId::new(),
+                page: super::super::TextCopyPage {
+                    source,
+                    offset: 0,
+                    text: String::new(),
+                    done: true,
+                },
+            },
+        };
+        assert!(text_copy_response(chat_id, message).is_err());
+        assert!(
+            text_copy_response(
+                chat_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn text_copy_pending_requests_fail_on_disconnect_and_explicit_close() {
+        for explicit_close in [false, true] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("text-copy-cleanup-host");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let respond =
+                    |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                        codec
+                            .write(
+                                server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id,
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap();
+                    };
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(connect.request_id),
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("start expected")
+                };
+                let chat_id = session.id;
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(start.request_id),
+                    ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot::default(),
+                    },
+                );
+                let copy: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(
+                    copy.request,
+                    ClientRequest::ChatCommand {
+                        command: Command::ReadTextCopy { .. },
+                        ..
+                    }
+                ));
+                if explicit_close {
+                    respond(
+                        &mut codec,
+                        &mut server,
+                        None,
+                        ServerResponse::ChatClosed {
+                            chat_id,
+                            snapshot: Snapshot {
+                                exited: true,
+                                ..Default::default()
+                            },
+                        },
+                    );
+                }
+                // EOF otherwise exercises the reader's disconnect drain.
+            });
+            let client = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            let error = client.copy_text(text_copy_source(1, 100)).unwrap_err();
+            assert!(
+                error.contains(if explicit_close {
+                    "explicitly closed"
+                } else {
+                    "disconnected"
+                }),
+                "{error}"
+            );
+            assert!(client.inner.text_copy_pending.lock().unwrap().is_empty());
+            assert_eq!(client.inner.text_copies.load(Ordering::Acquire), 0);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn text_copy_expired_deadline_does_not_wait_for_writer_or_send_a_frame() {
+        let (stream, _server) = UnixStream::pair().unwrap();
+        let wire = Mutex::new(Wire {
+            stream,
+            codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
+        });
+        let _held = wire.lock().unwrap();
+        let error = transmit_text_copy(
+            &wire,
+            &host_proof("expired-text-copy"),
+            1,
+            ClientRequest::ChatCommand {
+                chat_id: TerminalId::new(),
+                command: Command::ReadTextCopy {
+                    source: text_copy_source(1, 0),
+                    offset: 0,
+                },
+            },
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+    }
+
+    #[test]
+    fn text_copy_wire_is_request_specific_bounded_and_pages_exact_raw_utf8() {
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        let mut ready = Vec::new();
+        let mut release = Vec::new();
+        let mut finish = Vec::new();
+        for client_index in 0..2_u64 {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let (finish_tx, finish_rx) = crossbeam_channel::bounded(1);
+            ready.push(ready_rx);
+            release.push(release_tx);
+            finish.push(finish_tx);
+            servers.push(thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("text-copy-host");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let respond =
+                    |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                        codec
+                            .write(
+                                server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id,
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap();
+                    };
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(connect.request_id),
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("start expected")
+                };
+                let chat_id = session.id;
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(start.request_id),
+                    ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                );
+                for round in 0..2 {
+                    let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    let second: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    if round == 0 {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    // Coalesced view updates cannot consume requester-specific pages.
+                    respond(
+                        &mut codec,
+                        &mut server,
+                        None,
+                        ServerResponse::ChatSnapshot {
+                            chat_id,
+                            snapshot: Some(Snapshot {
+                                generation: round + 2,
+                                ..Default::default()
+                            }),
+                        },
+                    );
+                    for request in [second, first] {
+                        let ClientRequest::ChatCommand {
+                            chat_id: requested_chat,
+                            command: Command::ReadTextCopy { source, offset },
+                        } = request.request
+                        else {
+                            panic!("copy page expected")
+                        };
+                        assert_eq!(requested_chat, chat_id);
+                        assert_eq!(source.token / 10, client_index);
+                        let text = if round == 0 {
+                            assert_eq!(offset, 0);
+                            if source.token % 10 == 1 { "a" } else { "b" }
+                                .repeat(super::super::TEXT_COPY_PAGE_BYTES)
+                        } else {
+                            assert_eq!(offset, super::super::TEXT_COPY_PAGE_BYTES as u64);
+                            if source.token % 10 == 1 { "一" } else { "二" }.into()
+                        };
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            Some(request.request_id),
+                            ServerResponse::ChatTextCopy {
+                                chat_id,
+                                page: super::super::TextCopyPage {
+                                    source,
+                                    offset,
+                                    text,
+                                    done: round == 1,
+                                },
+                            },
+                        );
+                    }
+                }
+                finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            clients.push(
+                ClientHandle::connect_on(
+                    client,
+                    omp_card(None, None),
+                    Intent::Start,
+                    None,
+                    false,
+                    None,
+                    None,
+                    |_| {},
+                )
+                .unwrap(),
+            );
+        }
+        let mut requests = Vec::new();
+        for (index, client) in clients.iter().enumerate() {
+            for token in [1, 2] {
+                let client = client.clone();
+                requests.push((
+                    token,
+                    thread::spawn(move || {
+                        client.copy_text(text_copy_source(
+                            index as u64 * 10 + token,
+                            super::super::TEXT_COPY_PAGE_BYTES as u64 + 3,
+                        ))
+                    }),
+                ));
+            }
+        }
+        for event in ready {
+            event.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for client in &clients {
+            assert!(
+                client
+                    .copy_text(text_copy_source(99, 0))
+                    .unwrap_err()
+                    .contains("capacity")
+            );
+            assert_eq!(client.inner.text_copy_pending.lock().unwrap().len(), 2);
+        }
+        for event in release {
+            event.send(()).unwrap();
+        }
+        for (token, request) in requests {
+            let expected = format!(
+                "{}{}",
+                if token == 1 { "a" } else { "b" }.repeat(super::super::TEXT_COPY_PAGE_BYTES),
+                if token == 1 { "一" } else { "二" }
+            );
+            assert_eq!(request.join().unwrap().unwrap(), expected);
+        }
+        for client in &clients {
+            assert!(client.inner.text_copy_pending.lock().unwrap().is_empty());
+            assert_eq!(client.inner.text_copies.load(Ordering::Acquire), 0);
+        }
+        for event in finish {
+            event.send(()).unwrap();
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
     }
 
     #[test]

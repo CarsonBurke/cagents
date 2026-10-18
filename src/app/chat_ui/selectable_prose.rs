@@ -541,6 +541,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 && modifiers.command() =>
             {
                 if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
+                    super::text_copy::invalidate();
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
                         self.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]

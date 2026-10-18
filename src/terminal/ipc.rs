@@ -155,7 +155,10 @@ use crate::{
 /// Version 98 combines notification context with account-default selection.
 /// Version 99 preserves version 98 and adds the version 96 terminal-title
 /// descriptor layout, requiring matched positional postcard peers.
-pub const PROTOCOL_VERSION: u16 = 99;
+/// Version 100 adds immutable native text-copy sidecars to Snapshot and a
+/// requester-specific paged reply. The three executables require this matched
+/// positional postcard layout; JSON defaults do not preserve binary compatibility.
+pub const PROTOCOL_VERSION: u16 = 100;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -792,6 +795,10 @@ pub enum ServerResponse {
     ChatFileChangePatches {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
+    },
+    ChatTextCopy {
+        chat_id: TerminalId,
+        page: crate::chat::TextCopyPage,
     },
 }
 
@@ -2238,6 +2245,47 @@ mod tests {
         let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.prompt_suggestion, None);
         assert_eq!(restored.turn_generation, 7);
+    }
+
+    #[test]
+    fn chat_text_copy_request_and_reply_preserve_exact_source_and_raw_text() {
+        use crate::chat::{Command, TextCopyPage, TextCopyScope, TextCopySource};
+        let chat_id = TerminalId::new();
+        let source = TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: TextCopyScope::Subagent {
+                id: "same#opaque-id".into(),
+            },
+            token: 17,
+            revision: 29,
+            bytes: 9,
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id,
+            command: Command::ReadTextCopy {
+                source: source.clone(),
+                offset: 3,
+            },
+        };
+        let encoded = postcard::to_allocvec(&request).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&encoded).unwrap(),
+            request
+        );
+        let response = ServerResponse::ChatTextCopy {
+            chat_id,
+            page: TextCopyPage {
+                source,
+                offset: 3,
+                text: "猫\r\n ".into(),
+                done: true,
+            },
+        };
+        let encoded = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

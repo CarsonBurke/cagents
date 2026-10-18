@@ -1950,6 +1950,9 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
+            Command::ReadTextCopy { .. } => {
+                return Err("Text copies are served by the transcript cache".into());
+            }
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }

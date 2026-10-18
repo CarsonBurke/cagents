@@ -1704,6 +1704,8 @@ impl Adapter for Codex {
                 // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
+            Command::ReadTextCopy { .. } =>
+                return Err("Text copies are served by the transcript cache".into()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
