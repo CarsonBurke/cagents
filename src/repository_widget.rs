@@ -25,7 +25,7 @@ use cosmic::iced::advanced::{
 };
 use cosmic::{
     Element,
-    iced::{self, Alignment, Font, Length, Task, highlighter},
+    iced::{self, Alignment, Font, Length, Task, highlighter, keyboard},
     widget::{self, markdown},
 };
 
@@ -3432,6 +3432,14 @@ impl RepositoryRuntime {
     #[must_use]
     pub fn find_is_open(&self) -> bool {
         self.find_open
+    }
+
+    /// Current selected match (zero based) and total, after the current
+    /// query and buffer revision have settled. Pending or closed Find has
+    /// no current result; a settled query without matches returns `(0, 0)`.
+    pub fn find_match_position(&self) -> Option<(usize, usize)> {
+        (self.find_open && self.find_cache.as_ref() == self.wanted_find().as_ref())
+            .then_some((self.find_index, self.find_total))
     }
 
     pub fn find_input_is_focused(&self) -> bool {
@@ -8499,19 +8507,43 @@ fn find_strip<'a>(
             .selected(runtime.replace_open)
             .on_press(RepositoryAction::ToggleReplace { card })
             .into(),
-        crate::ui_controls::field::search("Find in file", &runtime.find_query)
-            .id(find_focus_id(card))
-            .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
-            .on_focus(RepositoryAction::FindInputFocus {
-                card,
-                focused: true,
-            })
-            .on_unfocus(RepositoryAction::FindInputFocus {
-                card,
-                focused: false,
-            })
-            .width(Length::Fill)
-            .into(),
+        crate::interaction::focused_key(
+            crate::ui_controls::field::search("Find in file", &runtime.find_query)
+                .id(find_focus_id(card))
+                .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
+                .on_focus(RepositoryAction::FindInputFocus {
+                    card,
+                    focused: true,
+                })
+                .on_unfocus(RepositoryAction::FindInputFocus {
+                    card,
+                    focused: false,
+                })
+                .width(Length::Fill),
+            move |event| {
+                let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+                match key {
+                    keyboard::key::Named::Escape => Some(RepositoryAction::CloseFind { card }),
+                    keyboard::key::Named::Enter
+                        if !modifiers.control() && !modifiers.alt() && !modifiers.logo() =>
+                    {
+                        Some(if modifiers.shift() {
+                            RepositoryAction::FindPrevious { card }
+                        } else {
+                            RepositoryAction::FindNext { card }
+                        })
+                    }
+                    _ => None,
+                }
+            },
+        ),
     ];
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
@@ -8603,10 +8635,15 @@ fn find_strip<'a>(
     if runtime.replace_open {
         strips.push(
             widget::row::with_children(vec![
-                crate::ui_controls::field::text("Replace with", &runtime.replace_query)
-                    .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
-                    .width(Length::Fill)
-                    .into(),
+                crate::interaction::focused_escape(
+                    crate::ui_controls::field::text("Replace with", &runtime.replace_query)
+                        .on_input(move |query| RepositoryAction::ReplaceQueryChanged {
+                            card,
+                            query,
+                        })
+                        .width(Length::Fill),
+                    move || RepositoryAction::CloseFind { card },
+                ),
                 {
                     let mut preserve =
                         crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
@@ -18613,6 +18650,148 @@ mod tests {
                 }]
             );
             assert!(runtime.take_lsp_edits().is_empty());
+        }
+    }
+
+    #[test]
+    fn programmatic_query_focus_routes_find_keys_once_before_native_input() {
+        use cosmic::iced::{
+            Event, Rectangle, Size,
+            advanced::{
+                Layout, Shell, clipboard,
+                widget::{Tree, operation},
+            },
+            mouse,
+        };
+        let renderer = headless_renderer();
+        for (key, modifiers, focused, captured, expected) in [
+            (
+                keyboard::key::Named::Enter,
+                keyboard::Modifiers::empty(),
+                false,
+                false,
+                None,
+            ),
+            (
+                keyboard::key::Named::Enter,
+                keyboard::Modifiers::empty(),
+                true,
+                false,
+                Some("next"),
+            ),
+            (
+                keyboard::key::Named::Enter,
+                keyboard::Modifiers::SHIFT,
+                true,
+                false,
+                Some("previous"),
+            ),
+            (
+                keyboard::key::Named::Escape,
+                keyboard::Modifiers::empty(),
+                true,
+                false,
+                Some("close"),
+            ),
+            (
+                keyboard::key::Named::Escape,
+                keyboard::Modifiers::empty(),
+                true,
+                true,
+                None,
+            ),
+            (
+                keyboard::key::Named::ArrowDown,
+                keyboard::Modifiers::empty(),
+                true,
+                false,
+                None,
+            ),
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "hit\nhit\nhit\n");
+            drop(runtime.update(RepositoryAction::OpenFind { card }));
+            drop(runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "hit".into(),
+            }));
+            assert!(
+                !runtime.find_input_is_focused(),
+                "operation focus emits no model callback"
+            );
+            let mut element = find_strip(card, &runtime).unwrap();
+            let mut tree = Tree::new(&element);
+            let bounds = Rectangle::with_size(Size::new(600.0, 240.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            if focused {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(find_focus_id(card)),
+                );
+            }
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            });
+            let mut published = Vec::new();
+            let mut shell = Shell::new(&mut published);
+            if captured {
+                shell.capture_event();
+            }
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            if expected.is_some() {
+                assert!(shell.is_event_captured());
+            }
+            drop(shell);
+            drop(element);
+            if let Some(expected) = expected {
+                assert_eq!(
+                    published.len(),
+                    1,
+                    "one widget event must emit exactly one Find command"
+                );
+                assert!(matches!(
+                    (&published[0], expected),
+                    (RepositoryAction::FindNext { .. }, "next")
+                        | (RepositoryAction::FindPrevious { .. }, "previous")
+                        | (RepositoryAction::CloseFind { .. }, "close")
+                ));
+                drop(runtime.update(published.pop().unwrap()));
+                match expected {
+                    "next" => assert_eq!(runtime.find_match_position(), Some((1, 3))),
+                    "previous" => assert_eq!(runtime.find_match_position(), Some((2, 3))),
+                    "close" => assert!(!runtime.find_is_open()),
+                    _ => unreachable!(),
+                }
+            } else {
+                assert!(
+                    published.is_empty(),
+                    "unfocused/captured/non-Find keys belong to their original owner"
+                );
+                assert_eq!(runtime.find_match_position(), Some((0, 3)));
+            }
         }
     }
 

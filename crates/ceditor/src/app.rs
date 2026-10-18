@@ -180,10 +180,6 @@ pub enum Message {
     ResetSettings,
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
-    FindQueryChanged(String),
-    CloseFind,
-    FindNext,
-    FindPrevious,
     QuickOpen,
     QuickOpenQueryChanged(String),
     QuickOpenNext,
@@ -211,7 +207,7 @@ pub enum Message {
     Hover,
     Completion(CardId, usize),
     Jump(CardId, LspPosition),
-    Key(keyboard::Event),
+    Key(keyboard::Event, bool),
     Notices,
     CloseNotices,
     Dismiss,
@@ -480,13 +476,6 @@ pub struct Editor {
     settings_open: bool,
     settings_writable: bool,
     quick_open_files: Option<Vec<PathBuf>>,
-    find_open: bool,
-    find_query: String,
-    find_match_index: usize,
-    /// Occurrences of `find_query` in the active buffer, recorded by the
-    /// search itself. Counting again in `view` re-materialized and
-    /// re-lowercased the whole rope on every animation frame.
-    find_match_total: usize,
     quick_open_generation: u64,
     quick_open: bool,
     quick_open_query: String,
@@ -945,44 +934,6 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
     cagents::interaction::layer(backdrop, centered.into())
 }
 
-fn find_bar(editor: &Editor) -> Element<'_, Message> {
-    widget::container(
-        widget::row::with_children(vec![
-            cagents::ui_controls::passive_icon(Icon::Search, 16),
-            widget::text_input("Find in file", &editor.find_query)
-                .id(widget::Id::new("ceditor.find.query"))
-                .on_input(Message::FindQueryChanged)
-                .width(Length::Fill)
-                .into(),
-            design::caption(if editor.find_query.trim().is_empty() {
-                "Type to find".to_owned()
-            } else if editor.find_match_total == 0 {
-                "No matches".to_owned()
-            } else {
-                format!(
-                    "{} of {} matches",
-                    editor.find_match_index + 1,
-                    editor.find_match_total
-                )
-            })
-            .into(),
-            icon_button(Icon::ChevronUp, "Previous match (Shift+Enter)")
-                .on_press(Message::FindPrevious)
-                .into(),
-            icon_button(Icon::ChevronDown, "Next match (Enter)")
-                .on_press(Message::FindNext)
-                .into(),
-            icon_button(Icon::Close, "Close find")
-                .on_press(Message::CloseFind)
-                .into(),
-        ])
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-    )
-    .padding([4.0, 8.0])
-    .width(Length::Fill)
-    .into()
-}
 fn tab_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
@@ -2489,31 +2440,8 @@ impl Editor {
         })
     }
 
-    fn focus_find_query(&self) -> Task<Message> {
-        iced::widget::operation::focus(widget::Id::new("ceditor.find.query"))
-            .map(cosmic::Action::App)
-    }
-
-    /// Releases the search hold on every tab.
-    ///
-    /// A tab in search mode ignores every editor action except scrolling, so a
-    /// tab that kept the hold after find moved elsewhere swallowed typing,
-    /// paste and IME commits with no indication and no way back.
-    fn clear_search_mode(&mut self) {
-        for tab in &mut self.tabs {
-            tab.runtime.set_search_mode(false);
-        }
-    }
-
-    /// Closes the find bar and releases the search hold.
-    ///
-    /// Find targets one buffer, so a tab switch closes it rather than silently
-    /// re-pointing the query and the match index at a different file.
-    fn close_find(&mut self) {
-        self.find_open = false;
-        self.find_match_index = 0;
-        self.find_match_total = 0;
-        self.clear_search_mode();
+    fn find_is_open(&self) -> bool {
+        self.current().is_some_and(|tab| tab.runtime.find_is_open())
     }
 
     /// Dismisses the palette and abandons the tree walk it started.
@@ -2525,62 +2453,41 @@ impl Editor {
         self.quick_open_cancel.cancel();
     }
 
-    /// Selects one occurrence in the active tab and records the occurrence
-    /// count, which is the only place it is ever computed.
-    fn select_find_match(&mut self, occurrence: usize) {
-        let Some(id) = self.active else {
-            return;
-        };
-        let query = self.find_query.clone();
-        let total = self.tab_mut(id).and_then(|tab| {
-            tab.runtime.set_search_mode(true);
-            tab.runtime.select_text_match(&query, occurrence)
-        });
-        match total {
-            Some(total) => {
-                self.find_match_index = occurrence % total;
-                self.find_match_total = total;
-            }
-            None => {
-                self.find_match_index = 0;
-                self.find_match_total = 0;
-            }
+    /// The shared query widget owns Return using actual native focus; the
+    /// shell only routes Find commands that remain outside native inputs.
+    fn handle_find_key(
+        &mut self,
+        event: &keyboard::Event,
+        captured: bool,
+    ) -> Option<Task<Message>> {
+        let tab = self.current()?;
+        if !tab.runtime.find_is_open() {
+            return None;
         }
-    }
-
-    /// The keys the find bar itself owns.
-    ///
-    /// Everything else returns `None` and falls through to the shortcut table:
-    /// find is deliberately not modal, so Ctrl+S must still save while it is
-    /// open. Navigation is Enter, Shift+Enter, Up and Down only — Left and
-    /// Right belong to the query input, where they move the caret.
-    fn handle_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let card = tab.id;
         let keyboard::Event::KeyPressed {
-            key,
+            key: keyboard::Key::Named(key),
             modifiers,
-            repeat: false,
             ..
         } = event
         else {
             return None;
         };
-        match key {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                Some(self.update(Message::CloseFind))
-            }
-            keyboard::Key::Named(keyboard::key::Named::Enter) => Some(if modifiers.shift() {
-                self.update(Message::FindPrevious)
-            } else {
-                self.update(Message::FindNext)
-            }),
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                Some(self.update(Message::FindPrevious))
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                Some(self.update(Message::FindNext))
-            }
-            _ => None,
+        if modifiers.control() || modifiers.alt() || modifiers.logo() {
+            return None;
         }
+        let action = match key {
+            keyboard::key::Named::Escape if !captured => RepositoryAction::CloseFind { card },
+            keyboard::key::Named::F3 => {
+                if modifiers.shift() {
+                    RepositoryAction::FindPrevious { card }
+                } else {
+                    RepositoryAction::FindNext { card }
+                }
+            }
+            _ => return None,
+        };
+        Some(self.update(Message::Repository(action)))
     }
 
     /// The keys the quick-open palette owns.
@@ -3012,10 +2919,6 @@ impl Application for Editor {
             settings_writable,
             quick_open_files: None,
             quick_open_generation: 0,
-            find_open: false,
-            find_query: String::new(),
-            find_match_index: 0,
-            find_match_total: 0,
             quick_open: false,
             quick_open_query: String::new(),
             quick_open_index: 0,
@@ -3135,7 +3038,8 @@ impl Application for Editor {
                 return Task::none();
             }
             if self.settings_open
-                && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) = &message
+                && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }, _) =
+                    &message
                 && modifiers.control()
                 && !modifiers.shift()
                 && !modifiers.alt()
@@ -3145,10 +3049,13 @@ impl Application for Editor {
                 return iced::widget::operation::focus(cagents::settings_widgets::search_id())
                     .map(cosmic::Action::App);
             }
-            if let Message::Key(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) = &message
+            if let Message::Key(
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                },
+                captured,
+            ) = &message
             {
                 if self.pending_discard().is_some() {
                     return self.update(Message::Sidebar(SidebarAction::CancelDiscard));
@@ -3165,15 +3072,16 @@ impl Application for Editor {
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
                 }
-                if self.find_open {
-                    return self.update(Message::CloseFind);
+                if !*captured && self.find_is_open() {
+                    let card = self.active.unwrap();
+                    return self.update(Message::Repository(RepositoryAction::CloseFind { card }));
                 }
             }
             // Quick open counts as a modal, and the guard below drops every
             // key while a modal is up. A palette whose whole point is staying
             // on the keyboard has to read its own keys first.
             if self.quick_open
-                && let Message::Key(event) = &message
+                && let Message::Key(event, _) = &message
                 && let Some(task) = self.handle_quick_open_key(event)
             {
                 return task;
@@ -3198,7 +3106,7 @@ impl Application for Editor {
                         | Message::Sidebar(_)
                         | Message::ToggleSidebar
                         | Message::NewTab
-                        | Message::Key(_)
+                        | Message::Key(_, _)
                 )
             {
                 return Task::none();
@@ -4182,40 +4090,9 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::FindInFile => {
-                    if self.find_open {
-                        self.close_find();
-                        return self.focus_active_editor();
-                    }
-                    self.find_open = true;
-                    self.select_find_match(0);
-                    self.focus_find_query()
-                }
-                Message::FindQueryChanged(query) => {
-                    self.find_query = query;
-                    self.select_find_match(0);
-                    Task::none()
-                }
-                Message::FindNext => {
-                    self.select_find_match(self.find_match_index.wrapping_add(1));
-                    self.focus_find_query()
-                }
-                Message::FindPrevious => {
-                    // Wrapping to `usize::MAX` and letting the search take it
-                    // modulo the total only lands on the last match when the
-                    // total divides 2^64: for 3 or 5 matches it re-selected the
-                    // first, for 7 the second.
-                    let previous = self
-                        .find_match_index
-                        .checked_sub(1)
-                        .unwrap_or_else(|| self.find_match_total.saturating_sub(1));
-                    self.select_find_match(previous);
-                    self.focus_find_query()
-                }
-                Message::CloseFind => {
-                    self.close_find();
-                    self.focus_active_editor()
-                }
+                Message::FindInFile => self.active.map_or_else(Task::none, |card| {
+                    self.update(Message::Repository(RepositoryAction::OpenFind { card }))
+                }),
                 Message::QuickOpen => {
                     let opening = !self.quick_open;
                     self.close_quick_open();
@@ -4523,7 +4400,7 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::Key(event) => {
+                Message::Key(event, captured) => {
                     if cagents::tab_history::released(&event) {
                         self.tab_history.finish(self.active);
                     }
@@ -4539,9 +4416,7 @@ impl Application for Editor {
                         }
                         return Task::none();
                     }
-                    if self.find_open
-                        && let Some(task) = self.handle_find_key(&event)
-                    {
+                    if let Some(task) = self.handle_find_key(&event, captured) {
                         return task;
                     }
                     if let Some(task) = self.handle_shortcut(&event) {
@@ -4563,12 +4438,21 @@ impl Application for Editor {
                 }
             }
         })();
-        // Find owns one buffer. If the active tab changed under it, the
-        // outgoing tab would keep the search hold that makes its editor ignore
-        // every edit, recoverable only by closing the tab.
-        let find_closed = previous_tabs.0 != self.active && self.find_open;
+        // A tab switch dismisses the outgoing strip without moving either
+        // buffer's caret or carrying the query into another file.
+        let find_closed = previous_tabs.0 != self.active
+            && previous_tabs
+                .0
+                .and_then(|id| self.tab(id))
+                .is_some_and(|tab| tab.runtime.find_is_open());
         if find_closed {
-            self.close_find();
+            let id = previous_tabs.0.unwrap();
+            drop(
+                self.tab_mut(id)
+                    .unwrap()
+                    .runtime
+                    .update(RepositoryAction::CloseFind { card: id }),
+            );
         }
         let session = if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
             self.save_session()
@@ -4604,8 +4488,11 @@ impl Application for Editor {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, _, window| match event {
-            iced::Event::Keyboard(event) => Some(Message::Key(event)),
+        let events = iced::event::listen_with(|event, status, window| match event {
+            iced::Event::Keyboard(event) => Some(Message::Key(
+                event,
+                matches!(status, iced::event::Status::Captured),
+            )),
             iced::Event::Window(window::Event::CloseRequested) => Some(Message::CloseWindow),
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
@@ -4681,15 +4568,6 @@ impl Application for Editor {
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
-            if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
-                toolbar_controls.push(
-                    widget::container(toolbar.map(Message::Repository))
-                        .width(Length::FillPortion(1))
-                        .into(),
-                );
-            } else {
-                toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
-            }
             if tab.review.is_open()
                 && let Some(control) = tab
                     .review
@@ -4715,37 +4593,23 @@ impl Application for Editor {
             }
             toolbar_controls.push(
                 icon_button(Icon::Search, "Find in file (Ctrl+F)")
-                    .selected(self.find_open)
+                    .selected(tab.runtime.find_is_open())
                     .on_press_maybe((!self.modal_open()).then_some(Message::FindInFile))
                     .into(),
             );
-            if !toolbar_controls.is_empty() {
-                editor.push(
-                    widget::container(
-                        widget::row::with_children(toolbar_controls)
-                            .spacing(design::TOOLBAR_GROUP_SPACING)
-                            .align_y(iced::Alignment::Center)
-                            .width(Length::Fill),
-                    )
-                    // The file toolbar carries the header's leading inset
-                    // itself, so this row adds none: a second inset here put
-                    // the file name at 20px while everything below it started
-                    // at 12. Only the trailing edge needs one, because the
-                    // controls this shell appends past the toolbar have no
-                    // container of their own to provide it.
-                    .padding(iced::Padding {
-                        right: design::TOOLBAR_INSET,
-                        ..iced::Padding::ZERO
-                    })
-                    .center_y(Length::Fill)
-                    .height(design::HEADER_CONTENT_HEIGHT)
-                    .width(Length::Fill)
-                    .into(),
-                );
-                editor.push(design::horizontal_rule().into());
-            }
-            if self.find_open {
-                editor.push(find_bar(self));
+            let trailing = widget::row::with_children(toolbar_controls)
+                .spacing(design::TOOLBAR_GROUP_SPACING)
+                .align_y(iced::Alignment::Center)
+                .into();
+            // Let the shared toolbar own its height: its Find/replace strip
+            // is a complete row below the file and shell action groups.
+            if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
+                tab.id,
+                &tab.runtime,
+                Some(trailing),
+                Message::Repository,
+            ) {
+                editor.push(toolbar);
                 editor.push(design::horizontal_rule().into());
             }
             editor.push(
@@ -6014,10 +5878,10 @@ mod tests {
         drop(app.update(Message::Settings));
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.settings_open);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Escape,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert!(!app.modal_open());
         assert!(root.join("new.txt").exists());
 
@@ -6224,10 +6088,6 @@ mod tests {
             settings_reset_confirm: false,
             settings_path: PathBuf::new(),
             settings_open: false,
-            find_open: false,
-            find_match_index: 0,
-            find_match_total: 0,
-            find_query: String::new(),
             quick_open: false,
             quick_open_query: String::new(),
             quick_open_index: 0,
@@ -6325,19 +6185,22 @@ mod tests {
             drop(app.update(Message::Select(id)));
         }
         let next = || {
-            Message::Key(named_key(
-                keyboard::key::Named::Tab,
-                keyboard::Modifiers::CTRL,
-            ))
+            Message::Key(
+                named_key(keyboard::key::Named::Tab, keyboard::Modifiers::CTRL),
+                false,
+            )
         };
         drop(app.update(next()));
         assert_eq!(app.active, Some(second));
         drop(app.update(next()));
         assert_eq!(app.active, Some(first));
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Tab,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-        ))));
+        drop(app.update(Message::Key(
+            named_key(
+                keyboard::key::Named::Tab,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            ),
+            false,
+        )));
         assert_eq!(app.active, Some(second));
         drop(app.update(Message::WindowFocused(window::Id::RESERVED, false)));
         drop(app.update(next()));
@@ -6419,15 +6282,15 @@ mod tests {
         file_loaded(&mut app, second, root, "b.rs");
         drop(app.update(Message::Select(first)));
         drop(app.update(Message::FindInFile));
-        assert!(app.find_open);
+        assert!(app.find_is_open());
         // Clicking another tab's title while find is open used to leave the
         // outgoing tab holding search mode, where it drops every edit.
         drop(app.update(Message::Select(second)));
-        assert!(!app.find_open);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Escape,
-            keyboard::Modifiers::empty(),
-        ))));
+        assert!(!app.find_is_open());
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
         drop(app.update(Message::Select(first)));
         drop(
             app.update(Message::Repository(RepositoryAction::EditorAction {
@@ -6459,17 +6322,31 @@ mod tests {
             let id = add(&mut app, root.to_str().unwrap(), Some(&file));
             file_loaded(&mut app, id, root, &file);
             drop(app.update(Message::FindInFile));
-            drop(app.update(Message::FindQueryChanged("hit".into())));
-            assert_eq!(app.find_match_total, total);
-            assert_eq!(app.find_match_index, 0);
-            drop(app.update(Message::FindPrevious));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                    card: id,
+                    query: "hit".into(),
+                })),
+            );
             assert_eq!(
-                app.find_match_index,
-                total - 1,
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, total))
+            );
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindPrevious {
+                    card: id,
+                })),
+            );
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((total - 1, total)),
                 "previous from the first match did not wrap for {total} matches",
             );
-            drop(app.update(Message::FindNext));
-            assert_eq!(app.find_match_index, 0);
+            drop(app.update(Message::Repository(RepositoryAction::FindNext { card: id })));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, total))
+            );
         }
     }
 
@@ -6484,7 +6361,7 @@ mod tests {
         drop(app.update(Message::FindInFile));
         let save = character_key("s", keyboard::key::Code::KeyS);
         assert!(
-            app.handle_find_key(&save).is_none(),
+            app.handle_find_key(&save, true).is_none(),
             "find claimed Ctrl+S, which reads as a data-loss risk",
         );
         // Left and Right belong to the query input's caret.
@@ -6493,17 +6370,130 @@ mod tests {
             keyboard::key::Named::ArrowRight,
         ] {
             assert!(
-                app.handle_find_key(&named_key(arrow, keyboard::Modifiers::empty()))
+                app.handle_find_key(&named_key(arrow, keyboard::Modifiers::empty()), true)
                     .is_none(),
             );
         }
         let sidebar_open = app.sidebar_open;
-        drop(app.update(Message::Key(character_key("b", keyboard::key::Code::KeyB))));
+        drop(app.update(Message::Key(
+            character_key("b", keyboard::key::Code::KeyB),
+            false,
+        )));
         assert_ne!(
             app.sidebar_open, sidebar_open,
             "no shortcut reached the shortcut table while the find bar was open",
         );
-        assert!(app.find_open, "an unrelated chord closed the find bar");
+        assert!(app.find_is_open(), "an unrelated chord closed the find bar");
+    }
+
+    #[test]
+    fn standalone_find_tracks_real_edits_undo_redo_and_preserves_selection_on_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "hit hit\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, root, "a.rs");
+        drop(app.update(Message::FindInFile));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card: id,
+                query: "hit".into(),
+            })),
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 2))
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("changed".into()),
+                )),
+            })),
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("changed hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 1))
+        );
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card: id })));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("hit hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 2))
+        );
+        drop(app.update(Message::Repository(RepositoryAction::Redo { card: id })));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("changed hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 1))
+        );
+        assert!(app.find_is_open());
+        drop(app.update(Message::Repository(RepositoryAction::FindNext { card: id })));
+        let cursor = app.tab(id).unwrap().runtime.cursor_position();
+        let selection = app.tab(id).unwrap().runtime.selected_text();
+        assert_eq!(selection.as_deref(), Some("hit"));
+        drop(app.update(Message::Repository(RepositoryAction::CloseFind {
+            card: id,
+        })));
+        assert!(!app.find_is_open());
+        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), cursor);
+        assert_eq!(app.tab(id).unwrap().runtime.selected_text(), selection);
+    }
+
+    #[test]
+    fn standalone_find_leaves_captured_buffer_keys_to_their_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "hit\nhit\nhit\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, root, "a.rs");
+        drop(app.update(Message::FindInFile));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card: id,
+                query: "hit".into(),
+            })),
+        );
+        for key in [
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            let event = named_key(key, keyboard::Modifiers::empty());
+            assert!(
+                app.handle_find_key(&event, true).is_none(),
+                "captured buffer key was claimed: {key:?}"
+            );
+            let cursor = app.tab(id).unwrap().runtime.cursor_position();
+            let selection = app.tab(id).unwrap().runtime.selected_text();
+            drop(app.update(Message::Key(event, true)));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, 3))
+            );
+            assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), cursor);
+            assert_eq!(app.tab(id).unwrap().runtime.selected_text(), selection);
+            assert!(app.find_is_open());
+        }
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
+        assert!(!app.find_is_open());
     }
 
     #[test]
@@ -6514,15 +6504,18 @@ mod tests {
         // Layouts that shift the digit row report a symbol as the logical key,
         // which is why the canonical matcher consults the physical digit.
         let key = keyboard::Key::Character("!".into());
-        drop(app.update(Message::Key(keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL,
-            text: None,
-            repeat: false,
-        })));
+        drop(app.update(Message::Key(
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            },
+            false,
+        )));
         assert_ne!(
             app.sidebar_open, sidebar_open,
             "the configured digit chord never fired",
@@ -6675,21 +6668,21 @@ mod tests {
             keyboard::key::Named::ArrowDown,
             keyboard::Modifiers::empty(),
         );
-        drop(app.update(Message::Key(down.clone())));
+        drop(app.update(Message::Key(down.clone(), false)));
         assert_eq!(app.quick_open_selection(results.len()), 1);
         // Down from the last row wraps, and Up from the first row wraps back.
-        drop(app.update(Message::Key(down)));
+        drop(app.update(Message::Key(down, false)));
         assert_eq!(app.quick_open_selection(results.len()), 0);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::ArrowUp,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::ArrowUp, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert_eq!(app.quick_open_selection(results.len()), 1);
         let selected = results[1].clone();
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Enter,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert!(!app.quick_open, "Enter did not open the selected result");
         assert_eq!(
             app.tab(id)
