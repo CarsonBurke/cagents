@@ -151,6 +151,10 @@ impl Cagents {
                     .as_raw();
                 let parent_lifetime = Arc::new(ParentWindowLifetime::new(parent_id));
                 let lifetime_guard: Arc<dyn Any + Send + Sync> = parent_lifetime.clone();
+                let _probe_span = tracing::info_span!(
+                    target: "cagents::browser_capability", "browser_protocol_probe", %generation
+                )
+                .entered();
                 // SAFETY: Cagents retains this actual-parent token, joins
                 // every browser worker, then explicitly clears all protocol
                 // queues before the owner closes. This constructor creates
