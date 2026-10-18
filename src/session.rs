@@ -4440,11 +4440,11 @@ mod tests {
             id: TerminalId::new(),
             proof: Some(proof("old")),
             terminal: None,
-            native_continuity: Default::default(),
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,
-                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                session_id: None,
                 recipe: LaunchRecipe {
                     program: "claude".into(),
                     arguments: Vec::new(),

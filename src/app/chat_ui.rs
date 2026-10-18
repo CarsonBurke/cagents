@@ -17473,6 +17473,7 @@ mod tests {
                 }
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             }
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let directory = tempfile::tempdir().unwrap();
             let (writer, _) = crate::session::SessionRuntime::open(
                 directory.path().join("state.sqlite3"),
@@ -20285,4 +20286,138 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() {
+        for (stale_reply, codex_resume) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            if codex_resume {
+                source.launch.provider = Provider::Codex;
+                source.launch.recipe.program = "codex".into();
+                source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                source.launch.session_id = None;
+                let allocator = source.proof.clone().unwrap();
+                assert!(source.claim_owned_codex_listener(
+                    std::path::Path::new("/run/test-native"),
+                    &allocator
+                ));
+                source.launch.session_id = Some(KNOWN_THREAD.into());
+                source.native_continuity = chat::NativeContinuity::Durable {
+                    provider_version: "0.100.0".into(),
+                };
+            } else {
+                source.launch.provider = Provider::Claude;
+                source.launch.recipe.program = "claude".into();
+                source.launch.session_id = None;
+                source.native_continuity =
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            }
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            let mut replacement = source.clone();
+            replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
+            if codex_resume {
+                replacement
+                    .launch
+                    .recipe
+                    .arguments
+                    .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
+            } else {
+                replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            }
+            let handle = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    source.clone(),
+                    replacement.clone(),
+                    Snapshot {
+                        session_id: replacement.launch.session_id.clone(),
+                        ready: true,
+                        ..Snapshot::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let target = app.chat_ui.next_target(card);
+            app.chat_ui.phases.insert(
+                card,
+                Phase::Starting(Attempt {
+                    target,
+                    session: source.clone(),
+                    recovery: None,
+                    upgrade_committed: false,
+                }),
+            );
+            app.cards.remove(&card);
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert!(!app.cards.contains_key(&card));
+            let receipt = account_commit_reply(task);
+            assert!(matches!(
+                receipt,
+                Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+            ));
+            if stale_reply {
+                let next = app.chat_ui.next_target(card);
+                app.chat_ui.phases.insert(
+                    card,
+                    Phase::Starting(Attempt {
+                        target: next,
+                        session: source.clone(),
+                        recovery: None,
+                        upgrade_committed: false,
+                    }),
+                );
+                let _ = app.update(receipt);
+                assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);
+                assert!(!app.chat_ui.attempt(card).unwrap().upgrade_committed);
+                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+                assert!(!app.cards.contains_key(&card));
+            } else {
+                let _ = app.update(receipt);
+                assert!(!app.chat_start_pending(card));
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(replacement.clone())
+                );
+                assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                app.persist();
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(writer.last_error(), None);
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_card(card, None)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(replacement)
+                );
+            }
+        }
+    }
+
+
 }

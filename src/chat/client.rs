@@ -532,10 +532,7 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
-    if matches!(
-        session.native_continuity,
-        super::NativeContinuity::Durable { .. }
-    ) {
+    if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
@@ -4079,4 +4076,33 @@ mod tests {
             server.join().unwrap();
         }
     }
+    #[test]
+    fn retained_claude_pre_id_restore_records_authenticated_writer_lineage() {
+        for learned in [false, true] {
+            let mut source = omp_card(None, Some(host_proof("prior")));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.native_continuity =
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let mut resolved = source.clone();
+            resolved.proof = Some(host_proof("live"));
+            resolved.launch.session_id = learned.then(|| CONVERSATION.into());
+            let handle = restore_with_lineage(source.clone(), Some(resolved.clone()), |request| {
+                let ClientRequest::ChatAttach { session } = request else {
+                    panic!("retained recovery must attach without starting");
+                };
+                let snapshot = Snapshot {
+                    session_id: session.launch.session_id.clone(),
+                    ..Default::default()
+                };
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached { session, snapshot },
+                }
+            })
+            .unwrap();
+            assert_eq!(handle.upgrade_recovery(), Some(&(source, resolved)));
+        }
+    }
+
+
 }
