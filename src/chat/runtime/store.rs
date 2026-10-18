@@ -53,7 +53,6 @@ pub(crate) struct Store {
     db: Connection,
     copy_cache: uuid::Uuid,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
-    copy_failed: bool,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -159,7 +158,6 @@ impl Store {
             Ok(Self {
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_projection: Default::default(),
-                copy_failed: false,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -677,14 +675,6 @@ impl Store {
         }
         self.index_child_event(&event)?;
         let mut out = Vec::new();
-        if !self.copy_failed
-            && let Err(error) = self.copy_child_event(&event)
-        {
-            self.copy_failed = true;
-            out.push(nonfatal(format!(
-                "Full-message copy cache is unavailable: {error}"
-            )));
-        }
         let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?
@@ -818,7 +808,7 @@ impl Store {
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
-                self.copy_remove(&crate::chat::TextCopyScope::Conversation, &ids)?;
+                self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -835,7 +825,6 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 self.copy_cache = uuid::Uuid::new_v4();
                 self.copy_projection.clear();
-                self.copy_failed = false;
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -922,7 +911,7 @@ impl Store {
                 },
                 false,
             )?;
-            self.copy_remove(&crate::chat::TextCopyScope::Conversation, &[id.to_owned()])?;
+            self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
                 // The identity itself could not be cached; the delta has nowhere to go.
                 return Ok(warning);
