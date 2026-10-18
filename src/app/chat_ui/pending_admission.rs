@@ -273,9 +273,13 @@ impl Cagents {
             // Failed exact lineage is not permission to restart either actor.
             // Keep the source copy inert and leave the canonical pane's retry
             // explicit instead of falling through to ordinary resume/start.
-            self.cards.insert(pane.id, CardRuntime::Failed(
-                "The shared conversation's exact upgrade could not be confirmed. Its saved draft is retained beside it; retry to reconnect.".into(),
-            ));
+            let notice = if saved_copy.is_some() {
+                "Could not reconnect this conversation. Your draft is in the pane beside it. Retry to reconnect."
+            } else {
+                "Could not reconnect this conversation. Retry to reconnect."
+            };
+            self.cards
+                .insert(pane.id, CardRuntime::Failed(notice.into()));
             return (presentation, saved_copy);
         }
         let task = match &pane.kind {
