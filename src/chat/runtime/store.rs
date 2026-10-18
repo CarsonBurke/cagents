@@ -7,12 +7,7 @@ use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
-};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
@@ -63,6 +58,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
+    _lease: fs::File,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -80,9 +76,12 @@ pub(crate) struct Store {
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
     /// Recognizes delivered messages as they enter the transcript.
-    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
 impl Store {
+    pub(super) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
     #[cfg(test)]
     pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
         self.db
@@ -217,11 +216,8 @@ impl Store {
         Self::at(root)
     }
     fn at(root: PathBuf) -> Result<Self, String> {
-        let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Cannot create private transcript cache: {e}"))?;
+        let (directory, lease) = crate::transcript_cache::create(&root)
+            .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
         let result = (|| {
             fs::OpenOptions::new()
@@ -252,6 +248,7 @@ impl Store {
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
+                _lease: lease,
                 end: None,
                 first: None,
                 newest: None,
@@ -744,7 +741,7 @@ impl Store {
     /// next event on.
     pub(crate) fn recognize_messages(
         &mut self,
-        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     ) {
         self.messages = seal;
     }
@@ -1476,9 +1473,10 @@ impl Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
-        // This UUID directory was created exclusively by this store, never discovered by a scan.
+        // This store owns the cache lease. Retained semantic evidence must outlive
+        // the reducer until its journal owner publishes a checked disposal permit.
         let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        let _ = fs::remove_dir_all(&self.directory);
+        let _ = crate::transcript_cache::remove_if_reclaimable(&self.directory);
     }
 }
 /// Bounds the identity fields a provider can make arbitrarily large so an
@@ -1628,6 +1626,75 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {
+        use std::fs::OpenOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = Store::at(root.path().to_owned()).unwrap();
+        let ordinary_directory = ordinary.directory().to_owned();
+        drop(ordinary);
+        assert!(!ordinary_directory.exists());
+
+        let retained = Store::at(root.path().to_owned()).unwrap();
+        let retained_directory = retained.directory().to_owned();
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(retained_directory.join("actor-journal.sqlite"))
+            .unwrap();
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&retained_directory, &journal)
+                .unwrap();
+        journal
+            .write_all(b"accepted input and unacknowledged outcome")
+            .unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(retained);
+        assert!(retained_directory.join("transcript.sqlite").exists());
+        assert_eq!(
+            fs::read(retained_directory.join("actor-journal.sqlite")).unwrap(),
+            b"accepted input and unacknowledged outcome"
+        );
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            0
+        );
+
+        // Only the journal owner can assert retirement/drain. Dropping Store
+        // releases the lease, so its exact permit allows a later sweep.
+        retention.allow_removal().unwrap();
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            1
+        );
+        assert!(!retained_directory.exists());
+    }
+
+    #[test]
+    fn dropping_a_store_reclaims_an_exactly_retired_actor_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().to_owned()).unwrap();
+        let directory = store.directory().to_owned();
+        let journal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("actor-journal.sqlite"))
+            .unwrap();
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&directory, &journal).unwrap();
+        retention.allow_removal().unwrap();
+        drop(journal);
+        drop(store);
+        assert!(!directory.exists());
+    }
+
     #[test]
     fn history_coverage_checks_hidden_rows_and_every_chunk_not_only_the_window() {
         let old = history_item("old-page", "older cached page");

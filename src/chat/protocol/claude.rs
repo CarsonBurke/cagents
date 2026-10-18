@@ -38,15 +38,48 @@ const MODES: &[&str] = &[
 ];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_inner(launch, false)
+    create_inner(launch, None, false)
 }
 
 pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_inner(launch, true)
+    create_inner(launch, None, true)
+}
+
+/// Transient identity selected by the original adapter during preparation.
+/// A fresh UUID is not provider confirmation or a disk-resume descriptor.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedIdentity {
+    session_id: String,
+    resumed: bool,
+}
+impl PreparedIdentity {
+    fn validate(&self, launch: &Launch) -> Result<(), String> {
+        validate_id(&self.session_id)?;
+        if self.resumed != launch.session_id.is_some()
+            || launch
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != self.session_id)
+        {
+            return Err(
+                "Retained Claude identity differs from its issued launch mode or session".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn create_prepared(
+    launch: &Launch,
+    identity: PreparedIdentity,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    identity.validate(launch)?;
+    create_inner(launch, Some(identity), false)
 }
 
 fn create_inner(
     launch: &Launch,
+    prepared: Option<PreparedIdentity>,
     forced_history: bool,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     if forced_history
@@ -78,9 +111,9 @@ fn create_inner(
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
-    let session_id = launch
-        .session_id
-        .clone()
+    let session_id = prepared
+        .map(|identity| identity.session_id)
+        .or_else(|| launch.session_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if launch.session_id.is_none() {
         spec.arguments.push(format!("--session-id={session_id}"));
@@ -88,6 +121,10 @@ fn create_inner(
     Ok((
         spec,
         Box::new(Claude {
+            prepared_identity: Some(PreparedIdentity {
+                session_id: session_id.clone(),
+                resumed: launch.session_id.is_some(),
+            }),
             session_id: Some(session_id),
             resumed: launch.session_id.is_some(),
             history_only,
@@ -347,6 +384,7 @@ enum ReportTask {
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
+    prepared_identity: Option<PreparedIdentity>,
     titles: Option<super::claude_titles::ClaudeTitles>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
@@ -1666,6 +1704,10 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn prepared_launch_identity(&self) -> Option<PreparedIdentity> {
+        self.prepared_identity.clone()
+    }
+
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,

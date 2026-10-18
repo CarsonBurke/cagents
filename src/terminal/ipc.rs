@@ -163,7 +163,9 @@ use crate::{
 /// sidecars to Snapshot and a requester-specific paged reply. The three
 /// executables require this matched positional postcard layout; JSON defaults
 /// do not preserve binary compatibility.
-pub const PROTOCOL_VERSION: u16 = 102;
+/// Version 103 adds retained Claude actor continuity to native descriptors and
+/// snapshots. Private actor protocol 2 has a separate authenticated namespace.
+pub const PROTOCOL_VERSION: u16 = 103;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -1943,6 +1945,32 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes)).unwrap(),
+            Some(response)
+        );
+        let mut legacy = serde_json::to_value(crate::chat::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("native_continuity");
+        let legacy: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.native_continuity,
+            crate::chat::NativeContinuity::ReconnectOnly
+        );
+    }
 
     #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {

@@ -642,7 +642,7 @@ fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
 
-fn announce(host: &SharedHost, registry: &SharedRegistry) {
+pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
     let sequence = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())

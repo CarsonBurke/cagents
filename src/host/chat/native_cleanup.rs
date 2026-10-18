@@ -18,9 +18,11 @@ struct RetainedPair {
     original_role: Option<registry::OriginalRole>,
 }
 
-/// Cleanup does not require provider history or a successful protocol attach.
-/// Only the authenticated exact holder and current exclusive daemon lease can
-/// authorize it; disappearance alone never counts as a successful close.
+/// Codex cleanup does not require provider history or a successful attach.
+/// Claude cleanup adopts its authenticated resident reducer with close-only
+/// authority from its durable registration; this grants no account read or input
+/// authority. Exact ownership and the current daemon lease authorize either
+/// route; disappearance never proves a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
     close_retained_inner(host, source, None)
 }
@@ -39,6 +41,40 @@ fn close_retained_inner(
     closing: Option<&capacity::Reservation>,
 ) -> Result<(), String> {
     super::super::agent_execution::preflight_retirement(host, source)?;
+    if source.launch.provider == Provider::Claude {
+        if matches!(source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { protocol } if protocol != 2)
+        {
+            return Err(
+                "This retained Claude actor protocol is unsupported; its owner was preserved"
+                    .into(),
+            );
+        }
+        let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
+        let owner = registry::recovery_candidate(&socket, Kind::Native)?;
+        let hosted = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .get(&source.id)
+            .is_some_and(|record| record.handle.actor_identity().is_some());
+        if hosted
+            || matches!(
+                source.native_continuity,
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || owner.as_ref().is_some_and(|record| {
+                Handle::is_remote_record(record)
+                    || record.build.as_ref().is_some_and(|build| {
+                        build
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability.starts_with("claude-actor-"))
+                    })
+            })
+        {
+            return super::retained_actor::close_unattached(host, source, owner);
+        }
+    }
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -55,12 +91,11 @@ fn close_retained_inner(
             if record.handle.owns_work() {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
-            let ServerResponse::ChatAttached {
-                session: observed, ..
-            } = session_snapshot(record)
-            else {
-                unreachable!()
-            };
+            // Identity/continuity are cached actor metadata; never hydrate a
+            // potentially remote transcript while holding HostState.
+            let mut observed = record.session.clone();
+            observed.launch.session_id = record.handle.session_id();
+            observed.native_continuity = record.handle.native_continuity();
             if record.session != *source
                 && observed != *source
                 && !state
@@ -357,8 +392,8 @@ fn retained_pair(
     if terminal.is_some_and(|terminal| terminal.id != holder.terminal) {
         return Err("The paired source differs from its authenticated holder identity".into());
     }
-    // This source was authenticated against exact live recovery or the
-    // immutable source-digest receipt, including its original package role.
+    // The caller has already matched this native source against the live
+    // holder's full recovery or its exact durable source-digest receipt.
     let original_role = registry::OriginalRole::authenticated(
         holder,
         native_source
