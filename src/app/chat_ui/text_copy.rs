@@ -208,7 +208,7 @@ impl Cagents {
 /// handled: another copy may be requested while this effect is still pending.
 fn clipboard_write(context: ClipboardContext, intent: u64, text: String) -> Task<Message> {
     let mut text = Some(text);
-    Task::done(()).then(move |_| {
+    iced::Task::done(()).then(move |_| {
         if context.is_current(intent) {
             iced::clipboard::write(text.take().unwrap_or_default()).map(cosmic::Action::App)
         } else {
