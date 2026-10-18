@@ -139,18 +139,55 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
             mode: chat::PromptMode::Send,
         })
         .unwrap();
-    wait(
-        || {
-            root.join("provider-done").exists()
-                && original.lock().unwrap().chats[&id]
-                    .session
-                    .launch
-                    .session_id
-                    .is_some()
-        },
-        "HOST never committed actual provider confirmation",
-    );
-    let canonical = original.lock().unwrap().chats[&id].session.clone();
+    // The hosted Record retains its issued startup descriptor. Public list
+    // and attachment responses project the current provider-confirmed ID.
+    // One acceptance cutoff covers every poll and both public calls; it does
+    // not preempt synchronous handler I/O, which the outer wrapper bounds.
+    let confirmation_deadline = Instant::now() + Duration::from_secs(15);
+    let canonical = loop {
+        assert!(
+            Instant::now() < confirmation_deadline,
+            "HOST never published actual provider confirmation"
+        );
+        if root.join("provider-done").exists()
+            && let Some(confirmed) = handle.confirmed_session_id()
+        {
+            let ServerResponse::ChatListed { sessions } =
+                process(&original, 0, ClientRequest::ChatList).unwrap()
+            else {
+                panic!("public chat list did not return its inventory");
+            };
+            assert!(
+                Instant::now() < confirmation_deadline,
+                "public chat list exceeded the confirmation cutoff"
+            );
+            let listed = sessions.into_iter().find(|session| session.id == id);
+            if let Some(listed) = listed
+                && listed.launch.session_id.as_deref() == Some(confirmed.as_str())
+            {
+                let ServerResponse::ChatAttached { session, snapshot } = process(
+                    &original,
+                    0,
+                    ClientRequest::ChatAttach {
+                        session: listed.clone(),
+                    },
+                )
+                .unwrap() else {
+                    panic!("public chat attachment did not return its snapshot");
+                };
+                assert!(
+                    Instant::now() < confirmation_deadline,
+                    "public attachment exceeded the confirmation cutoff"
+                );
+                assert_eq!(session.id, id);
+                assert_eq!(session.launch, listed.launch);
+                assert_eq!(snapshot.session_id.as_deref(), Some(confirmed.as_str()));
+                assert_eq!(handle.actor_identity(), Some(identity.clone()));
+                break session;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(canonical.launch.session_id, handle.confirmed_session_id());
     assert!(canonical.launch.session_id.is_some());
     let ServerResponse::ChatResumePrepared { session: live } = process_inner(
