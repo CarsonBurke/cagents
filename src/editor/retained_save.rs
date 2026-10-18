@@ -64,6 +64,38 @@ impl RetainedSaveOutcome {
         (self.outcome, self.recovery)
     }
 }
+/// Settle an operation-owned bootstrap only after its leaf cleanup. Pending
+/// leaf authority is carried by the bootstrap retry before the empty sibling
+/// can be removed, preserving both custody phases in the window result.
+pub(crate) fn finish_context(
+    context: &FilesystemRecoveryContext,
+    result: Result<RetainedSaveOutcome, RetainedSaveError>,
+) -> Result<RetainedSaveOutcome, RetainedSaveError> {
+    let leaf = match &result {
+        Ok(outcome) => outcome.recovery_authority(),
+        Err(error) => error.recovery_authority(),
+    }
+    .cloned();
+    let Some(authority) = context.finish(leaf) else {
+        return result;
+    };
+    match result {
+        Ok(mut outcome) => {
+            if let SaveOutcome::Saved { durability, .. } = &mut outcome.outcome {
+                *durability = super::SaveDurability::Unconfirmed {
+                    error: "Private recovery parent cleanup remains pending".into(),
+                };
+            }
+            outcome.recovery = Some(authority);
+            Ok(outcome)
+        }
+        Err(error) => Err(RetainedSaveError::Recovery {
+            message: error.to_string(),
+            authority,
+        }),
+    }
+}
+
 fn io_error(error: impl std::fmt::Display) -> FileIoError {
     FileIoError::Io(error.to_string())
 }

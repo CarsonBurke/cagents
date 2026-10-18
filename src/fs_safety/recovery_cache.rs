@@ -39,7 +39,9 @@ pub(crate) fn verify_recovery_directory_private(
 const MAX_CANDIDATES: usize = 8;
 const MAX_PARENT_WALK: usize = 256;
 
-/// At most eight original held candidates and a bounded256-edge walk. Retain
+/// At most eight protected and eight sticky original held candidates and a
+/// bounded256-edge walk. Sticky candidates do not consume the protected-parent
+/// allowance that existed before sibling bootstrap support. Retain
 /// and charge yielded handles in the actual domain intake; prefer trying one
 /// at a time. No pathname is reopened and no directory is created here.
 pub struct RecoveryParentCandidates {
@@ -47,6 +49,7 @@ pub struct RecoveryParentCandidates {
     source: RecoveryDirectoryStamp,
     walked: usize,
     yielded: usize,
+    sticky_yielded: usize,
     finished: bool,
 }
 impl RecoveryParentCandidates {
@@ -57,6 +60,7 @@ impl RecoveryParentCandidates {
             source: stamp,
             walked: 0,
             yielded: 0,
+            sticky_yielded: 0,
             finished: false,
         })
     }
@@ -69,7 +73,7 @@ impl Iterator for RecoveryParentCandidates {
         }
         while self.walked < MAX_PARENT_WALK {
             self.walked += 1;
-            let step = (|| -> io::Result<Option<Arc<Root>>> {
+            let step = (|| -> io::Result<Option<(Arc<Root>, bool)>> {
                 let previous = recovery_directory_stamp(&self.cursor)?;
                 let parent = Arc::new(retained_parent_directory(&self.cursor)?);
                 let current = recovery_directory_stamp(&parent)?;
@@ -84,7 +88,7 @@ impl Iterator for RecoveryParentCandidates {
                 match DirectoryNamespace::acquire(&parent) {
                     Ok(namespace) => {
                         drop(namespace);
-                        Ok(Some(parent))
+                        Ok(Some((parent, false)))
                     }
                     Err(error)
                         if matches!(
@@ -92,14 +96,26 @@ impl Iterator for RecoveryParentCandidates {
                             io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
                         ) =>
                     {
-                        Ok(None)
+                        // A sticky namespace grants only a fresh exclusive
+                        // sibling bootstrap, never ordinary publication.
+                        if self.sticky_yielded < MAX_CANDIDATES
+                            && StickyParent::acquire(parent.clone()).is_ok()
+                        {
+                            Ok(Some((parent, true)))
+                        } else {
+                            Ok(None)
+                        }
                     }
                     Err(error) => Err(error),
                 }
             })();
             match step {
-                Ok(Some(parent)) => {
-                    self.yielded += 1;
+                Ok(Some((parent, sticky))) => {
+                    if sticky {
+                        self.sticky_yielded += 1;
+                    } else {
+                        self.yielded += 1;
+                    }
                     return Some(Ok(parent));
                 }
                 Ok(None) if !self.finished => continue,

@@ -90,6 +90,84 @@ fn mount_identity(_root: &Root) -> io::Result<u64> {
         "Strong recovery placement is unavailable without qualified native mount-identity ancestry inspection.",
     ))
 }
+/// Pre-effect qualification of a retained outside candidate. Unlike final
+/// placement this does not claim a private namespace, create anything, or
+/// authorize payloads. Sticky bootstrap callers must run this before mkdir,
+/// then acquire RecoveryPlacement on the actual fresh private sibling.
+pub(crate) fn validate_recovery_parent(
+    parent: &Root,
+    source: &Root,
+    known_roots: &[Arc<Root>],
+) -> io::Result<()> {
+    if known_roots.len() > MAX_EXCLUDED_ROOTS {
+        return Err(unsupported(
+            "Recovery parent exceeds the bounded checkout census",
+        ));
+    }
+    let source_identity = identity(source)?;
+    if identity(parent)?.0 != source_identity.0
+        || mount_identity(parent)? != mount_identity(source)?
+    {
+        return Err(unsupported(
+            "Recovery parent must be on the original source mount",
+        ));
+    }
+    validate_recovery_ancestry(parent, source_identity, known_roots, &[])
+}
+
+fn validate_recovery_ancestry(
+    start: &Root,
+    source_identity: (u64, u64),
+    known_roots: &[Arc<Root>],
+    current_roots: &[Arc<Root>],
+) -> io::Result<()> {
+    let mut excluded = HashSet::from([source_identity]);
+    for root in known_roots.iter() {
+        excluded.insert(identity(root)?);
+    }
+    for root in current_roots {
+        excluded.insert(identity(root)?);
+    }
+    if excluded.len() > MAX_EXCLUDED_ROOTS {
+        return Err(unsupported(
+            "The combined recovery root census exceeds its bounded inspection.",
+        ));
+    }
+    let mut cursor = start.try_clone()?;
+    for _ in 0..MAX_ANCESTORS {
+        let current = identity(&cursor)?;
+        let current_mount = mount_identity(&cursor)?;
+        if excluded.contains(&current) {
+            return Err(unsupported(
+                "Recovery payloads would be inside a captured known checkout root; this step was refused and existing recovery was retained.",
+            ));
+        }
+        // Presence alone refuses placement. Do not read an attacker/FIFO
+        // locator, follow a symlink, or adopt unknown foreign Git metadata.
+        match metadata_beneath(&cursor, Path::new(".git")) {
+            Err(error) if error.is_not_found() => {}
+            Ok(_) => {
+                return Err(unsupported(
+                    "Recovery placement has an enclosing Git checkout locator; this step was refused and existing recovery was retained.",
+                ));
+            }
+            Err(error) => {
+                return Err(unsupported(&format!(
+                    "Recovery checkout ancestry could not be established: {error}"
+                )));
+            }
+        }
+        let parent = parent_of(&cursor)?;
+        if identity(&parent)? == current && mount_identity(&parent)? == current_mount {
+            return Ok(());
+        }
+        cursor = parent;
+    }
+    Err(unsupported(
+        "Recovery placement exceeds the bounded ancestor inspection; this step was refused and existing recovery was retained.",
+    ))
+}
+
 impl RecoveryPlacement {
     /// Retain the actual same-filesystem outside parent and captured known
     /// roots. No path-only consent, registry callback or adoption grant exists.
@@ -183,51 +261,7 @@ impl RecoveryPlacement {
                 "The retained recovery payload is not on the captured source mount; this step was refused.",
             ));
         }
-        let mut excluded = HashSet::from([self.source_identity]);
-        for root in self.excluded.iter() {
-            excluded.insert(identity(root)?);
-        }
-        for root in current_roots {
-            excluded.insert(identity(root)?);
-        }
-        if excluded.len() > MAX_EXCLUDED_ROOTS {
-            return Err(unsupported(
-                "The combined recovery root census exceeds its bounded inspection.",
-            ));
-        }
-        let mut cursor = start.try_clone()?;
-        for _ in 0..MAX_ANCESTORS {
-            let current = identity(&cursor)?;
-            let current_mount = mount_identity(&cursor)?;
-            if excluded.contains(&current) {
-                return Err(unsupported(
-                    "Recovery payloads would be inside a captured known checkout root; this step was refused and existing recovery was retained.",
-                ));
-            }
-            // Presence alone refuses placement. Do not read an attacker/FIFO
-            // locator, follow a symlink, or adopt unknown foreign Git metadata.
-            match metadata_beneath(&cursor, Path::new(".git")) {
-                Err(error) if error.is_not_found() => {}
-                Ok(_) => {
-                    return Err(unsupported(
-                        "Recovery placement has an enclosing Git checkout locator; this step was refused and existing recovery was retained.",
-                    ));
-                }
-                Err(error) => {
-                    return Err(unsupported(&format!(
-                        "Recovery checkout ancestry could not be established: {error}"
-                    )));
-                }
-            }
-            let parent = parent_of(&cursor)?;
-            if identity(&parent)? == current && mount_identity(&parent)? == current_mount {
-                return Ok(());
-            }
-            cursor = parent;
-        }
-        Err(unsupported(
-            "Recovery placement exceeds the bounded ancestor inspection; this step was refused and existing recovery was retained.",
-        ))
+        validate_recovery_ancestry(start, self.source_identity, &self.excluded, current_roots)
     }
     /// The consumer's original effect Root must match the captured source;
     /// borrowing a safe placement for another source does not transfer consent.
@@ -270,6 +304,43 @@ mod tests {
         let outside = Arc::new(Root::open(directory.path()).unwrap());
         (directory, source, outside)
     }
+    #[test]
+    fn sticky_sibling_qualifies_direct_temporary_directory_sources() {
+        for temporary_parent in ["/tmp", "/var/tmp"] {
+            let source = tempfile::tempdir_in(temporary_parent).unwrap();
+            let source_root = Arc::new(Root::open(source.path()).unwrap());
+            let parent_root = Arc::new(Root::open(temporary_parent).unwrap());
+            let known = Arc::from([source_root.clone()]);
+            validate_recovery_parent(&parent_root, &source_root, &known).unwrap();
+            let parent = StickyParent::acquire(parent_root).unwrap();
+            let mut sibling = parent.create_private_sibling().unwrap();
+            let placement =
+                RecoveryPlacement::acquire(sibling.directory_arc().unwrap(), source_root, known)
+                    .unwrap();
+            placement.validate().unwrap();
+            assert_eq!(
+                placement.retained_descriptor_count(),
+                3,
+                "same source Arc is deduplicated, child plus namespace plus source"
+            );
+            drop(placement);
+            sibling.cleanup_empty().unwrap();
+            assert!(sibling.is_resolved());
+        }
+    }
+
+    #[test]
+    fn sticky_parent_preflight_refuses_source_and_captured_ancestors_before_creation() {
+        let (directory, source, outside) = roots();
+        let initial = std::fs::read_dir(directory.path()).unwrap().count();
+        assert!(validate_recovery_parent(&source, &source, &[]).is_err());
+        assert!(validate_recovery_parent(&outside, &source, &[outside.clone()]).is_err());
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            initial
+        );
+    }
+
     #[test]
     fn local_recovery_parent_refuses_source_and_known_checkout_ancestors() {
         let (_directory, source, outside) = roots();

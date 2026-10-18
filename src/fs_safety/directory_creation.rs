@@ -7,7 +7,7 @@
 //! Hostile same-UID/root interference inside the protected namespace is outside
 //! this contract. No post-hoc stat can make that bootstrap assumption absolute.
 use super::*;
-use std::os::unix::fs::MetadataExt;
+use std::{os::unix::fs::MetadataExt, sync::Arc};
 
 /// A retained namespace whose entries other UIDs cannot replace.
 ///
@@ -27,6 +27,311 @@ impl DirectoryNamespace {
     }
     pub fn directory(&self) -> &Root {
         &self.directory
+    }
+}
+
+/// A retained root- or effective-user-owned sticky namespace. This proof is
+/// only for fresh random internal entries owned by this effective user; it is
+/// never a DirectoryNamespace or authority over an existing public entry.
+/// Root and noncooperating same-UID interference remain outside this contract.
+#[derive(Debug)]
+pub(crate) struct StickyParent {
+    directory: Arc<Root>,
+    stamp: RecoveryDirectoryStamp,
+    uid: u32,
+    mode: u32,
+}
+/// Kernel permission observation on the retained inode, using effective
+/// credentials, supplementary groups and ACLs. This is a pre-effect check,
+/// never a write probe or a promise against later permission/topology changes.
+#[cfg(target_os = "linux")]
+fn sticky_parent_effective_access(directory: &Root) -> io::Result<()> {
+    // SAFETY: the Root retains its descriptor and the empty C string is live.
+    // AT_EMPTY_PATH selects that descriptor; AT_EACCESS uses effective IDs.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            directory.descriptor(),
+            c"".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+        )
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EINVAL)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Sticky-parent qualification requires retained-FD effective permission observation",
+        ));
+    }
+    Err(error)
+}
+#[cfg(not(target_os = "linux"))]
+fn sticky_parent_effective_access(_directory: &Root) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Retained sticky-parent effective permission observation is unavailable on this platform",
+    ))
+}
+impl StickyParent {
+    pub(crate) fn acquire(directory: Arc<Root>) -> io::Result<Arc<Self>> {
+        let metadata = directory.metadata()?;
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != euid)
+            || metadata.mode() & 0o1000 == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Private sibling creation requires a root- or user-owned sticky parent",
+            ));
+        }
+        let parent = Arc::new(Self {
+            stamp: recovery_directory_stamp(&directory)?,
+            directory,
+            uid: metadata.uid(),
+            mode: metadata.mode() & 0o7777,
+        });
+        parent.validate()?;
+        Ok(parent)
+    }
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let current = self.directory.metadata()?;
+        let euid = unsafe { libc::geteuid() };
+        if recovery_directory_stamp(&self.directory)? != self.stamp
+            || current.uid() != self.uid
+            || (current.uid() != 0 && current.uid() != euid)
+            || current.mode() & 0o7777 != self.mode
+            || current.mode() & 0o1000 == 0
+        {
+            return Err(io::Error::other(
+                "Retained sticky parent protection changed",
+            ));
+        }
+        sticky_parent_effective_access(&self.directory)
+    }
+    /// One native parent handle; Arc aliases do not add descriptors.
+    pub(crate) fn retained_descriptor_count(&self) -> usize {
+        1
+    }
+    /// Callers must reserve their bounded recovery slot and charge retained
+    /// native owners before this first effect. No existing entry is adopted.
+    pub(crate) fn create_private_sibling(
+        self: Arc<Self>,
+    ) -> Result<OwnedPrivateSibling, PrivateSiblingCreateError> {
+        self.create_with_hook(|_, _| Ok(()))
+    }
+    fn create_with_hook(
+        self: Arc<Self>,
+        after_mkdir: impl FnOnce(&Root, &OsStr) -> io::Result<()>,
+    ) -> Result<OwnedPrivateSibling, PrivateSiblingCreateError> {
+        let name = temporary_name().map_err(PrivateSiblingCreateError::Rejected)?;
+        self.create_named_with_hook(name, after_mkdir)
+    }
+    fn create_named_with_hook(
+        self: Arc<Self>,
+        name: OsString,
+        after_mkdir: impl FnOnce(&Root, &OsStr) -> io::Result<()>,
+    ) -> Result<OwnedPrivateSibling, PrivateSiblingCreateError> {
+        self.validate()
+            .map_err(PrivateSiblingCreateError::Rejected)?;
+        let leaf = c_component(&name, &self.directory.path)
+            .map_err(|e| PrivateSiblingCreateError::Rejected(io::Error::other(e)))?;
+        let mut sibling = OwnedPrivateSibling {
+            parent: self,
+            name,
+            directory: None,
+            stamp: None,
+            quarantined: None,
+            removed: false,
+            synced: false,
+        };
+        // Exclusive success under the pinned sticky namespace is the creation
+        // provenance. EEXIST never confers custody of the occupied entry.
+        if unsafe { libc::mkdirat(sibling.parent.directory.descriptor(), leaf.as_ptr(), 0o700) }
+            != 0
+        {
+            return Err(PrivateSiblingCreateError::Rejected(
+                io::Error::last_os_error(),
+            ));
+        }
+        let setup = (|| {
+            after_mkdir(&sibling.parent.directory, &sibling.name)?;
+            sibling.acquire_original()?;
+            let directory = sibling.directory.as_ref().unwrap();
+            // Restrictive umasks can remove owner access. Only repair the
+            // exact fresh EUID-owned inode after mount/identity qualification.
+            set_directory_permissions(directory, 0o700)?;
+            sibling.validate()?;
+            sync_directory(directory)?;
+            sync_directory(&sibling.parent.directory)
+        })();
+        match setup {
+            Ok(()) => Ok(sibling),
+            Err(cause) => Err(PrivateSiblingCreateError::Retained { cause, sibling }),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrivateSiblingCreateError {
+    #[error("Private sibling creation refused: {0}")]
+    Rejected(#[source] io::Error),
+    #[error("Private sibling preparation failed: {cause}; original cleanup custody retained")]
+    Retained {
+        #[source]
+        cause: io::Error,
+        sibling: OwnedPrivateSibling,
+    },
+}
+
+/// Exact fresh private sibling custody, including incomplete initial FD
+/// acquisition. No Drop performs filesystem IO. A successful caller must
+/// explicitly remove this empty parent after all leaf holdings have retired;
+/// cleanup errors retain this receipt and its pre-effect reservation.
+#[derive(Debug)]
+#[must_use = "retain the sibling through explicit cleanup and parent sync"]
+pub(crate) struct OwnedPrivateSibling {
+    parent: Arc<StickyParent>,
+    name: OsString,
+    directory: Option<Arc<Root>>,
+    stamp: Option<RecoveryDirectoryStamp>,
+    quarantined: Option<OsString>,
+    removed: bool,
+    synced: bool,
+}
+impl OwnedPrivateSibling {
+    fn acquire_original(&mut self) -> io::Result<()> {
+        self.parent.validate()?;
+        if self.directory.is_none() {
+            // A pending first acquisition is permitted only by the ORIGINAL
+            // fresh mkdir + sticky namespace custody, never pathname existence.
+            let directory = resolve_directory(&self.parent.directory, Path::new(&self.name))
+                .map_err(io::Error::other)?;
+            self.directory = Some(Arc::new(directory));
+        }
+        let directory = self.directory.as_ref().unwrap();
+        let metadata = directory.metadata()?;
+        let stamp = recovery_directory_stamp(directory)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || stamp.device != self.parent.stamp.device
+            || stamp.mount_id != self.parent.stamp.mount_id
+            || self.stamp.is_some_and(|expected| expected != stamp)
+        {
+            return Err(io::Error::other(
+                "Fresh private sibling ownership or retained mount identity changed; entry preserved",
+            ));
+        }
+        self.stamp = Some(stamp);
+        Ok(())
+    }
+    pub(crate) fn directory(&self) -> io::Result<&Root> {
+        self.validate()?;
+        Ok(self.directory.as_ref().unwrap())
+    }
+    pub(crate) fn directory_arc(&self) -> io::Result<Arc<Root>> {
+        self.validate()?;
+        Ok(self.directory.as_ref().unwrap().clone())
+    }
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        self.parent.validate()?;
+        let directory = self.directory.as_ref().ok_or_else(|| {
+            io::Error::other("Private sibling initial acquisition remains unresolved")
+        })?;
+        let metadata = directory.metadata()?;
+        if self.removed
+            || self.quarantined.is_some()
+            || self.stamp != Some(recovery_directory_stamp(directory)?)
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o7777 != 0o700
+        {
+            return Err(io::Error::other(
+                "Original private sibling is no longer qualified",
+            ));
+        }
+        namespace_protected(directory)
+    }
+    /// Actual native handles, including the pinned original sticky parent.
+    /// Arc aliases of the parent/child must be deduplicated by the owner.
+    /// Quarantine is a name under that same parent and owns no extra FD.
+    pub(crate) fn retained_descriptor_count(&self) -> usize {
+        1 + usize::from(self.directory.is_some())
+    }
+    pub(crate) fn is_resolved(&self) -> bool {
+        self.removed && self.synced
+    }
+    pub(crate) fn diagnostic_path(&self) -> PathBuf {
+        self.parent
+            .directory
+            .path
+            .join(self.quarantined.as_ref().unwrap_or(&self.name))
+    }
+    pub(crate) fn cleanup_empty(&mut self) -> io::Result<()> {
+        self.cleanup_with_hooks(|| {}, sync_directory)
+    }
+    fn cleanup_with_hooks(
+        &mut self,
+        after_acquire: impl FnOnce(),
+        sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.removed {
+            if !self.synced {
+                sync_parent(&self.parent.directory)?;
+                self.synced = true;
+            }
+            return Ok(());
+        }
+        self.acquire_original()?;
+        if self.quarantined.is_none() {
+            let quarantine = temporary_name()?;
+            rename_new_between(
+                &self.parent.directory,
+                &self.name,
+                &self.parent.directory,
+                &quarantine,
+            )
+            .map_err(io::Error::other)?;
+            self.quarantined = Some(quarantine);
+        }
+        after_acquire();
+        self.parent.validate()?;
+        let quarantine = self.quarantined.as_ref().unwrap();
+        let removal = (|| {
+            let acquired = resolve_directory(&self.parent.directory, Path::new(quarantine))
+                .map_err(io::Error::other)?;
+            if Some(recovery_directory_stamp(&acquired)?) != self.stamp
+                || acquired.metadata()?.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(io::Error::other(
+                    "Sibling cleanup acquired a replacement; it was preserved",
+                ));
+            }
+            remove_directory_within(&self.parent.directory, quarantine).map_err(io::Error::other)
+        })();
+        if let Err(cause) = removal {
+            rename_new_between(
+                &self.parent.directory,
+                quarantine,
+                &self.parent.directory,
+                &self.name,
+            ).map_err(|restore| io::Error::other(format!(
+                "{cause}; no-clobber sibling restoration failed: {restore}; acquired entry retained",
+            )))?;
+            self.quarantined = None;
+            return Err(cause);
+        }
+        self.quarantined = None;
+        self.removed = true;
+        sync_parent(&self.parent.directory)?;
+        self.synced = true;
+        Ok(())
     }
 }
 
@@ -1066,6 +1371,228 @@ mod tests {
         fs,
         os::unix::fs::{DirBuilderExt, PermissionsExt},
     };
+    fn sticky_fixture() -> (tempfile::TempDir, Arc<StickyParent>) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        let root = Arc::new(Root::open(directory.path()).unwrap());
+        let parent = StickyParent::acquire(root).unwrap();
+        (directory, parent)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_parent_effective_access_checks_the_retained_original_before_creation() {
+        // A root process may bypass DAC checks. This fixture needs no chown or
+        // privileged child, so exercise denial under an ordinary effective UID.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("sticky");
+        let moved = fixture.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o1555)).unwrap();
+        let retained = Arc::new(Root::open(&original).unwrap());
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let error = StickyParent::acquire(retained).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_is_owned_without_broadening_namespace_or_publication() {
+        let (fixture, parent) = sticky_fixture();
+        assert!(DirectoryNamespace::acquire(&parent.directory).is_err());
+        assert_eq!(parent.retained_descriptor_count(), 1);
+        let mut sibling = parent.clone().create_private_sibling().unwrap();
+        assert_eq!(sibling.retained_descriptor_count(), 2);
+        assert_eq!(
+            sibling.directory().unwrap().metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
+        let child = sibling.directory_arc().unwrap();
+        assert_eq!(
+            child.descriptor(),
+            sibling.directory().unwrap().descriptor()
+        );
+        DirectoryNamespace::acquire(&child).unwrap();
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_never_adopts_an_existing_entry() {
+        let (fixture, parent) = sticky_fixture();
+        let name = OsString::from("occupied");
+        std::fs::create_dir(fixture.path().join(&name)).unwrap();
+        std::fs::write(fixture.path().join(&name).join("foreign"), b"preserve").unwrap();
+        let error = parent
+            .create_named_with_hook(name, |_, _| Ok(()))
+            .unwrap_err();
+        assert!(
+            matches!(error, PrivateSiblingCreateError::Rejected(ref error)
+            if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::read(fixture.path().join("occupied/foreign")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_partial_acquisition_retains_cleanup_custody() {
+        let (fixture, parent) = sticky_fixture();
+        let error = parent
+            .create_with_hook(|_, _| Err(io::Error::other("initial open unavailable")))
+            .unwrap_err();
+        let PrivateSiblingCreateError::Retained { mut sibling, .. } = error else {
+            panic!("post-mkdir failure must retain original custody");
+        };
+        assert_eq!(sibling.retained_descriptor_count(), 1);
+        assert!(sibling.directory().is_err());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_partial_custody_refuses_a_symlink_replacement() {
+        let (fixture, parent) = sticky_fixture();
+        let error = parent
+            .create_with_hook(|parent, name| {
+                std::fs::remove_dir(parent.path.join(name))?;
+                std::os::unix::fs::symlink("foreign-target", parent.path.join(name))?;
+                Err(io::Error::other("initial acquisition interrupted"))
+            })
+            .unwrap_err();
+        let PrivateSiblingCreateError::Retained { mut sibling, .. } = error else {
+            panic!("post-mkdir failure must retain custody");
+        };
+        assert!(sibling.cleanup_empty().is_err());
+        assert_eq!(sibling.retained_descriptor_count(), 1);
+        assert!(
+            std::fs::symlink_metadata(sibling.diagnostic_path())
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_repairs_restrictive_creation_mode_on_original_only() {
+        let (_fixture, parent) = sticky_fixture();
+        let mut sibling = parent
+            .create_with_hook(|parent, name| {
+                let directory =
+                    resolve_directory(parent, Path::new(name)).map_err(io::Error::other)?;
+                set_directory_permissions(&directory, 0)
+            })
+            .unwrap();
+        assert_eq!(
+            sibling.directory().unwrap().metadata().unwrap().mode() & 0o7777,
+            0o700
+        );
+        sibling.cleanup_empty().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_refuses_changed_parent_proof() {
+        let (fixture, parent) = sticky_fixture();
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            parent.create_private_sibling(),
+            Err(PrivateSiblingCreateError::Rejected(_))
+        ));
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_retains_nonempty_original_until_explicit_retry() {
+        let (_fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let file = sibling.diagnostic_path().join("leaf");
+        std::fs::write(&file, b"preserve").unwrap();
+        assert!(sibling.cleanup_empty().is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
+        assert!(!sibling.is_resolved());
+        std::fs::remove_file(file).unwrap();
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_preserves_replacement_and_retains_original_fd() {
+        let (fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let name = sibling.diagnostic_path();
+        let moved = fixture.path().join("original-moved");
+        std::fs::rename(&name, &moved).unwrap();
+        std::fs::create_dir(&name).unwrap();
+        assert!(sibling.cleanup_empty().is_err());
+        assert!(name.is_dir());
+        assert!(moved.is_dir());
+        std::fs::remove_dir(&name).unwrap();
+        std::fs::rename(&moved, &name).unwrap();
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_quarantine_collision_is_retained_and_retryable() {
+        let (fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let original = sibling.diagnostic_path();
+        std::fs::write(original.join("leaf"), b"preserve").unwrap();
+        assert!(
+            sibling
+                .cleanup_with_hooks(|| std::fs::create_dir(&original).unwrap(), sync_directory)
+                .is_err()
+        );
+        let quarantine = sibling.diagnostic_path();
+        assert_ne!(quarantine, original);
+        assert_eq!(std::fs::read(quarantine.join("leaf")).unwrap(), b"preserve");
+        std::fs::remove_file(quarantine.join("leaf")).unwrap();
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+        assert!(original.is_dir(), "no-clobber collision entry is preserved");
+        std::fs::remove_dir(original).unwrap();
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sticky_private_sibling_parent_sync_failure_retries_without_reopening_removed_name() {
+        let (_fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let original = sibling.diagnostic_path();
+        assert!(
+            sibling
+                .cleanup_with_hooks(|| {}, |_| Err(io::Error::other("parent sync unavailable")))
+                .is_err()
+        );
+        assert!(!sibling.is_resolved());
+        assert!(!original.exists());
+        std::fs::create_dir(&original).unwrap();
+        sibling.cleanup_empty().unwrap();
+        assert!(sibling.is_resolved());
+        assert!(original.is_dir());
+    }
+
     fn published(result: DirectoryCreation) -> DirectoryPublication {
         match result {
             DirectoryCreation::Published(p) => p,

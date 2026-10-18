@@ -4852,18 +4852,25 @@ impl RepositoryRuntime {
                     crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(
                         &root, &known,
                     )
-                    .map_err(|error| {
-                        crate::editor::retained_save::RetainedSaveError::Io(error.to_string())
+                    .map_err(|error| match error.authority {
+                        Some(authority) => {
+                            crate::editor::retained_save::RetainedSaveError::Recovery {
+                                message: error.message,
+                                authority,
+                            }
+                        }
+                        None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
                     })
                     .and_then(|context| {
-                        crate::editor::retained_save::save_file_at(
+                        let result = crate::editor::retained_save::save_file_at(
                             &root,
                             &destination,
                             &text,
                             disk_hash,
                             overwrite,
                             &context,
-                        )
+                        );
+                        crate::editor::retained_save::finish_context(&context, result)
                     });
                 let authority = match &result {
                     Ok(outcome) => outcome.recovery_authority(),

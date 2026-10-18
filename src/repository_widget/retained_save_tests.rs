@@ -296,9 +296,51 @@ async fn direct_private_temporary_checkout_remains_saveable() {
     ) {
         return;
     }
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::write(directory.path().join("file.txt"), "baseline").unwrap();
-    let (mut runtime, card, _) = loaded(directory.path()).await;
+    for parent in ["/tmp", "/var/tmp"] {
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        std::fs::write(directory.path().join("file.txt"), "baseline").unwrap();
+        let (mut runtime, card, _) = loaded(directory.path()).await;
+        runtime.set_auto_save(false);
+        insert(&mut runtime, card, '!');
+        let submitted = runtime.editor_text().unwrap();
+        assert_ne!(submitted, "baseline");
+        assert!(runtime.is_dirty());
+        let save = runtime.request_save(card, false);
+        finish(&mut runtime, save).await;
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
+            submitted,
+            "a directly owned private temporary checkout must remain saveable"
+        );
+        assert!(!runtime.is_dirty());
+        assert!(runtime.save_error().is_none());
+    }
+}
+
+#[tokio::test]
+async fn rejected_sticky_candidate_does_not_hide_a_safe_outside_ancestor() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::rejected_sticky_candidate_does_not_hide_a_safe_outside_ancestor",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let enclosing = parent.path().join("enclosing-repository");
+    let mut shared = enclosing.clone();
+    std::fs::create_dir(&enclosing).unwrap();
+    std::fs::create_dir(enclosing.join(".git")).unwrap();
+    // More sticky candidates than the bootstrap allowance must not consume
+    // the preexisting protected-parent discovery allowance.
+    for index in 0..10 {
+        shared = shared.join(format!("shared-{index}"));
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    }
+    let source = shared.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("file.txt"), "baseline").unwrap();
+    let (mut runtime, card, _) = loaded(&source).await;
     runtime.set_auto_save(false);
     insert(&mut runtime, card, '!');
     let submitted = runtime.editor_text().unwrap();
@@ -307,9 +349,8 @@ async fn direct_private_temporary_checkout_remains_saveable() {
     let save = runtime.request_save(card, false);
     finish(&mut runtime, save).await;
     assert_eq!(
-        std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
-        submitted,
-        "a directly owned private temporary checkout must remain saveable"
+        std::fs::read_to_string(source.join("file.txt")).unwrap(),
+        submitted
     );
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());

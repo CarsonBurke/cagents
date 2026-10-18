@@ -441,6 +441,7 @@ pub use directory_creation::{
     DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
     create_directory_in_namespace, stage_directory_in_namespace,
 };
+pub(crate) use directory_creation::{OwnedPrivateSibling, PrivateSiblingCreateError, StickyParent};
 
 /// Changes permissions through the exact retained directory descriptor.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
@@ -470,7 +471,7 @@ pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), Res
 #[path = "fs_safety/recovery_placement.rs"]
 mod recovery_placement;
 pub(crate) use recovery_placement::{
-    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp,
+    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp, validate_recovery_parent,
 };
 
 #[path = "fs_safety/recovery_cache.rs"]
