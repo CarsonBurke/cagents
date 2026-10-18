@@ -14493,7 +14493,10 @@ mod tests {
                 panic!("native editable fixture");
             };
             document.content.set_cursor(text_editor::Cursor {
-                position: text_editor::Position { line: 1, column: 13 },
+                position: text_editor::Position {
+                    line: 1,
+                    column: 13,
+                },
                 selection: Some(text_editor::Position { line: 1, column: 7 }),
             });
             document.history_time = Some(now);
@@ -14518,7 +14521,10 @@ mod tests {
                     ticket: runtime.next_auto_save_ticket,
                 })
             } else if midway_save == Some(false) {
-                runtime.update(RepositoryAction::Save { card, overwrite: false })
+                runtime.update(RepositoryAction::Save {
+                    card,
+                    overwrite: false,
+                })
             } else {
                 Task::none()
             };
@@ -14531,9 +14537,8 @@ mod tests {
             let DocumentState::Editable(document) = &mut runtime.document else {
                 unreachable!();
             };
-            document.history_time = Some(
-                now + Duration::from_millis(if midway_save.is_some() { 900 } else { 28 }),
-            );
+            document.history_time =
+                Some(now + Duration::from_millis(if midway_save.is_some() { 900 } else { 28 }));
             for character in "hanged".chars() {
                 drop(runtime.update(RepositoryAction::EditorAction {
                     card,
@@ -14543,7 +14548,10 @@ mod tests {
             let changed = ORIGINAL.replacen("target", "changed", 1);
             assert_eq!(buffer_text(&runtime), changed);
             assert!(runtime.is_dirty());
-            let save = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            let save = runtime.update(RepositoryAction::Save {
+                card,
+                overwrite: false,
+            });
             finish_navigation_task(&mut runtime, save).await;
             assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
 
@@ -14554,7 +14562,10 @@ mod tests {
                 ORIGINAL
             };
             assert_eq!(buffer_text(&runtime), expected);
-            let save = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            let save = runtime.update(RepositoryAction::Save {
+                card,
+                overwrite: false,
+            });
             finish_navigation_task(&mut runtime, save).await;
             assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
             assert!(!runtime.is_dirty());
@@ -14608,7 +14619,10 @@ mod tests {
                 unreachable!();
             };
             let active_save = document.active_save.clone();
-            let task = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            let task = runtime.update(RepositoryAction::Save {
+                card,
+                overwrite: false,
+            });
             assert_eq!(runtime.next_save_ticket, next_save_ticket);
             let DocumentState::Editable(document) = &runtime.document else {
                 unreachable!();

@@ -521,7 +521,8 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
     let SaveOutcome::Saved {
         content_hash,
         durability,
-    } = saved.outcome() else {
+    } = saved.outcome()
+    else {
         panic!("write/search permission must permit publication");
     };
     assert_eq!(*content_hash, blake3::hash(submitted.as_bytes()));
