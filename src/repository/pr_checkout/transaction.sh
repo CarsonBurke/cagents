@@ -2,7 +2,7 @@
 set -eu
 trap 'code=$?; if [ "$code" -ne 0 ]; then printf "%s\n" "PR checkout could not retain its confirmed state or repository policy refused it; refresh or inspect the retained operation" >&2; fi; exit "$code"' 0
 
-case "$1" in prepared|committed|aborted) ;; *) exit 1;; esac
+case "$1" in preparing|prepared|committed|aborted) ;; *) exit 1;; esac
 input="$CAGENTS_PR_PRIVATE/input-$1"
 /bin/cat > "$input"
 
@@ -92,6 +92,17 @@ previous_hook() {
         fi
     fi
 }
+
+if [ "$1" = preparing ]; then
+    # Git 2.56 reports this before acquiring reference locks and resolving
+    # symbolic HEAD. It cannot authorize checkout or supply prepared proof.
+    # Capability probes remain policy-free; real transactions retain the
+    # original hook's opportunity to refuse this earlier phase.
+    if [ "$CAGENTS_PR_MODE" != probe ]; then
+        previous_hook "$@"
+    fi
+    exit 0
+fi
 
 if [ "$CAGENTS_PR_MODE" = probe ]; then
     if [ "$1" = prepared ]; then
