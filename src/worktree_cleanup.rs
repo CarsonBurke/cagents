@@ -271,6 +271,26 @@ impl std::fmt::Debug for Protection {
 }
 
 impl Protection {
+    /// Actual retained native descriptors, including every discovered Git
+    /// ancestor's two locks and held directory. Does no filesystem work.
+    pub(crate) fn retained_descriptor_count(&self) -> usize {
+        self._locks.len() + self._directories.len()
+    }
+
+    /// Worker-side proof that this already-acquired lease protects the exact
+    /// model-open root; lexical path equality is insufficient after replacement.
+    pub(crate) fn protects_root(&self, root: &crate::fs_safety::Root) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let expected = root.metadata()?;
+        for directory in &self._directories {
+            let actual = directory.metadata()?;
+            if (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Independent open descriptions retain shared protection in exec children.
     /// OwnedLock explicitly unlocks on drop, so duplicating its descriptor would
     /// let the parent's retirement unlock the child's shared open description.
@@ -439,6 +459,27 @@ fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<V
         .into_iter()
         .map(|directory| acquire(runtime, &directory, false))
         .collect()
+}
+
+/// Worker-only physical lease for an explicit local filesystem operation,
+/// including intake without an initialized window. This only protects the
+/// original root against cooperating automatic cleanup; it grants no global
+/// root-adoption, placement or publication authority. It never returns an
+/// unprotected compatibility fallback.
+pub fn protect_root_operation(root: &crate::fs_safety::Root) -> io::Result<Protection> {
+    protect_root_operation_in_runtime(&crate::instance::runtime_directory()?, root)
+}
+fn protect_root_operation_in_runtime(
+    runtime: &Path,
+    root: &crate::fs_safety::Root,
+) -> io::Result<Protection> {
+    let protection = acquire(runtime, root.path(), false)?;
+    if !protection.protects_root(root)? {
+        return Err(io::Error::other(
+            "The operation source root changed while acquiring cleanup protection; no file was changed.",
+        ));
+    }
+    Ok(protection)
 }
 
 /// A displaying process protects the next directory before it exposes it.
@@ -873,6 +914,36 @@ mod tests {
         );
         drop(guards);
         acquire(runtime.path(), worktree.path(), true).unwrap();
+    }
+
+    #[test]
+    fn root_operation_protection_holds_the_original_directory() {
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        let protection = protect_root_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        drop(protection);
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+    }
+
+    #[test]
+    fn root_operation_protection_rejects_replacement_at_the_original_path() {
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        let moved = tree.path().join("moved");
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(protect_root_operation_in_runtime(runtime.path(), &root).is_err());
+        // Rejection must release the replacement's temporary acquisition.
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+        assert!(acquire(runtime.path(), &moved, true).is_ok());
     }
 
     #[test]
