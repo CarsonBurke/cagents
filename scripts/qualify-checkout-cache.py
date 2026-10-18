@@ -43,6 +43,9 @@ def guard_vendor_hooks():
         # Require the watch before any branch, including SQLite's early return.
         main = source.split("fn main() {", 1)[1].lstrip()
         assert main.startswith(ENV_WATCH), vendor
+        if vendor in ("vendor/libcosmic", "vendor/libsqlite3-sys"):
+            assert 'env::var_os("CARGO_MANIFEST_DIR")' in source, vendor
+            assert 'env!("CARGO_MANIFEST_DIR")' not in source, vendor
     for vendor in VENDOR_SOURCE_HOOKS:
         package = tomllib.loads((ROOT / vendor / "Cargo.toml").read_text())
         assert package["package"].get("build", True) is False or not (ROOT / vendor / "build.rs").exists(), vendor
@@ -248,6 +251,87 @@ pub fn generated() -> &'static str { GENERATED }
     return {"owned": outcomes, "patched": patch_outcomes}
 
 
+def qualify_manifest_paths(directory, fixed):
+    """Distinguish current script inputs from an executable's baked-in paths."""
+    lane = directory / ("metadata-fixed" if fixed else "metadata-control")
+    checkout_a = lane / "a"
+    checkout_b = lane / "b"
+    target = lane / "target"
+    write(checkout_a / ".cargo/config.toml", (ROOT / ".cargo/config.toml").read_text())
+    write(checkout_a / "Cargo.toml", '''[workspace]
+members=[".", "vendor/path-source"]
+resolver="2"
+[package]
+name="qualification-path-observer"
+version="0.1.0"
+edition="2021"
+[dependencies]
+qualification-path-source={path="vendor/path-source"}
+''')
+    write(checkout_a / "build.rs", '''fn main() {
+    println!("cargo:rerun-if-env-changed=QUALIFICATION_PROBE_CHECKOUT");
+    println!("cargo:rustc-env=QUALIFICATION_OBSERVER_CHECKOUT={}",
+        std::env::var("QUALIFICATION_PROBE_CHECKOUT").unwrap());
+    println!("cargo:rustc-env=QUALIFICATION_DEP_INCLUDE={}",
+        std::env::var("DEP_QUALIFICATION_PATHS_INCLUDE").unwrap());
+}
+''')
+    write(checkout_a / "src/main.rs", '''fn main() {
+    println!("{}|{}|{}", env!("QUALIFICATION_OBSERVER_CHECKOUT"),
+        qualification_path_source::input(), env!("QUALIFICATION_DEP_INCLUDE"));
+}
+''')
+    write(checkout_a / "vendor/path-source/Cargo.toml", '''[package]
+name="qualification-path-source"
+version="0.1.0"
+edition="2021"
+links="qualification_paths"
+''')
+    write(checkout_a / "vendor/path-source/src/lib.rs", '''pub fn input() -> &'static str {
+    env!("QUALIFICATION_GENERATED_INPUT")
+}
+''')
+    manifest_dir = ('std::env::var_os("CARGO_MANIFEST_DIR").unwrap()' if fixed
+                    else 'env!("CARGO_MANIFEST_DIR")')
+    write(checkout_a / "vendor/path-source/build.rs", '''fn main() {
+    WATCH
+    println!("cargo:rerun-if-changed=input.txt");
+    let input = std::fs::read_to_string("input.txt").unwrap();
+    println!("cargo:rustc-env=QUALIFICATION_GENERATED_INPUT={input}");
+    let manifest_dir = std::path::PathBuf::from(MANIFEST_LOOKUP);
+    println!("cargo:include={}", manifest_dir.display());
+}
+'''.replace("WATCH", ENV_WATCH).replace("MANIFEST_LOOKUP", manifest_dir))
+    write(checkout_a / "vendor/path-source/input.txt", "input-A")
+    write(checkout_a / ".gitignore", "/target/\n")
+    run("git", "init", "-q", cwd=checkout_a)
+    run("git", "add", ".", cwd=checkout_a)
+    run("git", "-c", "user.name=Cache qualification", "-c", "user.email=cache-fixture@invalid",
+        "commit", "-qm", "Path metadata fixture", cwd=checkout_a)
+    run("git", "worktree", "add", "--detach", str(checkout_b), "HEAD", cwd=checkout_a)
+    write(checkout_b / "vendor/path-source/input.txt", "input-B")
+    for checkout in (checkout_a, checkout_b):
+        tracked, _ = run("git", "ls-files", cwd=checkout)
+        for relative in tracked.splitlines():
+            os.utime(checkout / relative, (OLD_TIME, OLD_TIME))
+    env = os.environ.copy()
+    env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(lane / "build"),
+               CARGO_BUILD_JOBS="2", CAGENTS_CHECKOUT_ROOT="deliberately-stale-inherited-value")
+    for step, checkout in enumerate((checkout_a, checkout_b, checkout_a)):
+        env["QUALIFICATION_PROBE_CHECKOUT"] = str(checkout)
+        _, log = run("cargo", "build", "--offline", "--workspace", "--verbose", cwd=checkout, env=env)
+        write(lane / f"build-{step}.log", log)
+        observed, _ = run(str(target / "debug/qualification-path-observer"), cwd=checkout)
+        observer, input_value, include = observed.split("|")
+        assert observer == str(checkout), ("metadata observer was stale", checkout, observer)
+        assert input_value == ("input-B" if step == 1 else "input-A"), (checkout, input_value)
+        expected_root = checkout if fixed else checkout_a
+        assert include == str(expected_root / "vendor/path-source"), (checkout, include)
+        if not fixed and step == 1:
+            assert include != str(checkout / "vendor/path-source"), "control did not leak its compiled manifest path"
+        print(f"{lane.name}: {observed}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", type=Path, help="retain fixture and Cargo logs in a new directory")
@@ -267,11 +351,15 @@ def main():
         directory.mkdir(parents=True, exist_ok=False)
         qualify(directory, False)
         qualify(directory, True)
+        qualify_manifest_paths(directory, False)
+        qualify_manifest_paths(directory, True)
     else:
         with tempfile.TemporaryDirectory(prefix="cagents-cache-qualification-", dir="/var/tmp") as temporary:
             qualify(Path(temporary), False)
             qualify(Path(temporary), True)
-    print("PASS: stale reuse reproduced; all owned sources, stamps, plain and generated patches follow A → B → A; same-checkout generated input stays live; external dependency remains fresh")
+            qualify_manifest_paths(Path(temporary), False)
+            qualify_manifest_paths(Path(temporary), True)
+    print("PASS: stale reuse reproduced; owned sources, stamps, patches and build-script path metadata follow A → B → A; same-checkout generated input stays live; external dependency remains fresh")
 
 
 if __name__ == "__main__":
