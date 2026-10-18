@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 mod child_text_copy;
+#[cfg(test)]
+pub(crate) mod courier_tests;
 mod execution;
 mod store;
 mod websocket;
@@ -47,6 +49,8 @@ enum ActorCommand {
         command: Command,
         decline_only: bool,
     },
+    /// Courier input must not pass over a request arriving after its idle scan.
+    IdlePrompt(String),
     CloseIfIdle {
         generation: u64,
     },
@@ -569,10 +573,11 @@ impl Handle {
             .map_err(String::from)
     }
 
-    /// Like [`Self::command`], but tells a refusal, after which the command
-    /// may be offered again, from a timeout, after which it may still run.
-    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
-        self.submit_command(None, command, false)
+    /// Rechecks courier eligibility on the actor, immediately before preparing
+    /// the prompt. A caller's earlier idle observation is only a hint. Refusal
+    /// permits retry; an unacknowledged command may already have run.
+    pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+        self.submit_actor_command(ActorCommand::IdlePrompt(text))
     }
 
     pub(crate) fn command_for_run(
@@ -629,7 +634,15 @@ impl Handle {
             }
             return Ok(());
         }
-        if exiting {
+        self.submit_actor_command(ActorCommand::Provider {
+            run,
+            command,
+            decline_only,
+        })
+    }
+
+    fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) {
             return Err(Rejection::Refused(
                 "Provider process exited; explicitly recover the exact session".into(),
             ));
@@ -640,14 +653,7 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((
-                ActorCommand::Provider {
-                    run,
-                    command,
-                    decline_only,
-                },
-                reply,
-            ))
+            .try_send((command, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
@@ -2040,6 +2046,22 @@ impl Actor {
                         }
                     }
                     (run, command)
+                }
+                ActorCommand::IdlePrompt(text) => {
+                    if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
+                        let _ = reply.send(Err(
+                            "The conversation is no longer idle for courier delivery".into(),
+                        ));
+                        continue;
+                    }
+                    (
+                        None,
+                        Command::Prompt {
+                            text,
+                            attachments: Vec::new(),
+                            mode: super::PromptMode::Send,
+                        },
+                    )
                 }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
