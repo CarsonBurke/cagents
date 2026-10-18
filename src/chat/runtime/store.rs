@@ -121,6 +121,88 @@ impl Store {
         }
         Ok(path.to_string_lossy().into_owned())
     }
+    /// Check every resident parent item and body chunk against a fresh provider
+    /// reload. Keep memory bounded to one metadata record or 128 KiB chunk;
+    /// paging windows alone cannot establish transcript preservation.
+    pub(super) fn is_covered_by(&mut self, reloaded: &Self) -> Result<bool, String> {
+        self.flush_text()?;
+        // Child sidecars are independent sources. Parent rows alone cannot
+        // establish that their transcript and edit index can be recovered.
+        if self.child_files_seen
+            || self.file_index_incomplete
+            || !self.presented_children.is_empty()
+        {
+            return Ok(false);
+        }
+        let mut items = self
+            .db
+            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
+            .map_err(|error| error.to_string())?;
+        let mut rows = items.query([]).map_err(|error| error.to_string())?;
+        let mut last_ordinal = None;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
+                row.get(1).map_err(|error| error.to_string())?,
+                row.get(2).map_err(|error| error.to_string())?,
+                row.get(3).map_err(|error| error.to_string())?,
+                row.get(4).map_err(|error| error.to_string())?,
+                row.get(5).map_err(|error| error.to_string())?,
+            );
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
+                .db
+                .query_row(
+                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            (
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((ordinal, contents)) = loaded else {
+                return Ok(false);
+            };
+            if contents != resident || last_ordinal.is_some_and(|previous| ordinal <= previous) {
+                return Ok(false);
+            }
+            last_ordinal = Some(ordinal);
+        }
+        let mut chunks = self
+            .db
+            .prepare("SELECT id,field,position,data FROM chunks")
+            .map_err(|error| error.to_string())?;
+        let mut rows = chunks.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let field: i64 = row.get(1).map_err(|error| error.to_string())?;
+            let position: i64 = row.get(2).map_err(|error| error.to_string())?;
+            let resident: Vec<u8> = row.get(3).map_err(|error| error.to_string())?;
+            let loaded: Option<Vec<u8>> = reloaded
+                .db
+                .query_row(
+                    "SELECT data FROM chunks WHERE id=?1 AND field=?2 AND position=?3",
+                    params![id, field, position],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if loaded.as_ref() != Some(&resident) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn new() -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
@@ -1495,6 +1577,94 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn history_coverage_checks_hidden_rows_and_every_chunk_not_only_the_window() {
+        let old = history_item("old-page", "older cached page");
+        let large = history_item("large-tail", &"x".repeat(4 * 1024 * 1024));
+        let mut resident = Store::new().unwrap();
+        resident
+            .apply(Event::History {
+                items: vec![old.clone(), large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        let window = resident.window().unwrap();
+        assert!(
+            window
+                .items
+                .iter()
+                .all(|item| !item.id.starts_with("old-page"))
+        );
+        let empty = Store::new().unwrap();
+        assert!(!resident.is_covered_by(&empty).unwrap());
+        let mut missing_old = Store::new().unwrap();
+        missing_old
+            .apply(Event::History {
+                items: vec![large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&missing_old).unwrap());
+        let mut changed = large.clone();
+        if let ItemContent::Text { text, .. } = &mut changed.content {
+            text.replace_range(..1, "y");
+        }
+        let mut changed_hidden_chunk = Store::new().unwrap();
+        changed_hidden_chunk
+            .apply(Event::History {
+                items: vec![old.clone(), changed],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&changed_hidden_chunk).unwrap());
+        let mut reordered = Store::new().unwrap();
+        reordered
+            .apply(Event::History {
+                items: vec![large.clone(), old.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&reordered).unwrap());
+        let mut unchanged = Store::new().unwrap();
+        unchanged
+            .apply(Event::History {
+                items: vec![
+                    old,
+                    large,
+                    history_item("additional", "new provider history"),
+                ],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(resident.is_covered_by(&unchanged).unwrap());
+    }
+
+    #[test]
+    fn history_coverage_preserves_child_payload_outside_parent_sql_rows() {
+        let parent = history_item("parent", "saved parent body");
+        let mut resident = Store::new().unwrap();
+        let mut reloaded = Store::new().unwrap();
+        for store in [&mut resident, &mut reloaded] {
+            store
+                .apply(Event::History {
+                    items: vec![parent.clone()],
+                    has_earlier: false,
+                })
+                .unwrap();
+        }
+        assert!(resident.is_covered_by(&reloaded).unwrap());
+        assert!(!resident.child_files_seen);
+        assert!(!resident.file_index_incomplete);
+        resident.presented_children.insert(
+            "retained-child".into(),
+            vec![std::sync::Arc::new(history_item(
+                "child-item",
+                "child payload is outside the parent SQL coverage",
+            ))],
+        );
+        assert!(!resident.is_covered_by(&reloaded).unwrap());
+    }
+
     #[test]
     fn output_for_an_uncacheable_identity_remains_nonfatal() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();

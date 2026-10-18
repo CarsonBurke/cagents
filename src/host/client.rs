@@ -430,6 +430,7 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
+            | ClientRequest::ChatRelease { dry_run: false, .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -734,7 +735,11 @@ pub(super) fn process_request(
         | ClientRequest::ChatClose { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
-        | ClientRequest::ChatList) => Ok((
+        | ClientRequest::ChatList
+        | ClientRequest::ChatCapacityInspect
+        | ClientRequest::ChatCapacitySet { .. }
+        | ClientRequest::ChatReleaseInspect { .. }
+        | ClientRequest::ChatRelease { .. }) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
             false,
@@ -1432,6 +1437,80 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn resident_release_drains_admitted_control_operations_before_retirement() {
+        let (proof, host) = panic_test_host("resident-release-gate");
+        let gate = control_gate(&host);
+        // Model an admitted submission between authentication and acceptance.
+        let admitted = gate.read().unwrap();
+        let release = crate::terminal_ipc::ChatReleaseProof {
+            session: crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "/missing-never-started".into(),
+                        arguments: vec![],
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            },
+            execution_instance: uuid::Uuid::new_v4(),
+            generation: 0,
+        };
+        // Inspection stays a shared operation and promptly reports absence.
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ChatRelease {
+                    proof: release.clone(),
+                    dry_run: true
+                }
+            )
+            .is_err()
+        );
+        let worker_host = host.clone();
+        let (started, ready) = crossbeam_channel::bounded(1);
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(process_request(
+                    &worker_host,
+                    1,
+                    ClientRequest::ChatRelease {
+                        proof: release,
+                        dry_run: false,
+                    },
+                ))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                result.recv_timeout(Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "mutating release crossed an admitted operation before its acceptance completed"
+        );
+        drop(admitted);
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {

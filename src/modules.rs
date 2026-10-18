@@ -9,6 +9,7 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub(crate) mod native_chat_capacity;
 pub mod search_match;
 
 pub mod account;
@@ -52,6 +53,7 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
+mod filesystem_recovery_context;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
@@ -79,6 +81,8 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
@@ -87,6 +91,7 @@ pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]

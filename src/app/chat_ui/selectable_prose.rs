@@ -85,6 +85,7 @@ impl State {
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
+                    let _stage = chat_stage::scope(Stage::Shape);
                     ParagraphBuffer::with_spans(shape.text(spans.as_ref()))
                 }
                 _ => ParagraphBuffer::default(),

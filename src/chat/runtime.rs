@@ -20,15 +20,20 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+#[cfg(test)]
+pub(crate) mod courier_tests;
 mod execution;
 mod store;
 mod websocket;
-use store::Store;
+pub(crate) use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// Pipe EOF may precede the kernel's child-exit publication. Do not turn that
+// short interval into an uncertain provider owner, or wait for a live writer.
+const PROTOCOL_EXIT_GRACE: Duration = Duration::from_millis(100);
 const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 /// Frames parsed per poll iteration: bounded so a provider flood cannot starve
 /// the stdin writer or queued UI commands.
@@ -46,8 +51,11 @@ enum ActorCommand {
         command: Command,
         decline_only: bool,
     },
+    /// Courier input must not pass over a request arriving after its idle scan.
+    IdlePrompt(String),
     CloseIfIdle {
         generation: u64,
+        closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
@@ -568,10 +576,11 @@ impl Handle {
             .map_err(String::from)
     }
 
-    /// Like [`Self::command`], but tells a refusal, after which the command
-    /// may be offered again, from a timeout, after which it may still run.
-    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
-        self.submit_command(None, command, false)
+    /// Rechecks courier eligibility on the actor, immediately before preparing
+    /// the prompt. A caller's earlier idle observation is only a hint. Refusal
+    /// permits retry; an unacknowledged command may already have run.
+    pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+        self.submit_actor_command(ActorCommand::IdlePrompt(text))
     }
 
     pub(crate) fn command_for_run(
@@ -626,7 +635,15 @@ impl Handle {
             }
             return Ok(());
         }
-        if exiting {
+        self.submit_actor_command(ActorCommand::Provider {
+            run,
+            command,
+            decline_only,
+        })
+    }
+
+    fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) {
             return Err(Rejection::Refused(
                 "Provider process exited; explicitly recover the exact session".into(),
             ));
@@ -637,14 +654,7 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((
-                ActorCommand::Provider {
-                    run,
-                    command,
-                    decline_only,
-                },
-                reply,
-            ))
+            .try_send((command, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
         response
@@ -674,9 +684,23 @@ impl Handle {
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
     }
 
-    pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
-        self.close()
+    fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
+        let (closed, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseIfIdle { generation, closed })?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Provider idle close was not acknowledged: {error}"))
+    }
+
+    /// False proves the actor was idle but its generation changed. No close
+    /// occurred; the caller may take a new snapshot and retry its exact owner.
+    /// Nonidle state and uncertain acknowledgement remain errors.
+    pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+        if !self.claim_idle_close(generation)? {
+            return Ok(false);
+        }
+        self.close()?;
+        Ok(true)
     }
 
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
@@ -688,7 +712,9 @@ impl Handle {
         ) {
             self.0.retain_cleanup_receipt.store(true, Ordering::Release);
         }
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        if !self.claim_idle_close(generation)? {
+            return Err("Provider state changed before conditional idle close".into());
+        }
         self.close_for_resume()
     }
 
@@ -1014,6 +1040,18 @@ impl Handle {
             .error
             .clone()
     }
+    pub(crate) fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_covered_by(reloaded)
+    }
+
+    pub(crate) fn is_read_only_history(&self) -> bool {
+        self.0.history_only
+    }
+
     pub fn owns_work(&self) -> bool {
         !self.0.history_only
             && (!self.is_completed()
@@ -1423,6 +1461,45 @@ struct ChildGuard {
     terminated: bool,
 }
 impl ChildGuard {
+    /// Wait on the original child capability without reaping it or releasing
+    /// the process-group identity needed by teardown.
+    fn observe_exit_within(
+        &self,
+        grace: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + grace;
+        loop {
+            if let Some(status) = self.observed_exit_status()? {
+                return Ok(Some(status));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.identity.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32;
+            // SAFETY: descriptor points to one initialized pollfd and the
+            // owned pidfd stays open throughout this non-reaping observation.
+            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+                return Err(std::io::Error::other(
+                    "Provider exit capability became unavailable",
+                ));
+            }
+        }
+    }
+
     /// Capture immediately after spawn, before any code can reap this child.
     fn new(mut child: Child) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
@@ -1838,7 +1915,7 @@ impl Actor {
                     .child
                     .as_mut()
                     .ok_or("Provider process unavailable")?
-                    .observed_exit_status()
+                    .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
@@ -2017,6 +2094,22 @@ impl Actor {
                     }
                     (run, command)
                 }
+                ActorCommand::IdlePrompt(text) => {
+                    if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
+                        let _ = reply.send(Err(
+                            "The conversation is no longer idle for courier delivery".into(),
+                        ));
+                        continue;
+                    }
+                    (
+                        None,
+                        Command::Prompt {
+                            text,
+                            attachments: Vec::new(),
+                            mode: super::PromptMode::Send,
+                        },
+                    )
+                }
                 ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
@@ -2065,18 +2158,23 @@ impl Actor {
                     }
                     (None, Command::Interrupt)
                 }
-                ActorCommand::CloseIfIdle { generation } => {
+                ActorCommand::CloseIfIdle { generation, closed } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let idle = state.generation == generation
-                        && self.update_readiness(&state) == UpdateReadiness::Idle;
-                    if idle {
+                    // A stale generation must never hide new requests, child
+                    // work or pending transport. Only a proved idle actor can
+                    // return the retryable generation-change receipt.
+                    if self.update_readiness(&state) != UpdateReadiness::Idle {
+                        let _ = reply.send(Err(
+                            "Provider state changed before conditional idle close".into(),
+                        ));
+                        continue;
+                    }
+                    let unchanged = state.generation == generation;
+                    if unchanged {
                         self.stop.store(true, Ordering::Release);
                     }
-                    let _ = reply.send(if idle {
-                        Ok(())
-                    } else {
-                        Err("Provider state changed before conditional idle close".into())
-                    });
+                    let _ = closed.send(unchanged);
+                    let _ = reply.send(Ok(()));
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
@@ -6782,6 +6880,58 @@ mod tests {
             );
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
+        for (tail, expected) in [
+            ("sleep 0.02; exit 0", None),
+            ("sleep 0.02; exit 7", Some("Provider exited with")),
+            ("sleep 5", Some("unobservable writer")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), format!("read -r init; exec 1>&-; {tail}")],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = handle.is_completed();
+            let failure = handle.failure();
+            // Join and reap the owned actor before checking any failure path.
+            handle.close().unwrap();
+            assert!(completed, "EOF classification exceeded its bound: {tail}");
+            match expected {
+                None => {
+                    assert_eq!(failure, None);
+                    assert!(!handle.owns_work());
+                }
+                Some(message) => {
+                    assert!(
+                        failure
+                            .as_deref()
+                            .is_some_and(|error| error.contains(message)),
+                        "{tail}: {failure:?}"
+                    );
+                    assert!(
+                        handle.owns_work(),
+                        "uncertain/failed writer must remain protected"
+                    );
+                }
+            }
         }
     }
 

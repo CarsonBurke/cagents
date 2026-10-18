@@ -243,6 +243,17 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     launch.provider.create_chat(launch)
 }
 
+/// Reconstruct a saved reader without granting permission to launch a provider.
+/// Support is deliberately limited to adapters with a local history transport.
+pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    match launch.provider {
+        crate::agent::Provider::Claude => claude::create_history(launch),
+        _ => {
+            Err("This provider does not support restoring a local read-only history reader".into())
+        }
+    }
+}
+
 /// Record a provider-confirmed conversation rotation in the launch recipe.
 ///
 /// Upgrade checkpointing stamps the live confirmed identity onto

@@ -86,6 +86,10 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }
+        | R::ChatCapacityInspect
+        | R::ChatCapacitySet { .. }
+        | R::ChatReleaseInspect { .. }
+        | R::ChatRelease { .. }
         | R::ChatList
         | R::ChatAcknowledge { .. }
         | R::ChatPreview { .. }

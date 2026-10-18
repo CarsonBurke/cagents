@@ -214,7 +214,9 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
-    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
+    let mut initial = HostState::new(proof);
+    initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .enable_holder_recovery();
