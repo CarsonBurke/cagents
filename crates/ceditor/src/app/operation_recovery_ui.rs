@@ -11,13 +11,13 @@ impl Editor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(scope, authority);
     }
-    fn operation_recovery_pending(&self) -> bool {
+    pub(super) fn operation_recovery_pending(&self) -> bool {
         self.operation_recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_pending()
     }
-    fn prepare_editor_save(&mut self, card: CardId) -> bool {
+    pub(super) fn prepare_editor_save(&mut self, card: CardId) -> bool {
         let mut paths = BTreeSet::new();
         for tab in &self.tabs {
             paths.insert(tab.runtime.descriptor.worktree.clone());
@@ -44,7 +44,7 @@ impl Editor {
                 .configure_save_recovery(window, paths.into_iter().collect())
         })
     }
-    fn retain_repository_operation(&mut self, action: &RepositoryAction) {
+    pub(super) fn retain_repository_operation(&mut self, action: &RepositoryAction) {
         if let Some(authority) = action.recovery_authority() {
             self.retain_operation_recovery(
                 action.recovery_scope().map(Path::to_owned),
