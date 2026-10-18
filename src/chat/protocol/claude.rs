@@ -5848,12 +5848,15 @@ mod tests {
         };
         assert_eq!(denial.reason, "Push needs approval");
         assert_eq!(denial.agent_id.as_deref(), Some("child"));
-        assert_eq!(
-            serde_json::from_str::<Value>(denial.tool_input.as_ref().unwrap()).unwrap(),
-            input
-        );
+        // The provider agent UUID does not identify the parent tool-use
+        // namespace. Never attribute a root cache entry to that child.
+        assert!(denial.tool_input.is_none());
+        let root = adapter.receive(json!({"type":"system","subtype":"permission_denied","parent_tool_use_id":null,"tool_use_id":"blocked","tool_name":"Bash","decision_reason":"Root advisory"})).unwrap();
+        assert!(root.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         let result = adapter.receive(json!({"type":"result","permission_denials":[{"tool_use_id":"blocked","tool_name":"Bash","tool_input":input}]})).unwrap();
-        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_use_id == "blocked" && d.tool_input.is_some())));
+        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_use_id == "blocked" && d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         adapter
             .command(Command::DismissPermissionDenial {
                 tool_use_id: "blocked".into(),
