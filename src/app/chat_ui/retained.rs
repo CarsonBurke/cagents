@@ -194,6 +194,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Retained<'_> {
             && let Some((kept_limits, node)) = &tree.state.downcast_ref::<Memo>().laid_out
             && kept_limits == limits
         {
+            let _stage = chat_stage::scope(Stage::RetainedClone);
             return node.clone();
         }
         let (element, child) = self.parts(tree);
