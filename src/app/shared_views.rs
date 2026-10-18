@@ -1625,7 +1625,13 @@ impl Cagents {
                         current.width_fraction = pane.width_fraction;
                         current.kind = kind;
                     }
-                    if !self.cards.contains_key(&pane.id) {
+                    // Publishing a locally opened chat can echo its pane
+                    // before the provider handshake creates a runtime. Its
+                    // exact in-flight attempt already owns that attachment;
+                    // replacing it would discard the first start's reply.
+                    // A different canonical descriptor still needs attachment.
+                    let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
+                    if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     }
                 }
@@ -1970,6 +1976,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod history_start;
     mod startup_admission;
 
     use super::*;
