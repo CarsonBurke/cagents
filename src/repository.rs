@@ -13376,6 +13376,7 @@ mod worktree_journal_tests {
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&marker)
             .unwrap();
+        fs::create_dir_all(fixture.request.repository.join(".git/hooks")).unwrap();
         let hook = fixture.request.repository.join(".git/hooks/post-checkout");
         fs::write(
             &hook,
