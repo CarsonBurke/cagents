@@ -971,6 +971,14 @@ fn exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver()
 }
 
 fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
+    exercise_canonical_upgrade_with_echoes(refuse_lineage, retire_before_ready, false);
+}
+
+fn exercise_canonical_upgrade_with_echoes(
+    refuse_lineage: bool,
+    retire_before_ready: bool,
+    duplicate_echoes: bool,
+) {
     use crate::app::workspace_model_sync::ModelUpdate;
     let (mut app, active, hidden, mut pane, identity) = cached_chat();
     let CardKind::Chat(source) = &pane.kind else {
@@ -1035,7 +1043,7 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
     let admission = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
         scope: Scope::Channel(hidden),
         operation: None,
-        model: authoritative,
+        model: authoritative.clone(),
     });
     if !refuse_lineage && !retire_before_ready {
         let before = app.persistent_workspace();
@@ -1070,7 +1078,103 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
     }
     let mut ready_seen = false;
     let mut receipt_seen = false;
+    let mut strict_target = None;
+    let mut echo_tasks = Vec::new();
+    let mut echoes = 0;
     settle_observing(&mut app, admission, |app, message| {
+        let boundary = match &message {
+            Message::ChatUi(chat_ui::Action::Ready(target, _)) if !ready_seen => Some(*target),
+            Message::ChatUi(chat_ui::Action::UpgradeCommitted(target, _, result)) => {
+                assert!(
+                    result.is_ok(),
+                    "the real writer must acknowledge before UI receipt delivery"
+                );
+                Some(*target)
+            }
+            _ => None,
+        };
+        if duplicate_echoes && let Some(receipt_target) = boundary {
+            if let Some(original) = strict_target {
+                assert_eq!(
+                    receipt_target, original,
+                    "the writer receipt must retain the strict attachment Target"
+                );
+            } else {
+                strict_target = Some(receipt_target);
+            }
+            let before_target = match app.cards.get(&pane.id).unwrap() {
+                CardRuntime::Chat(runtime) => {
+                    assert_eq!(&**runtime as *const chat_ui::Runtime as usize, allocation);
+                    runtime.target
+                }
+                _ => panic!("pending strict upgrade must retain original Content"),
+            };
+            // The first echo precedes Ready application. The second precedes
+            // UI consumption of the actual writer ACK, which has already
+            // committed on its own thread. Neither echo may reinterpret S's
+            // Content as canonical A or authorize a second attachment.
+            echoes += 1;
+            let mut duplicate = authoritative.clone();
+            duplicate.sequence += echoes;
+            let view = duplicate
+                .views
+                .iter_mut()
+                .find(|view| view.scope == Scope::Channel(hidden))
+                .unwrap();
+            view.revision += echoes;
+            echo_tasks.push(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(hidden),
+                operation: None,
+                model: duplicate,
+            }));
+            let CardRuntime::Chat(runtime) = app.cards.get(&pane.id).unwrap() else {
+                panic!("canonical echo must retain the pending original Content");
+            };
+            assert_eq!(&**runtime as *const chat_ui::Runtime as usize, allocation);
+            assert_eq!(
+                runtime.target, before_target,
+                "echo cannot replace the Content owner's target"
+            );
+            assert_eq!(runtime.session, source);
+            let snapshot = app.persistent_workspace();
+            assert_eq!(
+                snapshot
+                    .cards
+                    .iter()
+                    .find(|card| card.id == pane.id)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(
+                snapshot.pending_chat_admissions.get(&pane.id),
+                Some(&source)
+            );
+            assert_eq!(
+                snapshot.chat_drafts.get(&pane.id).map(String::as_str),
+                Some(text)
+            );
+            assert_eq!(
+                snapshot
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open())
+                    .count(),
+                1,
+                "same canonical echoes must not manufacture an inert copy"
+            );
+            assert!(app.chat_start_pending(pane.id));
+            assert_eq!(
+                app.startup_pane_check(),
+                Ok(false),
+                "UI receipt is still pending"
+            );
+            assert_eq!(daemon.resolutions(), vec![source.clone()]);
+            assert_eq!(daemon.requests(), vec![canonical.clone()]);
+            // Queue a real ordinary snapshot while the pending source is S.
+            // The existing writer translation must preserve its ordered rebind.
+            app.persist();
+        }
         if matches!(&message, Message::ChatUi(chat_ui::Action::Ready(..))) && !ready_seen {
             ready_seen = true;
             if !refuse_lineage && !retire_before_ready {
@@ -1094,6 +1198,21 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
         }
         Some(message)
     });
+    // Returned projection work joins the existing task harness only after its
+    // executor has exited. No nested settle/Tokio runtime occurs in observers.
+    for task in echo_tasks {
+        settle(&mut app, task);
+    }
+    if duplicate_echoes {
+        assert_eq!(
+            echoes, 2,
+            "exercise both pre-Ready and pre-UI-ACK boundaries"
+        );
+        let CardRuntime::Chat(runtime) = app.cards.get(&pane.id).unwrap() else {
+            panic!("confirmed strict attachment remains usable");
+        };
+        assert_eq!(Some(runtime.target), strict_target);
+    }
     assert!(ready_seen);
     assert_eq!(daemon.resolutions(), vec![source.clone()]);
     assert_eq!(
@@ -1323,4 +1442,12 @@ fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignore
         return;
     }
     exercise_canonical_upgrade(false, true);
+}
+
+#[test]
+fn canonical_upgrade_duplicate_echoes_preserve_pending_source_through_ui_receipt() {
+    if isolated("canonical_upgrade_duplicate_echoes_preserve_pending_source_through_ui_receipt") {
+        return;
+    }
+    exercise_canonical_upgrade_with_echoes(false, false, true);
 }
