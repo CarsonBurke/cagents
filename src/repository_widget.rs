@@ -4773,6 +4773,29 @@ impl RepositoryRuntime {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn request_save_with_sync_warning_for_test(
+        &mut self,
+        card: CardId,
+    ) -> Task<RepositoryAction> {
+        self.request_save_with_writer(
+            card,
+            false,
+            true,
+            |root, path, text, hash, overwrite, context| {
+                crate::editor::retained_save::save_file_with_cleanup_warning_at(
+                    root,
+                    path,
+                    text,
+                    hash,
+                    overwrite,
+                    context,
+                    |_, _| Ok(()),
+                )
+            },
+        )
+    }
+
     fn request_save_with_writer(
         &mut self,
         card: CardId,

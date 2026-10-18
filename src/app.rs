@@ -20786,6 +20786,140 @@ mod tests {
         (app, card)
     }
 
+    /// Own both the checkout and its private outside parent for every lazy Save.
+    struct CloseSaveFixture {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl CloseSaveFixture {
+        fn install(app: &mut Cagents, card: CardId) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let checkout = directory.path().join("checkout");
+            std::fs::create_dir(&checkout).unwrap();
+            let path = checkout.join("notes.txt");
+            std::fs::write(&path, "A\n").unwrap();
+            let descriptor = RepositoryView {
+                project: ProjectId::new(),
+                repository: checkout.clone(),
+                worktree: checkout,
+                selected_file: None,
+            };
+            let mut runtime = RepositoryRuntime::new_directory(descriptor.clone());
+            runtime.set_auto_save(false);
+            let read = task_app_message(repository_task(runtime.update(
+                RepositoryAction::OpenFile {
+                    card,
+                    path: "notes.txt".into(),
+                },
+            )));
+            let Message::Repository(read) = read else {
+                panic!("actual file read callback");
+            };
+            assert!(matches!(&read, RepositoryAction::FileLoadedAt { .. }));
+            drop(runtime.update(read));
+            assert_eq!(runtime.editor_text().as_deref(), Some("A\n"));
+            app.card_state_mut(card).unwrap().kind = CardKind::Repository(descriptor);
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn edit(app: &mut Cagents, card: CardId, text: &str) {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                panic!("repository remains installed");
+            };
+            for action in [
+                repository_widget::EditorAction::SelectAll,
+                repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Paste(
+                    Arc::new(text.to_owned()),
+                )),
+            ] {
+                drop(runtime.update(RepositoryAction::EditorAction { card, action }));
+            }
+            assert_eq!(runtime.editor_text().as_deref(), Some(text));
+        }
+
+        fn assert_saving(app: &Cagents, card: CardId) {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.is_saving() && !runtime.can_abandon_unsaved_changes()));
+            assert!(app.operation_recovery_pending());
+        }
+
+        fn post_persist_warning(&self, app: &mut Cagents, card: CardId) -> Message {
+            Self::edit(app, card, "B\n");
+            assert!(app.prepare_editor_save(card));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                panic!("repository remains installed");
+            };
+            let task = repository_task(runtime.request_save_with_sync_warning_for_test(card));
+            Self::assert_saving(app, card);
+            let completed = task_app_message(task);
+            assert!(matches!(&completed,
+                Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(outcome), .. })
+                    if matches!(outcome.outcome(), crate::editor::SaveOutcome::Saved {
+                        durability: crate::editor::SaveDurability::Unconfirmed { .. }, ..
+                    }) && outcome.recovery_authority().is_none()));
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "B\n");
+            assert!(!app.operation_recovery_pending());
+            // The callback must retain B as the disk baseline, while a newer
+            // buffer A remains dirty and protected by the durability fence.
+            Self::edit(app, card, "A\n");
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "B\n");
+            completed
+        }
+
+        fn failed_retry(&self, app: &mut Cagents, card: CardId) -> String {
+            let task = app.update(Message::SaveAndCloseRepository(card));
+            Self::assert_saving(app, card);
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "B\n");
+            std::fs::remove_file(&self.path).unwrap();
+            let completed = task_app_message(task);
+            let Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(error @ crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            }) = &completed else {
+                panic!("removing the target causes an actual pre-publication failure");
+            };
+            let error = error.to_string();
+            assert!(!self.path.exists(), "failed Save must not publish A");
+            assert!(!app.operation_recovery_pending());
+            drop(app.update(completed));
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if !runtime.is_saving() && runtime.is_dirty() && runtime.blocks_navigation()
+                    && runtime.editor_text().as_deref() == Some("A\n")
+                    && runtime.save_error().is_some_and(|message|
+                        message.contains(&error) && message.contains("replaced on disk"))));
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+                .unwrap();
+            std::io::Write::write_all(&mut target, b"B\n").unwrap();
+            drop(target);
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "B\n");
+            error
+        }
+
+        fn durable_retry(&self, app: &mut Cagents, card: CardId) -> Message {
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "B\n");
+            let task = app.update(Message::SaveAndCloseRepository(card));
+            Self::assert_saving(app, card);
+            let completed = task_app_message(task);
+            assert!(matches!(&completed,
+                Message::Repository(RepositoryAction::RetainedSaveFinished { result: Ok(outcome), .. })
+                    if matches!(outcome.outcome(), crate::editor::SaveOutcome::Saved {
+                        durability: crate::editor::SaveDurability::Durable, ..
+                    }) && outcome.recovery_authority().is_none()));
+            assert_eq!(std::fs::read_to_string(&self.path).unwrap(), "A\n");
+            assert!(!app.operation_recovery_pending());
+            completed
+        }
+    }
+
     #[tokio::test]
     async fn reviewed_update_prepare_flushes_folder_editor_selection_before_handoff() {
         let directory = tempfile::tempdir().unwrap();
@@ -21090,7 +21224,14 @@ mod tests {
     fn a_failed_save_repaints_the_dirty_close_dialog() {
         use cosmic::iced::advanced::widget::Tree;
 
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::a_failed_save_repaints_the_dirty_close_dialog",
+        ) {
+            return;
+        }
         let (mut app, card) = editing_repository_app();
+        let fixture = CloseSaveFixture::install(&mut app, card);
+        CloseSaveFixture::edit(&mut app, card, "unsaved\n");
         let mut renderer = headless_renderer();
         let mut tree = Tree::empty();
 
@@ -21107,17 +21248,25 @@ mod tests {
 
         // The save starts: Discard leaves, because there is nothing coherent
         // to abandon while a write is in flight.
-        let _ = app.update(Message::SaveAndCloseRepository(card));
+        let task = app.update(Message::SaveAndCloseRepository(card));
+        CloseSaveFixture::assert_saving(&app, card);
         present(&app, &mut renderer, &mut tree);
         assert_frame_is_faithful(&app, &tree);
 
         // The save fails: the buffer is dirty again and Discard comes back,
         // in the middle of the row rather than at its end.
-        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
-            panic!("the card is a repository");
-        };
-        let failed = runtime.failed_active_save_completion();
-        let _ = app.update(Message::Repository(failed));
+        std::fs::remove_file(&fixture.path).unwrap();
+        let failed = task_app_message(task);
+        assert!(matches!(&failed, Message::Repository(
+            RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)), ..
+            }
+        )));
+        assert!(!fixture.path.exists());
+        assert!(!app.operation_recovery_pending());
+        let _ = app.update(failed);
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && runtime.can_abandon_unsaved_changes()));
         assert!(
             app.dirty_repository_close.is_some(),
             "a failed save leaves the dialog up"
@@ -21151,6 +21300,11 @@ mod tests {
 
     #[test]
     fn application_close_advances_only_after_current_durability_fence_resolves() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::application_close_advances_only_after_current_durability_fence_resolves",
+        ) {
+            return;
+        }
         let mut app = context_inspector_test_app(true);
         let first = app.workspace.focused().unwrap();
         let second_state = terminal_card_state();
@@ -21170,12 +21324,12 @@ mod tests {
                 false,
             )
             .unwrap();
-        app.cards.insert(
-            first,
-            CardRuntime::Repository(Box::new(RepositoryRuntime::post_persist_warning_fixture(
-                first,
-            ))),
-        );
+        let fixture = CloseSaveFixture::install(&mut app, first);
+        let warning = fixture.post_persist_warning(&mut app, first);
+        drop(app.update(warning));
+        assert!(matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && !runtime.is_saving() && runtime.blocks_navigation()
+                && runtime.save_error().is_some_and(|warning| warning.contains("replaced on disk"))));
         app.cards.insert(
             second,
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
@@ -21188,12 +21342,8 @@ mod tests {
             |close| close.card == first && close.remaining == VecDeque::from([second])
         ));
 
-        let _ = app.update(Message::SaveAndCloseRepository(first));
-        let CardRuntime::Repository(runtime) = app.cards.get(&first).unwrap() else {
-            panic!("first repository remains installed during close resolution");
-        };
-        let completion = runtime.durable_active_save_completion();
-        let _ = app.update(Message::Repository(completion));
+        let completion = fixture.durable_retry(&mut app, first);
+        let _ = app.update(completion);
 
         assert!(
             app.dirty_repository_close
@@ -21214,11 +21364,15 @@ mod tests {
 
     #[test]
     fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds",
+        ) {
+            return;
+        }
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let (runtime, failure) = RepositoryRuntime::post_persist_failure_fixture(card);
-        app.cards
-            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let fixture = CloseSaveFixture::install(&mut app, card);
+        let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
             card,
             remaining: VecDeque::new(),
@@ -21227,12 +21381,14 @@ mod tests {
             restore_card: Some(card),
         });
 
-        let _ = app.update(Message::Repository(failure));
+        let _ = app.update(failure);
 
         assert!(app.dirty_repository_close.is_some());
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
             panic!("repository runtime should remain installed");
         };
+        assert!(runtime.is_dirty());
+        assert!(!runtime.is_saving());
         assert!(runtime.blocks_navigation());
         assert!(
             runtime
@@ -21240,31 +21396,22 @@ mod tests {
                 .is_some_and(|warning| warning.contains("replaced on disk"))
         );
 
-        let _ = app.update(Message::SaveAndCloseRepository(card));
-        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
-            panic!("repository runtime should remain installed");
-        };
-        let retry_failure = runtime.failed_active_save_completion();
-        let _ = app.update(Message::Repository(retry_failure));
+        let retry_error = fixture.failed_retry(&mut app, card);
 
         assert!(app.dirty_repository_close.is_some());
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
             panic!("repository runtime should remain installed");
         };
         let message = runtime.save_error().expect("close dialog shows the error");
-        assert!(message.contains("retry failure before persist"));
+        assert!(message.contains(&retry_error));
         assert!(message.contains("replaced on disk"));
         assert!(runtime.blocks_navigation());
         let context = runtime.inspector_context();
         assert!(context.can_reload);
         assert!(context.can_save);
 
-        let _ = app.update(Message::SaveAndCloseRepository(card));
-        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
-            panic!("repository runtime should remain installed");
-        };
-        let completion = runtime.durable_active_save_completion();
-        let _close = app.update(Message::Repository(completion));
+        let completion = fixture.durable_retry(&mut app, card);
+        let _close = app.update(completion);
 
         assert!(app.dirty_repository_close.is_none());
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
@@ -21276,12 +21423,16 @@ mod tests {
 
     #[test]
     fn window_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::window_close_stays_fenced_after_post_persist_failure_until_retry_succeeds",
+        ) {
+            return;
+        }
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let window = window::Id::unique();
-        let (runtime, failure) = RepositoryRuntime::post_persist_failure_fixture(card);
-        app.cards
-            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let fixture = CloseSaveFixture::install(&mut app, card);
+        let failure = fixture.post_persist_warning(&mut app, card);
         app.dirty_repository_close = Some(DirtyRepositoryClose {
             card,
             remaining: VecDeque::new(),
@@ -21290,39 +21441,31 @@ mod tests {
             restore_card: Some(card),
         });
 
-        let _ = app.update(Message::Repository(failure));
+        let _ = app.update(failure);
 
         assert!(app.dirty_repository_close.is_some());
         assert!(matches!(
             app.cards.get(&card),
-            Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()
+            Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()
+                && !runtime.is_saving() && runtime.blocks_navigation()
         ));
 
-        let _ = app.update(Message::SaveAndCloseRepository(card));
-        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
-            panic!("repository runtime should remain installed");
-        };
-        let retry_failure = runtime.failed_active_save_completion();
-        let _ = app.update(Message::Repository(retry_failure));
+        let retry_error = fixture.failed_retry(&mut app, card);
 
         assert!(app.dirty_repository_close.is_some());
         let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
             panic!("repository runtime should remain installed");
         };
         let message = runtime.save_error().expect("close dialog shows the error");
-        assert!(message.contains("retry failure before persist"));
+        assert!(message.contains(&retry_error));
         assert!(message.contains("replaced on disk"));
         assert!(runtime.blocks_navigation());
         let context = runtime.inspector_context();
         assert!(context.can_reload);
         assert!(context.can_save);
 
-        let _ = app.update(Message::SaveAndCloseRepository(card));
-        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
-            panic!("repository runtime should remain installed");
-        };
-        let completion = runtime.durable_active_save_completion();
-        let _exit = app.update(Message::Repository(completion));
+        let completion = fixture.durable_retry(&mut app, card);
+        let _exit = app.update(completion);
 
         assert!(app.dirty_repository_close.is_none());
         assert!(matches!(
