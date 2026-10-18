@@ -839,45 +839,508 @@ for line in sys.stdin:
 
 /// This boundary kills a separate host owner process with SIGKILL. Unlike a
 /// lease-rotation-only fixture, no destructor or old proxy can help recovery.
+// These types belong only to the two SIGKILL fixtures. In particular, the
+// ordinary libtest process never changes its process-wide subreaper setting.
+#[cfg(target_os = "linux")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SigkillCase {
+    id: uuid::Uuid,
+    selected_test: String,
+    semantic_held: bool,
+    deadline_ns: u64,
+}
+#[cfg(target_os = "linux")]
+impl SigkillCase {
+    const CLEANUP_NS: u64 = 30_000_000_000;
+    fn now_ns() -> u64 {
+        let mut value: libc::timespec = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) },
+            0
+        );
+        value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
+    }
+    fn remaining(&self, cleanup: bool) -> Duration {
+        Duration::from_nanos(
+            self.deadline_ns
+                .saturating_sub(Self::now_ns())
+                .saturating_sub(if cleanup { 0 } else { Self::CLEANUP_NS }),
+        )
+    }
+    fn wait(&self, maximum: Duration, mut condition: impl FnMut() -> bool, reason: &str) {
+        self.wait_before(
+            Instant::now() + maximum.min(self.remaining(false)),
+            &mut condition,
+            reason,
+        );
+    }
+    fn wait_before(&self, deadline: Instant, mut condition: impl FnMut() -> bool, reason: &str) {
+        let deadline = deadline.min(Instant::now() + self.remaining(false));
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "{reason}: shared SIGKILL fixture deadline"
+            );
+            if condition() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{reason}: shared SIGKILL fixture deadline"
+                );
+                return;
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sigkill_read<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+    sigkill_try_read(path).unwrap()
+}
+#[cfg(target_os = "linux")]
+fn sigkill_try_read<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.take(128 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 {
+        return Err(std::io::Error::other("bounded SIGKILL fixture receipt"));
+    }
+    serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+}
+#[cfg(target_os = "linux")]
+fn sigkill_write(path: &Path, value: &impl serde::Serialize) {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let bytes = serde_json::to_vec(value).unwrap();
+    assert!(bytes.len() <= 128 * 1024, "bounded SIGKILL fixture marker");
+    let temporary = path.with_file_name(format!(".sigkill-marker-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        // Publish complete bytes atomically while refusing an existing final
+        // path. Pollers must never observe a half-written create_new marker.
+        fs::hard_link(&temporary, path)
+    })();
+    let _ = fs::remove_file(&temporary);
+    result.unwrap();
+}
+#[cfg(target_os = "linux")]
+fn sigkill_output(path: &Path) -> String {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if let Ok(file) = fs::File::open(path) {
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes).unwrap();
+    }
+    assert!(
+        bytes.len() <= 1024 * 1024,
+        "private fixture output exceeded 1 MiB"
+    );
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn sigkill_child(root: &Path, role: &str, case: &SigkillCase) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &case.selected_test, "--nocapture"])
+        .env_clear()
+        .env(
+            "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+            retained_helper_executable(),
+        )
+        .env("CAGENTS_RETAINED_HOST_PROCESS_ROLE", role)
+        .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+        .env("CAGENTS_HOLDER_ROOT", root)
+        .env("HOME", root.join("home"))
+        .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        );
+    command
+}
+
+#[cfg(target_os = "linux")]
+struct SigkillChild {
+    child: std::process::Child,
+    case: SigkillCase,
+    stdout: std::path::PathBuf,
+    stderr: std::path::PathBuf,
+}
+#[cfg(target_os = "linux")]
+impl SigkillChild {
+    fn spawn(command: std::process::Command, root: &Path, role: &str, case: &SigkillCase) -> Self {
+        Self::try_spawn(command, root, role, case).unwrap()
+    }
+    fn try_spawn(
+        mut command: std::process::Command,
+        root: &Path,
+        role: &str,
+        case: &SigkillCase,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let stdout = root.join(format!("{role}.stdout"));
+        let stderr = root.join(format!("{role}.stderr"));
+        let output = |path: &Path| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+        };
+        let child = command
+            .stdout(output(&stdout)?)
+            .stderr(output(&stderr)?)
+            .spawn()?;
+        Ok(Self {
+            child,
+            case: case.clone(),
+            stdout,
+            stderr,
+        })
+    }
+    fn poll(&mut self) -> Option<std::process::ExitStatus> {
+        for path in [&self.stdout, &self.stderr] {
+            assert!(
+                fs::metadata(path).unwrap().len() <= 1024 * 1024,
+                "bounded private fixture output"
+            );
+        }
+        self.child.try_wait().unwrap()
+    }
+    fn stop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        // This Child still owns its wait status; it cannot name a reused PID.
+        let _ = self.child.kill();
+        while !self.case.remaining(true).is_zero() {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!(
+            "exact fixture Child {} did not settle before cleanup deadline",
+            self.child.id()
+        );
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for SigkillChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SigkillProcess {
+    identity: crate::daemon::holder_registry::Process,
+    pidfd: std::os::fd::OwnedFd,
+    collected: bool,
+}
+#[cfg(target_os = "linux")]
+impl SigkillProcess {
+    fn capture(identity: &crate::daemon::holder_registry::Process) -> Self {
+        Self::try_capture(identity).unwrap()
+    }
+    fn try_capture(identity: &crate::daemon::holder_registry::Process) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        if identity.pid <= 0 || identity.start == 0 || !identity.is_current() {
+            return Err(std::io::Error::other(
+                "fixture process is no longer the admitted incarnation",
+            ));
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        if !identity.is_current() {
+            return Err(std::io::Error::other(
+                "fixture process changed while opening pidfd",
+            ));
+        }
+        Ok(Self {
+            identity: identity.clone(),
+            pidfd,
+            collected: false,
+        })
+    }
+    fn parent(&self) -> Option<i32> {
+        use std::io::Read;
+        let file = fs::File::open(format!("/proc/{}/stat", self.identity.pid)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes).ok()?;
+        let (_, start) = crate::model::agent_recovery::process_identity(&bytes)?;
+        if start != self.identity.start {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes).ok()?;
+        text.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+    fn exited(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut descriptor, 1, 0) } >= 0);
+        descriptor.revents & libc::POLLIN != 0
+    }
+    fn reap(&mut self) -> Option<i32> {
+        if self.collected {
+            return None;
+        }
+        assert_eq!(
+            self.parent(),
+            Some(std::process::id() as i32),
+            "exact admitted process did not reparent to the dedicated coordinator"
+        );
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(self.identity.pid, &mut status, libc::WNOHANG) };
+        assert!(
+            result >= 0,
+            "exact wait custody lost (including ECHILD): {}",
+            std::io::Error::last_os_error()
+        );
+        if result == 0 {
+            return None;
+        }
+        assert_eq!(result, self.identity.pid);
+        self.collected = true;
+        assert!(
+            !self.identity.is_current(),
+            "collected exact process is still current"
+        );
+        Some(status)
+    }
+    fn kill(&self) {
+        use std::os::fd::AsRawFd;
+        if self.collected {
+            return;
+        }
+        // A captured pidfd, never a numeric lookup, grants this cleanup signal.
+        let _ = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+    }
+    fn cleanup_reap(&mut self) {
+        if !self.collected && self.parent() == Some(std::process::id() as i32) {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(self.identity.pid, &mut status, libc::WNOHANG) };
+            if result == self.identity.pid {
+                self.collected = true;
+            } else if result < 0 {
+                eprintln!(
+                    "exact cleanup wait failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SigkillMarker {
+    case: uuid::Uuid,
+    selected_test: String,
+    helper: crate::daemon::holder_registry::Process,
+    provider: crate::daemon::holder_registry::Process,
+}
+#[cfg(target_os = "linux")]
+impl SigkillMarker {
+    fn for_actor(case: &SigkillCase, identity: &chat::runtime::ActorIdentity) -> Self {
+        Self {
+            case: case.id,
+            selected_test: case.selected_test.clone(),
+            helper: identity.record.holder.clone(),
+            provider: identity.record.root.clone(),
+        }
+    }
+    fn verify(&self, case: &SigkillCase, identity: &chat::runtime::ActorIdentity) {
+        assert_eq!(self.case, case.id);
+        assert_eq!(self.selected_test, case.selected_test);
+        assert_eq!(self.helper, identity.record.holder);
+        assert_eq!(self.provider, identity.record.root);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SigkillAdmission {
+    case: uuid::Uuid,
+    selected_test: String,
+    coordinator: crate::daemon::holder_registry::Process,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SigkillReceipt {
+    case: uuid::Uuid,
+    identity: chat::runtime::ActorIdentity,
+    agent: crate::model::AgentId,
+    run: crate::model::RunId,
+    session: TerminalId,
+}
+#[cfg(target_os = "linux")]
+struct SigkillStartupGuard(Option<Handle>);
+#[cfg(target_os = "linux")]
+impl Drop for SigkillStartupGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take()
+            && let Err(error) = handle.close().and_then(|()| handle.finish_retained_close())
+        {
+            eprintln!("exact startup actor cleanup was not proved: {error}");
+        }
+    }
+}
+
+// Drop order is explicit: stop original source/successor Children before any
+// private cleanup lease, then signal/reap only the captured helper/provider.
+#[cfg(target_os = "linux")]
+struct SigkillCoordinator {
+    case: SigkillCase,
+    root: std::path::PathBuf,
+    source: SigkillChild,
+    successor: Option<SigkillChild>,
+    helper: Option<SigkillProcess>,
+    provider: Option<SigkillProcess>,
+    successful: bool,
+}
+#[cfg(target_os = "linux")]
+impl Drop for SigkillCoordinator {
+    fn drop(&mut self) {
+        if self.successful {
+            return;
+        }
+        if let Some(successor) = &mut self.successor {
+            successor.stop();
+        }
+        self.source.stop();
+        let receipt = sigkill_try_read::<SigkillReceipt>(&self.root.join("owner-receipt.json"))
+            .ok()
+            .filter(|receipt| receipt.case == self.case.id);
+        if let Some(receipt) = &receipt {
+            // A capture failure must not disable exact record cleanup. These
+            // identities come from the same complete typed private receipt.
+            if self.helper.is_none() {
+                self.helper = SigkillProcess::try_capture(&receipt.identity.record.holder).ok();
+            }
+            if self.provider.is_none() {
+                self.provider = SigkillProcess::try_capture(&receipt.identity.record.root).ok();
+            }
+        } else {
+            // A hard kill before any completed handoff cannot manufacture
+            // unknown process identities. This is a failed/uncertain case;
+            // the already-owned outer supervisor must contain the family and
+            // reach ECHILD before releasing its slot, never accept this path.
+            eprintln!(
+                "SIGKILL fixture failed before typed actor handoff; cleanup is uncertain, outer family containment required"
+            );
+        }
+        if receipt.is_some() && !self.case.remaining(true).is_zero() {
+            match SigkillChild::try_spawn(
+                sigkill_child(&self.root, "cleanup", &self.case),
+                &self.root,
+                "cleanup",
+                &self.case,
+            ) {
+                Ok(mut cleanup) => {
+                    let deadline =
+                        Instant::now() + Duration::from_secs(10).min(self.case.remaining(true));
+                    while Instant::now() < deadline {
+                        let oversized =
+                            [&cleanup.stdout, &cleanup.stderr].into_iter().any(|path| {
+                                fs::metadata(path)
+                                    .map_or(true, |metadata| metadata.len() > 1024 * 1024)
+                            });
+                        if oversized || cleanup.child.try_wait().ok().flatten().is_some() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    cleanup.stop();
+                }
+                Err(error) => eprintln!("private cleanup Child could not start: {error}"),
+            }
+        }
+        // No waitpid(-1): provider may become this coordinator's child only if
+        // its original helper dies on a failed path. Retain that exact custody.
+        if let Some(provider) = &self.provider {
+            provider.kill();
+        }
+        if let Some(helper) = &self.helper {
+            helper.kill();
+        }
+        while !self.case.remaining(true).is_zero() {
+            let mut pending = false;
+            for process in [&mut self.helper, &mut self.provider].into_iter().flatten() {
+                process.cleanup_reap();
+                pending |= process.identity.is_current();
+            }
+            if !pending {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        for process in [&self.helper, &self.provider].into_iter().flatten() {
+            if process.identity.is_current() {
+                eprintln!(
+                    "exact fixture owner remains after bounded cleanup: {:?}",
+                    process.identity
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn slow_turn_survives_sigkill_of_the_host_owner_process() {
+    sigkill_host_fixture(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn semantic_retirement_precedes_original_parent_wait_after_host_sigkill() {
+    sigkill_host_fixture(true);
+}
+
+#[cfg(target_os = "linux")]
+fn sigkill_host_fixture(semantic_held: bool) {
     let _helper_executable = retained_helper_executable();
-    const EXACT: &str =
-        "host::chat::retained_actor_tests::slow_turn_survives_sigkill_of_the_host_owner_process";
     const ROLE: &str = "CAGENTS_RETAINED_HOST_PROCESS_ROLE";
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct Receipt {
-        identity: chat::runtime::ActorIdentity,
-        agent: crate::model::AgentId,
-        run: crate::model::RunId,
-        session: TerminalId,
-    }
-    fn child(root: &Path, role: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .args(["--exact", EXACT, "--nocapture"])
-            .env_clear()
-            .env(
-                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
-                retained_helper_executable(),
-            )
-            .env(ROLE, role)
-            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_HOLDER_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            );
-        command
-    }
     if std::env::var_os(ROLE).is_none() {
-        use std::os::unix::process::ExitStatusExt;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = directory.path();
         for path in [
@@ -892,70 +1355,205 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             fs::create_dir_all(root.join(path)).unwrap();
         }
         install_provider(&root.join("bin/claude"));
-        // Cleanup uses a separate private host lease; the parallel test runner
-        // never changes its own HOME/runtime or acquires the production lease.
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = child(&self.0, "cleanup").output();
+        let case = SigkillCase {
+            id: uuid::Uuid::new_v4(),
+            selected_test: thread::current().name().unwrap().to_owned(),
+            semantic_held,
+            deadline_ns: SigkillCase::now_ns() + 150_000_000_000,
+        };
+        sigkill_write(&root.join("sigkill-case.json"), &case);
+        // Reexec first: PR_SET_CHILD_SUBREAPER is process-wide and must never
+        // affect unrelated tests running beside this parent in libtest.
+        let mut coordinator = SigkillChild::spawn(
+            sigkill_child(root, "coordinator", &case),
+            root,
+            "coordinator",
+            &case,
+        );
+        let status = loop {
+            if let Some(status) = coordinator.poll() {
+                break status;
             }
-        }
-        let _cleanup = Cleanup(root.to_owned());
-        struct SourceOwner(std::process::Child);
-        impl Drop for SourceOwner {
-            fn drop(&mut self) {
-                if self.0.try_wait().is_ok_and(|status| status.is_none()) {
-                    let _ = self.0.kill();
-                }
-                let _ = self.0.wait();
-            }
-        }
-        let mut owner = SourceOwner(
-            child(root, "source")
-                .stdout(fs::File::create(root.join("source.stdout")).unwrap())
-                .stderr(fs::File::create(root.join("source.stderr")).unwrap())
-                .spawn()
-                .unwrap(),
-        );
-        let owner_identity =
-            crate::daemon::holder_registry::Process::read(owner.0.id() as i32).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !root.join("owner-receipt.json").exists() {
             assert!(
-                owner.0.try_wait().unwrap().is_none(),
-                "source host failed: {}",
-                fs::read_to_string(root.join("source.stderr")).unwrap_or_default()
+                !case.remaining(true).is_zero(),
+                "dedicated SIGKILL coordinator exceeded shared budget"
             );
-            assert!(
-                Instant::now() < deadline,
-                "source host never published its exact owner receipt"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(owner_identity.is_current());
-        owner.0.kill().unwrap();
-        assert_eq!(owner.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+            thread::sleep(Duration::from_millis(10));
+        };
         assert!(
-            !owner_identity.is_current(),
-            "the old host owner must actually be gone"
-        );
-        wait_until(
-            || root.join("provider-done").exists(),
-            "provider did not finish while no host owner existed",
-        );
-        let output = child(root, "successor").output().unwrap();
-        assert!(
-            output.status.success(),
-            "successor failed (coordinator_pid={}, source_pid={}):\n{}\n{}",
-            std::process::id(),
-            owner.0.id(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            status.success(),
+            "dedicated SIGKILL coordinator failed:\n{}\n{}",
+            sigkill_output(&coordinator.stdout),
+            sigkill_output(&coordinator.stderr)
         );
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let case: SigkillCase = sigkill_read(&root.join("sigkill-case.json"));
+    assert_eq!(case.selected_test, thread::current().name().unwrap());
+    assert_eq!(case.semantic_held, semantic_held);
     let role = std::env::var(ROLE).unwrap();
+    if role == "coordinator" {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        sigkill_write(
+            &root.join("coordinator-admission.json"),
+            &SigkillAdmission {
+                case: case.id,
+                selected_test: case.selected_test.clone(),
+                coordinator: crate::daemon::holder_registry::Process::read(
+                    std::process::id() as i32
+                )
+                .unwrap(),
+            },
+        );
+        let source_ready_deadline =
+            Instant::now() + Duration::from_secs(20).min(case.remaining(false));
+        let source = SigkillChild::spawn(
+            sigkill_child(&root, "source", &case),
+            &root,
+            "source",
+            &case,
+        );
+        let mut coordinator = SigkillCoordinator {
+            case: case.clone(),
+            root: root.clone(),
+            source,
+            successor: None,
+            helper: None,
+            provider: None,
+            successful: false,
+        };
+        case.wait_before(
+            source_ready_deadline,
+            || {
+                assert!(
+                    coordinator.source.poll().is_none(),
+                    "source host exited before its exact receipt: {}",
+                    sigkill_output(&coordinator.source.stderr)
+                );
+                root.join("owner-receipt.json").exists()
+            },
+            "source host never published its exact receipt",
+        );
+        let receipt: SigkillReceipt = sigkill_read(&root.join("owner-receipt.json"));
+        assert_eq!(receipt.case, case.id);
+        coordinator.helper = Some(SigkillProcess::capture(&receipt.identity.record.holder));
+        coordinator.provider = Some(SigkillProcess::capture(&receipt.identity.record.root));
+        sigkill_write(
+            &root.join("actor-custody.json"),
+            &SigkillMarker::for_actor(&case, &receipt.identity),
+        );
+        case.wait_before(
+            source_ready_deadline,
+            || {
+                assert!(
+                    coordinator.source.poll().is_none(),
+                    "source host failed before the provider began"
+                );
+                root.join("source-ready.json").exists()
+            },
+            "provider never began before source SIGKILL",
+        );
+        let ready: SigkillMarker = sigkill_read(&root.join("source-ready.json"));
+        ready.verify(&case, &receipt.identity);
+        let source_identity =
+            crate::daemon::holder_registry::Process::read(coordinator.source.child.id() as i32)
+                .unwrap();
+        coordinator.source.child.kill().unwrap();
+        let killed = loop {
+            if let Some(status) = coordinator.source.poll() {
+                break status;
+            }
+            assert!(
+                !case.remaining(false).is_zero(),
+                "source SIGKILL wait exceeded shared budget"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(killed.signal(), Some(libc::SIGKILL));
+        assert!(
+            !source_identity.is_current(),
+            "exact source must actually be killed and collected"
+        );
+        case.wait(
+            Duration::from_secs(15),
+            || coordinator.helper.as_ref().unwrap().parent() == Some(std::process::id() as i32),
+            "exact helper did not reparent to the dedicated coordinator",
+        );
+        case.wait(
+            Duration::from_secs(15),
+            || root.join("provider-done").exists(),
+            "provider did not finish while no host owner existed",
+        );
+        coordinator.successor = Some(SigkillChild::spawn(
+            sigkill_child(&root, "successor", &case),
+            &root,
+            "successor",
+            &case,
+        ));
+        let mut helper_collected = false;
+        let status = loop {
+            assert!(
+                !case.remaining(false).is_zero(),
+                "successor exceeded shared SIGKILL budget"
+            );
+            let release = if case.semantic_held {
+                if root.join("semantic-retirement.json").exists() {
+                    let marker: SigkillMarker =
+                        sigkill_read(&root.join("semantic-retirement.json"));
+                    marker.verify(&case, &receipt.identity);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            let helper = coordinator.helper.as_mut().unwrap();
+            if !helper_collected && release && helper.exited() {
+                if let Some(status) = helper.reap() {
+                    assert!(libc::WIFEXITED(status));
+                    assert_eq!(
+                        libc::WEXITSTATUS(status),
+                        73,
+                        "exact helper must prove its existing teardown contract"
+                    );
+                    helper_collected = true;
+                    sigkill_write(
+                        &root.join("helper-reaped.json"),
+                        &SigkillMarker::for_actor(&case, &receipt.identity),
+                    );
+                }
+            }
+            if let Some(status) = coordinator.successor.as_mut().unwrap().poll() {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let successor = coordinator.successor.as_ref().unwrap();
+        assert!(
+            status.success(),
+            "successor failed (coordinator_pid={}, source_pid={}):\n{}\n{}",
+            std::process::id(),
+            coordinator.source.child.id(),
+            sigkill_output(&successor.stdout),
+            sigkill_output(&successor.stderr)
+        );
+        assert!(
+            helper_collected,
+            "successor cannot pass without exact original-parent collection"
+        );
+        assert!(
+            !receipt.identity.record.holder.is_current()
+                && !receipt.identity.record.root.is_current()
+        );
+        coordinator.successful = true;
+        return;
+    }
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new("sigkill-host-fixture"),
@@ -964,35 +1562,16 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     };
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     if role == "cleanup" {
-        // Only exact holder records inside this fixture's private namespace.
-        let directory =
-            crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
-                .unwrap();
-        if let Ok(records) = crate::daemon::holder_registry::discover(
-            &directory,
-            &proof.boot_id,
-            crate::daemon::holder_registry::Kind::Native,
-        ) {
-            for record in records {
-                if let Ok(inspection) = Handle::inspect_remote(&record, proof.clone())
-                    && let Ok(handle) =
-                        Handle::adopt_remote(&record, inspection.source, proof.clone(), |_| {})
-                    && handle.close().is_ok()
-                    && handle.finish_retained_close().is_ok()
-                {
-                    continue;
-                }
-                // On a failing assertion there may be uncommitted outcomes;
-                // never misreport that as semantic retirement. Kill only the
-                // exact fixture-created process incarnations for test hygiene.
-                for process in [&record.root, &record.holder] {
-                    if process.is_current() {
-                        unsafe {
-                            libc::kill(process.pid, libc::SIGKILL);
-                        }
-                    }
-                }
-            }
+        let receipt: SigkillReceipt = sigkill_read(&root.join("owner-receipt.json"));
+        assert_eq!(receipt.case, case.id);
+        // Only the exact actor already captured in this fresh case. Failure
+        // signals and adopted waits remain with the coordinator's pidfds.
+        if let Ok(inspection) = Handle::inspect_remote(&receipt.identity.record, proof.clone())
+            && let Ok(handle) =
+                Handle::adopt_remote(&receipt.identity.record, inspection.source, proof, |_| {})
+        {
+            let _ = handle.close();
+            let _ = handle.finish_retained_close();
         }
         return;
     }
@@ -1067,6 +1646,23 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
                 state.chats[&id].handle.clone(),
             )
         };
+        let mut startup = SigkillStartupGuard(Some(handle.clone()));
+        let receipt = SigkillReceipt {
+            case: case.id,
+            identity: handle.actor_identity().unwrap(),
+            agent: accepted.agent.id,
+            run: accepted.run.id,
+            session: id,
+        };
+        sigkill_write(&root.join("owner-receipt.json"), &receipt);
+        case.wait(
+            Duration::from_secs(15),
+            || root.join("actor-custody.json").exists(),
+            "coordinator did not acknowledge exact helper/provider custody",
+        );
+        let custody: SigkillMarker = sigkill_read(&root.join("actor-custody.json"));
+        custody.verify(&case, &receipt.identity);
+        startup.0 = None;
         super::super::agent_execution::registry(&host)
             .unwrap()
             .lock()
@@ -1087,7 +1683,8 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
                 },
             )
             .unwrap();
-        wait_until(
+        case.wait(
+            Duration::from_secs(15),
             || {
                 fs::read_to_string(root.join("produced"))
                     .unwrap_or_default()
@@ -1097,29 +1694,16 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             },
             "provider never began",
         );
-        let receipt = Receipt {
-            identity: handle.actor_identity().unwrap(),
-            agent: accepted.agent.id,
-            run: accepted.run.id,
-            session: id,
-        };
-        let temporary = root.join("owner-receipt.pending");
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .unwrap();
-        serde_json::to_writer(&file, &receipt).unwrap();
-        file.sync_all().unwrap();
-        fs::rename(temporary, root.join("owner-receipt.json")).unwrap();
+        sigkill_write(
+            &root.join("source-ready.json"),
+            &SigkillMarker::for_actor(&case, &receipt.identity),
+        );
         loop {
             thread::park();
         }
     }
-    let receipt: Receipt =
-        serde_json::from_slice(&fs::read(root.join("owner-receipt.json")).unwrap()).unwrap();
+    let receipt: SigkillReceipt = sigkill_read(&root.join("owner-receipt.json"));
+    assert_eq!(receipt.case, case.id);
     assert!(
         receipt.identity.record.root.is_current(),
         "the original provider must survive the host SIGKILL"
@@ -1134,7 +1718,8 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
         .unwrap()
         .interrupt_unproven_agent_runs_except(2, &retained)
         .unwrap();
-    wait_until(
+    case.wait(
+        Duration::from_secs(15),
         || {
             registry
                 .lock()
@@ -1148,7 +1733,8 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     );
     let run = registry.lock().unwrap().agent_run(receipt.run).unwrap();
     handle.set_visible(true);
-    wait_until(
+    case.wait(
+        Duration::from_secs(15),
         || {
             handle
                 .snapshot(None)
@@ -1182,6 +1768,16 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             .count(),
         1
     );
+    let expected_retirement = case.semantic_held.then(|| {
+        let proof = host.lock().unwrap().proof().clone();
+        let inspection = Handle::inspect_remote(&receipt.identity.record, proof.clone()).unwrap();
+        assert_eq!(inspection.identity, receipt.identity);
+        (
+            proof,
+            inspection.source,
+            handle.launch_account_scope().unwrap().clone(),
+        )
+    });
     super::super::agent_execution::process(
         &host,
         Authority::default(),
@@ -1194,7 +1790,129 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             sigkill_retirement_diagnostic(&receipt.identity, &current_proof)
         );
     });
-    wait_until(
+    if let Some((proof, expected_source, expected_scope)) = expected_retirement {
+        let retired = Handle::retired_actor_receipt(&receipt.identity.record, &proof)
+            .unwrap()
+            .expect("semantic retirement must be validated before parent wait");
+        assert!(retired.installed);
+        assert_eq!(retired.identity, receipt.identity);
+        assert_eq!(retired.proof, proof);
+        assert_eq!(retired.source, expected_source);
+        assert_eq!(retired.launch_account_scope, Ok(expected_scope.clone()));
+        assert!(
+            !receipt.identity.record.root.is_current(),
+            "retirement must prove original provider absence"
+        );
+        let admission: SigkillAdmission = sigkill_read(&root.join("coordinator-admission.json"));
+        assert_eq!(admission.case, case.id);
+        assert_eq!(admission.selected_test, case.selected_test);
+        assert!(admission.coordinator.is_current());
+        let witness = SigkillProcess::capture(&receipt.identity.record.holder);
+        assert!(
+            witness.exited(),
+            "exact helper execution must have exited before semantic marker"
+        );
+        assert_eq!(witness.parent(), Some(admission.coordinator.pid));
+        assert!(
+            witness.identity.is_current(),
+            "helper must still be uncollected by its original parent"
+        );
+
+        // Read the actual committed saved descriptor, rather than projecting a
+        // UUID or refining an issued source by hand, then use the real public
+        // disk-resume entry while its old helper still has parent wait custody.
+        let retirement = registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(receipt.identity.instance)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retirement.actor(), receipt.identity.instance);
+        assert_eq!(retirement.owner(), &receipt.identity.record);
+        assert_eq!(retirement.scope(), Ok(&expected_scope));
+        assert_eq!(retirement.source(), &retired.source);
+        let canonical = retirement.source().clone();
+        let confirmed = retirement
+            .confirmed_session()
+            .expect("completed original turn confirms a conversation");
+        assert_eq!(retired.confirmed_session.as_deref(), Some(confirmed));
+        assert_eq!(canonical.launch.session_id.as_deref(), Some(confirmed));
+        let trace_before = fs::read(root.join("provider-trace.jsonl")).unwrap();
+        assert!(trace_before.len() <= 8192);
+        let ServerResponse::ChatResumePrepared { session } = process_inner(
+            &host,
+            17,
+            ClientRequest::ChatPrepareResume {
+                source: canonical.clone(),
+            },
+        )
+        .unwrap() else {
+            panic!("real held-retirement disk resume did not return a prepared pane");
+        };
+        assert_ne!(session.id, canonical.id);
+        assert_eq!(session.launch, canonical.launch);
+        assert!(
+            session.proof.is_none()
+                && session.terminal.is_none()
+                && session.owned_codex_listener.is_none()
+        );
+        assert_eq!(
+            session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(receipt.identity.instance)
+                .unwrap(),
+            Some(retirement)
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .agent(receipt.agent)
+                .unwrap()
+                .closed
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_run(receipt.run)
+                .unwrap()
+                .state,
+            State::Succeeded
+        );
+        assert!(!host.lock().unwrap().chats.contains_key(&receipt.session));
+        assert_eq!(
+            fs::read(root.join("provider-trace.jsonl")).unwrap(),
+            trace_before
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("prompts"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(witness.identity.is_current() && witness.exited());
+        assert!(!receipt.identity.record.root.is_current());
+        sigkill_write(
+            &root.join("semantic-retirement.json"),
+            &SigkillMarker::for_actor(&case, &receipt.identity),
+        );
+        case.wait(
+            Duration::from_secs(15),
+            || root.join("helper-reaped.json").exists(),
+            "original parent did not collect the exact helper after semantic retirement",
+        );
+        let marker: SigkillMarker = sigkill_read(&root.join("helper-reaped.json"));
+        marker.verify(&case, &receipt.identity);
+    }
+    case.wait(
+        Duration::from_secs(15),
         || {
             !receipt.identity.record.holder.is_current()
                 && !receipt.identity.record.root.is_current()
