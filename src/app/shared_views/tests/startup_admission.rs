@@ -157,6 +157,14 @@ impl Drop for ScriptedDaemon {
 }
 
 fn settle(app: &mut Cagents, task: Task<Message>) {
+    settle_observing(app, task, |_, message| Some(message));
+}
+
+pub(super) fn settle_observing(
+    app: &mut Cagents,
+    task: Task<Message>,
+    mut observe: impl FnMut(&mut Cagents, Message) -> Option<Message>,
+) {
     use cosmic::iced::futures::StreamExt;
     // Renderer initialization owns an executor. Build it before entering the
     // task executor; widget effects must not start a nested Tokio runtime.
@@ -179,7 +187,9 @@ fn settle(app: &mut Cagents, task: Task<Message>) {
                     cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
                         // Scope selection also schedules lifecycle/focus work.
                         // Drive those actual reducers, not only chat replies.
-                        pending.push_back(app.update(message));
+                        if let Some(message) = observe(app, message) {
+                            pending.push_back(app.update(message));
+                        }
                     }
                     cosmic::iced::runtime::Action::Widget(mut operation) => {
                         use cosmic::iced::advanced::{
