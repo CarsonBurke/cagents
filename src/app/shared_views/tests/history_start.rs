@@ -118,6 +118,7 @@ impl Daemon {
         let attaches = Arc::new(Mutex::new(Vec::new()));
         let refusals = Arc::new(Mutex::new(Vec::new()));
         let admitted = Arc::new(Mutex::new(Vec::<Session>::new()));
+        let pending = Arc::new(Mutex::new(HashMap::<TerminalId, Session>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let (recorded, stop, sockets) = (starts.clone(), stopped.clone(), connections.clone());
@@ -143,6 +144,7 @@ impl Daemon {
                 let (recorded, stop) = (recorded.clone(), stop.clone());
                 let (admitted, attached) = (admitted.clone(), attached.clone());
                 let preflight = preflight.clone();
+                let pending = pending.clone();
                 let rejected = rejected.clone();
                 workers.push(std::thread::spawn(move || {
                     stream
@@ -181,7 +183,8 @@ impl Daemon {
                             // faithful: a duplicate Restore must attach to it,
                             // never manufacture another empty-inventory start.
                             ClientRequest::ChatList => {
-                                let sessions = admitted.lock().unwrap().clone();
+                                let mut sessions = admitted.lock().unwrap().clone();
+                                sessions.extend(pending.lock().unwrap().values().cloned());
                                 if let Some(script) = &preflight {
                                     // Snapshot inventory while first preflight
                                     // is blocked, before its reservation exists.
@@ -212,13 +215,12 @@ impl Daemon {
                                     starts.push(session.clone());
                                     starts.len()
                                 };
-                                let duplicate = admitted
-                                    .lock()
-                                    .unwrap()
-                                    .iter()
-                                    .any(|old| old.id == session.id);
-                                if (fail_first && count == 1) || duplicate {
-                                    let message = if duplicate {
+                                let already_admitted = admitted.lock().unwrap().iter().any(|old| old.id == session.id);
+                                let already_pending = pending.lock().unwrap().contains_key(&session.id);
+                                if (fail_first && count == 1) || already_admitted || already_pending {
+                                    let message = if already_admitted {
+                                        "This exact conversation already has a daemon writer or unconfirmed backend work; attach to its existing chat"
+                                    } else if already_pending {
                                         "Chat is already starting"
                                     } else {
                                         "History fixture first start deliberately refused"
@@ -256,8 +258,8 @@ impl Daemon {
                                     false
                                 };
                                 session.proof = Some(proof.clone());
-                                admitted.lock().unwrap().push(session.clone());
                                 if let Some(script) = &preflight {
+                                    pending.lock().unwrap().insert(session.id, session.clone());
                                     script.reserved.send(()).unwrap();
                                     if await_duplicate {
                                         script
@@ -266,6 +268,8 @@ impl Daemon {
                                             .unwrap();
                                     }
                                 }
+                                pending.lock().unwrap().remove(&session.id);
+                                admitted.lock().unwrap().push(session.clone());
                                 ServerResponse::ChatAttached {
                                     snapshot: crate::chat::Snapshot {
                                         ready: true,
