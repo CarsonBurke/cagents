@@ -14023,7 +14023,9 @@ mod tests {
     #[tokio::test]
     async fn autosave_preserves_a_selection_replacement_typing_group_but_explicit_save_seals_it() {
         const ORIGINAL: &str = "// fixture header\npub fn target() -> i32 { 42 }\n\npub fn caller() -> i32 { target() }\n";
-        for automatic in [true, false] {
+        // Some(true) autosaves mid-run; Some(false) explicitly saves;
+        // None covers the native short burst followed only by explicit Save.
+        for midway_save in [Some(true), Some(false), None] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().canonicalize().unwrap();
             let path = root.join("find.rs");
@@ -14057,7 +14059,7 @@ mod tests {
             let first = ORIGINAL.replacen("target", "c", 1);
             assert_eq!(buffer_text(&runtime), first);
 
-            let save = if automatic {
+            let save = if midway_save == Some(true) {
                 // Deliver the accepted 800 ms timer through its real reducer;
                 // the following input is still within the 1,000 ms history
                 // group. The injected edit clock avoids scheduler-dependent
@@ -14070,17 +14072,23 @@ mod tests {
                     revision: document_revision(&runtime),
                     ticket: runtime.next_auto_save_ticket,
                 })
-            } else {
+            } else if midway_save == Some(false) {
                 runtime.update(RepositoryAction::Save { card, overwrite: false })
+            } else {
+                Task::none()
             };
             finish_navigation_task(&mut runtime, save).await;
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
-            assert!(!runtime.is_dirty());
+            if midway_save.is_some() {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+                assert!(!runtime.is_dirty());
+            }
 
             let DocumentState::Editable(document) = &mut runtime.document else {
                 unreachable!();
             };
-            document.history_time = Some(now + Duration::from_millis(900));
+            document.history_time = Some(
+                now + Duration::from_millis(if midway_save.is_some() { 900 } else { 28 }),
+            );
             for character in "hanged".chars() {
                 drop(runtime.update(RepositoryAction::EditorAction {
                     card,
@@ -14095,8 +14103,12 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
 
             drop(runtime.update(RepositoryAction::Undo { card }));
-            let expected = if automatic { ORIGINAL } else { &first };
-            assert_eq!(buffer_text(&runtime), expected, "automatic={automatic}");
+            let expected = if midway_save == Some(false) {
+                &first
+            } else {
+                ORIGINAL
+            };
+            assert_eq!(buffer_text(&runtime), expected);
             let save = runtime.update(RepositoryAction::Save { card, overwrite: false });
             finish_navigation_task(&mut runtime, save).await;
             assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
