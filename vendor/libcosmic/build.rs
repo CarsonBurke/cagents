@@ -15,7 +15,7 @@ fn main() {
 fn generate_bundled_icons() {
     println!("cargo::rerun-if-changed=cosmic-icons");
 
-    let manifest_dir = std::path::Path::new(std::env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = std::path::PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let icon_paths = [
         "cosmic-icons/freedesktop/scalable",
         "cosmic-icons/extra/scalable",
