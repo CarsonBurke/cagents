@@ -1240,49 +1240,51 @@ impl Runtime {
                 ));
             }
             for item in &agent.items {
-                let Some(cached) = self.cache.get(&item.id) else {
+                let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
-                let row_index = transcript.message(
-                    if item.role == chat::Role::User && !item.content.is_step() {
-                        if matches!(item.content, ItemContent::Delivery { .. }) {
-                            self.delivery_view(item, cached, markdown_settings)
-                        } else {
-                            self.prompt_view(item)
+                let body: Element<'_, Message> = if item.role == chat::Role::User
+                    && !item.content.is_step()
+                {
+                    if matches!(item.content, ItemContent::Delivery { .. }) {
+                        self.delivery_view(item, cached, markdown_settings)
+                    } else {
+                        self.prompt_view(item)
+                    }
+                } else if let Some(coordinated) = cached
+                    .coordination
+                    .as_deref()
+                    .filter(|coordinated| coordinated.is_card())
+                {
+                    let raw = self
+                        .item_expanded(&item.id)
+                        .then(|| self.step_detail(item, cached, markdown_settings));
+                    self.coordination_card(item, cached, coordinated, markdown_settings, raw)
+                } else {
+                    match &item.content {
+                        ItemContent::Text { .. } => {
+                            self.prose_view(item, cached, turn::slot_of(item), markdown_settings)
                         }
-                    } else if let Some(coordinated) = cached
+                        ItemContent::Image { .. } => self.image_preview(item, cached),
+                        _ => self.step_view(item, cached, markdown_settings),
+                    }
+                };
+                let footer = if (item.role == chat::Role::User && !item.content.is_step())
+                    || matches!(item.content, ItemContent::Text { .. })
+                    || cached
                         .coordination
                         .as_deref()
-                        .filter(|coordinated| coordinated.is_card())
-                    {
-                        let raw = self
-                            .expanded
-                            .contains(&item.id)
-                            .then(|| self.step_detail(item, cached, markdown_settings));
-                        self.coordination_card(item, cached, coordinated, markdown_settings, raw)
-                    } else {
-                        match &item.content {
-                            ItemContent::Text { .. } => self.prose_view(
-                                item,
-                                cached,
-                                turn::slot_of(item),
-                                markdown_settings,
-                            ),
-                            ItemContent::Image { .. } => self.image_preview(item, cached),
-                            _ => self.step_view(item, cached, markdown_settings),
-                        }
-                    },
-                    if (item.role == chat::Role::User && !item.content.is_step())
-                        || matches!(item.content, ItemContent::Text { .. })
-                        || cached
-                            .coordination
-                            .as_deref()
-                            .is_some_and(Coordinated::is_card)
-                    {
-                        MESSAGE_ACTION_FOOTER
-                    } else {
-                        0.0
-                    },
+                        .is_some_and(Coordinated::is_card)
+                {
+                    MESSAGE_ACTION_FOOTER
+                } else {
+                    0.0
+                };
+                let row_index = transcript.message(
+                    widget::container(body)
+                        .id(self.find_anchor(&item.id))
+                        .into(),
+                    footer,
                 );
                 anchors.push((row_index, item.id.as_str()));
             }
@@ -1414,9 +1416,10 @@ impl Runtime {
                         "0 matches".to_owned()
                     } else {
                         format!(
-                            "{} of {} turns",
+                            "{} of {} {}",
                             self.find_index + 1,
-                            self.find_matches.len()
+                            self.find_matches.len(),
+                            if selected.is_some() { "items" } else { "turns" }
                         )
                     })
                     .into(),
@@ -3559,7 +3562,7 @@ impl Runtime {
             Action::Copy(self.target, item.id.clone(), CopyPart::Text),
         )];
         if let Some((at, stamp, full)) = self
-            .cache
+            .presentation_cache()
             .get(&item.id)
             .and_then(|cached| cached.stamp.as_ref())
             && item.at == Some(*at)
@@ -3674,7 +3677,7 @@ impl Runtime {
         // another filled bubble, so a message with two images does not read as
         // three separate things the reader said.
         let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
-        let expanded = self.expanded.contains(&item.id);
+        let expanded = self.item_expanded(&item.id);
         let text = if long && !expanded {
             text.lines()
                 .take(12)
@@ -3771,7 +3774,7 @@ impl Runtime {
         else {
             return self.prompt_view(item);
         };
-        let expanded = self.expanded.contains(&item.id);
+        let expanded = self.item_expanded(&item.id);
         let toggle = |label: &'static str| -> Element<'static, Message> {
             widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
                 .class(crate::ui_controls::control_style(false, None))
@@ -3952,7 +3955,7 @@ impl Runtime {
                     },
                 );
             let finished = reasoning_finished(items, busy, &item.id);
-            let expanded = self.expanded.contains(&item.id);
+            let expanded = self.item_expanded(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
                 items
                     .iter()
@@ -4864,7 +4867,7 @@ mod tests {
             id: "dated-prompt".into(),
             role: chat::Role::User,
             at: Some(at),
-            started_at: None,
+            started_at: Some(at - 120_000),
             content: ItemContent::Text {
                 text: "Recorded prompt".into(),
                 thinking: false,
@@ -4873,7 +4876,8 @@ mod tests {
         };
         let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&parent));
         let child = chat::Item {
-            id: "dated-child-answer".into(),
+            // Opaque message IDs can collide across transcripts.
+            id: parent.id.clone(),
             role: chat::Role::Assistant,
             at: Some(at + 120_000),
             content: ItemContent::Text {
@@ -4885,6 +4889,7 @@ mod tests {
         };
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
+        let child_id = native_child_fixture().id;
         snapshot.subagents.push(chat::Subagent {
             items: vec![Arc::new(child.clone())],
             ..native_child_fixture()
@@ -4896,9 +4901,14 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        for item in [&parent, &child] {
+        for (selected, item) in [(None, &parent), (Some(child_id), &child)] {
+            let child_selected = selected.is_some();
+            let before_selection = app.chat_runtime_mut(target).unwrap().snapshot.clone();
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, selected)));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            let expected = runtime.cache[&item.id]
+            assert!(Arc::ptr_eq(&before_selection, &runtime.snapshot));
+            assert_eq!(runtime.cache[&parent.id].stamp.as_ref().unwrap().0, at);
+            let expected = runtime.presentation_cache()[&item.id]
                 .stamp
                 .clone()
                 .expect("parent and child retain recorded time");
@@ -4909,7 +4919,10 @@ mod tests {
             drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(Arc::ptr_eq(&before, &runtime.snapshot));
-            assert_eq!(runtime.cache[&item.id].stamp.as_ref(), Some(&expected));
+            assert_eq!(
+                runtime.presentation_cache()[&item.id].stamp.as_ref(),
+                Some(&expected)
+            );
             let mut footer = runtime.message_copy(item);
             let mut tree = Tree::new(footer.as_widget());
             let node = footer.as_widget_mut().layout(
@@ -4970,6 +4983,58 @@ mod tests {
             assert!(
                 matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
             );
+            drop(footer);
+            if child_selected {
+                let revision = app.chat_runtime_mut(target).unwrap().child_cache[&item.id].revision;
+                let mut previous_label = expected.1;
+                for recorded in [Some(at + 180_000), None] {
+                    let mut snapshot = (*handle.snapshot()).clone();
+                    snapshot.generation += 1;
+                    Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = recorded;
+                    handle.publish_snapshot_for_test(snapshot);
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    runtime.refresh();
+                    assert_eq!(
+                        runtime.child_cache[&item.id].revision, revision,
+                        "clock-only publication retains prepared child body"
+                    );
+                    assert_eq!(
+                        runtime.cache[&parent.id].stamp.as_ref().unwrap().0,
+                        at,
+                        "same child ID cannot replace the parent timestamp"
+                    );
+                    let current = &runtime.snapshot.subagents[0].items[0];
+                    let label = runtime.child_cache[&item.id]
+                        .stamp
+                        .as_ref()
+                        .map(|stamp| stamp.1.clone());
+                    let mut footer = runtime.message_copy(current);
+                    tree.diff(footer.as_widget_mut());
+                    let node = footer.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100.0)),
+                    );
+                    let mut texts = Texts::default();
+                    footer.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut texts,
+                    );
+                    if let Some(label) = &label {
+                        assert!(
+                            texts.0.iter().any(|(text, _)| text == label),
+                            "same native footer Tree draws the changed child timestamp"
+                        );
+                    }
+                    assert!(
+                        !texts.0.iter().any(|(text, _)| text == &previous_label),
+                        "same native footer Tree withdraws the obsolete timestamp"
+                    );
+                    previous_label = label.unwrap_or_default();
+                }
+            }
         }
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
@@ -4980,9 +5045,128 @@ mod tests {
         runtime.refresh();
         assert!(runtime.cache[&parent.id].stamp.is_none());
         assert!(
-            runtime.cache[&child.id].stamp.is_none(),
+            runtime.child_cache[&child.id].stamp.is_none(),
             "missing recorded time never falls back to the current clock"
         );
+    }
+
+    #[test]
+    fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                    self.0.push(prose.plain.to_string());
+                }
+            }
+        }
+        let parent = chat::Item {
+            id: "shared-thought".into(),
+            role: chat::Role::Assistant,
+            at: Some(1_700_000_000_000),
+            started_at: Some(1_700_000_000_000),
+            content: ItemContent::Text {
+                text: "Distinct parent reasoning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        };
+        let child = chat::Item {
+            content: ItemContent::Text {
+                text: "Distinct child reasoning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            ..parent.clone()
+        };
+        let (mut runtime, handle) = frame_cost::live_runtime(&[parent]);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.push(chat::Subagent {
+            status: chat::ToolStatus::Succeeded,
+            items: vec![Arc::new(child)],
+            ..native_child_fixture()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let renderer = crate::app::tests::headless_renderer();
+        let inspect = |runtime: &Runtime| {
+            let item = runtime.active_item("shared-thought").unwrap();
+            let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            let mut element = runtime.prose_view(
+                item,
+                &runtime.presentation_cache()[&item.id],
+                turn::Slot::Thinking,
+                settings,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            texts.0.join(" ")
+        };
+        assert!(
+            !inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::Find(target, "Distinct parent reasoning".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct child reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(!runtime.item_expanded("shared-thought"));
+        assert!(!runtime.part_unfolded("shared-thought#output"));
+        assert!(!inspect(runtime).contains("Distinct parent reasoning"));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.item_expanded("shared-thought"));
+        assert!(runtime.part_unfolded("shared-thought#output"));
+        assert!(inspect(runtime).contains("Distinct child reasoning"));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.item_expanded("shared-thought"));
+        assert!(runtime.part_unfolded("shared-thought#output"));
+        assert!(inspect(runtime).contains("Distinct parent reasoning"));
     }
 
     #[test]
@@ -5375,6 +5559,248 @@ mod tests {
         assert!(known.contains("Waiting for your approval"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
+    }
+
+    #[test]
+    fn selected_child_find_navigation_resolves_real_scoped_widget_anchors() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Outcome},
+        };
+        use iced::futures::StreamExt;
+        let item = |id: &str, text: &str| chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: text.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (runtime, handle) = frame_cost::live_runtime(&[item("bc", "parent needle")]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = [("a", "bc"), ("ab", "c")]
+            .into_iter()
+            .map(|(child, id)| chat::Subagent {
+                id: child.into(),
+                items: vec![Arc::new(item(id, "child needle"))],
+                ..native_child_fixture()
+            })
+            .collect();
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let renderer = crate::app::tests::headless_renderer();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut previous_anchor = None;
+        for (child, item, framed) in [("a", "bc", "1:abc"), ("ab", "c", "2:abc")] {
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some(child.into()))));
+            let task = app.handle_chat_ui(Action::Find(target, "needle".into()));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.find_matches, vec![item]);
+            let expected = iced::advanced::widget::Id::new(format!(
+                "chat-child-item-{}-{framed}",
+                target.card
+            ));
+            assert_ne!(
+                previous_anchor.as_ref(),
+                Some(&expected),
+                "opaque child/item boundaries must be unambiguous"
+            );
+            previous_anchor = Some(expected.clone());
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "project".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+            );
+            struct Anchors {
+                expected: iced::advanced::widget::Id,
+                count: usize,
+            }
+            impl Operation for Anchors {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn container(
+                    &mut self,
+                    id: Option<&iced::advanced::widget::Id>,
+                    _: iced::Rectangle,
+                ) {
+                    self.count += usize::from(id == Some(&self.expected));
+                }
+            }
+            let mut anchors = Anchors { expected, count: 0 };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut anchors);
+            assert_eq!(
+                anchors.count, 1,
+                "actual selected child widget owns its Find anchor"
+            );
+            executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task)
+                    .expect("Find must navigate a visible child match");
+                let Some(iced::runtime::Action::Widget(mut operation)) =
+                    tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                else {
+                    panic!("Find must produce its scroll widget operation");
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    operation.as_mut(),
+                );
+                assert!(
+                    matches!(operation.finish(), Outcome::Chain(_)),
+                    "Find navigation must resolve the selected child row, not an absent parent turn"
+                );
+            });
+        }
+        executor.shutdown_background();
+    }
+
+    #[test]
+    fn find_reveals_long_prompts_and_restores_disclosures_in_each_transcript() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        let prompt = |suffix: &str| chat::Item {
+            id: "same#opaque-id".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: format!("{}{suffix}", "A long prompt line.\n".repeat(128)),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (runtime, handle) = frame_cost::live_runtime(&[prompt("parent-only-suffix")]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![chat::Subagent {
+            items: vec![Arc::new(prompt("child-only-suffix"))],
+            ..native_child_fixture()
+        }];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let renderer = crate::app::tests::headless_renderer();
+        let rendered = |runtime: &Runtime| {
+            let mut element = runtime.prompt_view(runtime.active_item("same#opaque-id").unwrap());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
+            );
+            #[derive(Default)]
+            struct Text(Vec<String>);
+            impl Operation for Text {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_mut::<selectable_prose::State>() {
+                        self.0.push(prose.plain.to_string());
+                    }
+                }
+            }
+            let mut text = Text::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+            text.0.join("\n")
+        };
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        assert!(
+            rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"),
+            "a parent prompt Find match must be visible beyond its collapsed cutoff"
+        );
+        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
+        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        assert!(
+            rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"),
+            "a child prompt Find match must be visible beyond its collapsed cutoff"
+        );
+        assert!(
+            !app.chat_runtime_mut(target)
+                .unwrap()
+                .expanded
+                .contains("same#opaque-id")
+        );
+        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
+        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
+        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        assert!(
+            rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"),
+            "explicit child expansion survives search close and transcript switches"
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert!(
+            rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"),
+            "explicit parent prompt choice survives Find closure too"
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        assert!(rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
     }
 
     #[test]
