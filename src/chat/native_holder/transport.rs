@@ -461,6 +461,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                 proof: source_proof.clone(),
                 source: retained_source,
                 original_role: None,
+                receipt_proof: source_proof.clone(),
             },
         }),
         Err(error) => {
@@ -573,6 +574,7 @@ pub(crate) fn adopt(
                         source: recovery.source.clone(),
                         proof: proof.clone(),
                         original_role,
+                        receipt_proof: proof.clone(),
                     },
                 },
                 recovery,

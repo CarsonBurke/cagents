@@ -16,6 +16,8 @@ pub(crate) struct Detached {
     pub source: super::super::Session,
     pub proof: HostSessionProof,
     pub(crate) original_role: Option<registry::OriginalRole>,
+    /// The receipt keeps its publishing lease; current cleanup authority is separate.
+    pub(super) receipt_proof: HostSessionProof,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +111,7 @@ impl Detached {
             source,
             proof,
             original_role,
+            receipt_proof: receipt.proof,
         })
     }
 
@@ -145,20 +148,22 @@ impl Detached {
         self.receipt(false)
     }
 
+    fn matches_receipt(&self, receipt: &Receipt) -> bool {
+        receipt.record == self.record
+            && receipt.proof == self.receipt_proof
+            && (receipt.record.application == crate::instance::APPLICATION_ID
+                || self
+                    .original_role
+                    .as_ref()
+                    .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
+    }
+
     pub(super) fn receipt(&self, retain: bool) -> Result<bool, String> {
         consume(
             self.record.terminal,
             &self.record.holder,
             retain,
-            |receipt| {
-                receipt.record == self.record
-                    && receipt.proof == self.proof
-                    && (receipt.record.application == crate::instance::APPLICATION_ID
-                        || self
-                            .original_role
-                            .as_ref()
-                            .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
-            },
+            |receipt| self.matches_receipt(receipt),
         )
     }
 }
@@ -325,4 +330,54 @@ fn find_source(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_receipt_keeps_publishing_proof_separate_from_successor_authority() {
+        // Pure receipt matcher: actual construction still requires find_source's
+        // exact digest, current lease, dead owner and discovery-retirement checks.
+        let source = super::super::tests::recovery().source;
+        let original = source.proof.clone().unwrap();
+        let mut successor = original.clone();
+        successor.host_incarnation = "successor-cleanup".into();
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: original.boot_id.clone(),
+            terminal: source.id,
+            holder: Process { pid: 42, start: 1 },
+            root: Process { pid: 43, start: 2 },
+        };
+        let receipt = Receipt {
+            record: record.clone(),
+            proof: original.clone(),
+            sources: vec![source_digest(&source).unwrap()],
+            paired_closed: true,
+            paired_holder: None,
+        };
+        let detached = Detached {
+            record,
+            source,
+            proof: successor.clone(),
+            original_role: None,
+            receipt_proof: original,
+        };
+        assert_ne!(detached.proof, detached.receipt_proof);
+        assert!(detached.matches_receipt(&receipt));
+        let mut changed = receipt.clone();
+        changed.proof = successor;
+        assert!(!detached.matches_receipt(&changed));
+        changed = receipt.clone();
+        changed.record.holder.start += 1;
+        assert!(!detached.matches_receipt(&changed));
+        changed = receipt;
+        changed.record.application = "another.installation".into();
+        assert!(!detached.matches_receipt(&changed));
+    }
 }
