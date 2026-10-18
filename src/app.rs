@@ -16441,23 +16441,6 @@ impl Application for Cagents {
                         RepositoryAction::FindNext { card }
                     }));
                 }
-                if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    modifiers,
-                    ..
-                } = &event
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
-                {
-                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
-                        RepositoryAction::FindPrevious { card }
-                    } else {
-                        RepositoryAction::FindNext { card }
-                    }));
-                }
                 #[cfg(feature = "integrated-browser")]
                 if !captured
                     && let Some(card) = self.workspace.focused()
