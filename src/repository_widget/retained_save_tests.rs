@@ -462,6 +462,16 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
     std::fs::create_dir(&parent).unwrap();
     let path = parent.join("file.txt");
     std::fs::write(&path, "baseline").unwrap();
+    // Always restore this owned fixture directory before TempDir cleanup,
+    // including when an assertion or the actual worker panics.
+    struct RestoreReadAccess(PathBuf);
+    impl Drop for RestoreReadAccess {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let restore_read_access = RestoreReadAccess(parent.clone());
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
     let source = PathBuf::from("/");
     let card = CardId::new();
@@ -491,20 +501,58 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
     assert_ne!(submitted, "baseline");
     assert!(runtime.is_dirty());
     let save = runtime.request_save(card, false);
-    finish(&mut runtime, save).await;
-    // Publication is supported; read-restricted directory fsync can still
-    // honestly report unconfirmed durability, as it did on production base.
+    let mut completion = None;
+    if let Some(mut stream) = iced::runtime::task::into_stream(save) {
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(action) = action {
+                if let RepositoryAction::RetainedSaveFinished { result, .. } = &action {
+                    assert!(completion.replace(result.clone()).is_none());
+                }
+                drop(runtime.update(action));
+            }
+        }
+    }
+    // Restore before inspecting the result; the guard also covers unwinding.
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(restore_read_access);
+    let saved = completion
+        .expect("actual Save completion")
+        .expect("publication succeeds");
+    let SaveOutcome::Saved {
+        content_hash,
+        durability,
+    } = saved.outcome() else {
+        panic!("write/search permission must permit publication");
+    };
+    assert_eq!(*content_hash, blake3::hash(submitted.as_bytes()));
+    let warned = match durability {
+        SaveDurability::Durable => false,
+        SaveDurability::Unconfirmed { error } => {
+            assert!(!error.is_empty());
+            true
+        }
+    };
+    // Read-restricted directory sync may be Unconfirmed. That is a warning
+    // about a successful publication, not a failed Save or dirty buffer.
     assert_eq!(std::fs::read_to_string(&path).unwrap(), submitted);
     assert!(!runtime.is_dirty());
-    assert!(runtime.save_error().is_none());
-    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if let DocumentState::Editable(document) = &runtime.document
-        && let Some(authority) = document.cleanup_recovery.clone()
-    {
-        authority.retry().unwrap();
-    }
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("editable after Save");
+    };
+    assert!(document.error.is_none());
+    assert!(document.active_save.is_none());
+    assert_eq!(document.saved_text, submitted);
+    assert_eq!(document.durability_warning.is_some(), warned);
+    assert_eq!(runtime.has_durability_warning(), warned);
+    assert_eq!(runtime.save_error().is_some(), warned);
+    assert_eq!(runtime.blocks_navigation(), warned);
+    assert!(saved.recovery_authority().is_none());
+    assert!(document.cleanup_recovery.is_none());
+    assert!(!runtime.has_editor_recovery());
+    assert!(!custody.lock().unwrap().is_pending());
     drop(runtime.reconcile_operation_recovery(card));
     assert!(!custody.lock().unwrap().is_pending());
+    assert_eq!(runtime.has_durability_warning(), warned);
 }
 
 #[tokio::test]
