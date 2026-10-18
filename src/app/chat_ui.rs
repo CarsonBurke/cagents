@@ -19122,6 +19122,7 @@ mod tests {
     }
     #[test]
     fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() {
+        let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture(&mut app);
         let parent = presentation_text("same:opaque:id", "loaded final 45 KiB fragment");
@@ -19200,11 +19201,7 @@ mod tests {
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
-        let request = text_copy::Request {
-            intent: text_copy::invalidate(),
-            handle,
-            source,
-        };
+        let request = text_copy::Request::for_test(handle, source);
         let control = app.handle_chat_ui(Action::MessageCopied(
             target,
             "last-part".into(),
@@ -19240,6 +19237,7 @@ mod tests {
 
     #[test]
     fn newer_chat_copy_blocks_delayed_full_message_clipboard_write() {
+        let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, request, body) = valid_message_copy_completion(&mut app);
         drop(app.handle_chat_ui(Action::CopyLiteral("newer code selection".into())));
@@ -19259,6 +19257,7 @@ mod tests {
 
     #[test]
     fn captured_builtin_copy_event_on_same_card_supersedes_async_message_copy() {
+        let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, request, body) = valid_message_copy_completion(&mut app);
         drop(app.update(Message::KeyEvent {
@@ -19289,6 +19288,7 @@ mod tests {
 
     #[test]
     fn logical_copy_footer_uses_item_identity_when_display_ids_collide() {
+        let _context = text_copy::isolated_context();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture(&mut app);
         let first = presentation_text("opaque:native-part:1", "first logical message part");
