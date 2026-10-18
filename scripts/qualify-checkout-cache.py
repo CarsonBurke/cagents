@@ -40,6 +40,7 @@ def guard_vendor_hooks():
     assert actual == set(VENDOR_BUILD_HOOKS + VENDOR_SOURCE_HOOKS), actual
     for vendor in VENDOR_BUILD_HOOKS:
         source = (ROOT / vendor / "build.rs").read_text()
+        assert ANCHOR.strip() in source, vendor
         # Require the watch before any branch, including SQLite's early return.
         main = source.split("fn main() {", 1)[1].lstrip()
         assert main.startswith(ENV_WATCH), vendor
@@ -251,9 +252,10 @@ pub fn generated() -> &'static str { GENERATED }
     return {"owned": outcomes, "patched": patch_outcomes}
 
 
-def qualify_manifest_paths(directory, fixed):
+def qualify_manifest_paths(directory, fixed, *, body_identity=None):
     """Distinguish current script inputs from an executable's baked-in paths."""
-    lane = directory / ("metadata-fixed" if fixed else "metadata-control")
+    lane = directory / (("body-anchored" if body_identity else "body-watch-only") if body_identity is not None
+                        else ("metadata-fixed" if fixed else "metadata-control"))
     checkout_a = lane / "a"
     checkout_b = lane / "b"
     target = lane / "target"
@@ -302,6 +304,12 @@ links="qualification_paths"
     println!("cargo:include={}", manifest_dir.display());
 }
 '''.replace("WATCH", ENV_WATCH).replace("MANIFEST_LOOKUP", manifest_dir))
+    if body_identity is not None:
+        script = checkout_a / "vendor/path-source/build.rs"
+        body = script.read_text().replace("manifest_dir.display()", 'manifest_dir.join("body-A").display()')
+        if body_identity:
+            body = ANCHOR + body
+        write(script, body)
     write(checkout_a / "vendor/path-source/input.txt", "input-A")
     write(checkout_a / ".gitignore", "/target/\n")
     run("git", "init", "-q", cwd=checkout_a)
@@ -310,6 +318,9 @@ links="qualification_paths"
         "commit", "-qm", "Path metadata fixture", cwd=checkout_a)
     run("git", "worktree", "add", "--detach", str(checkout_b), "HEAD", cwd=checkout_a)
     write(checkout_b / "vendor/path-source/input.txt", "input-B")
+    if body_identity is not None:
+        script = checkout_b / "vendor/path-source/build.rs"
+        write(script, script.read_text().replace("body-A", "body-B"))
     for checkout in (checkout_a, checkout_b):
         tracked, _ = run("git", "ls-files", cwd=checkout)
         for relative in tracked.splitlines():
@@ -326,7 +337,13 @@ links="qualification_paths"
         assert observer == str(checkout), ("metadata observer was stale", checkout, observer)
         assert input_value == ("input-B" if step == 1 else "input-A"), (checkout, input_value)
         expected_root = checkout if fixed else checkout_a
-        assert include == str(expected_root / "vendor/path-source"), (checkout, include)
+        expected_include = expected_root / "vendor/path-source"
+        if body_identity is not None:
+            # Watch-only control deliberately observes stale executable BODY
+            # while relative input and runtime manifest path follow checkout B.
+            expected_body = "body-B" if body_identity and step == 1 else "body-A"
+            expected_include = expected_include / expected_body
+        assert include == str(expected_include), (checkout, include)
         if not fixed and step == 1:
             assert include != str(checkout / "vendor/path-source"), "control did not leak its compiled manifest path"
         print(f"{lane.name}: {observed}")
@@ -353,13 +370,17 @@ def main():
         qualify(directory, True)
         qualify_manifest_paths(directory, False)
         qualify_manifest_paths(directory, True)
+        qualify_manifest_paths(directory, True, body_identity=False)
+        qualify_manifest_paths(directory, True, body_identity=True)
     else:
         with tempfile.TemporaryDirectory(prefix="cagents-cache-qualification-", dir="/var/tmp") as temporary:
             qualify(Path(temporary), False)
             qualify(Path(temporary), True)
             qualify_manifest_paths(Path(temporary), False)
             qualify_manifest_paths(Path(temporary), True)
-    print("PASS: stale reuse reproduced; owned sources, stamps, patches and build-script path metadata follow A → B → A; same-checkout generated input stays live; external dependency remains fresh")
+            qualify_manifest_paths(Path(temporary), True, body_identity=False)
+            qualify_manifest_paths(Path(temporary), True, body_identity=True)
+    print("PASS: stale reuse reproduced; owned sources, stamps, patches and build-script path metadata follow A → B → A; same-checkout generated input stays live; external dependency remains fresh; watch-only stale script BODY reproduced and compile-anchor BODY follows A → B → A")
 
 
 if __name__ == "__main__":
