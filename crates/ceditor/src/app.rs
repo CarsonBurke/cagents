@@ -5309,7 +5309,8 @@ mod tests {
         write("editor_auto_save = false\nlanguage_servers = []\n");
         assert!(settings::load(&settings_path).is_err());
         write(NATIVE_FIND_FIXTURE_SETTINGS);
-        let loaded = settings::load(&settings_path).expect("native fixture must load, not fall back");
+        let loaded =
+            settings::load(&settings_path).expect("native fixture must load, not fall back");
         assert_eq!(loaded.schema_version, settings::SETTINGS_SCHEMA_VERSION);
         assert!(!loaded.editor_auto_save);
         assert!(loaded.language_servers.is_empty());
@@ -5327,12 +5328,14 @@ mod tests {
         assert!(!app.settings_writable);
         let id = add(&mut app, root.to_str().unwrap(), Some("find.rs"));
         file_loaded(&mut app, id, &root, "find.rs");
-        drop(app.update(Message::Repository(RepositoryAction::EditorAction {
-            card: id,
-            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
-                Arc::new("changed".into()),
-            )),
-        })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("changed".into()),
+                )),
+            })),
+        );
         let runtime = &mut app.tab_mut(id).unwrap().runtime;
         assert!(runtime.is_dirty());
         assert!(iced::runtime::task::into_stream(runtime.auto_save_task(id)).is_none());
