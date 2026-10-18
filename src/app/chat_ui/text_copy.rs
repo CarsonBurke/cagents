@@ -1,18 +1,82 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
-static INTENT: AtomicU64 = AtomicU64::new(0);
+/// All production UI surfaces share one clipboard intent context. A request
+/// owns this context so async task polling never depends on thread-local state.
+#[derive(Clone, Default)]
+struct ClipboardContext(Arc<AtomicU64>);
 
-/// A newer chat copy (including widget-owned selection) supersedes an in-flight read.
+impl ClipboardContext {
+    fn advance(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+    fn is_current(&self, intent: u64) -> bool {
+        self.0.load(Ordering::Relaxed) == intent
+    }
+}
+
+fn current_context() -> ClipboardContext {
+    #[cfg(test)]
+    if let Some(context) = TEST_CONTEXT.with(|slot| slot.borrow().clone()) {
+        return context;
+    }
+    static PROCESS: std::sync::OnceLock<ClipboardContext> = std::sync::OnceLock::new();
+    PROCESS.get_or_init(ClipboardContext::default).clone()
+}
+
+/// A newer copy (including widget-owned selection) supersedes an in-flight read.
 pub(super) fn invalidate() -> u64 {
-    INTENT.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    current_context().advance()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONTEXT: std::cell::RefCell<Option<ClipboardContext>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scope only UI event entrypoints; asynchronous work captures the owned
+/// context. The guard cannot move to a different thread and restores nesting.
+#[cfg(test)]
+pub(super) struct TestContext {
+    previous: Option<ClipboardContext>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(test)]
+pub(super) fn isolated_context() -> TestContext {
+    TestContext {
+        previous: TEST_CONTEXT.with(|slot| slot.replace(Some(ClipboardContext::default()))),
+        _thread: std::marker::PhantomData,
+    }
+}
+#[cfg(test)]
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        TEST_CONTEXT.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
 }
 
 #[derive(Clone)]
 pub struct Request {
-    pub(super) intent: u64,
-    pub(super) handle: Arc<ClientHandle>,
-    pub(super) source: chat::TextCopySource,
+    context: ClipboardContext,
+    intent: u64,
+    handle: Arc<ClientHandle>,
+    source: chat::TextCopySource,
+}
+
+#[cfg(test)]
+impl Request {
+    pub(super) fn for_test(handle: Arc<ClientHandle>, source: chat::TextCopySource) -> Self {
+        let context = current_context();
+        let intent = context.advance();
+        Self {
+            context,
+            intent,
+            handle,
+            source,
+        }
+    }
 }
 
 impl Runtime {
@@ -69,7 +133,8 @@ impl Cagents {
         id: String,
         source: Option<chat::TextCopySource>,
     ) -> Task<Message> {
-        let intent = invalidate();
+        let context = current_context();
+        let intent = context.advance();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -83,6 +148,7 @@ impl Cagents {
             return Task::none();
         };
         let request = Request {
+            context,
             intent,
             handle: handle.clone(),
             source: source.clone(),
@@ -103,7 +169,7 @@ impl Cagents {
         request: Request,
         result: Result<String, String>,
     ) -> Task<Message> {
-        if INTENT.load(Ordering::Relaxed) != request.intent
+        if !request.context.is_current(request.intent)
             || self.workspace.focused() != Some(target.card)
         {
             return Task::none();
@@ -123,7 +189,7 @@ impl Cagents {
                 let at = Instant::now();
                 runtime.copied = Some((id, at));
                 Task::batch([
-                    clipboard_write(request.intent, text),
+                    clipboard_write(request.context, request.intent, text),
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         Message::ChatUi(Action::ClearCopied(target, at))
@@ -140,10 +206,10 @@ impl Cagents {
 
 /// Check again when the returned task is polled, not just when completion is
 /// handled: another copy may be requested while this effect is still pending.
-fn clipboard_write(intent: u64, text: String) -> Task<Message> {
+fn clipboard_write(context: ClipboardContext, intent: u64, text: String) -> Task<Message> {
     let mut text = Some(text);
     Task::done(()).then(move |_| {
-        if INTENT.load(Ordering::Relaxed) == intent {
+        if context.is_current(intent) {
             iced::clipboard::write(text.take().unwrap_or_default()).map(cosmic::Action::App)
         } else {
             Task::none()
@@ -165,6 +231,7 @@ mod tests {
 
     #[test]
     fn appended_prefix_is_valid_but_rewrite_scope_and_cache_changes_are_not() {
+        let _context = isolated_context();
         let captured = chat::TextCopySource {
             cache: uuid::Uuid::new_v4(),
             scope: chat::TextCopyScope::Conversation,
@@ -192,7 +259,13 @@ mod tests {
     #[test]
     fn cross_surface_copy_invalidates_an_already_scheduled_chat_write() {
         use iced::futures::StreamExt;
-        let task = clipboard_write(invalidate(), "old logical message".into());
+        let _context = isolated_context();
+        let context = current_context();
+        let task = clipboard_write(
+            context.clone(),
+            context.advance(),
+            "old logical message".into(),
+        );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.update(Message::Repository(RepositoryAction::Clipboard {
             card: CardId::new(),
@@ -207,6 +280,40 @@ mod tests {
         assert!(
             effects.is_empty(),
             "the gate must run when the clipboard task is polled"
+        );
+    }
+    #[test]
+    fn isolated_contexts_do_not_cancel_each_other_and_captured_context_survives_thread_change() {
+        use iced::futures::StreamExt;
+        let _scope = isolated_context();
+        let first = current_context();
+        let intent = first.advance();
+        {
+            let _other_scope = isolated_context();
+            invalidate();
+            assert!(first.is_current(intent));
+        }
+        let task = clipboard_write(first.clone(), intent, "first context source".into());
+        let copied = std::thread::spawn(move || {
+            // This thread has no injected context. The task must use its
+            // captured first context rather than the process default.
+            iced::futures::executor::block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task).unwrap();
+                match effects.next().await {
+                    Some(iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    )) => Some(contents),
+                    _ => None,
+                }
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(copied.as_deref(), Some("first context source"));
+        invalidate();
+        assert!(
+            !first.is_current(intent),
+            "the restored shared UI context must cancel its own request"
         );
     }
 }
