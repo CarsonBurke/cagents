@@ -441,7 +441,9 @@ pub use directory_creation::{
     DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
     create_directory_in_namespace, stage_directory_in_namespace,
 };
-pub(crate) use directory_creation::{OwnedPrivateSibling, PrivateSiblingCreateError, StickyParent};
+pub(crate) use directory_creation::{
+    OwnedPrivateSibling, PrivateSiblingCreateError, SaveSiblingDurability, StickyParent,
+};
 
 /// Changes permissions through the exact retained directory descriptor.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
@@ -476,10 +478,13 @@ pub(crate) use recovery_placement::{
 
 #[path = "fs_safety/recovery_cache.rs"]
 mod recovery_cache;
+#[cfg(test)]
+pub(crate) use recovery_cache::fixture_fail_next_save_preparation_sync;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 pub(crate) use recovery_cache::{
-    RecoveryDirectoryError, RecoveryParentCandidates, prepare_recovery_directory_with_owner,
+    RecoveryDirectoryError, RecoveryParentCandidates, SavePreparationDurability,
+    prepare_recovery_directory_with_owner, prepare_save_recovery_directory_with_owner,
     verify_recovery_directory_private,
 };
 

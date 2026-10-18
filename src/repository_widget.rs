@@ -2250,7 +2250,9 @@ impl RepositoryRuntime {
                 .is_some_and(|authority| authority.is_resolved())
         {
             document.cleanup_recovery = None;
-            document.durability_warning = None;
+            // Namespace/content recovery completing does not prove earlier
+            // directory durability. Explicit Reload or another successful
+            // Save owns that baseline transition, as in the ordinary writer.
         }
         if self
             .editor_recovery

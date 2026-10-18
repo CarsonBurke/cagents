@@ -131,6 +131,20 @@ impl StickyParent {
     ) -> Result<OwnedPrivateSibling, PrivateSiblingCreateError> {
         self.create_with_hook(|_, _| Ok(()))
     }
+    /// Save-only live custody after strict fresh identity/private qualification.
+    /// Directory sync failure is reported separately and must remain a warning
+    /// through the final Save outcome. Callers retain the same pre-effect charge.
+    pub(crate) fn create_save_private_sibling(
+        self: Arc<Self>,
+    ) -> Result<(OwnedPrivateSibling, SaveSiblingDurability), PrivateSiblingCreateError> {
+        let name = temporary_name().map_err(PrivateSiblingCreateError::Rejected)?;
+        self.create_named_using(
+            name,
+            |_, _| Ok(()),
+            SiblingPreparationPolicy::SaveLiveCustody,
+            sync_directory,
+        )
+    }
     fn create_with_hook(
         self: Arc<Self>,
         after_mkdir: impl FnOnce(&Root, &OsStr) -> io::Result<()>,
@@ -143,6 +157,21 @@ impl StickyParent {
         name: OsString,
         after_mkdir: impl FnOnce(&Root, &OsStr) -> io::Result<()>,
     ) -> Result<OwnedPrivateSibling, PrivateSiblingCreateError> {
+        self.create_named_using(
+            name,
+            after_mkdir,
+            SiblingPreparationPolicy::Strict,
+            sync_directory,
+        )
+        .map(|(sibling, _)| sibling)
+    }
+    fn create_named_using(
+        self: Arc<Self>,
+        name: OsString,
+        after_mkdir: impl FnOnce(&Root, &OsStr) -> io::Result<()>,
+        policy: SiblingPreparationPolicy,
+        mut sync: impl FnMut(&Root) -> io::Result<()>,
+    ) -> Result<(OwnedPrivateSibling, SaveSiblingDurability), PrivateSiblingCreateError> {
         self.validate()
             .map_err(PrivateSiblingCreateError::Rejected)?;
         let leaf = c_component(&name, &self.directory.path)
@@ -172,15 +201,48 @@ impl StickyParent {
             // Restrictive umasks can remove owner access. Only repair the
             // exact fresh EUID-owned inode after mount/identity qualification.
             set_directory_permissions(directory, 0o700)?;
-            sibling.validate()?;
-            sync_directory(directory)?;
-            sync_directory(&sibling.parent.directory)
+            sibling.validate()
         })();
-        match setup {
-            Ok(()) => Ok(sibling),
-            Err(cause) => Err(PrivateSiblingCreateError::Retained { cause, sibling }),
+        if let Err(cause) = setup {
+            return Err(PrivateSiblingCreateError::Retained { cause, sibling });
+        }
+        let holding = sync(sibling.directory.as_ref().unwrap());
+        let confirmation = if matches!(policy, SiblingPreparationPolicy::Strict) {
+            holding.and_then(|()| sync(&sibling.parent.directory))
+        } else {
+            // Save still observes both directory confirmation steps, retaining
+            // the first error without weakening any pre-sync qualification.
+            let parent = sync(&sibling.parent.directory);
+            holding.and(parent)
+        };
+        match confirmation {
+            Ok(()) => Ok((sibling, SaveSiblingDurability::Confirmed)),
+            Err(cause) => match policy {
+                SiblingPreparationPolicy::Strict => {
+                    Err(PrivateSiblingCreateError::Retained { cause, sibling })
+                }
+                SiblingPreparationPolicy::SaveLiveCustody => {
+                    Ok((sibling, SaveSiblingDurability::Unconfirmed(cause)))
+                }
+            },
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SiblingPreparationPolicy {
+    Strict,
+    SaveLiveCustody,
+}
+
+/// Save-only directory durability, separate from live fresh custody and exact
+/// namespace removal. Later successful syncs do not erase an earlier warning
+/// without qualified proof. General sibling operations retain strict errors.
+#[derive(Debug)]
+#[must_use = "sibling directory durability must propagate to the final Save outcome"]
+pub(crate) enum SaveSiblingDurability {
+    Confirmed,
+    Unconfirmed(io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,19 +339,51 @@ impl OwnedPrivateSibling {
             .path
             .join(self.quarantined.as_ref().unwrap_or(&self.name))
     }
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
     pub(crate) fn cleanup_empty(&mut self) -> io::Result<()> {
         self.cleanup_with_hooks(|| {}, sync_directory)
+    }
+    /// Save may retire positively removed sibling custody with a durability
+    /// warning. All namespace/quarantine/identity/nonempty failures stay errors.
+    pub(crate) fn cleanup_save_empty(&mut self) -> io::Result<SaveSiblingDurability> {
+        self.cleanup_save_with_hooks(|| {}, sync_directory)
+    }
+    fn cleanup_save_with_hooks(
+        &mut self,
+        after_acquire: impl FnOnce(),
+        sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    ) -> io::Result<SaveSiblingDurability> {
+        self.remove_empty_with_hook(after_acquire)?;
+        // The removal phase succeeded; only this explicit final sync phase
+        // can become Unconfirmed. No matching of arbitrary cleanup errors.
+        debug_assert!(self.removed);
+        Ok(match self.confirm_removed_parent(sync_parent) {
+            Ok(()) => SaveSiblingDurability::Confirmed,
+            Err(error) => SaveSiblingDurability::Unconfirmed(error),
+        })
     }
     fn cleanup_with_hooks(
         &mut self,
         after_acquire: impl FnOnce(),
         sync_parent: impl FnOnce(&Root) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.remove_empty_with_hook(after_acquire)?;
+        self.confirm_removed_parent(sync_parent)
+    }
+    fn confirm_removed_parent(
+        &mut self,
+        sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if !self.synced {
+            sync_parent(&self.parent.directory)?;
+            self.synced = true;
+        }
+        Ok(())
+    }
+    fn remove_empty_with_hook(&mut self, after_acquire: impl FnOnce()) -> io::Result<()> {
         if self.removed {
-            if !self.synced {
-                sync_parent(&self.parent.directory)?;
-                self.synced = true;
-            }
             return Ok(());
         }
         self.acquire_original()?;
@@ -333,8 +427,6 @@ impl OwnedPrivateSibling {
         }
         self.quarantined = None;
         self.removed = true;
-        sync_parent(&self.parent.directory)?;
-        self.synced = true;
         Ok(())
     }
 }
@@ -1405,6 +1497,185 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sibling_directory_confirmation_is_strict_generally_and_typed_for_save() {
+        for failure_on in [1, 2] {
+            for policy in [
+                SiblingPreparationPolicy::Strict,
+                SiblingPreparationPolicy::SaveLiveCustody,
+            ] {
+                let (_fixture, parent) = sticky_fixture();
+                let mut calls = 0;
+                let result = parent.create_named_using(
+                    temporary_name().unwrap(),
+                    |_, _| Ok(()),
+                    policy,
+                    |_| {
+                        calls += 1;
+                        if calls == failure_on {
+                            Err(io::Error::other("injected sibling directory sync failure"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                match policy {
+                    SiblingPreparationPolicy::Strict => {
+                        let PrivateSiblingCreateError::Retained { mut sibling, .. } =
+                            result.unwrap_err()
+                        else {
+                            panic!("strict directory-sync failure must retain original sibling");
+                        };
+                        assert_eq!(calls, failure_on);
+                        sibling.validate().unwrap();
+                        sibling.cleanup_empty().unwrap();
+                        assert!(sibling.is_resolved());
+                    }
+                    SiblingPreparationPolicy::SaveLiveCustody => {
+                        let (mut sibling, durability) = result.unwrap();
+                        assert_eq!(calls, 2, "Save observes both directory confirmations");
+                        sibling.validate().unwrap();
+                        assert!(
+                            matches!(&durability, SaveSiblingDurability::Unconfirmed(error)
+                            if error.to_string() == "injected sibling directory sync failure")
+                        );
+                        sync_directory(sibling.directory().unwrap()).unwrap();
+                        sync_directory(&sibling.parent.directory).unwrap();
+                        assert!(
+                            matches!(durability, SaveSiblingDurability::Unconfirmed(_)),
+                            "later sync success does not rewrite preparation proof"
+                        );
+                        assert!(matches!(
+                            sibling.cleanup_save_empty().unwrap(),
+                            SaveSiblingDurability::Confirmed
+                        ));
+                        assert!(sibling.is_removed());
+                        assert!(sibling.is_resolved());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn save_sibling_incomplete_acquisition_and_foreign_entry_failures_remain_retained() {
+        let (_fixture, parent) = sticky_fixture();
+        let error = parent
+            .create_named_using(
+                temporary_name().unwrap(),
+                |_, _| Err(io::Error::other("initial acquisition unavailable")),
+                SiblingPreparationPolicy::SaveLiveCustody,
+                |_| panic!("incomplete fresh qualification cannot become a sync warning"),
+            )
+            .unwrap_err();
+        let PrivateSiblingCreateError::Retained { mut sibling, .. } = error else {
+            panic!("post-mkdir failure must retain original custody");
+        };
+        assert_eq!(sibling.retained_descriptor_count(), 1);
+        assert!(matches!(
+            sibling.cleanup_save_empty().unwrap(),
+            SaveSiblingDurability::Confirmed
+        ));
+        assert!(sibling.is_removed());
+
+        let (_fixture, parent) = sticky_fixture();
+        let error = parent
+            .create_named_using(
+                temporary_name().unwrap(),
+                |parent, name| {
+                    std::fs::remove_dir(parent.path.join(name)).unwrap();
+                    std::os::unix::fs::symlink("foreign-target", parent.path.join(name)).unwrap();
+                    Ok(())
+                },
+                SiblingPreparationPolicy::SaveLiveCustody,
+                |_| panic!("foreign entry cannot become a sync warning"),
+            )
+            .unwrap_err();
+        let PrivateSiblingCreateError::Retained { mut sibling, .. } = error else {
+            panic!("foreign entry must retain original custody for explicit resolution");
+        };
+        assert!(sibling.cleanup_save_empty().is_err());
+        assert!(!sibling.is_removed());
+        assert!(
+            std::fs::symlink_metadata(sibling.diagnostic_path())
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn save_sibling_cleanup_softens_only_sync_after_positive_removal() {
+        let (_fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let original = sibling.diagnostic_path();
+        let durability = sibling
+            .cleanup_save_with_hooks(
+                || {},
+                |_| Err(io::Error::other("removed sibling parent sync unavailable")),
+            )
+            .unwrap();
+        assert!(matches!(durability, SaveSiblingDurability::Unconfirmed(_)));
+        assert!(sibling.is_removed());
+        assert!(
+            !sibling.is_resolved(),
+            "strict resolution still requires parent sync"
+        );
+        assert!(!original.exists());
+        std::fs::create_dir(&original).unwrap();
+        assert!(matches!(
+            sibling.cleanup_save_empty().unwrap(),
+            SaveSiblingDurability::Confirmed
+        ));
+        assert!(sibling.is_resolved());
+        assert!(
+            original.is_dir(),
+            "sync-only retry must preserve new original-name entry"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn save_sibling_cleanup_never_softens_nonempty_or_replacement_errors() {
+        let (fixture, parent) = sticky_fixture();
+        let mut sibling = parent.create_private_sibling().unwrap();
+        let original = sibling.diagnostic_path();
+        std::fs::write(original.join("leaf"), b"preserve").unwrap();
+        assert!(
+            sibling
+                .cleanup_save_with_hooks(
+                    || {},
+                    |_| { panic!("nonempty removal must fail before parent sync") }
+                )
+                .is_err()
+        );
+        assert!(!sibling.is_removed());
+        assert_eq!(std::fs::read(original.join("leaf")).unwrap(), b"preserve");
+        std::fs::remove_file(original.join("leaf")).unwrap();
+        let moved = fixture.path().join("moved-original");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert!(
+            sibling
+                .cleanup_save_with_hooks(
+                    || {},
+                    |_| { panic!("replacement identity must fail before parent sync") }
+                )
+                .is_err()
+        );
+        assert!(!sibling.is_removed());
+        assert!(moved.is_dir());
+        assert!(original.is_dir());
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
+        assert!(matches!(
+            sibling.cleanup_save_empty().unwrap(),
+            SaveSiblingDurability::Confirmed
+        ));
     }
 
     #[test]

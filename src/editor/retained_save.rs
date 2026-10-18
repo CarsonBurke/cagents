@@ -76,23 +76,50 @@ pub(crate) fn finish_context(
         Err(error) => error.recovery_authority(),
     }
     .cloned();
-    let Some(authority) = context.finish(leaf) else {
+    let authority = context.finish(leaf);
+    let mut warnings = context.take_directory_warnings();
+    if authority.is_some() {
+        warnings.push(
+            "Private recovery parent cleanup remains pending; directory durability is unconfirmed"
+                .into(),
+        );
+    }
+    if warnings.is_empty() && authority.is_none() {
         return result;
-    };
+    }
+    let warning = warnings.join("; ");
     match result {
         Ok(mut outcome) => {
-            if let SaveOutcome::Saved { durability, .. } = &mut outcome.outcome {
-                *durability = super::SaveDurability::Unconfirmed {
-                    error: "Private recovery parent cleanup remains pending".into(),
-                };
+            if !warning.is_empty()
+                && let SaveOutcome::Saved { durability, .. } = &mut outcome.outcome
+            {
+                match durability {
+                    super::SaveDurability::Durable => {
+                        *durability = super::SaveDurability::Unconfirmed { error: warning }
+                    }
+                    super::SaveDurability::Unconfirmed { error } => {
+                        error.push_str("; ");
+                        error.push_str(&warning);
+                    }
+                }
             }
-            outcome.recovery = Some(authority);
+            if let Some(authority) = authority {
+                outcome.recovery = Some(authority);
+            }
             Ok(outcome)
         }
-        Err(error) => Err(RetainedSaveError::Recovery {
-            message: error.to_string(),
-            authority,
-        }),
+        Err(error) => {
+            let authority = authority.or_else(|| error.recovery_authority().cloned());
+            let message = if warning.is_empty() {
+                error.to_string()
+            } else {
+                format!("{error}; {warning}")
+            };
+            match authority {
+                Some(authority) => Err(RetainedSaveError::Recovery { message, authority }),
+                None => Err(RetainedSaveError::Io(message)),
+            }
+        }
     }
 }
 
@@ -382,9 +409,9 @@ struct Holding {
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
     slot: Option<RecoverySlot>,
-    // Removal and parent durability are distinct irreversible phases.
-    cleanup_sync_complete: bool,
-    source_sync_pending: bool,
+    // Directory durability is an observation, separate from live namespace
+    // and content custody. Only unresolved artifacts retain authority.
+    directory_warnings: Vec<String>,
 }
 impl Holding {
     fn create(
@@ -401,9 +428,19 @@ impl Holding {
         );
         let admission = context.reserve_directory().map_err(FileIoError::Io)?;
         let name = OsString::from(format!(".cagents-save-{}", uuid::Uuid::new_v4()));
-        let directory =
-            fs_safety::prepare_recovery_directory_with_owner(admission, &name, || false, owner)
-                .map_err(directory_error)?;
+        let (directory, preparation) = fs_safety::prepare_save_recovery_directory_with_owner(
+            admission,
+            &name,
+            || false,
+            owner,
+        )
+        .map_err(directory_error)?;
+        let directory_warnings = match preparation {
+            fs_safety::SavePreparationDurability::Confirmed => Vec::new(),
+            fs_safety::SavePreparationDurability::Unconfirmed(error) => vec![format!(
+                "private holding preparation durability unconfirmed: {error}"
+            )],
+        };
         let (publication, (parent, source), private_metadata, context, slot) =
             directory.into_parts();
         // The factory established actual owner-only700 on this retained inode
@@ -416,8 +453,7 @@ impl Holding {
             context,
             slot: Some(slot),
             files: vec![source],
-            cleanup_sync_complete: false,
-            source_sync_pending: false,
+            directory_warnings,
         })
     }
     fn root(&self) -> &Root {
@@ -490,8 +526,10 @@ impl Holding {
         } else {
             self.context.placement().validate().map_err(io_error)?;
         }
-        sync_cleanup_parent(self.context.placement().directory()).map_err(io_error)?;
-        self.cleanup_sync_complete = true;
+        if let Err(error) = sync_cleanup_parent(self.context.placement().directory()) {
+            self.directory_warnings
+                .push(format!("removed holding durability unconfirmed: {error}"));
+        }
         Ok(())
     }
     fn retain(mut self) -> RecoveryAuthority {
@@ -514,20 +552,20 @@ impl Holding {
             self.publication
                 .cleanup_empty()
                 .map_err(|error| error.to_string())?;
-        } else {
-            // A completed removal may have been followed by failed fsync.
-            // Its unlinked inode has no ancestry to walk; retry only the held
-            // outside/source parent sync, never any reconstructed path.
-            self.context
-                .placement()
-                .validate()
-                .map_err(|error| error.to_string())?;
         }
-        fs_safety::sync_directory(self.context.placement().directory())
-            .map_err(|e| e.to_string())?;
-        fs_safety::sync_directory(&self.parent).map_err(|e| e.to_string())?;
-        self.source_sync_pending = false;
-        self.cleanup_sync_complete = true;
+        // At this point the exact receipt has removed the holding and no
+        // namespace/content work remains. Failed directory sync is honest
+        // durability uncertainty, not perpetual live recovery authority.
+        if let Err(error) = fs_safety::sync_directory(self.context.placement().directory()) {
+            tracing::warn!(%error, "Save recovery namespace is removed but directory durability is unconfirmed");
+            self.directory_warnings
+                .push(format!("removed holding durability unconfirmed: {error}"));
+        }
+        if let Err(error) = fs_safety::sync_directory(&self.parent) {
+            tracing::warn!(%error, "Save recovery content is settled but source directory durability is unconfirmed");
+            self.directory_warnings
+                .push(format!("source directory durability unconfirmed: {error}"));
+        }
         Ok(())
     }
     fn location(&self) -> String {
@@ -552,6 +590,18 @@ fn sync_cleanup_parent(parent: &Root) -> io::Result<()> {
 #[cfg(test)]
 std::thread_local! {
     static FAIL_CLEANUP_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sync_acquired_directory(directory: &Root) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_ACQUIRED_DIRECTORY_SYNC.with(|flag| flag.replace(false)) {
+        return Err(io::Error::other("injected acquired directory sync failure"));
+    }
+    fs_safety::sync_directory(directory)
+}
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_ACQUIRED_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The replacement is prepared privately, then the actual current destination
@@ -610,10 +660,8 @@ fn publish_with_hooks(
         after_publish,
         sync_parent,
     );
-    if holding.publication.is_removed()
-        && holding.cleanup_sync_complete
-        && !holding.source_sync_pending
-    {
+    let result = with_directory_warnings(result, std::mem::take(&mut holding.directory_warnings));
+    if holding.publication.is_removed() {
         return result;
     }
     // Publication cleanup may have acquired an unexpected entry. Preserve the
@@ -796,7 +844,6 @@ fn publish_in_holding(
             resolve_error(error),
         ));
     }
-    holding.source_sync_pending = true;
     let acquired_identity = fs_safety::metadata_beneath(holding.root(), Path::new(previous));
     let verify: Result<(File, fs::Metadata), FileIoError> = (|| {
         acquired_identity
@@ -808,8 +855,14 @@ fn publish_in_holding(
         let acquired = holding.keep_file(acquired)?;
         baseline.verify(&acquired, true)?;
         let acquired_version = acquired.metadata().map_err(io_error)?;
-        // Sync the acquired directory entry before the replacement is exposed.
-        fs_safety::sync_directory(holding.root()).map_err(io_error)?;
+        // Directory confirmation affects crash durability, not the verified
+        // live acquisition. Keep regular-file sync and every identity fence
+        // strict while carrying this observation to the final Save warning.
+        if let Err(error) = sync_acquired_directory(holding.root()) {
+            holding.directory_warnings.push(format!(
+                "acquired original directory durability unconfirmed: {error}"
+            ));
+        }
         verify_temporary(
             holding,
             &temporary_name,
@@ -853,7 +906,7 @@ fn publish_in_holding(
                 Ok(()) => {
                     message.push_str("the acquired entry was restored without replacing newer work");
                     match fs_safety::sync_directory(parent) {
-                        Ok(()) => holding.source_sync_pending = false,
+                        Ok(()) => {},
                         Err(error) => message.push_str(&format!("; restoration durability unconfirmed: {error}")),
                     }
                     if let Err(error) = holding.remove_empty(parent) { message.push_str(&format!("; {error}")); }
@@ -899,7 +952,7 @@ fn publish_in_holding(
         tracing::warn!(path = %parent.path().join(name).display(), %attribute, "saved file did not receive one of its extended attributes");
     }
     match sync_parent(parent) {
-        Ok(()) => holding.source_sync_pending = false,
+        Ok(()) => {}
         Err(error) => warnings.push(format!("replacement durability unconfirmed: {error}")),
     }
     if warnings.is_empty() {
@@ -908,6 +961,33 @@ fn publish_in_holding(
         Ok(SaveDurability::Unconfirmed {
             error: warnings.join("; "),
         })
+    }
+}
+
+fn with_directory_warnings(
+    result: Result<SaveDurability, FileIoError>,
+    warnings: Vec<String>,
+) -> Result<SaveDurability, FileIoError> {
+    if warnings.is_empty() {
+        return result;
+    }
+    let warning = warnings.join("; ");
+    match result {
+        Ok(SaveDurability::Durable) => Ok(SaveDurability::Unconfirmed { error: warning }),
+        Ok(SaveDurability::Unconfirmed { error }) => Ok(SaveDurability::Unconfirmed {
+            error: format!("{error}; {warning}"),
+        }),
+        Ok(SaveDurability::Recovery { error, authority }) => Ok(SaveDurability::Recovery {
+            error: format!("{error}; {warning}"),
+            authority,
+        }),
+        Err(error) => {
+            let message = format!("{error}; {warning}");
+            match error.recovery_authority().cloned() {
+                Some(authority) => Err(FileIoError::Recovery { message, authority }),
+                None => Err(FileIoError::Io(message)),
+            }
+        }
     }
 }
 
@@ -988,6 +1068,62 @@ mod tests {
         let root = Root::open(directory.path()).unwrap();
         (directory, root)
     }
+    #[test]
+    fn acquired_directory_sync_failure_still_publishes_with_explicit_warning() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_ACQUIRED_DIRECTORY_SYNC.with(|flag| flag.set(false));
+            }
+        }
+        let (directory, root) = fixture();
+        let context = fixture_context(&root).unwrap();
+        FAIL_ACQUIRED_DIRECTORY_SYNC.with(|flag| flag.set(true));
+        let _reset = Reset;
+        let result = save_file_at(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+        )
+        .unwrap();
+        assert!(!FAIL_ACQUIRED_DIRECTORY_SYNC.with(|flag| flag.get()));
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
+        assert!(result.recovery_authority().is_none());
+        assert!(matches!(result.outcome(), SaveOutcome::Saved {
+            durability: super::super::SaveDurability::Unconfirmed { error }, ..
+        } if error.contains("acquired original directory durability unconfirmed")));
+    }
+
+    #[test]
+    fn preparation_directory_warning_survives_a_complete_real_save() {
+        let (directory, root) = fixture();
+        let context = fixture_context(&root).unwrap();
+        let _fault = fs_safety::fixture_fail_next_save_preparation_sync();
+        let result = save_file_at(
+            &root,
+            Path::new("file"),
+            "mine",
+            blake3::hash(b"base"),
+            false,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
+        assert!(result.recovery_authority().is_none());
+        assert!(matches!(result.outcome(), SaveOutcome::Saved {
+            durability: super::super::SaveDurability::Unconfirmed { error }, ..
+        } if error.contains("private holding preparation durability unconfirmed")));
+        assert!(
+            fs::read_dir(context.placement().directory().path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
     #[test]
     fn forced_save_refuses_an_oversized_current_target_before_publication() {
         let (directory, root) = fixture();
@@ -1212,7 +1348,7 @@ mod tests {
         );
     }
     #[test]
-    fn removed_holding_sync_failure_keeps_original_owner_in_both_outer_results() {
+    fn removed_holding_sync_failure_warns_without_false_live_authority_in_both_results() {
         for committed in [false, true] {
             let (directory, root) = fixture();
             let released = Arc::new(AtomicBool::new(false));
@@ -1236,18 +1372,26 @@ mod tests {
                 },
                 fs_safety::sync_directory,
             );
-            let authority = match result {
-                Ok(result) if committed => result.recovery_authority().unwrap().clone(),
-                Err(error) if !committed => error.recovery_authority().unwrap().clone(),
+            match result {
+                Ok(result) if committed => {
+                    assert!(result.recovery_authority().is_none());
+                    assert!(
+                        matches!(result.outcome(), SaveOutcome::Saved { durability: super::super::SaveDurability::Unconfirmed { error }, .. } if error.contains("removed holding durability unconfirmed"))
+                    );
+                }
+                Err(error) if !committed => {
+                    assert!(error.recovery_authority().is_none());
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("removed holding durability unconfirmed")
+                    );
+                }
                 other => panic!("whole outer typed result required: {other:?}"),
-            };
+            }
             assert!(!FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.get()));
             assert!(fs::read_dir(&outside).unwrap().next().is_none());
             drop(context);
-            assert!(!released.load(Ordering::Acquire));
-            assert!(!authority.is_resolved());
-            authority.retry().unwrap();
-            assert!(authority.is_resolved());
             assert!(released.load(Ordering::Acquire));
             assert_eq!(
                 fs::read(directory.path().join("file")).unwrap(),
@@ -1260,7 +1404,7 @@ mod tests {
         }
     }
     #[test]
-    fn source_parent_sync_failure_retains_original_cleanup_until_actual_retry() {
+    fn source_parent_sync_failure_is_saved_unconfirmed_without_live_artifacts() {
         let (directory, root) = fixture();
         let released = Arc::new(AtomicBool::new(false));
         let context = fixture_context_with_guard(&root, Closed(released.clone())).unwrap();
@@ -1276,9 +1420,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(directory.path().join("file")).unwrap(), b"mine");
-        let authority = result
-            .recovery_authority()
-            .expect("original source parent is still unsynced");
+        assert!(result.recovery_authority().is_none());
+        assert!(
+            matches!(result.outcome(), SaveOutcome::Saved { durability: super::super::SaveDurability::Unconfirmed { error }, .. } if error.contains("source parent sync refused"))
+        );
         assert!(
             fs::read_dir(context.placement().directory().path())
                 .unwrap()
@@ -1286,9 +1431,6 @@ mod tests {
                 .is_none()
         );
         drop(context);
-        assert!(!released.load(Ordering::Acquire));
-        authority.retry().unwrap();
-        assert!(authority.is_resolved());
         assert!(released.load(Ordering::Acquire));
     }
     #[test]
@@ -1299,18 +1441,32 @@ mod tests {
         let (directory, root) = fixture();
         fs::set_permissions(directory.path().join("file"), Permissions::from_mode(0o700)).unwrap();
         let context = fixture_context(&root).unwrap();
-        FAIL_CLEANUP_PARENT_SYNC.with(|flag| flag.set(true));
-        let _reset = ResetSync;
-        let result = save_file_at(
+        let destination = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let baseline = SaveBaseline::capture(&destination, Some(blake3::hash(b"base"))).unwrap();
+        let extra = std::cell::RefCell::new(None);
+        let result = publish_with_hooks(
             &root,
             Path::new("file"),
-            "#!/bin/sh\nprintf retained-save",
-            blake3::hash(b"base"),
-            false,
+            &destination,
+            b"#!/bin/sh\nprintf retained-save",
+            Permissions::from_mode(0o700),
+            &baseline,
             &context,
+            || Ok(()),
+            |_, _| Ok(()),
+            |_, holding| {
+                let (file, name) =
+                    fs_safety::create_temporary_in(holding, 0o600).map_err(io::Error::other)?;
+                *extra.borrow_mut() = Some((holding.try_clone()?, name, file));
+                Ok(())
+            },
+            fs_safety::sync_directory,
         )
         .unwrap();
-        let authority = result.recovery_authority().expect("real pending sync");
+        let authority = match result {
+            SaveDurability::Recovery { authority, .. } => authority,
+            other => panic!("an actual unknown private entry retains custody: {other:?}"),
+        };
         let output = SystemProcessExecutor
             .execute(
                 &CommandSpec::new(directory.path().join("file"))
@@ -1325,6 +1481,11 @@ mod tests {
         );
         assert_eq!(output.stdout, b"retained-save");
         assert!(!authority.is_resolved());
+        assert!(authority.retry().is_err());
+        let (holding, name, file) = extra.into_inner().unwrap();
+        drop(file);
+        fs_safety::unlink_within(&holding, &name).unwrap();
         authority.retry().unwrap();
+        assert!(authority.is_resolved());
     }
 }

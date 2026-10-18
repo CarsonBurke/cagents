@@ -120,11 +120,28 @@ impl std::error::Error for RecoveryAcquireError {}
 #[derive(Default)]
 struct BootstrapOwner {
     sibling: Option<OwnedPrivateSibling>,
+    save_live: bool,
+    directory_warnings: Vec<String>,
 }
 impl BootstrapOwner {
     fn cleanup(&mut self) -> Result<(), String> {
         if let Some(sibling) = &mut self.sibling {
-            sibling.cleanup_empty().map_err(|error| error.to_string())?;
+            if self.save_live {
+                match sibling
+                    .cleanup_save_empty()
+                    .map_err(|error| error.to_string())?
+                {
+                    crate::fs_safety::SaveSiblingDurability::Confirmed => {}
+                    crate::fs_safety::SaveSiblingDurability::Unconfirmed(error) => {
+                        tracing::warn!(%error, "Save private sibling is removed but directory durability is unconfirmed");
+                        self.directory_warnings.push(format!(
+                            "removed private sibling durability unconfirmed: {error}"
+                        ))
+                    }
+                }
+            } else {
+                sibling.cleanup_empty().map_err(|error| error.to_string())?;
+            }
         }
         Ok(())
     }
@@ -309,7 +326,11 @@ impl FilesystemRecoveryContext {
         if let Some(target) = &target {
             target.validate()?;
         }
-        let owner = Arc::new(Mutex::new(BootstrapOwner::default()));
+        let save_live = policy.target().is_some();
+        let owner = Arc::new(Mutex::new(BootstrapOwner {
+            save_live,
+            ..BootstrapOwner::default()
+        }));
         let mut descriptors = std::collections::HashSet::from([source.descriptor()]);
         descriptors.extend(excluded.iter().map(|root| root.descriptor()));
         // Reserve capacity BEFORE mkdir: one sticky-parent handle and at most
@@ -342,8 +363,16 @@ impl FilesystemRecoveryContext {
             message,
             authority: None,
         })?;
-        let sibling = match sticky.clone().create_private_sibling() {
-            Ok(sibling) => sibling,
+        let creation = if save_live {
+            sticky.clone().create_save_private_sibling()
+        } else {
+            sticky
+                .clone()
+                .create_private_sibling()
+                .map(|sibling| (sibling, crate::fs_safety::SaveSiblingDurability::Confirmed))
+        };
+        let (sibling, durability) = match creation {
+            Ok(created) => created,
             Err(PrivateSiblingCreateError::Rejected(error)) => return Err(error.into()),
             Err(PrivateSiblingCreateError::Retained { cause, sibling }) => {
                 owner
@@ -366,6 +395,15 @@ impl FilesystemRecoveryContext {
                 });
             }
         };
+        if let crate::fs_safety::SaveSiblingDurability::Unconfirmed(error) = durability {
+            owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .directory_warnings
+                .push(format!(
+                    "private sibling preparation durability unconfirmed: {error}"
+                ));
+        }
         let placement = match policy {
             BootstrapPlacement::Outside(target) => sibling
                 .directory_arc()
@@ -409,6 +447,20 @@ impl FilesystemRecoveryContext {
         self.bootstrap
             .as_ref()
             .and_then(|cleanup| Self::finish_bootstrap(cleanup, leaf))
+    }
+    pub(crate) fn take_directory_warnings(&self) -> Vec<String> {
+        let Some(cleanup) = &self.bootstrap else {
+            return Vec::new();
+        };
+        let owner = cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner
+            .clone();
+        let mut owner = owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut owner.directory_warnings)
     }
     fn finish_bootstrap(
         cleanup: &Arc<Mutex<BootstrapCleanup>>,

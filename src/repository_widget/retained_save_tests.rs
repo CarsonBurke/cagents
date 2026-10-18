@@ -182,6 +182,19 @@ async fn runtime_save_completion_keeps_newer_buffer_dirty_and_records_written_sn
         panic!("editable document")
     };
     assert_eq!(document.saved_text, submitted);
+    // The retained read/root association must remain usable after the first
+    // atomic replacement, and its refreshed disk hash must admit the next Save.
+    let second = runtime.request_save(card, false);
+    assert!(runtime.is_saving());
+    finish(&mut runtime, second).await;
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
+        newer
+    );
+    assert_eq!(runtime.editor_text().unwrap(), newer);
+    assert!(!runtime.is_dirty());
+    assert!(runtime.save_error().is_none());
+    assert!(!custody.lock().unwrap().is_pending());
 }
 
 #[tokio::test]
@@ -491,4 +504,52 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
     }
     drop(runtime.reconcile_operation_recovery(card));
     assert!(!custody.lock().unwrap().is_pending());
+}
+
+#[tokio::test]
+async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline",
+    ) {
+        return;
+    }
+    let directory = Checkout::new();
+    std::fs::write(directory.path().join("file.txt"), "baseline").unwrap();
+    let (mut runtime, card, _) = loaded(directory.path()).await;
+    runtime.set_auto_save(false);
+    // This reducer contract starts with an independently unconfirmed Save
+    // durability observation. Cleanup completion alone cannot replace it.
+    let slot = crate::recovery_authority::RecoverySlot::reserve().unwrap();
+    let artifact = directory.path().join("owned-cleanup-fixture");
+    std::fs::write(&artifact, b"owned fixture").unwrap();
+    let removed = artifact.clone();
+    let authority = slot.retain("owning cleanup fixture".into(), move || {
+        std::fs::remove_file(&removed).map_err(|error| error.to_string())
+    });
+    let DocumentState::Editable(document) = &mut runtime.document else {
+        panic!("editable");
+    };
+    document.durability_warning = Some("Earlier directory durability was not confirmed".into());
+    document.cleanup_recovery = Some(authority.clone());
+    authority.retry().unwrap();
+    assert!(!artifact.exists());
+    drop(runtime.reconcile_operation_recovery(card));
+    assert!(runtime.has_durability_warning());
+    assert!(runtime.blocks_navigation());
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("editable");
+    };
+    assert!(document.cleanup_recovery.is_none());
+    // A real subsequent Save, including regular-file and directory sync,
+    // owns the transition back to a qualified baseline.
+    let retry = runtime.request_save(card, false);
+    assert!(runtime.is_saving());
+    finish(&mut runtime, retry).await;
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("file.txt")).unwrap(),
+        "baseline"
+    );
+    assert!(!runtime.has_durability_warning());
+    assert!(!runtime.is_dirty());
+    assert!(runtime.save_error().is_none());
 }

@@ -144,9 +144,52 @@ pub(super) struct SaveLocalPlacement {
     additional_descriptors: usize,
 }
 impl SaveLocalPlacement {
-    /// Protected actual edited-parent placement. There is no arbitrary Root
-    /// parameter and no mount-root eligibility/fallback policy.
+    /// Prefer the nearest readable protected holding on the actual file's
+    /// mount. Effective access is an observation for preference only: when no
+    /// such ancestor exists, an exact protected edited parent remains valid.
     pub(super) fn acquire(target: Arc<SaveTargetAuthority>) -> io::Result<Arc<Self>> {
+        Self::acquire_with_readability(target, readable_holding)
+    }
+    fn acquire_with_readability(
+        target: Arc<SaveTargetAuthority>,
+        readable: impl Fn(&Root) -> bool,
+    ) -> io::Result<Arc<Self>> {
+        target.validate()?;
+        if readable(&target.parent)
+            && let Ok(placement) = Self::from_parts(target.clone(), target.parent.clone(), None)
+        {
+            return Ok(placement);
+        }
+        // Even an unqualified edited parent may have a protected ancestor.
+        // Every step is through the original held directory; pathname lookup
+        // cannot redirect the holding, and the file's mount is never crossed.
+        let mut cursor = target.parent.clone();
+        for _ in 0..MAX_ANCESTORS {
+            let Ok(parent) = retained_parent_directory(&cursor) else {
+                break;
+            };
+            let Ok(stamp) = recovery_directory_stamp(&parent) else {
+                break;
+            };
+            let Ok(current) = recovery_directory_stamp(&cursor) else {
+                break;
+            };
+            if stamp == current
+                || stamp.device != target.parent_stamp.device
+                || stamp.mount_id != target.parent_stamp.mount_id
+            {
+                break;
+            }
+            cursor = Arc::new(parent);
+            if readable(&cursor)
+                && let Ok(placement) = Self::from_parts(target.clone(), cursor.clone(), None)
+            {
+                return Ok(placement);
+            }
+        }
+        // Do not retain an unused fallback namespace while inspecting higher
+        // candidates. Requalify the original exact parent when it is needed.
+        drop(cursor);
         Self::from_parts(target.clone(), target.parent.clone(), None)
     }
     /// Only a validated fresh typed sibling receipt can supply this directory.
@@ -220,10 +263,10 @@ impl SaveLocalPlacement {
                     "Original private Save sibling moved away from its edited parent",
                 ));
             }
-        } else if self.stamp != self.target.parent_stamp {
-            return Err(refused(
-                "Protected Save placement is not the original edited parent",
-            ));
+        } else {
+            // The original edited parent must still reach the SAME held
+            // anchor on the SAME actual mount before every effect or retry.
+            validate_local_ancestry(&self.target.parent, self.stamp)?;
         }
         // Keep original namespace authority while checking current private
         // owner/mode/ACL policy. Safe protected parents need not have mode0700.
@@ -239,13 +282,36 @@ impl SaveLocalPlacement {
         validate_local_ancestry(payload, self.stamp)
     }
     /// ONLY additional native handles beyond target.retained_descriptor_count:
-    /// namespace clone, fresh child if any, and a separately held sticky-parent
-    /// FD if it does not alias a target Root. Never recount the target lease.
+    /// namespace clone, held ancestor or fresh child if any, and a separately
+    /// held sticky-parent FD if it does not alias a target Root. Never recount
+    /// the target lease.
     /// Revalidation needs at most three temporary FDs (resolver/ancestry plus
     /// metadata clone); callers must reserve that capacity before effects.
     pub(super) fn retained_descriptor_count(&self) -> usize {
         self.additional_descriptors
     }
+}
+
+/// Retained-FD permission observation, including effective credentials,
+/// supplementary groups and ACLs. A failure only declines preference; it is
+/// never a promise about later readability or an eligibility gate for Save.
+#[cfg(target_os = "linux")]
+fn readable_holding(directory: &Root) -> bool {
+    // SAFETY: Root retains the FD and the empty C string is live. AT_EMPTY_PATH
+    // selects that inode; AT_EACCESS selects the worker's effective IDs.
+    unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            directory.descriptor(),
+            c"".as_ptr(),
+            libc::R_OK | libc::W_OK | libc::X_OK,
+            libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+        ) == 0
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn readable_holding(_directory: &Root) -> bool {
+    false
 }
 
 fn count_additional_descriptors(
@@ -355,6 +421,114 @@ mod tests {
     }
 
     #[test]
+    fn injected_readability_prefers_nearest_protected_actual_mount_ancestor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("near/edited")).unwrap();
+        let source = Arc::new(Root::open(fixture.path()).unwrap());
+        let target = target(source, Path::new("near/edited/file"), runtime.path());
+        let nearest = Root::open(&fixture.path().join("near")).unwrap();
+        let nearest_stamp = recovery_directory_stamp(&nearest).unwrap();
+        // The injected observation isolates preference from the test runner's
+        // UID/capabilities. Namespace qualification and ancestry remain real.
+        let placement = SaveLocalPlacement::acquire_with_readability(target.clone(), |root| {
+            recovery_directory_stamp(root).unwrap() != target.parent_stamp
+        })
+        .unwrap();
+        assert_eq!(
+            recovery_directory_stamp(placement.directory()).unwrap(),
+            nearest_stamp
+        );
+        assert_eq!(
+            placement.retained_descriptor_count(),
+            2,
+            "ancestor and namespace clone"
+        );
+        placement.validate().unwrap();
+        placement.validate_payload_root(target.parent()).unwrap();
+    }
+
+    #[test]
+    fn injected_unreadable_observation_keeps_exact_protected_parent_eligible() {
+        let fixture = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir(fixture.path().join("edited")).unwrap();
+        let target = target(
+            Arc::new(Root::open(fixture.path()).unwrap()),
+            Path::new("edited/file"),
+            runtime.path(),
+        );
+        let placement =
+            SaveLocalPlacement::acquire_with_readability(target.clone(), |_| false).unwrap();
+        assert_eq!(
+            placement.directory().descriptor(),
+            target.parent().descriptor()
+        );
+        assert_eq!(placement.retained_descriptor_count(), 1);
+        placement.validate().unwrap();
+        assert_eq!(
+            fs::read_dir(fixture.path().join("edited")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn qualified_ancestor_is_considered_after_unqualified_actual_parent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir(fixture.path().join("edited")).unwrap();
+        fs::set_permissions(
+            fixture.path().join("edited"),
+            fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let source = Arc::new(Root::open(fixture.path()).unwrap());
+        let source_stamp = recovery_directory_stamp(&source).unwrap();
+        let target = target(source, Path::new("edited/file"), runtime.path());
+        assert!(DirectoryNamespace::acquire(target.parent()).is_err());
+        let placement =
+            SaveLocalPlacement::acquire_with_readability(target.clone(), |_| true).unwrap();
+        assert_eq!(
+            recovery_directory_stamp(placement.directory()).unwrap(),
+            source_stamp
+        );
+        placement.validate().unwrap();
+        // With no readable qualified ancestor, the unqualified parent is not
+        // promoted to authority; the context can consider sticky bootstrap.
+        assert!(SaveLocalPlacement::acquire_with_readability(target, |_| false).is_err());
+    }
+
+    #[test]
+    fn moved_actual_parent_cannot_keep_an_original_ancestor_holding() {
+        let fixture = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("anchor/edited")).unwrap();
+        fs::create_dir(fixture.path().join("outside")).unwrap();
+        let source = Arc::new(Root::open(fixture.path()).unwrap());
+        let target = target(source, Path::new("anchor/edited/file"), runtime.path());
+        let anchor = Root::open(&fixture.path().join("anchor")).unwrap();
+        let anchor_stamp = recovery_directory_stamp(&anchor).unwrap();
+        let placement = SaveLocalPlacement::acquire_with_readability(target.clone(), |root| {
+            recovery_directory_stamp(root).unwrap() == anchor_stamp
+        })
+        .unwrap();
+        fs::rename(
+            fixture.path().join("anchor/edited"),
+            fixture.path().join("outside/moved"),
+        )
+        .unwrap();
+        fs::create_dir(fixture.path().join("anchor/edited")).unwrap();
+        fs::write(fixture.path().join("anchor/edited/foreign"), b"preserve").unwrap();
+        assert!(validate_local_ancestry(target.parent(), anchor_stamp).is_err());
+        assert!(placement.validate().is_err());
+        assert_eq!(
+            fs::read(fixture.path().join("anchor/edited/foreign")).unwrap(),
+            b"preserve"
+        );
+        assert!(fixture.path().join("outside/moved").is_dir());
+    }
+
+    #[test]
     fn named_source_and_relative_parent_replacements_cannot_retarget_authority() {
         let fixture = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
@@ -412,7 +586,7 @@ mod tests {
         fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o1777)).unwrap();
         let source = Arc::new(Root::open(fixture.path()).unwrap());
         let target = target(source, Path::new("file"), runtime.path());
-        assert!(SaveLocalPlacement::acquire(target.clone()).is_err());
+        assert!(SaveLocalPlacement::acquire_with_readability(target.clone(), |_| false).is_err());
         let sticky = StickyParent::acquire(target.parent().clone()).unwrap();
         let mut sibling = sticky.clone().create_private_sibling().unwrap();
         let placement = SaveLocalPlacement::from_sibling(target.clone(), &sibling, sticky).unwrap();
