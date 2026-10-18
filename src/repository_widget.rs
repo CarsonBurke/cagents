@@ -5208,6 +5208,11 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
+        // Save is an editing boundary even when the current bytes are already
+        // saved, or a background write currently prevents starting a new one.
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.history.seal();
+        }
         self.request_save_inner(card, overwrite, SaveTrigger::Explicit)
     }
 
@@ -5249,11 +5254,8 @@ impl RepositoryRuntime {
         };
         if let DocumentState::Editable(document) = &mut self.document {
             // Background persistence is not a new editing gesture. Its
-            // 800 ms debounce can expire while the one-second typing group
-            // is still open; only an explicit Save ends that group.
-            if trigger == SaveTrigger::Explicit {
-                document.history.seal();
-            }
+            // 800 ms debounce can expire inside a one-second typing group;
+            // explicit Save seals that group at its public entry point.
             document.active_save = Some(ticket.clone());
             document.error = None;
         }
@@ -14116,6 +14118,61 @@ mod tests {
             drop(runtime.update(RepositoryAction::Redo { card }));
             assert_eq!(buffer_text(&runtime), changed);
             assert!(runtime.is_dirty());
+        }
+    }
+
+    #[test]
+    fn explicit_save_seals_typing_when_autosave_is_clean_or_in_flight() {
+        for complete_before_explicit_save in [true, false] {
+            let card = CardId::new();
+            let (mut runtime, identity) = RepositoryRuntime::lsp_open_fixture(card, "target\n");
+            let now = Instant::now();
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 6 },
+                selection: Some(text_editor::Position { line: 0, column: 0 }),
+            });
+            document.history_time = Some(now);
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('c')),
+            }));
+            drop(runtime.auto_save_task(card));
+            drop(runtime.update(RepositoryAction::AutoSaveDue {
+                identity,
+                revision: document_revision(&runtime),
+                ticket: runtime.next_auto_save_ticket,
+            }));
+            assert!(runtime.is_saving());
+            let completion = runtime.durable_active_save_completion();
+            if complete_before_explicit_save {
+                drop(runtime.update(completion.clone()));
+                assert!(!runtime.is_dirty());
+            }
+            // The explicit gesture cannot start another write in either
+            // state, but must still separate the user's next typing group.
+            let task = runtime.update(RepositoryAction::Save { card, overwrite: false });
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            if !complete_before_explicit_save {
+                drop(runtime.update(completion));
+            }
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.history_time = Some(now + Duration::from_millis(900));
+            for character in "hanged".chars() {
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+                }));
+            }
+            assert_eq!(buffer_text(&runtime), "changed\n");
+            assert!(runtime.is_dirty());
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(buffer_text(&runtime), "c\n");
+            assert!(!runtime.is_dirty());
         }
     }
 
