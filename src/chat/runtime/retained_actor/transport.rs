@@ -391,6 +391,15 @@ impl RemoteActor {
         }))
     }
     #[cfg(test)]
+    pub(in crate::chat::runtime) fn distinct_attachment_fixture(&self) -> Self {
+        let mut other = Self::fixture();
+        let remote = Arc::get_mut(&mut other.0).unwrap();
+        remote.identity = self.identity();
+        remote.proof = self.0.proof.clone();
+        remote.source = self.0.source.clone();
+        other
+    }
+    #[cfg(test)]
     pub(in crate::chat::runtime) fn completed_failure_fixture() -> Self {
         let actor = Self::fixture();
         {
@@ -454,6 +463,55 @@ impl RemoteActor {
     }
     pub fn identity(&self) -> ActorIdentity {
         self.0.identity.clone()
+    }
+    pub fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    /// Unlike snapshots, resolution always authenticates this live epoch.
+    pub fn resolve_source(&self, source: &chat::Session) -> Result<chat::Session, String> {
+        self.resolve_source_until(source, Instant::now() + TIMEOUT)
+    }
+    fn resolve_source_until(
+        &self,
+        source: &chat::Session,
+        deadline: Instant,
+    ) -> Result<chat::Session, String> {
+        if self.0.close_only {
+            return Err(close_only_refusal());
+        }
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "resolve_source".into(),
+                args: json!([source]),
+            },
+            deadline,
+        )?;
+        let resolved: Result<chat::Session, String> =
+            deadline_io::receive_until(&control, deadline)?;
+        let resolved = resolved?;
+        if resolved.id != self.0.identity.record.terminal
+            || resolved.proof.as_ref() != Some(&self.0.proof)
+            || resolved.launch.provider != crate::agent::Provider::Claude
+            || resolved.launch.recipe != self.0.source.launch.recipe
+            || resolved.owned_codex_listener.is_some()
+            || !matches!(
+                resolved.native_continuity,
+                chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+            )
+            || !resolved.has_valid_native_continuity()
+        {
+            return Err(
+                "Retained source resolution changed its exact actor or issued account/recipe"
+                    .into(),
+            );
+        }
+        Ok(resolved)
     }
     pub fn owns_work(&self) -> bool {
         !self.0.preserved.load(Ordering::Acquire) && self.state().owns_work
@@ -2045,6 +2103,26 @@ impl Server {
             | "exit_output" => {
                 Err("This retained actor protocol does not support this optional operation".into())
             }
+            "resolve_source" => {
+                if !self.installed
+                    || self.session_stopping
+                    || self.closed_snapshot.is_some()
+                    || self.actor.is_completed()
+                {
+                    return Err("This retained actor is not a live installed attachment".into());
+                }
+                let (source,) = decode!((chat::Session,));
+                if source != self.source && !self.published_sources().contains(&source) {
+                    return Err(
+                        "Retained source resolution requires an exact issued descriptor".into(),
+                    );
+                }
+                value!(published_source(
+                    &self.source,
+                    self.actor.confirmed_session_id().as_deref(),
+                    &chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+                ))
+            }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
                 let (after,) = decode!((u64,));
@@ -3350,6 +3428,154 @@ mod tests {
         assert!(!original.0.stop.load(Ordering::Acquire));
         assert!(identity.record.root.is_current());
         assert!(original.pending_inputs().is_empty());
+    }
+    #[test]
+    fn source_resolution_checks_issued_membership_before_returning_current_thread() {
+        let mut fixture = resident_fixture();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        fixture.server.source.launch.session_id = Some(a.into());
+        let issued = fixture.server.source.clone();
+        *fixture.server.actor.0.confirmed_session.lock().unwrap() = Some(b.into());
+        let invoke = |server: &mut Server, source: &chat::Session| {
+            server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: "resolve_source".into(),
+                args: json!([source]),
+            })
+        };
+        let resolved: chat::Session =
+            serde_json::from_value(invoke(&mut fixture.server, &issued).unwrap()).unwrap();
+        assert_eq!(resolved.launch.session_id.as_deref(), Some(b));
+        assert_eq!(resolved.launch.recipe, issued.launch.recipe);
+        assert_eq!(resolved.proof, issued.proof);
+        assert!(matches!(
+            resolved.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL }
+        ));
+        // A current projection is accepted too, without changing the issued
+        // source or turning ordinary Ready/idle completion into process death.
+        assert!(invoke(&mut fixture.server, &resolved).is_ok());
+        for change in ["account", "cwd", "uuid", "erased", "proof", "listener"] {
+            let mut foreign = issued.clone();
+            match change {
+                "account" => {
+                    foreign
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/foreign/account".into());
+                }
+                "cwd" => foreign.launch.recipe.working_directory = "/foreign/project".into(),
+                "uuid" => {
+                    foreign.launch.session_id = Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".into())
+                }
+                "erased" => foreign.launch.session_id = None,
+                "proof" => {
+                    foreign.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("foreign")
+                }
+                "listener" => {
+                    foreign.owned_codex_listener = Some(chat::OwnedCodexListener {
+                        socket: "/foreign/codex.sock".into(),
+                        allocator: foreign.proof.clone().unwrap(),
+                    })
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                invoke(&mut fixture.server, &foreign)
+                    .unwrap_err()
+                    .contains("exact issued descriptor"),
+                "{change}"
+            );
+        }
+        assert_eq!(fixture.server.source, issued);
+        assert!(fixture.server.lineage.is_empty());
+        assert!(fixture.server.pending.is_empty());
+        assert_eq!(fixture.server.journal.lock().unwrap().latest().unwrap(), 0);
+    }
+    #[test]
+    fn source_resolution_refuses_stale_cleanup_pending_and_process_completion() {
+        for refusal in [
+            "epoch",
+            "proof",
+            "close_only",
+            "pending",
+            "stopping",
+            "closed",
+            "completed",
+        ] {
+            let mut fixture = resident_fixture();
+            let source = fixture.server.source.clone();
+            let mut request = Invocation {
+                proof: fixture.server.proof.clone(),
+                epoch: Some(fixture.server.epoch),
+                method: "resolve_source".into(),
+                args: json!([source]),
+            };
+            match refusal {
+                "epoch" => request.epoch = Some(uuid::Uuid::new_v4()),
+                "proof" => {
+                    request.proof.host_incarnation = crate::model::HostIncarnation::new("old")
+                }
+                "close_only" => fixture.server.close_only = true,
+                "pending" => fixture.server.installed = false,
+                "stopping" => fixture.server.session_stopping = true,
+                "closed" => fixture.server.closed_snapshot = Some(Arc::new(Snapshot::default())),
+                "completed" => fixture.server.actor.close().unwrap(),
+                _ => unreachable!(),
+            }
+            let epoch = fixture.server.epoch;
+            let error = fixture.server.invoke(request).unwrap_err();
+            assert!(
+                if matches!(refusal, "epoch" | "proof") {
+                    error.contains("superseded")
+                } else if refusal == "close_only" {
+                    error.contains("close-only")
+                } else {
+                    error.contains("live installed")
+                },
+                "{refusal}: {error}"
+            );
+            assert_eq!(fixture.server.epoch, epoch);
+            assert_eq!(fixture.server.source, source);
+            assert!(fixture.server.pending.is_empty());
+        }
+    }
+    #[test]
+    fn source_resolution_uses_one_deadline_and_never_returns_a_cached_final_snapshot() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("resolve.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let source = actor.0.source.clone();
+        let epoch = actor.0.epoch;
+        *actor.0.final_snapshot.lock().unwrap() = Some(Arc::new(Snapshot {
+            exited: true,
+            ..Default::default()
+        }));
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "resolve_source");
+            assert_eq!(request.epoch, Some(epoch));
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        let started = Instant::now();
+        let error = actor
+            .resolve_source_until(&source, started + Duration::from_millis(40))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        peer.join().unwrap();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(actor.0.epoch, epoch);
+        assert!(actor.pending_inputs().is_empty());
     }
     #[test]
     fn close_only_discards_only_an_unowned_historical_terminal_view() {

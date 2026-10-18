@@ -202,6 +202,23 @@ impl Handle {
             _ => false,
         }
     }
+    /// Identity alone survives epoch changes; grants retain this exact proxy.
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Owner::Local(a), Owner::Local(b)) => a.same_actor(b),
+            (Owner::Remote(a), Owner::Remote(b)) => a.same_attachment(b),
+            _ => false,
+        }
+    }
+    pub(crate) fn resolve_retained_source(
+        &self,
+        source: &chat::Session,
+    ) -> Result<chat::Session, String> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.resolve_source(source),
+            _ => Err("This actor has no retained source resolver".into()),
+        }
+    }
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.try_command(command).map_err(String::from)
     }
@@ -543,6 +560,18 @@ impl chat::protocol::LaunchCleanup for Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_identity_distinguishes_new_proxy_epochs_of_the_same_actor() {
+        let remote = RemoteActor::fixture();
+        let distinct = remote.distinct_attachment_fixture();
+        assert_eq!(remote.identity(), distinct.identity());
+        let handle = Handle(Owner::Remote(remote));
+        let clone = handle.clone();
+        let next = Handle(Owner::Remote(distinct));
+        assert!(handle.same_actor(&next));
+        assert!(handle.same_attachment(&clone));
+        assert!(!handle.same_attachment(&next));
+    }
     #[test]
     fn remote_ownership_is_authoritative_even_when_completion_is_cached() {
         let remote = RemoteActor::completed_failure_fixture();
