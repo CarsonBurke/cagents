@@ -4824,6 +4824,12 @@ impl Cagents {
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
     }
+    /// A shared echo may arrive before a starting chat has a runtime. Only
+    /// the exact attempted descriptor reserves that attachment; a canonical
+    /// replacement must still be allowed to supersede it.
+    pub(super) fn chat_start_matches(&self, card: CardId, session: &chat::Session) -> bool {
+        matches!(self.chat_ui.phases.get(&card), Some(Phase::Starting(attempt)) if &attempt.session == session)
+    }
     /// Whether a card that could not put its saved conversation back on screen
     /// should offer to start a new one in the same place.
     ///

@@ -267,13 +267,13 @@ impl Drop for ScriptedDaemon {
 }
 
 fn settle(app: &mut Cagents, task: Task<Message>) {
-    settle_observing(app, task, |_, _| {});
+    settle_observing(app, task, |_, message| Some(message));
 }
 
-fn settle_observing(
+pub(super) fn settle_observing(
     app: &mut Cagents,
     task: Task<Message>,
-    mut observe: impl FnMut(&mut Cagents, &Message),
+    mut observe: impl FnMut(&mut Cagents, Message) -> Option<Message>,
 ) {
     use cosmic::iced::futures::StreamExt;
     // Renderer initialization owns an executor. Build it before entering the
@@ -297,8 +297,9 @@ fn settle_observing(
                     cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
                         // Scope selection also schedules lifecycle/focus work.
                         // Drive those actual reducers, not only chat replies.
-                        observe(app, &message);
-                        pending.push_back(app.update(message));
+                        if let Some(message) = observe(app, message) {
+                            pending.push_back(app.update(message));
+                        }
                     }
                     cosmic::iced::runtime::Action::Widget(mut operation) => {
                         use cosmic::iced::advanced::{
@@ -1070,7 +1071,7 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
     let mut ready_seen = false;
     let mut receipt_seen = false;
     settle_observing(&mut app, admission, |app, message| {
-        if matches!(message, Message::ChatUi(chat_ui::Action::Ready(..))) && !ready_seen {
+        if matches!(&message, Message::ChatUi(chat_ui::Action::Ready(..))) && !ready_seen {
             ready_seen = true;
             if !refuse_lineage && !retire_before_ready {
                 assert_eq!(
@@ -1084,13 +1085,14 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
                 );
             }
         }
-        if let Message::ChatUi(chat_ui::Action::UpgradeCommitted(_, _, result)) = message {
+        if let Message::ChatUi(chat_ui::Action::UpgradeCommitted(_, _, result)) = &message {
             assert!(
                 result.is_ok(),
                 "actual session writer must acknowledge: {result:?}"
             );
             receipt_seen = true;
         }
+        Some(message)
     });
     assert!(ready_seen);
     assert_eq!(daemon.resolutions(), vec![source.clone()]);
