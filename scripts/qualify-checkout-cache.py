@@ -215,6 +215,8 @@ pub fn generated() -> &'static str { GENERATED }
             "debug/build/qualification-generated-*/output",
             "debug/build/qualification-generated/*/run/output",
             "debug/build/qualification_generated/*/run/output",
+            "debug/build/qualification-generated/*/run/stdout",
+            "debug/build/qualification_generated/*/run/stdout",
         )
         directives = [p.read_bytes() for base in (target, lane / "build")
                       for pattern in output_patterns for p in base.glob(pattern)]
