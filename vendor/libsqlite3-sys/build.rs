@@ -36,10 +36,12 @@ fn copy_bindings<T: AsRef<Path>>(dir: &str, bindgen_name: &str, out_path: T) {
     } else {
         format!("{dir}/{bindgen_name}.rs")
     };
+    println!("cargo:rerun-if-changed={from}");
     std::fs::copy(from, out_path).expect("Could not copy bindings to output directory");
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {
