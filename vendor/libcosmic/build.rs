@@ -1,6 +1,7 @@
 use std::env;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     println!("cargo::rerun-if-changed=build.rs");
 
     if env::var_os("CARGO_CFG_UNIX").is_none()
