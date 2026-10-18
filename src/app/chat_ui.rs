@@ -536,7 +536,6 @@ impl State {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
     }
 
-    #[cfg(test)]
     fn attempt(&self, card: CardId) -> Option<&Attempt> {
         match self.phases.get(&card) {
             Some(Phase::Starting(attempt)) => Some(attempt),
