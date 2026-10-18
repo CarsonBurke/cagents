@@ -19788,6 +19788,27 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+    /// The actual App entry batches even an empty action. Observe its effects
+    /// rather than assuming that a no-op task has no stream representation.
+    fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
+        use iced::futures::StreamExt;
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => stream.collect::<Vec<_>>().await,
+                        None => Vec::new(),
+                    }
+                })
+                .await
+                .expect("a rejected copy must settle without asynchronous work")
+            });
+        assert!(effects.is_empty(), "{reason}");
+    }
+
     #[test]
     fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() {
         let _context = text_copy::isolated_context();
@@ -19833,9 +19854,9 @@ mod tests {
             Some(child_source)
         );
         let task = app.handle_chat_ui(Action::CopyMessage(target, "same:opaque:id".into(), None));
-        assert!(
-            iced::runtime::task::into_stream(task).is_none(),
-            "missing source must never copy the loaded fragment"
+        assert_chat_copy_task_has_no_effects(
+            task,
+            "missing source must never copy the loaded fragment",
         );
         assert!(
             chat_runtime(&app, card)
@@ -19916,9 +19937,9 @@ mod tests {
             request,
             Ok(body),
         ));
-        assert!(
-            iced::runtime::task::into_stream(task).is_none(),
-            "a delayed read must not overwrite the newer clipboard intent"
+        assert_chat_copy_task_has_no_effects(
+            task,
+            "a delayed read must not overwrite the newer clipboard intent",
         );
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
     }
@@ -19947,9 +19968,9 @@ mod tests {
             request,
             Ok(body),
         ));
-        assert!(
-            iced::runtime::task::into_stream(task).is_none(),
-            "a builtin copy captured by the same card must supersede the old read"
+        assert_chat_copy_task_has_no_effects(
+            task,
+            "a builtin copy captured by the same card must supersede the old read",
         );
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
     }
