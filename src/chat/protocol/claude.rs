@@ -3886,6 +3886,7 @@ impl Claude {
         frame: &Value,
         step: &mut Step,
     ) -> Result<(), String> {
+        let parent = parent.filter(|id| !id.is_empty());
         let id = required(frame, "tool_use_id")?;
         if self
             .dismissed_denials
@@ -6856,9 +6857,18 @@ mod tests {
                 json!({"message":"root body"}),
             ))
             .unwrap();
-        let ambiguous = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","tool_use_id":"same","tool_name":"Edit"})).unwrap();
+        for parent in [None, Some("")] {
+            let ambiguous = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","parent_tool_use_id":parent,"tool_use_id":"same","tool_name":"Edit"})).unwrap();
+            assert!(
+                ambiguous.events.iter().any(
+                    |event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none())
+                ),
+                "unidentified child advisories must not borrow root input"
+            );
+        }
+        let absent = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","tool_use_id":"same","tool_name":"Edit"})).unwrap();
         assert!(
-            ambiguous
+            absent
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none()))
