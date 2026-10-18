@@ -1,3 +1,6 @@
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 mod a11y_tree;
 pub mod id;
 mod node;

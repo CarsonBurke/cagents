@@ -14,6 +14,9 @@
 //! * `wayland-csd-adwaita-crossfont`.
 //! * `wayland-csd-adwaita-notitle`.
 //! * `wayland-csd-adwaita-notitlebar`.
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 use std::any::Any;
 use std::ffi::c_void;
 use std::marker::PhantomData;

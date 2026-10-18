@@ -6,6 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
+use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
@@ -1223,10 +1224,13 @@ impl CachedItem {
     /// exception is text that turned out to be something else than it was
     /// first handed over as, which is parsed again from the top.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
-        match self.source.advance(body, growing) {
-            markdown_source::Step::Append(text) => self.markdown.push_str(&text),
-            markdown_source::Step::Restart(text) => {
-                self.markdown = markdown::Content::parse(&text);
+        {
+            let _stage = chat_stage::scope(Stage::Parse);
+            match self.source.advance(body, growing) {
+                markdown_source::Step::Append(text) => self.markdown.push_str(&text),
+                markdown_source::Step::Restart(text) => {
+                    self.markdown = markdown::Content::parse(&text);
+                }
             }
         }
         self.highlight(theme);
@@ -1266,6 +1270,7 @@ impl CachedItem {
     /// refresh usually prepares again, and it is continued from its last
     /// whole line rather than highlighted from its first.
     fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        let _stage = chat_stage::scope(Stage::Highlight);
         let mut previous = std::mem::take(&mut self.blocks);
         let mut open = self.open.take();
         let mut blocks = HashMap::new();
@@ -2517,6 +2522,7 @@ impl Runtime {
         }
     }
     fn prepare_child_cache(&mut self, snapshot: &Snapshot) {
+        let _stage = chat_stage::scope(Stage::PrepareChild);
         if self.child_cache_context != self.selected_subagent {
             self.child_cache.clear();
             self.child_cache_context.clone_from(&self.selected_subagent);
@@ -2537,6 +2543,7 @@ impl Runtime {
         }
     }
     fn refresh(&mut self) {
+        let _stage = chat_stage::scope(Stage::Refresh);
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
             return;
@@ -2693,14 +2700,17 @@ impl Runtime {
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         // Parent grouping still reads the parent presentation. Child bodies
         // remain in Snapshot; only the selected child gets parser/syntax state.
-        Self::prepare_items(
-            &mut self.cache,
-            &snapshot.items,
-            snapshot.busy,
-            &self.expanded,
-            self.syntax_theme,
-            self.session.launch.provider,
-        );
+        {
+            let _stage = chat_stage::scope(Stage::PrepareParent);
+            Self::prepare_items(
+                &mut self.cache,
+                &snapshot.items,
+                snapshot.busy,
+                &self.expanded,
+                self.syntax_theme,
+                self.session.launch.provider,
+            );
+        }
         self.prepare_child_cache(&snapshot);
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
