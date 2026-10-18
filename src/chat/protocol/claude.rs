@@ -274,6 +274,23 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Provider IDs are opaque and local to their parent transcript. Keep the
+/// namespace structural: concatenating a parent and ID can itself collide.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ScopedId {
+    parent: Option<String>,
+    id: String,
+}
+
+impl ScopedId {
+    fn new(parent: Option<&str>, id: &str) -> Self {
+        Self {
+            parent: parent.filter(|id| !id.is_empty()).map(str::to_owned),
+            id: id.into(),
+        }
+    }
+}
+
 /// The API message one stream is delivering, keyed by parent tool use.
 struct Stream {
     message: String,
@@ -333,17 +350,17 @@ struct Claude {
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
-    blocks: HashMap<(String, u64), Item>,
+    blocks: HashMap<(ScopedId, u64), Item>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
-    message_offsets: HashMap<String, usize>,
-    message_order: VecDeque<String>,
+    message_offsets: HashMap<ScopedId, usize>,
+    message_order: VecDeque<ScopedId>,
     carrier_items: HashMap<String, Vec<String>>,
     carrier_parent: HashMap<String, String>,
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
-    tools: HashMap<String, Item>,
+    tools: HashMap<ScopedId, Item>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -351,12 +368,12 @@ struct Claude {
     /// no place for the name, and an edit that fails is shown as its call
     /// again; the input says which tool that was only while it is still
     /// held, which a large write's never is.
-    edit_tools: HashMap<String, String>,
-    tool_inputs: HashMap<String, String>,
-    tool_input_order: VecDeque<String>,
+    edit_tools: HashMap<ScopedId, String>,
+    tool_inputs: HashMap<ScopedId, String>,
+    tool_input_order: VecDeque<ScopedId>,
     dismissed_denials: VecDeque<String>,
     permissions: Option<super::claude_permissions::Snapshot>,
-    tool_order: VecDeque<String>,
+    tool_order: VecDeque<ScopedId>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
     /// Report-producing tasks, oldest first. Preserve their explicit native
@@ -521,21 +538,47 @@ impl Claude {
             self.retired.pop_front();
         }
     }
-    fn tool(&mut self, item: Item) {
-        if !self.tools.contains_key(&item.id) {
-            self.tool_order.push_back(item.id.clone());
+    fn tool(&mut self, parent: Option<&str>, item: Item) {
+        let key = ScopedId::new(parent, &item.id);
+        if !self.tools.contains_key(&key) {
+            self.tool_order.push_back(key.clone());
         }
-        self.tools.insert(item.id.clone(), item);
+        self.tools.insert(key, item);
         while self.tool_order.len() > MAX_TOOLS {
-            if let Some(id) = self.tool_order.pop_front() {
-                self.tools.remove(&id);
-                self.visible_task_rows.remove(&id);
-                self.edit_tools.remove(&id);
-                self.tool_inputs.remove(&id);
+            if let Some(key) = self.tool_order.pop_front() {
+                self.forget_tool(&key);
             }
         }
     }
-    fn task_rows_for_agent(&mut self, tool: &str) -> Vec<String> {
+    fn forget_tool(&mut self, key: &ScopedId) {
+        self.tools.remove(key);
+        self.edit_tools.remove(key);
+        self.tool_inputs.remove(key);
+        self.tool_input_order.retain(|known| known != key);
+        if key.parent.is_none() {
+            self.visible_task_rows.remove(&key.id);
+        }
+    }
+    fn completed_tool(&self, parent: Option<&str>, id: &str) -> bool {
+        self.tools
+            .get(&ScopedId::new(parent, id))
+            .is_some_and(|old| {
+                old.content
+                    .status()
+                    .is_some_and(|status| status != ToolStatus::Running)
+            })
+    }
+    fn task_rows_for_agent(&mut self, parent: Option<&str>, tool: &str) -> Vec<String> {
+        let incoming = ScopedId::new(parent, tool);
+        if self
+            .tools
+            .keys()
+            .any(|known| known.id == tool && known.parent != incoming.parent)
+        {
+            // Task notifications carry no transcript. Keep their fallback row
+            // while more than one scope could own the reported tool ID.
+            return Vec::new();
+        }
         self.agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
@@ -543,14 +586,20 @@ impl Claude {
             .filter(|id| self.visible_task_rows.remove(id))
             .collect()
     }
-    fn remember_tool_input(&mut self, id: &str, input: &Value) -> Result<(), String> {
+    fn remember_tool_input(
+        &mut self,
+        parent: Option<&str>,
+        id: &str,
+        input: &Value,
+    ) -> Result<(), String> {
         if !input.is_object() || encoded_len(input)? > chat::PermissionDenial::INPUT_LIMIT {
             return Ok(());
         }
-        if !self.tool_inputs.contains_key(id) {
-            self.tool_input_order.push_back(id.into());
+        let key = ScopedId::new(parent, id);
+        if !self.tool_inputs.contains_key(&key) {
+            self.tool_input_order.push_back(key.clone());
         }
-        self.tool_inputs.insert(id.into(), input.to_string());
+        self.tool_inputs.insert(key, input.to_string());
         while self.tool_input_order.len() > chat::PermissionDenial::LIMIT {
             if let Some(expired) = self.tool_input_order.pop_front() {
                 self.tool_inputs.remove(&expired);
@@ -778,6 +827,7 @@ impl Claude {
             && let Some(tool_use_id) = request["tool_use_id"].as_str()
         {
             self.permission_denied(
+                None,
                 &json!({
                     "tool_use_id": tool_use_id,
                     "tool_name": request["tool_name"],
@@ -1118,11 +1168,12 @@ impl Claude {
                 false,
             )));
         } else if let Some(content) = message["content"].as_array() {
+            let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
                 .as_u64()
                 .map(|v| v as usize)
                 .or_else(|| self.carrier_offsets.get(carrier).copied())
-                .unwrap_or_else(|| self.message_offsets.get(id).copied().unwrap_or(0));
+                .unwrap_or_else(|| self.message_offsets.get(&message_key).copied().unwrap_or(0));
             // Carrier offsets age out with `carrier_order`. A message's carriers
             // arrive together, so evicting the message first seen longest ago
             // leaves any message still arriving with its offset.
@@ -1130,10 +1181,10 @@ impl Claude {
                 self.carrier_offsets.insert(carrier.into(), base);
                 if self
                     .message_offsets
-                    .insert(id.into(), base + content.len())
+                    .insert(message_key.clone(), base + content.len())
                     .is_none()
                 {
-                    self.message_order.push_back(id.into());
+                    self.message_order.push_back(message_key.clone());
                 }
                 while self.message_order.len() > 2048 {
                     if let Some(old) = self.message_order.pop_front() {
@@ -1147,7 +1198,7 @@ impl Claude {
                     .blocks
                     .iter()
                     .filter(|((message, block_index), item)| {
-                        message == id
+                        message == &message_key
                             && *block_index >= base as u64
                             && match (&item.content, string(block, "type")) {
                                 (
@@ -1196,7 +1247,6 @@ impl Claude {
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
-                        self.remember_tool_input(&tool_id, &block["input"])?;
                         let item = Item {
                             id: tool_id.clone(),
                             role: Role::Assistant,
@@ -1209,13 +1259,11 @@ impl Claude {
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        if !self.tools.get(&item.id).is_some_and(|old| {
-                            old.content
-                                .status()
-                                .is_some_and(|status| status != ToolStatus::Running)
-                        }) {
+                        if !self.completed_tool(child, &item.id) {
+                            self.remember_tool_input(child, &tool_id, &block["input"])?;
                             if string(block, "name") == "Agent" {
-                                global_task_removals.extend(self.task_rows_for_agent(&tool_id));
+                                global_task_removals
+                                    .extend(self.task_rows_for_agent(child, &tool_id));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1234,29 +1282,33 @@ impl Claude {
                                 });
                             }
                             if matches!(item.content, ItemContent::Changes { .. }) {
-                                self.edit_tools
-                                    .insert(tool_id.clone(), string(block, "name").into());
+                                self.edit_tools.insert(
+                                    ScopedId::new(child, &tool_id),
+                                    string(block, "name").into(),
+                                );
                             }
-                            self.tool(item.clone());
+                            self.tool(child, item.clone());
                             step.events.push(Event::Item(item));
                         } else if history {
                             // Keep the original call position as an overlap
                             // anchor without changing its confirmed outcome.
-                            if let Some(completed) = self.tools.get(&tool_id) {
+                            if let Some(completed) = self.tools.get(&ScopedId::new(child, &tool_id))
+                            {
                                 step.events.push(Event::Item(completed.clone()));
                             }
                         }
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
-                        let needs_call=self.tools.get(&tool_id).is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
+                        let needs_call=self.tools.get(&ScopedId::new(child, &tool_id)).is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
                         let recovered = if needs_call {
                             if let Some(call) = correlated_call {
-                                self.remember_tool_input(&tool_id, &call["input"])?;
+                                self.remember_tool_input(child, &tool_id, &call["input"])?;
                                 let name = required(call, "name")?;
                                 let content = tool_content(name, &call["input"], &self.cwd);
                                 if matches!(&content, ItemContent::Changes { .. }) {
-                                    self.edit_tools.insert(tool_id.clone(), name.into());
+                                    self.edit_tools
+                                        .insert(ScopedId::new(child, &tool_id), name.into());
                                 }
                                 Some(content)
                             } else {
@@ -1273,7 +1325,7 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             })
-                            .or_else(|| self.tools.get(&tool_id).cloned())
+                            .or_else(|| self.tools.get(&ScopedId::new(child, &tool_id)).cloned())
                             .unwrap_or(Item {
                                 id: tool_id.clone(),
                                 role: Role::Assistant,
@@ -1290,8 +1342,12 @@ impl Claude {
                             &mut item.content,
                             content_text(&block["content"]),
                             block["is_error"].as_bool() == Some(true),
-                            self.edit_tools.get(&tool_id).map(String::as_str),
-                            self.tool_inputs.get(&tool_id).map(String::as_str),
+                            self.edit_tools
+                                .get(&ScopedId::new(child, &tool_id))
+                                .map(String::as_str),
+                            self.tool_inputs
+                                .get(&ScopedId::new(child, &tool_id))
+                                .map(String::as_str),
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
                             if content.len() == 1 {
@@ -1348,7 +1404,7 @@ impl Claude {
                                 }));
                             }
                         }
-                        self.tool(item.clone());
+                        self.tool(child, item.clone());
                         step.events.push(Event::Item(item));
                     }
                     "image" => step.events.push(Event::Item(Item {
@@ -1507,9 +1563,19 @@ impl Claude {
             }
             self.remember_retracted(carrier);
         }
-        for id in ids.iter().chain(child_ids.values().flatten()) {
-            self.tools.remove(id);
-            self.blocks.retain(|_, item| &item.id != id);
+        for (parent, removed) in std::iter::once((None, &ids)).chain(
+            child_ids
+                .iter()
+                .map(|(parent, ids)| (Some(parent.as_str()), ids)),
+        ) {
+            for id in removed {
+                let key = ScopedId::new(parent, id);
+                self.forget_tool(&key);
+                self.tool_order.retain(|known| known != &key);
+                self.blocks.retain(|(message, _), item| {
+                    message.parent.as_deref() != parent || &item.id != id
+                });
+            }
         }
         if !ids.is_empty() {
             step.events.push(Event::ItemsRemoved { ids });
@@ -2257,7 +2323,11 @@ impl Adapter for Claude {
                     .flatten()
                     .take(chat::PermissionDenial::LIMIT)
                 {
-                    self.permission_denied(denial, &mut step)?;
+                    self.permission_denied(
+                        frame["parent_tool_use_id"].as_str(),
+                        denial,
+                        &mut step,
+                    )?;
                 }
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
@@ -2321,7 +2391,7 @@ impl Adapter for Claude {
                     &mut step,
                 );
                 if let Some(stream) = self.streams.remove("") {
-                    self.settle(&stream.message);
+                    self.settle(None, &stream.message);
                 }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
@@ -3603,7 +3673,7 @@ impl Claude {
                     // A message interrupted before its `message_stop` is
                     // abandoned once its stream moves on.
                     if let Some(abandoned) = self.streams.insert(parent.clone(), stream) {
-                        self.settle(&abandoned.message);
+                        self.settle(Some(&parent), &abandoned.message);
                     }
                 }
                 if parent.is_empty() {
@@ -3669,8 +3739,13 @@ impl Claude {
                         return Ok(());
                     }
                 };
-                step.events.push(Event::Item(item.clone()));
-                self.blocks.insert((message, index), item);
+                if !matches!(&item.content, ItemContent::Tool { .. })
+                    || !self.completed_tool(Some(&parent), &item.id)
+                {
+                    step.events.push(Event::Item(item.clone()));
+                }
+                self.blocks
+                    .insert((ScopedId::new(Some(&parent), &message), index), item);
             }
             "content_block_delta" => {
                 let stream = self
@@ -3682,12 +3757,27 @@ impl Claude {
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                let Some(item) = self.blocks.get_mut(&(stream.message.clone(), index)) else {
+                let Some(item) = self
+                    .blocks
+                    .get_mut(&(ScopedId::new(Some(&parent), &stream.message), index))
+                else {
                     if stream.truncated {
                         return Ok(());
                     }
                     return Err("Claude delta arrived without its content block".into());
                 };
+                if matches!(&item.content, ItemContent::Tool { .. })
+                    && self
+                        .tools
+                        .get(&ScopedId::new(Some(&parent), &item.id))
+                        .is_some_and(|old| {
+                            old.content
+                                .status()
+                                .is_some_and(|status| status != ToolStatus::Running)
+                        })
+                {
+                    return Ok(());
+                }
                 match (&mut item.content, string(delta, "type")) {
                     (ItemContent::Text { text, thinking, .. }, "text_delta" | "thinking_delta") => {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
@@ -3730,7 +3820,14 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
-                if let Some(mut item) = self.blocks.get(&(message, index)).cloned() {
+                if let Some(mut item) = self
+                    .blocks
+                    .get(&(ScopedId::new(Some(&parent), &message), index))
+                    .cloned()
+                {
+                    if self.completed_tool(Some(&parent), &item.id) {
+                        return Ok(());
+                    }
                     if let ItemContent::Tool { name, input, .. } = &item.content {
                         let parsed = if input.is_empty() {
                             Value::Null
@@ -3740,6 +3837,9 @@ impl Claude {
                             // Claude Code closes a block cut off by a retried
                             // request with a synthetic stop. Its call was
                             // discarded, never run, so it leaves the transcript.
+                            let key = ScopedId::new(Some(&parent), &item.id);
+                            self.forget_tool(&key);
+                            self.tool_order.retain(|known| known != &key);
                             step.events.push(Event::ItemsRemoved {
                                 ids: vec![item.id.clone()],
                             });
@@ -3750,15 +3850,16 @@ impl Claude {
                         // accumulate as a plain tool call and the richer
                         // mapping happens here rather than against a prefix.
                         let content = tool_content(name, &parsed, &self.cwd);
-                        self.remember_tool_input(&item.id, &parsed)?;
+                        self.remember_tool_input(Some(&parent), &item.id, &parsed)?;
                         if matches!(content, ItemContent::Changes { .. }) {
-                            self.edit_tools.insert(item.id.clone(), name.clone());
+                            self.edit_tools
+                                .insert(ScopedId::new(Some(&parent), &item.id), name.clone());
                         }
                         if !matches!(content, ItemContent::Tool { .. }) {
                             item.content = content;
                             step.events.push(Event::Item(item.clone()));
                         }
-                        self.tool(item);
+                        self.tool(Some(&parent), item);
                     }
                 }
             }
@@ -3769,7 +3870,7 @@ impl Claude {
             }
             "message_stop" => {
                 if let Some(stream) = self.streams.remove(&parent) {
-                    self.settle(&stream.message);
+                    self.settle(Some(&parent), &stream.message);
                 }
             }
             "ping" => {}
@@ -3785,11 +3886,18 @@ impl Claude {
         Ok(())
     }
     /// Forget a message that will stream no further blocks.
-    fn settle(&mut self, message: &str) {
-        self.blocks.retain(|(id, _), _| id != message);
+    fn settle(&mut self, parent: Option<&str>, message: &str) {
+        let key = ScopedId::new(parent, message);
+        self.blocks.retain(|(id, _), _| id != &key);
     }
 
-    fn permission_denied(&self, frame: &Value, step: &mut Step) -> Result<(), String> {
+    fn permission_denied(
+        &self,
+        parent: Option<&str>,
+        frame: &Value,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        let parent = parent.filter(|id| !id.is_empty());
         let id = required(frame, "tool_use_id")?;
         if self
             .dismissed_denials
@@ -3801,8 +3909,12 @@ impl Claude {
         let name = required(frame, "tool_name")?;
         let input = if frame["tool_input"].is_object() {
             Some(frame["tool_input"].to_string())
+        } else if parent.is_some() || string(frame, "agent_id").is_empty() {
+            self.tool_inputs.get(&ScopedId::new(parent, id)).cloned()
         } else {
-            self.tool_inputs.get(id).cloned()
+            // An agent UUID is not a parent tool-use ID. Without the latter,
+            // no cached input can safely be attributed to this advisory.
+            None
         }
         .filter(|input| input.len() <= chat::PermissionDenial::INPUT_LIMIT);
         let bounded = |value: &str| {
@@ -3835,7 +3947,9 @@ impl Claude {
             )));
         }
         match string(frame, "subtype") {
-            "permission_denied" => self.permission_denied(frame, step)?,
+            "permission_denied" => {
+                self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
+            }
             "init" | "commands_changed" => self.metadata(frame, step),
             "model_refusal_fallback" => {
                 self.retract(&frame["retracted_message_uuids"], step)?;
@@ -3874,7 +3988,7 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
-                let previous = self.tools.get(&id).cloned();
+                let previous = self.tools.get(&ScopedId::new(None, &id)).cloned();
                 let mut item = previous.unwrap_or(Item {
                     id,
                     role: Role::Assistant,
@@ -3962,8 +4076,13 @@ impl Claude {
                     .as_deref()
                     .or_else(|| frame["tool_use_id"].as_str())
                     .is_some_and(|tool| {
-                        self.tools.get(tool).is_some_and(|item|
-                        matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
+                        // Task notifications do not identify a transcript. A
+                        // unique nested Agent is valid prior correlation, but
+                        // an opaque ID shared by multiple scopes is ambiguous.
+                        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
+                        let candidate = candidates.next();
+                        candidate.is_some_and(|(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
+                            && candidates.next().is_none()
                     });
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
@@ -4009,7 +4128,7 @@ impl Claude {
                         background: None,
                     });
                 }
-                self.tool(item.clone());
+                self.tool(None, item.clone());
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
                         step.events.push(Event::ItemsRemoved {
@@ -5729,12 +5848,15 @@ mod tests {
         };
         assert_eq!(denial.reason, "Push needs approval");
         assert_eq!(denial.agent_id.as_deref(), Some("child"));
-        assert_eq!(
-            serde_json::from_str::<Value>(denial.tool_input.as_ref().unwrap()).unwrap(),
-            input
-        );
+        // The provider agent UUID does not identify the parent tool-use
+        // namespace. Never attribute a root cache entry to that child.
+        assert!(denial.tool_input.is_none());
+        let root = adapter.receive(json!({"type":"system","subtype":"permission_denied","parent_tool_use_id":null,"tool_use_id":"blocked","tool_name":"Bash","decision_reason":"Root advisory"})).unwrap();
+        assert!(root.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         let result = adapter.receive(json!({"type":"result","permission_denials":[{"tool_use_id":"blocked","tool_name":"Bash","tool_input":input}]})).unwrap();
-        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_use_id == "blocked" && d.tool_input.is_some())));
+        assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d)
+            if d.tool_use_id == "blocked" && d.tool_input.as_deref().and_then(|v| serde_json::from_str::<Value>(v).ok()) == Some(input.clone()))));
         adapter
             .command(Command::DismissPermissionDenial {
                 tool_use_id: "blocked".into(),
@@ -6588,6 +6710,483 @@ mod tests {
         );
     }
 
+    fn scoped_call(
+        parent: Option<&str>,
+        carrier: &str,
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> Value {
+        json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":parent,"message":{"id":carrier,"content":[{"type":"tool_use","id":id,"name":name,"input":input}]}})
+    }
+
+    fn scoped_result(parent: Option<&str>, carrier: &str, id: &str, failed: bool) -> Value {
+        json!({"type":"user","uuid":carrier,"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":failed,"content":"finished"}]}})
+    }
+
+    fn scoped_item<'a>(step: &'a Step, parent: Option<&str>, id: &str) -> &'a Item {
+        step.events
+            .iter()
+            .find_map(|event| match (event, parent) {
+                (Event::Item(item), None) if item.id == id => Some(item),
+                (Event::SubagentItem { id: scope, item }, Some(parent))
+                    if scope == parent && item.id == id =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .expect("tool item must be published in its original parent scope")
+    }
+
+    fn assert_scoped_body(
+        step: &Step,
+        parent: Option<&str>,
+        id: &str,
+        body: &str,
+        status: ToolStatus,
+    ) {
+        let ItemContent::Tool {
+            name,
+            input,
+            status: actual,
+            ..
+        } = &scoped_item(step, parent, id).content
+        else {
+            panic!("coordination item must retain its exact tool payload");
+        };
+        assert_eq!(name, "SendMessage");
+        let input: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            input["message"], body,
+            "tool body must belong to its parent scope"
+        );
+        assert_eq!(*actual, status);
+    }
+
+    #[test]
+    fn opaque_tool_calls_and_results_keep_exact_parent_scoped_bodies() {
+        for parents in [
+            [Some("one"), Some("two")],
+            [Some("two"), Some("one")],
+            [None, Some("one")],
+            [Some("one"), None],
+        ] {
+            let mut adapter = Claude::default();
+            for (index, parent) in parents.into_iter().enumerate() {
+                let body = format!(
+                    "Current {} coordination body\n\n",
+                    parent.unwrap_or("parent")
+                )
+                .repeat(32);
+                let call = scoped_call(
+                    parent,
+                    &format!("call-{index}"),
+                    "same#opaque-id",
+                    "SendMessage",
+                    json!({"to":"reviewer","message":body}),
+                );
+                let call_step = adapter.receive(call).unwrap();
+                let step = adapter
+                    .receive(scoped_result(
+                        parent,
+                        &format!("result-{index}"),
+                        "same#opaque-id",
+                        false,
+                    ))
+                    .unwrap();
+                assert_scoped_body(
+                    &step,
+                    parent,
+                    "same#opaque-id",
+                    &body,
+                    ToolStatus::Succeeded,
+                );
+                assert_scoped_body(
+                    &call_step,
+                    parent,
+                    "same#opaque-id",
+                    &body,
+                    ToolStatus::Running,
+                );
+            }
+        }
+        // These two (parent, ID) pairs collide under delimiter concatenation.
+        let mut adapter = Claude::default();
+        for (index, parent, id) in [(0, "a", "b:c"), (1, "a:b", "c")] {
+            let body = format!("body-{index}");
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{index}"),
+                    id,
+                    "SendMessage",
+                    json!({"message":body}),
+                ))
+                .unwrap();
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{index}"),
+                    id,
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), id, &body, ToolStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn colliding_edit_inputs_and_permission_fallback_keep_their_scope() {
+        let mut adapter = Claude::default();
+        let calls = [
+            (
+                "one",
+                "Edit",
+                json!({"file_path":"one.rs","old_string":"before","new_string":"after"}),
+            ),
+            (
+                "two",
+                "Write",
+                json!({"file_path":"two.rs","content":"second"}),
+            ),
+        ];
+        for (parent, name, input) in &calls {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    name,
+                    input.clone(),
+                ))
+                .unwrap();
+        }
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-call",
+                "same",
+                "SendMessage",
+                json!({"message":"root body"}),
+            ))
+            .unwrap();
+        for parent in [None, Some("")] {
+            let ambiguous = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","parent_tool_use_id":parent,"tool_use_id":"same","tool_name":"Edit"})).unwrap();
+            assert!(
+                ambiguous.events.iter().any(
+                    |event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none())
+                ),
+                "unidentified child advisories must not borrow root input"
+            );
+        }
+        let absent = adapter.receive(json!({"type":"system","subtype":"permission_denied","agent_id":"provider-agent-uuid","tool_use_id":"same","tool_name":"Edit"})).unwrap();
+        assert!(
+            absent
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.is_none()))
+        );
+        for (parent, name, input) in &calls {
+            let denial = adapter.receive(json!({"type":"system","subtype":"permission_denied","parent_tool_use_id":parent,"tool_use_id":"same","tool_name":name,"decision_reason":"denied"})).unwrap();
+            assert!(denial.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.as_deref().and_then(|v|serde_json::from_str::<Value>(v).ok())==Some(input.clone()))));
+            let result = adapter.receive(json!({"type":"result","parent_tool_use_id":parent,"permission_denials":[{"tool_use_id":"same","tool_name":name}]})).unwrap();
+            assert!(result.events.iter().any(|event| matches!(event, Event::PermissionDenied(d) if d.tool_input.as_deref().and_then(|v|serde_json::from_str::<Value>(v).ok())==Some(input.clone()))));
+        }
+        for (parent, name, file) in [("one", "Edit", "one.rs"), ("two", "Write", "two.rs")] {
+            let step = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("failed-{parent}"),
+                    "same",
+                    true,
+                ))
+                .unwrap();
+            let ItemContent::Tool {
+                name: actual,
+                input,
+                status,
+                ..
+            } = &scoped_item(&step, Some(parent), "same").content
+            else {
+                panic!("failed edit must restore its own call");
+            };
+            assert_eq!(actual, name);
+            assert_eq!(
+                serde_json::from_str::<Value>(input).unwrap()["file_path"],
+                file
+            );
+            assert_eq!(*status, ToolStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn fragmented_colliding_child_streams_settle_and_replay_independently() {
+        let mut adapter = Claude::default();
+        let frame = |parent: &str, event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+        for parent in ["one", "two"] {
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"message_start","message":{"id":"same-message"}}),
+                ))
+                .unwrap();
+            adapter.receive(frame(parent, json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"SendMessage"}}))).unwrap();
+            adapter.receive(frame(parent, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"message\":\""}}))).unwrap();
+        }
+        for parent in ["one", "two"] {
+            adapter.receive(frame(parent, json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":format!("{parent}\"}}")}}))).unwrap();
+            adapter
+                .receive(frame(
+                    parent,
+                    json!({"type":"content_block_stop","index":0}),
+                ))
+                .unwrap();
+            adapter
+                .receive(frame(parent, json!({"type":"message_stop"})))
+                .unwrap();
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), "same", parent, ToolStatus::Succeeded);
+            // Both full-envelope and streamed replays must preserve the completed item.
+            let replay = adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("replay-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":"must not replace completion"}),
+                ))
+                .unwrap();
+            assert!(
+                !replay
+                    .events
+                    .iter()
+                    .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+            );
+            let replay = stream_message(
+                &mut adapter,
+                Some(parent),
+                &format!("replay-stream-{parent}"),
+                &[
+                    json!({"type":"tool_use","id":"same","name":"SendMessage","input":{"message":"must not replace completion"}}),
+                ],
+            );
+            assert!(
+                !replay
+                    .iter()
+                    .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+            );
+            let result = adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-replay-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+            assert_scoped_body(&result, Some(parent), "same", parent, ToolStatus::Succeeded);
+        }
+    }
+
+    #[test]
+    fn retracting_one_tool_scope_preserves_equal_sibling_ids() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":parent}),
+                ))
+                .unwrap();
+            adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+        }
+        let stream =
+            |event: Value| json!({"type":"stream_event","parent_tool_use_id":"two","event":event});
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"live"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"SendMessage"}}))).unwrap();
+        let removed = adapter.receive(json!({"type":"assistant","uuid":"replacement","supersedes":["call-one"],"message":{"content":"replacement"}})).unwrap();
+        assert!(removed.events.iter().any(|e|matches!(e,Event::SubagentItemsRemoved{id,ids} if id=="one" && ids==&vec!["same".to_owned()])));
+        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}))).unwrap();
+        adapter
+            .receive(stream(json!({"type":"message_stop"})))
+            .unwrap();
+        let replay = adapter
+            .receive(scoped_call(
+                Some("two"),
+                "replay-two",
+                "same",
+                "SendMessage",
+                json!({"message":"wrong"}),
+            ))
+            .unwrap();
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+        );
+        let new = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "new-one",
+                "same",
+                "SendMessage",
+                json!({"message":"new one"}),
+            ))
+            .unwrap();
+        assert_scoped_body(&new, Some("one"), "same", "new one", ToolStatus::Running);
+        let result = adapter
+            .receive(scoped_result(Some("two"), "late-two", "same", false))
+            .unwrap();
+        assert_scoped_body(&result, Some("two"), "same", "two", ToolStatus::Succeeded);
+    }
+
+    #[test]
+    fn tool_eviction_retires_only_the_exact_parent_identity() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "SendMessage",
+                    json!({"message":parent}),
+                ))
+                .unwrap();
+            adapter
+                .receive(scoped_result(
+                    Some(parent),
+                    &format!("result-{parent}"),
+                    "same",
+                    false,
+                ))
+                .unwrap();
+        }
+        for index in 0..MAX_TOOLS - 1 {
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("tool-{index}"),
+                    "Read",
+                    json!({"file_path":"filler"}),
+                ))
+                .unwrap();
+        }
+        // Only the oldest entry (child one) passed the existing bound.
+        let replay = adapter
+            .receive(scoped_call(
+                Some("two"),
+                "two-replay",
+                "same",
+                "SendMessage",
+                json!({"message":"wrong"}),
+            ))
+            .unwrap();
+        assert!(
+            !replay
+                .events
+                .iter()
+                .any(|e| matches!(e,Event::SubagentItem{item,..} if item.id=="same"))
+        );
+        let new = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "one-reloaded",
+                "same",
+                "SendMessage",
+                json!({"message":"fresh one"}),
+            ))
+            .unwrap();
+        assert_scoped_body(&new, Some("one"), "same", "fresh one", ToolStatus::Running);
+    }
+
+    #[test]
+    fn child_tool_eviction_preserves_root_task_visibility() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(scoped_call(
+                Some("child"),
+                "child-call",
+                "claude-task:root",
+                "SendMessage",
+                json!({"message":"child body"}),
+            ))
+            .unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"root","task_type":"local_workflow","description":"root task"})).unwrap();
+        for index in 0..MAX_TOOLS - 1 {
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("tool-{index}"),
+                    "Read",
+                    json!({"file_path":"filler"}),
+                ))
+                .unwrap();
+        }
+        assert!(
+            adapter.visible_task_rows.contains("claude-task:root"),
+            "evicting a child must preserve the colliding root task row"
+        );
+    }
+
+    #[test]
+    fn ambiguous_nested_agents_preserve_the_root_task_fallback_on_replay() {
+        let mut adapter = Claude::default();
+        for parent in ["one", "two"] {
+            adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("agent-{parent}"),
+                    "same",
+                    "Agent",
+                    json!({"description":parent}),
+                ))
+                .unwrap();
+        }
+        let task = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"taskB","tool_use_id":"same","task_type":"local_agent"})).unwrap();
+        assert!(
+            task.events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:taskB")),
+            "ambiguous task must keep its root fallback"
+        );
+        let replay = adapter
+            .receive(scoped_call(
+                Some("one"),
+                "agent-one-replay",
+                "same",
+                "Agent",
+                json!({"description":"one"}),
+            ))
+            .unwrap();
+        assert!(!replay.events.iter().any(|event|matches!(event,Event::ItemsRemoved{ids} if ids.iter().any(|id|id=="claude-task:taskB"))), "ambiguous replay must not retract the root task fallback");
+        assert!(adapter.visible_task_rows.contains("claude-task:taskB"));
+    }
+
     #[test]
     fn completed_carriers_upsert_each_streamed_block_not_message_zero() {
         let mut adapter = Claude::default();
@@ -6830,13 +7429,21 @@ mod tests {
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
-        assert!(!adapter.tool_inputs.contains_key("write"));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&ScopedId::new(None, "write"))
+        );
         for call in 0..chat::PermissionDenial::LIMIT {
             adapter.receive(json!({"type":"assistant","uuid":format!("b{call}"),"message":{"id":format!("msg-b{call}"),"content":[
                 {"type":"tool_use","id":format!("read-{call}"),"name":"Read","input":{"file_path":"src/app.rs"}},
             ]}})).unwrap();
         }
-        assert!(!adapter.tool_inputs.contains_key("edit"));
+        assert!(
+            !adapter
+                .tool_inputs
+                .contains_key(&ScopedId::new(None, "edit"))
+        );
         for (id, name, path) in [
             ("write", "Write", "big.txt"),
             ("edit", "MultiEdit", "src/app.rs"),
@@ -7635,7 +8242,9 @@ mod tests {
             }
         }
         assert_eq!(
-            adapter.tools["claude-task:task-one"].content.status(),
+            adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
+                .content
+                .status(),
             Some(ToolStatus::Succeeded)
         );
         assert!(adapter.visible_task_rows.is_empty());
@@ -9959,7 +10568,9 @@ mod tests {
             }
         }
         assert_eq!(
-            adapter.tools["wanted"].content.status(),
+            adapter.tools[&ScopedId::new(None, "wanted")]
+                .content
+                .status(),
             Some(ToolStatus::Succeeded)
         );
     }
@@ -9995,7 +10606,7 @@ mod tests {
         let mut step = Step::default();
         adapter.message(&json!({"type":"user","uuid":"live","_cagents_history_tool_call":correlation_call("unlogged","/wrong/spoof.rs"),"message":{"content":[correlation_result("unlogged",false)]}}),&mut step).unwrap();
         assert!(
-            matches!(&adapter.tools["unlogged"].content,ItemContent::Tool{name,status:ToolStatus::Succeeded,..} if name=="Tool")
+            matches!(&adapter.tools[&ScopedId::new(None, "unlogged")].content,ItemContent::Tool{name,status:ToolStatus::Succeeded,..} if name=="Tool")
         );
     }
     #[test]
@@ -10039,20 +10650,25 @@ mod tests {
             history: Some(history),
             ..Claude::default()
         };
-        adapter.tool(Item {
-            id: "confirmed".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Changes {
-                changes: vec![],
-                status: ToolStatus::Succeeded,
+        adapter.tool(
+            None,
+            Item {
+                id: "confirmed".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Changes {
+                    changes: vec![],
+                    status: ToolStatus::Succeeded,
+                },
             },
-        });
+        );
         assert!(adapter.command(Command::LoadEarlier).is_err());
         assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
         assert_eq!(
-            adapter.tools["confirmed"].content.status(),
+            adapter.tools[&ScopedId::new(None, "confirmed")]
+                .content
+                .status(),
             Some(ToolStatus::Succeeded)
         );
     }

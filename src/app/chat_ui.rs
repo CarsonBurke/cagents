@@ -2666,10 +2666,20 @@ impl Runtime {
             }
             self.child_expanded.retain(|_, choices| !choices.is_empty());
             self.child_unfolded.retain(|_, choices| !choices.is_empty());
+            let empty = HashSet::new();
+            let no_turns = HashMap::new();
+            for (child, disclosure) in &mut self.child_find_disclosure {
+                disclosure.retain(
+                    self.child_expanded.get(child).unwrap_or(&empty),
+                    self.child_unfolded.get(child).unwrap_or(&empty),
+                    &no_turns,
+                );
+            }
         }
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
-        if self.expanded.len() > 4096 {
+        let parent_items_pruned = self.expanded.len() > 4096;
+        if parent_items_pruned {
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
@@ -2756,7 +2766,12 @@ impl Runtime {
             });
         }
         self.turns = turns;
+        let parent_turns_pruned = self.opened.len() > 4096;
         reconcile_disclosure(&mut self.opened, &self.turns);
+        if parent_items_pruned || parent_turns_pruned {
+            self.find_disclosure
+                .retain(&self.expanded, &self.unfolded, &self.opened);
+        }
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
@@ -11962,6 +11977,79 @@ mod tests {
             at: None,
             started_at: None,
         })
+    }
+
+    #[test]
+    fn child_find_ownership_follows_window_pruning_and_preserves_manual_choices() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .session
+            .launch
+            .provider = Provider::Claude;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![child_find_tool("parent-only")];
+        let mut last_item = String::new();
+        let mut last_part = String::new();
+        for window in 0..4100 {
+            let item = format!("window#{window}-tool");
+            let coordinated = format!("window#{window}-card");
+            let mut tool = (*child_find_tool("needle")).clone();
+            tool.id = item.clone();
+            let card_item = Arc::new(chat::Item {
+                id: coordinated.clone(), role: chat::Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "SendMessage".into(),
+                    input: serde_json::json!({"to":"reviewer", "message": format!("{} needle", "Coordination body\n\n".repeat(16))}).to_string(),
+                    output: String::new(), status: chat::ToolStatus::Succeeded,
+                }, at: None, started_at: None,
+            });
+            snapshot.generation += 1;
+            snapshot.subagents = vec![chat::Subagent {
+                items: vec![Arc::new(tool), card_item],
+                ..presentation_child("same-child", child_find_tool("unused"))
+            }];
+            show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+            if window == 0 {
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("same-child".into()))));
+                drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+            } else {
+                drop(app.handle_chat_ui(Action::FindNext(target, true)));
+            }
+            drop(app.handle_chat_ui(Action::FindNext(target, true)));
+            last_item = item;
+            last_part = format!("{coordinated}#body");
+        }
+        let runtime = chat_runtime(&app, card);
+        let choices =
+            runtime.child_expanded["same-child"].len() + runtime.child_unfolded["same-child"].len();
+        assert!(
+            choices <= 4098,
+            "the existing choice budget prunes retired windows"
+        );
+        assert!(
+            runtime.child_find_disclosure["same-child"].owned_count() <= choices,
+            "Find ownership must follow the pruned child choice budget"
+        );
+        assert!(runtime.child_expanded["same-child"].contains(&last_item));
+        assert!(runtime.child_unfolded["same-child"].contains(&last_part));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
+        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::Unfold(target, last_part.clone())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.child_expanded["same-child"],
+            HashSet::from([last_item])
+        );
+        assert_eq!(
+            runtime.child_unfolded["same-child"],
+            HashSet::from([last_part])
+        );
+        assert!(runtime.child_find_disclosure.is_empty());
+        assert!(!runtime.expanded.contains("same#opaque-id"));
     }
 
     #[test]
