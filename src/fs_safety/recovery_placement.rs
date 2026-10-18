@@ -309,7 +309,7 @@ mod tests {
         for temporary_parent in ["/tmp", "/var/tmp"] {
             let source = tempfile::tempdir_in(temporary_parent).unwrap();
             let source_root = Arc::new(Root::open(source.path()).unwrap());
-            let parent_root = Arc::new(Root::open(temporary_parent).unwrap());
+            let parent_root = Arc::new(Root::open(Path::new(temporary_parent)).unwrap());
             let known = Arc::from([source_root.clone()]);
             validate_recovery_parent(&parent_root, &source_root, &known).unwrap();
             let parent = StickyParent::acquire(parent_root).unwrap();

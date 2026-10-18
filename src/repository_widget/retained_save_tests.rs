@@ -1,5 +1,6 @@
 //! Own the real lazy Runtime task boundary; synthetic FileLoaded is not attestation.
 use super::*;
+use crate::model::ProjectId;
 use cosmic::iced::futures::StreamExt;
 
 /// Re-executes exactly one owning test with private filesystem identity. No
