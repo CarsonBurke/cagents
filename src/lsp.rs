@@ -61,6 +61,7 @@ use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_grou
 use crate::settings::LanguageServerSettings;
 
 mod commands;
+mod discovery;
 
 /// Capacity of the application event channel. Diagnostics are coalesced by
 /// document once it is full; results and status changes apply backpressure to
@@ -3651,20 +3652,7 @@ fn expand_placeholder(body: &str, text: &mut String, stops: &mut Vec<LspSnippetS
 // Root discovery
 // ---------------------------------------------------------------------------
 
-/// Whether `candidate` is inside `worktree` after resolving symlinks.
-///
-/// Marker probing and file reads follow symlinks, so a lexical prefix test is
-/// not containment: `<worktree>/link/src` can resolve anywhere. Canonical
-/// paths are compared when both sides resolve; when either does not, the
-/// lexical test decides and the caller treats an unproven path as outside.
-fn contains_path(worktree: &Path, candidate: &Path) -> bool {
-    match (worktree.canonicalize(), candidate.canonicalize()) {
-        (Ok(root), Ok(inside)) => inside.starts_with(&root),
-        _ => candidate.starts_with(worktree),
-    }
-}
-
-/// As [`contains_path`], but an unresolvable path is never treated as inside.
+/// Canonical containment; an unresolvable path is never treated as inside.
 /// Used where being wrong means offering a writable editor for a file outside
 /// the worktree.
 fn contains_path_provably(worktree: &Path, candidate: &Path) -> bool {
@@ -3674,136 +3662,8 @@ fn contains_path_provably(worktree: &Path, candidate: &Path) -> bool {
     }
 }
 
-/// TypeScript configuration permits comments and trailing commas. Preserve
-/// quoted strings byte-for-byte while normalizing those two JSON extensions.
-fn workspace_manifest(mut bytes: Vec<u8>, jsonc: bool) -> Option<serde_json::Value> {
-    if jsonc {
-        let mut index = 0;
-        let mut quoted = false;
-        let mut escaped = false;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    quoted = false;
-                }
-                index += 1;
-            } else if byte == b'"' {
-                quoted = true;
-                index += 1;
-            } else if bytes.get(index..index + 2) == Some(b"//") {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    bytes[index] = b' ';
-                    index += 1;
-                }
-            } else if bytes.get(index..index + 2) == Some(b"/*") {
-                bytes[index..index + 2].fill(b' ');
-                index += 2;
-                loop {
-                    if bytes.get(index..index + 2) == Some(b"*/") {
-                        bytes[index..index + 2].fill(b' ');
-                        index += 2;
-                        break;
-                    }
-                    let byte = bytes.get_mut(index)?;
-                    if *byte != b'\n' {
-                        *byte = b' ';
-                    }
-                    index += 1;
-                }
-            } else {
-                index += 1;
-            }
-        }
-        quoted = false;
-        escaped = false;
-        for index in 0..bytes.len() {
-            let byte = bytes[index];
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    quoted = false;
-                }
-            } else if byte == b'"' {
-                quoted = true;
-            } else if byte == b','
-                && bytes[index + 1..]
-                    .iter()
-                    .find(|byte| !byte.is_ascii_whitespace())
-                    .is_some_and(|byte| matches!(byte, b']' | b'}'))
-            {
-                bytes[index] = b' ';
-            }
-        }
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Select a workspace root before falling back to the nearest project marker.
-/// Called only from the blocking discovery worker in production.
-fn discover_root(path: &Path, worktree: &Path, markers: &[String]) -> PathBuf {
-    if markers.is_empty() {
-        return worktree.to_path_buf();
-    }
-    let mut nearest = None;
-    let mut workspace = None;
-    let extension = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(str::to_ascii_lowercase);
-    let rust = extension.as_deref() == Some("rs");
-    let javascript = extension.as_deref().is_some_and(|extension| {
-        matches!(
-            extension,
-            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs"
-        )
-    });
-    let mut current = path.parent();
-    while let Some(directory) = current {
-        if !contains_path(worktree, directory) {
-            break;
-        }
-        if nearest.is_none() && markers.iter().any(|marker| directory.join(marker).exists()) {
-            nearest = Some(directory.to_path_buf());
-        }
-        if rust
-            && std::fs::read_to_string(directory.join("Cargo.toml"))
-                .ok()
-                .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
-                .is_some_and(|manifest| manifest.get("workspace").is_some())
-        {
-            workspace = Some(directory.to_path_buf());
-        }
-        if javascript {
-            let workspace_json = |name: &str, key: &str| {
-                std::fs::read(directory.join(name))
-                    .ok()
-                    .and_then(|text| workspace_manifest(text, name == "tsconfig.json"))
-                    .is_some_and(|manifest| manifest.get(key).is_some())
-            };
-            if directory.join("pnpm-workspace.yaml").is_file()
-                || workspace_json("package.json", "workspaces")
-                || workspace_json("tsconfig.json", "references")
-            {
-                workspace = Some(directory.to_path_buf());
-            }
-        }
-        if directory == worktree {
-            break;
-        }
-        current = directory.parent();
-    }
-    workspace
-        .or(nearest)
-        .unwrap_or_else(|| worktree.to_path_buf())
-}
+#[cfg(test)]
+use discovery::{discover_root, workspace_manifest};
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -3966,6 +3826,20 @@ struct PendingOpen {
     saved_text: Option<String>,
     ticket: u64,
     owner: Arc<RegistrationOwner>,
+    _discovery: Option<DiscoveryTask>,
+}
+
+/// Cancels both admission waiters and cooperative work when a registration ends.
+struct DiscoveryTask {
+    cancelled: Arc<AtomicBool>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for DiscoveryTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.task.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -4032,6 +3906,10 @@ pub struct LspManager {
     documents: HashMap<LspDocumentId, DocumentRef>,
     pending_opens: HashMap<LspDocumentId, PendingOpen>,
     next_discovery: u64,
+    discovery_slots: Arc<tokio::sync::Semaphore>,
+    discovery_admissions: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    discovery_enter: Option<Arc<dyn Fn() + Send + Sync>>,
     idle_timeout: Duration,
     session_cap: usize,
     process_slots: Arc<tokio::sync::Semaphore>,
@@ -4090,6 +3968,10 @@ impl LspManager {
             documents: HashMap::new(),
             pending_opens: HashMap::new(),
             next_discovery: 1,
+            discovery_slots: discovery::worker_slots(),
+            discovery_admissions: discovery::admission_slots(),
+            #[cfg(test)]
+            discovery_enter: None,
             idle_timeout: Duration::from_secs(600),
             session_cap: 8,
             process_slots: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -4216,33 +4098,79 @@ impl LspManager {
         self.close(doc);
         let ticket = self.next_discovery;
         self.next_discovery += 1;
-        let pending = PendingOpen {
-            path: path.to_owned(),
-            worktree: worktree.to_owned(),
-            language,
-            version,
-            text: source,
-            saved_text: None,
-            ticket,
-            owner: Arc::default(),
+        // Bound queued work before creating a task; process slots separately
+        // bound blocking workers across manager replacement and cancellation.
+        let Ok(admission) = Arc::clone(&self.discovery_admissions).try_acquire_owned() else {
+            self.pending_opens.insert(
+                doc,
+                PendingOpen {
+                    path: path.to_owned(),
+                    worktree: worktree.to_owned(),
+                    language,
+                    version,
+                    text: source,
+                    saved_text: None,
+                    ticket,
+                    owner: Arc::default(),
+                    _discovery: None,
+                },
+            );
+            return self.unavailable(doc, discovery::BUSY_REASON.into());
         };
-        let worker_path = pending.path.clone();
-        let worker_worktree = pending.worktree.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_path = path.to_owned();
+        let worker_worktree = worktree.to_owned();
         let markers = server.root_markers.clone();
         let events = self.events.clone();
-        self.pending_opens.insert(doc, pending);
-        // Canonicalization, marker reads and manifest parsing all happen here.
-        runtime.spawn(async move {
-            if let Ok(root) = tokio::task::spawn_blocking(move || {
-                discover_root(&worker_path, &worker_worktree, &markers)
+        let slots = Arc::clone(&self.discovery_slots);
+        #[cfg(test)]
+        let discovery_enter = self.discovery_enter.clone();
+        let task = runtime.spawn(async move {
+            let _admission = admission;
+            let Ok(permit) = slots.acquire_owned().await else {
+                return;
+            };
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let active_cancelled = Arc::clone(&worker_cancelled);
+            let root = tokio::task::spawn_blocking(move || {
+                // A cancelled async waiter must not release an active worker's
+                // permit while its filesystem operation is still returning.
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(enter) = discovery_enter {
+                    enter();
+                }
+                discovery::discover(&worker_path, &worker_worktree, &markers, &active_cancelled)
             })
-            .await
-            {
-                events
-                    .emit(LspEvent::RootDiscovered { doc, ticket, root })
-                    .await;
+            .await;
+            if !worker_cancelled.load(Ordering::Acquire) {
+                if let Ok(Some(root)) = root {
+                    events
+                        .emit(LspEvent::RootDiscovered { doc, ticket, root })
+                        .await;
+                }
             }
         });
+        self.pending_opens.insert(
+            doc,
+            PendingOpen {
+                path: path.to_owned(),
+                worktree: worktree.to_owned(),
+                language,
+                version,
+                text: source,
+                saved_text: None,
+                ticket,
+                owner: Arc::default(),
+                _discovery: Some(DiscoveryTask {
+                    cancelled,
+                    task: task.abort_handle(),
+                }),
+            },
+        );
         LspStatus::Starting
     }
 
@@ -4344,21 +4272,12 @@ impl LspManager {
             );
         };
 
-        let key = self
-            .sessions
-            .iter()
-            .filter(|(key, handle)| {
-                key.server_id.as_ref() == server.id
-                    && !handle.retired.load(Ordering::Acquire)
-                    && handle.worktree.as_ref() == worktree
-                    && path.starts_with(key.root.as_ref())
-            })
-            .min_by_key(|(key, _)| key.root.components().count())
-            .map(|(key, _)| key.clone())
-            .unwrap_or_else(|| SessionKey {
-                server_id: Arc::from(server.id.as_str()),
-                root: Arc::from(root.clone()),
-            });
+        // Discovery establishes project membership. An ancestor's live server
+        // is not authority to absorb an independent nested project.
+        let key = SessionKey {
+            server_id: Arc::from(server.id.as_str()),
+            root: Arc::from(root.clone()),
+        };
         // Keep a refused document registered so Restart can retry admission
         // after another workspace becomes idle, with its latest buffer text.
         // Ensure first: reopening previously blocked documents must not also
@@ -4570,13 +4489,12 @@ impl LspManager {
     /// its final tab closes.
     pub fn close(&mut self, doc: LspDocumentId) {
         self.pending_opens.remove(&doc);
+        // Queued discoveries can also have staged events.
+        self.events.forget(doc);
         let Some(reference) = self.documents.remove(&doc) else {
             return;
         };
         self.snapshots.unregister(doc);
-        // Nothing staged for a closed document can still be useful, and
-        // keeping it would let a churn of documents grow the backlog.
-        self.events.forget(doc);
         if let Some(session) = self.sessions.get(&reference.session) {
             let _ = session.commands.send(SessionCommand::Close {
                 doc,
@@ -4785,8 +4703,14 @@ impl LspManager {
     /// Current status of the session backing `doc`.
     #[must_use]
     pub fn status(&self, doc: LspDocumentId) -> LspStatus {
-        if self.pending_opens.contains_key(&doc) {
-            return LspStatus::Starting;
+        if let Some(pending) = self.pending_opens.get(&doc) {
+            return if pending._discovery.is_some() {
+                LspStatus::Starting
+            } else {
+                LspStatus::Unavailable {
+                    reason: discovery::BUSY_REASON.into(),
+                }
+            };
         }
         let Some(reference) = self.documents.get(&doc) else {
             return LspStatus::Disabled;
@@ -4850,6 +4774,23 @@ impl LspManager {
     /// schedule; it is marked retired first, so nothing it still publishes
     /// can reach the documents its replacement now owns.
     pub fn restart(&mut self, doc: LspDocumentId) {
+        if let Some(pending) = self.pending_opens.remove(&doc) {
+            // Admission refusal still owns a document and its newest immutable
+            // source. Retry through the same asynchronous path as an open.
+            drop(pending._discovery);
+            self.open_source(
+                doc,
+                &pending.path,
+                &pending.worktree,
+                pending.language,
+                pending.version,
+                pending.text,
+            );
+            if let Some(text) = pending.saved_text {
+                self.save(doc, &text);
+            }
+            return;
+        }
         let Some(reference) = self.documents.get(&doc).cloned() else {
             return;
         };
@@ -5774,6 +5715,764 @@ mod tests {
         }
     }
 
+    async fn open_discovered(
+        manager: &mut LspManager,
+        doc: LspDocumentId,
+        path: &Path,
+        worktree: &Path,
+    ) -> PathBuf {
+        let language = manager.language_for(path).expect("configured language");
+        assert_eq!(
+            manager.open(doc, path, worktree, language, 1, "fixture"),
+            LspStatus::Starting
+        );
+        let events = manager.events();
+        let (ticket, root) = next_matching(&events, |event| match event {
+            LspEvent::RootDiscovered {
+                doc: at,
+                ticket,
+                root,
+            } if *at == doc => Some((*ticket, root.clone())),
+            _ => None,
+        })
+        .await;
+        let status = manager.finish_discovery(doc, ticket, root.clone());
+        if !status.is_some_and(|status| status.is_ready()) {
+            await_ready(&events, doc).await;
+        }
+        root
+    }
+
+    #[test]
+    fn asynchronous_workspace_members_and_independent_islands_keep_correct_sessions_in_both_orders()
+    {
+        block_on(async {
+            for island_first in [false, true] {
+                for island_manifest in [
+                    "[package]\nname=\"island\"\n[workspace]\n",
+                    "[package]\nname=\"island\"\n",
+                ] {
+                    let root = tempfile::tempdir().unwrap();
+                    let worktree = root.path();
+                    std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers=[\"crates/*\"]\nexclude=[\"tools/island\"]\n[package]\nname=\"outer\"\n").unwrap();
+                    for name in ["crates/a", "crates/b", "tools/island"] {
+                        std::fs::create_dir_all(worktree.join(name).join("src")).unwrap();
+                        std::fs::write(
+                            worktree.join(name).join("Cargo.toml"),
+                            if name == "tools/island" {
+                                island_manifest
+                            } else {
+                                "[package]\nname=\"member\"\n"
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let outer = worktree.join("src/lib.rs");
+                    std::fs::create_dir_all(outer.parent().unwrap()).unwrap();
+                    let island = worktree.join("tools/island/src/lib.rs");
+                    let mut manager = rust_manager();
+                    install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                    let factory = Arc::clone(&manager.transport);
+                    let roots = Arc::new(Mutex::new(Vec::new()));
+                    let launches = Arc::clone(&roots);
+                    manager.set_transport(Arc::new(move |spec| {
+                        launches.lock().unwrap().push(spec.root.clone());
+                        factory(spec)
+                    }));
+                    let order = if island_first {
+                        [
+                            (&island, worktree.join("tools/island")),
+                            (&outer, worktree.to_owned()),
+                        ]
+                    } else {
+                        [
+                            (&outer, worktree.to_owned()),
+                            (&island, worktree.join("tools/island")),
+                        ]
+                    };
+                    for (index, (path, expected)) in order.iter().enumerate() {
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64 + 1),
+                                path,
+                                worktree
+                            )
+                            .await,
+                            *expected
+                        );
+                        assert_eq!(
+                            manager.documents[&LspDocumentId(index as u64 + 1)]
+                                .session
+                                .root
+                                .as_ref(),
+                            expected
+                        );
+                    }
+                    for (index, name) in ["crates/a", "crates/b"].iter().enumerate() {
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64 + 3),
+                                &worktree.join(name).join("src/lib.rs"),
+                                worktree
+                            )
+                            .await,
+                            worktree
+                        );
+                    }
+                    assert_eq!(manager.sessions.len(), 2);
+                    let mut actual = roots.lock().unwrap().clone();
+                    actual.sort();
+                    let mut expected = vec![worktree.to_owned(), worktree.join("tools/island")];
+                    expected.sort();
+                    assert_eq!(
+                        actual, expected,
+                        "initialize must receive each discovered root exactly once"
+                    );
+                    manager.shutdown();
+                    manager.wait_for_shutdown().await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_bounds_pending_work_and_cancels_closed_and_replaced_waiters() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_slots = Arc::new(tokio::sync::Semaphore::new(0));
+            manager.discovery_admissions = Arc::new(tokio::sync::Semaphore::new(4));
+            let events = manager.events();
+            let mut jobs = Vec::new();
+            for index in 0..4 {
+                assert_eq!(
+                    manager.open(
+                        LspDocumentId(index),
+                        &file,
+                        &worktree,
+                        rust_language(),
+                        1,
+                        "queued"
+                    ),
+                    LspStatus::Starting
+                );
+                jobs.push(
+                    manager.pending_opens[&LspDocumentId(index)]
+                        ._discovery
+                        .as_ref()
+                        .unwrap()
+                        .task
+                        .clone(),
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), events.recv())
+                    .await
+                    .is_err(),
+                "no blocking work may start before admission"
+            );
+            assert!(matches!(
+                manager.open(
+                    LspDocumentId(99),
+                    &file,
+                    &worktree,
+                    rust_language(),
+                    1,
+                    "over limit"
+                ),
+                LspStatus::Unavailable { .. }
+            ));
+            assert_eq!(manager.pending_opens.len(), 5);
+            assert_eq!(
+                manager
+                    .pending_opens
+                    .values()
+                    .filter(|pending| pending._discovery.is_some())
+                    .count(),
+                4
+            );
+            for index in 0..4 {
+                manager.close(LspDocumentId(index));
+            }
+            tokio::time::timeout(WAIT, async {
+                while jobs.iter().any(|job| !job.is_finished()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(manager.discovery_admissions.available_permits(), 4);
+            // Reopening the same identity must acquire a fresh ticket and only
+            // that registration may consume the subsequently released worker.
+            manager.open(
+                LspDocumentId(0),
+                &file,
+                &worktree,
+                rust_language(),
+                2,
+                "old queued",
+            );
+            let old_ticket = manager.pending_opens[&LspDocumentId(0)].ticket;
+            let old_job = manager.pending_opens[&LspDocumentId(0)]
+                ._discovery
+                .as_ref()
+                .unwrap()
+                .task
+                .clone();
+            manager.open(
+                LspDocumentId(0),
+                &file,
+                &worktree,
+                rust_language(),
+                3,
+                "replacement",
+            );
+            let new_ticket = manager.pending_opens[&LspDocumentId(0)].ticket;
+            assert_ne!(old_ticket, new_ticket);
+            manager.discovery_slots.add_permits(1);
+            let ticket = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { ticket, .. } => Some(*ticket),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ticket, new_ticket);
+            tokio::time::timeout(WAIT, async {
+                while !old_job.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            manager.shutdown();
+            tokio::time::timeout(WAIT, async {
+                while manager.discovery_admissions.available_permits() != 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(event, LspEvent::RootDiscovered { .. }));
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_rejects_fifo_and_oversized_workspace_manifests() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        struct ReleaseFifo {
+            path: PathBuf,
+            writer: Option<std::fs::File>,
+        }
+        impl Drop for ReleaseFifo {
+            fn drop(&mut self) {
+                // Remove the name before releasing a legacy blocking reader:
+                // a late worker must see ENOENT instead of opening a new FIFO.
+                let _ = std::fs::remove_file(&self.path);
+                if let Some(mut writer) = self.writer.take() {
+                    let _ = writer.write_all(b"\n");
+                }
+            }
+        }
+        block_on(async {
+            for inner in [false, true] {
+                for fifo in [false, true] {
+                    for (name, extension, content) in [
+                        ("Cargo.toml", "rs", "[workspace]\nmembers=[\"project\"]\n"),
+                        ("package.json", "ts", "{\"workspaces\":[\"project\"]}"),
+                        (
+                            "tsconfig.json",
+                            "ts",
+                            "{\"references\":[{\"path\":\"project\"}]}",
+                        ),
+                        ("pnpm-workspace.yaml", "ts", "packages:\n - project\n"),
+                    ] {
+                        let root = tempfile::tempdir().unwrap();
+                        let project = root.path().join("project");
+                        std::fs::create_dir_all(project.join("src")).unwrap();
+                        std::fs::write(
+                            project.join(if extension == "rs" {
+                                "Cargo.toml"
+                            } else {
+                                "package.json"
+                            }),
+                            if extension == "rs" {
+                                "[package]\nname=\"project\"\n"
+                            } else {
+                                "{}"
+                            },
+                        )
+                        .unwrap();
+                        if inner {
+                            std::fs::write(root.path().join(name), content).unwrap();
+                        }
+                        let manifest = if inner {
+                            project.join(name)
+                        } else {
+                            root.path().join(name)
+                        };
+                        if fifo {
+                            let _ = std::fs::remove_file(&manifest);
+                        }
+                        let _release = if fifo {
+                            let path =
+                                std::ffi::CString::new(manifest.as_os_str().as_encoded_bytes())
+                                    .unwrap();
+                            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                            Some(ReleaseFifo {
+                                path: manifest.clone(),
+                                writer: Some(
+                                    std::fs::OpenOptions::new()
+                                        .read(true)
+                                        .write(true)
+                                        .custom_flags(libc::O_NONBLOCK)
+                                        .open(&manifest)
+                                        .unwrap(),
+                                ),
+                            })
+                        } else {
+                            let mut bytes = content.as_bytes().to_vec();
+                            bytes.resize(discovery::MAX_MANIFEST_BYTES + 1, b' ');
+                            std::fs::write(&manifest, bytes).unwrap();
+                            None
+                        };
+                        let mut manager = if extension == "rs" {
+                            rust_manager()
+                        } else {
+                            LspManager::new(vec![server("typescript", &["ts"], &["package.json"])])
+                        };
+                        install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(1),
+                                &project.join(format!("src/lib.{extension}")),
+                                root.path()
+                            )
+                            .await,
+                            project,
+                            "{name} descriptor (inner={inner}, fifo={fifo}) must not confer outer membership"
+                        );
+                        manager.shutdown();
+                        manager.wait_for_shutdown().await;
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_cargo_discovery_includes_transitive_workspace_path_dependencies() {
+        block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("Cargo.toml"), "[workspace]\nmembers=[\"app\"]\n[workspace.dependencies]\nhelper={path=\"libs/helper\"}\n").unwrap();
+            for (path, manifest) in [
+                (
+                    "app",
+                    "[package]\nname=\"app\"\n[dependencies]\nhelper={workspace=true}\n",
+                ),
+                (
+                    "libs/helper",
+                    "[package]\nname=\"helper\"\n[target.'cfg(unix)'.dependencies]\nleaf={path=\"../leaf\"}\n",
+                ),
+                ("libs/leaf", "[package]\nname=\"leaf\"\n"),
+            ] {
+                std::fs::create_dir_all(root.path().join(path).join("src")).unwrap();
+                std::fs::write(root.path().join(path).join("Cargo.toml"), manifest).unwrap();
+            }
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            for (index, path) in ["libs/leaf", "app", "libs/helper"].iter().enumerate() {
+                assert_eq!(
+                    open_discovered(
+                        &mut manager,
+                        LspDocumentId(index as u64),
+                        &root.path().join(path).join("src/lib.rs"),
+                        root.path()
+                    )
+                    .await,
+                    root.path()
+                );
+            }
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_discovery_uses_one_canonical_root_for_in_worktree_aliases() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            std::os::unix::fs::symlink(&worktree, worktree.join("alias")).unwrap();
+            let alias = worktree.join("alias/main.rs");
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(&mut manager, LspDocumentId(1), &alias, &worktree).await,
+                worktree.canonicalize().unwrap()
+            );
+            assert_eq!(
+                open_discovered(&mut manager, LspDocumentId(2), &file, &worktree).await,
+                worktree.canonicalize().unwrap()
+            );
+            assert_eq!(manager.sessions.len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_package_workspace_link_resolves_a_member_beside_its_workspace_root() {
+        block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let member = root.path().join("member");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(member.join("src")).unwrap();
+            std::fs::write(
+                workspace.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"../member\"]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname=\"member\"\nworkspace=\"../workspace\"\n",
+            )
+            .unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(
+                    &mut manager,
+                    LspDocumentId(1),
+                    &member.join("src/lib.rs"),
+                    root.path()
+                )
+                .await,
+                workspace
+            );
+            assert_eq!(
+                manager.documents[&LspDocumentId(1)].session.root.as_ref(),
+                workspace
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_active_discovery_holds_worker_admission_until_real_worker_returns() {
+        struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let release = Release(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+            let gate = Arc::clone(&release.0);
+            let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
+            manager.discovery_enter = Some(Arc::new(move || {
+                entered.send(()).unwrap();
+                let (lock, changed) = &*gate;
+                let _guard = changed
+                    .wait_while(lock.lock().unwrap(), |released| !*released)
+                    .unwrap();
+            }));
+            manager.open(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "active",
+            );
+            tokio::time::timeout(WAIT, entering.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let task = manager.pending_opens[&LspDocumentId(1)]
+                ._discovery
+                .as_ref()
+                .unwrap()
+                .task
+                .clone();
+            manager.close(LspDocumentId(1));
+            tokio::time::timeout(WAIT, async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                manager.discovery_slots.available_permits(),
+                0,
+                "cancelling an async waiter must not free its still-blocking worker slot"
+            );
+            drop(release);
+            tokio::time::timeout(WAIT, async {
+                while manager.discovery_slots.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !manager
+                    .events()
+                    .try_recv()
+                    .is_ok_and(|event| matches!(event, LspEvent::RootDiscovered { .. }))
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_javascript_workspace_boundaries_hold_in_both_open_orders() {
+        block_on(async {
+            for (descriptor, contents) in [
+                (
+                    "package.json",
+                    r#"{"workspaces":["packages/*","!packages/island"]}"#,
+                ),
+                (
+                    "package.json",
+                    r#"{"workspaces":{"packages":["packages/a","packages/b"]}}"#,
+                ),
+                (
+                    "pnpm-workspace.yaml",
+                    "packages:\n - packages/*\n - '!packages/island'\n",
+                ),
+                (
+                    "pnpm-workspace.yaml",
+                    "packages:\n - '!packages/island'\n - packages/*\n",
+                ),
+                (
+                    "tsconfig.json",
+                    r#"{"references":[{"path":"packages/a/tsconfig.json"},{"path":"packages/b/tsconfig.json"}]}"#,
+                ),
+            ] {
+                for island_first in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    for package in ["a", "b", "island"] {
+                        let directory = root.path().join("packages").join(package);
+                        std::fs::create_dir_all(directory.join("src")).unwrap();
+                        std::fs::write(directory.join("package.json"), "{}").unwrap();
+                        std::fs::write(directory.join("tsconfig.json"), r#"{"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#).unwrap();
+                    }
+                    std::fs::write(root.path().join(descriptor), contents).unwrap();
+                    let mut manager =
+                        LspManager::new(vec![server("typescript", &["ts"], &["package.json"])]);
+                    install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                    let order = if island_first {
+                        ["island", "a"]
+                    } else {
+                        ["a", "island"]
+                    };
+                    for (index, package) in order.iter().enumerate() {
+                        let expected = if *package == "a" {
+                            root.path().to_owned()
+                        } else {
+                            root.path().join("packages/island")
+                        };
+                        assert_eq!(
+                            open_discovered(
+                                &mut manager,
+                                LspDocumentId(index as u64),
+                                &root
+                                    .path()
+                                    .join("packages")
+                                    .join(package)
+                                    .join("src/index.ts"),
+                                root.path()
+                            )
+                            .await,
+                            expected
+                        );
+                        assert_eq!(
+                            manager.documents[&LspDocumentId(index as u64)]
+                                .session
+                                .root
+                                .as_ref(),
+                            expected
+                        );
+                    }
+                    assert_eq!(
+                        open_discovered(
+                            &mut manager,
+                            LspDocumentId(3),
+                            &root.path().join("packages/b/src/index.ts"),
+                            root.path()
+                        )
+                        .await,
+                        root.path()
+                    );
+                    assert_eq!(manager.sessions.len(), 2);
+                    manager.shutdown();
+                    manager.wait_for_shutdown().await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn asynchronous_membership_budget_exhaustion_keeps_nearest_project() {
+        block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = root.path().join("project");
+            std::fs::create_dir_all(project.join("src")).unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\nname=\"project\"\n").unwrap();
+            let mut manifest =
+                String::from("[workspace]\nmembers=[]\n[package]\nname=\"root\"\n[dependencies]\n");
+            for index in 0..600 {
+                manifest.push_str(&format!("dep{index}={{path=\"missing{index}\"}}\n"));
+            }
+            std::fs::write(root.path().join("Cargo.toml"), manifest).unwrap();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            assert_eq!(
+                open_discovered(
+                    &mut manager,
+                    LspDocumentId(1),
+                    &project.join("src/lib.rs"),
+                    root.path()
+                )
+                .await,
+                project
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_admission_refusal_restarts_with_the_latest_buffer_and_saved_text() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            manager.discovery_admissions = Arc::new(tokio::sync::Semaphore::new(1));
+            let reservation = Arc::clone(&manager.discovery_admissions)
+                .try_acquire_owned()
+                .unwrap();
+            let fake = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let doc = LspDocumentId(17);
+            assert!(matches!(
+                manager.open(doc, &file, &worktree, rust_language(), 1, "original"),
+                LspStatus::Unavailable { .. }
+            ));
+            assert!(matches!(manager.status(doc), LspStatus::Unavailable { .. }));
+            assert!(manager.pending_opens[&doc]._discovery.is_none());
+            let refused_ticket = manager.pending_opens[&doc].ticket;
+            manager.change(doc, 2, &[], "saved edit");
+            manager.save(doc, "saved edit");
+            manager.change(doc, 3, &[], "newest unsaved edit");
+            drop(reservation);
+            manager.restart(doc);
+            assert_eq!(manager.status(doc), LspStatus::Starting);
+            let events = manager.events();
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered {
+                    doc: at,
+                    ticket,
+                    root,
+                } if *at == doc => Some((*ticket, root.clone())),
+                _ => None,
+            })
+            .await;
+            assert_ne!(ticket, refused_ticket);
+            manager.finish_discovery(doc, ticket, root);
+            await_ready(&events, doc).await;
+            let fake = handle_of(&fake).await;
+            fake.wait_for("textDocument/didSave").await;
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["text"],
+                "newest unsaved edit"
+            );
+            assert_eq!(
+                fake.entries("textDocument/didOpen")[0].params["textDocument"]["version"],
+                3
+            );
+            assert_eq!(
+                fake.entries("textDocument/didSave")[0].params["text"],
+                "saved edit"
+            );
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn asynchronous_pnpm_complexity_boundaries_keep_nearest_project() {
+        block_on(async {
+            let cases = [
+                (
+                    "alias",
+                    String::from("shared: &members [project]\npackages: *members\n"),
+                ),
+                (
+                    "depth",
+                    format!(
+                        "unrelated: {}0{}\npackages:\n - project\n",
+                        "[".repeat(40),
+                        "]".repeat(40)
+                    ),
+                ),
+                (
+                    "tokens",
+                    format!(
+                        "unrelated:\n{}packages:\n - project\n",
+                        " - value\n".repeat(4200)
+                    ),
+                ),
+            ];
+            for (label, contents) in cases {
+                let root = tempfile::tempdir().unwrap();
+                let project = root.path().join("project");
+                std::fs::create_dir_all(project.join("src")).unwrap();
+                std::fs::write(project.join("package.json"), "{}").unwrap();
+                std::fs::write(root.path().join("pnpm-workspace.yaml"), contents).unwrap();
+                let mut manager =
+                    LspManager::new(vec![server("typescript", &["ts"], &["package.json"])]);
+                install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+                assert_eq!(
+                    open_discovered(
+                        &mut manager,
+                        LspDocumentId(1),
+                        &project.join("src/index.ts"),
+                        root.path()
+                    )
+                    .await,
+                    project,
+                    "{label} complexity must not confer workspace membership"
+                );
+                manager.shutdown();
+                manager.wait_for_shutdown().await;
+            }
+        });
+    }
+
+    #[test]
+    fn discovery_workers_and_pending_admission_are_shared_across_managers() {
+        let first = rust_manager();
+        let second = rust_manager();
+        assert!(Arc::ptr_eq(&first.discovery_slots, &second.discovery_slots));
+        assert!(Arc::ptr_eq(
+            &first.discovery_admissions,
+            &second.discovery_admissions
+        ));
+        assert_eq!(discovery::MAX_PENDING, 256);
+    }
+
     #[test]
     fn workspace_discovery_prefers_topmost_cargo_workspace() {
         let root = tempfile::tempdir().unwrap();
@@ -6060,7 +6759,11 @@ mod tests {
     fn asynchronous_workspace_open_shares_server_and_idle_close_restarts_it() {
         block_on(async {
             let (_root, worktree, file) = workspace();
-            std::fs::write(worktree.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            std::fs::write(
+                worktree.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"crates/member\"]\n",
+            )
+            .unwrap();
             let member = worktree.join("crates/member");
             std::fs::create_dir_all(member.join("src")).unwrap();
             std::fs::write(member.join("Cargo.toml"), "[package]\nname=\"member\"\n").unwrap();
@@ -6384,9 +7087,14 @@ mod tests {
     }
 
     #[test]
-    fn closed_ancestor_session_launches_its_canonical_key_root() {
+    fn closed_workspace_session_launches_its_canonical_key_root() {
         block_on(async {
             let (_root, worktree, file) = workspace();
+            std::fs::write(
+                worktree.join("Cargo.toml"),
+                "[workspace]\nmembers=[\"package\"]\n[package]\nname=\"root\"\n",
+            )
+            .unwrap();
             let nested = worktree.join("package");
             std::fs::create_dir_all(&nested).unwrap();
             std::fs::write(nested.join("Cargo.toml"), "[package]\n").unwrap();
