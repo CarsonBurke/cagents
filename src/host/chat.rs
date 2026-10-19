@@ -2150,7 +2150,13 @@ fn process_inner(
                     session
                 })
                 .collect::<Vec<_>>();
-            sessions.extend(state.chat_spawning.values().cloned());
+            sessions.extend(state.chat_spawning.values().map(|pending| {
+                let mut session = pending.clone();
+                // Inventory describes this daemon's pending attachment. Keep
+                // the reservation's exact caller token unchanged for its CAS.
+                session.proof = Some(state.proof().clone());
+                session
+            }));
             Ok(ServerResponse::ChatListed { sessions })
         }
         ClientRequest::ChatStart {

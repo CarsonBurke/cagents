@@ -847,6 +847,56 @@ mod tests {
         )
     }
 
+    #[test]
+    fn pending_inventory_proves_the_daemon_without_replacing_its_reservation() {
+        let host = host();
+        let mut source = session();
+        source.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        assert_eq!(source.proof, None);
+        let reservation = Reservation::new(&host, &source).unwrap().unwrap();
+        let ServerResponse::ChatListed { sessions } =
+            process_inner(&host, 61, ClientRequest::ChatList).unwrap()
+        else {
+            panic!("pending inventory response")
+        };
+        let mut expected = source.clone();
+        expected.proof = Some(host.lock().unwrap().proof().clone());
+        assert_eq!(sessions, vec![expected]);
+        assert_eq!(
+            host.lock().unwrap().chat_spawning.get(&source.id),
+            Some(&source)
+        );
+        drop(reservation);
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn proofless_client_restore_of_a_pending_start_reports_transition_not_identity_mismatch() {
+        let host = host();
+        let mut source = session();
+        source.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        assert_eq!(source.proof, None);
+        let reservation = Reservation::new(&host, &source).unwrap().unwrap();
+        // This is the real client handshake, inventory lookup and attach over
+        // the actual daemon request dispatcher, not a direct ChatStart call.
+        let (result, server) = restore_client(&host, source.clone(), 62);
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("a pending provider start must not be replaced"),
+        };
+        server.join().unwrap();
+        assert_eq!(failure.recovery, chat::Recovery::Retry);
+        assert_eq!(failure.message, "Chat is already starting or closing");
+        assert_eq!(
+            host.lock().unwrap().chat_spawning.get(&source.id),
+            Some(&source)
+        );
+        assert!(host.lock().unwrap().chats.is_empty());
+        drop(reservation);
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+    }
+
     fn wait_for_client_history(client: &chat::client::ClientHandle) {
         client.set_visible(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
