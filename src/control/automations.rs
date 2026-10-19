@@ -49,7 +49,7 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
-    /// Read the current definition and its revisions.
+    /// Read the current saved definition and its revision.
     Show {
         #[arg(help = "The stable resource ID.")]
         id: Uuid,

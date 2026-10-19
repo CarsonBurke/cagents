@@ -13,7 +13,7 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
-fn isolated(name: &str) -> Option<tempfile::TempDir> {
+pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return None;
@@ -37,7 +37,11 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!("host::agent_execution::tests::{name}"),
+            &if name.contains("::") {
+                name.to_owned()
+            } else {
+                format!("host::agent_execution::tests::{name}")
+            },
             "--nocapture",
         ])
         .env_clear()
@@ -103,6 +107,15 @@ while IFS= read -r frame; do
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
       case "$frame" in
+        *HOLD_CLEANUP_BUSY*)
+          : > "$HOME/../cleanup-busy"
+          attempts=0
+          while [ ! -e "$HOME/../cleanup-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 1000 ] || exit 1
+            sleep 0.01
+          done
+          ;;
         *COURIER_BACKGROUND*)
           printf '{"type":"assistant","uuid":"launch-child","message":{"id":"launch-child","role":"assistant","content":[{"type":"tool_use","id":"courier-child","name":"Agent","input":{"run_in_background":true}}]}}\n'
           printf '{"type":"user","uuid":"child-launch-result","tool_use_result":{"status":"async_launched","agentId":"courier-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"courier-child","content":"Launched"}]}}\n'
@@ -439,10 +452,8 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     let stale = handle.snapshot(None).unwrap().generation;
     handle.command(Command::Refresh).unwrap();
     assert!(
-        handle
-            .close_if_idle(stale)
-            .unwrap_err()
-            .contains("state changed")
+        !handle.try_close_if_idle(stale).unwrap(),
+        "idle metadata drift must defer without stopping the actor"
     );
     assert!(!handle.is_completed());
     assert_eq!(
@@ -838,7 +849,7 @@ fn release_fixture(host: &SharedHost, run: &Run) {
         .unwrap();
 }
 
-fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
+pub(in crate::host) fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
     let path = root.join("registry.sqlite3");
     let mut registry = Registry::at(&path).unwrap();
@@ -2427,6 +2438,23 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         1,
         "the decision outlives the turn"
     );
+
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session].handle.clone();
+    let stale = handle.snapshot(None).unwrap().generation.wrapping_sub(1);
+    assert!(
+        handle.try_close_if_idle(stale).is_err(),
+        "stale generation must not hide a pending permission request"
+    );
+    assert!(!handle.is_completed());
 
     let error = control(answer(&asked.id, "allow")).unwrap_err();
     assert!(error.contains("only decline"), "{error}");
