@@ -579,6 +579,211 @@ mod tests {
         );
         assert!(host.lock().unwrap().chats.contains_key(&source.id));
     }
+    fn provider_history_path(source: &Session) -> std::path::PathBuf {
+        let project: String = source
+            .launch
+            .recipe
+            .working_directory
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        std::path::PathBuf::from(&source.launch.recipe.environment["CLAUDE_CONFIG_DIR"])
+            .join("projects")
+            .join(project)
+            .join(format!(
+                "{}.jsonl",
+                source.launch.session_id.as_ref().unwrap()
+            ))
+    }
+
+    #[test]
+    fn truncated_or_changed_provider_history_cannot_release_the_only_cached_body() {
+        for changed in ["", "changed provider body"] {
+            let host = host();
+            let (_directory, source, handle) = closed_history(&host);
+            let proof = inspect(&host, source.id).unwrap().proof;
+            let path = provider_history_path(&source);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                if changed.is_empty() {
+                    String::new()
+                } else {
+                    text.replace("durable history body", changed)
+                },
+            )
+            .unwrap();
+            assert!(
+                inspect(&host, source.id)
+                    .unwrap()
+                    .release_blocked
+                    .unwrap()
+                    .contains("does not cover")
+            );
+            assert!(release(&host, &proof, false).is_err());
+            assert!(host.lock().unwrap().chats.contains_key(&source.id));
+            assert!(handle.snapshot(None).unwrap().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
+        }
+    }
+
+    #[test]
+    fn pending_launches_and_retained_managed_authorities_block_resident_release() {
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target,
+        };
+        for pending in [false, true] {
+            let host = host();
+            let (directory, source, _) = closed_history(&host);
+            let mut registry = super::super::super::model::Registry::at(
+                &directory.path().join("workspace.sqlite"),
+            )
+            .unwrap();
+            let owned = HostedSession::Chat(source.clone());
+            if pending {
+                registry
+                    .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                        repository: directory.path().into(),
+                        name: "Fixture".into(),
+                        kind: crate::model::ProjectKind::Folder,
+                    })
+                    .unwrap();
+                let accepted = registry
+                    .submit_agent(
+                        &Origin::User,
+                        &Submit {
+                            name: None,
+                            destination: Destination::New(Spec {
+                                provider: Provider::Claude,
+                                account: None,
+                                target: Target {
+                                    repository: directory.path().into(),
+                                    directory: directory.path().into(),
+                                    placement: None,
+                                },
+                                surface: Surface::Chat,
+                                model: None,
+                                permission_mode: None,
+                                reasoning_effort: None,
+                            }),
+                            prompt: "private pending fixture".into(),
+                            idempotency_key: "pending-release-test".into(),
+                        },
+                        1,
+                    )
+                    .unwrap();
+                registry
+                    .reserve_agent_launch(accepted.agent.id, &owned)
+                    .unwrap();
+            } else {
+                registry.register_agent_authority(&owned).unwrap();
+            }
+            assert!(registry.agent_for_session(source.id).unwrap().is_none());
+            host.lock().unwrap().execution_registry =
+                Some(Arc::new(std::sync::Mutex::new(registry)));
+            assert!(
+                inspect(&host, source.id)
+                    .unwrap()
+                    .release_blocked
+                    .unwrap()
+                    .contains("managed agent")
+            );
+            assert!(host.lock().unwrap().chats.contains_key(&source.id));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_operation_refuses_inspection_before_opening_provider_history() {
+        use std::{
+            io::Read,
+            os::fd::{AsRawFd, FromRawFd},
+        };
+        let host = host();
+        let (directory, source, _) = closed_history(&host);
+        let path = provider_history_path(&source);
+        let other = directory.path().join("reserved-account");
+        std::fs::create_dir(&other).unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("homes"));
+        let store = crate::account::registry::Store::at(directory.path().join("accounts"));
+        let reservation = super::super::super::account_lifecycle::Reservation::test_install(
+            &host,
+            &[crate::account::Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                other,
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut watcher = unsafe { std::fs::File::from_raw_fd(fd) };
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    watcher.as_raw_fd(),
+                    cpath.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            } >= 0
+        );
+        assert!(inspect(&host, source.id).is_err());
+        let request = ClientRequest::ChatReleaseInspect { chat_id: source.id };
+        assert!(super::super::super::account_lifecycle::admit(&host, &request).is_err());
+        let mut events = [0_u8; 256];
+        assert_eq!(
+            watcher.read(&mut events).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(reservation);
+        assert_eq!(inspect(&host, source.id).unwrap().release_blocked, None);
+    }
+
+    #[test]
+    fn history_release_reservation_prevents_a_new_attached_view() {
+        let host = host();
+        let (_directory, source, _) = closed_history(&host);
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(source.id, source.clone());
+        assert!(
+            process_inner(
+                &host,
+                9,
+                ClientRequest::ChatAttach {
+                    session: source.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .subscribers
+                .is_empty()
+        );
+        host.lock().unwrap().chat_spawning.clear();
+        assert!(matches!(
+            process_inner(
+                &host,
+                9,
+                ClientRequest::ChatAttach {
+                    session: source.clone()
+                }
+            )
+            .unwrap(),
+            ServerResponse::ChatAttached { .. }
+        ));
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .subscribers
+                .contains_key(&9)
+        );
+    }
 }
 
 pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
@@ -612,7 +817,9 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                     Some("Actor owns live or unconfirmed provider work".into())
                 } else if !record.subscribers.is_empty() {
                     Some("A client is attached".into())
-                } else if !record.handle.is_read_only_history() {
+                } else if !snapshot.subagents.is_empty() {
+        Some("Child transcript preservation is not yet verified; its resident history is preserved")
+    } else if !record.handle.is_read_only_history() {
                     Some("Writer transcript durability is unverified".into())
                 } else if state.chat_spawning.contains_key(&id)
                     || state.native_closing.contains_key(&id)
@@ -696,51 +903,58 @@ pub(in crate::host) fn inspect(
     host: &SharedHost,
     id: TerminalId,
 ) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
-    let (mut inspection, _) =
+    let (mut inspection, handle) =
         inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
     if inspection.release_blocked.is_some() {
         return Ok(inspection);
     }
+    super::super::account_lifecycle::ensure_idle(host)?;
     // Managed run state is independent of actor activity. Do not cancel or
     // retire any managed authority through this resident-only operation.
     if let Ok(registry) = super::super::agent_execution::registry(host) {
-        match registry.lock().unwrap_or_else(|p| p.into_inner()).agent_for_session(id) {
-            Ok(None) => {},
-            Ok(Some(_)) => inspection.release_blocked = Some("The actor belongs to a managed agent; use its supported owned-agent close operation".into()),
+        match registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(id) {
+            Ok(sources) if sources.is_empty() => {},
+            Ok(_) => inspection.release_blocked = Some("The actor belongs to a managed agent; use its supported owned-agent close operation".into()),
             Err(error) => inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}")),
         }
     }
     if inspection.release_blocked.is_none() {
-        let reload = (|| -> Result<(), String> {
-            if has_native_owner(&inspection.proof.session).map_err(|error| error.message)? {
-                return Err("An authenticated native provider owner remains".into());
-            }
-            let (spec, mut adapter) = chat::protocol::create(&inspection.proof.session.launch)?;
-            if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-                return Err(
-                    "The saved conversation cannot currently be reopened as read-only history"
-                        .into(),
-                );
-            }
-            let initial = adapter.initialize()?;
-            if !initial.writes.is_empty() {
-                return Err("History reload attempted a provider write".into());
-            }
-            if initial
-                .events
-                .iter()
-                .any(|event| matches!(event, chat::Event::HistoryError(_)))
-            {
-                return Err("Provider history could not be reloaded".into());
-            }
-            Ok(())
-        })();
+        let reload = reload_history(&inspection.proof.session)
+            .and_then(|reloaded| if handle.history_is_covered_by(&reloaded)? {
+                Ok(())
+            } else {
+                Err("The reloaded provider history does not cover all resident transcript data; older cached pages or changed history remain protected".into())
+            });
         if let Err(error) = reload {
             inspection.release_blocked =
                 Some(format!("Saved provider history is not verified: {error}"));
         }
     }
     Ok(inspection)
+}
+
+fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
+    if has_native_owner(session).map_err(|error| error.message)? {
+        return Err("An authenticated native provider owner remains".into());
+    }
+    let (spec, mut adapter) = chat::protocol::create(&session.launch)?;
+    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
+        return Err(
+            "The saved conversation cannot currently be reopened as read-only history".into(),
+        );
+    }
+    let mut initial = adapter.initialize()?;
+    if !initial.writes.is_empty() {
+        return Err("History reload attempted a provider write".into());
+    }
+    if initial
+        .events
+        .iter()
+        .any(|event| matches!(event, chat::Event::HistoryError(_)))
+    {
+        return Err("Provider history could not be reloaded".into());
+    }
+    chat::runtime::preflight(&spec, &mut initial)
 }
 
 pub(in crate::host) fn release(
@@ -773,9 +987,41 @@ pub(in crate::host) fn release(
         Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
         handle
     };
+    // Repeat complete coverage with the ownership reservation held. Paging
+    // admitted before the last detach may still have settled since inspection.
+    super::super::account_lifecycle::ensure_idle(host)?;
+    let reloaded = reload_history(&proof.session).map_err(unavailable)?;
+    if !handle
+        .history_is_covered_by(&reloaded)
+        .map_err(unavailable)?
+    {
+        return Err(unavailable(
+            "Reloaded provider history does not cover all resident data",
+        ));
+    }
+    if handle
+        .snapshot(None)
+        .expect("unconditional history snapshot")
+        .generation
+        != proof.generation
+    {
+        return Err(error(
+            "The native history generation changed; inspect it again",
+        ));
+    }
     // This proven history reader owns no provider process, socket or execution
     // authority. Closing it stops paging only, never an agent or provider run.
     handle.close().map_err(unavailable)?;
+    // The worker is now immutable. A previously queued page must also be
+    // recoverable before its cache can be dropped.
+    if !handle
+        .history_is_covered_by(&reloaded)
+        .map_err(unavailable)?
+    {
+        return Err(unavailable(
+            "History changed while its reader closed; resident data was preserved",
+        ));
+    }
     let retired = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state

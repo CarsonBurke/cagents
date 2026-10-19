@@ -2185,6 +2185,11 @@ fn process_inner(
             let stopped_launch = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(session.proof.as_ref(), state.proof())?;
+                if state.chat_spawning.contains_key(&session.id) {
+                    return Err(unavailable(
+                        "Native chat ownership is changing; retry its normal attach after the transition finishes",
+                    ));
+                }
                 state
                     .chats
                     .get(&session.id)
@@ -2196,6 +2201,11 @@ fn process_inner(
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
+            if state.chat_spawning.contains_key(&session.id) {
+                return Err(unavailable(
+                    "Native chat ownership is changing; retry its normal attach after the transition finishes",
+                ));
+            }
             if let Some(receipt) = state.chat_handoffs.get_mut(&session.id) {
                 receipt.validate_source(&session)?;
                 receipt.subscribers.entry(client).or_insert(false);
