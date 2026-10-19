@@ -31,6 +31,9 @@ const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// Pipe EOF may precede the kernel's child-exit publication. Do not turn that
+// short interval into an uncertain provider owner, or wait for a live writer.
+const PROTOCOL_EXIT_GRACE: Duration = Duration::from_millis(100);
 const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 /// Frames parsed per poll iteration: bounded so a provider flood cannot starve
 /// the stdin writer or queued UI commands.
@@ -1441,6 +1444,45 @@ struct ChildGuard {
     terminated: bool,
 }
 impl ChildGuard {
+    /// Wait on the original child capability without reaping it or releasing
+    /// the process-group identity needed by teardown.
+    fn observe_exit_within(
+        &self,
+        grace: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + grace;
+        loop {
+            if let Some(status) = self.observed_exit_status()? {
+                return Ok(Some(status));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.identity.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32;
+            // SAFETY: descriptor points to one initialized pollfd and the
+            // owned pidfd stays open throughout this non-reaping observation.
+            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+                return Err(std::io::Error::other(
+                    "Provider exit capability became unavailable",
+                ));
+            }
+        }
+    }
+
     /// Capture immediately after spawn, before any code can reap this child.
     fn new(mut child: Child) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
@@ -1856,7 +1898,7 @@ impl Actor {
                     .child
                     .as_mut()
                     .ok_or("Provider process unavailable")?
-                    .observed_exit_status()
+                    .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
@@ -6816,6 +6858,58 @@ mod tests {
             );
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
+        for (tail, expected) in [
+            ("sleep 0.02; exit 0", None),
+            ("sleep 0.02; exit 7", Some("Provider exited with")),
+            ("sleep 5", Some("unobservable writer")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), format!("read -r init; exec 1>&-; {tail}")],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = handle.is_completed();
+            let failure = handle.failure();
+            // Join and reap the owned actor before checking any failure path.
+            handle.close().unwrap();
+            assert!(completed, "EOF classification exceeded its bound: {tail}");
+            match expected {
+                None => {
+                    assert_eq!(failure, None);
+                    assert!(!handle.owns_work());
+                }
+                Some(message) => {
+                    assert!(
+                        failure
+                            .as_deref()
+                            .is_some_and(|error| error.contains(message)),
+                        "{tail}: {failure:?}"
+                    );
+                    assert!(
+                        handle.owns_work(),
+                        "uncertain/failed writer must remain protected"
+                    );
+                }
+            }
         }
     }
 

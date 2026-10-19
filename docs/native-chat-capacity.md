@@ -67,12 +67,17 @@ cagents chat release FULL-CHAT-ID --dry-run
 An idle activity label alone does not authorize release. The daemon checks the
 exact resident, provider state, ownership, transitions, attached readers and
 whether saved history can be reopened. The inspection reports why release is
-blocked. Running, waiting or unconfirmed work remains protected. The initial
-release path supports detached, unmanaged read-only history readers after their
-history has loaded and can be verified again. Ordinary resident writers remain
-protected, including completed writers. A finished run alone does not establish
-that dropping its resident cache preserves the full transcript. The command is
-not a general cleanup operation for every Idle or completed row in the table.
+blocked. Running, waiting or unconfirmed work remains protected. Release supports
+detached, unmanaged Claude history readers and writers whose provider teardown
+has finished successfully. Every cached item, metadata field and body chunk must
+be covered by a fresh local history reload before its resident cache can be
+released. Reopening uses read-only history and never starts the provider.
+
+A completed writer may still be blocked: live observation timestamps, unsaved
+messages, child transcripts or private image files can make its cache differ
+from saved provider history. Those residents remain protected. A finished run
+alone does not establish that dropping its cache preserves the full transcript.
+The command is not a general cleanup operation for every Idle or completed row.
 
 If inspection confirms eligibility, `cagents chat release FULL-CHAT-ID --yes`
 explicitly requests release. The CLI obtains a fresh identity proof and the
