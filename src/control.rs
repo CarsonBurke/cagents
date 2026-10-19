@@ -1476,6 +1476,15 @@ impl ControlClient {
         }
     }
 
+    /// Exercises the public control wire in host integration fixtures.
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_request(
+        &mut self,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, ControlError> {
+        self.request_strict(request)
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
