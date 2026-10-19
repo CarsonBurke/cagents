@@ -452,10 +452,8 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     let stale = handle.snapshot(None).unwrap().generation;
     handle.command(Command::Refresh).unwrap();
     assert!(
-        handle
-            .close_if_idle(stale)
-            .unwrap_err()
-            .contains("state changed")
+        !handle.try_close_if_idle(stale).unwrap(),
+        "idle metadata drift must defer without stopping the actor"
     );
     assert!(!handle.is_completed());
     assert_eq!(
@@ -2440,6 +2438,23 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         1,
         "the decision outlives the turn"
     );
+
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session].handle.clone();
+    let stale = handle.snapshot(None).unwrap().generation.wrapping_sub(1);
+    assert!(
+        handle.try_close_if_idle(stale).is_err(),
+        "stale generation must not hide a pending permission request"
+    );
+    assert!(!handle.is_completed());
 
     let error = control(answer(&asked.id, "allow")).unwrap_err();
     assert!(error.contains("only decline"), "{error}");

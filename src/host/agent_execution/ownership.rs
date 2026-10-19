@@ -7,7 +7,7 @@ use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 pub(in crate::host) enum Reconciliation {
     Closed,
     Idle,
-    /// The exact owned provider is still draining work; retain its slot.
+    /// The exact owned provider is busy or changed before idle close; retain its slot.
     Busy,
     UserOwned,
 }
@@ -164,7 +164,9 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             return Ok(Reconciliation::Idle);
         }
         if let Some(generation) = idle_generation {
-            handle.close_if_idle(generation)?;
+            if !handle.try_close_if_idle(generation)? {
+                return Ok(Reconciliation::Busy);
+            }
         }
         super::super::chat::process(
             host,

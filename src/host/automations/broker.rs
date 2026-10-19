@@ -900,6 +900,11 @@ mod tests {
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     handle.release_run(&host, &firing, 10_002).unwrap();
+                    let observed = registry.lock().unwrap().automation(enabled.id).unwrap();
+                    assert!(
+                        pause || observed.enabled,
+                        "cleanup unexpectedly paused {mode:?}: {observed:?}"
+                    );
                     if registry
                         .lock()
                         .unwrap()

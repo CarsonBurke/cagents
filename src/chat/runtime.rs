@@ -55,6 +55,7 @@ enum ActorCommand {
     IdlePrompt(String),
     CloseIfIdle {
         generation: u64,
+        closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
@@ -683,9 +684,23 @@ impl Handle {
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
     }
 
-    pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
-        self.close()
+    fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
+        let (closed, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseIfIdle { generation, closed })?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Provider idle close was not acknowledged: {error}"))
+    }
+
+    /// False proves the actor was idle but its generation changed. No close
+    /// occurred; the caller may take a new snapshot and retry its exact owner.
+    /// Nonidle state and uncertain acknowledgement remain errors.
+    pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+        if !self.claim_idle_close(generation)? {
+            return Ok(false);
+        }
+        self.close()?;
+        Ok(true)
     }
 
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
@@ -697,7 +712,9 @@ impl Handle {
         ) {
             self.0.retain_cleanup_receipt.store(true, Ordering::Release);
         }
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        if !self.claim_idle_close(generation)? {
+            return Err("Provider state changed before conditional idle close".into());
+        }
         self.close_for_resume()
     }
 
@@ -2141,18 +2158,23 @@ impl Actor {
                     }
                     (None, Command::Interrupt)
                 }
-                ActorCommand::CloseIfIdle { generation } => {
+                ActorCommand::CloseIfIdle { generation, closed } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let idle = state.generation == generation
-                        && self.update_readiness(&state) == UpdateReadiness::Idle;
-                    if idle {
+                    // A stale generation must never hide new requests, child
+                    // work or pending transport. Only a proved idle actor can
+                    // return the retryable generation-change receipt.
+                    if self.update_readiness(&state) != UpdateReadiness::Idle {
+                        let _ = reply.send(Err(
+                            "Provider state changed before conditional idle close".into(),
+                        ));
+                        continue;
+                    }
+                    let unchanged = state.generation == generation;
+                    if unchanged {
                         self.stop.store(true, Ordering::Release);
                     }
-                    let _ = reply.send(if idle {
-                        Ok(())
-                    } else {
-                        Err("Provider state changed before conditional idle close".into())
-                    });
+                    let _ = closed.send(unchanged);
+                    let _ = reply.send(Ok(()));
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
