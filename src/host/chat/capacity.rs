@@ -20,6 +20,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
                 state.chats.len(),
                 state.chat_spawning.len(),
                 state.native_chat_capacity,
+                used,
             ),
             true,
         ));
