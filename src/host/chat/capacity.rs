@@ -69,7 +69,24 @@ impl Reservation {
                         .get(&terminal.id)
                         .is_some_and(|live| live.session.launch == terminal.launch)
                 });
-            if paired {
+            // Older source-based callers may omit terminal metadata. The
+            // second attachment path resolves their exact proven live worker
+            // before checking the conversation; preserve that path without
+            // treating an arbitrary live chat as recoverable.
+            let resolving_pair = terminal_proof.is_some()
+                && source.launch.provider == Provider::Codex
+                && record.session.launch.provider == Provider::Codex
+                && record.session.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.id == source.id
+                        && state.terminals.get(&terminal.id).is_some_and(|live| {
+                            live.session.launch == terminal.launch
+                                && record
+                                    .paired_terminal
+                                    .as_ref()
+                                    .is_some_and(|paired| paired.same_worker(&live.handle))
+                        })
+                });
+            if paired || resolving_pair {
                 validate_proof(terminal_proof.or(source.proof.as_ref()), state.proof())?;
                 return Ok(None);
             }
@@ -199,8 +216,9 @@ mod tests {
         }
         // This launch cannot pass account/history/adapter setup. Capacity must
         // be the first failure, before any attempt to create its environment.
-        let failure =
-            start(&host, 1, session(), None, false, None, Default::default()).unwrap_err();
+        let mut rejected = session();
+        rejected.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        let failure = start(&host, 1, rejected, None, false, None, Default::default()).unwrap_err();
         assert_eq!(failure.code, ProtocolErrorCode::ChatCapacity);
         assert!(failure.message.contains("0 resident, 1 starting, limit 1"));
         assert_eq!(host.lock().unwrap().chat_spawning.len(), 1);
@@ -280,6 +298,10 @@ mod tests {
         assert_eq!(usage(&host.lock().unwrap()), 0);
     }
     fn closed_history(host: &SharedHost) -> (tempfile::TempDir, Session, Handle) {
+        history_reader(host, true)
+    }
+
+    fn history_reader(host: &SharedHost, close: bool) -> (tempfile::TempDir, Session, Handle) {
         let directory = tempfile::tempdir().unwrap();
         let mut source = session();
         source.proof = Some(host.lock().unwrap().proof().clone());
@@ -324,7 +346,17 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        handle.close().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.snapshot(None).unwrap().read_only_reason.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "history initialization did not complete"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        if close {
+            handle.close().unwrap();
+        }
         host.lock().unwrap().chats.insert(
             source.id,
             Record {
@@ -385,4 +417,386 @@ mod tests {
         assert!(state.chat_spawning.is_empty());
         assert_eq!(usage(&state), 1);
     }
+    #[test]
+    fn release_dry_run_and_exact_nonce_preserve_history_and_successor() {
+        let host = host();
+        let (_directory, source, handle) = closed_history(&host);
+        let inspection = inspect(&host, source.id).unwrap();
+        assert_eq!(inspection.release_blocked, None);
+        release(&host, &inspection.proof, true).unwrap();
+        assert!(host.lock().unwrap().chats.contains_key(&source.id));
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .execution_instance = uuid::Uuid::new_v4();
+        assert!(release(&host, &inspection.proof, false).is_err());
+        let fresh = inspect(&host, source.id).unwrap();
+        release(&host, &fresh.proof, false).unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        drop(handle);
+        let (_, mut adapter) = chat::protocol::create(&fresh.proof.session.launch).unwrap();
+        let loaded = adapter.initialize().unwrap();
+        assert!(
+            loaded.events.iter().any(
+                |event| matches!(event, chat::Event::History { items, .. } if !items.is_empty())
+            )
+        );
+    }
+
+    #[test]
+    fn release_refuses_attached_transition_and_missing_provider_history() {
+        let host = host();
+        let (directory, source, _handle) = closed_history(&host);
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .subscribers
+            .insert(4, false);
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("attached")
+        );
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .subscribers
+            .clear();
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(source.id, source.clone());
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("transition")
+        );
+        host.lock().unwrap().chat_spawning.clear();
+        std::fs::remove_dir_all(directory.path().join("claude")).unwrap();
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("history")
+        );
+        assert!(host.lock().unwrap().chats.contains_key(&source.id));
+    }
+    #[test]
+    fn exact_recovery_has_one_reservation_and_rejects_the_second_before_setup() {
+        let host = host();
+        let (_directory, source, _) = closed_history(&host);
+        host.lock().unwrap().native_chat_capacity = 1;
+        let first = Reservation::new(&host, &source).unwrap();
+        assert!(first.is_some());
+        assert!(Reservation::new(&host, &source).is_err());
+        assert_eq!(usage(&host.lock().unwrap()), 1);
+        drop(first);
+        assert!(Reservation::new(&host, &source).unwrap().is_some());
+    }
+
+    #[test]
+    fn live_read_only_paging_worker_can_be_released_without_provider_execution() {
+        let host = host();
+        let (_directory, source, handle) = history_reader(&host, false);
+        assert!(!handle.is_completed());
+        assert!(!handle.owns_work());
+        let inspection = inspect(&host, source.id).unwrap();
+        assert_eq!(inspection.release_blocked, None);
+        release(&host, &inspection.proof, false).unwrap();
+        assert!(handle.is_completed());
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        let (_, mut adapter) = chat::protocol::create(&source.launch).unwrap();
+        assert!(!adapter.initialize().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn live_and_closed_writers_are_preserved_even_when_their_snapshot_is_idle() {
+        struct Idle;
+        impl chat::protocol::Adapter for Idle {
+            fn initialize(&mut self) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<chat::protocol::Step, String> {
+                Ok(Default::default())
+            }
+        }
+        let host = host();
+        let (_directory, source, _) = closed_history(&host);
+        let mut recipe = source.launch.recipe.clone();
+        recipe.program = "/bin/cat".into();
+        recipe.working_directory = std::env::current_dir().unwrap();
+        let spec = chat::protocol::ProcessSpec::from(&recipe);
+        let mut initial = chat::protocol::Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(Idle),
+            initial,
+            store,
+            source.launch.session_id.clone(),
+            |_| {},
+        )
+        .unwrap();
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .handle = handle.clone();
+        assert!(Reservation::new(&host, &source).is_err());
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("owns")
+        );
+        handle.close().unwrap();
+        assert!(
+            inspect(&host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("durable")
+        );
+        assert!(host.lock().unwrap().chats.contains_key(&source.id));
+    }
+}
+
+pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    status_from_state(&state)
+}
+
+pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
+    crate::terminal_ipc::ChatCapacity {
+        resident: state.chats.len() as u32,
+        spawning: state.chat_spawning.len() as u32,
+        limit: state.native_chat_capacity as u32,
+        used: usage(&state) as u32,
+        residents: state
+            .chats
+            .iter()
+            .take(4096)
+            .map(|(&id, record)| crate::terminal_ipc::ChatCapacityResident {
+                chat_id: id,
+                provider: record.session.launch.provider,
+                status: if state.chat_spawning.contains_key(&id) {
+                    "starting".into()
+                } else if record.handle.is_read_only_history() {
+                    "read-only history".into()
+                } else if record.handle.is_completed() {
+                    "closed".into()
+                } else {
+                    format!("{:?}", record.handle.activity())
+                },
+                release_blocked: if record.handle.owns_work() {
+                    Some("Actor owns live or unconfirmed provider work".into())
+                } else if !record.subscribers.is_empty() {
+                    Some("A client is attached".into())
+                } else if !record.handle.is_read_only_history() {
+                    Some("Writer transcript durability is unverified".into())
+                } else if state.chat_spawning.contains_key(&id)
+                    || state.native_closing.contains_key(&id)
+                    || state.chat_handoffs.contains_key(&id)
+                    || record.returning_terminal
+                {
+                    Some("Ownership transition is pending".into())
+                } else if record.paired_terminal.is_some() || record.session.terminal.is_some() {
+                    Some("Paired terminal ownership remains".into())
+                } else {
+                    None
+                },
+            })
+            .collect(),
+        omitted_residents: state.chats.len().saturating_sub(4096) as u32,
+    }
+}
+
+fn inspected_record(
+    state: &HostState,
+    id: TerminalId,
+) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle), ProtocolError> {
+    let record = state
+        .chats
+        .get(&id)
+        .ok_or_else(|| unavailable("Native chat is no longer resident"))?;
+    let ServerResponse::ChatAttached { session, snapshot } = session_snapshot(record) else {
+        unreachable!()
+    };
+    let blocked = if state.shutting_down {
+        Some("Daemon is shutting down")
+    } else if state.chat_spawning.contains_key(&id)
+        || state.native_closing.contains_key(&id)
+        || state.chat_handoffs.contains_key(&id)
+        || record.returning_terminal
+    {
+        Some("A native ownership transition is pending")
+    } else if record.handle.owns_work() {
+        Some(
+            "The actor is live or still owns unconfirmed backend work; idle does not authorize release",
+        )
+    } else if !record.subscribers.is_empty() {
+        Some("A client is attached; detach its view before releasing the resident actor")
+    } else if record.paired_terminal.is_some() || session.terminal.is_some() {
+        Some("The actor retains a paired terminal")
+    } else if !matches!(
+        session.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    ) || session.owned_codex_listener.is_some()
+    {
+        Some("The actor retains native provider ownership; use its authenticated close operation")
+    } else if snapshot.busy
+        || snapshot.waiting
+        || !snapshot.requests.is_empty()
+        || !record.handle.background_subagents().is_empty()
+    {
+        Some("The actor still reports pending or delegated work")
+    } else if !record.handle.is_read_only_history() {
+        Some("Completed writer history is not proven durable; its resident transcript is preserved")
+    } else if !snapshot.exited || snapshot.read_only_reason.is_none() {
+        Some("The read-only history has not finished loading")
+    } else if session.launch.session_id.is_none() {
+        Some("The provider conversation identity is unconfirmed")
+    } else {
+        None
+    };
+    Ok((
+        crate::terminal_ipc::ChatReleaseInspection {
+            proof: crate::terminal_ipc::ChatReleaseProof {
+                session,
+                generation: snapshot.generation,
+                execution_instance: record.execution_instance,
+            },
+            release_blocked: blocked.map(str::to_owned),
+        },
+        record.handle.clone(),
+    ))
+}
+
+pub(in crate::host) fn inspect(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
+    let (mut inspection, _) =
+        inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
+    if inspection.release_blocked.is_some() {
+        return Ok(inspection);
+    }
+    // Managed run state is independent of actor activity. Do not cancel or
+    // retire any managed authority through this resident-only operation.
+    if let Ok(registry) = super::super::agent_execution::registry(host) {
+        match registry.lock().unwrap_or_else(|p| p.into_inner()).agent_for_session(id) {
+            Ok(None) => {},
+            Ok(Some(_)) => inspection.release_blocked = Some("The actor belongs to a managed agent; use its supported owned-agent close operation".into()),
+            Err(error) => inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}")),
+        }
+    }
+    if inspection.release_blocked.is_none() {
+        let reload = (|| -> Result<(), String> {
+            if has_native_owner(&inspection.proof.session).map_err(|error| error.message)? {
+                return Err("An authenticated native provider owner remains".into());
+            }
+            let (spec, mut adapter) = chat::protocol::create(&inspection.proof.session.launch)?;
+            if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
+                return Err(
+                    "The saved conversation cannot currently be reopened as read-only history"
+                        .into(),
+                );
+            }
+            let initial = adapter.initialize()?;
+            if !initial.writes.is_empty() {
+                return Err("History reload attempted a provider write".into());
+            }
+            if initial
+                .events
+                .iter()
+                .any(|event| matches!(event, chat::Event::HistoryError(_)))
+            {
+                return Err("Provider history could not be reloaded".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = reload {
+            inspection.release_blocked =
+                Some(format!("Saved provider history is not verified: {error}"));
+        }
+    }
+    Ok(inspection)
+}
+
+pub(in crate::host) fn release(
+    host: &SharedHost,
+    proof: &crate::terminal_ipc::ChatReleaseProof,
+    dry_run: bool,
+) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
+    let inspection = inspect(host, proof.session.id)?;
+    if inspection.proof != *proof {
+        return Err(error(
+            "The exact native actor or its generation changed; inspect it again",
+        ));
+    }
+    if let Some(reason) = &inspection.release_blocked {
+        return Err(unavailable(reason.clone()));
+    }
+    let mut reservation = None;
+    let handle = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(proof.session.proof.as_ref(), state.proof())?;
+        let (current, handle) = inspected_record(&state, proof.session.id)?;
+        if current.proof != *proof || current.release_blocked.is_some() {
+            return Err(error(
+                "The exact native actor or its release eligibility changed; inspect it again",
+            ));
+        }
+        if dry_run {
+            return Ok(inspection);
+        }
+        Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
+        handle
+    };
+    // This proven history reader owns no provider process, socket or execution
+    // authority. Closing it stops paging only, never an agent or provider run.
+    handle.close().map_err(unavailable)?;
+    let retired = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&proof.session.id)
+            .ok_or_else(|| error("Native history reader changed while closing"))?;
+        if !record.handle.same_actor(&handle)
+            || record.execution_instance != proof.execution_instance
+            || !record.subscribers.is_empty()
+            || record.handle.owns_work()
+            || state.chat_spawning.get(&proof.session.id) != Some(&proof.session)
+        {
+            return Err(error(
+                "The exact native history reader changed; its successor was preserved",
+            ));
+        }
+        state.inventory_generation += 1;
+        let retired = state.chats.remove(&proof.session.id);
+        if let Some(notifications) = &state.notifications {
+            notifications.retire(proof.session.id);
+        }
+        retired
+    };
+    // Store cleanup and final worker joining must never hold the host mutex.
+    drop(retired);
+    drop(reservation);
+    Ok(inspection)
 }

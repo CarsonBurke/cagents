@@ -2011,6 +2011,29 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatCapacityInspect => Ok(ServerResponse::ChatCapacity {
+            capacity: capacity::status(host),
+            persistence_warning: None,
+        }),
+        ClientRequest::ChatCapacitySet { limit } => {
+            crate::native_chat_capacity::validate(limit).map_err(error)?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = crate::native_chat_capacity::save(limit).map_err(|failure| {
+                unavailable(format!("Cannot persist native chat capacity: {failure}"))
+            })?;
+            state.native_chat_capacity = limit as usize;
+            Ok(ServerResponse::ChatCapacity {
+                capacity: capacity::status_from_state(&state),
+                persistence_warning: saved.durability_warning,
+            })
+        }
+        ClientRequest::ChatReleaseInspect { chat_id } => Ok(ServerResponse::ChatReleaseInspected {
+            inspection: capacity::inspect(host, chat_id)?,
+        }),
+        ClientRequest::ChatRelease { proof, dry_run } => Ok(ServerResponse::ChatReleased {
+            inspection: capacity::release(host, &proof, dry_run)?,
+            dry_run,
+        }),
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()

@@ -1020,6 +1020,10 @@ impl Handle {
             .error
             .clone()
     }
+    pub(crate) fn is_read_only_history(&self) -> bool {
+        self.0.history_only
+    }
+
     pub fn owns_work(&self) -> bool {
         !self.0.history_only
             && (!self.is_completed()
