@@ -2179,6 +2179,15 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
+            let missing = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(session.proof.as_ref(), state.proof())?;
+                !state.chats.contains_key(&session.id)
+                    && !state.chat_handoffs.contains_key(&session.id)
+            };
+            if missing {
+                return capacity::restore_saved_history(host, client, session);
+            }
             // A live actor remains attachable after account removal. A stopped
             // actor cannot resume with that home, so expose the same recovery
             // choice without creating a replacement process.

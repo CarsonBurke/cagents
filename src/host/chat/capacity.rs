@@ -827,6 +827,207 @@ mod tests {
         assert!(handle.is_completed());
         assert!(!host.lock().unwrap().chats.contains_key(&source.id));
     }
+
+    fn restore_client(
+        host: &SharedHost,
+        source: Session,
+        client_id: ClientId,
+    ) -> (
+        Result<chat::client::ClientHandle, chat::StartFailure>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server = thread::spawn(move || {
+            super::super::super::client::serve(server, client_id, server_host);
+        });
+        (
+            chat::client::ClientHandle::fixture_restore(client, source),
+            server,
+        )
+    }
+
+    fn wait_for_client_history(client: &chat::client::ClientHandle) {
+        client.set_visible(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = client.snapshot();
+            if snapshot.read_only_reason.is_some()
+                && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real client did not receive saved history"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn released_history_reopens_through_real_client_restore_even_when_directory_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        for directory_returns in [false, true] {
+            let host = host();
+            let (directory, mut source, _) = history_reader(&host, false);
+            let marker = directory.path().join("provider-started");
+            let program = directory.path().join("provider");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf started > '{}'\nexit 91\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            source.launch.recipe.program = program.to_string_lossy().into_owned();
+            host.lock()
+                .unwrap()
+                .chats
+                .get_mut(&source.id)
+                .unwrap()
+                .session = source.clone();
+            let (first, server) = restore_client(&host, source.clone(), 41);
+            let first = first.unwrap();
+            wait_for_client_history(&first);
+            assert_eq!(first.session(), source);
+            assert!(first.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
+            drop(first);
+            server.join().unwrap();
+            assert!(
+                host.lock().unwrap().chats[&source.id]
+                    .subscribers
+                    .is_empty()
+            );
+
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let server =
+                thread::spawn(move || super::super::super::client::serve(server, 42, server_host));
+            let mut control = crate::control::ControlClient::from_stream(client).unwrap();
+            control.authenticate(Default::default()).unwrap();
+            let ServerResponse::ChatReleaseInspected { inspection } = control
+                .fixture_request(ClientRequest::ChatReleaseInspect { chat_id: source.id })
+                .unwrap()
+            else {
+                panic!("release inspection response")
+            };
+            assert_eq!(inspection.release_blocked, None);
+            assert!(matches!(
+                control
+                    .fixture_request(ClientRequest::ChatRelease {
+                        proof: inspection.proof,
+                        dry_run: false
+                    })
+                    .unwrap(),
+                ServerResponse::ChatReleased { dry_run: false, .. }
+            ));
+            drop(control);
+            server.join().unwrap();
+            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+            if directory_returns {
+                std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
+            }
+
+            let pending = session();
+            {
+                let mut state = host.lock().unwrap();
+                state.native_chat_capacity = 1;
+                state.chat_spawning.insert(pending.id, pending.clone());
+            }
+            let (full, server) = restore_client(&host, source.clone(), 43);
+            let failure = match full {
+                Err(failure) => failure,
+                Ok(_) => panic!("full capacity restored a new resident"),
+            };
+            assert!(failure.message.contains("capacity reached"));
+            server.join().unwrap();
+            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+            host.lock().unwrap().chat_spawning.remove(&pending.id);
+
+            let (restored, server) = restore_client(&host, source.clone(), 44);
+            let restored = restored.unwrap();
+            wait_for_client_history(&restored);
+            assert_eq!(restored.session(), source);
+            assert!(restored.snapshot().read_only_reason.is_some());
+            assert!(restored.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
+            assert!(
+                !marker.exists(),
+                "restoring history must never execute the provider program"
+            );
+            assert!(
+                host.lock().unwrap().chats[&source.id]
+                    .handle
+                    .is_read_only_history()
+            );
+            assert!(!host.lock().unwrap().chats[&source.id].handle.owns_work());
+            drop(restored);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_saved_history_refuses_unknown_ownership_and_native_writer_descriptors() {
+        let host = host();
+        let (_directory, source, _) = closed_history(&host);
+        let proof = inspect(&host, source.id).unwrap().proof;
+        release(&host, &proof, false).unwrap();
+        let registry = host.lock().unwrap().execution_registry.take().unwrap();
+        assert!(
+            process_inner(
+                &host,
+                51,
+                ClientRequest::ChatAttach {
+                    session: source.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        host.lock().unwrap().execution_registry = Some(registry.clone());
+        registry
+            .lock()
+            .unwrap()
+            .register_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .unwrap();
+        assert!(
+            process_inner(
+                &host,
+                51,
+                ClientRequest::ChatAttach {
+                    session: source.clone()
+                }
+            )
+            .is_err()
+        );
+        registry
+            .lock()
+            .unwrap()
+            .retire_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
+            .unwrap();
+        let mut durable = source.clone();
+        durable.native_continuity = chat::NativeContinuity::Durable {
+            provider_version: "test".into(),
+        };
+        assert!(process_inner(&host, 51, ClientRequest::ChatAttach { session: durable }).is_err());
+        let mut wrong_daemon = source;
+        wrong_daemon.proof = None;
+        assert!(
+            process_inner(
+                &host,
+                51,
+                ClientRequest::ChatAttach {
+                    session: wrong_daemon
+                }
+            )
+            .is_err()
+        );
+        assert!(host.lock().unwrap().chats.is_empty());
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+    }
 }
 
 pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
@@ -954,19 +1155,9 @@ pub(in crate::host) fn inspect(
     super::super::account_lifecycle::ensure_idle(host)?;
     // Managed run state is independent of actor activity. Do not cancel or
     // retire any managed authority through this resident-only operation.
-    let registry = match super::super::agent_execution::registry(host) {
-        Ok(registry) => registry,
-        Err(error) => {
-            inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
-            return Ok(inspection);
-        }
-    };
-    {
-        match registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(id) {
-            Ok(sources) if sources.is_empty() => {},
-            Ok(_) => inspection.release_blocked = Some("The actor belongs to a managed agent; use its supported owned-agent close operation".into()),
-            Err(error) => inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}")),
-        }
+    if let Err(error) = require_unmanaged(host, id) {
+        inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
+        return Ok(inspection);
     }
     if inspection.release_blocked.is_none() {
         let reload = reload_history(&inspection.proof.session)
@@ -984,10 +1175,21 @@ pub(in crate::host) fn inspect(
 }
 
 fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
+    let (spec, _, mut initial) = load_history(session)?;
+    chat::runtime::preflight(&spec, &mut initial)
+}
+
+type LoadedHistory = (
+    chat::protocol::ProcessSpec,
+    Box<dyn chat::protocol::Adapter>,
+    chat::protocol::Step,
+);
+
+fn load_history(session: &Session) -> Result<LoadedHistory, String> {
     if has_native_owner(session).map_err(|error| error.message)? {
         return Err("An authenticated native provider owner remains".into());
     }
-    let (spec, mut adapter) = chat::protocol::create(&session.launch)?;
+    let (spec, mut adapter) = chat::protocol::create_history(&session.launch)?;
     if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
         return Err(
             "The saved conversation cannot currently be reopened as read-only history".into(),
@@ -1004,7 +1206,119 @@ fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
     {
         return Err("Provider history could not be reloaded".into());
     }
-    chat::runtime::preflight(&spec, &mut initial)
+    Ok((spec, adapter, initial))
+}
+
+fn require_unmanaged(host: &SharedHost, id: TerminalId) -> Result<(), String> {
+    let registry = super::super::agent_execution::registry(host)?;
+    if registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(id)?
+        .is_empty()
+    {
+        Ok(())
+    } else {
+        Err(
+            "The actor belongs to a managed agent; use its supported owned-agent close operation"
+                .into(),
+        )
+    }
+}
+
+/// A saved read-only descriptor can outlive its resident paging worker. This
+/// path never resumes a provider: the constructor must prove History transport
+/// again, even if the working directory changes while the request is admitted.
+pub(super) fn restore_saved_history(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+) -> Result<ServerResponse, ProtocolError> {
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(session.proof.as_ref(), state.proof())?;
+    }
+    if session.terminal.is_some()
+        || session.owned_codex_listener.is_some()
+        || !matches!(
+            session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        )
+        || session.launch.provider != Provider::Claude
+    {
+        return Err(unavailable(
+            "Exact native chat not found; only saved read-only history can be reattached without a resident actor",
+        ));
+    }
+    let admission = Reservation::new_with_source(host, &session, None)?;
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chats.contains_key(&session.id) {
+            return Err(unavailable(
+                "The saved history became resident; retry its normal attach",
+            ));
+        }
+    }
+    super::super::account_lifecycle::ensure_idle(host)?;
+    require_unmanaged(host, session.id).map_err(unavailable)?;
+    let (mut spec, adapter, mut initial) = load_history(&session).map_err(unavailable)?;
+    spec.messages = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox_seal
+        .clone();
+    let store = chat::runtime::preflight(&spec, &mut initial).map_err(unavailable)?;
+    let environment = spec.environment.clone();
+    let weak = Arc::downgrade(host);
+    let id = session.id;
+    let handle = Handle::start_owned(
+        spec,
+        adapter,
+        initial,
+        store,
+        session.clone(),
+        environment,
+        move |update| changed(&weak, id, update),
+    )
+    .map_err(unavailable)?;
+    let result = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down
+            || state.chats.contains_key(&id)
+            || state.chat_spawning.get(&id) != Some(&session)
+        {
+            Err(unavailable(
+                "Native history ownership changed before installation",
+            ))
+        } else {
+            let observation = Observation {
+                after_generation: handle.observe_next_update(),
+                ..Observation::default()
+            };
+            let record = Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session,
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::from([(client, false)]),
+                observations: BTreeMap::from([(client, observation)]),
+                completion_observed: false,
+                returning_terminal: false,
+            };
+            let response = session_snapshot(&record);
+            record.handle.commit_native_installation();
+            state.chats.insert(id, record);
+            state.inventory_generation += 1;
+            Ok(response)
+        }
+    };
+    if result.is_err() {
+        let _ = handle.close();
+    }
+    drop(admission);
+    result
 }
 
 pub(in crate::host) fn release(

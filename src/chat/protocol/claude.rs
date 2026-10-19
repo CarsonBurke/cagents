@@ -38,6 +38,35 @@ const MODES: &[&str] = &[
 ];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, false)
+}
+
+pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, true)
+}
+
+fn create_inner(
+    launch: &Launch,
+    forced_history: bool,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    if forced_history
+        && (launch
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.len() != 36 || uuid::Uuid::parse_str(id).is_err())
+            || !launch.recipe.working_directory.is_absolute()
+            || launch.recipe.working_directory.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            }))
+    {
+        return Err(
+            "Read-only history requires an exact saved conversation and absolute working directory"
+                .into(),
+        );
+    }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.arguments = arguments(launch)?;
     let history = launch
@@ -45,7 +74,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .as_deref()
         .map(|id| History::open(launch, id))
         .transpose()?;
-    let history_only = launch.needs_read_only_history();
+    let history_only = forced_history || launch.needs_read_only_history();
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
@@ -62,6 +91,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             session_id: Some(session_id),
             resumed: launch.session_id.is_some(),
             history_only,
+            forced_history,
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
@@ -418,6 +448,7 @@ struct Claude {
     history: Option<History>,
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
+    forced_history: bool,
 }
 impl Claude {
     fn observe_title(&mut self, step: &mut Step) {
@@ -1765,10 +1796,14 @@ impl Adapter for Claude {
         }
         if self.history_only {
             self.observe_title(&mut step);
-            let reason = format!(
-                "The saved working directory {} is unavailable. Conversation history is read-only.",
-                self.cwd.display()
-            );
+            let reason = if self.forced_history {
+                "Saved conversation history is read-only; no provider was started.".to_owned()
+            } else {
+                format!(
+                    "The saved working directory {} is unavailable. Conversation history is read-only.",
+                    self.cwd.display()
+                )
+            };
             step.events.push(Event::ReadOnlyHistory {
                 reason: reason.clone(),
             });
@@ -1787,10 +1822,11 @@ impl Adapter for Claude {
             match command {
                 Command::LoadEarlier => {}
                 Command::Refresh => return Ok(Step::default()),
-                _ => return Err(
-                    "The saved working directory is unavailable; this conversation is read-only"
-                        .into(),
-                ),
+                _ => {
+                    return Err(
+                        "This saved conversation is read-only; no provider was started".into(),
+                    );
+                }
             }
         }
         match command {
