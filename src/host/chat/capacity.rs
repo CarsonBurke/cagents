@@ -36,6 +36,28 @@ pub(super) struct Reservation {
 }
 
 impl Reservation {
+    /// Fence teardown through durable retirement, including the interval after
+    /// its resident record is removed and before its old authority is retired.
+    pub(super) fn closing(
+        host: &SharedHost,
+        state: &mut HostState,
+        source: &Session,
+    ) -> Result<Self, ProtocolError> {
+        if state.chat_spawning.contains_key(&source.id) {
+            return Err(error("Chat is already starting or closing"));
+        }
+        state.chat_spawning.insert(source.id, source.clone());
+        state.inventory_generation += 1;
+        Ok(Self {
+            host: host.clone(),
+            source: source.clone(),
+        })
+    }
+
+    pub(super) fn holds(&self, state: &HostState, id: TerminalId) -> bool {
+        self.source.id == id && state.chat_spawning.get(&id) == Some(&self.source)
+    }
+
     pub(super) fn new(host: &SharedHost, source: &Session) -> Result<Option<Self>, ProtocolError> {
         Self::new_with_source(host, source, None)
     }
@@ -379,6 +401,94 @@ mod tests {
             },
         );
         (directory, source, handle)
+    }
+
+    #[test]
+    fn pending_recovery_rejects_close_without_stopping_retained_actor() {
+        let host = host();
+        let (_directory, source, handle) = history_reader(&host, false);
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .subscribers
+            .insert(7, false);
+        let admission = Reservation::new(&host, &source).unwrap();
+        let failure =
+            process(&host, 7, ClientRequest::ChatClose { chat_id: source.id }).unwrap_err();
+        assert!(failure.message.contains("starting or closing"));
+        assert!(
+            !handle.is_completed(),
+            "recovery's retained reader must not be stopped"
+        );
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .handle
+                .same_actor(&handle)
+        );
+        assert!(host.lock().unwrap().chat_spawning.contains_key(&source.id));
+        drop(admission);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn close_fences_replacement_before_retirement_and_after_resident_removal() {
+        let host = host();
+        let (_directory, source, handle) = history_reader(&host, false);
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&source.id)
+            .unwrap()
+            .subscribers
+            .insert(7, false);
+        let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        // Hold the real preflight boundary: close must reserve before waiting
+        // on durable retirement, so replacement cannot run provider setup.
+        let locked = registry.lock().unwrap();
+        let closing_host = host.clone();
+        let id = source.id;
+        let close = thread::spawn(move || {
+            process(&closing_host, 7, ClientRequest::ChatClose { chat_id: id })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !host.lock().unwrap().chat_spawning.contains_key(&id) {
+            assert!(
+                Instant::now() < deadline,
+                "close did not reserve before retirement preflight"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(Reservation::new(&host, &source).is_err());
+        assert!(!handle.is_completed());
+        drop(locked);
+        assert!(matches!(
+            close.join().unwrap().unwrap(),
+            ServerResponse::ChatClosed { .. }
+        ));
+        assert!(!host.lock().unwrap().chats.contains_key(&id));
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+
+        // The same lease must survive the final resident-removal boundary.
+        // Otherwise a new same-ID authority could be minted before retired().
+        let lease = {
+            let mut state = host.lock().unwrap();
+            Reservation::closing(&host, &mut state, &source).unwrap()
+        };
+        let failure = start(
+            &host,
+            7,
+            source.clone(),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(failure.message.contains("starting or closing"));
+        drop(lease);
+        assert!(Reservation::new(&host, &source).is_ok());
     }
 
     #[test]

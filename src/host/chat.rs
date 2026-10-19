@@ -2566,15 +2566,17 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
-            let (handle, source) = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let (handle, source, closing) = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
                 let record = attached(&state, client, chat_id)?;
-                (record.handle.clone(), record.session.clone())
+                let (handle, source) = (record.handle.clone(), record.session.clone());
+                let closing = capacity::Reservation::closing(host, &mut state, &source)?;
+                (handle, source, closing)
             };
             super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
             handle.close_for_resume().map_err(unavailable)?;
@@ -2606,7 +2608,8 @@ fn process_inner(
                 // Closing an exited attachment proves only that local actor is
                 // gone. A server preserved by an earlier failed adoption must
                 // also acknowledge exact cleanup before this close can succeed.
-                close_retained_native(host, &retained).map_err(unavailable)?;
+                native_cleanup::close_retained_with_reservation(host, &retained, &closing)
+                    .map_err(unavailable)?;
                 return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
             }
             let terminal = {
@@ -2650,10 +2653,11 @@ fn process_inner(
             }
             let record = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if !state
-                    .chats
-                    .get(&chat_id)
-                    .is_some_and(|record| record.handle.same_actor(&handle))
+                if !closing.holds(&state, chat_id)
+                    || !state
+                        .chats
+                        .get(&chat_id)
+                        .is_some_and(|record| record.handle.same_actor(&handle))
                 {
                     return Err(unavailable(
                         "The thread changed while its previous actor was closing.",
