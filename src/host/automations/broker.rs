@@ -776,13 +776,13 @@ mod tests {
         for mode in [SessionMode::Fresh, SessionMode::Reuse] {
             for pause in [false, true] {
                 let root = path.parent().unwrap();
-                let _ = std::fs::remove_file(root.join("courier-release"));
-                let _ = std::fs::remove_file(root.join("courier-busy"));
+                let _ = std::fs::remove_file(root.join("cleanup-release"));
+                let _ = std::fs::remove_file(root.join("cleanup-busy"));
                 let automation = service::create(
                     &host,
                     Definition {
                         name: "Busy cleanup fixture".into(),
-                        prompt: "COURIER_BACKGROUND".into(),
+                        prompt: "HOLD_CLEANUP_BUSY".into(),
                         agent: spec.clone(),
                         schedule: Schedule {
                             pattern: SchedulePattern::Hourly { minute: 0 },
@@ -826,7 +826,7 @@ mod tests {
                 let accepted = claim.accepted.unwrap();
                 agent_execution::dispatch_accepted(&host, accepted.clone()).unwrap();
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while !root.join("courier-busy").exists() {
+                while !root.join("cleanup-busy").exists() {
                     assert!(std::time::Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -896,7 +896,7 @@ mod tests {
                             .enabled
                     );
                 }
-                std::fs::write(root.join("courier-release"), "release").unwrap();
+                std::fs::write(root.join("cleanup-release"), "release").unwrap();
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     handle.release_run(&host, &firing, 10_002).unwrap();

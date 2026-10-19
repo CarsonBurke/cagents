@@ -107,6 +107,15 @@ while IFS= read -r frame; do
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
       case "$frame" in
+        *HOLD_CLEANUP_BUSY*)
+          : > "$HOME/../cleanup-busy"
+          attempts=0
+          while [ ! -e "$HOME/../cleanup-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 1000 ] || exit 1
+            sleep 0.01
+          done
+          ;;
         *COURIER_BACKGROUND*)
           printf '{"type":"assistant","uuid":"launch-child","message":{"id":"launch-child","role":"assistant","content":[{"type":"tool_use","id":"courier-child","name":"Agent","input":{"run_in_background":true}}]}}\n'
           printf '{"type":"user","uuid":"child-launch-result","tool_use_result":{"status":"async_launched","agentId":"courier-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"courier-child","content":"Launched"}]}}\n'
