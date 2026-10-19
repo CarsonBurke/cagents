@@ -4,8 +4,9 @@ The daemon keeps a bounded number of resident native chat handles. Completed
 handles can still occupy this capacity. This limit is separate from account
 usage allowances and provider plan quotas.
 
-Run `cagents chat capacity` to see resident handles, pending spawns and the
-configured limit. `cagents chat capacity set 256` persists a new limit on the
+Run `cagents chat capacity` to see used admission slots, resident handles, pending spawns and the
+configured limit. A pending recovery can refer to an existing resident, so the
+used count can be lower than resident plus spawning. `cagents chat capacity set 256` persists a new limit on the
 selected daemon. The default is 128; accepted values are 1 through 4096. The
 upper bound limits an accidental configuration change and does not guarantee
 that the machine can run that many providers. Increasing the limit can increase
@@ -17,7 +18,8 @@ resident does not allocate another slot. The daemon saves this setting in
 `native-chat-capacity.toml` beside its window settings, with a private atomic
 replacement. Window settings saves cannot overwrite it. A malformed or unsafe
 capacity file causes daemon startup to report an error rather than silently
-change the limit.
+change the limit. If the atomic replacement succeeds but directory syncing fails,
+the new limit takes effect and the CLI reports a durability warning.
 
 To inspect one handle, run:
 

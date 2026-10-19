@@ -47,7 +47,7 @@ mod persistence {
         load_from(&directory()?)
     }
 
-    pub fn save(limit: u32) -> io::Result<()> {
+    pub fn save(limit: u32) -> io::Result<SaveOutcome> {
         save_to(&directory()?, limit)
     }
 
@@ -65,6 +65,12 @@ mod persistence {
         };
         crate::secure_file::validate_and_privatize_open_file(&directory.join(FILE_NAME), &file)?;
         let bytes = fs_safety::read_bounded(&mut file, MAX_BYTES)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native chat capacity file exceeds 1024 bytes",
+            ));
+        }
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let config: Configuration =
@@ -73,7 +79,21 @@ mod persistence {
         Ok(config.limit)
     }
 
-    fn save_to(directory: &Path, limit: u32) -> io::Result<()> {
+    #[derive(Debug)]
+    pub(crate) struct SaveOutcome {
+        /// The rename committed; only crash durability is uncertain.
+        pub durability_warning: Option<String>,
+    }
+
+    fn save_to(directory: &Path, limit: u32) -> io::Result<SaveOutcome> {
+        save_to_with_sync(directory, limit, fs_safety::sync_directory)
+    }
+
+    fn save_to_with_sync(
+        directory: &Path,
+        limit: u32,
+        sync: impl FnOnce(&Root) -> io::Result<()>,
+    ) -> io::Result<SaveOutcome> {
         validate(limit).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         crate::secure_file::prepare_private_directory(directory)?;
         let root = Root::open(directory)?;
@@ -84,7 +104,11 @@ mod persistence {
             file.write_all(document.as_bytes())?;
             file.sync_all()?;
             fs_safety::rename_within(&root, &name, FILE_NAME.as_ref()).map_err(io::Error::other)?;
-            fs_safety::sync_directory(&root)
+            Ok(SaveOutcome {
+                durability_warning: sync(&root).err().map(|error| format!(
+                    "The new capacity is effective and its file was replaced, but syncing the configuration directory failed: {error}. The setting may not survive a system crash."
+                )),
+            })
         })();
         if result.is_err() {
             let _ = fs_safety::unlink_within(&root, &name);
@@ -95,6 +119,23 @@ mod persistence {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn published_limit_reports_durability_failure_as_committed() {
+            let temp = tempfile::tempdir().unwrap();
+            save_to(temp.path(), 128).unwrap();
+            let outcome = save_to_with_sync(temp.path(), 17, |_| {
+                Err(io::Error::other("injected directory sync failure"))
+            })
+            .unwrap();
+            assert!(
+                outcome
+                    .durability_warning
+                    .as_ref()
+                    .unwrap()
+                    .contains("effective")
+            );
+            assert_eq!(load_from(temp.path()).unwrap(), 17);
+        }
         #[test]
         fn capacity_persists_bounds_and_rejects_invalid_without_overwrite() {
             let temp = tempfile::tempdir().unwrap();

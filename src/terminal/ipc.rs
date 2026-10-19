@@ -808,6 +808,7 @@ pub enum ServerResponse {
     },
     ChatCapacity {
         capacity: ChatCapacity,
+        persistence_warning: Option<String>,
     },
     ChatReleaseInspected {
         inspection: ChatReleaseInspection,
@@ -821,6 +822,8 @@ pub enum ServerResponse {
 /// Counts resident handles and in-flight reservations, including completed records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatCapacity {
+    /// Distinct admission slots; recovery can reserve an already resident ID.
+    pub used: u32,
     pub resident: u32,
     pub spawning: u32,
     pub limit: u32,

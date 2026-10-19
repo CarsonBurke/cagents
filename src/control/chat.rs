@@ -25,7 +25,10 @@ pub enum ChatCommand {
 #[derive(Debug, clap::Subcommand)]
 pub enum CapacityCommand {
     /// Persist a limit from 1 to 4096; existing residents are never evicted.
-    Set { limit: u32 },
+    Set {
+        /// Maximum distinct native resident and spawning slots (1..=4096).
+        limit: u32,
+    },
 }
 
 fn validate_command(command: &ChatCommand) -> Result<(), AppError> {
@@ -69,13 +72,17 @@ fn execute_requests(
                 Some(CapacityCommand::Set { limit }) => ClientRequest::ChatCapacitySet { limit },
             };
             let response = request(request_value).map_err(protocol_error)?;
-            let ServerResponse::ChatCapacity { capacity } = response else {
+            let ServerResponse::ChatCapacity {
+                capacity,
+                persistence_warning,
+            } = response
+            else {
                 return Err(protocol_error(unexpected_response(
                     "native chat capacity",
                     &response,
                 )));
             };
-            Ok(capacity_output(capacity))
+            Ok(capacity_output(capacity, persistence_warning))
         }
         ChatCommand::Release { id, dry_run, .. } => {
             let response = request(ClientRequest::ChatReleaseInspect { chat_id: id })
@@ -128,21 +135,25 @@ fn execute_requests(
     }
 }
 
-fn capacity_output(capacity: ChatCapacity) -> CommandOutput {
-    let suffix = if u64::from(capacity.resident) + u64::from(capacity.spawning)
-        >= u64::from(capacity.limit)
-    {
+fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) -> CommandOutput {
+    let suffix = if capacity.used >= capacity.limit {
         "\nNew admissions are blocked. Existing work is unchanged. Inspect a completed chat with cagents chat release ID --dry-run."
     } else {
         ""
     };
+    let warning = persistence_warning
+        .as_ref()
+        .map(|warning| format!("\nWarning: {warning}"))
+        .unwrap_or_default();
+    let mut data = json!(capacity);
+    data["persistence_warning"] = json!(persistence_warning);
     CommandOutput {
         command: "chat.capacity",
         human: format!(
-            "Native chats: {} resident + {} spawning / {} limit{suffix}",
-            capacity.resident, capacity.spawning, capacity.limit
+            "Native chats: {} used / {} limit ({} resident, {} spawning){suffix}{warning}",
+            capacity.used, capacity.limit, capacity.resident, capacity.spawning
         ),
-        data: json!(capacity),
+        data,
     }
 }
 
@@ -285,6 +296,30 @@ mod tests {
         assert_eq!(output.data["released"], true);
     }
     #[test]
+    fn overlapping_recovery_slot_is_not_reported_as_full_and_warning_is_visible() {
+        let output = capacity_output(
+            ChatCapacity {
+                used: 127,
+                resident: 127,
+                spawning: 1,
+                limit: 128,
+            },
+            Some("sync failed after publication".into()),
+        );
+        assert!(!output.human.contains("admissions are blocked"));
+        assert!(
+            output
+                .human
+                .contains("Warning: sync failed after publication")
+        );
+        assert_eq!(output.data["used"], 127);
+        assert_eq!(
+            output.data["persistence_warning"],
+            "sync failed after publication"
+        );
+    }
+
+    #[test]
     fn invalid_capacity_has_no_request_and_lower_than_usage_is_reported_truthfully() {
         assert!(
             execute_requests(
@@ -303,10 +338,12 @@ mod tests {
                 assert_eq!(request, ClientRequest::ChatCapacitySet { limit: 1 });
                 Ok(ServerResponse::ChatCapacity {
                     capacity: ChatCapacity {
+                        used: 130,
                         resident: 128,
                         spawning: 2,
                         limit: 1,
                     },
+                    persistence_warning: None,
                 })
             },
         )
