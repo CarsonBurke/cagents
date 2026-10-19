@@ -128,7 +128,10 @@ impl Store {
         self.flush_text()?;
         // Child sidecars are independent sources. Parent rows alone cannot
         // establish that their transcript and edit index can be recovered.
-        if self.child_files_seen || self.file_index_incomplete {
+        if self.child_files_seen
+            || self.file_index_incomplete
+            || !self.presented_children.is_empty()
+        {
             return Ok(false);
         }
         let mut items = self
@@ -1634,6 +1637,32 @@ mod tests {
             })
             .unwrap();
         assert!(resident.is_covered_by(&unchanged).unwrap());
+    }
+
+    #[test]
+    fn history_coverage_preserves_child_payload_outside_parent_sql_rows() {
+        let parent = history_item("parent", "saved parent body");
+        let mut resident = Store::new().unwrap();
+        let mut reloaded = Store::new().unwrap();
+        for store in [&mut resident, &mut reloaded] {
+            store
+                .apply(Event::History {
+                    items: vec![parent.clone()],
+                    has_earlier: false,
+                })
+                .unwrap();
+        }
+        assert!(resident.is_covered_by(&reloaded).unwrap());
+        assert!(!resident.child_files_seen);
+        assert!(!resident.file_index_incomplete);
+        resident.presented_children.insert(
+            "retained-child".into(),
+            vec![std::sync::Arc::new(history_item(
+                "child-item",
+                "child payload is outside the parent SQL coverage",
+            ))],
+        );
+        assert!(!resident.is_covered_by(&reloaded).unwrap());
     }
 
     #[test]
