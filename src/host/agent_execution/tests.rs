@@ -13,7 +13,7 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
-fn isolated(name: &str) -> Option<tempfile::TempDir> {
+pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return None;
@@ -37,7 +37,11 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!("host::agent_execution::tests::{name}"),
+            &if name.contains("::") {
+                name.to_owned()
+            } else {
+                format!("host::agent_execution::tests::{name}")
+            },
             "--nocapture",
         ])
         .env_clear()
@@ -838,7 +842,7 @@ fn release_fixture(host: &SharedHost, run: &Run) {
         .unwrap();
 }
 
-fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
+pub(in crate::host) fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
     let path = root.join("registry.sqlite3");
     let mut registry = Registry::at(&path).unwrap();

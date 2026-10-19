@@ -457,7 +457,12 @@ active precheck, with at most four prechecks at once.
 
 A fresh conversation closes the automation's idle provider after its result is
 durable. **Reuse this automation’s idle agent** keeps its own verified idle conversation for the
-next occurrence. If you take over the conversation, automatic cleanup and reuse
+next occurrence. A ready provider still finishing ordinary work retains the run’s
+slot until verified idle. The schedule stays enabled, overlapping occurrences
+are skipped, and the finished prompt is never resent. History shows “session
+release pending” during cleanup. Explicitly pausing the schedule stays effective
+after cleanup. Permission requests and uncertain ownership still require attention.
+If you take over the conversation, automatic cleanup and reuse
 stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.

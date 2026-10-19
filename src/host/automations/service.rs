@@ -367,6 +367,7 @@ fn retire_reuse_under_control(
     match agent_execution::reconcile_agent_run_under_control(host, &run, true)? {
         agent_execution::Reconciliation::Closed => Ok(()),
         agent_execution::Reconciliation::Idle => Err("The provider did not confirm its close".into()),
+        agent_execution::Reconciliation::Busy => Err("The provider is still busy; wait until it is idle before changing or removing the automation.".into()),
         agent_execution::Reconciliation::UserOwned => Err("Interactive work owns this provider. Close it before changing or removing the automation.".into()),
     }
 }

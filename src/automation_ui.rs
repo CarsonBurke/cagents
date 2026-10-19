@@ -1597,11 +1597,16 @@ impl State {
                         };
                         content = content.push(button_owned(
                             format!(
-                                "{} · {} · {} · {}",
+                                "{} · {} · {} · {}{}",
                                 firing.name,
                                 timestamp(firing.created_ms),
                                 origin,
-                                state_label(firing.state)
+                                state_label(firing.state),
+                                if firing.release_pending {
+                                    " · Session release pending"
+                                } else {
+                                    ""
+                                }
                             ),
                             Action::Run(firing.id),
                             !busy,
@@ -1629,6 +1634,11 @@ impl State {
                         "Finished: {}",
                         timestamp(finished)
                     )));
+                }
+                if run.firing.release_pending {
+                    content = content.push(crate::design::body(
+                        "Session release pending. Future runs wait for cleanup.",
+                    ));
                 }
                 if let Some(diagnostic) = &run.firing.diagnostic {
                     content = content.push(crate::design::body(diagnostic));
