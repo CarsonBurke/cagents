@@ -1,6 +1,7 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+pub(super) mod capacity;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -753,6 +754,9 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Reserve before account setup, history reads, listener allocation or provider
+    // initialization. An unsuccessful attempt releases only its own reservation.
+    let mut admission = capacity::Reservation::new(host, &session)?;
     super::account_lifecycle::ensure_launch(
         host,
         &session.launch.recipe.working_directory,
@@ -828,9 +832,9 @@ fn start_with_execution(
         chat::NativeContinuity::Durable { .. }
     ) || has_native_owner(&session)?
     {
-        return native_recovery::restore(host, client, &session).map_err(unavailable);
+        return native_recovery::restore_with_admission(host, client, &session, admission)
+            .map_err(unavailable);
     }
-    let reservation_id = session.id;
     let mut source_process = None;
     let mut source_fresh = None;
     let mut source_environment = BTreeMap::new();
@@ -1094,7 +1098,6 @@ fn start_with_execution(
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));
     }
-    let mut retired = None;
     let source_handle = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
@@ -1129,10 +1132,10 @@ fn start_with_execution(
         } else {
             false
         };
-        if !recovering && state.chats.len() + state.chat_spawning.len() >= 128 {
-            return Err(unavailable("Daemon native chat capacity reached"));
+        if !recovering && admission.is_none() {
+            capacity::require_available(&state)?;
         }
-        if state.chat_spawning.contains_key(&session.id)
+        if (state.chat_spawning.contains_key(&session.id) && admission.is_none())
             || state.native_closing.contains_key(&session.id)
         {
             return Err(error("Chat is already starting"));
@@ -1146,11 +1149,9 @@ fn start_with_execution(
                 ));
             }
         }
-        if state
-            .chat_spawning
-            .values()
-            .any(|pending| same_conversation(&pending.launch, &session.launch))
-        {
+        if state.chat_spawning.iter().any(|(id, pending)| {
+            *id != session.id && same_conversation(&pending.launch, &session.launch)
+        }) {
             return Err(error("This exact conversation is already starting"));
         }
         if let Some(id) = &session.launch.session_id {
@@ -1197,17 +1198,11 @@ fn start_with_execution(
             }
             None
         };
-        if recovering {
-            retired = state.chats.remove(&session.id);
-        }
         session.proof = Some(state.proof().clone());
-        state.chat_spawning.insert(session.id, session.clone());
+        capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
         state.inventory_generation += 1;
         source_handle
     };
-    // Joining a completed actor must never happen while holding the host lock:
-    // its final notification may still be acquiring that same lock.
-    drop(retired);
     let result = (|| {
         let mut pending_fresh = None;
         if let Some(handle) = source_handle {
@@ -1426,16 +1421,18 @@ fn start_with_execution(
         };
         let response = session_snapshot(&record);
         record.handle.commit_native_installation();
-        state.chats.insert(id, record);
+        let retired = state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
         }
         state.inventory_generation += 1;
+        // A failed recovery leaves its completed record available. Only a
+        // successfully installed replacement retires it, outside the host lock.
+        drop(state);
+        drop(retired);
         Ok(response)
     })();
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.chat_spawning.remove(&reservation_id);
-    state.inventory_generation += 1;
+    drop(admission);
     result
 }
 
