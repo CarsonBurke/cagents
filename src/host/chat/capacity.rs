@@ -442,15 +442,17 @@ mod tests {
             .get_mut(&source.id)
             .unwrap()
             .subscribers
-            .insert(7, false);
+            .insert(0, false);
         let registry = host.lock().unwrap().execution_registry.clone().unwrap();
+        // Internal execution client 0 dispatches directly to the shared close
+        // handler, avoiding the interactive ownership lookup's earlier lock.
         // Hold the real preflight boundary: close must reserve before waiting
         // on durable retirement, so replacement cannot run provider setup.
         let locked = registry.lock().unwrap();
         let closing_host = host.clone();
         let id = source.id;
         let close = thread::spawn(move || {
-            process(&closing_host, 7, ClientRequest::ChatClose { chat_id: id })
+            process(&closing_host, 0, ClientRequest::ChatClose { chat_id: id })
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !host.lock().unwrap().chat_spawning.contains_key(&id) {
