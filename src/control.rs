@@ -644,7 +644,7 @@ impl ControlClient {
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     pub(crate) fn commit_terminal_handoff(
         &mut self,
         terminal_id: TerminalId,
