@@ -16,7 +16,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
         return Err(ProtocolError::new(
             ProtocolErrorCode::ChatCapacity,
             format!(
-                "Daemon native chat capacity reached: {} resident, {} starting, limit {}. Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
+                "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
                 state.chats.len(),
                 state.chat_spawning.len(),
                 state.native_chat_capacity,
@@ -425,6 +425,9 @@ mod tests {
         assert_eq!(inspection.release_blocked, None);
         release(&host, &inspection.proof, true).unwrap();
         assert!(host.lock().unwrap().chats.contains_key(&source.id));
+        let mut stale_generation = inspection.proof.clone();
+        stale_generation.generation += 1;
+        assert!(release(&host, &stale_generation, false).is_err());
         host.lock()
             .unwrap()
             .chats
