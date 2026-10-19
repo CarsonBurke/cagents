@@ -200,7 +200,20 @@ fn inspection_output(
     Ok(CommandOutput {
         command: "chat.release",
         human: status,
-        data: json!({"dry_run":dry_run,"released":!dry_run,"inspection":inspection}),
+        // The wire proof includes launch arguments and environment for exact
+        // identity checks. Keep it inside this process; CLI reports expose only
+        // the fields needed to identify the inspected resident.
+        data: json!({
+            "dry_run": dry_run,
+            "released": !dry_run,
+            "inspection": {
+                "chat_id": id,
+                "provider": inspection.proof.session.launch.provider,
+                "generation": inspection.proof.generation,
+                "execution_instance": inspection.proof.execution_instance,
+                "release_blocked": inspection.release_blocked,
+            },
+        }),
     })
 }
 
@@ -234,6 +247,73 @@ mod tests {
             release_blocked: blocked.map(str::to_owned),
         }
     }
+    #[test]
+    fn release_reports_redact_launch_credentials_while_wire_keeps_exact_proof() {
+        let id = TerminalId::new();
+        let mut observed = inspection(id, None);
+        let recipe = &mut observed.proof.session.launch.recipe;
+        recipe.arguments = vec!["--token=ARGUMENT_CREDENTIAL_SENTINEL".into()];
+        recipe.environment.insert(
+            "PROVIDER_TOKEN".into(),
+            "ENVIRONMENT_CREDENTIAL_SENTINEL".into(),
+        );
+        recipe.working_directory = "/PRIVATE_WORKING_DIRECTORY_SENTINEL".into();
+        observed.proof.session.launch.session_id = Some("PRIVATE_PROVIDER_THREAD_SENTINEL".into());
+        for dry_run in [true, false] {
+            let mut calls = 0;
+            let output = execute_requests(
+                ChatCommand::Release {
+                    id,
+                    dry_run,
+                    yes: !dry_run,
+                },
+                |request| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert_eq!(request, ClientRequest::ChatReleaseInspect { chat_id: id });
+                        Ok(ServerResponse::ChatReleaseInspected {
+                            inspection: observed.clone(),
+                        })
+                    } else {
+                        assert_eq!(
+                            request,
+                            ClientRequest::ChatRelease {
+                                proof: observed.proof.clone(),
+                                dry_run: false
+                            }
+                        );
+                        Ok(ServerResponse::ChatReleased {
+                            inspection: observed.clone(),
+                            dry_run: false,
+                        })
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, if dry_run { 1 } else { 2 });
+            let rendered = format!("{} {}", output.human, output.data);
+            for private in [
+                "ARGUMENT_CREDENTIAL_SENTINEL",
+                "ENVIRONMENT_CREDENTIAL_SENTINEL",
+                "PRIVATE_WORKING_DIRECTORY_SENTINEL",
+                "PRIVATE_PROVIDER_THREAD_SENTINEL",
+            ] {
+                assert!(
+                    !rendered.contains(private),
+                    "CLI output exposed launch identity data"
+                );
+            }
+            assert_eq!(output.data["inspection"]["chat_id"], id.to_string());
+            assert_eq!(output.data["inspection"]["generation"], 7);
+            assert_eq!(
+                output.data["inspection"]["execution_instance"],
+                observed.proof.execution_instance.to_string()
+            );
+            assert!(output.data["inspection"].get("proof").is_none());
+            assert!(output.data["inspection"].get("session").is_none());
+        }
+    }
+
     #[test]
     fn release_requires_explicit_mode_and_dry_run_never_sends_effect() {
         assert!(
