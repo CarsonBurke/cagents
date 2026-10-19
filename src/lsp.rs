@@ -5680,6 +5680,51 @@ mod tests {
         .await;
     }
 
+    /// Multiple opens may initialise in either order. Waiting for one document
+    /// at a time would consume and discard another document's Ready event.
+    async fn await_ready_documents(
+        events: &async_channel::Receiver<LspEvent>,
+        documents: &[LspDocumentId],
+    ) {
+        let mut pending: HashSet<_> = documents.iter().copied().collect();
+        assert!(!pending.is_empty(), "expected documents to become ready");
+        next_matching(events, |event| {
+            if let LspEvent::Status { doc, status } = event
+                && status.is_ready()
+            {
+                pending.remove(doc);
+                if pending.is_empty() {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
+    }
+
+    #[test]
+    fn concurrent_readiness_wait_retains_reverse_order_and_ignores_unrelated_events() {
+        block_on(async {
+            let (sender, events) = async_channel::bounded(8);
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            for (doc, status) in [
+                (two, LspStatus::Ready),
+                (LspDocumentId(3), LspStatus::Ready),
+                (one, LspStatus::Starting),
+                (two, LspStatus::Ready),
+                (one, LspStatus::Ready),
+            ] {
+                sender.try_send(LspEvent::Status { doc, status }).unwrap();
+            }
+            // Closing after preloading makes a lost Ready fail immediately,
+            // rather than depending on the suite's generous scheduling bound.
+            drop(sender);
+            await_ready_documents(&events, &[one, two]).await;
+            assert!(events.is_empty());
+        });
+    }
+
     fn full_sync_capabilities() -> Value {
         json!({
             "textDocumentSync": {
@@ -10137,8 +10182,7 @@ mod tests {
             manager.open_for_test(one, &first, &worktree, rust_language(), 1, "a\n");
             manager.open_for_test(two, &second, &worktree, rust_language(), 1, "b\n");
             let handle = handle_for(&registry, &worktree).await;
-            await_ready(&events, one).await;
-            await_ready(&events, two).await;
+            await_ready_documents(&events, &[one, two]).await;
 
             assert_eq!(
                 registry.lock().expect("registry").len(),
@@ -10206,8 +10250,7 @@ mod tests {
             manager.open_for_test(two, &second, second_root.path(), rust_language(), 1, "b\n");
             let first_handle = handle_for(&registry, first_root.path()).await;
             let _second_handle = handle_for(&registry, second_root.path()).await;
-            await_ready(&events, one).await;
-            await_ready(&events, two).await;
+            await_ready_documents(&events, &[one, two]).await;
             assert_eq!(
                 manager.sessions.len(),
                 2,
