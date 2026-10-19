@@ -133,9 +133,10 @@ impl Store {
         }
         let mut items = self
             .db
-            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items")
+            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let mut rows = items.query([]).map_err(|error| error.to_string())?;
+        let mut last_ordinal = None;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let id: String = row.get(0).map_err(|error| error.to_string())?;
             let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
@@ -145,26 +146,33 @@ impl Store {
                 row.get(4).map_err(|error| error.to_string())?,
                 row.get(5).map_err(|error| error.to_string())?,
             );
-            let loaded: Option<(Vec<u8>, i64, i64, i64, Vec<u8>)> = reloaded
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
                 .db
                 .query_row(
-                    "SELECT metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
                     [&id],
                     |row| {
                         Ok((
                             row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
+                            (
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
                         ))
                     },
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
-            if loaded.as_ref() != Some(&resident) {
+            let Some((ordinal, contents)) = loaded else {
+                return Ok(false);
+            };
+            if contents != resident || last_ordinal.is_some_and(|previous| ordinal <= previous) {
                 return Ok(false);
             }
+            last_ordinal = Some(ordinal);
         }
         let mut chunks = self
             .db
@@ -1606,6 +1614,14 @@ mod tests {
             })
             .unwrap();
         assert!(!resident.is_covered_by(&changed_hidden_chunk).unwrap());
+        let mut reordered = Store::new().unwrap();
+        reordered
+            .apply(Event::History {
+                items: vec![large.clone(), old.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&reordered).unwrap());
         let mut unchanged = Store::new().unwrap();
         unchanged
             .apply(Event::History {
