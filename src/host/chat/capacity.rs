@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn live_and_closed_writers_are_preserved_even_when_their_snapshot_is_idle() {
+    fn live_writers_are_protected_and_completed_writers_require_full_coverage() {
         struct Idle;
         impl chat::protocol::Adapter for Idle {
             fn initialize(&mut self) -> Result<chat::protocol::Step, String> {
@@ -672,7 +672,26 @@ mod tests {
         recipe.program = "/bin/cat".into();
         recipe.working_directory = std::env::current_dir().unwrap();
         let spec = chat::protocol::ProcessSpec::from(&recipe);
-        let mut initial = chat::protocol::Step::default();
+        let (_, mut history) = chat::protocol::create_history(&source.launch).unwrap();
+        let item = history
+            .initialize()
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| {
+                if let chat::Event::History { items, .. } = event {
+                    items.into_iter().next()
+                } else {
+                    None
+                }
+            })
+            .expect("nonempty saved history");
+        // Observing an otherwise identical item live stamps local times. These
+        // are resident data too and must not be silently discarded on release.
+        let mut initial = chat::protocol::Step {
+            events: vec![chat::Event::Item(item)],
+            ..Default::default()
+        };
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let handle = Handle::start(
             spec,
@@ -698,15 +717,126 @@ mod tests {
                 .contains("owns")
         );
         handle.close().unwrap();
+        assert!(!handle.owns_work());
         assert!(
             inspect(&host, source.id)
                 .unwrap()
                 .release_blocked
                 .unwrap()
-                .contains("durable")
+                .contains("cover")
         );
         assert!(host.lock().unwrap().chats.contains_key(&source.id));
     }
+
+    fn completed_writer(host: &SharedHost) -> (tempfile::TempDir, Session, Handle) {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, mut source, _) = closed_history(host);
+        std::fs::create_dir(&source.launch.recipe.working_directory).unwrap();
+        let program = directory.path().join("completed-provider");
+        // A real pipe transport consumes initialization and exits normally.
+        // Its transcript comes from the real Claude history adapter, not a
+        // hand-built Store or a history reader relabeled as a writer.
+        std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        source.launch.recipe.program = program.to_string_lossy().into_owned();
+        // Enter through the real daemon start path: ordinary UI writers also
+        // receive a self-delegation capability, even without a managed Agent.
+        let old = host.lock().unwrap().chats.remove(&source.id).unwrap();
+        drop(old);
+        let ServerResponse::ChatAttached { session, .. } = process_inner(
+            host,
+            73,
+            ClientRequest::ChatStart {
+                session: source,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap() else {
+            panic!("writer start response")
+        };
+        let source = session;
+        let handle = host.lock().unwrap().chats[&source.id].handle.clone();
+        let registry = super::super::super::agent_execution::registry(host).unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(source.id)
+                .unwrap()
+                .is_some(),
+            "real startup must register self authority; a manually constructed actor misses this contract"
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_for_session(source.id)
+                .unwrap()
+                .is_none()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline, "writer did not finish teardown");
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.close().unwrap();
+        assert!(!handle.is_read_only_history());
+        assert!(
+            !handle.owns_work(),
+            "writer cleanup: {:?}",
+            handle.failure()
+        );
+        let snapshot = handle.snapshot(None).unwrap();
+        assert!(snapshot.exited);
+        assert!(snapshot.read_only_reason.is_none());
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "durable history body")));
+        assert!(
+            inspect(host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("attached")
+        );
+        process_inner(host, 73, ClientRequest::ChatDetach { chat_id: source.id }).unwrap();
+        (directory, source, handle)
+    }
+
+    #[test]
+    fn completed_writer_release_checks_saved_bytes_and_stale_generation() {
+        for changed in [false, true] {
+            let host = host();
+            let (_directory, source, handle) = completed_writer(&host);
+            let registry = super::super::super::agent_execution::registry(&host).unwrap();
+            let token = registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority(source.id)
+                .unwrap();
+            let inspection = inspect(&host, source.id).unwrap();
+            assert!(registry.lock().unwrap().execution_origin(&token).is_ok());
+            assert_eq!(inspection.release_blocked, None);
+            let mut stale = inspection.proof.clone();
+            stale.generation += 1;
+            assert!(release(&host, &stale, false).is_err());
+            assert!(host.lock().unwrap().chats.contains_key(&source.id));
+            if changed {
+                std::fs::write(provider_history_path(&source), "").unwrap();
+                assert!(release(&host, &inspection.proof, false).is_err());
+                assert!(host.lock().unwrap().chats.contains_key(&source.id));
+                assert!(handle.snapshot(None).unwrap().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "durable history body")));
+            } else {
+                release(&host, &inspection.proof, false).unwrap();
+                assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+                assert!(registry.lock().unwrap().execution_origin(&token).is_err());
+            }
+            if changed {
+                assert!(registry.lock().unwrap().execution_origin(&token).is_ok());
+            }
+        }
+    }
+
     fn provider_history_path(source: &Session) -> std::path::PathBuf {
         let project: String = source
             .launch
@@ -1020,12 +1150,12 @@ mod tests {
         assert!(host.lock().unwrap().chat_spawning.is_empty());
     }
 
-    fn wait_for_client_history(client: &chat::client::ClientHandle) {
+    fn wait_for_client_history(client: &chat::client::ClientHandle, read_only: bool) {
         client.set_visible(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = client.snapshot();
-            if snapshot.read_only_reason.is_some()
+            if (!read_only || snapshot.read_only_reason.is_some())
                 && snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body")))
             {
                 return;
@@ -1041,11 +1171,23 @@ mod tests {
     #[test]
     fn released_history_reopens_through_real_client_restore_even_when_directory_returns() {
         use std::os::unix::fs::PermissionsExt;
-        for directory_returns in [false, true] {
+        for (writer, directory_returns) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let host = host();
-            let (directory, mut source, _) = history_reader(&host, false);
+            let (directory, mut source, _) = if writer {
+                let result = completed_writer(&host);
+                std::fs::remove_dir(&result.1.launch.recipe.working_directory).unwrap();
+                result
+            } else {
+                history_reader(&host, false)
+            };
             let marker = directory.path().join("provider-started");
-            let program = directory.path().join("provider");
+            let program = if writer {
+                std::path::PathBuf::from(&source.launch.recipe.program)
+            } else {
+                directory.path().join("provider")
+            };
             std::fs::write(
                 &program,
                 format!(
@@ -1064,7 +1206,7 @@ mod tests {
                 .session = source.clone();
             let (first, server) = restore_client(&host, source.clone(), 41);
             let first = first.unwrap();
-            wait_for_client_history(&first);
+            wait_for_client_history(&first, !writer);
             assert_eq!(first.session(), source);
             assert!(first.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
             drop(first);
@@ -1122,7 +1264,7 @@ mod tests {
 
             let (restored, server) = restore_client(&host, source.clone(), 44);
             let restored = restored.unwrap();
-            wait_for_client_history(&restored);
+            wait_for_client_history(&restored, true);
             assert_eq!(restored.session(), source);
             assert!(restored.snapshot().read_only_reason.is_some());
             assert!(restored.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
@@ -1138,6 +1280,16 @@ mod tests {
             assert!(!host.lock().unwrap().chats[&source.id].handle.owns_work());
             drop(restored);
             server.join().unwrap();
+            // Join the owned reader before dropping its host; a final callback
+            // must not become the last host owner and drop its own worker.
+            let reader = host
+                .lock()
+                .unwrap()
+                .chats
+                .remove(&source.id)
+                .unwrap()
+                .handle;
+            reader.close().unwrap();
         }
     }
 
@@ -1234,8 +1386,8 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                     Some("Actor owns live or unconfirmed provider work".into())
                 } else if !record.subscribers.is_empty() {
                     Some("A client is attached".into())
-                } else if !record.handle.is_read_only_history() {
-                    Some("Writer transcript durability is unverified".into())
+                } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
+                    Some("Writer teardown is unconfirmed".into())
                 } else if state.chat_spawning.contains_key(&id)
                     || state.native_closing.contains_key(&id)
                     || state.chat_handoffs.contains_key(&id)
@@ -1256,7 +1408,7 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
 fn inspected_record(
     state: &HostState,
     id: TerminalId,
-) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle), ProtocolError> {
+) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle, Session), ProtocolError> {
     let record = state
         .chats
         .get(&id)
@@ -1294,10 +1446,12 @@ fn inspected_record(
         Some("The actor still reports pending or delegated work")
     } else if !snapshot.subagents.is_empty() {
         Some("Child transcript preservation is not yet verified; its resident history is preserved")
-    } else if !record.handle.is_read_only_history() {
-        Some("Completed writer history is not proven durable; its resident transcript is preserved")
-    } else if !snapshot.exited || snapshot.read_only_reason.is_none() {
-        Some("The read-only history has not finished loading")
+    } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
+        Some("The writer has not finished provider teardown")
+    } else if !snapshot.exited
+        || (record.handle.is_read_only_history() && snapshot.read_only_reason.is_none())
+    {
+        Some("The history reader or completed writer has not settled")
     } else if session.launch.session_id.is_none() {
         Some("The provider conversation identity is unconfirmed")
     } else {
@@ -1313,22 +1467,40 @@ fn inspected_record(
             release_blocked: blocked.map(str::to_owned),
         },
         record.handle.clone(),
+        record.session.clone(),
     ))
+}
+
+fn release_kind(handle: &Handle) -> super::super::model::ResidentRelease {
+    if handle.is_read_only_history() {
+        super::super::model::ResidentRelease::ReadOnlyHistory
+    } else {
+        super::super::model::ResidentRelease::CompletedWriter
+    }
 }
 
 pub(in crate::host) fn inspect(
     host: &SharedHost,
     id: TerminalId,
 ) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
-    let (mut inspection, handle) =
+    let (mut inspection, handle, source) =
         inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
     if inspection.release_blocked.is_some() {
         return Ok(inspection);
     }
     super::super::account_lifecycle::ensure_idle(host)?;
-    // Managed run state is independent of actor activity. Do not cancel or
-    // retire any managed authority through this resident-only operation.
-    if let Err(error) = require_unmanaged(host, id) {
+    // A writer's own delegation capability is separate from managed work.
+    let ownership = super::super::agent_execution::registry(host).and_then(|registry| {
+        let result = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inspect_resident_release(
+                &crate::agent_execution::HostedSession::Chat(source),
+                release_kind(&handle),
+            );
+        result
+    });
+    if let Err(error) = ownership {
         inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
         return Ok(inspection);
     }
@@ -1509,10 +1681,10 @@ pub(in crate::host) fn release(
         return Err(unavailable(reason.clone()));
     }
     let mut reservation = None;
-    let handle = {
+    let (handle, source) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(proof.session.proof.as_ref(), state.proof())?;
-        let (current, handle) = inspected_record(&state, proof.session.id)?;
+        let (current, handle, source) = inspected_record(&state, proof.session.id)?;
         if current.proof != *proof || current.release_blocked.is_some() {
             return Err(error(
                 "The exact native actor or its release eligibility changed; inspect it again",
@@ -1522,7 +1694,7 @@ pub(in crate::host) fn release(
             return Ok(inspection);
         }
         Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
-        handle
+        (handle, source)
     };
     // Repeat complete coverage with the ownership reservation held. Paging
     // admitted before the last detach may still have settled since inspection.
@@ -1546,8 +1718,9 @@ pub(in crate::host) fn release(
             "The native history generation changed; inspect it again",
         ));
     }
-    // This proven history reader owns no provider process, socket or execution
-    // authority. Closing it stops paging only, never an agent or provider run.
+    // A history reader only stops paging. A completed writer has already
+    // confirmed teardown and owns no provider work; close joins its worker.
+    // Neither path may stop a running provider to make it eligible.
     handle.close().map_err(unavailable)?;
     // The worker is now immutable. A previously queued page must also be
     // recoverable before its cache can be dropped.
@@ -1559,6 +1732,18 @@ pub(in crate::host) fn release(
             "History changed while its reader closed; resident data was preserved",
         ));
     }
+    // The exclusive request gate remains held through exact capability
+    // retirement and resident removal. No cached-origin submission may cross
+    // this boundary; the reservation also fences actor recovery and attach.
+    super::super::agent_execution::registry(host)
+        .map_err(unavailable)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retire_resident_release(
+            &crate::agent_execution::HostedSession::Chat(source),
+            release_kind(&handle),
+        )
+        .map_err(unavailable)?;
     let retired = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
