@@ -15,7 +15,7 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod claude_metadata;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 pub mod client;
 #[cfg(feature = "host")]
 pub(crate) mod native_holder;
