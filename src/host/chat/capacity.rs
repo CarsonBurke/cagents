@@ -1195,7 +1195,7 @@ fn load_history(session: &Session) -> Result<LoadedHistory, String> {
             "The saved conversation cannot currently be reopened as read-only history".into(),
         );
     }
-    let mut initial = adapter.initialize()?;
+    let initial = adapter.initialize()?;
     if !initial.writes.is_empty() {
         return Err("History reload attempted a provider write".into());
     }
