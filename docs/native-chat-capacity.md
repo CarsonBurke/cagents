@@ -68,10 +68,11 @@ An idle activity label alone does not authorize release. The daemon checks the
 exact resident, provider state, ownership, transitions, attached readers and
 whether saved history can be reopened. The inspection reports why release is
 blocked. Running, waiting or unconfirmed work remains protected. The initial
-release path supports completed read-only history readers whose provider history
-can be verified again. Completed writable providers remain protected because
-a finished run alone does not establish that dropping their resident cache
-preserves the full transcript.
+release path supports detached, unmanaged read-only history readers after their
+history has loaded and can be verified again. Ordinary resident writers remain
+protected, including completed writers. A finished run alone does not establish
+that dropping its resident cache preserves the full transcript. The command is
+not a general cleanup operation for every Idle or completed row in the table.
 
 If inspection confirms eligibility, `cagents chat release FULL-CHAT-ID --yes`
 explicitly requests release. The CLI obtains a fresh identity proof and the

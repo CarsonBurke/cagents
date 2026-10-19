@@ -9,7 +9,7 @@ pub enum ChatCommand {
         #[command(subcommand)]
         command: Option<CapacityCommand>,
     },
-    /// Inspect or release one exact completed resident handle, preserving saved history.
+    /// Inspect or release one eligible resident; idle or finished alone is insufficient.
     Release {
         /// Full resident native chat ID, as shown by chat capacity.
         id: TerminalId,
@@ -43,7 +43,7 @@ fn validate_command(command: &ChatCommand) -> Result<(), AppError> {
             ..
         } => Err(AppError::new(
             "confirmation",
-            "Pass --dry-run to inspect, or --yes to authorize releasing one completed resident handle",
+            "Pass --dry-run to inspect, or --yes to authorize a guarded release of this resident handle",
         )),
         _ => Ok(()),
     }
@@ -137,7 +137,7 @@ fn execute_requests(
 
 fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) -> CommandOutput {
     let suffix = if capacity.used >= capacity.limit {
-        "\nNew admissions are blocked. Existing work is unchanged. Inspect a completed chat with cagents chat release ID --dry-run."
+        "\nNew admissions are blocked. Existing work is unchanged. Check eligibility with cagents chat release ID --dry-run. Release requires supported, verified saved history and no protected work."
     } else {
         ""
     };
