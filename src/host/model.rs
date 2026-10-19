@@ -28,6 +28,7 @@ mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
+pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
 mod navigation;

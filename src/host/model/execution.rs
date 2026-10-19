@@ -11,6 +11,80 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+/// The host proves this actor state before inspecting or retiring authority.
+#[derive(Clone, Copy)]
+pub(in crate::host) enum ResidentRelease {
+    ReadOnlyHistory,
+    CompletedWriter,
+}
+
+/// A self capability is not a managed agent binding. A history reader cannot
+/// prove teardown of a former writer, so only a completed writer may retire it.
+fn resident_release_authority(
+    db: &Connection,
+    source: &HostedSession,
+    kind: ResidentRelease,
+) -> Result<Option<(String, String)>, String> {
+    if !source.has_complete_proof() {
+        return Err("Resident release requires a complete process identity".into());
+    }
+    let managed: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE session_id=?1 AND closed=0)
+             OR EXISTS(SELECT 1 FROM agent_launches WHERE session_id=?1)",
+            [source.id().to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if managed {
+        return Err(
+            "The actor belongs to a managed agent; use its supported owned-agent close operation"
+                .into(),
+        );
+    }
+    let lineage: String = db
+        .query_row(
+            "SELECT coalesce((SELECT lineage FROM session_lineages WHERE session_id=?1), ?1)",
+            [source.id().to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let parent = Lineage(
+        lineage
+            .parse()
+            .map_err(|_| "Stored session lineage is invalid")?,
+    );
+    let origin = encode(&Origin::Child { parent })?;
+    let delegated: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE origin=?1 AND closed=0)
+             OR EXISTS(SELECT 1 FROM agent_runs WHERE origin=?1 AND state IN ('accepted','running','waiting'))
+             OR EXISTS(SELECT 1 FROM agent_launches p JOIN agents a ON p.agent=a.id WHERE a.origin=?1)",
+        [&origin], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if delegated {
+        return Err("The session lineage retains delegated agents or unconfirmed work; close its owned agents first".into());
+    }
+    let authority: Option<(String, String)> = db
+        .query_row(
+            "SELECT token,source FROM agent_authorities WHERE session_id=?1",
+            [source.id().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((_, stored)) = &authority {
+        if matches!(kind, ResidentRelease::ReadOnlyHistory) {
+            return Err("A retained provider or managed agent authority remains; a history reader cannot prove its teardown".into());
+        }
+        // Provider-confirmed thread metadata can advance after startup; the
+        // immutable process recipe and daemon proof still must match exactly.
+        if !source.same_process(&decode::<HostedSession>(stored)?) {
+            return Err("The registered provider authority belongs to a different process; its successor was preserved".into());
+        }
+    }
+    Ok(authority)
+}
+
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
     tx.execute_batch(
@@ -71,6 +145,39 @@ pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String
 }
 
 impl Registry {
+    pub(crate) fn inspect_resident_release(
+        &mut self,
+        source: &HostedSession,
+        kind: ResidentRelease,
+    ) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        resident_release_authority(&tx, source, kind)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// The caller holds the exclusive daemon control gate through removal of
+    /// the exact resident. This drains submissions that authenticated before
+    /// retirement and excludes new acceptance until the capability is revoked.
+    /// Do not hold HostState while acquiring this transaction.
+    pub(crate) fn retire_resident_release(
+        &mut self,
+        source: &HostedSession,
+        kind: ResidentRelease,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some((token, stored)) = resident_release_authority(&tx, source, kind)? {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id=?1 AND token=?2 AND source=?3",
+                params![source.id().to_string(), token, stored],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Automatic removal must also wait for durable work not yet represented
     /// by an actor, including unconfirmed launch ownership after a restart.
     pub(crate) fn cleanup_execution_is_quiescent(&self) -> Result<bool, String> {
@@ -2276,6 +2383,100 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.execution_sequence().unwrap(), sequence);
+    }
+
+    #[test]
+    fn resident_release_retires_only_its_own_completed_writer_capability() {
+        let (mut registry, _directory, _) = fixture();
+        let source = source();
+        let token = registry.register_agent_authority(&source).unwrap();
+        assert!(
+            registry
+                .inspect_resident_release(&source, ResidentRelease::ReadOnlyHistory)
+                .is_err()
+        );
+        registry
+            .inspect_resident_release(&source, ResidentRelease::CompletedWriter)
+            .unwrap();
+        assert!(
+            registry.execution_origin(&token).is_ok(),
+            "inspection cannot revoke a capability"
+        );
+        let mut confirmed = source.clone();
+        let HostedSession::Chat(session) = &mut confirmed else {
+            unreachable!()
+        };
+        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        registry
+            .retire_resident_release(&confirmed, ResidentRelease::CompletedWriter)
+            .unwrap();
+        assert!(registry.execution_origin(&token).is_err());
+        assert!(
+            registry
+                .retained_agent_authority_source(source.id())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resident_release_preserves_successor_capability() {
+        let (mut registry, _directory, _) = fixture();
+        let source = source();
+        let mut successor = source.clone();
+        let HostedSession::Chat(session) = &mut successor else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("successor");
+        let token = registry.fresh_agent_authority(&successor).unwrap();
+        assert!(
+            registry
+                .retire_resident_release(&source, ResidentRelease::CompletedWriter)
+                .is_err()
+        );
+        assert!(registry.execution_origin(&token).is_ok());
+        assert_eq!(
+            registry
+                .retained_agent_authority_source(source.id())
+                .unwrap(),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn resident_release_preserves_managed_pending_and_delegated_work() {
+        for (delegated, bound) in [(false, false), (false, true), (true, false)] {
+            let (mut registry, _directory, request) = fixture();
+            let source = source();
+            let token = registry.register_agent_authority(&source).unwrap();
+            let origin = if delegated {
+                registry.execution_origin(&token).unwrap()
+            } else {
+                Origin::User
+            };
+            let accepted = registry.submit_agent(&origin, &request, 1).unwrap();
+            if !delegated {
+                registry
+                    .reserve_agent_launch(accepted.agent.id, &source)
+                    .unwrap();
+                if bound {
+                    registry
+                        .bind_agent(accepted.agent.id, None, source.clone())
+                        .unwrap();
+                }
+            }
+            assert!(
+                registry
+                    .retire_resident_release(&source, ResidentRelease::CompletedWriter)
+                    .is_err()
+            );
+            assert!(registry.execution_origin(&token).is_ok());
+            assert_eq!(
+                registry.latest_agent_run(accepted.agent.id).unwrap().state,
+                State::Accepted
+            );
+        }
     }
 
     #[test]

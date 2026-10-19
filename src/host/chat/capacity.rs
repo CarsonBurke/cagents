@@ -739,23 +739,43 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nread -r initialization\nexit 0\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         source.launch.recipe.program = program.to_string_lossy().into_owned();
-        let (spec, mut adapter) = chat::protocol::create(&source.launch).unwrap();
-        assert!(matches!(
-            spec.transport,
-            chat::protocol::TransportSpec::JsonLines
-        ));
-        let mut initial = adapter.initialize().unwrap();
-        assert!(!initial.writes.is_empty());
-        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(
-            spec,
-            adapter,
-            initial,
-            store,
-            source.launch.session_id.clone(),
-            |_| {},
+        // Enter through the real daemon start path: ordinary UI writers also
+        // receive a self-delegation capability, even without a managed Agent.
+        let old = host.lock().unwrap().chats.remove(&source.id).unwrap();
+        drop(old);
+        let ServerResponse::ChatAttached { session, .. } = process_inner(
+            host,
+            73,
+            ClientRequest::ChatStart {
+                session: source,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
         )
-        .unwrap();
+        .unwrap() else {
+            panic!("writer start response")
+        };
+        let source = session;
+        let handle = host.lock().unwrap().chats[&source.id].handle.clone();
+        let registry = super::super::super::agent_execution::registry(host).unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority_source(source.id)
+                .unwrap()
+                .is_some(),
+            "real startup must register self authority; a manually constructed actor misses this contract"
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_for_session(source.id)
+                .unwrap()
+                .is_none()
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
             assert!(Instant::now() < deadline, "writer did not finish teardown");
@@ -772,11 +792,14 @@ mod tests {
         assert!(snapshot.exited);
         assert!(snapshot.read_only_reason.is_none());
         assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "durable history body")));
-        let mut state = host.lock().unwrap();
-        let record = state.chats.get_mut(&source.id).unwrap();
-        record.session = source.clone();
-        record.handle = handle.clone();
-        drop(state);
+        assert!(
+            inspect(host, source.id)
+                .unwrap()
+                .release_blocked
+                .unwrap()
+                .contains("attached")
+        );
+        process_inner(host, 73, ClientRequest::ChatDetach { chat_id: source.id }).unwrap();
         (directory, source, handle)
     }
 
@@ -785,7 +808,14 @@ mod tests {
         for changed in [false, true] {
             let host = host();
             let (_directory, source, handle) = completed_writer(&host);
+            let registry = super::super::super::agent_execution::registry(&host).unwrap();
+            let token = registry
+                .lock()
+                .unwrap()
+                .retained_agent_authority(source.id)
+                .unwrap();
             let inspection = inspect(&host, source.id).unwrap();
+            assert!(registry.lock().unwrap().execution_origin(&token).is_ok());
             assert_eq!(inspection.release_blocked, None);
             let mut stale = inspection.proof.clone();
             stale.generation += 1;
@@ -799,6 +829,10 @@ mod tests {
             } else {
                 release(&host, &inspection.proof, false).unwrap();
                 assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+                assert!(registry.lock().unwrap().execution_origin(&token).is_err());
+            }
+            if changed {
+                assert!(registry.lock().unwrap().execution_origin(&token).is_ok());
             }
         }
     }
@@ -1149,7 +1183,11 @@ mod tests {
                 history_reader(&host, false)
             };
             let marker = directory.path().join("provider-started");
-            let program = directory.path().join("provider");
+            let program = if writer {
+                std::path::PathBuf::from(&source.launch.recipe.program)
+            } else {
+                directory.path().join("provider")
+            };
             std::fs::write(
                 &program,
                 format!(
@@ -1370,7 +1408,7 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
 fn inspected_record(
     state: &HostState,
     id: TerminalId,
-) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle), ProtocolError> {
+) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle, Session), ProtocolError> {
     let record = state
         .chats
         .get(&id)
@@ -1429,22 +1467,40 @@ fn inspected_record(
             release_blocked: blocked.map(str::to_owned),
         },
         record.handle.clone(),
+        record.session.clone(),
     ))
+}
+
+fn release_kind(handle: &Handle) -> super::super::model::ResidentRelease {
+    if handle.is_read_only_history() {
+        super::super::model::ResidentRelease::ReadOnlyHistory
+    } else {
+        super::super::model::ResidentRelease::CompletedWriter
+    }
 }
 
 pub(in crate::host) fn inspect(
     host: &SharedHost,
     id: TerminalId,
 ) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
-    let (mut inspection, handle) =
+    let (mut inspection, handle, source) =
         inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
     if inspection.release_blocked.is_some() {
         return Ok(inspection);
     }
     super::super::account_lifecycle::ensure_idle(host)?;
-    // Managed run state is independent of actor activity. Do not cancel or
-    // retire any managed authority through this resident-only operation.
-    if let Err(error) = require_unmanaged(host, id) {
+    // A writer's own delegation capability is separate from managed work.
+    let ownership = super::super::agent_execution::registry(host).and_then(|registry| {
+        let result = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inspect_resident_release(
+                &crate::agent_execution::HostedSession::Chat(source),
+                release_kind(&handle),
+            );
+        result
+    });
+    if let Err(error) = ownership {
         inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
         return Ok(inspection);
     }
@@ -1625,10 +1681,10 @@ pub(in crate::host) fn release(
         return Err(unavailable(reason.clone()));
     }
     let mut reservation = None;
-    let handle = {
+    let (handle, source) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(proof.session.proof.as_ref(), state.proof())?;
-        let (current, handle) = inspected_record(&state, proof.session.id)?;
+        let (current, handle, source) = inspected_record(&state, proof.session.id)?;
         if current.proof != *proof || current.release_blocked.is_some() {
             return Err(error(
                 "The exact native actor or its release eligibility changed; inspect it again",
@@ -1638,7 +1694,7 @@ pub(in crate::host) fn release(
             return Ok(inspection);
         }
         Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
-        handle
+        (handle, source)
     };
     // Repeat complete coverage with the ownership reservation held. Paging
     // admitted before the last detach may still have settled since inspection.
@@ -1676,6 +1732,18 @@ pub(in crate::host) fn release(
             "History changed while its reader closed; resident data was preserved",
         ));
     }
+    // The exclusive request gate remains held through exact capability
+    // retirement and resident removal. No cached-origin submission may cross
+    // this boundary; the reservation also fences actor recovery and attach.
+    super::super::agent_execution::registry(host)
+        .map_err(unavailable)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retire_resident_release(
+            &crate::agent_execution::HostedSession::Chat(source),
+            release_kind(&handle),
+        )
+        .map_err(unavailable)?;
     let retired = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state

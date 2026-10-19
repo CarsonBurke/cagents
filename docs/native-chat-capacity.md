@@ -71,7 +71,10 @@ blocked. Running, waiting or unconfirmed work remains protected. Release support
 detached, unmanaged Claude history readers and writers whose provider teardown
 has finished successfully. Every cached item, metadata field and body chunk must
 be covered by a fresh local history reload before its resident cache can be
-released. Reopening uses read-only history and never starts the provider.
+released. Its own delegation capability is revoked only after confirmed teardown
+and an exact process-identity check. Managed bindings, pending launches and
+retained delegated agents block release; use their supported owned-agent close
+operations first. Reopening uses read-only history and never starts the provider.
 
 A completed writer may still be blocked: live observation timestamps, unsaved
 messages, child transcripts or private image files can make its cache differ
