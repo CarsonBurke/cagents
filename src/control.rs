@@ -21,6 +21,8 @@ mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
 mod channels;
+mod chat;
+pub use chat::ChatCommand;
 mod format;
 pub use agents::AgentCommand;
 mod automations;
@@ -120,6 +122,11 @@ pub enum TopCommand {
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
+    /// Inspect native resident capacity and explicitly release completed handles.
+    Chat {
+        #[command(subcommand)]
+        command: ChatCommand,
+    },
     /// Message another session; a live conversation receives it once idle.
     Send(SendArgs),
     /// Message another session and wait for its reply.
@@ -1869,6 +1876,9 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatAttached { .. } => "chat_attached",
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
+        ServerResponse::ChatCapacity { .. } => "chat_capacity",
+        ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
+        ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
         ServerResponse::ChatPreviewed { .. } => "chat_previewed",
@@ -2226,6 +2236,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
         | TopCommand::Account { .. }
+        | TopCommand::Chat { .. }
         | TopCommand::Whoami
         | TopCommand::Sessions(_)
         | TopCommand::Send(_)
@@ -2289,6 +2300,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),
+        TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
