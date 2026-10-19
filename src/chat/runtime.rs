@@ -25,7 +25,7 @@ pub(crate) mod courier_tests;
 mod execution;
 mod store;
 mod websocket;
-use store::Store;
+pub(crate) use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -1020,6 +1020,18 @@ impl Handle {
             .error
             .clone()
     }
+    pub(crate) fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_covered_by(reloaded)
+    }
+
+    pub(crate) fn is_read_only_history(&self) -> bool {
+        self.0.history_only
+    }
+
     pub fn owns_work(&self) -> bool {
         !self.0.history_only
             && (!self.is_completed()

@@ -79,12 +79,21 @@ pub(super) fn restore(
     client: ClientId,
     source: &Session,
 ) -> Result<ServerResponse, String> {
+    restore_with_admission(host, client, source, None)
+}
+
+pub(super) fn restore_with_admission(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    mut admission: Option<capacity::Reservation>,
+) -> Result<ServerResponse, String> {
     // Main's durable holder format has no immutable account-home proof.
     super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
-            || state.chat_spawning.contains_key(&source.id)
+            || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
         {
             return Err(
@@ -103,23 +112,22 @@ pub(super) fn restore(
                 record.handle.owns_work()
                     && same_conversation(&record.session.launch, &source.launch)
             })
-            || state
-                .chat_spawning
-                .values()
-                .any(|pending| same_conversation(&pending.launch, &source.launch))
-            || (!state.chats.contains_key(&source.id)
-                && state.chats.len() + state.chat_spawning.len() >= 128)
+            || state.chat_spawning.iter().any(|(id, pending)| {
+                *id != source.id && same_conversation(&pending.launch, &source.launch)
+            })
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        state.chat_spawning.insert(source.id, source.clone());
+        if !state.chats.contains_key(&source.id) && admission.is_none() {
+            capacity::require_available(&state).map_err(|error| error.message)?;
+        }
+        capacity::Reservation::install(&mut admission, host, &mut state, source)
+            .map_err(|error| error.message)?;
         state.inventory_generation += 1;
         state.proof().clone()
     };
     let result = restore_reserved(host, client, source, &proof);
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.chat_spawning.remove(&source.id);
-    state.inventory_generation += 1;
+    drop(admission);
     result
 }
 

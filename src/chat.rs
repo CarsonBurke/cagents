@@ -15,7 +15,7 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod claude_metadata;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 pub mod client;
 #[cfg(feature = "host")]
 pub(crate) mod native_holder;
@@ -324,6 +324,9 @@ pub enum Recovery {
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
     Retry,
+    /// The daemon has no free resident chat slots. Retrying preserves this
+    /// conversation; capacity must become available before it can start.
+    Capacity,
     /// The saved conversation cannot be reached by any retry. Only a new
     /// conversation in the same place is left, and the reader has to ask for
     /// it rather than find one started on their behalf.

@@ -21,11 +21,31 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    close_retained_inner(host, source, None)
+}
+
+pub(super) fn close_retained_with_reservation(
+    host: &SharedHost,
+    source: &Session,
+    closing: &capacity::Reservation,
+) -> Result<(), String> {
+    close_retained_inner(host, source, Some(closing))
+}
+
+fn close_retained_inner(
+    host: &SharedHost,
+    source: &Session,
+    closing: Option<&capacity::Reservation>,
+) -> Result<(), String> {
     super::super::agent_execution::preflight_retirement(host, source)?;
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
-            || state.chat_spawning.contains_key(&source.id)
+            || if let Some(closing) = closing {
+                !closing.holds(&state, source.id)
+            } else {
+                state.chat_spawning.contains_key(&source.id)
+            }
             || state.chat_handoffs.contains_key(&source.id)
         {
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
@@ -68,8 +88,10 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                     .into(),
             );
         }
-        state.chat_spawning.insert(source.id, source.clone());
-        state.inventory_generation += 1;
+        if closing.is_none() {
+            state.chat_spawning.insert(source.id, source.clone());
+            state.inventory_generation += 1;
+        }
         (state.proof().clone(), pending, actor)
     };
     let result = (|| {
@@ -205,8 +227,13 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.chat_spawning.remove(&source.id);
-    state.inventory_generation += 1;
+    if closing.is_some_and(|closing| !closing.holds(&state, source.id)) {
+        return Err("Native close reservation changed; replacement ownership was retained".into());
+    }
+    if closing.is_none() {
+        state.chat_spawning.remove(&source.id);
+        state.inventory_generation += 1;
+    }
     if result.is_ok() {
         if let Some(actor) = actor {
             if state

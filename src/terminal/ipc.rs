@@ -155,7 +155,7 @@ use crate::{
 /// Version 98 combines notification context with account-default selection.
 /// Version 99 preserves version 98 and adds the version 96 terminal-title
 /// descriptor layout, requiring matched positional postcard peers.
-pub const PROTOCOL_VERSION: u16 = 99;
+pub const PROTOCOL_VERSION: u16 = 100;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -486,6 +486,19 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Resident native handles; this is independent of provider usage quotas.
+    ChatCapacityInspect,
+    ChatCapacitySet {
+        limit: u32,
+    },
+    ChatReleaseInspect {
+        chat_id: TerminalId,
+    },
+    /// Revalidate the exact inspected actor before releasing its resident handle.
+    ChatRelease {
+        proof: ChatReleaseProof,
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +806,54 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ChatCapacity {
+        capacity: ChatCapacity,
+        persistence_warning: Option<String>,
+    },
+    ChatReleaseInspected {
+        inspection: ChatReleaseInspection,
+    },
+    ChatReleased {
+        inspection: ChatReleaseInspection,
+        dry_run: bool,
+    },
+}
+
+/// Maximum compact inventory rows in one capacity response.
+pub const MAX_CHAT_CAPACITY_ROWS: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacity {
+    /// Distinct admission slots; recovery can reserve an already resident ID.
+    pub used: u32,
+    pub resident: u32,
+    pub spawning: u32,
+    pub limit: u32,
+    pub residents: Vec<ChatCapacityResident>,
+    pub omitted_residents: u32,
+}
+
+/// Cheap resident inventory; eligibility still requires a per-ID inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacityResident {
+    pub chat_id: TerminalId,
+    pub provider: crate::agent::Provider,
+    pub status: String,
+    /// None means verification is still required, never permission to release.
+    pub release_blocked: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseProof {
+    pub session: crate::chat::Session,
+    pub execution_instance: uuid::Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseInspection {
+    pub proof: ChatReleaseProof,
+    pub release_blocked: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -894,6 +955,7 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+    ChatCapacity,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

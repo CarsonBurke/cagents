@@ -492,6 +492,8 @@ pub(super) struct State {
     /// A card in this set has no chat runtime to hold the offer, because its
     /// start never produced one, so the failed card itself has to carry it.
     fresh_offers: HashSet<CardId>,
+    /// Capacity failures before a chat runtime exists (saved-pane hydration).
+    capacity_offers: HashSet<CardId>,
     removed_accounts: HashSet<CardId>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
@@ -514,6 +516,7 @@ impl Default for State {
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
+            capacity_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
             last_models: HashMap::new(),
         }
@@ -1567,6 +1570,8 @@ enum QueuedStep {
     Prompt,
 }
 
+const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
+
 pub(super) struct Runtime {
     find: Option<String>,
     find_focused: bool,
@@ -1666,6 +1671,8 @@ pub(super) struct Runtime {
     listed_models: u64,
     visible: AtomicBool,
     error: Option<String>,
+    /// A typed admission refusal, independent of provider/account failures.
+    capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
@@ -2239,6 +2246,7 @@ impl Runtime {
             listed_models: 0,
             visible: AtomicBool::new(visible),
             error: None,
+            capacity_refused: false,
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
@@ -4901,6 +4909,7 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
+        self.chat_ui.capacity_offers.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
@@ -5010,6 +5019,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -5053,6 +5063,16 @@ impl Cagents {
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
     }
+    pub(super) fn chat_capacity_guidance(&self, card: CardId) -> Option<&'static str> {
+        (self.chat_ui.capacity_offers.contains(&card)
+            && !self.chat_start_pending(card)
+            && matches!(
+                self.card_state(card).map(|state| &state.kind),
+                Some(CardKind::Chat(_))
+            ))
+        .then_some(CAPACITY_GUIDANCE)
+    }
+
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
     }
@@ -5585,6 +5605,10 @@ impl Cagents {
     ) -> Task<Message> {
         if self.chat_awaiting_admission(card) {
             return Task::none();
+        }
+        self.chat_ui.capacity_offers.remove(&card);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.capacity_refused = false;
         }
         let selection = None;
         let target = self.chat_ui.next_target(card);
@@ -6855,6 +6879,7 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             runtime.error = None;
+                            runtime.capacity_refused = false;
                             runtime.show(visible);
                         } else {
                             let mut runtime = Runtime::new(
@@ -6945,6 +6970,7 @@ impl Cagents {
                         // an identity of its own.
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
+                            runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
                         }
                         return self.retire_chat(target.card, None, Some(attempt.session));
@@ -6997,6 +7023,7 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
@@ -7004,6 +7031,11 @@ impl Cagents {
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Chat(_))
                         ) {
+                            if failure.recovery == chat::Recovery::Capacity {
+                                self.chat_ui.capacity_offers.insert(target.card);
+                            } else {
+                                self.chat_ui.capacity_offers.remove(&target.card);
+                            }
                             self.fail_runtime(target.card, failure.message.clone());
                             self.status = Some(TransientNotice::error(failure.message));
                         } else {
@@ -17599,6 +17631,204 @@ mod tests {
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, session, chat::Intent::Restore);
         assert!(app.chat_start_pending(card));
+    }
+
+    fn capacity_recovery_labels(app: &Cagents, card: CardId) -> Vec<String> {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let mut element = app.card_view(card, true, false);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let message = "Native chat capacity reached: 128 resident, 0 starting; limit 128";
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: message.into(),
+                recovery: chat::Recovery::Capacity,
+            }),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(runtime.capacity_refused);
+        assert_eq!(runtime.error.as_deref(), Some(message));
+        assert_eq!(runtime.composer.text(), "hello");
+        assert!(runtime.queued.is_none());
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let labels = capacity_recovery_labels(&app, card);
+        assert!(labels.iter().any(|label| label == "Retry"), "{labels:?}");
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("cagents chat capacity")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.contains("daemon may still be working")),
+            "{labels:?}"
+        );
+        let retry = runtime.target;
+        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        let attempt = chat_runtime_attempt(&app, card);
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.capacity_refused);
+        assert_eq!(runtime.queued.as_ref().unwrap().text, "hello");
+        assert!(runtime.composer.text().is_empty());
+        // A second press while that attempt owns the card cannot enqueue or
+        // create another start, even with the old rendered target.
+        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        assert_eq!(chat_runtime_attempt(&app, card), attempt);
+        assert_eq!(
+            chat_runtime(&app, card).queued.as_ref().unwrap().text,
+            "hello"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_on_cold_restore_keeps_guidance_identity_and_stashed_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("saved capacity draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "128 resident, 0 starting; limit 128".into(),
+                recovery: chat::Recovery::Capacity,
+            }),
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert_eq!(app.chat_capacity_guidance(card), Some(CAPACITY_GUIDANCE));
+        let labels = capacity_recovery_labels(&app, card);
+        assert!(
+            labels.iter().any(|label| label.contains("Retry")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("cagents chat release ID --dry-run")),
+            "{labels:?}"
+        );
+        assert_eq!(
+            app.chat_ui.drafts.get(&card).unwrap(),
+            "saved capacity draft"
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert!(!app.chat_offers_fresh_conversation(card));
+        drop(app.update(Message::RetryCard(card)));
+        let retry = chat_runtime_attempt(&app, card);
+        assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
+        assert_eq!(app.chat_capacity_guidance(card), None);
+        drop(app.update(Message::RetryCard(card)));
+        assert_eq!(chat_runtime_attempt(&app, card), retry);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, retry, Ok(handle));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "saved capacity draft"
+        );
+        assert!(!chat_runtime(&app, card).capacity_refused);
+        assert_eq!(app.chat_capacity_guidance(card), None);
+        // A delayed old failure cannot replace the recovered attachment or
+        // re-offer capacity recovery for its superseded attempt.
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "stale capacity".into(),
+                recovery: chat::Recovery::Capacity,
+            }),
+        );
+        assert!(!chat_runtime(&app, card).capacity_refused);
+        assert_eq!(app.chat_capacity_guidance(card), None);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "saved capacity draft"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("unsent capacity draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure {
+                message: "Resident slots full".into(),
+                recovery: chat::Recovery::Capacity,
+            }),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.capacity_refused);
+        assert!(runtime.disconnected);
+        assert_eq!(runtime.session, source);
+        assert_eq!(runtime.composer.text(), "unsent capacity draft");
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let labels = capacity_recovery_labels(&app, card);
+        assert!(labels.iter().any(|label| label == "Retry"), "{labels:?}");
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("cagents chat capacity")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.contains("daemon may still be working")),
+            "{labels:?}"
+        );
+        let retry = runtime.target;
+        drop(app.handle_chat_ui(Action::Reconnect(retry)));
+        assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
+        assert!(!chat_runtime(&app, card).capacity_refused);
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            "unsent capacity draft"
+        );
     }
 
     #[test]

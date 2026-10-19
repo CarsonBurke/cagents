@@ -957,6 +957,8 @@ pub(super) fn admit(
     match request {
         ClientRequest::Attach { terminal_id, .. } => ensure_terminal(host, *terminal_id)?,
         ClientRequest::ChatAttach { .. }
+        | ClientRequest::ChatReleaseInspect { .. }
+        | ClientRequest::ChatRelease { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatRecoverAccount { .. } => ensure_idle(host)?,
         ClientRequest::PrepareUpgrade { .. }

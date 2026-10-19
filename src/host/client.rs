@@ -734,7 +734,11 @@ pub(super) fn process_request(
         | ClientRequest::ChatClose { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
-        | ClientRequest::ChatList) => Ok((
+        | ClientRequest::ChatList
+        | ClientRequest::ChatCapacityInspect
+        | ClientRequest::ChatCapacitySet { .. }
+        | ClientRequest::ChatReleaseInspect { .. }
+        | ClientRequest::ChatRelease { .. }) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
             false,

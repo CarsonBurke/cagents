@@ -1,6 +1,7 @@
 use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
+pub(super) mod capacity;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -753,6 +754,9 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Reserve before account setup, history reads, listener allocation or provider
+    // initialization. An unsuccessful attempt releases only its own reservation.
+    let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
     super::account_lifecycle::ensure_launch(
         host,
         &session.launch.recipe.working_directory,
@@ -828,9 +832,9 @@ fn start_with_execution(
         chat::NativeContinuity::Durable { .. }
     ) || has_native_owner(&session)?
     {
-        return native_recovery::restore(host, client, &session).map_err(unavailable);
+        return native_recovery::restore_with_admission(host, client, &session, admission)
+            .map_err(unavailable);
     }
-    let reservation_id = session.id;
     let mut source_process = None;
     let mut source_fresh = None;
     let mut source_environment = BTreeMap::new();
@@ -1094,7 +1098,6 @@ fn start_with_execution(
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));
     }
-    let mut retired = None;
     let source_handle = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
@@ -1129,10 +1132,10 @@ fn start_with_execution(
         } else {
             false
         };
-        if !recovering && state.chats.len() + state.chat_spawning.len() >= 128 {
-            return Err(unavailable("Daemon native chat capacity reached"));
+        if !recovering && admission.is_none() {
+            capacity::require_available(&state)?;
         }
-        if state.chat_spawning.contains_key(&session.id)
+        if (state.chat_spawning.contains_key(&session.id) && admission.is_none())
             || state.native_closing.contains_key(&session.id)
         {
             return Err(error("Chat is already starting"));
@@ -1146,11 +1149,9 @@ fn start_with_execution(
                 ));
             }
         }
-        if state
-            .chat_spawning
-            .values()
-            .any(|pending| same_conversation(&pending.launch, &session.launch))
-        {
+        if state.chat_spawning.iter().any(|(id, pending)| {
+            *id != session.id && same_conversation(&pending.launch, &session.launch)
+        }) {
             return Err(error("This exact conversation is already starting"));
         }
         if let Some(id) = &session.launch.session_id {
@@ -1197,17 +1198,11 @@ fn start_with_execution(
             }
             None
         };
-        if recovering {
-            retired = state.chats.remove(&session.id);
-        }
         session.proof = Some(state.proof().clone());
-        state.chat_spawning.insert(session.id, session.clone());
+        capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
         state.inventory_generation += 1;
         source_handle
     };
-    // Joining a completed actor must never happen while holding the host lock:
-    // its final notification may still be acquiring that same lock.
-    drop(retired);
     let result = (|| {
         let mut pending_fresh = None;
         if let Some(handle) = source_handle {
@@ -1426,16 +1421,18 @@ fn start_with_execution(
         };
         let response = session_snapshot(&record);
         record.handle.commit_native_installation();
-        state.chats.insert(id, record);
+        let retired = state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
         }
         state.inventory_generation += 1;
+        // A failed recovery leaves its completed record available. Only a
+        // successfully installed replacement retires it, outside the host lock.
+        drop(state);
+        drop(retired);
         Ok(response)
     })();
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.chat_spawning.remove(&reservation_id);
-    state.inventory_generation += 1;
+    drop(admission);
     result
 }
 
@@ -2014,6 +2011,29 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatCapacityInspect => Ok(ServerResponse::ChatCapacity {
+            capacity: capacity::status(host),
+            persistence_warning: None,
+        }),
+        ClientRequest::ChatCapacitySet { limit } => {
+            crate::native_chat_capacity::validate(limit).map_err(error)?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let saved = crate::native_chat_capacity::save(limit).map_err(|failure| {
+                unavailable(format!("Cannot persist native chat capacity: {failure}"))
+            })?;
+            state.native_chat_capacity = limit as usize;
+            Ok(ServerResponse::ChatCapacity {
+                capacity: capacity::status_from_state(&state),
+                persistence_warning: saved.durability_warning,
+            })
+        }
+        ClientRequest::ChatReleaseInspect { chat_id } => Ok(ServerResponse::ChatReleaseInspected {
+            inspection: capacity::inspect(host, chat_id)?,
+        }),
+        ClientRequest::ChatRelease { proof, dry_run } => Ok(ServerResponse::ChatReleased {
+            inspection: capacity::release(host, &proof, dry_run)?,
+            dry_run,
+        }),
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()
@@ -2130,7 +2150,13 @@ fn process_inner(
                     session
                 })
                 .collect::<Vec<_>>();
-            sessions.extend(state.chat_spawning.values().cloned());
+            sessions.extend(state.chat_spawning.values().map(|pending| {
+                let mut session = pending.clone();
+                // Inventory describes this daemon's pending attachment. Keep
+                // the reservation's exact caller token unchanged for its CAS.
+                session.proof = Some(state.proof().clone());
+                session
+            }));
             Ok(ServerResponse::ChatListed { sessions })
         }
         ClientRequest::ChatStart {
@@ -2159,12 +2185,26 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
+            let missing = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(session.proof.as_ref(), state.proof())?;
+                !state.chats.contains_key(&session.id)
+                    && !state.chat_handoffs.contains_key(&session.id)
+            };
+            if missing {
+                return capacity::restore_saved_history(host, client, session);
+            }
             // A live actor remains attachable after account removal. A stopped
             // actor cannot resume with that home, so expose the same recovery
             // choice without creating a replacement process.
             let stopped_launch = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(session.proof.as_ref(), state.proof())?;
+                if state.chat_spawning.contains_key(&session.id) {
+                    return Err(unavailable(
+                        "Native chat ownership is changing; retry its normal attach after the transition finishes",
+                    ));
+                }
                 state
                     .chats
                     .get(&session.id)
@@ -2176,6 +2216,11 @@ fn process_inner(
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
+            if state.chat_spawning.contains_key(&session.id) {
+                return Err(unavailable(
+                    "Native chat ownership is changing; retry its normal attach after the transition finishes",
+                ));
+            }
             if let Some(receipt) = state.chat_handoffs.get_mut(&session.id) {
                 receipt.validate_source(&session)?;
                 receipt.subscribers.entry(client).or_insert(false);
@@ -2521,15 +2566,17 @@ fn process_inner(
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
-            let (handle, source) = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let (handle, source, closing) = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.chat_handoffs.contains_key(&chat_id) {
                     return Err(error(
                         "This chat already returned to terminal; complete the retained handoff before closing its card",
                     ));
                 }
                 let record = attached(&state, client, chat_id)?;
-                (record.handle.clone(), record.session.clone())
+                let (handle, source) = (record.handle.clone(), record.session.clone());
+                let closing = capacity::Reservation::closing(host, &mut state, &source)?;
+                (handle, source, closing)
             };
             super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
             handle.close_for_resume().map_err(unavailable)?;
@@ -2561,7 +2608,8 @@ fn process_inner(
                 // Closing an exited attachment proves only that local actor is
                 // gone. A server preserved by an earlier failed adoption must
                 // also acknowledge exact cleanup before this close can succeed.
-                close_retained_native(host, &retained).map_err(unavailable)?;
+                native_cleanup::close_retained_with_reservation(host, &retained, &closing)
+                    .map_err(unavailable)?;
                 return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
             }
             let terminal = {
@@ -2605,10 +2653,11 @@ fn process_inner(
             }
             let record = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if !state
-                    .chats
-                    .get(&chat_id)
-                    .is_some_and(|record| record.handle.same_actor(&handle))
+                if !closing.holds(&state, chat_id)
+                    || !state
+                        .chats
+                        .get(&chat_id)
+                        .is_some_and(|record| record.handle.same_actor(&handle))
                 {
                     return Err(unavailable(
                         "The thread changed while its previous actor was closing.",
@@ -3119,22 +3168,32 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
-    let source = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&terminal_id)
-        .filter(|record| record.handle.same_actor(handle))
-        .map(|record| record.session.clone());
-    if let Some(source) = source {
-        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    let closing = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let source = state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| record.handle.same_actor(handle))
+            .map(|record| record.session.clone());
+        source
+            .map(|source| {
+                let closing = capacity::Reservation::closing(host, &mut state, &source)?;
+                Ok::<_, ProtocolError>((source, closing))
+            })
+            .transpose()?
+    };
+    if let Some((source, _)) = &closing {
+        super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
     }
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let removed = if state
-        .chats
-        .get(&terminal_id)
-        .is_some_and(|record| record.handle.same_actor(handle))
+    let removed = if closing
+        .as_ref()
+        .is_some_and(|(_, closing)| closing.holds(&state, terminal_id))
+        && state
+            .chats
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_actor(handle))
     {
         state.inventory_generation += 1;
         state.chats.remove(&terminal_id)
