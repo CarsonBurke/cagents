@@ -11,7 +11,7 @@ pub enum ChatCommand {
     },
     /// Inspect or release one exact completed resident handle, preserving saved history.
     Release {
-        /// Full native chat ID, as shown by sessions --all.
+        /// Full resident native chat ID, as shown by chat capacity.
         id: TerminalId,
         /// Inspect current eligibility without releasing anything.
         #[arg(long, conflicts_with = "yes", required_unless_present = "yes")]
@@ -145,12 +145,40 @@ fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) 
         .as_ref()
         .map(|warning| format!("\nWarning: {warning}"))
         .unwrap_or_default();
+    let rows = capacity
+        .residents
+        .iter()
+        .map(|row| {
+            [
+                row.chat_id.to_string(),
+                row.provider.label().to_owned(),
+                row.status.clone(),
+                row.release_blocked
+                    .clone()
+                    .unwrap_or_else(|| "Inspect with --dry-run to verify".to_owned()),
+            ]
+        })
+        .collect();
+    let inventory = format::table(
+        ["CHAT", "PROVIDER", "STATUS", "RELEASE"],
+        rows,
+        "No resident chats",
+    );
+    let truncation = if capacity.omitted_residents > 0 {
+        format!(
+            "\nShowing {} resident rows; {} omitted by the bounded inventory limit",
+            capacity.residents.len(),
+            capacity.omitted_residents
+        )
+    } else {
+        String::new()
+    };
     let mut data = json!(capacity);
     data["persistence_warning"] = json!(persistence_warning);
     CommandOutput {
         command: "chat.capacity",
         human: format!(
-            "Native chats: {} used / {} limit ({} resident, {} spawning){suffix}{warning}",
+            "Native chats: {} used / {} limit ({} resident, {} spawning){suffix}{warning}\n\n{inventory}{truncation}",
             capacity.used, capacity.limit, capacity.resident, capacity.spawning
         ),
         data,
@@ -296,6 +324,32 @@ mod tests {
         assert_eq!(output.data["released"], true);
     }
     #[test]
+    fn compact_inventory_exposes_completed_ids_without_claiming_eligibility() {
+        let id = TerminalId::new();
+        let output = capacity_output(
+            ChatCapacity {
+                used: 4097,
+                resident: 4097,
+                spawning: 0,
+                limit: 128,
+                residents: vec![crate::terminal_ipc::ChatCapacityResident {
+                    chat_id: id,
+                    provider: crate::agent::Provider::Codex,
+                    status: "completed".into(),
+                    release_blocked: None,
+                }],
+                omitted_residents: 4096,
+            },
+            None,
+        );
+        assert!(output.human.contains(&id.to_string()));
+        assert!(output.human.contains("Inspect with --dry-run to verify"));
+        assert!(output.human.contains("4096 omitted"));
+        assert_eq!(output.data["residents"][0]["chat_id"], id.to_string());
+        assert_eq!(output.data["omitted_residents"], 4096);
+    }
+
+    #[test]
     fn overlapping_recovery_slot_is_not_reported_as_full_and_warning_is_visible() {
         let output = capacity_output(
             ChatCapacity {
@@ -303,6 +357,8 @@ mod tests {
                 resident: 127,
                 spawning: 1,
                 limit: 128,
+                residents: Vec::new(),
+                omitted_residents: 0,
             },
             Some("sync failed after publication".into()),
         );
@@ -342,6 +398,8 @@ mod tests {
                         resident: 128,
                         spawning: 2,
                         limit: 1,
+                        residents: Vec::new(),
+                        omitted_residents: 0,
                     },
                     persistence_warning: None,
                 })

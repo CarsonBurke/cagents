@@ -819,7 +819,9 @@ pub enum ServerResponse {
     },
 }
 
-/// Counts resident handles and in-flight reservations, including completed records.
+/// Maximum compact inventory rows in one capacity response.
+pub const MAX_CHAT_CAPACITY_ROWS: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatCapacity {
     /// Distinct admission slots; recovery can reserve an already resident ID.
@@ -827,6 +829,18 @@ pub struct ChatCapacity {
     pub resident: u32,
     pub spawning: u32,
     pub limit: u32,
+    pub residents: Vec<ChatCapacityResident>,
+    pub omitted_residents: u32,
+}
+
+/// Cheap resident inventory; eligibility still requires a per-ID inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacityResident {
+    pub chat_id: TerminalId,
+    pub provider: crate::agent::Provider,
+    pub status: String,
+    /// None means verification is still required, never permission to release.
+    pub release_blocked: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -4,8 +4,11 @@ The daemon keeps a bounded number of resident native chat handles. Completed
 handles can still occupy this capacity. This limit is separate from account
 usage allowances and provider plan quotas.
 
-Run `cagents chat capacity` to see used admission slots, resident handles, pending spawns and the
-configured limit. A pending recovery can refer to an existing resident, so the
+Run `cagents chat capacity` to see used admission slots, resident handles, pending
+spawns and the configured limit. Its compact resident table includes completed
+handles that ordinary session listings may omit. The table shows at most 4096
+rows and reports any omitted count; it does not load transcripts or establish
+release eligibility. A pending recovery can refer to an existing resident, so the
 used count can be lower than resident plus spawning. `cagents chat capacity set 256` persists a new limit on the
 selected daemon. The default is 128; accepted values are 1 through 4096. The
 upper bound limits an accidental configuration change and does not guarantee
