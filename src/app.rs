@@ -9586,6 +9586,9 @@ impl Cagents {
                         },
                         self.account_recovery_controls(id)
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
+                        self.chat_capacity_guidance(id)
+                            .map(|guidance| design::caption(guidance).into())
+                            .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
                             let mut controls = if browser_session.is_some()
                                 && self.browser_unavailable_reason().is_some()

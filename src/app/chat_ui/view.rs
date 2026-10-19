@@ -1496,6 +1496,30 @@ impl Runtime {
         }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
+        } else if self.capacity_refused {
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && !self.attachment_chooser_pending
+                && (!self.is_draft()
+                    || !self.composer.text().trim().is_empty()
+                    || !self.attachments.is_empty());
+            content.push(
+                widget::column::with_children(vec![
+                    design::caption(CAPACITY_GUIDANCE).into(),
+                    widget::button::custom(design::caption("Retry"))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .on_press_maybe(enabled.then(|| {
+                            action(if self.is_draft() {
+                                Action::Submit(target, PromptMode::Send)
+                            } else {
+                                Action::Reconnect(target)
+                            })
+                        }))
+                        .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
             let enabled =

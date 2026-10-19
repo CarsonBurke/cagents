@@ -27,6 +27,17 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+fn start_failure(error: ipc::ProtocolError) -> StartFailure {
+    StartFailure {
+        message: error.message,
+        recovery: match error.code {
+            ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
+            ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
+            _ => super::Recovery::Retry,
+        },
+    }
+}
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -886,14 +897,7 @@ impl ClientHandle {
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
-                    return Err(StartFailure {
-                        message: error.message,
-                        recovery: if error.code == ipc::ProtocolErrorCode::AccountRemoved {
-                            super::Recovery::Account
-                        } else {
-                            super::Recovery::Retry
-                        },
-                    });
+                    return Err(start_failure(error));
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
@@ -1503,6 +1507,42 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_capacity_is_typed_and_keeps_daemon_detail() {
+        for (code, recovery) in [
+            (
+                ipc::ProtocolErrorCode::ChatCapacity,
+                super::super::Recovery::Capacity,
+            ),
+            (
+                ipc::ProtocolErrorCode::AccountRemoved,
+                super::super::Recovery::Account,
+            ),
+            (
+                ipc::ProtocolErrorCode::TerminalUnavailable,
+                super::super::Recovery::Retry,
+            ),
+        ] {
+            let failure = start_failure(ipc::ProtocolError::new(
+                code,
+                "128 resident; limit 128",
+                true,
+            ));
+            assert_eq!(failure.recovery, recovery);
+            assert_eq!(failure.message, "128 resident; limit 128");
+        }
+        // Text alone must never turn a provider failure into capacity recovery.
+        assert_eq!(
+            start_failure(ipc::ProtocolError::new(
+                ipc::ProtocolErrorCode::TerminalUnavailable,
+                "Daemon native chat capacity reached",
+                true,
+            ))
+            .recovery,
+            super::super::Recovery::Retry,
+        );
+    }
 
     #[test]
     fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
