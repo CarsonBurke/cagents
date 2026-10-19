@@ -736,6 +736,25 @@ impl ClientHandle {
         )
     }
 
+    /// Exercise the real restore handshake against an in-process daemon in
+    /// host tests, without discovering or launching any external daemon.
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_restore(
+        stream: UnixStream,
+        session: Session,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
     fn connect_on(
         mut stream: UnixStream,
         session: Session,
