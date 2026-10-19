@@ -24,6 +24,40 @@ capacity file causes daemon startup to report an error rather than silently
 change the limit. If the atomic replacement succeeds but directory syncing fails,
 the new limit takes effect and the CLI reports a durability warning.
 
+## Repair a capacity file that prevents startup
+
+`chat capacity set` needs a running daemon. If this setting prevents startup,
+repair it offline on the selected daemon's host. Do this only for the daemon
+that failed to start; leave a healthy daemon's configuration alone.
+
+First select the correct application instance. On Linux, the configuration
+base is an absolute `XDG_CONFIG_HOME`, or `~/.config` when that variable is
+unset or relative. The file is:
+
+- Production: `cagents/native-chat-capacity.toml` beneath that base.
+- Development: `cagents-development/native-chat-capacity.toml` beneath that base.
+
+Debug builds and builds with the `development` feature use the development
+instance. A remote device uses its own host's configuration base, not the
+local CLI's directory.
+
+For a malformed regular file owned by your user, preserve the existing file by
+renaming it to an unused backup name in the same directory. Check that the
+backup name is absent and use a move that refuses to overwrite an existing
+file; do not replace an earlier backup. Then choose one recovery:
+
+- Leave the capacity file absent and start normally to intentionally restore
+  the default limit of 128.
+- Create a private replacement regular file owned by your user, with mode
+  `0600`, containing only `limit = 128` or another chosen integer from 1 through
+  4096, then start normally.
+
+If startup reports an unsafe path, inspect the path components and ownership
+before repairing them. Do not follow a symlink to edit its target or replace
+files whose ownership you have not established. This procedure changes only
+the capacity preference; leave saved conversations, drafts and provider files
+untouched.
+
 To inspect one handle, run:
 
 ```
