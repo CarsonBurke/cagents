@@ -1570,7 +1570,7 @@ enum QueuedStep {
     Prompt,
 }
 
-const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Review eligibility with cagents chat release ID --dry-run before releasing a completed resident chat. Then retry. Your conversation and draft are kept.";
+const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
 pub(super) struct Runtime {
     find: Option<String>,
