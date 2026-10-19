@@ -817,9 +817,7 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                     Some("Actor owns live or unconfirmed provider work".into())
                 } else if !record.subscribers.is_empty() {
                     Some("A client is attached".into())
-                } else if !snapshot.subagents.is_empty() {
-        Some("Child transcript preservation is not yet verified; its resident history is preserved")
-    } else if !record.handle.is_read_only_history() {
+                } else if !record.handle.is_read_only_history() {
                     Some("Writer transcript durability is unverified".into())
                 } else if state.chat_spawning.contains_key(&id)
                     || state.native_closing.contains_key(&id)
@@ -877,6 +875,8 @@ fn inspected_record(
         || !record.handle.background_subagents().is_empty()
     {
         Some("The actor still reports pending or delegated work")
+    } else if !snapshot.subagents.is_empty() {
+        Some("Child transcript preservation is not yet verified; its resident history is preserved")
     } else if !record.handle.is_read_only_history() {
         Some("Completed writer history is not proven durable; its resident transcript is preserved")
     } else if !snapshot.exited || snapshot.read_only_reason.is_none() {
