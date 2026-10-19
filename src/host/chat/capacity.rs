@@ -304,6 +304,11 @@ mod tests {
 
     fn history_reader(host: &SharedHost, close: bool) -> (tempfile::TempDir, Session, Handle) {
         let directory = tempfile::tempdir().unwrap();
+        let registry = super::super::super::model::Registry::at(
+            &directory.path().join("capacity-model.sqlite"),
+        )
+        .unwrap();
+        host.lock().unwrap().execution_registry = Some(Arc::new(std::sync::Mutex::new(registry)));
         let mut source = session();
         source.proof = Some(host.lock().unwrap().proof().clone());
         source.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
@@ -784,6 +789,44 @@ mod tests {
                 .contains_key(&9)
         );
     }
+    #[test]
+    fn unavailable_managed_registry_preserves_reader_until_verified_empty_registry_returns() {
+        let host = host();
+        let (_directory, source, handle) = history_reader(&host, false);
+        let proof = inspect(&host, source.id).unwrap().proof;
+        let verified_registry = host.lock().unwrap().execution_registry.take().unwrap();
+        let blocked = inspect(&host, source.id).unwrap();
+        assert!(
+            blocked
+                .release_blocked
+                .unwrap()
+                .contains("registry is unavailable")
+        );
+        assert!(release(&host, &proof, false).is_err());
+        assert!(
+            !handle.is_completed(),
+            "unknown ownership must not even stop paging"
+        );
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .handle
+                .same_actor(&handle)
+        );
+        assert!(
+            verified_registry
+                .lock()
+                .unwrap()
+                .retained_agent_sources(source.id)
+                .unwrap()
+                .is_empty()
+        );
+        host.lock().unwrap().execution_registry = Some(verified_registry);
+        let fresh = inspect(&host, source.id).unwrap();
+        assert_eq!(fresh.release_blocked, None);
+        release(&host, &fresh.proof, false).unwrap();
+        assert!(handle.is_completed());
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+    }
 }
 
 pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
@@ -911,7 +954,14 @@ pub(in crate::host) fn inspect(
     super::super::account_lifecycle::ensure_idle(host)?;
     // Managed run state is independent of actor activity. Do not cancel or
     // retire any managed authority through this resident-only operation.
-    if let Ok(registry) = super::super::agent_execution::registry(host) {
+    let registry = match super::super::agent_execution::registry(host) {
+        Ok(registry) => registry,
+        Err(error) => {
+            inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
+            return Ok(inspection);
+        }
+    };
+    {
         match registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(id) {
             Ok(sources) if sources.is_empty() => {},
             Ok(_) => inspection.release_blocked = Some("The actor belongs to a managed agent; use its supported owned-agent close operation".into()),
