@@ -36,6 +36,14 @@ pub(super) struct Reservation {
 
 impl Reservation {
     pub(super) fn new(host: &SharedHost, source: &Session) -> Result<Option<Self>, ProtocolError> {
+        Self::new_with_source(host, source, None)
+    }
+
+    pub(super) fn new_with_source(
+        host: &SharedHost,
+        source: &Session,
+        terminal_proof: Option<&HostSessionProof>,
+    ) -> Result<Option<Self>, ProtocolError> {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
@@ -45,10 +53,40 @@ impl Reservation {
         {
             return Err(error("Chat is already starting or closing"));
         }
-        // Existing records need their attachment/recovery identity validated by
-        // start. Replacing that same resident never consumes another slot.
-        if state.chats.contains_key(&source.id) {
-            return Ok(None);
+        if let Some(record) = state.chats.get(&source.id) {
+            // An exact live Codex terminal pair is an attachment, not admission.
+            // Authenticate it before allowing the existing fast path to run.
+            let paired = (terminal_proof.is_some() || source.owns_codex_listener())
+                && record.handle.owns_work()
+                && source.launch.provider == Provider::Codex
+                && record.session.launch.provider == Provider::Codex
+                && record.handle.session_id() == source.launch.session_id
+                && record.session.terminal.as_ref().is_some_and(|terminal| {
+                    source.terminal.as_ref().is_some_and(|source| {
+                        terminal.id == source.id && terminal.launch == source.launch
+                    }) && state
+                        .terminals
+                        .get(&terminal.id)
+                        .is_some_and(|live| live.session.launch == terminal.launch)
+                });
+            if paired {
+                validate_proof(terminal_proof.or(source.proof.as_ref()), state.proof())?;
+                return Ok(None);
+            }
+            if record.returning_terminal || record.handle.owns_work() {
+                return Err(error(
+                    "Chat already owns work or a pending handoff; attach to its existing view",
+                ));
+            }
+            validate_proof(source.proof.as_ref(), state.proof())?;
+            if record.session.launch.provider != source.launch.provider
+                || record.session.launch.recipe != source.launch.recipe
+                || record.handle.session_id() != source.launch.session_id
+            {
+                return Err(error(
+                    "Explicit recovery must retain the exact closed chat identity",
+                ));
+            }
         }
         if state.chat_handoffs.contains_key(&source.id) {
             return Err(error(
@@ -71,7 +109,9 @@ impl Reservation {
         {
             return Err(error("This exact conversation is already starting"));
         }
-        require_available(&state)?;
+        if !state.chats.contains_key(&source.id) {
+            require_available(&state)?;
+        }
         state.chat_spawning.insert(source.id, source.clone());
         state.inventory_generation += 1;
         Ok(Some(Self {
@@ -308,7 +348,7 @@ mod tests {
         let host = host();
         let (_directory, source, _) = closed_history(&host);
         let mut admission = Reservation::new(&host, &source).unwrap();
-        assert!(admission.is_none());
+        assert!(admission.is_some());
         {
             let mut state = host.lock().unwrap();
             state.native_chat_capacity = 1;

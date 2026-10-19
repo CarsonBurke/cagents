@@ -756,7 +756,7 @@ fn start_with_execution(
 ) -> Result<ServerResponse, ProtocolError> {
     // Reserve before account setup, history reads, listener allocation or provider
     // initialization. An unsuccessful attempt releases only its own reservation.
-    let mut admission = capacity::Reservation::new(host, &session)?;
+    let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
     super::account_lifecycle::ensure_launch(
         host,
         &session.launch.recipe.working_directory,
