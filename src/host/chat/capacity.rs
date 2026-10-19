@@ -428,6 +428,17 @@ mod tests {
                 .same_actor(&handle)
         );
         assert!(host.lock().unwrap().chat_spawning.contains_key(&source.id));
+        let failure = close_terminal_actor(&host, source.id, &handle).unwrap_err();
+        assert!(failure.message.contains("starting or closing"));
+        assert!(
+            !handle.is_completed(),
+            "terminal close must preserve the same recovery reader"
+        );
+        assert!(
+            host.lock().unwrap().chats[&source.id]
+                .handle
+                .same_actor(&handle)
+        );
         drop(admission);
         handle.close().unwrap();
     }

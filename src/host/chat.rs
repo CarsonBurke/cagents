@@ -3168,22 +3168,32 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
-    let source = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&terminal_id)
-        .filter(|record| record.handle.same_actor(handle))
-        .map(|record| record.session.clone());
-    if let Some(source) = source {
-        super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
+    let closing = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let source = state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| record.handle.same_actor(handle))
+            .map(|record| record.session.clone());
+        source
+            .map(|source| {
+                let closing = capacity::Reservation::closing(host, &mut state, &source)?;
+                Ok::<_, ProtocolError>((source, closing))
+            })
+            .transpose()?
+    };
+    if let Some((source, _)) = &closing {
+        super::agent_execution::preflight_retirement(host, source).map_err(unavailable)?;
     }
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let removed = if state
-        .chats
-        .get(&terminal_id)
-        .is_some_and(|record| record.handle.same_actor(handle))
+    let removed = if closing
+        .as_ref()
+        .is_some_and(|(_, closing)| closing.holds(&state, terminal_id))
+        && state
+            .chats
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_actor(handle))
     {
         state.inventory_generation += 1;
         state.chats.remove(&terminal_id)
