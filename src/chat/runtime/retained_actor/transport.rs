@@ -840,11 +840,31 @@ impl RemoteActor {
         close_only: bool,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        validate_record(record)?;
         let socket = registry::socket(&registry::directory(Kind::Native)?, record.terminal);
-        let control = registry::connect(&socket).map_err(|error| error.to_string())?;
+        Self::adopt_at_until(
+            record,
+            source,
+            proof,
+            close_only,
+            &socket,
+            Instant::now() + TIMEOUT,
+            notify,
+        )
+    }
+    fn adopt_at_until(
+        record: &Record,
+        source: chat::Session,
+        proof: HostSessionProof,
+        close_only: bool,
+        socket: &std::path::Path,
+        deadline: Instant,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        validate_record(record)?;
+        let control =
+            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
         verify_peer(&control, record)?;
-        send(
+        deadline_io::send_until(
             &control,
             &Invocation {
                 proof: proof.clone(),
@@ -852,9 +872,9 @@ impl RemoteActor {
                 method: if close_only { "attach_close" } else { "attach" }.into(),
                 args: json!([source, record]),
             },
-            TIMEOUT,
+            deadline,
         )?;
-        let attached: Result<Attached, String> = receive(&control, TIMEOUT)?;
+        let attached: Result<Attached, String> = deadline_io::receive_until(&control, deadline)?;
         let attached = attached?;
         if &attached.identity.record != record || attached.close_only != close_only {
             return Err("Retained actor changed identity during attachment".into());
@@ -1133,12 +1153,21 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
     }
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
+        self.call_until(method, args, Instant::now() + TIMEOUT)
+    }
+    fn call_until<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+        deadline: Instant,
+    ) -> Result<T, String> {
         if self.0.close_only && !close_only_method(method) {
             return Err(close_only_refusal());
         }
-        let control = registry::connect(&self.0.socket).map_err(|error| error.to_string())?;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
         verify_peer(&control, &self.0.identity.record)?;
-        send(
+        deadline_io::send_until(
             &control,
             &Invocation {
                 proof: self.0.proof.clone(),
@@ -1146,9 +1175,9 @@ impl RemoteActor {
                 method: method.into(),
                 args,
             },
-            TIMEOUT,
+            deadline,
         )?;
-        let response: Result<Value, String> = receive(&control, TIMEOUT)?;
+        let response: Result<Value, String> = deadline_io::receive_until(&control, deadline)?;
         serde_json::from_value(response?).map_err(|error| error.to_string())
     }
     pub fn enqueue(
@@ -4825,3 +4854,7 @@ mod recognition_tests;
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "transport_deadline_tests.rs"]
+mod deadline_tests;

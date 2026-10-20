@@ -254,6 +254,14 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     arguments
 }
 
+/// An unavailable remote snapshot proves neither provider exit nor safe retry.
+fn provider_launch_snapshot(
+    handle: &chat::runtime::Handle,
+) -> Result<chat::Snapshot, (State, String)> {
+    handle.snapshot(None).ok_or_else(|| (State::Interrupted,
+        "The exact provider could not confirm startup; its ownership was preserved and the prompt was not resent".into()))
+}
+
 fn dispatch(
     host: &SharedHost,
     accepted: &Accepted,
@@ -459,7 +467,7 @@ fn dispatch(
     drop(_dispatch);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+        let snapshot = provider_launch_snapshot(&handle)?;
         if snapshot.exited || handle.is_completed() {
             return Err(before("Provider exited before accepting the prompt".into()));
         }

@@ -20386,6 +20386,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    upgrade_admission: None,
                 }),
             );
             app.cards.remove(&card);
@@ -20462,6 +20463,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        upgrade_admission: None,
                     }),
                 );
                 let _ = app.update(receipt);
@@ -20521,6 +20523,4 @@ mod tests {
             }
         }
     }
-
-
 }

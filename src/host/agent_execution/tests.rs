@@ -4101,3 +4101,16 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         .unwrap();
     }
 }
+
+#[test]
+fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted() {
+    let (handle, _) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    let identity = handle.actor_identity().unwrap();
+    let result = provider_launch_snapshot(&handle);
+    assert!(
+        matches!(result, Err((State::Interrupted, reason)) if reason.contains("ownership was preserved"))
+    );
+    assert_eq!(handle.actor_identity(), Some(identity));
+    assert!(handle.owns_work());
+    assert!(!handle.is_completed());
+}
