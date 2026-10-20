@@ -2065,6 +2065,15 @@ pub struct PullRequestDialog {
     retry_confirmation: Option<bool>,
 }
 
+impl PullRequestDialog {
+    fn can_submit(&self) -> bool {
+        !self.title.trim().is_empty()
+            && !self.head.trim().is_empty()
+            && !self.base.trim().is_empty()
+            && self.retry_confirmation != Some(false)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextTab {
     #[default]
@@ -12157,16 +12166,6 @@ impl Cagents {
             .or_else(|| self.parked_chat_restart_blocker())
     }
 
-    fn primary_dirty_close_control(&self, card: CardId) -> DirtyCloseControl {
-        match self.cards.get(&card) {
-            Some(CardRuntime::Repository(runtime)) if runtime.can_save() => DirtyCloseControl::Save,
-            Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes() => {
-                DirtyCloseControl::Discard
-            }
-            _ => DirtyCloseControl::Cancel,
-        }
-    }
-
     fn begin_dirty_close(
         &mut self,
         intent: DirtyCloseIntent,
@@ -12184,7 +12183,7 @@ impl Cagents {
         // while dirty-close is topmost; Cancel re-checks the live modal tree
         // and uses this only when none remains.
         let restore_card = self.workspace.focused();
-        let focused = self.primary_dirty_close_control(card);
+        let focused = DirtyCloseControl::Cancel;
         self.dirty_repository_close = Some(DirtyRepositoryClose {
             card,
             remaining: cards,
@@ -12216,7 +12215,7 @@ impl Cagents {
         if matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         {
             let card = close.card;
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
             return iced::widget::operation::focus(dirty_close_control_id(card, focused))
@@ -12225,7 +12224,7 @@ impl Cagents {
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         }) {
-            let focused = self.primary_dirty_close_control(card);
+            let focused = DirtyCloseControl::Cancel;
             close.focused = focused;
             self.dirty_repository_close = Some(close);
             return iced::widget::operation::focus(dirty_close_control_id(
@@ -12273,7 +12272,7 @@ impl Cagents {
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
-            Some(sidebar::discard_confirm_id())
+            Some(sidebar::discard_cancel_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
@@ -12287,6 +12286,17 @@ impl Cagents {
         } else {
             None
         }
+    }
+
+    fn pull_request_submission_allowed(&self) -> bool {
+        self.pull_request_dialog.as_ref().is_some_and(|dialog| {
+            dialog.can_submit()
+                && self
+                    .github_availability
+                    .get(&dialog.project_id)
+                    .and_then(GitHubAvailability::repository_key)
+                    == Some(&dialog.repository)
+        })
     }
 
     fn restore_pull_request_dialog(
@@ -14794,7 +14804,7 @@ impl Application for Cagents {
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
-                            iced::widget::operation::focus(sidebar::discard_confirm_id())
+                            iced::widget::operation::focus(sidebar::discard_cancel_id())
                                 .map(cosmic::Action::App)
                         } else {
                             Task::none()
@@ -15986,7 +15996,7 @@ impl Application for Cagents {
                 if self
                     .pull_request_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.retry_confirmation == Some(false))
+                    .is_some_and(|dialog| !dialog.can_submit())
                 {
                     return Task::none();
                 }
@@ -16088,6 +16098,10 @@ impl Application for Cagents {
                 }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
+                }
+                #[cfg(feature = "integrated-browser")]
+                if is_escape_press(&event) && self.browser_import_on_top() {
+                    return self.update_browser_import(self.browser_import.escape_action());
                 }
                 if let Some(task) = self.session_recovery_key_event(&event, captured) {
                     return task;
@@ -16263,6 +16277,9 @@ impl Application for Cagents {
                     }
                     if self.project_ui.modal_open() {
                         return self.handle_project_action(project_ui::Action::Dismiss);
+                    }
+                    if self.channel_ui.modal_open() {
+                        return self.handle_channel_ui(channel_ui::Action::Dismiss);
                     }
                     if self.sidebar_selection_ui.dialog.is_some() {
                         return self
@@ -17148,19 +17165,14 @@ impl Application for Cagents {
                              pane widths, and the configured language servers.",
                         ),
                         notice_detail("This cannot be undone."),
-                        widget::row::with_children(vec![
-                            iced::widget::Space::new().width(Length::Fill).into(),
+                        dialog_ui::confirmation_actions(
                             crate::ui_controls::button::secondary("Cancel")
                                 .id(widget::Id::new("dialog.reset-settings.cancel"))
-                                .on_press(Message::CancelResetSettings)
-                                .into(),
+                                .on_press(Message::CancelResetSettings),
                             crate::ui_controls::button::destructive("Reset settings")
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
-                                .on_press(Message::ConfirmResetSettings)
-                                .into(),
-                        ])
-                        .spacing(space::S)
-                        .into(),
+                                .on_press(Message::ConfirmResetSettings),
+                        ),
                     ])
                     .spacing(space::M),
                     480.0,
@@ -17244,11 +17256,12 @@ impl Application for Cagents {
                 .on_press_maybe(save_message)
                 .into(),
             );
-            rows.push(
-                widget::row::with_children(controls)
-                    .spacing(space::S)
-                    .into(),
-            );
+            let dismiss = controls.remove(0);
+            rows.push(dialog_ui::confirmation_actions(
+                dismiss,
+                widget::row::with_children(controls).spacing(space::S),
+            ));
+
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::container(widget::column::with_children(rows).spacing(space::M))
@@ -17311,6 +17324,10 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
                     .into(),
             ])
             .spacing(space::XS)
@@ -17320,6 +17337,10 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
                     .into(),
             ])
             .spacing(space::XS)
@@ -17329,6 +17350,10 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
+                    .on_submit_maybe(
+                        self.pull_request_submission_allowed()
+                            .then_some(|_| Message::SubmitPullRequest),
+                    )
                     .into(),
             ])
             .spacing(space::XS)
@@ -17363,29 +17388,13 @@ impl Application for Cagents {
                     .into(),
             );
         }
-        rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::secondary("Cancel")
-                    .on_press(Message::CancelDialog)
-                    .into(),
-                crate::ui_controls::button::primary("Create")
-                    .on_press_maybe(
-                        (!head.is_empty()
-                            && !base.is_empty()
-                            && !dialog.title.trim().is_empty()
-                            && dialog.retry_confirmation != Some(false)
-                            && self
-                                .github_availability
-                                .get(&dialog.project_id)
-                                .and_then(GitHubAvailability::repository_key)
-                                == Some(&dialog.repository))
-                        .then_some(Message::SubmitPullRequest),
-                    )
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
-        );
+        rows.push(dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel").on_press(Message::CancelDialog),
+            crate::ui_controls::button::primary("Create").on_press_maybe(
+                self.pull_request_submission_allowed()
+                    .then_some(Message::SubmitPullRequest),
+            ),
+        ));
         Some(dialog_ui::overlay(
             dialog_ui::surface(
                 widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(
@@ -21592,6 +21601,81 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_single_line_fields_submit_on_enter() {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog);
+        for id in [
+            pull_request_dialog_focus_id(),
+            widget::Id::new("dialog.pull-request.head"),
+            widget::Id::new("dialog.pull-request.base"),
+        ] {
+            let (messages, _) = dialog_ui::tests::key_control(
+                app.dialog().unwrap(),
+                id,
+                dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::SubmitPullRequest))
+                    .count(),
+                1
+            );
+            // Native text_editor::unfocus queues ClearSelection. Focusing any
+            // single-line field flushes that pending edit on the next event.
+            assert!(
+                messages.iter().all(|message| matches!(
+                    message,
+                    Message::SubmitPullRequest
+                        | Message::PullRequestBodyChanged(
+                            widget::text_editor::Action::ClearSelection
+                        )
+                )),
+                "unexpected Enter callbacks: {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_request_enter_and_reducer_refuse_blank_fields_without_creator_task() {
+        for field in 0..3 {
+            for value in ["", "   ", "\t"] {
+                let mut app = context_inspector_test_app(false);
+                let mut dialog = pull_request_test_dialog();
+                authorize_pull_request_test(&mut app, &dialog);
+                match field {
+                    0 => dialog.title = value.into(),
+                    1 => dialog.head = value.into(),
+                    _ => dialog.base = value.into(),
+                }
+                app.pull_request_dialog = Some(dialog.clone());
+                assert!(!app.pull_request_submission_allowed());
+                for id in [
+                    pull_request_dialog_focus_id(),
+                    widget::Id::new("dialog.pull-request.head"),
+                    widget::Id::new("dialog.pull-request.base"),
+                ] {
+                    let (messages, _) = dialog_ui::tests::key_control(
+                        app.dialog().unwrap(),
+                        id,
+                        dialog_ui::tests::key_press(keyboard::key::Named::Enter),
+                    );
+                    assert!(
+                        !messages
+                            .iter()
+                            .any(|message| matches!(message, Message::SubmitPullRequest))
+                    );
+                }
+                let task = app.update(Message::SubmitPullRequest);
+                assert_eq!(task.units(), 0, "invalid form must schedule no creator");
+                assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+            }
+        }
+    }
+
+    #[test]
     fn pull_request_editor_preserves_multiline_markdown_on_rejection() {
         let mut app = context_inspector_test_app(false);
         let mut dialog = pull_request_test_dialog();
@@ -21892,6 +21976,25 @@ mod tests {
         let task = app.update(Message::CancelResetSettings);
         assert_eq!(focused(&app, task), Some(widget::Id::new("settings.reset")));
         assert!(app.settings_reset_keyboard_nav.is_none());
+    }
+
+    #[test]
+    fn dirty_editor_confirmation_starts_on_cancel_and_enter_preserves_edits() {
+        let (mut app, card) = editing_repository_app();
+        let opening = app.update(Message::CloseCard(card));
+        let cancel = dirty_close_control_id(card, DirtyCloseControl::Cancel);
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), opening),
+            Some(cancel.clone())
+        );
+        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(message, Message::CancelRepositoryClose));
+        drop(app.update(message));
+        assert!(app.dirty_repository_close.is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            matches!(&app.cards[&card],CardRuntime::Repository(runtime) if runtime.is_dirty() && !runtime.is_saving())
+        );
     }
 
     #[test]
@@ -27889,6 +27992,60 @@ mod tests {
                 &Message::Sidebar(action)
             ));
         }
+    }
+
+    #[test]
+    fn discard_confirmation_starts_on_cancel_and_enter_does_not_admit_a_mutation() {
+        let mut app = context_inspector_test_app(false);
+        let opening = app.update(Message::Sidebar(SidebarAction::RequestDiscard {
+            key: discard_key(),
+            request: discard_request(false),
+        }));
+        let cancel = sidebar::discard_cancel_id();
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), opening),
+            Some(cancel.clone())
+        );
+        let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(
+            message,
+            Message::Sidebar(SidebarAction::CancelDiscard)
+        ));
+        drop(app.update(message));
+        assert!(app.sidebar_state.pending_discard().is_none());
+        assert!(app.source_control_mutations.is_empty());
+    }
+
+    #[test]
+    fn discard_reexposed_after_transient_close_still_focuses_cancel() {
+        let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::Sidebar(SidebarAction::RequestDiscard {
+            key: discard_key(),
+            request: discard_request(false),
+        })));
+        // The transient close owner is drawn above discard. Its actual Cancel
+        // reducer must restore the lower confirmation's safe focus target.
+        app.transient_work_close = Some(window::Id::unique());
+        let cancel_upper = dialog_ui::tests::enter_control(
+            app.dialog().unwrap(),
+            widget::Id::new("dialog.transient-close.cancel"),
+        );
+        assert!(matches!(cancel_upper, Message::CancelTransientWorkClose));
+        let restoring = app.update(cancel_upper);
+        assert!(app.transient_work_close.is_none());
+        let cancel = sidebar::discard_cancel_id();
+        assert_eq!(
+            focused_element(app.dialog().unwrap(), restoring),
+            Some(cancel.clone())
+        );
+        let enter = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
+        assert!(matches!(
+            enter,
+            Message::Sidebar(SidebarAction::CancelDiscard)
+        ));
+        drop(app.update(enter));
+        assert!(app.sidebar_state.pending_discard().is_none());
+        assert!(app.source_control_mutations.is_empty());
     }
 
     #[test]

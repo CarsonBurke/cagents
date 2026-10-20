@@ -305,10 +305,10 @@ impl Cagents {
                     active: true,
                     dont_ask_again: false,
                     detail: None,
-                    focus: 1,
+                    focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -641,9 +641,9 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
-                intent.focus = 1;
+                intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -736,18 +736,16 @@ impl Cagents {
                     .into(),
             ]
         } else {
-            vec![
+            vec![super::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
-                    .into(),
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)),
                 crate::ui_controls::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
                         (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
-                    )
-                    .into(),
-            ]
+                    ),
+            )]
         };
         rows.push(widget::row::with_children(buttons).spacing(space::S).into());
         Some(super::dialog_ui::surface(
@@ -833,11 +831,15 @@ mod tests {
             host_incarnation: HostIncarnation::new("incarnation"),
         };
         let _ = app.begin_card_close(card);
-        let _ = app.update(Message::CompletedTerminalClosed {
+        let opening = app.update(Message::CompletedTerminalClosed {
             card,
             session: source.clone(),
             result: Ok(CompletedCloseOutcome::Active(proof.clone())),
         });
+        assert_eq!(
+            super::super::tests::focused_element(app.terminal_close_dialog().unwrap(), opening),
+            Some(widget::Id::new("dialog.terminal-close.cancel"))
+        );
         assert!(app.terminal_close_dialog().is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
         let _ = app.update(Message::ConfirmTerminalClose);

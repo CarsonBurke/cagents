@@ -302,7 +302,7 @@ impl State {
     }
 
     pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.confirm")
+        widget::Id::new("dialog.channel.close")
     }
 }
 
@@ -977,16 +977,14 @@ impl Cagents {
         let dialog = self.channel_ui.dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Delete channel?").into(),
-            super::notice_body(dialog.title.clone()),
             super::notice_body(match dialog.chats {
-                0 => "It holds no conversations.".to_owned(),
-                1 => "Deleting it closes the one conversation inside it.".to_owned(),
-                chats => format!("Deleting it closes the {chats} conversations inside it."),
+                0 => format!("Delete \"{}\" from this workspace?", dialog.title),
+                1 => format!("Delete \"{}\" and close its conversation?", dialog.title),
+                chats => format!(
+                    "Delete \"{}\" and close its {chats} conversations?",
+                    dialog.title
+                ),
             }),
-            super::notice_detail(
-                "The channel and the conversations it holds are removed from this workspace. \
-                 Nothing outside the channel is touched.",
-            ),
         ];
         if let Some(failure) = &dialog.failure {
             rows.push(super::notice_body(format!(
@@ -1002,7 +1000,7 @@ impl Cagents {
             } else {
                 "Delete channel"
             })
-            .id(State::focus_target())
+            .id(widget::Id::new("dialog.channel.confirm"))
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
         Some(super::dialog_ui::surface(
@@ -1223,6 +1221,50 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
+        for enter in [false, true] {
+            let (mut app, channel, _survivor, card) = channel_with_a_conversation();
+            let original = app.card_state(card).unwrap().clone();
+            let opening = app.handle_channel_ui(Action::Delete(channel));
+            assert_eq!(
+                super::super::tests::focused_element(app.channel_dialog_view().unwrap(), opening),
+                Some(widget::Id::new("dialog.channel.close"))
+            );
+            let cancel = if enter {
+                let message = super::super::dialog_ui::tests::enter_control(
+                    app.channel_dialog_view().unwrap(),
+                    State::focus_target(),
+                );
+                assert!(matches!(message, Message::ChannelUi(Action::Dismiss)));
+                message
+            } else {
+                Message::KeyEvent {
+                    event: keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    },
+                    captured: false,
+                }
+            };
+            drop(app.update(cancel));
+            assert!(!app.channel_ui.modal_open());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|current| current.id == channel)
+            );
+            assert_eq!(app.card_state(card), Some(&original));
+            assert!(!app.channel_ui.deletion_running());
+        }
+    }
 
     #[test]
     fn primary_channel_guard_and_selection_share_git_directory_fallback() {
