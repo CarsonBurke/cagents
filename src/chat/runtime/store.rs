@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
@@ -50,6 +51,9 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    copy_cache: uuid::Uuid,
+    copy_revision: u64,
+    copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -232,7 +236,12 @@ impl Store {
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            db.execute_batch(text_copy::SCHEMA)
+                .map_err(|e| e.to_string())?;
             Ok(Self {
+                copy_cache: uuid::Uuid::new_v4(),
+                copy_revision: 0,
+                copy_projection: Default::default(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -441,6 +450,11 @@ impl Store {
         } else {
             body0.len() as i64
         };
+        let copy_prefix = if matches!(item.content, ItemContent::Text { .. }) {
+            self.copy_parent_prefix(&item.id, &body0)?
+        } else {
+            false
+        };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
@@ -457,7 +471,16 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
+        let copy_invalidated = Self::copy_parent_put(
+            &transaction,
+            &item.id,
+            matches!(item.content, ItemContent::Text { .. }).then_some(len0 as usize),
+            copy_prefix,
+        )?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if copy_invalidated {
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -872,6 +895,7 @@ impl Store {
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
+                self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -883,6 +907,12 @@ impl Store {
             }
             Event::Reset { reason } => {
                 self.files_reset()?;
+                self.db
+                    .execute("DELETE FROM copy_sources", [])
+                    .map_err(|e| e.to_string())?;
+                self.copy_cache = uuid::Uuid::new_v4();
+                self.copy_revision = self.copy_revision.wrapping_add(1);
+                self.copy_projection.clear();
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -969,6 +999,7 @@ impl Store {
                 },
                 false,
             )?;
+            self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
                 // The identity itself could not be cached; the delta has nowhere to go.
                 return Ok(warning);
@@ -1001,6 +1032,7 @@ impl Store {
                     params![id, delta.len() as i64, stamped],
                 )
                 .map_err(|e| e.to_string())?;
+            Self::copy_parent_append(&transaction, id, delta.len())?;
             transaction.commit().map_err(|e| e.to_string())?;
             self.changed(id);
         }
@@ -1112,6 +1144,12 @@ impl Store {
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
+        let mut copy_projection = Vec::new();
+        let old_copy: std::collections::HashMap<_, _> = previous
+            .iter()
+            .zip(&self.copy_projection)
+            .map(|(item, source)| (item.id.as_str(), source.clone()))
+            .collect();
         let old: std::collections::HashMap<_, _> = previous
             .iter()
             .map(|item| (item.id.as_str(), item))
@@ -1208,10 +1246,18 @@ impl Store {
                 {
                     break 'records;
                 }
+                let copy_source = if matches!(base.content, ItemContent::Text { .. }) {
+                    self.copy_parent_source(&id)?
+                } else {
+                    None
+                };
                 if self
                     .changed
                     .as_ref()
                     .is_some_and(|changed| !changed.contains(&id))
+                    && old_copy
+                        .get(item_id.as_ref())
+                        .is_some_and(|source| *source == copy_source)
                     && let Some(previous) = old.get(item_id.as_ref())
                 {
                     reused.insert(item_id.into_owned());
@@ -1221,6 +1267,7 @@ impl Store {
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
+                    copy_projection.push(copy_source);
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1338,6 +1385,7 @@ impl Store {
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
+                copy_projection.push(copy_source);
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1363,6 +1411,7 @@ impl Store {
         }
         if self.forward.is_none() {
             items.reverse();
+            copy_projection.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1411,6 +1460,8 @@ impl Store {
             })
             .collect();
         drop(old);
+        drop(old_copy);
+        self.copy_projection = copy_projection;
         previous.clear();
         self.dirty = false;
         self.paging = false;

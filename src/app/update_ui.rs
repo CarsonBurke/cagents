@@ -763,13 +763,15 @@ impl Cagents {
                     channel.map_or_else(Task::none, |channel| self.select_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
             }
-            Action::CopyDetails => self
-                .update_ui
-                .confirmation
-                .as_ref()
-                .map_or_else(Task::none, |confirmation| {
-                    iced::clipboard::write(preview_details(&confirmation.preview))
-                }),
+            Action::CopyDetails => {
+                self.update_ui
+                    .confirmation
+                    .as_ref()
+                    .map_or_else(Task::none, |confirmation| {
+                        chat_ui::invalidate_copy_intent();
+                        iced::clipboard::write(preview_details(&confirmation.preview))
+                    })
+            }
             Action::ReviewJob => {
                 self.update_ui.set_aside = None;
                 if !self.other_modal_is_open() {

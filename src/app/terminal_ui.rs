@@ -468,6 +468,7 @@ impl Cagents {
             }
             Action::Copy(_, text) => {
                 self.terminal_context = None;
+                chat_ui::invalidate_copy_intent();
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
             Action::CopySelection(_, selection) => {

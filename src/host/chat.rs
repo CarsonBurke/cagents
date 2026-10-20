@@ -2309,6 +2309,10 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
+            if let crate::chat::Command::ReadTextCopy { source, offset } = &command {
+                let page = handle.text_copy(source, *offset).map_err(unavailable)?;
+                return Ok(ServerResponse::ChatTextCopy { chat_id, page });
+            }
             if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
                 return Ok(match reply {
                     crate::chat::FileChangeReply::Files(summary) => {

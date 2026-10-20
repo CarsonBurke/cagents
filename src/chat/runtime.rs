@@ -22,6 +22,7 @@ use std::{
 };
 #[cfg(test)]
 pub(crate) mod courier_tests;
+mod child_text_copy;
 mod execution;
 mod store;
 mod websocket;
@@ -606,7 +607,9 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::ReadTextCopy { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -803,6 +806,25 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
+    pub(crate) fn text_copy(
+        &self,
+        source: &super::TextCopySource,
+        offset: u64,
+    ) -> Result<super::TextCopyPage, String> {
+        match &source.scope {
+            super::TextCopyScope::Conversation => self
+                .0
+                .store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .text_copy(source, offset),
+            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
+                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
+                source,
+                offset,
+            ),
+        }
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -847,6 +869,7 @@ impl Handle {
             }
         }
         if refresh_publication {
+            store.publish_copy_sources(&mut state);
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
                 state.file_changes.revision,
@@ -896,6 +919,7 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            store.publish_copy_sources(&mut state);
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -2837,6 +2861,7 @@ fn apply_projected_event(
     if !preview_observed {
         Arc::make_mut(&mut state.notification_preview).observe(&event);
     }
+    let child_copy_update = child_text_copy::prepare(state, &event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -3294,6 +3319,7 @@ fn apply_projected_event(
     if child_changed {
         trim_subagents(state);
     }
+    child_text_copy::finish(state, child_copy_update);
 }
 
 /// Running task identities authorize interruption and idle waits. Retiring
@@ -6994,6 +7020,126 @@ mod tests {
             .unwrap();
         assert_eq!(reply, "scope transport preserved\n");
         provider.terminate().unwrap();
+    }
+
+    #[test]
+    fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after_exit() {
+        struct CopyFixture;
+        let body = format!("{}{}", "a".repeat(128 * 1024 - 1), "🦀界".repeat(30_000));
+        fn message(text: &str) -> Item {
+            Item {
+                id: "same".into(),
+                role: super::super::Role::Assistant,
+                at: None,
+                started_at: None,
+                content: ItemContent::Text {
+                    text: text.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+            }
+        }
+        impl Adapter for CopyFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                panic!("copy reached provider")
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/true".into(),
+            arguments: vec![],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![
+                Event::Item(message("parent")),
+                Event::SubagentItem {
+                    id: "child".into(),
+                    item: message("complete child 🦀"),
+                },
+                Event::SubagentItem {
+                    id: "trimmed".into(),
+                    item: message(&body),
+                },
+            ],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            Handle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let child = snapshot
+            .subagents
+            .iter()
+            .find(|child| child.id == "child")
+            .unwrap();
+        assert_eq!(child.items[0].content, message("complete child 🦀").content);
+        let trimmed = snapshot
+            .subagents
+            .iter()
+            .find(|child| child.id == "trimmed")
+            .unwrap();
+        assert!(trimmed.items[0].content.byte_len() < 64 * 1024);
+        assert_ne!(trimmed.items[0].content, message(&body).content);
+        assert!(
+            snapshot.text_copy_sources.children["trimmed"][0].is_none(),
+            "a presentation placeholder is not complete text"
+        );
+        let parent_source = snapshot.text_copy_sources.conversation[0].as_ref().unwrap();
+        let child_source = snapshot.text_copy_sources.children["child"][0]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            parent_source.scope,
+            super::super::TextCopyScope::Conversation
+        );
+        assert_eq!(
+            child_source.scope,
+            super::super::TextCopyScope::Subagent { id: "child".into() }
+        );
+        for (source, expected) in [
+            (parent_source, "parent"),
+            (child_source, "complete child 🦀"),
+        ] {
+            let mut copied = String::new();
+            loop {
+                let page = handle.text_copy(source, copied.len() as u64).unwrap();
+                copied.push_str(&page.text);
+                if page.done {
+                    break;
+                }
+            }
+            assert_eq!(copied.as_bytes(), expected.as_bytes());
+        }
+        let mut unavailable = child_source.clone();
+        unavailable.scope = super::super::TextCopyScope::Subagent {
+            id: "trimmed".into(),
+        };
+        assert!(handle.text_copy(&unavailable, 0).is_err());
+        assert!(
+            handle
+                .command(Command::ReadTextCopy {
+                    source: child_source.clone(),
+                    offset: 0
+                })
+                .unwrap_err()
+                .contains("requester-specific")
+        );
     }
 
     #[test]

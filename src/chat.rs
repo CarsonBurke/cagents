@@ -930,6 +930,8 @@ pub struct Snapshot {
     /// Immutable payloads are shared by daemon, client and retained UI snapshots.
     /// Updating one answer must not copy the finished transcript around it.
     pub items: Vec<std::sync::Arc<Item>>,
+    #[serde(default)]
+    pub text_copy_sources: TextCopySources,
     pub requests: Vec<Request>,
     pub capabilities: Capabilities,
     pub models: Vec<Model>,
@@ -1190,6 +1192,51 @@ pub enum PromptMode {
     Steer,
     Queue,
 }
+/// A logical text source, independent of loaded transcript part IDs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TextCopyScope {
+    Conversation,
+    Subagent { id: String },
+}
+
+/// Owned-source authority for the exact committed prefix shown by a publication.
+/// Appends preserve the revision; authoritative replacement invalidates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopySource {
+    pub cache: uuid::Uuid,
+    pub scope: TextCopyScope,
+    pub token: u64,
+    pub revision: u64,
+    pub bytes: u64,
+}
+
+/// Keep each reply at the existing transcript chunk size, far below the IPC
+/// frame ceiling. A single clipboard operation may collect one 30 MiB Claude
+/// envelope, with headroom; longer accumulated streams fail explicitly.
+pub const TEXT_COPY_PAGE_BYTES: usize = 128 * 1024;
+pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopyPage {
+    pub source: TextCopySource,
+    pub offset: u64,
+    pub text: String,
+    pub done: bool,
+}
+
+/// Body-free authority aligned with the items of the same snapshot. Keeping
+/// source identity outside Item avoids changing provider-owned item IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextCopySources {
+    /// Changes only when canonical parent text is rewritten, removed, or reset.
+    /// Paging and verified append preserve pending clipboard authority. An
+    /// unrelated destructive edit conservatively cancels a pending copy too.
+    #[serde(default)]
+    pub conversation_revision: u64,
+    pub conversation: Vec<Option<TextCopySource>>,
+    pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Verify login on the same live actor without replaying any failed prompt.
@@ -1263,6 +1310,11 @@ pub enum Command {
         key: FileChangeKey,
         cursor: Option<FilePatchCursor>,
         revision: u64,
+    },
+    /// Read only the exact Store-owned source prefix; never invokes a provider.
+    ReadTextCopy {
+        source: TextCopySource,
+        offset: u64,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
