@@ -12,9 +12,36 @@ fn next_attempt() -> u64 {
     ATTEMPT.fetch_add(1, Ordering::Relaxed)
 }
 
+fn available() -> &'static tokio::sync::watch::Sender<u64> {
+    static AVAILABLE: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+        std::sync::OnceLock::new();
+    AVAILABLE.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+fn notify_available() {
+    available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+}
+/// A current-state event closes the defer→subscription race. Final source
+/// lease release can happen on the reclaimer after an output event/redraw.
+pub(super) fn availability() -> Subscription<Message> {
+    Subscription::run(availability_stream)
+}
+fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+    iced::futures::stream::unfold(
+        (available().subscribe(), true),
+        |(mut receiver, initial)| async move {
+            if !initial {
+                receiver.changed().await.ok()?;
+            }
+            receiver.borrow_and_update();
+            Some((action(Action::PreparationAvailable), (receiver, false)))
+        },
+    )
+}
+
 #[derive(Clone)]
 struct Request {
     item: Arc<chat::Item>,
+    provider: Provider,
     growing: bool,
     version: u64,
     theme: crate::settings::EditorSyntaxTheme,
@@ -32,6 +59,7 @@ pub(super) struct Parsed {
 const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
+    send::<coordination::Prepared>();
     send::<prose_document::Data>();
     send::<prose::CodeBlock>();
     send::<tool_text::PreparedSources>();
@@ -62,6 +90,9 @@ impl Lease {
             }
         } else {
             RESERVED.fetch_sub(old - bytes, Ordering::Relaxed);
+            if bytes < old {
+                notify_available();
+            }
         }
         self.0.store(bytes, Ordering::Relaxed);
         true
@@ -69,7 +100,11 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        RESERVED.fetch_sub(self.0.load(Ordering::Relaxed), Ordering::Relaxed);
+        let bytes = self.0.load(Ordering::Relaxed);
+        RESERVED.fetch_sub(bytes, Ordering::Relaxed);
+        if bytes != 0 {
+            notify_available();
+        }
     }
 }
 
@@ -99,6 +134,11 @@ pub(super) struct State {
     entries: HashMap<String, Entry>,
     errors: HashMap<String, (std::sync::Weak<chat::Item>, String)>,
     reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
+    provider: Option<Provider>,
+    // Cursor into the authoritative selected Snapshot, never another retained
+    // source queue. A pump examines at most128 metadata entries per event.
+    deferred: Option<usize>,
+    last_deferred: bool,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -279,6 +319,8 @@ impl State {
         }
         self.errors.clear();
         self.context = None;
+        self.deferred = None;
+        self.last_deferred = false;
     }
     pub(super) fn context(
         &mut self,
@@ -312,7 +354,29 @@ impl State {
     fn remove(&mut self, id: &str) {
         if let Some(entry) = self.entries.remove(id) {
             retire_shared(entry.shared);
+            notify_available();
         }
+    }
+    pub(super) fn waiting(&self) -> bool {
+        self.deferred.is_some()
+    }
+    pub(super) fn take_deferred(&mut self) -> Option<usize> {
+        self.deferred.take()
+    }
+    pub(super) fn defer(&mut self, index: usize) {
+        self.deferred = Some(self.deferred.map_or(index, |old| old.min(index)));
+    }
+    pub(super) fn reschedule(&self) {
+        notify_available();
+    }
+    pub(super) fn was_deferred(&self) -> bool {
+        self.last_deferred
+    }
+    pub(super) fn set_provider(&mut self, provider: Provider) {
+        if self.provider.is_some_and(|old| old != provider) {
+            self.clear();
+        }
+        self.provider = Some(provider);
     }
     pub(super) fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
@@ -343,6 +407,7 @@ impl State {
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
     ) -> bool {
+        self.last_deferred = false;
         let Some(bytes) = source_bytes(&item.content) else {
             return false;
         };
@@ -354,7 +419,9 @@ impl State {
             return false;
         }
         self.errors.remove(&item.id);
-        if bytes > SOURCE_BYTES && CachedItem::prose(&item.content).is_some() {
+        if bytes > QUEUED_BYTES
+            || (bytes > SOURCE_BYTES && CachedItem::prose(&item.content).is_some())
+        {
             if let Some(entry) = self.entries.get(&item.id) {
                 entry.shared.cancel();
             }
@@ -384,6 +451,7 @@ impl State {
                 if entry.shared.lease.resize(bytes) {
                     *latest = Request {
                         item: item.clone(),
+                        provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: latest.version.wrapping_add(1),
                         theme,
@@ -401,7 +469,9 @@ impl State {
         self.remove(&item.id);
         let lease = Lease::default();
         if self.entries.len() >= QUEUED_ITEMS || !lease.resize(bytes) {
-            self.errors.insert(item.id.clone(), (Arc::downgrade(item), "Some messages could not be loaded. Retry when another message has finished loading.".into()));
+            // A valid source waits in the selected Snapshot. Saturation is
+            // temporary backpressure, never a sticky same-Arc parse error.
+            self.last_deferred = true;
             return true;
         }
         self.entries.insert(
@@ -412,6 +482,7 @@ impl State {
                 shared: Arc::new(Shared {
                     latest: Mutex::new(Request {
                         item: item.clone(),
+                        provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: 1,
                         theme,
@@ -505,6 +576,7 @@ pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
     document: prose_document::Data,
+    coordination: Option<coordination::Prepared>,
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
     reader_verifications: HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
@@ -519,6 +591,9 @@ pub(super) struct Prepared {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl Prepared {
+    pub(super) fn is_coordination(&self) -> bool {
+        self.coordination.is_some()
+    }
     pub(super) fn item(&self) -> &Arc<chat::Item> {
         &self.request.item
     }
@@ -529,6 +604,7 @@ impl Prepared {
         retire(Retired {
             _parsed: self.parsed,
             _document: Some(self.document),
+            _coordination: self.coordination,
             _blocks: self.blocks,
             _palettes: Some(self.palettes),
             _item: Some(self.request.item),
@@ -542,6 +618,7 @@ impl Prepared {
             .reader_memory
             .verified_readers(cached.reader_context.as_deref(), self.reader_verifications);
         let previous_tools = cached.prepared_tools.take();
+        let previous_coordination = cached.coordination.take();
         if CachedItem::prose(&self.request.item.content).is_none() {
             let mut previous = std::mem::replace(
                 cached,
@@ -561,8 +638,13 @@ impl Prepared {
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         cached.document = Some(prose_document::Document::new(self.document));
+        cached.coordination = self
+            .coordination
+            .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)));
+        drop(previous_coordination);
         let retired = Retired {
             _document: None,
+            _coordination: None,
             _parsed: Parsed {
                 source: std::mem::replace(&mut cached.source, self.parsed.source),
                 markdown: std::mem::replace(&mut cached.markdown, self.parsed.markdown),
@@ -590,6 +672,7 @@ impl Prepared {
 struct Retired {
     _parsed: Parsed,
     _document: Option<prose_document::Data>,
+    _coordination: Option<coordination::Prepared>,
     _blocks: HashMap<u64, prose::CodeBlock>,
     _palettes: Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
@@ -609,6 +692,8 @@ pub(super) struct Presentation {
 
 enum Retirement {
     Document(prose_document::Data),
+    Coordination(coordination::Prepared),
+    Styles(HashMap<u64, prose::CodeBlock>, Option<prose::Palettes>),
     Geometry(Box<flow_layout::Geometry>, Option<flow_layout::WorkSlot>),
     Presentation(Presentation),
     Installed(Retired),
@@ -618,6 +703,15 @@ enum Retirement {
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
     #[cfg(test)]
     Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+}
+pub(super) fn retire_styles(
+    blocks: HashMap<u64, prose::CodeBlock>,
+    palettes: Option<prose::Palettes>,
+) {
+    enqueue_retirement(Retirement::Styles(blocks, palettes));
+}
+pub(super) fn retire_coordination(prepared: coordination::Prepared) {
+    enqueue_retirement(Retirement::Coordination(prepared));
 }
 pub(super) fn retire_document(document: prose_document::Data) {
     enqueue_retirement(Retirement::Document(document));
@@ -661,6 +755,8 @@ fn enqueue_retirement(retired: Retirement) {
             };
             match retired {
                 Retirement::Document(document) => drop(document),
+                Retirement::Coordination(prepared) => drop(prepared),
+                Retirement::Styles(blocks, palettes) => { drop(blocks); drop(palettes); }
                 Retirement::Geometry(geometry, admission) => { drop(geometry); drop(admission); }
                 Retirement::Presentation(presentation) => drop(presentation),
                 Retirement::Installed(retired) => drop(retired),
@@ -711,7 +807,7 @@ pub(super) fn retirement_barrier() -> std::thread::ThreadId {
     reclamation_barrier().expect("retirement worker remains alive")
 }
 
-fn prime_plain(items: &[markdown::Item], cancelled: &AtomicBool) -> Result<(), String> {
+pub(super) fn prime_plain(items: &[markdown::Item], cancelled: &AtomicBool) -> Result<(), String> {
     for item in items {
         if cancelled.load(Ordering::Relaxed) {
             return Err("Message loading was cancelled.".into());
@@ -869,29 +965,55 @@ fn execute(
             &mut reader_verifications,
         );
     }
+    let coordinated = chat::coordination::recognize(&request.item, request.provider)
+        .map(|reading| coordination::Prepared::prepare(reading, &shared.cancelled))
+        .transpose()?;
+    if let Some(coordinated) = &coordinated {
+        for (index, content) in coordinated.contents().enumerate() {
+            if shared.cancelled.load(Ordering::Relaxed) {
+                return Err("Message loading was cancelled.".into());
+            }
+            verify_markdown_readers(
+                &request.item.id,
+                &[1, index as u32],
+                content.items(),
+                &request.reader_proofs,
+                &mut reader_verifications,
+            );
+        }
+    }
     let mut previous = std::mem::take(&mut canonical.blocks);
     #[cfg(test)]
     let mut syntax_work = (0, 0);
-    for_each_fence(canonical.parsed.markdown.items(), &mut |language, code| {
-        if shared.cancelled.load(Ordering::Relaxed) || code.len() > CachedItem::HIGHLIGHT_LIMIT {
-            return;
-        }
-        let key = fence_key(language.unwrap_or_default(), code);
-        canonical.blocks.entry(key).or_insert_with(|| {
-            previous.remove(&key).unwrap_or_else(|| {
-                #[cfg(test)]
-                {
-                    syntax_work.0 += 1;
-                    syntax_work.1 += code.len();
-                }
-                prose::CodeBlock::new(
-                    language.and_then(prose::fence_language),
-                    code,
-                    request.theme,
-                )
-            })
-        });
-    });
+    for_each_fence(
+        canonical.parsed.markdown.items().iter().chain(
+            coordinated
+                .iter()
+                .flat_map(|prepared| prepared.contents())
+                .flat_map(markdown::Content::items),
+        ),
+        &mut |language, code| {
+            if shared.cancelled.load(Ordering::Relaxed) || code.len() > CachedItem::HIGHLIGHT_LIMIT
+            {
+                return;
+            }
+            let key = fence_key(language.unwrap_or_default(), code);
+            canonical.blocks.entry(key).or_insert_with(|| {
+                previous.remove(&key).unwrap_or_else(|| {
+                    #[cfg(test)]
+                    {
+                        syntax_work.0 += 1;
+                        syntax_work.1 += code.len();
+                    }
+                    prose::CodeBlock::new(
+                        language.and_then(prose::fence_language),
+                        code,
+                        request.theme,
+                    )
+                })
+            });
+        },
+    );
     if shared.cancelled.load(Ordering::Relaxed) {
         return Err("Message loading was cancelled.".into());
     }
@@ -927,6 +1049,7 @@ fn execute(
         request,
         parsed,
         document,
+        coordination: coordinated,
         blocks,
         palettes,
         reader_verifications,
@@ -1655,6 +1778,384 @@ mod tests {
         drop(cached);
         drop(state);
         retirement_barrier();
+    }
+
+    #[test]
+    fn large_coordination_runtime_admits_worker_and_retires_real_graphs() {
+        let prompt = "# Task λ\n\n> quoted **work**\n>\n> - nested item\n\n| first | second |\n| --- | --- |\n| exact | é |\n\n```text\nsource line\n```\n\n".repeat(700);
+        let result = "# Report\n\nExact returned rich result λ.\n\n".repeat(1000);
+        for (provider, name, input, output) in [
+            (Provider::Claude, "Agent", serde_json::json!({"prompt":prompt.clone(),"subagent_type":"Explore","run_in_background":false}).to_string(), result.clone()),
+            (Provider::Codex, "spawn_agent", prompt.clone(), String::new()),
+            (Provider::Omp, "task", serde_json::json!({"task":prompt.clone(),"context":result.clone(),"agent":"scout","name":"private-child"}).to_string(), String::new()),
+        ] {
+            let session = fresh_chat_session(provider, TerminalId::new(), "/project".into(), &Account::system(provider), false).unwrap();
+            let handle = Arc::new(ClientHandle::fixture(session.clone(), Snapshot { ready:true, ..Snapshot::default() }));
+            let mut runtime = Runtime::new(target(), session, Connection::Live(handle.clone()), true, crate::settings::EditorSyntaxTheme::Auto);
+            let source = Arc::new(chat::Item { id:"message".into(), role:chat::Role::Assistant,
+                content:ItemContent::Tool { name:name.into(), input, output, status:chat::ToolStatus::Succeeded }, started_at:None, at:None });
+            let ui_work = coordination::preparations();
+            handle.replace_snapshot_for_test(Snapshot { generation:1,ready:true,items:vec![source.clone()], ..Snapshot::default() });
+            runtime.refresh();
+            assert_eq!(coordination::preparations(), ui_work, "actual Runtime admission does not parse coordination on UI");
+            assert!(runtime.cache["message"].preparing && runtime.cache["message"].coordination.is_none());
+            assert!(runtime.preparation.queued_bytes() > 64*1024);
+            let (run, shared) = job(&runtime.preparation);
+            let mut output = std::thread::spawn(move || execute(shared, permit()).unwrap()).join().unwrap();
+            let prepared = output.coordination.as_mut().expect("provider-specific worker recognition");
+            assert_ne!(prepared.created_on, std::thread::current().id());
+            assert!(prepared.contents().next().unwrap().items().len() > 4);
+            let (sent, disposed) = std::sync::mpsc::channel();
+            prepared.watch_disposal(sent);
+            runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+            let cached = &runtime.cache["message"];
+            let coordinated = cached.coordination.as_ref().unwrap();
+            assert!(coordinated.is_card());
+            assert!(matches!(&coordinated.reading.kind, crate::chat::coordination::Kind::Spawn(spawn) if spawn.agents[0].prompt.inline()==Some(prompt.as_str())));
+            assert!(runtime.turns.iter().flat_map(|turn| &turn.prose).any(|placed| placed.index==0 && placed.slot==turn::Slot::Card), "async completion regroups actual parent turns into the rich card slot");
+            let address = coordinated.address();
+            let contents = coordinated.contents().enumerate().map(|(index, content)| {
+                let mut builder = selection::Catalog::builder();
+                builder.markdown(&source.id, &[1,index as u32], content.items());
+                let catalog = builder.finish();
+                let (first,last) = catalog.endpoints().unwrap();
+                (first.identity,catalog.copy(first,last).unwrap())
+            }).collect::<Vec<_>>();
+            let catalog = runtime.selection_document().0;
+            for (identity, text) in contents { assert_eq!(catalog.text(identity).is_some(), true); assert!(text.contains("λ") || text.contains("Report")); }
+            drop(catalog);
+            let previous = runtime.cache.remove("message").unwrap();
+            let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
+            assert_eq!(rebuilt.coordination.as_ref().unwrap().address(), address, "disclosure reuses the same prepared canonical graphs/palettes");
+            assert_eq!(coordination::preparations(), ui_work);
+            runtime.cache.insert("message".into(), rebuilt);
+            runtime.show(false);
+            let thread = disposed.recv_timeout(Duration::from_secs(5)).expect("actual coordinated canonical graph destructor");
+            assert_eq!(thread, retirement_barrier());
+            assert_ne!(thread, std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn more_than_128_mixed_sources_settle_from_the_same_snapshot_without_retry() {
+        let provider = Provider::Claude;
+        let session = fresh_chat_session(
+            provider,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(provider),
+            false,
+        )
+        .unwrap();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                ..Snapshot::default()
+            },
+        ));
+        let mut runtime = Runtime::new(
+            target(),
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let sources = (0..300).map(|index| Arc::new(chat::Item {
+            id:format!("source-{index}"), role:chat::Role::Assistant, started_at:None, at:None,
+            content:match index % 3 {
+                0 => ItemContent::Command { command:format!("cargo test package_{index}"), output:format!("exact ordinary output {index}"), status:chat::ToolStatus::Succeeded, exit_code:Some(0), label:String::new(),working_directory:"/project".into(),action:chat::CommandAction::Run,duration_ms:None },
+                1 => ItemContent::Tool { name:"Agent".into(), input:serde_json::json!({"prompt":format!("# Exact prompt {index} λ\n\n> source body\n\n- nested item\n"),"subagent_type":"Explore","run_in_background":true}).to_string(), output:"Background task launched".into(), status:chat::ToolStatus::Succeeded },
+                _ => ItemContent::Command { command:format!("printf '%s' '{}-{index}'", "x".repeat(3000)), output:format!("exact long-command output {index}"), status:chat::ToolStatus::Succeeded, exit_code:Some(0), label:String::new(),working_directory:"/project".into(),action:chat::CommandAction::Run,duration_ms:None },
+            },
+        })).collect::<Vec<_>>();
+        let ui_work = coordination::preparations();
+        handle.replace_snapshot_for_test(Snapshot {
+            generation: 1,
+            ready: true,
+            items: sources.clone(),
+            ..Snapshot::default()
+        });
+        runtime.refresh();
+        assert!(runtime.preparation.waiting());
+        assert!(runtime.preparation.entries.len() <= QUEUED_ITEMS);
+        assert!(
+            runtime.preparation.contains("source-299"),
+            "the newest body has first admission ahead of historical work"
+        );
+        assert!(
+            runtime.preparation.error().is_none(),
+            "transient pressure is not a sticky source failure"
+        );
+        // Real worker completion and the production refill path use this same
+        // immutable source generation. No new provider update, input or Retry.
+        use iced::futures::StreamExt;
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let events = availability_stream();
+        let mut events = Box::pin(events);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let Message::ChatUi(wake) = executor.block_on(events.next()).unwrap() else {
+            panic!("admission wake")
+        };
+        drop(app.handle_chat_ui(wake));
+        for _ in 0..400 {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let next = runtime
+                .preparation
+                .entries
+                .iter()
+                .find(|(_, entry)| entry.running)
+                .map(|(id, entry)| (id.clone(), entry.run, entry.shared.clone()));
+            let Some((id, run, shared)) = next else {
+                if !runtime.preparation.waiting() {
+                    break;
+                }
+                retirement_barrier();
+                let Message::ChatUi(wake) = executor.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(10), events.next())
+                        .await
+                        .expect("actual idle capacity wake")
+                        .unwrap()
+                }) else {
+                    panic!("admission wake")
+                };
+                drop(app.handle_chat_ui(wake));
+                continue;
+            };
+            let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            drop(app.handle_chat_ui(Action::MarkdownPrepared(target, id, run, ready(Ok(output)))));
+        }
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(!runtime.preparation.waiting());
+        assert!(runtime.preparation.entries.is_empty());
+        assert!(runtime.preparation.error().is_none());
+        for (index, source) in sources.iter().enumerate() {
+            let cached = &runtime.cache[&source.id];
+            assert!(!cached.preparing && !cached.placeholder);
+            assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), source));
+            assert_eq!(cached.coordination.is_some(), index % 3 == 1);
+            if let Some(coordinated) = &cached.coordination {
+                assert!(
+                    matches!(&coordinated.reading.kind, crate::chat::coordination::Kind::Spawn(spawn) if spawn.agents[0].prompt.inline().unwrap().contains(&format!("Exact prompt {index} λ")))
+                );
+            }
+        }
+        runtime.refresh();
+        assert!(
+            runtime.preparation.entries.is_empty(),
+            "unchanged accepted sources are not restaged"
+        );
+        assert_eq!(
+            coordination::preparations(),
+            ui_work,
+            "neither saturation nor refill falls back to UI recognition/parsing"
+        );
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn deferred_history_replacement_and_selected_child_reject_old_queued_output() {
+        for child in [false, true] {
+            let provider = Provider::Claude;
+            let session = fresh_chat_session(
+                provider,
+                TerminalId::new(),
+                "/project".into(),
+                &Account::system(provider),
+                false,
+            )
+            .unwrap();
+            let handle = Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    ..Snapshot::default()
+                },
+            ));
+            let mut runtime = Runtime::new(
+                target(),
+                session,
+                Connection::Live(handle.clone()),
+                true,
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            let make = |id: String, prompt: &str| {
+                Arc::new(chat::Item {
+                    id,
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "Agent".into(),
+                        input: serde_json::json!({"prompt":prompt,"run_in_background":true})
+                            .to_string(),
+                        output: "Background task launched".into(),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            };
+            let old = (0..160)
+                .map(|index| {
+                    make(
+                        format!("old-{index}"),
+                        "Old graph must never enter the next context.",
+                    )
+                })
+                .collect::<Vec<_>>();
+            handle.replace_snapshot_for_test(Snapshot {
+                generation: 1,
+                ready: true,
+                items: old,
+                ..Snapshot::default()
+            });
+            runtime.refresh();
+            assert!(runtime.preparation.waiting());
+            let (run, shared) = {
+                let entry = &runtime.preparation.entries["old-159"];
+                (entry.run, entry.shared.clone())
+            };
+            let old_output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            let source = make("old-159".into(), "# Exact replacement λ\n\nNew graph only.");
+            let mut snapshot = Snapshot {
+                generation: 2,
+                ready: true,
+                items: vec![source.clone()],
+                ..Snapshot::default()
+            };
+            if child {
+                snapshot.subagents.push(chat::Subagent {
+                    id: "replacement-child".into(),
+                    kind: "fixture".into(),
+                    description: "Child".into(),
+                    status: chat::ToolStatus::Succeeded,
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
+                    background: true,
+                    items: vec![source.clone()],
+                });
+                runtime.selected_subagent = Some("replacement-child".into());
+            }
+            handle.replace_snapshot_for_test(snapshot);
+            runtime.refresh();
+            runtime.markdown_prepared(runtime.target, "old-159", run, ready(Ok(old_output)));
+            assert!(
+                runtime.presentation_cache()["old-159"]
+                    .coordination
+                    .is_none(),
+                "old exact run cannot install into replaced source/selected context"
+            );
+            let (run, shared) = {
+                let entry = &runtime.preparation.entries["old-159"];
+                (entry.run, entry.shared.clone())
+            };
+            let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            runtime.markdown_prepared(runtime.target, "old-159", run, ready(Ok(output)));
+            assert!(
+                !runtime.preparation.waiting(),
+                "old deferred cursor is not carried into a new source context"
+            );
+            assert_eq!(runtime.presentation_cache().len(), 1);
+            let cached = &runtime.presentation_cache()["old-159"];
+            assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &source));
+            assert!(
+                matches!(&cached.coordination.as_ref().unwrap().reading.kind,crate::chat::coordination::Kind::Spawn(spawn) if spawn.agents[0].prompt.inline()==Some("# Exact replacement λ\n\nNew graph only."))
+            );
+            runtime.show(false);
+            retirement_barrier();
+        }
+    }
+
+    #[test]
+    fn retired_source_lease_release_emits_the_idle_admission_wake() {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let source = item("Owned source whose final lease is held by rejected output.");
+        let mut state = configured(target(), &source);
+        state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let output = execute(shared, permit()).unwrap();
+        let retained = Arc::downgrade(&output._owner);
+        state.clear();
+        retirement_barrier();
+        let events = availability_stream();
+        let mut events = Box::pin(events);
+        executor
+            .block_on(events.next())
+            .expect("current-state subscription closes defer/install race");
+        let release = hold_retirement();
+        drop(ready(Ok(output)));
+        // The source Arc and lease remain in the actual queued raw output.
+        release.send(()).unwrap();
+        executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    assert!(matches!(
+                        events.next().await,
+                        Some(Message::ChatUi(Action::PreparationAvailable))
+                    ));
+                    if retained.upgrade().is_none() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("final lease release wakes an idle UI without provider/input events");
+        });
+        retirement_barrier();
+    }
+
+    #[test]
+    fn rejected_large_coordination_output_retires_all_raw_graphs_before_barrier() {
+        let source = Arc::new(chat::Item { id:"message".into(), role:chat::Role::Assistant,
+            content:ItemContent::Tool { name:"Agent".into(), input:serde_json::json!({"prompt":"> actual graph λ\n>\n> - nested item\n\n".repeat(4000),"subagent_type":"Explore"}).to_string(), output:String::new(),status:chat::ToolStatus::Succeeded },started_at:None,at:None });
+        let mut state = configured(target(), &source);
+        state.set_provider(Provider::Claude);
+        state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let mut output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        let (sent, disposed) = std::sync::mpsc::channel();
+        output.coordination.as_mut().unwrap().watch_disposal(sent);
+        let held = hold_retirement();
+        drop(ready(Ok(output)));
+        assert!(disposed.try_recv().is_err());
+        drop(held);
+        let barrier = retirement_barrier();
+        assert_eq!(
+            disposed
+                .try_recv()
+                .expect("raw coordinated output disposed within its retirement batch"),
+            barrier
+        );
+        drop(state);
     }
 
     #[test]

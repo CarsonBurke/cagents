@@ -476,7 +476,6 @@ impl Pane {
         {
             runtime.opened.insert(turn.key.clone(), true);
         }
-        let coordination = chat::coordination::recognize(item, runtime.session.launch.provider);
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(
             id.to_owned(),
@@ -486,7 +485,7 @@ impl Pane {
                 previous,
                 true,
                 false,
-                coordination,
+                None,
             ),
         );
     }

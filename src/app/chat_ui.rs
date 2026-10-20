@@ -155,6 +155,7 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
+    PreparationAvailable,
     FlowAvailable,
     FlowRequest(Target, flow_layout::Request),
     FlowReady(
@@ -363,6 +364,7 @@ impl Action {
                 | Self::FindExpired(..)
                 | Self::FindIndexed(..)
                 | Self::FindLocated(..)
+                | Self::PreparationAvailable
                 | Self::FlowAvailable
                 | Self::FlowRequest(..)
                 | Self::FlowReady(..)
@@ -1168,10 +1170,10 @@ impl CachedItem {
     fn updated(
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
-        previous: Option<Self>,
+        mut previous: Option<Self>,
         expanded: bool,
         growing: bool,
-        coordination: Option<chat::coordination::Coordination>,
+        coordination: Option<coordination::Prepared>,
     ) -> Self {
         // Only the exact immutable item authorizes descriptor reuse. A tail
         // token cannot prove that a same-ID replacement has the same body.
@@ -1190,6 +1192,25 @@ impl CachedItem {
                     .clone()
                     .unwrap_or_else(|| Arc::new(tool_text::PreparedSources::retained(cached)))
             });
+        let fresh_coordination = coordination.is_some();
+        let retained_coordination = previous
+            .as_mut()
+            .filter(|cached| {
+                cached
+                    .item
+                    .as_ref()
+                    .is_some_and(|item| std::ptr::eq(&item.content, content))
+                    && cached.coordination.is_some()
+            })
+            .map(|cached| {
+                (
+                    cached.coordination.take(),
+                    std::mem::take(&mut cached.blocks),
+                    cached.palette_views.take(),
+                )
+            });
+        let (retained_coordination, retained_blocks, retained_palettes) =
+            retained_coordination.unwrap_or_default();
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
         // Weak descriptors survive append publication; only mounted row owners
@@ -1346,8 +1367,8 @@ impl CachedItem {
             flow_cache,
             reader_memory,
             reader_context,
-            blocks: HashMap::new(),
-            palette_views: None,
+            blocks: retained_blocks,
+            palette_views: retained_palettes,
             open: None,
             detail: None,
             stamp,
@@ -1359,7 +1380,8 @@ impl CachedItem {
             image_wait,
             image_evicted,
             coordination: coordination
-                .map(|reading| Box::new(coordination::Coordinated::new(reading))),
+                .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
+                .or(retained_coordination),
         };
         if expanded
             && matches!(
@@ -1371,7 +1393,7 @@ impl CachedItem {
         {
             cached.prepared_tools = Some(Arc::new(tool_text::PreparedSources::retained(&cached)));
         }
-        if cached.coordination.is_some() {
+        if fresh_coordination {
             cached.highlight(theme);
             cached.settle_blocks();
         }
@@ -2678,16 +2700,16 @@ impl Runtime {
         self.syntax_theme = theme;
         self.preparation.clear();
         for cached in self.cache.values_mut().chain(self.child_cache.values_mut()) {
-            if cached
-                .item
-                .as_ref()
-                .is_some_and(|item| CachedItem::prose(&item.content).is_some())
-                && cached.coordination.is_none()
-            {
+            if cached.item.as_ref().is_some_and(|item| {
+                CachedItem::prose(&item.content).is_some()
+                    || chat::coordination::may_recognize(item, self.session.launch.provider)
+            }) {
                 // Keep logical text/selection while the new palette is
                 // prepared, without highlighting all historical fences here.
-                cached.blocks.clear();
-                cached.palette_views = None;
+                preparation::retire_styles(
+                    std::mem::take(&mut cached.blocks),
+                    cached.palette_views.take(),
+                );
                 cached.open = None;
                 cached.preparing = true;
                 cached.revision = CachedItem::next_revision();
@@ -2814,6 +2836,21 @@ impl Runtime {
     }
 
     fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
+        self.preparation.take_deferred();
+        self.prepare_transcript_cache_from(snapshot, None);
+    }
+
+    fn resume_preparation(&mut self) {
+        if !self.visible.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(cursor) = self.preparation.take_deferred() {
+            let snapshot = self.snapshot.clone();
+            self.prepare_transcript_cache_from(&snapshot, Some(cursor));
+        }
+    }
+
+    fn prepare_transcript_cache_from(&mut self, snapshot: &Snapshot, resume: Option<usize>) {
         let _stage = chat_stage::scope(Stage::PrepareChild);
         let mut presentation_changed = false;
         let context = self.selected_subagent.clone();
@@ -2822,6 +2859,7 @@ impl Runtime {
         let handle = self.handle().cloned();
         let reader_proofs = self.scroll_memory.reader_proofs(context.as_deref());
         self.preparation.set_reader_proofs(reader_proofs.clone());
+        self.preparation.set_provider(provider);
         let expanded = context
             .as_ref()
             .and_then(|id| self.child_expanded.get(id))
@@ -2844,12 +2882,14 @@ impl Runtime {
                 agent.status == chat::ToolStatus::Running,
             )
         });
-        if self.preparation.context(
-            self.target,
-            snapshot.session_id.as_deref(),
-            context.as_deref(),
-            items,
-        ) {
+        if resume.is_none()
+            && self.preparation.context(
+                self.target,
+                snapshot.session_id.as_deref(),
+                context.as_deref(),
+                items,
+            )
+        {
             // The same opaque item ID may exist in two different transcripts.
             // Never display another actor/child's old prose while loading it.
             cache.retain(|_, cached| {
@@ -2862,13 +2902,20 @@ impl Runtime {
             presentation_changed = true;
         }
         let newest = items.len().wrapping_sub(1);
-        for (index, item) in items.iter().enumerate() {
+        let start = resume.unwrap_or(0).min(items.len());
+        let end = resume.map_or(items.len(), |_| start.saturating_add(128).min(items.len()));
+        let mut stopped = false;
+        // Admit the newest item first so the currently streaming answer does
+        // not wait behind a full historical window. Remaining history keeps
+        // deterministic source order; the cursor stores this metadata order.
+        for position in start..end {
+            let index = if position == 0 { newest } else { position - 1 };
+            let item = &items[index];
             let growing = busy && index == newest;
-            let coordinated = chat::coordination::recognize(item, provider);
+            let coordinated = chat::coordination::may_recognize(item, provider);
             let reader_only = !reader_proofs.is_empty()
                 && preparation::has_tool_reader_proofs(item, &reader_proofs);
-            if (CachedItem::prose(&item.content).is_some() || reader_only) && coordinated.is_none()
-            {
+            if CachedItem::prose(&item.content).is_some() || reader_only || coordinated {
                 let current = cache.get(&item.id);
                 let exact = current
                     .and_then(|cached| cached.item.as_ref())
@@ -2889,13 +2936,16 @@ impl Runtime {
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if pending || !exact {
-                    let replaced =
-                        self.preparation
-                            .stage(item, growing && !reader_only, theme, |old, new| {
-                                handle
-                                    .as_ref()
-                                    .is_some_and(|handle| handle.known_append(old, new))
-                            });
+                    let replaced = self.preparation.stage(
+                        item,
+                        growing && (!reader_only || coordinated),
+                        theme,
+                        |old, new| {
+                            handle
+                                .as_ref()
+                                .is_some_and(|handle| handle.known_append(old, new))
+                        },
+                    );
                     if replaced && !exact && !proven_from_cache {
                         cache.insert(item.id.clone(), CachedItem::preparing(item, theme));
                         presentation_changed = true;
@@ -2910,6 +2960,13 @@ impl Runtime {
                     cached.preparing = true;
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.reader_context.clone_from(&context);
+                    if self.preparation.was_deferred() {
+                        self.preparation.defer(position);
+                        if resume.is_some() {
+                            stopped = true;
+                            break;
+                        }
+                    }
                     continue;
                 }
             }
@@ -2972,7 +3029,7 @@ impl Runtime {
                 previous,
                 expanded.contains(&item.id),
                 growing,
-                chat::coordination::recognize(item, provider),
+                None,
             );
             if matches!(item.content, ItemContent::Image { .. }) {
                 cached.image_source = Some(item.clone());
@@ -2985,7 +3042,9 @@ impl Runtime {
             presentation_changed = true;
         }
         let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
-        for item in items {
+        for position in start..end {
+            let index = if position == 0 { newest } else { position - 1 };
+            let item = &items[index];
             if let Some(cached) = cache.get_mut(&item.id)
                 && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
             {
@@ -2993,6 +3052,10 @@ impl Runtime {
                     .at
                     .and_then(|at| recorded_message_stamp(at, today.as_ref()));
             }
+        }
+        if resume.is_some() && !stopped && end < items.len() {
+            self.preparation.defer(end);
+            self.preparation.reschedule();
         }
         self.child_cache_context.clone_from(&context);
         if presentation_changed {
@@ -3024,7 +3087,24 @@ impl Runtime {
             prepared.discard();
             return;
         };
+        let regroup = cached.coordination.is_some() || prepared.is_coordination();
         prepared.install(cached, managed, expanded);
+        self.resume_preparation();
+        if regroup && self.selected_subagent.is_none() {
+            let turns = turn::group(&self.snapshot.items, &self.asked_after, |item| {
+                self.cache.get(&item.id)?.coordination.as_deref()
+            });
+            carry_step_disclosures(
+                &mut self.opened,
+                &mut self.find_disclosure,
+                &self.turns,
+                &self.snapshot.items,
+                &turns,
+                &self.snapshot.items,
+            );
+            self.turns = turns;
+            reconcile_disclosure(&mut self.opened, &self.turns);
+        }
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.refresh_find();
@@ -3480,7 +3560,7 @@ impl Runtime {
                     previous,
                     true,
                     false,
-                    chat::coordination::recognize(&item, self.session.launch.provider),
+                    None,
                 ),
             );
         }
@@ -4552,7 +4632,7 @@ impl Cagents {
                             previous,
                             true,
                             false,
-                            chat::coordination::recognize(item, runtime.session.launch.provider),
+                            None,
                         ),
                     );
                 }
@@ -5642,6 +5722,11 @@ impl Cagents {
             matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed))
         }) {
             subscriptions.push(flow_layout::availability());
+        }
+        if self.cards.values().any(|card| {
+            matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed) && runtime.preparation.waiting())
+        }) {
+            subscriptions.push(preparation::availability());
         }
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
@@ -7176,6 +7261,13 @@ impl Cagents {
             }
             Action::DiscardClosedDraft(target, revision) => {
                 return self.discard_closed_chat_draft(target, revision);
+            }
+            Action::PreparationAvailable => {
+                for card in self.cards.values_mut() {
+                    if let CardRuntime::Chat(runtime) = card {
+                        runtime.resume_preparation();
+                    }
+                }
             }
             Action::FlowAvailable => {
                 let targets: Vec<_> = self
@@ -9160,7 +9252,7 @@ impl Cagents {
                             previous,
                             runtime.item_expanded(&id),
                             false,
-                            chat::coordination::recognize(&item, runtime.session.launch.provider),
+                            None,
                         );
                         runtime.presentation_cache_mut().insert(id.clone(), cached);
                     }
@@ -19426,8 +19518,14 @@ mod tests {
             at: None,
         };
         let coordinated = chat::coordination::recognize(&item, Provider::Claude).unwrap();
-        let mut coordinated =
-            CachedItem::updated(&item.content, theme, None, false, false, Some(coordinated));
+        let mut coordinated = CachedItem::updated(
+            &item.content,
+            theme,
+            None,
+            false,
+            false,
+            Some(coordination::Prepared::new(coordinated)),
+        );
         for cached in [&mut finished, &mut hidden, &mut coordinated] {
             assert!(!cached.blocks.is_empty());
             assert!(cached.open.is_none());
