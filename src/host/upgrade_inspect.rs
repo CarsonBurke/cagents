@@ -482,6 +482,22 @@ mod tests {
     }
 
     #[test]
+    fn known_thread_cannot_be_qualified_by_unidentified_inventory() {
+        let saved = session();
+        let mut unidentified = saved.clone();
+        unidentified.launch.session_id = None;
+        assert!(
+            qualify(
+                &saved,
+                &[unidentified],
+                saved.proof.as_ref().unwrap(),
+                |_| panic!("a current known identity cannot be erased")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn old_proof_requires_authenticated_resolution_and_exact_current_inventory() {
         let saved = session();
         let mut current = saved.clone();
@@ -635,7 +651,21 @@ fn qualify_with_mode(
     };
     let live = inventory
         .iter()
-        .find(|live| handoff::issued_chat_matches(live, source))
+        .find(|live| {
+            if handoff::issued_chat_matches(live, source) {
+                return true;
+            }
+            // A current pane may not have observed the live actor's first
+            // identity yet. Inspection can take that identity from exact,
+            // authenticated current inventory. Recovery aliases remain exact
+            // and cannot erase a previously issued known identity.
+            if saved.proof.as_ref() == Some(proof) && source.launch.session_id.is_none() {
+                let mut observed = source.clone();
+                observed.launch.session_id = live.launch.session_id.clone();
+                return handoff::issued_chat_matches(live, &observed);
+            }
+            false
+        })
         .ok_or("Saved conversation has no exact current source owner")?;
     if require_resumable {
         handoff::validate_chat_source(source, &live.launch)

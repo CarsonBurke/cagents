@@ -688,6 +688,11 @@ mod tests {
                 panic!("confirmation produced no receipt");
             });
         drop(state.update(reply));
+        assert!(
+            state.existing_checkout.completed.is_some(),
+            "checkout did not produce a verified receipt: {:?}",
+            state.existing_checkout.error
+        );
         let receipt = state.existing_checkout.completed.as_ref().unwrap();
         assert_eq!(receipt.head(), &local);
         assert_eq!(receipt.disposition(), disposition);

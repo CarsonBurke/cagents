@@ -190,7 +190,7 @@ impl RequestRaceFixture {
     pub(crate) fn wait_for_queued_prompt(&self) {
         assert!(self.request.is_some(), "request barrier must be held");
         let deadline = Instant::now() + TIMEOUT;
-        while self.handle.0.commands.is_empty() {
+        while self.handle.local_command_queue_is_empty() {
             assert!(Instant::now() < deadline, "courier command was not queued");
             thread::yield_now();
         }

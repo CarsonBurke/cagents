@@ -1413,7 +1413,24 @@ fn inspected_record(
         .chats
         .get(&id)
         .ok_or_else(|| unavailable("Native chat is no longer resident"))?;
-    let ServerResponse::ChatAttached { session, snapshot } = session_snapshot(record) else {
+    // Retained actors are never eligible for resident eviction. Inspect only
+    // cached identity metadata while holding HostState, without a helper RPC.
+    if record.handle.actor_identity().is_some() {
+        let mut session = record.session.clone();
+        session.launch.session_id = record.handle.session_id();
+        session.native_continuity = record.handle.native_continuity();
+        return Ok((crate::terminal_ipc::ChatReleaseInspection {
+            proof: crate::terminal_ipc::ChatReleaseProof {
+                session,
+                generation: record.handle.resident_generation(),
+                execution_instance: record.execution_instance,
+            },
+            release_blocked: Some("The actor retains native provider ownership; use its authenticated close operation".into()),
+        }, record.handle.clone(), record.session.clone()));
+    }
+    let ServerResponse::ChatAttached { session, snapshot } =
+        session_snapshot(&record.session, &record.handle).map_err(unavailable)?
+    else {
         unreachable!()
     };
     let blocked = if state.shutting_down {
@@ -1611,7 +1628,8 @@ pub(super) fn restore_saved_history(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
-        .clone();
+        .as_ref()
+        .map(|seal| Arc::new(seal.recognizer()));
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(unavailable)?;
     let environment = spec.environment.clone();
     let weak = Arc::downgrade(host);
@@ -1652,8 +1670,12 @@ pub(super) fn restore_saved_history(
                 completion_observed: false,
                 returning_terminal: false,
             };
-            let response = session_snapshot(&record);
-            record.handle.commit_native_installation();
+            let response =
+                session_snapshot(&record.session, &record.handle).map_err(unavailable)?;
+            record
+                .handle
+                .commit_native_installation()
+                .map_err(unavailable)?;
             state.chats.insert(id, record);
             state.inventory_generation += 1;
             Ok(response)

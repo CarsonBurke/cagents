@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{BootId, TerminalId};
 
+mod connection;
+pub(crate) use connection::connect_until;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Kind {
     #[default]
@@ -77,6 +80,32 @@ pub(crate) struct Record {
     pub terminal: TerminalId,
     pub holder: Process,
     pub root: Process,
+}
+
+pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
+
+/// Retained Claude discovery visibility only. Attachment still requires the
+/// original record, authenticated peer, daemon lease and actor epoch. Ordinary
+/// terminal discovery and native Codex matching remain application-exact.
+pub(crate) fn record_application_matches(record: &Record) -> bool {
+    record_application_matches_for(
+        record,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
+}
+
+fn record_application_matches_for(record: &Record, current: &str, development: bool) -> bool {
+    record.application == current
+        || (!development
+            && record.kind == Kind::Native
+            && production_role_pair(&record.application, current)
+            && record.build.as_ref().is_some_and(|build| {
+                build
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == RETAINED_CLAUDE_CAPABILITY)
+            }))
 }
 
 /// Read-only recovery intake may inspect the other production package's original
@@ -532,6 +561,85 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {
+        const FULL: &str = "dev.cagents.Cagents";
+        const BROWSERLESS: &str = "dev.cagents.Cagents.Browserless";
+        for (current, prior) in [(FULL, BROWSERLESS), (BROWSERLESS, FULL)] {
+            let mut actor = record();
+            actor.version = 4;
+            actor.kind = Kind::Native;
+            actor.application = prior.into();
+            actor.build = Some(BuildIdentity::current(Kind::Native));
+            let original = serde_json::to_vec(&actor).unwrap();
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "native Codex stays exact"
+            );
+            actor
+                .build
+                .as_mut()
+                .unwrap()
+                .capabilities
+                .push("claude-actor-v2".into());
+            let original_actor = serde_json::to_vec(&actor).unwrap();
+            assert!(record_application_matches_for(&actor, current, false));
+            assert!(
+                !record_application_matches_for(&actor, current, true),
+                "development cannot acquire production actors"
+            );
+            assert!(!record_application_matches_for(
+                &actor,
+                "another.installation",
+                false
+            ));
+            assert_eq!(
+                serde_json::to_vec(&actor).unwrap(),
+                original_actor,
+                "visibility never retags application/process provenance"
+            );
+            actor.build.as_mut().unwrap().capabilities.pop();
+            assert_eq!(serde_json::to_vec(&actor).unwrap(), original);
+            assert!(!record_application_matches_for(&actor, current, false));
+            actor.build = None;
+            assert!(
+                !record_application_matches_for(&actor, current, false),
+                "legacy records cannot infer the actor protocol"
+            );
+        }
+        let mut terminal = record();
+        terminal.application = BROWSERLESS.into();
+        terminal.kind = Kind::Terminal;
+        terminal
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(RETAINED_CLAUDE_CAPABILITY.into());
+        assert!(
+            !record_application_matches_for(&terminal, FULL, false),
+            "Claude capability cannot widen terminal discovery"
+        );
+        terminal.application = FULL.into();
+        assert!(record_application_matches_for(&terminal, FULL, false));
+        let mut foreign = record();
+        foreign.kind = Kind::Native;
+        foreign.application = "dev.cagents.Cagents.Development".into();
+        foreign
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push("claude-actor-v2".into());
+        assert!(!record_application_matches_for(&foreign, FULL, false));
+        foreign.application = "another.installation".into();
+        assert!(!record_application_matches_for(
+            &foreign,
+            BROWSERLESS,
+            false
+        ));
+    }
 
     #[test]
     fn recovery_roles_are_only_the_two_distinct_production_packages() {

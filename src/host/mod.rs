@@ -173,6 +173,12 @@ impl From<PlatformError> for HostError {
     }
 }
 
+/// Private retained-provider owner mode. Invoke before ordinary daemon setup;
+/// its captured account context and cleanup status belong to the launch owner.
+pub fn run_retained_actor_helper() -> Option<Result<(), String>> {
+    crate::chat::runtime::run_retained_helper_if_requested()
+}
+
 /// Dedicated precheck owners must enter before tracing or runtime threads are
 /// started: their descendant cleanup relies on being the sole child reaper.
 pub fn run_automation_helper() -> Option<Result<(), String>> {
@@ -249,16 +255,26 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Some(broker) = &notification_broker {
         host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
     }
+    // Cache sweeps preserve unretired helper journals and live Store leases.
+    if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
+        tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
+    }
     let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
     state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
     chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+    chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+    chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+    let retained_runs = chat::retained_actor::retained_runs(&host);
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
     if let Ok(registry) = agent_execution::registry(&host) {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
+            .interrupt_unproven_agent_runs_except(
+                crate::chat::now_ms().unwrap_or(0),
+                &retained_runs,
+            )
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;
@@ -420,6 +436,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     }
     for client in clients {
         let _ = client.join();
+    }
+    // Healthy originals deliberately handed to a successor may outlive us.
+    // A suspended or failed handoff must not be reported as proved cleanup.
+    if let Some(error) = crate::daemon::child_reaper::retained_custody_error() {
+        tracing::error!(%error, "daemon shutdown retained unconfirmed original child custody");
+        runtime_error.get_or_insert_with(|| io::Error::other(error));
     }
     match runtime_error {
         Some(error) => Err(error.into()),

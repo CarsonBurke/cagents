@@ -1388,6 +1388,16 @@ impl Registry {
     /// Until exact live prompt evidence can be reconciled, restart records an
     /// uncertain outcome rather than authorizing another delivery of effects.
     pub(crate) fn interrupt_unproven_agent_runs(&mut self, now_ms: u64) -> Result<(), String> {
+        self.interrupt_unproven_agent_runs_except(now_ms, &[])
+    }
+
+    /// Only authenticated retained helpers supply these exact run/session pairs.
+    /// A stale descriptor, a busy flag or an unrelated run ID is not ownership.
+    pub(in crate::host) fn interrupt_unproven_agent_runs_except(
+        &mut self,
+        now_ms: u64,
+        retained: &[(RunId, HostedSession)],
+    ) -> Result<(), String> {
         let records = self
             .db
             .prepare(
@@ -1399,6 +1409,15 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         for record in records {
             let run: Run = decode(&record)?;
+            let agent = self.agent(run.agent)?;
+            if !agent.closed && retained.iter().any(|(id, source)| {
+                *id == run.id && agent.session.as_ref() == Some(source)
+                    && matches!(source, HostedSession::Chat(chat) if
+                        matches!(chat.native_continuity, crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 })
+                        && chat.has_valid_native_continuity())
+            }) {
+                continue;
+            }
             self.update_agent_run(run.id, run.revision, Update::Finished {
                 state: State::Interrupted,
                 result: ResultSummary {
@@ -1428,64 +1447,74 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let record: String = tx
-            .query_row(
-                "SELECT record FROM agent_runs WHERE id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        let mut run: Run = decode(&record)?;
-        if run.revision != revision || run.state.is_terminal() {
-            return Err("The agent run has already advanced or finished".into());
-        }
-        match update {
-            Update::Started { provider_key } => {
-                if run.state != State::Accepted
-                    || provider_key.is_empty()
-                    || provider_key.len() > 1024
-                {
-                    return Err("The provider start does not match an accepted run".into());
-                }
-                run.provider_key = Some(provider_key);
-                run.started_ms = Some(now_ms);
-                run.state = State::Running;
-            }
-            Update::Waiting if run.state == State::Running => run.state = State::Waiting,
-            Update::Resumed if run.state == State::Waiting => run.state = State::Running,
-            Update::Finished { state, mut result } if state.is_terminal() => {
-                if state == State::Succeeded && run.provider_key.is_none() {
-                    return Err("An unconfirmed provider turn cannot succeed".into());
-                }
-                result.bound();
-                run.result = result;
-                run.state = state;
-                run.finished_ms = Some(now_ms);
-            }
-            _ => return Err("The provider update does not match the agent run state".into()),
-        }
-        run.revision = run
-            .revision
-            .checked_add(1)
-            .ok_or("Agent run revision exhausted")?;
-        tx.execute(
-            "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
-            params![
-                id.to_string(),
-                state_key(run.state),
-                run.revision,
-                encode(&run)?
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
-            [],
-        )
-        .map_err(|error| error.to_string())?;
+        let run = update_agent_run_in(&tx, id, revision, update, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+}
+
+/// A retained actor's semantic cursor and run transition share this transaction.
+pub(super) fn update_agent_run_in(
+    tx: &Transaction<'_>,
+    id: RunId,
+    revision: u64,
+    update: Update,
+    now_ms: u64,
+) -> Result<Run, String> {
+    let record: String = tx
+        .query_row(
+            "SELECT record FROM agent_runs WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut run: Run = decode(&record)?;
+    if run.revision != revision || run.state.is_terminal() {
+        return Err("The agent run has already advanced or finished".into());
+    }
+    match update {
+        Update::Started { provider_key } => {
+            if run.state != State::Accepted || provider_key.is_empty() || provider_key.len() > 1024
+            {
+                return Err("The provider start does not match an accepted run".into());
+            }
+            run.provider_key = Some(provider_key);
+            run.started_ms = Some(now_ms);
+            run.state = State::Running;
+        }
+        Update::Waiting if run.state == State::Running => run.state = State::Waiting,
+        Update::Resumed if run.state == State::Waiting => run.state = State::Running,
+        Update::Finished { state, mut result } if state.is_terminal() => {
+            if state == State::Succeeded && run.provider_key.is_none() {
+                return Err("An unconfirmed provider turn cannot succeed".into());
+            }
+            result.bound();
+            run.result = result;
+            run.state = state;
+            run.finished_ms = Some(now_ms);
+        }
+        _ => return Err("The provider update does not match the agent run state".into()),
+    }
+    run.revision = run
+        .revision
+        .checked_add(1)
+        .ok_or("Agent run revision exhausted")?;
+    tx.execute(
+        "UPDATE agent_runs SET state = ?2, revision = ?3, record = ?4 WHERE id = ?1",
+        params![
+            id.to_string(),
+            state_key(run.state),
+            run.revision,
+            encode(&run)?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(run)
 }
 
 /// Moving a pane changes presentation membership, not execution authority.
@@ -1632,6 +1661,65 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn startup_preserves_only_exact_helper_proven_run_and_session_pairs() {
+        for mismatch in 0..6 {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let mut source = source();
+            let HostedSession::Chat(chat) = &mut source else {
+                unreachable!()
+            };
+            chat.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            assert!(chat.has_valid_native_continuity());
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            let mut retained = source.clone();
+            let HostedSession::Chat(chat) = &mut retained else {
+                unreachable!()
+            };
+            let mut run = accepted.run.id;
+            match mismatch {
+                0 => {}
+                1 => run = RunId::new(),
+                2 => {
+                    chat.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("stale")
+                }
+                3 => {
+                    chat.launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                4 => chat.native_continuity = Default::default(),
+                5 => chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                _ => unreachable!(),
+            }
+            registry
+                .interrupt_unproven_agent_runs_except(2, &[(run, retained)])
+                .unwrap();
+            assert_eq!(
+                registry.agent_run(accepted.run.id).unwrap().state,
+                if mismatch == 0 {
+                    State::Accepted
+                } else {
+                    State::Interrupted
+                },
+                "retained mismatch case {mismatch}"
+            );
+            if mismatch == 0 {
+                registry.interrupt_unproven_agent_runs(3).unwrap();
+                assert_eq!(
+                    registry.agent_run(accepted.run.id).unwrap().state,
+                    State::Interrupted
+                );
+            }
+        }
     }
 
     #[test]
@@ -1905,7 +1993,11 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE shared_view_terminal_sources; PRAGMA user_version=12;",
+                        "DROP TABLE native_actor_retirements;
+                         DROP TABLE native_actor_ownerships;
+                         DROP TABLE native_actor_cursors;
+                         DROP TABLE shared_view_terminal_sources;
+                         PRAGMA user_version=12;",
                     )
                     .unwrap();
                 drop(registry);

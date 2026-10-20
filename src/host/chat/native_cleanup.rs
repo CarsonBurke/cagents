@@ -18,11 +18,13 @@ struct RetainedPair {
     original_role: Option<registry::OriginalRole>,
 }
 
-/// Cleanup does not require provider history or a successful protocol attach.
-/// Only the authenticated exact holder and current exclusive daemon lease can
-/// authorize it; disappearance alone never counts as a successful close.
+/// Codex cleanup does not require provider history or a successful attach.
+/// Claude cleanup adopts its authenticated resident reducer with close-only
+/// authority from its durable registration; this grants no account read or input
+/// authority. Exact ownership and the current daemon lease authorize either
+/// route; disappearance never proves a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
-    close_retained_inner(host, source, None)
+    close_retained_inner(host, source, None, None)
 }
 
 pub(super) fn close_retained_with_reservation(
@@ -30,15 +32,68 @@ pub(super) fn close_retained_with_reservation(
     source: &Session,
     closing: &capacity::Reservation,
 ) -> Result<(), String> {
-    close_retained_inner(host, source, Some(closing))
+    close_retained_inner(host, source, Some(closing), None)
+}
+
+pub(super) fn close_captured(
+    host: &SharedHost,
+    source: &Session,
+    target: &super::CloseTarget,
+    closing: &capacity::Reservation,
+) -> Result<(), String> {
+    close_retained_inner(host, source, Some(closing), Some(target))
 }
 
 fn close_retained_inner(
     host: &SharedHost,
     source: &Session,
     closing: Option<&capacity::Reservation>,
+    expected: Option<&super::CloseTarget>,
 ) -> Result<(), String> {
+    if let Some(expected) = expected {
+        expected
+            .require_current(host)
+            .map_err(|error| error.message)?;
+    }
     super::super::agent_execution::preflight_retirement(host, source)?;
+    if source.launch.provider == Provider::Claude {
+        if matches!(source.native_continuity, chat::NativeContinuity::RetainedClaudeActor { protocol } if protocol != 2)
+        {
+            return Err(
+                "This retained Claude actor protocol is unsupported; its owner was preserved"
+                    .into(),
+            );
+        }
+        let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
+        let owner = registry::recovery_candidate(&socket, Kind::Native)?;
+        let hosted = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .get(&source.id)
+            .is_some_and(|record| record.handle.actor_identity().is_some());
+        if hosted
+            || matches!(
+                source.native_continuity,
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || owner.as_ref().is_some_and(|record| {
+                Handle::is_remote_record(record)
+                    || record.build.as_ref().is_some_and(|build| {
+                        build
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability.starts_with("claude-actor-"))
+                    })
+            })
+        {
+            return if let Some(expected) = expected {
+                super::retained_actor::close_captured(host, source, expected, closing)
+            } else {
+                super::retained_actor::close_unattached(host, source, owner)
+            };
+        }
+    }
     let (proof, pending, actor) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
@@ -51,16 +106,23 @@ fn close_retained_inner(
         {
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
         }
+        if expected.is_some_and(|expected| {
+            !state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| expected.matches(record))
+        }) {
+            return Err("The exact hosted attachment changed before native cleanup".into());
+        }
         let actor = if let Some(record) = state.chats.get(&source.id) {
             if record.handle.owns_work() {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
-            let ServerResponse::ChatAttached {
-                session: observed, ..
-            } = session_snapshot(record)
-            else {
-                unreachable!()
-            };
+            // Identity/continuity are cached actor metadata; never hydrate a
+            // potentially remote transcript while holding HostState.
+            let mut observed = record.session.clone();
+            observed.launch.session_id = record.handle.session_id();
+            observed.native_continuity = record.handle.native_continuity();
             if record.session != *source
                 && observed != *source
                 && !state
@@ -183,6 +245,11 @@ fn close_retained_inner(
                 );
             }
         }
+        if let Some(expected) = expected {
+            expected
+                .require_current(host)
+                .map_err(|error| error.message)?;
+        }
         if !pending.closed {
             pending.owner.close_retaining_receipt()?;
             pending.closed = true;
@@ -190,6 +257,11 @@ fn close_retained_inner(
                 .unwrap_or_else(|p| p.into_inner())
                 .native_closing
                 .insert(source.id, pending.clone());
+        }
+        if let Some(expected) = expected {
+            expected
+                .require_current(host)
+                .map_err(|error| error.message)?;
         }
         if let Some(pair) = &pending.paired {
             if let Some(handle) = &pair.handle {
@@ -238,6 +310,14 @@ fn close_retained_inner(
         state.inventory_generation += 1;
     }
     if result.is_ok() {
+        if expected.is_some_and(|expected| {
+            !state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| expected.matches(record))
+        }) {
+            return Err("The exact hosted attachment changed during native cleanup; replacement was preserved".into());
+        }
         if let Some(actor) = actor {
             if state
                 .chats

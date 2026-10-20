@@ -6911,13 +6911,14 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        if let Some((source, resolved)) = handle.upgrade_recovery() {
+                        if let Some(recovery) = handle.authenticated_upgrade_recovery() {
+                            let source = recovery.source();
+                            let resolved = recovery.replacement();
                             let replacement = handle.session();
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || &replacement != resolved
-                                || !(chat::is_upgrade_recovery(source, &replacement)
-                                    || chat::is_upgrade_identity_learning(source, &replacement))
+                                || !recovery.validate()
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6931,10 +6932,9 @@ impl Cagents {
                                     .as_ref()
                                     .ok_or_else(|| "Session storage is unavailable".to_owned())
                                     .and_then(|writer| {
-                                        writer.rebind_chat_upgrade(
+                                        writer.rebind_authenticated_chat_upgrade(
                                             target.card,
-                                            source.clone(),
-                                            replacement,
+                                            recovery.clone(),
                                         )
                                     });
                                 self.chat_ui
@@ -7483,6 +7483,9 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::Reconnect(target) => {
+                if self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -17473,6 +17476,7 @@ mod tests {
                 }
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             }
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let directory = tempfile::tempdir().unwrap();
             let (writer, _) = crate::session::SessionRuntime::open(
                 directory.path().join("state.sqlite3"),
@@ -20284,5 +20288,1020 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+    struct LiveSharedRecovery {
+        app: Cagents,
+        _directory: tempfile::TempDir,
+        card: CardId,
+        target: Target,
+        source: chat::Session,
+        canonical: chat::Session,
+        model: crate::workspace_model::WorkspaceModel,
+        allocation: usize,
+        draft: String,
+        cursor: text_editor::Cursor,
+        selection: Option<String>,
+    }
+
+    fn live_shared_recovery_fixture() -> LiveSharedRecovery {
+        live_shared_recovery_fixture_for_identity(Some(KNOWN_THREAD))
+    }
+
+    fn live_shared_recovery_fixture_for_identity(session_id: Option<&str>) -> LiveSharedRecovery {
+        use crate::model::{ChannelId, ProjectChannel, ProjectId, ProjectKind, ProjectState};
+        use crate::workspace_model::{
+            ModelChannel, ModelProject, WorkspaceModel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let mut source = chat_runtime(&app, card).session.clone();
+        source.launch.provider = Provider::Claude;
+        source.launch.session_id = session_id.map(str::to_owned);
+        source.launch.recipe.program = "claude".into();
+        source.launch.recipe.arguments.clear();
+        source.launch.recipe.environment.clear();
+        source.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            "/private/retained-recovery-account".into(),
+        );
+        source.owned_codex_listener = None;
+        source.terminal = None;
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(source.has_valid_native_continuity());
+        app.install_chat_session(card, source.clone());
+        let before = Arc::new(chat::Item {
+            id: "native-before-recovery".into(),
+            role: chat::Role::Assistant,
+            content: text("BEFORE_RECOVERY"),
+            started_at: None,
+            at: None,
+        });
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ready: true,
+                    items: vec![before],
+                    ..Snapshot::default()
+                },
+            )));
+            runtime.show(true);
+        }
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let identity = uuid::Uuid::new_v4();
+        let repository = PathBuf::from(FIXTURE_DIRECTORY);
+        app.sidebar_model.projects.push(
+            crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Recovery fixture".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.workspace_model_identity = Some(identity);
+            durable.active_channel = Some(channel);
+            durable.channels.push(ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Recovery fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        let mut view = View::empty(Scope::Channel(channel));
+        view.panes.push(
+            Pane::from_card(app.card_state(card).unwrap(), Some(repository.clone())).unwrap(),
+        );
+        let mut model = WorkspaceModel {
+            identity,
+            sequence: 1,
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "Recovery fixture".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            }],
+            channels: vec![ModelChannel {
+                id: channel,
+                repository,
+                title: "Recovery fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            }],
+            views: vec![view],
+            ..WorkspaceModel::default()
+        };
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                scope: Scope::Channel(channel),
+                operation: None,
+                model: model.clone(),
+            },
+        )));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(&app, card).session, source);
+        // The assertions inspect the presented body. Hidden panes deliberately
+        // defer snapshot presentation even after their connection is admitted.
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        let draft = "Keep this unsent thought\n  with λ and spacing".to_owned();
+        write(&mut app, card, &draft);
+        let (allocation, cursor, selection) = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+            runtime
+                .composer
+                .perform(text_editor::Action::Select(text_editor::Motion::Right));
+            (
+                runtime as *const Runtime as usize,
+                runtime.composer.cursor(),
+                runtime.composer.selection(),
+            )
+        };
+        assert_eq!(selection.as_deref(), Some("K"));
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        writer.save_project(ProjectState {
+            id: project,
+            generation: 0,
+            name: "Recovery fixture".into(),
+            repository: PathBuf::from(FIXTURE_DIRECTORY),
+            kind: ProjectKind::Folder,
+            existence: Existence::Open,
+        });
+        app.session = Some(writer);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        drop(app.update(Message::ChatUi(Action::Wake(
+            target,
+            Wake::Disconnected("fixture native HOST lost".into()),
+        ))));
+        assert!(chat_runtime(&app, card).disconnected);
+        let mut canonical = source.clone();
+        canonical.proof.as_mut().unwrap().host_incarnation = "recovered-daemon".into();
+        assert!(chat::is_upgrade_recovery(&source, &canonical));
+        model.sequence += 1;
+        model.views[0].revision += 1;
+        model.views[0].panes[0].kind = CardKind::Chat(canonical.clone());
+        LiveSharedRecovery {
+            app,
+            _directory: directory,
+            card,
+            target,
+            source,
+            canonical,
+            model,
+            allocation,
+            draft,
+            cursor,
+            selection,
+        }
+    }
+
+    fn assert_live_recovery_content(fixture: &LiveSharedRecovery) {
+        let runtime = chat_runtime(&fixture.app, fixture.card);
+        assert_eq!(
+            runtime as *const Runtime as usize, fixture.allocation,
+            "recovery must retain the original live Runtime/Content owner"
+        );
+        assert_eq!(runtime.composer.text(), fixture.draft);
+        assert_eq!(runtime.composer.cursor(), fixture.cursor);
+        assert_eq!(runtime.composer.selection(), fixture.selection);
+        assert!(
+            runtime.queued.is_none(),
+            "an unsent draft is never a provider replay"
+        );
+        assert!(runtime.followups.is_empty());
+    }
+
+    fn exercise_live_shared_recovery(reconnect_first: bool) {
+        exercise_live_shared_recovery_fixture(live_shared_recovery_fixture(), reconnect_first);
+    }
+
+    fn exercise_live_shared_recovery_fixture(mut f: LiveSharedRecovery, reconnect_first: bool) {
+        let old_attempt = reconnect_first.then(|| {
+            drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
+            f.app.chat_ui.attempt(f.card).unwrap().target
+        });
+        // The actual watcher message projects a same-ID authoritative descriptor,
+        // independently of the old live connection's unsent Content.
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        assert_eq!(
+            f.app.card_state(f.card).unwrap().kind,
+            CardKind::Chat(f.canonical.clone())
+        );
+        assert_live_recovery_content(&f);
+        assert_eq!(
+            chat_runtime(&f.app, f.card).snapshot.items[0].content,
+            text("BEFORE_RECOVERY")
+        );
+        let saved = f.app.persistent_workspace();
+        assert_eq!(
+            saved.cards.iter().find(|c| c.id == f.card).unwrap().kind,
+            CardKind::Chat(f.source.clone()),
+            "ModelUpdate cannot autosave canonical ownership before authenticated lineage and durable ACK"
+        );
+        assert_eq!(saved.chat_drafts.get(&f.card), Some(&f.draft));
+        f.app.persist();
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(f.source.clone())
+        );
+        let admitted = f
+            .app
+            .chat_ui
+            .attempt(f.card)
+            .expect("canonical projection must enter strict upgrade admission")
+            .target;
+        assert_eq!(
+            f.app
+                .chat_ui
+                .attempt(f.card)
+                .unwrap()
+                .upgrade_admission
+                .as_ref(),
+            Some(&f.canonical)
+        );
+        if let Some(old) = old_attempt {
+            assert_ne!(
+                old, admitted,
+                "canonical admission supersedes the ordinary source attachment"
+            );
+        }
+        // Retry from the still-rendered disconnected runtime cannot replace the
+        // already admitted strict attachment with an ordinary restore.
+        drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
+        assert_eq!(f.app.chat_ui.attempt(f.card).unwrap().target, admitted);
+        let snapshot = Snapshot {
+            session_id: f.canonical.launch.session_id.clone(),
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: "native-after-recovery".into(),
+                role: chat::Role::Assistant,
+                content: text("BEFORE_RECOVERY\nAFTER_RECOVERY_EXACT_ONCE"),
+                started_at: None,
+                at: None,
+            })],
+            ..Snapshot::default()
+        };
+        if let Some(old) = old_attempt {
+            let stale = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    f.source.clone(),
+                    f.canonical.clone(),
+                    snapshot.clone(),
+                )
+                .unwrap(),
+            );
+            answer_start(&mut f.app, old, Ok(stale));
+            assert_eq!(f.app.chat_ui.attempt(f.card).unwrap().target, admitted);
+            assert!(!f.app.chat_ui.attempt(f.card).unwrap().upgrade_committed);
+        }
+        let handle = Arc::new(
+            ClientHandle::fixture_upgrade_handshake(
+                f.source.clone(),
+                f.canonical.clone(),
+                snapshot.clone(),
+            )
+            .unwrap(),
+        );
+        let witness = handle.authenticated_upgrade_recovery().unwrap();
+        assert!(witness.validate());
+        assert_eq!(witness.source(), &f.source);
+        assert_eq!(witness.replacement(), &f.canonical);
+        assert_eq!(
+            f.app.workspace.visibility(f.card),
+            Some(VisibilityClass::Visible)
+        );
+        let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
+            admitted,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert_live_recovery_content(&f);
+        assert_eq!(
+            chat_runtime(&f.app, f.card).session,
+            f.source,
+            "a connected handle is not the durable writer ACK"
+        );
+        let receipt = account_commit_reply(checkpoint);
+        assert!(matches!(
+            &receipt,
+            Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+        ));
+        drop(f.app.update(receipt));
+        assert!(!f.app.chat_start_pending(f.card));
+        assert_live_recovery_content(&f);
+        let runtime = chat_runtime(&f.app, f.card);
+        assert_eq!(runtime.session, f.canonical);
+        assert!(!runtime.disconnected);
+        assert!(runtime.connected());
+        assert_eq!(runtime.snapshot.items, snapshot.items);
+        assert!(
+            f.app
+                .persistent_workspace()
+                .pending_chat_admissions
+                .is_empty()
+        );
+        f.app.persist();
+        let writer = f.app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        assert_eq!(writer.last_error(), None);
+        assert_eq!(
+            writer
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(f.canonical)
+        );
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_reconnect_holds_source_through_real_writer_ack() {
+        exercise_live_shared_recovery(false);
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_supersedes_inflight_ordinary_reconnect_without_replaying_draft()
+    {
+        exercise_live_shared_recovery(true);
+    }
+
+    fn assert_no_live_upgrade_checkpoint(task: Task<Message>) {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else { return };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(action) = stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        assert!(!matches!(message, Message::ChatUi(Action::UpgradeCommitted(..) | Action::AccountCommitted(..) | Action::Ready(..) | Action::Retired(..))), "refused or stale Ready cannot checkpoint, activate or retire an actor");
+                    }
+                }
+            }).await.expect("ancillary UI tasks must settle without an upgrade checkpoint");
+        });
+    }
+
+    fn live_shared_recovery_handle(f: &LiveSharedRecovery) -> Arc<ClientHandle> {
+        Arc::new(
+            ClientHandle::fixture_upgrade_handshake(
+                f.source.clone(),
+                f.canonical.clone(),
+                Snapshot {
+                    session_id: f.canonical.launch.session_id.clone(),
+                    ready: true,
+                    ..Snapshot::default()
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn project_live_shared_recovery(f: &mut LiveSharedRecovery) -> Target {
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        let attempt = f
+            .app
+            .chat_ui
+            .attempt(f.card)
+            .expect("strict canonical admission");
+        assert_eq!(attempt.upgrade_admission.as_ref(), Some(&f.canonical));
+        attempt.target
+    }
+
+    fn assert_inert_live_recovery_copy(f: &LiveSharedRecovery) {
+        let (copy, runtime) = f
+            .app
+            .cards
+            .iter()
+            .find_map(|(card, value)| match value {
+                CardRuntime::Chat(runtime)
+                    if (&**runtime as *const Runtime as usize) == f.allocation =>
+                {
+                    Some((*card, &**runtime))
+                }
+                _ => None,
+            })
+            .expect("the original Content owner must remain reachable");
+        assert_ne!(copy, f.card);
+        assert_eq!(runtime.session, f.source);
+        assert!(runtime.awaiting_admission());
+        assert_eq!(runtime.composer.text(), f.draft);
+        assert_eq!(runtime.composer.cursor(), f.cursor);
+        assert_eq!(runtime.composer.selection(), f.selection);
+        assert!(runtime.queued.is_none() && runtime.followups.is_empty());
+        assert_eq!(
+            f.app.card_state(copy).unwrap().kind,
+            CardKind::Chat(f.source.clone())
+        );
+        assert!(f.app.durable.local_only_cards.contains(&copy));
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_first_identity_and_bound_reset_require_the_same_exact_checkpoint()
+     {
+        for first_identity in [true, false] {
+            let mut f = live_shared_recovery_fixture_for_identity(
+                (!first_identity).then_some(KNOWN_THREAD),
+            );
+            f.canonical.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+            assert!(chat::client::UpgradeRecovery::is_candidate(
+                &f.source,
+                &f.canonical
+            ));
+            assert!(!chat::is_upgrade_recovery(&f.source, &f.canonical));
+            if !first_identity {
+                assert!(!chat::is_upgrade_identity_learning(&f.source, &f.canonical));
+            }
+            assert!(
+                f.app
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .rebind_chat_upgrade(f.card, &f.source, &f.canonical)
+                    .is_err(),
+                "raw descriptors never authorize a retained transition"
+            );
+            exercise_live_shared_recovery_fixture(f, false);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_handles() {
+        for case in [
+            "unproved",
+            "writer refusal",
+            "newer canonical before Ready",
+            "newer canonical before writer ACK",
+        ] {
+            let mut f = live_shared_recovery_fixture();
+            let target = project_live_shared_recovery(&mut f);
+            let fault =
+                rusqlite::Connection::open(f._directory.path().join("state.sqlite3")).unwrap();
+            if case == "writer refusal" {
+                fault.execute_batch("CREATE TRIGGER refuse_recovery BEFORE UPDATE OF content_json ON cards WHEN NEW.content_json != OLD.content_json BEGIN SELECT RAISE(ABORT, 'fixture refused recovery'); END;").unwrap();
+            }
+            let handle = if case == "unproved" {
+                Arc::new(ClientHandle::fixture(
+                    f.canonical.clone(),
+                    Snapshot {
+                        session_id: f.canonical.launch.session_id.clone(),
+                        ready: true,
+                        ..Snapshot::default()
+                    },
+                ))
+            } else {
+                live_shared_recovery_handle(&f)
+            };
+            let mut newer = f.model.clone();
+            newer.sequence += 1;
+            newer.views[0].revision += 1;
+            let CardKind::Chat(next) = &mut newer.views[0].panes[0].kind else {
+                unreachable!()
+            };
+            next.proof.as_mut().unwrap().host_incarnation = "still-newer-daemon".into();
+            if case == "newer canonical before Ready" {
+                drop(f.app.update(Message::WorkspaceModelObserved(
+                    super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
+                )));
+            }
+            let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            if case == "unproved" {
+                assert_no_live_upgrade_checkpoint(checkpoint);
+                assert_live_recovery_content(&f);
+                assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
+                assert!(!chat_runtime(&f.app, f.card).connected());
+            } else if case == "newer canonical before Ready" {
+                assert_no_live_upgrade_checkpoint(checkpoint);
+                assert_inert_live_recovery_copy(&f);
+            } else {
+                let receipt = account_commit_reply(checkpoint);
+                if case == "writer refusal" {
+                    assert!(
+                        matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("fixture refused recovery"))
+                    );
+                    fault
+                        .execute_batch("DROP TRIGGER refuse_recovery;")
+                        .unwrap();
+                } else {
+                    assert!(matches!(
+                        &receipt,
+                        Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+                    ));
+                    drop(f.app.update(Message::WorkspaceModelObserved(
+                        super::super::workspace_model_sync::ModelUpdate::Read(newer),
+                    )));
+                }
+                drop(f.app.update(receipt));
+                assert_inert_live_recovery_copy(&f);
+            }
+            assert!(!f.app.chat_start_pending(f.card));
+            assert!(
+                f.app.chat_ui.retiring.is_empty() && f.app.chat_ui.abandoned.is_empty(),
+                "failed admission only detaches; shared actors are never retired/restarted"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners() {
+        for owner in ["account", "return", "close", "other source"] {
+            let mut f = live_shared_recovery_fixture();
+            let target = f.app.chat_ui.next_target(f.card);
+            let phase = match owner {
+                "account" => Phase::Starting(Attempt {
+                    target,
+                    session: f.source.clone(),
+                    recovery: Some(AccountRecovery {
+                        source: f.source.clone(),
+                        committed: false,
+                        submit: None,
+                    }),
+                    upgrade_committed: false,
+                    upgrade_admission: None,
+                }),
+                "return" => Phase::Returning {
+                    target,
+                    local: None,
+                    close_requested: false,
+                },
+                "other source" => {
+                    let mut other = f.source.clone();
+                    other.id = TerminalId::new();
+                    other.launch.recipe.arguments.push("--other-start".into());
+                    Phase::Starting(Attempt {
+                        target,
+                        session: other,
+                        recovery: None,
+                        upgrade_committed: false,
+                        upgrade_admission: None,
+                    })
+                }
+                _ => Phase::Closing {
+                    target,
+                    restart: None,
+                },
+            };
+            f.app.chat_ui.phases.insert(f.card, phase);
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+            )));
+            assert_eq!(
+                f.app.chat_ui.phases[&f.card].target(),
+                target,
+                "{owner} owns its generation"
+            );
+            match (&f.app.chat_ui.phases[&f.card], owner) {
+                (Phase::Starting(attempt), "account") => {
+                    assert!(attempt.recovery.is_some() && attempt.upgrade_admission.is_none())
+                }
+                (Phase::Starting(attempt), "other source") => {
+                    assert_ne!(attempt.session, f.source);
+                    assert!(attempt.recovery.is_none() && attempt.upgrade_admission.is_none());
+                }
+                (Phase::Returning { .. }, "return") | (Phase::Closing { .. }, "close") => {}
+                _ => panic!("{owner} phase changed"),
+            }
+            assert_live_recovery_content(&f);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_candidates_keep_account_recipe_proof_and_unstarted_guards() {
+        for mutation in [
+            "account",
+            "program",
+            "arguments",
+            "directory",
+            "boot",
+            "proof",
+            "unstarted",
+        ] {
+            let mut f = live_shared_recovery_fixture();
+            match mutation {
+                "account" => {
+                    f.canonical
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                "program" => f.canonical.launch.recipe.program = "other-provider".into(),
+                "arguments" => f
+                    .canonical
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--other-model".into()),
+                "directory" => {
+                    f.canonical.launch.recipe.working_directory = "/other-project".into()
+                }
+                "boot" => f.canonical.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                "proof" => f.canonical.proof.as_mut().unwrap().host_incarnation = "".into(),
+                _ => {
+                    f.source.proof = None;
+                    f.source.launch.session_id = None;
+                    f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+                    let runtime = f.app.chat_runtime_mut(f.target).unwrap();
+                    runtime.session = f.source.clone();
+                    runtime.connection = Connection::Draft;
+                    f.app.install_chat_session(f.card, f.source.clone());
+                }
+            }
+            assert!(
+                !chat::client::UpgradeRecovery::is_candidate(&f.source, &f.canonical),
+                "{mutation}"
+            );
+            f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+            )));
+            assert!(
+                !f.app.chat_start_pending(f.card),
+                "{mutation} cannot dispatch a strict or ordinary provider attachment"
+            );
+            assert_live_recovery_content(&f);
+            assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_refuses_future_unnamed_alias_over_a_known_checkpoint() {
+        let mut f = live_shared_recovery_fixture_for_identity(None);
+        f.canonical.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+        let target = project_live_shared_recovery(&mut f);
+        f.app.persist();
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        // A separate already-known checkpoint wins over this older unnamed
+        // alias, even though its future B attachment has authentic lineage.
+        let mut checkpoint = (*f.app.persistent_workspace()).clone();
+        let mut known = f.source.clone();
+        known.launch.session_id = Some(KNOWN_THREAD.into());
+        checkpoint
+            .cards
+            .iter_mut()
+            .find(|c| c.id == f.card)
+            .unwrap()
+            .kind = CardKind::Chat(known.clone());
+        checkpoint.pending_chat_admissions.remove(&f.card);
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot(Arc::new(checkpoint));
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let handle = live_shared_recovery_handle(&f);
+        assert!(handle.authenticated_upgrade_recovery().unwrap().validate());
+        let task = f.app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        let receipt = account_commit_reply(task);
+        assert!(
+            matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("saved conversation changed"))
+        );
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(known.clone())
+        );
+        drop(f.app.update(receipt));
+        assert_inert_live_recovery_copy(&f);
+        assert!(!f.app.chat_start_pending(f.card));
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(known)
+        );
+    }
+
+    #[test]
+    fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() {
+        // pre-ID learning, Codex normalization, and grant-bound retained reset.
+        for (stale_reply, mode, refused) in [
+            (false, 0, false),
+            (true, 0, false),
+            (false, 1, false),
+            (true, 1, false),
+            (false, 2, false),
+            (true, 2, false),
+            (false, 2, true),
+        ] {
+            let codex_resume = mode == 1;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            if codex_resume {
+                source.launch.provider = Provider::Codex;
+                source.launch.recipe.program = "codex".into();
+                source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                source.launch.session_id = None;
+                let allocator = source.proof.clone().unwrap();
+                assert!(source.claim_owned_codex_listener(
+                    std::path::Path::new("/run/test-native"),
+                    &allocator
+                ));
+                source.launch.session_id = Some(KNOWN_THREAD.into());
+                source.native_continuity = chat::NativeContinuity::Durable {
+                    provider_version: "0.100.0".into(),
+                };
+            } else {
+                source.launch.provider = Provider::Claude;
+                source.launch.recipe.program = "claude".into();
+                source.launch.recipe.arguments.clear();
+                source.owned_codex_listener = None;
+                source.launch.session_id = (mode == 2).then(|| KNOWN_THREAD.into());
+                source.native_continuity =
+                    chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            }
+            assert!(
+                source.has_valid_native_continuity(),
+                "invalid writer fixture source: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
+            assert_eq!(
+                source.owned_codex_listener.is_some(),
+                codex_resume,
+                "unexpected fixture allocation: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
+            assert_eq!(
+                source.owns_codex_listener(),
+                codex_resume,
+                "invalid fixture allocation: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let draft = "Keep this unsent thought\n  with λ and spacing";
+            write(&mut app, card, draft);
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            let fault = rusqlite::Connection::open(directory.path().join("state.sqlite3")).unwrap();
+            if refused {
+                // Refuse the identity CAS while allowing the unchanged old-source title autosave.
+                fault.execute_batch("CREATE TRIGGER refuse_upgrade BEFORE UPDATE OF content_json ON cards WHEN NEW.content_json != OLD.content_json BEGIN SELECT RAISE(ABORT, 'fixture refused upgraded identity'); END;").unwrap();
+            }
+            let mut replacement = source.clone();
+            replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
+            if codex_resume {
+                replacement
+                    .launch
+                    .recipe
+                    .arguments
+                    .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
+            } else {
+                replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            }
+            if mode == 2 {
+                assert!(
+                    app.session
+                        .as_ref()
+                        .unwrap()
+                        .operation_store()
+                        .rebind_chat_upgrade(card, &source, &replacement)
+                        .is_err(),
+                    "raw Session values cannot authorize a retained reset"
+                );
+            }
+            let handle = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    source.clone(),
+                    replacement.clone(),
+                    Snapshot {
+                        session_id: replacement.launch.session_id.clone(),
+                        ready: true,
+                        ..Snapshot::default()
+                    },
+                )
+                .unwrap(),
+            );
+            app.chat_forget(card);
+            let target = app.chat_ui.next_target(card);
+            app.chat_ui.phases.insert(
+                card,
+                Phase::Starting(Attempt {
+                    target,
+                    session: source.clone(),
+                    recovery: None,
+                    upgrade_committed: false,
+                    upgrade_admission: None,
+                }),
+            );
+            app.cards.remove(&card);
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert!(!app.cards.contains_key(&card));
+            assert_eq!(app.chat_ui.drafts.get(&card).unwrap(), draft);
+            // This changed old-source autosave must translate only after the ordered CAS succeeds.
+            app.card_state_mut(card).unwrap().title = "Edited while recovery waits".into();
+            app.persist();
+            let receipt = account_commit_reply(task);
+            if refused {
+                assert!(matches!(
+                    &receipt,
+                    Message::ChatUi(Action::UpgradeCommitted(_, _, Err(_)))
+                ));
+                let _ = app.update(receipt);
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(source.clone())
+                );
+                assert!(!app.chat_start_pending(card));
+                assert!(!matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+                assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+                fault.execute_batch("DROP TRIGGER refuse_upgrade;").unwrap();
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_card(card, None)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(source.clone())
+                );
+                drop(app.session.take());
+                let reopened = crate::persistence::StateStore::open(
+                    directory.path().join("state.sqlite3"),
+                    crate::model::BootId::new("boot-test"),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.load_card(card, None).unwrap().unwrap().kind,
+                    CardKind::Chat(source)
+                );
+                assert_eq!(
+                    reopened
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
+                );
+                continue;
+            }
+            assert!(matches!(
+                receipt,
+                Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+            ));
+            if stale_reply {
+                let next = app.chat_ui.next_target(card);
+                app.chat_ui.phases.insert(
+                    card,
+                    Phase::Starting(Attempt {
+                        target: next,
+                        session: source.clone(),
+                        recovery: None,
+                        upgrade_committed: false,
+                        upgrade_admission: None,
+                    }),
+                );
+                let _ = app.update(receipt);
+                assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);
+                assert!(!app.chat_ui.attempt(card).unwrap().upgrade_committed);
+                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+                assert!(!app.cards.contains_key(&card));
+            } else {
+                let _ = app.update(receipt);
+                assert!(!app.chat_start_pending(card));
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(replacement.clone())
+                );
+                assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                assert_eq!(chat_runtime(&app, card).composer.text(), draft);
+                app.persist();
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(writer.last_error(), None);
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_card(card, None)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(replacement.clone())
+                );
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
+                );
+                drop(app.session.take());
+                let reopened = crate::persistence::StateStore::open(
+                    directory.path().join("state.sqlite3"),
+                    crate::model::BootId::new("boot-test"),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.load_card(card, None).unwrap().unwrap().kind,
+                    CardKind::Chat(replacement)
+                );
+                assert_eq!(
+                    reopened
+                        .load_workspace(app.durable.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts[&card],
+                    draft
+                );
+            }
+        }
     }
 }

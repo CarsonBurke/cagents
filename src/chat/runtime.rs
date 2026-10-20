@@ -15,15 +15,23 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
-mod child_text_copy;
 mod execution;
+mod handle;
+pub use handle::Handle;
+#[cfg(test)]
+pub(crate) use handle::RetainedInputOutcome;
+pub(crate) use retained_actor::transport::{
+    ActorIdentity, RetirementInspection, VerifiedRetirement,
+};
+mod retained_actor;
 mod store;
 mod websocket;
 pub(crate) use store::Store;
@@ -42,6 +50,12 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    RetainedProvider {
+        run: Option<crate::model::RunId>,
+        command: Command,
+        decline_only: bool,
+        effects: Arc<AtomicU8>,
+    },
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -64,6 +78,24 @@ enum ActorCommand {
         including_subagents: bool,
     },
 }
+/// A refusal before a Step is prepared proves no provider effects; after a
+/// Step is admitted, an uncertain acknowledgement never authorizes replay.
+struct InputEffects(Option<Arc<AtomicU8>>);
+impl InputEffects {
+    fn possible(&self) {
+        if let Some(effects) = &self.0 {
+            effects.store(2, Ordering::Release);
+        }
+    }
+}
+impl Drop for InputEffects {
+    fn drop(&mut self) {
+        if let Some(effects) = &self.0 {
+            let _ = effects.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
 /// Why a provider command may not have taken effect.
@@ -84,15 +116,17 @@ impl From<Rejection> for String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum UpdateReadiness {
     Idle,
     Busy,
     Unready,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Update {
+    /// Helper outbox has uncommitted semantic evidence; wake the host broker.
+    RetainedOutcomes,
     Execution {
         run: crate::model::RunId,
         update: crate::agent_execution::Update,
@@ -127,7 +161,7 @@ pub(crate) enum Update {
 }
 
 #[derive(Clone)]
-pub struct Handle(Arc<Inner>);
+struct LocalHandle(Arc<Inner>);
 
 struct OwnedSocket(std::path::PathBuf);
 impl Drop for OwnedSocket {
@@ -139,7 +173,7 @@ impl Drop for OwnedSocket {
     }
 }
 
-impl Handle {
+impl LocalHandle {
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -173,6 +207,8 @@ struct Inner {
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
+    launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
 }
 
 enum NativeOwnership {
@@ -182,7 +218,7 @@ enum NativeOwnership {
         crate::daemon::holder_registry::Process,
     ),
 }
-impl Handle {
+impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,
@@ -258,12 +294,56 @@ impl Handle {
     }
 
     fn start_inner(
+        spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        session_id: Option<String>,
+        ownership: Option<NativeOwnership>,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::start_with_scope(
+            spec, adapter, initial, store, session_id, ownership, None, notify,
+        )
+    }
+
+    /// The helper captures its immutable physical account before spawning.
+    pub(super) fn start_retained(
+        spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        source: super::Session,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        if source.launch.provider != crate::agent::Provider::Claude {
+            return Err("Retained stream actors require Claude".into());
+        }
+        let scope = crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider,
+            &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        )?;
+        Self::start_with_scope(
+            spec,
+            adapter,
+            initial,
+            store,
+            source.launch.session_id,
+            None,
+            Some(scope),
+            notify,
+        )
+    }
+
+    fn start_with_scope(
         mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
+        launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -311,6 +391,7 @@ impl Handle {
         };
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
+        let provider_process = Arc::new(Mutex::new(None));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -367,6 +448,10 @@ impl Handle {
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
+            provider_process: provider_process.clone(),
+            launch_account_scope: launch_account_scope
+                .clone()
+                .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -377,6 +462,7 @@ impl Handle {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
+                    launch_account_scope,
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
@@ -433,6 +519,17 @@ impl Handle {
                         } else {
                             spawn_provider(&spec, &actor.stop)
                         };
+                        let child = child.and_then(|child| {
+                            if let Some(child) = &child {
+                                *provider_process.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+                                    crate::daemon::holder_registry::Process::read(
+                                        child.child.id() as i32
+                                    )
+                                    .map_err(|error| error.to_string())?,
+                                );
+                            }
+                            Ok(child)
+                        });
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {
@@ -572,11 +669,46 @@ impl Handle {
         }
         Ok(handle)
     }
+    pub(super) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
+        self.0
+            .provider_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+    pub(super) fn launch_account_scope(
+        &self,
+    ) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
+        self.0.launch_account_scope.as_ref().map_err(String::as_str)
+    }
+    /// Queue admission is bounded; only the helper owns waiting and receipts.
+    pub(super) fn enqueue_actor(
+        &self,
+        command: ActorCommand,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        if self.is_completed()
+            || self.0.draining.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+        {
+            return Err("Provider actor is no longer accepting commands".into());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0
+            .commands
+            .try_send((command, reply))
+            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+        self.wake();
+        Ok(response)
+    }
+
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command, false)
             .map_err(String::from)
     }
 
+    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
+        self.submit_command(None, command, false)
+    }
     /// Rechecks courier eligibility on the actor, immediately before preparing
     /// the prompt. A caller's earlier idle observation is only a hint. Refusal
     /// permits retry; an unacknowledged command may already have run.
@@ -1392,7 +1524,7 @@ impl Drop for Inner {
         }
     }
 }
-impl super::protocol::LaunchCleanup for Handle {
+impl super::protocol::LaunchCleanup for LocalHandle {
     fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
@@ -1675,6 +1807,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
@@ -2086,11 +2219,31 @@ impl Actor {
             let Ok((command, reply)) = self.incoming.try_recv() else {
                 break;
             };
+            let (command, effects) = match command {
+                ActorCommand::RetainedProvider {
+                    run,
+                    command,
+                    decline_only,
+                    effects,
+                } => (
+                    ActorCommand::Provider {
+                        run,
+                        command,
+                        decline_only,
+                    },
+                    Some(effects),
+                ),
+                command => (command, None),
+            };
+            let effects = InputEffects(effects);
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::RetainedProvider { .. } => {
+                    unreachable!("retained inputs normalized above")
+                }
                 ActorCommand::Provider {
                     run,
                     command,
@@ -2276,12 +2429,20 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            if authorizes_work
+                && let Some(scope) = &self.launch_account_scope
+                && let Err(error) = scope.revalidate()
+            {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
             };
             match prepared {
                 Ok(step) => {
+                    effects.possible();
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
                     }
@@ -3465,7 +3626,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
     let (send, receive) = crossbeam_channel::bounded(64);
-    let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
         if let Update::AttentionContext { evidence, content } = update {
             let _ = send.try_send((
                 evidence,
@@ -3601,7 +3762,7 @@ mod tests {
         let store = preflight(&spec, &mut initial).unwrap();
         let updates = Arc::new(Mutex::new(Vec::new()));
         let observed = updates.clone();
-        let handle = Handle::start(
+        let handle = LocalHandle::start(
             spec,
             Box::new(adapter),
             initial,
@@ -3783,7 +3944,7 @@ mod tests {
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
             let (send, receive) = crossbeam_channel::bounded(8);
-            let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
                 if let Update::AttentionContext { evidence, content } = update {
                     let _ = send.try_send((evidence, content));
                 }
@@ -3932,7 +4093,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = updates.send(update);
         })
         .unwrap();
@@ -4039,7 +4200,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
         let state = handle.0.state.lock().unwrap();
         let probe = handle.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4260,7 +4422,7 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(
+        let handle = LocalHandle::start(
             spec,
             Box::new(GatedPrompt {
                 entered: entered_tx,
@@ -4352,7 +4514,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
         assert_eq!(
             context.reconcile_cleanup().unwrap(),
@@ -4579,7 +4742,8 @@ mod tests {
         };
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
         assert_eq!(
             handle.check_update_readiness().unwrap(),
             UpdateReadiness::Idle
@@ -5421,7 +5585,7 @@ mod tests {
             let mut adapter: Box<dyn Adapter> = Box::new(HistoryFixture { attempts: 0 });
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
-            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
             until(&handle, |snapshot| snapshot.ready);
             for _ in 0..2 {
                 handle.command(Command::LoadEarlier).unwrap();
@@ -5487,7 +5651,7 @@ mod tests {
             })
         }
     }
-    fn until(handle: &Handle, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    fn until(handle: &LocalHandle, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = handle.snapshot(None).unwrap();
@@ -5559,7 +5723,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(CompletionFixture(0));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.ready);
         handle.command(Command::Refresh).unwrap();
         let working = handle.snapshot(None).unwrap();
@@ -5692,7 +5856,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(NotificationFixture(0));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.ready);
         handle.command(Command::Refresh).unwrap();
         let response = handle.notification_content(crate::notifications::Kind::Succeeded);
@@ -5808,7 +5972,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (send, receive) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             if let Update::AttentionContext { evidence, .. } = update {
                 let _ = send.try_send(evidence);
             }
@@ -5882,7 +6046,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Updates);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let baseline = until(&handle, |snapshot| snapshot.ready);
         let fixed = baseline.items[0].clone();
         let id = crate::model::TerminalId::new();
@@ -5951,7 +6115,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         let ItemContent::Text { text, .. } = &snapshot.items[0].content else {
             panic!("environment fixture did not return text");
@@ -5981,7 +6145,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         assert!(
             matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
@@ -6042,7 +6206,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         assert!(
             matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
@@ -6081,7 +6245,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(
             snapshot
@@ -6137,7 +6302,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Reporter);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let generation = |handle: &Handle| {
+        let generation = |handle: &LocalHandle| {
             handle
                 .0
                 .state
@@ -6146,7 +6311,7 @@ mod tests {
                 .generation
         };
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6220,9 +6385,9 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(WholeTurn(crate::model::RunId::new()));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let (started, actor) = crossbeam_channel::bounded::<Handle>(1);
+        let (started, actor) = crossbeam_channel::bounded::<LocalHandle>(1);
         let (observe, observed) = crossbeam_channel::bounded(1);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             if let Update::Execution {
                 update: crate::agent_execution::Update::Finished { .. },
                 ..
@@ -6259,7 +6424,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6448,7 +6613,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6485,6 +6650,7 @@ mod tests {
                 | Update::AttentionContext { .. }
                 | Update::Ready
                 | Update::PromptAvailable
+                | Update::RetainedOutcomes
                 | Update::Execution { .. } => None,
             })
             .collect();
@@ -6545,7 +6711,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(snapshot.error.is_some());
         assert!(snapshot.items.is_empty());
@@ -6574,7 +6740,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(
             snapshot
@@ -6607,7 +6774,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.exited);
         handle.close().unwrap();
         // Model a panic after the worker published completion, such as a
@@ -7076,7 +7244,7 @@ mod tests {
         };
         let store = preflight(&spec, &mut initial).unwrap();
         let handle =
-            Handle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
+            LocalHandle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
@@ -7185,7 +7353,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(CacheFixture);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.exited);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
@@ -7330,4 +7498,9 @@ mod tests {
         assert_eq!(state.error, None);
         assert_eq!(state.items, retained);
     }
+}
+
+/// Explicit retained-helper dispatch after Rust runtime initialization.
+pub(crate) fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
+    retained_actor::transport::run_helper_if_requested()
 }

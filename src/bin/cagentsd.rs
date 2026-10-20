@@ -11,7 +11,17 @@ fn command() -> clap::Command {
 }
 
 fn main() -> std::process::ExitCode {
-    // SAFETY: first statement of main, before any thread exists. Every
+    if let Some(result) = cagents::host::run_retained_actor_helper() {
+        return match result {
+            // The startup owner treats this private status as proved teardown.
+            Ok(()) => std::process::ExitCode::from(73),
+            Err(error) => {
+                eprintln!("cagents retained actor: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    // SAFETY: helper mode returned above; no thread exists. Every
     // terminal and conversation this daemon starts inherits its environment.
     unsafe { cagents::account::detach_inherited_selections() };
     if let Some(result) = cagents::host::run_upgrade_inspection_helper() {

@@ -1,5 +1,8 @@
 #![cfg(feature = "host")]
 
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
+
 use serde_json::Value;
 use std::{
     fs,
@@ -15,6 +18,7 @@ use std::{
 struct Fixture {
     root: tempfile::TempDir,
     daemon: Child,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -66,7 +70,11 @@ impl Fixture {
             .stderr(log)
             .spawn()
             .unwrap();
-        let fixture = Self { root, daemon };
+        let fixture = Self {
+            root,
+            daemon,
+            agents: Default::default(),
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let output = fixture.output(&["daemon", "status"]);
@@ -106,7 +114,9 @@ impl Fixture {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        self.agents.observe(&output);
+        output
     }
 
     fn wait(&self, arguments: &[&str], expected_code: i32) -> Value {
@@ -133,16 +143,43 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Confirm only this isolated daemon's exact counted inventory. This
-        // also retires the provider if an assertion fails while it is waiting.
-        let preflight = self.output(&["daemon", "preflight"]);
-        if let Ok(value) = serde_json::from_slice::<Value>(&preflight.stdout)
-            && let Some(capability) = value["data"].get("capability")
-        {
-            let _ = self.output(&["daemon", "stop", "--confirm", &capability.to_string()]);
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
         }
-        let _ = self.daemon.kill();
+        // Daemon stop deliberately preserves retained actors. Only after all
+        // assertions, explicitly retire exact agents this private CLI accepted.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
+            }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
+            }
+        }
     }
 }
 

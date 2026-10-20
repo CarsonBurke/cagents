@@ -141,10 +141,105 @@ impl SourceClock {
     }
 }
 
+/// An exact recovery authenticated on one daemon stream and confirmed by its
+/// grant-bound attachment. This is deliberately neither serializable nor
+/// constructible from descriptors outside the handshake.
+#[derive(Clone, Debug)]
+pub(crate) struct UpgradeRecovery {
+    sessions: (Session, Session),
+    kind: UpgradeRecoveryKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UpgradeRecoveryKind {
+    Exact,
+    FirstIdentity,
+    BoundRetainedReset,
+}
+
+impl UpgradeRecovery {
+    /// Shape alone authorizes only an exact lineage query, never activation or
+    /// persistence. Only the authenticated handshake can produce a witness.
+    pub(crate) fn is_candidate(source: &Session, replacement: &Session) -> bool {
+        Self::candidate(source, replacement).is_some()
+    }
+
+    fn candidate(source: &Session, replacement: &Session) -> Option<UpgradeRecoveryKind> {
+        if super::is_upgrade_recovery(source, replacement) {
+            return Some(UpgradeRecoveryKind::Exact);
+        }
+        if super::is_upgrade_identity_learning(source, replacement) {
+            return Some(UpgradeRecoveryKind::FirstIdentity);
+        }
+        if !matches!(
+            source.native_continuity,
+            super::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !source.has_valid_native_continuity()
+            || source.launch.session_id.is_none()
+            || replacement.launch.session_id.is_none()
+            || source.launch.session_id == replacement.launch.session_id
+        {
+            return None;
+        }
+        // Shape validation alone grants no authority. The HOST must resolve
+        // the exact issued alias and bind this stream's attachment to that
+        // helper, including its actor identity and attachment epoch.
+        let mut normalized = source.clone();
+        normalized.launch.session_id = replacement.launch.session_id.clone();
+        super::is_upgrade_recovery(&normalized, replacement)
+            .then_some(UpgradeRecoveryKind::BoundRetainedReset)
+    }
+
+    fn confirmed(
+        source: Session,
+        replacement: Session,
+        attached: &Session,
+        snapshot: &Snapshot,
+    ) -> Result<Self, StartFailure> {
+        if attached != &replacement || snapshot.session_id != replacement.launch.session_id {
+            return Err(
+                "The attached conversation did not confirm the daemon's exact upgrade replacement"
+                    .into(),
+            );
+        }
+        let kind = Self::candidate(&source, &replacement)
+            .ok_or("The authenticated upgrade changed the saved conversation configuration")?;
+        Ok(Self {
+            sessions: (source, replacement),
+            kind,
+        })
+    }
+
+    pub(crate) fn source(&self) -> &Session {
+        &self.sessions.0
+    }
+    pub(crate) fn replacement(&self) -> &Session {
+        &self.sessions.1
+    }
+
+    pub(crate) fn validate(&self) -> bool {
+        matches!(
+            (
+                self.kind,
+                Self::candidate(self.source(), self.replacement())
+            ),
+            (UpgradeRecoveryKind::Exact, Some(UpgradeRecoveryKind::Exact))
+                | (
+                    UpgradeRecoveryKind::FirstIdentity,
+                    Some(UpgradeRecoveryKind::FirstIdentity)
+                )
+                | (
+                    UpgradeRecoveryKind::BoundRetainedReset,
+                    Some(UpgradeRecoveryKind::BoundRetainedReset)
+                )
+        )
+    }
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
-    upgrade_recovery: Option<(Session, Session)>,
+    upgrade_recovery: Option<UpgradeRecovery>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -511,9 +606,7 @@ fn restore(
                     && restored.launch.provider == session.launch.provider =>
             {
                 if session != restored {
-                    if !(super::is_upgrade_recovery(&session, &restored)
-                        || super::is_upgrade_identity_learning(&session, &restored))
-                    {
+                    if UpgradeRecovery::candidate(&session, &restored).is_none() {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
                     *upgrade_recovery = Some((session, restored.clone()));
@@ -532,10 +625,7 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
-    if matches!(
-        session.native_continuity,
-        super::NativeContinuity::Durable { .. }
-    ) {
+    if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
@@ -624,7 +714,10 @@ impl ClientHandle {
         let mut handle = Self::fixture(session.clone(), snapshot);
         let inner = Arc::get_mut(&mut handle.inner).unwrap();
         inner.proof = proof;
-        inner.upgrade_recovery = Some((source, session));
+        inner.upgrade_recovery = Some(UpgradeRecovery {
+            sessions: (source, session),
+            kind: UpgradeRecoveryKind::Exact,
+        });
         handle
     }
 
@@ -826,9 +919,7 @@ impl ClientHandle {
         expected: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        if !(super::is_upgrade_recovery(&source, &expected)
-            || super::is_upgrade_identity_learning(&source, &expected))
-        {
+        if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
         let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -930,8 +1021,7 @@ impl ClientHandle {
                 || terminate_source
                 || selection.is_some()
                 || account_recovery.is_some()
-                || !(super::is_upgrade_recovery(&session, expected)
-                    || super::is_upgrade_identity_learning(&session, expected)))
+                || UpgradeRecovery::candidate(&session, expected).is_none())
         {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
@@ -1120,14 +1210,11 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
-        if let Some((_, resolved)) = &upgrade_recovery
-            && (&session != resolved || initial.session_id != resolved.launch.session_id)
-        {
-            return Err(
-                "The attached conversation did not confirm the daemon's exact upgrade replacement"
-                    .into(),
-            );
-        }
+        let upgrade_recovery = upgrade_recovery
+            .map(|(source, resolved)| {
+                UpgradeRecovery::confirmed(source, resolved, &session, &initial)
+            })
+            .transpose()?;
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
@@ -1287,6 +1374,9 @@ impl ClientHandle {
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
                     let _ = reply.try_send(result);
+                    // Request-specific command failures are delivered to the
+                    // caller; they do not make presentation unavailable.
+                    continue;
                 }
                 match envelope.message {
                     ServerMessage::ChatChanged { chat_id } if chat_id == id && visible.load(Ordering::Acquire) => {
@@ -1343,7 +1433,13 @@ impl ClientHandle {
                     ServerMessage::Error(error) => {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                        Arc::make_mut(&mut state).error = Some(error.message);
+                        {
+                            let snapshot = Arc::make_mut(&mut state);
+                            if error.code == ipc::ProtocolErrorCode::TerminalUnavailable {
+                                snapshot.ready = false;
+                            }
+                            snapshot.error = Some(error.message);
+                        }
                         drop(state); wake(Wake::Changed);
                     },
                     ServerMessage::HostShuttingDown => break "Chat daemon is shutting down".into(),
@@ -1402,6 +1498,12 @@ impl ClientHandle {
         session
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+        self.inner
+            .upgrade_recovery
+            .as_ref()
+            .map(|recovery| &recovery.sessions)
+    }
+    pub(crate) fn authenticated_upgrade_recovery(&self) -> Option<&UpgradeRecovery> {
         self.inner.upgrade_recovery.as_ref()
     }
     pub(crate) fn is_connected(&self) -> bool {
@@ -3097,6 +3199,108 @@ mod tests {
     }
 
     #[test]
+    fn retained_reset_candidates_reject_changed_configuration_before_attach() {
+        let live = host_proof("live");
+        let mut source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.recipe.program = "claude".into();
+        source.native_continuity =
+            super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        let mut resolved = source.clone();
+        resolved.proof = Some(live.clone());
+        resolved.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        for mutation in 0..9 {
+            let mut changed = resolved.clone();
+            match mutation {
+                0 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                1 => changed.launch.recipe.working_directory = "/other-project".into(),
+                2 => changed.launch.recipe.program = "other-provider".into(),
+                3 => changed.launch.recipe.arguments.push("--other-model".into()),
+                4 => changed.launch.provider = crate::agent::Provider::Omp,
+                5 => {
+                    changed.native_continuity =
+                        super::super::NativeContinuity::RetainedClaudeActor { protocol: 1 }
+                }
+                6 => changed.launch.session_id = Some("invalid-uuid".into()),
+                7 => changed.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                _ => changed.id = TerminalId::new(),
+            }
+            let (outcome, _, candidate) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved { session: changed },
+                },
+            );
+            assert!(outcome.is_err(), "mutation {mutation}");
+            assert!(
+                candidate.is_none(),
+                "invalid resolution cannot become a recovery candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_reset_witness_requires_exact_attachment_and_snapshot_confirmation() {
+        for mismatch in 0..3 {
+            let mut source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.native_continuity =
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let mut resolved = source.clone();
+            resolved.proof = Some(host_proof("live"));
+            resolved.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+            assert!(!super::super::is_upgrade_recovery(&source, &resolved));
+            assert!(!super::super::is_upgrade_identity_learning(
+                &source, &resolved
+            ));
+            let result =
+                restore_with_lineage(source.clone(), Some(resolved.clone()), move |request| {
+                    let ClientRequest::ChatAttach { mut session } = request else {
+                        panic!("resolved recovery must attach without starting");
+                    };
+                    let mut snapshot = Snapshot {
+                        session_id: session.launch.session_id.clone(),
+                        ..Default::default()
+                    };
+                    match mismatch {
+                        1 => {
+                            session
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                        }
+                        2 => snapshot.session_id = Some(CONVERSATION.into()),
+                        _ => {}
+                    }
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached { session, snapshot },
+                    }
+                });
+            if mismatch == 0 {
+                let handle = result.unwrap();
+                let witness = handle.authenticated_upgrade_recovery().unwrap();
+                assert_eq!(witness.source(), &source);
+                assert_eq!(witness.replacement(), &resolved);
+                assert!(matches!(
+                    witness.kind,
+                    UpgradeRecoveryKind::BoundRetainedReset
+                ));
+            } else {
+                assert!(result.is_err(), "mismatch {mismatch}");
+            }
+        }
+    }
+
+    #[test]
     fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
         for mismatch in 0..3 {
             let source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
@@ -4078,5 +4282,216 @@ mod tests {
         for server in servers {
             server.join().unwrap();
         }
+    }
+    #[test]
+    fn retained_claude_pre_id_restore_records_authenticated_writer_lineage() {
+        for learned in [false, true] {
+            let mut source = omp_card(None, Some(host_proof("prior")));
+            source.launch.provider = crate::agent::Provider::Claude;
+            source.launch.recipe.program = "claude".into();
+            source.native_continuity =
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let mut resolved = source.clone();
+            resolved.proof = Some(host_proof("live"));
+            resolved.launch.session_id = learned.then(|| CONVERSATION.into());
+            let handle = restore_with_lineage(source.clone(), Some(resolved.clone()), |request| {
+                let ClientRequest::ChatAttach { session } = request else {
+                    panic!("retained recovery must attach without starting");
+                };
+                let snapshot = Snapshot {
+                    session_id: session.launch.session_id.clone(),
+                    ..Default::default()
+                };
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached { session, snapshot },
+                }
+            })
+            .unwrap();
+            assert_eq!(handle.upgrade_recovery(), Some(&(source, resolved)));
+        }
+    }
+    #[test]
+    fn unavailable_presentation_disables_readiness_but_preserves_body_and_copy_authority() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (released, release) = std::sync::mpsc::channel();
+        let (changed, changes) = std::sync::mpsc::channel();
+        let session = omp_card(Some(CONVERSATION), Some(host_proof("presentation")));
+        let source = session.clone();
+        let body = Arc::new(super::super::Item {
+            id: "retained-body".into(),
+            role: super::super::Role::Assistant,
+            content: super::super::ItemContent::Text {
+                text: "Preserved private answer λ".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let initial = Snapshot {
+            generation: 7,
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            items: vec![body.clone()],
+            text_copy_sources: super::super::TextCopySources {
+                conversation_revision: 3,
+                conversation: vec![Some(text_copy_source(11, 28))],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let before = initial.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("presentation");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(start.request, ClientRequest::ChatStart { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(command.request, ClientRequest::ChatCommand { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(command.request_id),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "one command was refused",
+                    true,
+                )),
+            );
+            let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                visible.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(visible.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id: source.id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(7),
+                    ..
+                }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "retained presentation is unavailable",
+                    true,
+                )),
+            );
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            source.clone(),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                if matches!(wake, Wake::Changed) {
+                    let _ = changed.send(());
+                }
+            },
+        )
+        .unwrap();
+        let decoded_body = handle.snapshot().items[0].clone();
+        assert_eq!(
+            handle.send(Command::Refresh).unwrap_err(),
+            "one command was refused"
+        );
+        assert!(
+            handle.snapshot().ready,
+            "request-specific refusal must not disable presentation"
+        );
+        assert_eq!(handle.snapshot().error, None);
+        handle.set_visible(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let after = loop {
+            let snapshot = handle.snapshot();
+            if !snapshot.ready
+                && snapshot.error.as_deref() == Some("retained presentation is unavailable")
+            {
+                break snapshot;
+            }
+            changes
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        };
+        assert!(!after.ready);
+        assert_eq!(
+            after.error.as_deref(),
+            Some("retained presentation is unavailable")
+        );
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.items, before.items);
+        assert!(Arc::ptr_eq(&after.items[0], &decoded_body));
+        assert_eq!(after.text_copy_sources, before.text_copy_sources);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.exited, before.exited);
+        assert_eq!(handle.session(), source);
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        released.send(()).unwrap();
+        worker.join().unwrap();
     }
 }

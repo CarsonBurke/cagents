@@ -254,6 +254,14 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     arguments
 }
 
+/// An unavailable remote snapshot proves neither provider exit nor safe retry.
+fn provider_launch_snapshot(
+    handle: &chat::runtime::Handle,
+) -> Result<chat::Snapshot, (State, String)> {
+    handle.snapshot(None).ok_or_else(|| (State::Interrupted,
+        "The exact provider could not confirm startup; its ownership was preserved and the prompt was not resent".into()))
+}
+
 fn dispatch(
     host: &SharedHost,
     accepted: &Accepted,
@@ -459,7 +467,7 @@ fn dispatch(
     drop(_dispatch);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+        let snapshot = provider_launch_snapshot(&handle)?;
         if snapshot.exited || handle.is_completed() {
             return Err(before("Provider exited before accepting the prompt".into()));
         }
@@ -642,7 +650,7 @@ fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
 
-fn announce(host: &SharedHost, registry: &SharedRegistry) {
+pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
     let sequence = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -731,22 +739,14 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                     state
                         .chats
                         .get(&session.id)
-                        .map(|record| record.session.clone())
+                        .map(|record| {
+                            super::chat::CloseTarget::for_execution(&state, record, session)
+                        })
+                        .transpose()
+                        .map_err(|error| error.message)?
                 };
-                if let Some(current) = hosted {
-                    if current.proof != session.proof
-                        || current.launch.recipe != session.launch.recipe
-                    {
-                        return Err("The agent ownership changed before close; its successor was not stopped".into());
-                    }
-                    super::chat::process(
-                        host,
-                        EXECUTION_CLIENT,
-                        ClientRequest::ChatClose {
-                            chat_id: session.id,
-                        },
-                    )
-                    .map_err(|error| error.message)?;
+                if let Some(target) = hosted {
+                    super::chat::close_captured(host, target).map_err(|error| error.message)?;
                 } else {
                     let startup = host
                         .lock()
@@ -1013,10 +1013,16 @@ fn control(
                 action,
                 answers,
             };
+            let synchronization = super::chat::retained_actor::AnswerSync::capture(host, &handle)?;
             if run.state.is_terminal() {
                 handle.decline_answer(command)?;
             } else {
                 handle.command(command)?;
+            }
+            if let Some(synchronization) = synchronization {
+                synchronization.complete(host).map_err(|error| format!(
+                    "The answer was accepted, but its durable run state is unconfirmed: {error}. Do not repeat the answer."
+                ))?;
             }
             Some(request_id)
         }

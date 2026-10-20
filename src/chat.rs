@@ -491,6 +491,20 @@ pub enum NativeContinuity {
     Durable {
         provider_version: String,
     },
+    /// The exact Claude reducer, Store and pipes remain in an authenticated
+    /// helper, including before the provider reports a conversation ID.
+    RetainedClaudeActor {
+        protocol: u32,
+    },
+}
+
+impl NativeContinuity {
+    pub fn retains_provider(&self) -> bool {
+        matches!(
+            self,
+            Self::Durable { .. } | Self::RetainedClaudeActor { .. }
+        )
+    }
 }
 
 /// Account recovery changes only account selection. It never changes the
@@ -546,27 +560,35 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
         return false;
     };
+    let unnamed_retained = source.has_unnamed_retained_claude_actor()
+        && replacement.has_unnamed_retained_claude_actor();
     if !old.is_complete()
         || !new.is_complete()
         || old == new
         || source.id != replacement.id
         || source.launch.provider != replacement.launch.provider
         || source.launch.session_id != replacement.launch.session_id
+        || (matches!(
+            source.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ) && old.boot_id != new.boot_id)
         || !upgrade_recipe_matches(source, replacement)
         || source.owned_codex_listener != replacement.owned_codex_listener
         || (source.native_continuity != replacement.native_continuity
             && !matches!(source.native_continuity, NativeContinuity::ReconnectOnly))
         || !replacement.has_valid_native_continuity()
-        || !source
-            .launch
-            .session_id
-            .as_ref()
-            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
-        || !replacement
-            .launch
-            .session_id
-            .as_ref()
-            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+        || (!unnamed_retained
+            && !source
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty() && id.len() <= 1024))
+        || (!unnamed_retained
+            && !replacement
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty() && id.len() <= 1024))
     {
         return false;
     }
@@ -587,6 +609,10 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// It does not authorize an ordinary snapshot to change saved ownership.
 pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> bool {
     if source.launch.session_id.is_some()
+        || (matches!(
+            replacement.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ) && !source.has_unnamed_retained_claude_actor())
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
@@ -713,9 +739,38 @@ impl Session {
                 .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
     }
 
+    /// A typed descriptor shape, never proof of an authenticated live helper.
+    /// Adoption and persistence callers must also resolve its exact actor owner.
+    pub(crate) fn has_unnamed_retained_claude_actor(&self) -> bool {
+        self.launch.session_id.is_none()
+            && matches!(
+                self.native_continuity,
+                NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            && self.has_valid_native_continuity()
+            && std::path::Path::new(&self.launch.recipe.program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(Provider::Claude.executable())
+    }
+
     pub fn has_valid_native_continuity(&self) -> bool {
         match &self.native_continuity {
             NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::RetainedClaudeActor { protocol } => {
+                *protocol == 2
+                    && self.launch.provider == Provider::Claude
+                    && self.owned_codex_listener.is_none()
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self
+                        .launch
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
             NativeContinuity::Durable { provider_version } => {
                 self.owns_codex_listener()
                     && self
@@ -742,8 +797,9 @@ impl Session {
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
-        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+        previous.native_continuity.retains_provider()
             && self.native_continuity == previous.native_continuity
+            && previous.has_valid_native_continuity()
             && self.has_valid_native_continuity()
             && previous
                 .proof
@@ -2158,6 +2214,187 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+}
+
+#[cfg(test)]
+mod retained_native_pair_tests {
+    use super::*;
+    use crate::model::{
+        BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalContinuity, TerminalId,
+        TerminalSession,
+    };
+
+    fn live(proof: &HostSessionProof) -> TerminalContinuity {
+        TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        }
+    }
+
+    fn pair(confirmed: bool) -> (Session, Session) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("paired-host"),
+            boot_id: BootId::new("paired-boot"),
+            host_incarnation: HostIncarnation::new("old-daemon"),
+        };
+        let id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/paired-project".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let previous = Session {
+            id,
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: recipe.clone(),
+                session_id: confirmed.then(|| uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(proof.clone()),
+            terminal: Some(TerminalSession {
+                id,
+                launch: recipe,
+                continuity: live(&proof),
+                resume_hint: None,
+                transcript_path: None,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+            }),
+            owned_codex_listener: None,
+            native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        let mut successor = previous.clone();
+        successor.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("new-daemon");
+        successor.terminal.as_mut().unwrap().continuity = live(successor.proof.as_ref().unwrap());
+        (previous, successor)
+    }
+
+    #[test]
+    fn retained_pre_id_upgrade_learns_only_exact_confirmed_identity() {
+        let (source, mut replacement) = pair(false);
+        assert!(is_upgrade_recovery(&source, &replacement));
+        replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(is_upgrade_identity_learning(&source, &replacement));
+        for mutation in 0..9 {
+            let mut old = source.clone();
+            let mut new = replacement.clone();
+            match mutation {
+                0 => old.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => old.native_continuity = NativeContinuity::ReconnectOnly,
+                2 => {
+                    new.launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                3 => new.launch.recipe.arguments.push("--other-model".into()),
+                4 => new.proof = old.proof.clone(),
+                5 => new.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                6 => new.id = TerminalId::new(),
+                7 => new.launch.session_id = Some("invalid-provider-identity".into()),
+                _ => new.terminal.as_mut().unwrap().continuity = live(old.proof.as_ref().unwrap()),
+            }
+            assert!(
+                !is_upgrade_identity_learning(&old, &new),
+                "mutation {mutation}"
+            );
+        }
+        let mut known = source;
+        known.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(
+            !is_upgrade_recovery(&known, &replacement),
+            "two known IDs never prove a reset lineage"
+        );
+    }
+
+    #[test]
+    fn retained_claude_pair_accepts_only_exact_terminal_and_proof_rotation() {
+        for confirmed in [false, true] {
+            let (previous, successor) = pair(confirmed);
+            assert_ne!(previous.terminal, successor.terminal);
+            assert!(successor.retains_native_pair_from(&previous));
+            // Persistence independently checks the enclosing pane/provider/
+            // launch descriptor before consulting this terminal-only gate.
+            assert_eq!(previous.id, successor.id);
+            assert_eq!(previous.launch, successor.launch);
+            for mutation in 0..8 {
+                let mut changed = successor.clone();
+                match mutation {
+                    0 => changed.terminal = None,
+                    1 => changed.terminal.as_mut().unwrap().id = TerminalId::new(),
+                    2 => changed
+                        .terminal
+                        .as_mut()
+                        .unwrap()
+                        .launch
+                        .arguments
+                        .push("--different".into()),
+                    3 => {
+                        changed.terminal.as_mut().unwrap().launch.working_directory =
+                            "/other-project".into()
+                    }
+                    4 => {
+                        changed.terminal.as_mut().unwrap().owned_codex_listener =
+                            Some(OwnedCodexListener {
+                                socket: "/other/control.sock".into(),
+                                allocator: previous.proof.clone().unwrap(),
+                            })
+                    }
+                    5 => {
+                        changed.terminal.as_mut().unwrap().continuity =
+                            live(previous.proof.as_ref().unwrap())
+                    }
+                    6 => {
+                        changed.proof.as_mut().unwrap().boot_id = BootId::new("other-boot");
+                        changed.terminal.as_mut().unwrap().continuity =
+                            live(changed.proof.as_ref().unwrap());
+                    }
+                    _ => changed.native_continuity = NativeContinuity::ReconnectOnly,
+                }
+                assert!(
+                    !changed.retains_native_pair_from(&previous),
+                    "terminal mutation {mutation}, confirmed={confirmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_claude_pair_requires_valid_previous_and_current_actor_continuity() {
+        let (previous, successor) = pair(false);
+        for mutation in 0..6 {
+            let mut old = previous.clone();
+            let mut new = successor.clone();
+            match mutation {
+                0 => old.terminal = None,
+                1 => {
+                    old.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("");
+                    old.terminal.as_mut().unwrap().continuity = live(old.proof.as_ref().unwrap());
+                }
+                2 => old.terminal.as_mut().unwrap().continuity = live(new.proof.as_ref().unwrap()),
+                3 => {
+                    old.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 1 };
+                    new.native_continuity = old.native_continuity.clone();
+                }
+                4 => {
+                    new.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("");
+                    new.terminal.as_mut().unwrap().continuity = live(new.proof.as_ref().unwrap());
+                }
+                _ => {
+                    old.launch.provider = Provider::Codex;
+                    new.launch.provider = Provider::Codex;
+                }
+            }
+            assert!(
+                !new.retains_native_pair_from(&old),
+                "continuity mutation {mutation}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

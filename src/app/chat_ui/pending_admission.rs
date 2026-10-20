@@ -162,6 +162,43 @@ impl Cagents {
             )
     }
 
+    /// An authoritative upgrade can arrive before or during an ordinary
+    /// reconnect. Keep the live Content owner, but admit the canonical target
+    /// through the same exact lineage and durable checkpoint as a cached pane.
+    pub(in crate::app) fn prepare_shared_chat_upgrade(
+        &mut self,
+        pane: &crate::workspace_model::views::Pane,
+    ) {
+        let CardKind::Chat(canonical) = &pane.kind else {
+            return;
+        };
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&pane.id) else {
+            return;
+        };
+        if runtime.awaiting_admission()
+            || !chat::client::UpgradeRecovery::is_candidate(&runtime.session, canonical)
+            || self.chat_ui.phases.get(&pane.id).is_some_and(|phase| {
+                !matches!(phase, Phase::Starting(attempt)
+                    if attempt.session == runtime.session
+                        && attempt.recovery.is_none()
+                        && attempt.upgrade_admission.is_none())
+            })
+        {
+            return;
+        }
+        let source = runtime.session.clone();
+        // This only supersedes an ordinary attachment to this exact source.
+        // Its late Ready detaches; it must not retire the shared actor or send
+        // the unsent Content. Returning/closing/account recovery keep ownership.
+        self.chat_ui.phases.remove(&pane.id);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&pane.id) {
+            runtime.connection = Connection::AwaitingAdmission;
+        }
+        Arc::make_mut(&mut self.durable)
+            .pending_chat_admissions
+            .insert(pane.id, source);
+    }
+
     pub(in crate::app) fn admit_shared_chat(
         &mut self,
         pane: &crate::workspace_model::views::Pane,
@@ -187,8 +224,7 @@ impl Cagents {
         assert!(runtime.awaiting_admission());
         if resolve_upgrade
             && let CardKind::Chat(canonical) = &pane.kind
-            && (chat::is_upgrade_recovery(&runtime.session, canonical)
-                || chat::is_upgrade_identity_learning(&runtime.session, canonical))
+            && chat::client::UpgradeRecovery::is_candidate(&runtime.session, canonical)
         {
             // Similar descriptors are only candidates. Resolve the old source
             // on the authenticated connection and attach this exact target;
