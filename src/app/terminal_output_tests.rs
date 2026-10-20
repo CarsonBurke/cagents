@@ -4,8 +4,8 @@ use crate::terminal::{
     RenderSnapshot,
     ipc::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-        ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, TerminalSnapshot,
-        WireTerminalEvent, write_frame,
+        ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage, ServerResponse,
+        TerminalDescriptor, TerminalSnapshot, WireTerminalEvent, write_frame,
     },
 };
 use std::{
@@ -107,15 +107,27 @@ impl Peer {
                     }
                     Err(error) => panic!("private decode: {error}"),
                 };
-                let response = if !connected {
+                let message = if !connected {
                     assert!(matches!(request.request, ClientRequest::Connect { .. }));
                     connected = true;
-                    ServerResponse::Connected {
-                        proof: proof.clone(),
-                        resumed: vec![descriptor.clone()],
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![descriptor.clone()],
+                        },
                     }
+                } else if matches!(request.request, ClientRequest::CopyTerminalSelection { .. }) {
+                    // Control errors carry the request ID. The hosted client
+                    // restores the exact pending operation before UI delivery.
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "fixture copy refused",
+                        false,
+                    ))
                 } else {
-                    ServerResponse::Accepted
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
                 };
                 if write_frame(
                     &mut stream,
@@ -123,7 +135,7 @@ impl Peer {
                         version: PROTOCOL_VERSION,
                         request_id: Some(request.request_id),
                         proof: proof.clone(),
-                        message: ServerMessage::Response { response },
+                        message,
                     },
                 )
                 .is_err()
@@ -376,17 +388,33 @@ fn root_exit_keeps_the_live_descendant_surface_and_controls() {
 
 #[test]
 fn terminal_control_failure_reports_a_notice_and_clears_pending_copy() {
-    let (mut app, card, mut peer) = fixture();
-    app.terminal_find.entry(card).or_default().pending_copy = Some(uuid::Uuid::new_v4());
-    apply(
-        &mut app,
+    let (mut app, card, peer) = fixture();
+    let request = uuid::Uuid::new_v4();
+    app.terminal_find.entry(card).or_default().pending_copy = Some(request);
+    peer.handle
+        .copy_selection(
+            request,
+            crate::terminal::SearchMatch {
+                start_row: 0,
+                start_column: 0,
+                end_row: 0,
+                end_column: 1,
+            },
+        )
+        .unwrap();
+    let events = peer.handle.events();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while events.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "actual failed Copy request reply"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(app.update(Message::TerminalWake {
         card,
-        &mut peer,
-        Some(WireTerminalEvent::Error {
-            operation: "copy terminal selection".into(),
-            message: "fixture copy refused".into(),
-        }),
-    );
+        generation: peer.handle.generation(),
+    }));
     assert_eq!(counts(), (1, 1));
     assert_eq!(app.terminal_find[&card].pending_copy, None);
     assert!(
