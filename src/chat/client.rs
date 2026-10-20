@@ -3813,6 +3813,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             move |wake| {
                 let _ = wake_tx.send(wake);
             },
@@ -4138,6 +4139,7 @@ mod tests {
             Intent::Start,
             None,
             false,
+            None,
             None,
             None,
             move |wake| {
@@ -4685,6 +4687,7 @@ mod tests {
         let wire = Mutex::new(Wire {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
+            body_requested: Arc::new(AtomicBool::new(true)),
         });
         let _held = wire.lock().unwrap();
         let error = transmit_text_copy(
