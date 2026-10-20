@@ -279,6 +279,9 @@ impl Registry {
                 }
                 changed = agent.session.as_ref() != Some(successor);
                 agent.session = Some(successor.clone());
+                changed |= super::views::adopt_authenticated_agent_pane(
+                    &tx, agent.id, retained, successor,
+                )?;
                 tx.execute(
                     "UPDATE agents SET record = ?2 WHERE id = ?1",
                     params![agent.id.to_string(), encode(&agent)?],

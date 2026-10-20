@@ -739,6 +739,90 @@ fn owner(db: &Connection, id: crate::model::CardId) -> Result<Option<Scope>, Str
     .map(|id| parse_scope(&id))
     .transpose()
 }
+
+/// Rotate an existing canonical pane with its authenticated holder, before the
+/// new Agent descriptor becomes visible. A stale or replaced pane is evidence
+/// to preserve, not permission to insert a pane or discover another alias.
+pub(super) fn adopt_authenticated_agent_pane(
+    db: &Connection,
+    agent: crate::model::AgentId,
+    retained: &[crate::agent_execution::HostedSession],
+    successor: &crate::agent_execution::HostedSession,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let id = crate::model::CardId::from_uuid(agent.as_uuid());
+    let Some(scope) = owner(db, id)? else {
+        return Ok(false);
+    };
+    let mut view = read(db, &scope)?;
+    if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
+        return Ok(false);
+    }
+    let pane = view.panes.iter_mut().find(|pane| pane.id == id).unwrap();
+    let replacement = match (&pane.kind, successor) {
+        (CardKind::Chat(current), HostedSession::Chat(next))
+            if retained.contains(&HostedSession::Chat(current.clone()))
+                && (crate::chat::is_upgrade_recovery(current, next)
+                    || crate::chat::is_upgrade_identity_learning(current, next)) =>
+        {
+            CardKind::Chat(next.clone())
+        }
+        (CardKind::Terminal(current), _) => {
+            let terminal = |source: &HostedSession| match source {
+                HostedSession::Terminal(session) => Some(session.clone()),
+                HostedSession::Chat(session) => session.terminal.clone(),
+            };
+            let Some(next) = terminal(successor) else {
+                return Ok(false);
+            };
+            if !retained.iter().any(|source| {
+                terminal(source).as_ref() == Some(current)
+                    && match (source, successor) {
+                        (HostedSession::Terminal(_), HostedSession::Terminal(_)) => true,
+                        (HostedSession::Chat(old), HostedSession::Chat(next)) => {
+                            crate::chat::is_upgrade_recovery(old, next)
+                                || crate::chat::is_upgrade_identity_learning(old, next)
+                        }
+                        _ => false,
+                    }
+            }) || !current
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete())
+                || !next
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+            {
+                return Ok(false);
+            }
+            CardKind::Terminal(next)
+        }
+        _ => return Ok(false),
+    };
+    if pane.kind == replacement {
+        return Ok(false);
+    }
+    pane.kind = replacement;
+    view.revision = view
+        .revision
+        .checked_add(1)
+        .ok_or("view revision exhausted")?;
+    // Holder continuity does not start a new channel naming choice, including
+    // learning a previously unobserved provider thread. Preserve all placement,
+    // presentation, retirement and naming state outside the descriptor itself.
+    db.execute(
+        "UPDATE shared_views SET revision=?2, panes=?3 WHERE scope=?1",
+        params![
+            key(&scope)?,
+            view.revision,
+            serde_json::to_string(&view.panes).map_err(|error| error.to_string())?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 fn write(db: &Connection, view: &View) -> Result<(), String> {
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
