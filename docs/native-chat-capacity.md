@@ -25,9 +25,10 @@ change the limit. If the atomic replacement succeeds but directory syncing fails
 the new limit takes effect and the CLI reports a durability warning.
 
 Cooperative upgrades and retained recovery inventories use the same 4096-chat
-ceiling, regardless of the current admission preference. Lowering the preference
-therefore does not prevent recovery of existing chats. The checkpoint and each
-recovery evidence file still have an 8 MiB limit; source inspection retains its
+ceiling for stored inventory. Recovery still obeys the destination admission
+preference when it creates resident handles; set that preference high enough
+for the inventory being restored. The checkpoint and each recovery evidence
+file still have an 8 MiB limit; source inspection retains its
 4 MiB response limit and 30-second deadline. Large launch environments or long
 recovery lineages can exceed these byte budgets before reaching the count limit.
 An oversized checkpoint refuses the upgrade before stopping source owners; an
