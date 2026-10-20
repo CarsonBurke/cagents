@@ -20357,7 +20357,8 @@ mod tests {
                 .unwrap();
             let fault = rusqlite::Connection::open(directory.path().join("state.sqlite3")).unwrap();
             if refused {
-                fault.execute_batch("CREATE TRIGGER refuse_upgrade BEFORE UPDATE OF content_json ON cards BEGIN SELECT RAISE(ABORT, 'fixture refused upgraded identity'); END;").unwrap();
+                // Refuse the identity CAS while allowing the unchanged old-source title autosave.
+                fault.execute_batch("CREATE TRIGGER refuse_upgrade BEFORE UPDATE OF content_json ON cards WHEN NEW.content_json != OLD.content_json BEGIN SELECT RAISE(ABORT, 'fixture refused upgraded identity'); END;").unwrap();
             }
             let mut replacement = source.clone();
             replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
