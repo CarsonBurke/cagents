@@ -20351,7 +20351,7 @@ mod tests {
         app.sidebar_model.projects.push(
             crate::sidebar::SidebarProject::new(
                 project,
-                crate::model::RepositoryId::new(),
+                crate::repository::RepositoryId::new(),
                 "Recovery fixture".into(),
                 repository.clone(),
                 Vec::new(),
