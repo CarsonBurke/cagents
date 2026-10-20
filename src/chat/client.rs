@@ -158,6 +158,12 @@ enum UpgradeRecoveryKind {
 }
 
 impl UpgradeRecovery {
+    /// Shape alone authorizes only an exact lineage query, never activation or
+    /// persistence. Only the authenticated handshake can produce a witness.
+    pub(crate) fn is_candidate(source: &Session, replacement: &Session) -> bool {
+        Self::candidate(source, replacement).is_some()
+    }
+
     fn candidate(source: &Session, replacement: &Session) -> Option<UpgradeRecoveryKind> {
         if super::is_upgrade_recovery(source, replacement) {
             return Some(UpgradeRecoveryKind::Exact);

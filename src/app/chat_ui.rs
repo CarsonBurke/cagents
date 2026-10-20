@@ -7483,6 +7483,9 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::Reconnect(target) => {
+                if self.chat_start_pending(target.card) {
+                    return Task::none();
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -20301,6 +20304,10 @@ mod tests {
     }
 
     fn live_shared_recovery_fixture() -> LiveSharedRecovery {
+        live_shared_recovery_fixture_for_identity(Some(KNOWN_THREAD))
+    }
+
+    fn live_shared_recovery_fixture_for_identity(session_id: Option<&str>) -> LiveSharedRecovery {
         use crate::model::{ChannelId, ProjectChannel, ProjectId, ProjectKind, ProjectState};
         use crate::workspace_model::{
             ModelChannel, ModelProject, WorkspaceModel,
@@ -20311,6 +20318,7 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let mut source = chat_runtime(&app, card).session.clone();
         source.launch.provider = Provider::Claude;
+        source.launch.session_id = session_id.map(str::to_owned);
         source.launch.recipe.program = "claude".into();
         source.launch.recipe.arguments.clear();
         source.launch.recipe.environment.clear();
@@ -20488,7 +20496,10 @@ mod tests {
     }
 
     fn exercise_live_shared_recovery(reconnect_first: bool) {
-        let mut f = live_shared_recovery_fixture();
+        exercise_live_shared_recovery_fixture(live_shared_recovery_fixture(), reconnect_first);
+    }
+
+    fn exercise_live_shared_recovery_fixture(mut f: LiveSharedRecovery, reconnect_first: bool) {
         let old_attempt = reconnect_first.then(|| {
             drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
             f.app.chat_ui.attempt(f.card).unwrap().target
@@ -20648,6 +20659,370 @@ mod tests {
     fn retained_live_model_upgrade_supersedes_inflight_ordinary_reconnect_without_replaying_draft()
     {
         exercise_live_shared_recovery(true);
+    }
+
+    fn live_shared_recovery_handle(f: &LiveSharedRecovery) -> Arc<ClientHandle> {
+        Arc::new(
+            ClientHandle::fixture_upgrade_handshake(
+                f.source.clone(),
+                f.canonical.clone(),
+                Snapshot {
+                    session_id: f.canonical.launch.session_id.clone(),
+                    ready: true,
+                    ..Snapshot::default()
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn project_live_shared_recovery(f: &mut LiveSharedRecovery) -> Target {
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        let attempt = f
+            .app
+            .chat_ui
+            .attempt(f.card)
+            .expect("strict canonical admission");
+        assert_eq!(attempt.upgrade_admission.as_ref(), Some(&f.canonical));
+        attempt.target
+    }
+
+    fn assert_inert_live_recovery_copy(f: &LiveSharedRecovery) {
+        let (copy, runtime) = f
+            .app
+            .cards
+            .iter()
+            .find_map(|(card, value)| match value {
+                CardRuntime::Chat(runtime)
+                    if (&**runtime as *const Runtime as usize) == f.allocation =>
+                {
+                    Some((*card, &**runtime))
+                }
+                _ => None,
+            })
+            .expect("the original Content owner must remain reachable");
+        assert_ne!(copy, f.card);
+        assert_eq!(runtime.session, f.source);
+        assert!(runtime.awaiting_admission());
+        assert_eq!(runtime.composer.text(), f.draft);
+        assert_eq!(runtime.composer.cursor(), f.cursor);
+        assert_eq!(runtime.composer.selection(), f.selection);
+        assert!(runtime.queued.is_none() && runtime.followups.is_empty());
+        assert_eq!(
+            f.app.card_state(copy).unwrap().kind,
+            CardKind::Chat(f.source.clone())
+        );
+        assert!(f.app.durable.local_only_cards.contains(&copy));
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_first_identity_and_bound_reset_require_the_same_exact_checkpoint()
+     {
+        for first_identity in [true, false] {
+            let mut f = live_shared_recovery_fixture_for_identity(
+                (!first_identity).then_some(KNOWN_THREAD),
+            );
+            f.canonical.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+            assert!(chat::client::UpgradeRecovery::is_candidate(
+                &f.source,
+                &f.canonical
+            ));
+            assert!(!chat::is_upgrade_recovery(&f.source, &f.canonical));
+            if !first_identity {
+                assert!(!chat::is_upgrade_identity_learning(&f.source, &f.canonical));
+            }
+            assert!(
+                f.app
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .rebind_chat_upgrade(f.card, &f.source, &f.canonical)
+                    .is_err(),
+                "raw descriptors never authorize a retained transition"
+            );
+            exercise_live_shared_recovery_fixture(f, false);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_handles() {
+        for case in [
+            "unproved",
+            "writer refusal",
+            "newer canonical before Ready",
+            "newer canonical before writer ACK",
+        ] {
+            let mut f = live_shared_recovery_fixture();
+            let target = project_live_shared_recovery(&mut f);
+            let fault =
+                rusqlite::Connection::open(f._directory.path().join("state.sqlite3")).unwrap();
+            if case == "writer refusal" {
+                fault.execute_batch("CREATE TRIGGER refuse_recovery BEFORE UPDATE OF content_json ON cards WHEN NEW.content_json != OLD.content_json BEGIN SELECT RAISE(ABORT, 'fixture refused recovery'); END;").unwrap();
+            }
+            let handle = if case == "unproved" {
+                Arc::new(ClientHandle::fixture(
+                    f.canonical.clone(),
+                    Snapshot {
+                        session_id: f.canonical.launch.session_id.clone(),
+                        ready: true,
+                        ..Snapshot::default()
+                    },
+                ))
+            } else {
+                live_shared_recovery_handle(&f)
+            };
+            let mut newer = f.model.clone();
+            newer.sequence += 1;
+            newer.views[0].revision += 1;
+            let CardKind::Chat(next) = &mut newer.views[0].panes[0].kind else {
+                unreachable!()
+            };
+            next.proof.as_mut().unwrap().host_incarnation = "still-newer-daemon".into();
+            if case == "newer canonical before Ready" {
+                drop(f.app.update(Message::WorkspaceModelObserved(
+                    super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
+                )));
+            }
+            let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            if case == "unproved" {
+                assert!(cosmic::iced::runtime::task::into_stream(checkpoint).is_none());
+                assert_live_recovery_content(&f);
+                assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
+                assert!(!chat_runtime(&f.app, f.card).connected());
+            } else if case == "newer canonical before Ready" {
+                assert!(cosmic::iced::runtime::task::into_stream(checkpoint).is_none());
+                assert_inert_live_recovery_copy(&f);
+            } else {
+                let receipt = account_commit_reply(checkpoint);
+                if case == "writer refusal" {
+                    assert!(
+                        matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("fixture refused recovery"))
+                    );
+                    fault
+                        .execute_batch("DROP TRIGGER refuse_recovery;")
+                        .unwrap();
+                } else {
+                    assert!(matches!(
+                        &receipt,
+                        Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+                    ));
+                    drop(f.app.update(Message::WorkspaceModelObserved(
+                        super::super::workspace_model_sync::ModelUpdate::Read(newer),
+                    )));
+                }
+                drop(f.app.update(receipt));
+                assert_inert_live_recovery_copy(&f);
+            }
+            assert!(!f.app.chat_start_pending(f.card));
+            assert!(
+                f.app.chat_ui.retiring.is_empty() && f.app.chat_ui.abandoned.is_empty(),
+                "failed admission only detaches; shared actors are never retired/restarted"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners() {
+        for owner in ["account", "return", "close", "other source"] {
+            let mut f = live_shared_recovery_fixture();
+            let target = f.app.chat_ui.next_target(f.card);
+            let phase = match owner {
+                "account" => Phase::Starting(Attempt {
+                    target,
+                    session: f.source.clone(),
+                    recovery: Some(AccountRecovery {
+                        source: f.source.clone(),
+                        committed: false,
+                        submit: None,
+                    }),
+                    upgrade_committed: false,
+                    upgrade_admission: None,
+                }),
+                "return" => Phase::Returning {
+                    target,
+                    local: None,
+                    close_requested: false,
+                },
+                "other source" => {
+                    let mut other = f.source.clone();
+                    other.id = TerminalId::new();
+                    other.launch.recipe.arguments.push("--other-start".into());
+                    Phase::Starting(Attempt {
+                        target,
+                        session: other,
+                        recovery: None,
+                        upgrade_committed: false,
+                        upgrade_admission: None,
+                    })
+                }
+                _ => Phase::Closing {
+                    target,
+                    restart: None,
+                },
+            };
+            f.app.chat_ui.phases.insert(f.card, phase);
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+            )));
+            assert_eq!(
+                f.app.chat_ui.phases[&f.card].target(),
+                target,
+                "{owner} owns its generation"
+            );
+            match (&f.app.chat_ui.phases[&f.card], owner) {
+                (Phase::Starting(attempt), "account") => {
+                    assert!(attempt.recovery.is_some() && attempt.upgrade_admission.is_none())
+                }
+                (Phase::Starting(attempt), "other source") => {
+                    assert_ne!(attempt.session, f.source);
+                    assert!(attempt.recovery.is_none() && attempt.upgrade_admission.is_none());
+                }
+                (Phase::Returning { .. }, "return") | (Phase::Closing { .. }, "close") => {}
+                _ => panic!("{owner} phase changed"),
+            }
+            assert_live_recovery_content(&f);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_candidates_keep_account_recipe_proof_and_unstarted_guards() {
+        for mutation in [
+            "account",
+            "program",
+            "arguments",
+            "directory",
+            "boot",
+            "proof",
+            "unstarted",
+        ] {
+            let mut f = live_shared_recovery_fixture();
+            match mutation {
+                "account" => {
+                    f.canonical
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                "program" => f.canonical.launch.recipe.program = "other-provider".into(),
+                "arguments" => f
+                    .canonical
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--other-model".into()),
+                "directory" => {
+                    f.canonical.launch.recipe.working_directory = "/other-project".into()
+                }
+                "boot" => f.canonical.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                "proof" => f.canonical.proof.as_mut().unwrap().host_incarnation = "".into(),
+                _ => {
+                    f.source.proof = None;
+                    f.source.launch.session_id = None;
+                    f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+                    let runtime = f.app.chat_runtime_mut(f.target).unwrap();
+                    runtime.session = f.source.clone();
+                    runtime.connection = Connection::Draft;
+                    f.app.install_chat_session(f.card, f.source.clone());
+                }
+            }
+            assert!(
+                !chat::client::UpgradeRecovery::is_candidate(&f.source, &f.canonical),
+                "{mutation}"
+            );
+            f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+            )));
+            assert!(
+                !f.app.chat_start_pending(f.card),
+                "{mutation} cannot dispatch a strict or ordinary provider attachment"
+            );
+            assert_live_recovery_content(&f);
+            assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
+        }
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_refuses_future_unnamed_alias_over_a_known_checkpoint() {
+        let mut f = live_shared_recovery_fixture_for_identity(None);
+        f.canonical.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+        let target = project_live_shared_recovery(&mut f);
+        f.app.persist();
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        // A separate already-known checkpoint wins over this older unnamed
+        // alias, even though its future B attachment has authentic lineage.
+        let mut checkpoint = (*f.app.persistent_workspace()).clone();
+        let mut known = f.source.clone();
+        known.launch.session_id = Some(KNOWN_THREAD.into());
+        checkpoint
+            .cards
+            .iter_mut()
+            .find(|c| c.id == f.card)
+            .unwrap()
+            .kind = CardKind::Chat(known.clone());
+        checkpoint.pending_chat_admissions.remove(&f.card);
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot(Arc::new(checkpoint));
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let handle = live_shared_recovery_handle(&f);
+        assert!(handle.authenticated_upgrade_recovery().unwrap().validate());
+        let task = f.app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        let receipt = account_commit_reply(task);
+        assert!(
+            matches!(&receipt, Message::ChatUi(Action::UpgradeCommitted(_, _, Err(error))) if error.contains("saved conversation changed"))
+        );
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(known.clone())
+        );
+        drop(f.app.update(receipt));
+        assert_inert_live_recovery_copy(&f);
+        assert!(!f.app.chat_start_pending(f.card));
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(known)
+        );
     }
 
     #[test]

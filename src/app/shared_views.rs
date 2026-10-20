@@ -1579,6 +1579,7 @@ impl Cagents {
                 tasks.push(pending);
                 current.extend(saved_copy);
             }
+            self.prepare_shared_chat_upgrade(pane);
             if self.chat_awaiting_admission(pane.id) {
                 let (task, saved_copy) = self.admit_shared_chat(pane);
                 tasks.push(task);
