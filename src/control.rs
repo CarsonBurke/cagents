@@ -2505,6 +2505,7 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
+        .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
