@@ -7242,7 +7242,7 @@ mod tests {
         };
         let store = preflight(&spec, &mut initial).unwrap();
         let handle =
-            Handle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
+            LocalHandle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {

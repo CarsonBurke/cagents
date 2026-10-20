@@ -24,6 +24,13 @@ impl Handle {
         (Self(Owner::Remote(first)), Self(Owner::Remote(second)))
     }
     #[cfg(test)]
+    pub(crate) fn local_command_queue_is_empty(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.0.commands.is_empty(),
+            Owner::Remote(_) => panic!("courier barrier fixture requires a local actor"),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
