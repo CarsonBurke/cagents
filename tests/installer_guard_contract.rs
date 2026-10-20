@@ -446,6 +446,117 @@ esac
 }
 
 #[test]
+fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let prefix = root.path().join("install");
+    for version in ["old", "new"] {
+        let bin = prefix.join("versions").join(version).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            fs::write(bin.join(name), "complete matched fixture").unwrap();
+        }
+    }
+    let candidate = prefix.join("versions/new/bin/cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &candidate).unwrap();
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("versions/new", prefix.join("current")).unwrap();
+    let marker = prefix.join("versions/new/.deferred-owner.json");
+    fs::write(&marker, r#"{"version":1,"owner_version":"old"}"#).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let name = if cfg!(any(debug_assertions, feature = "development")) {
+        "cagents-development-ui.lock"
+    } else {
+        "cagents-ui.lock"
+    };
+    // After cooperative UI shutdown the coordinator keeps both fences alive.
+    // There is deliberately no daemon or window to authenticate instead.
+    let legacy = file(&runtime.join(name));
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    let update_path = runtime.join(format!("{name}.update"));
+    let update = file(&update_path);
+    let run = |inherited: Option<&File>, marker: Option<&str>| {
+        let mut command = Command::new(&candidate);
+        command
+            .args(["--json", "daemon", "status"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+            .env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+        if let Some(marker) = marker {
+            command.env("CAGENTS_UI_UPDATE_GUARD_FD", marker);
+        }
+        let descriptor = inherited.map(AsRawFd::as_raw_fd);
+        // SAFETY: only descriptor operations run after fork, and the parent
+        // retains each input description until the child exits.
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(descriptor) = descriptor {
+                    if libc::dup2(descriptor, 197) == -1 || libc::fcntl(197, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    libc::close(197);
+                }
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+    let ordinary = run(None, None);
+    assert!(
+        !ordinary.status.success(),
+        "legacy contention must remain a refusal: {ordinary:?}"
+    );
+    for (descriptor, marker) in [
+        (None, "197"),
+        (Some(&update), "197"),
+        (Some(&update), "999"),
+    ] {
+        let output = run(descriptor, Some(marker));
+        assert!(
+            !output.status.success(),
+            "missing, unheld or malformed authority: {output:?}"
+        );
+    }
+    assert_eq!(
+        unsafe { libc::flock(update.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let different = file(&runtime.join("unrelated-update"));
+    let independent = File::open(&update_path).unwrap();
+    for descriptor in [&different, &independent] {
+        let output = run(Some(descriptor), Some("197"));
+        assert!(
+            !output.status.success(),
+            "a different description must not borrow authority: {output:?}"
+        );
+    }
+    let valid = run(Some(&update), Some("197"));
+    assert!(valid.status.success(), "{valid:?}");
+    let result: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(result["data"]["running"], false);
+    assert_eq!(
+        unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        -1,
+        "validation must not release the coordinator's exclusive fence"
+    );
+}
+
+#[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
     let _fixture = OS_FIXTURE.lock().unwrap();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
