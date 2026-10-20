@@ -2506,6 +2506,7 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
+        .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5818,6 +5819,18 @@ mod tests {
             })
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ui_launcher_advertises_recovery_progress_support() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "test \"$CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS\" = 1 || exit 94; printf 'ready\\n'",
+            ])
+            .env_remove("CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS");
+        spawn_ui_process(&mut command).unwrap();
     }
 
     #[test]

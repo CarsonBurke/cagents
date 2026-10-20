@@ -63,6 +63,9 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
+/// Older launchers understand only the final ready/error response. Progress
+/// requires a separate explicit capability to keep their stdout protocol valid.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
 pub const UI_LAUNCH_READY: &str = "ready";
 pub const UI_LAUNCH_ERROR_PREFIX: &str = "error: ";
 /// A usable recovery window remains open while the updater reports failure.
@@ -278,7 +281,10 @@ pub fn ui_launch_handshake_requested() -> bool {
 /// This is progress only: the launcher must still await `report_ui_startup`.
 pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
     static REPORTED: AtomicBool = AtomicBool::new(false);
-    if ui_launch_handshake_requested() && !REPORTED.swap(true, Ordering::AcqRel) {
+    if ui_launch_handshake_requested()
+        && env::var_os(UI_LAUNCH_RECOVERY_PROGRESS_ENV).as_deref() == Some("1".as_ref())
+        && !REPORTED.swap(true, Ordering::AcqRel)
+    {
         if saved_chats > 1152 {
             return Err(io::Error::other(
                 "saved conversation inventory exceeds the recovery limit",
