@@ -704,6 +704,31 @@ pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
     verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+/// A candidate whose exact daemon already owns the runtime may reopen while an
+/// older coordinator retains its shared legacy fence. Keep legacy exclusive UI
+/// owners excluded, and authenticate every modern window before routing.
+/// The caller must hold the launch fence and retain the returned legacy guard.
+pub(crate) fn verified_windows_for_daemon(
+    executable: &Path,
+) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
+    let runtime = runtime_directory()?;
+    let legacy = owned_lock(
+        &runtime.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
+    let windows = verified_window_lease_owners_in(&runtime, Path::new("/proc"))?;
+    if crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .as_deref()
+        != Some(executable)
+    {
+        return Err(io::Error::other(
+            "candidate daemon ownership changed while checking windows",
+        ));
+    }
+    Ok((windows, legacy))
+}
+
 fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();
     if fields.len() != 8
