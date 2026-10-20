@@ -20348,18 +20348,21 @@ mod tests {
         let project = ProjectId::new();
         let identity = uuid::Uuid::new_v4();
         let repository = PathBuf::from(FIXTURE_DIRECTORY);
+        app.sidebar_model.projects.push(
+            crate::sidebar::SidebarProject::new(
+                project,
+                crate::model::RepositoryId::new(),
+                "Recovery fixture".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
         {
             let durable = Arc::make_mut(&mut app.durable);
             durable.workspace_model_identity = Some(identity);
             durable.active_channel = Some(channel);
-            durable.projects.push(ProjectState {
-                id: project,
-                generation: durable.generation,
-                name: "Recovery fixture".into(),
-                repository: repository.clone(),
-                kind: ProjectKind::Folder,
-                existence: Existence::Open,
-            });
             durable.channels.push(ProjectChannel {
                 id: channel,
                 project_id: project,
@@ -20427,6 +20430,14 @@ mod tests {
             crate::model::BootId::new("boot-test"),
         )
         .unwrap();
+        writer.save_project(ProjectState {
+            id: project,
+            generation: 0,
+            name: "Recovery fixture".into(),
+            repository: PathBuf::from(FIXTURE_DIRECTORY),
+            kind: ProjectKind::Folder,
+            existence: Existence::Open,
+        });
         app.session = Some(writer);
         app.persist();
         app.session
