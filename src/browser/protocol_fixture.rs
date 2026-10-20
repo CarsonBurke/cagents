@@ -215,6 +215,100 @@ fn capable_registry_requires_both_syncs_then_latches_ready() {
     factory.release_parent();
 }
 
+#[derive(Clone)]
+struct ProtocolLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ProtocolLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn protocol_logs(body: impl FnOnce()) -> String {
+    let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = bytes.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || ProtocolLog(writer.clone()))
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, body);
+    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn protocol_diagnostics_distinguish_both_syncs_and_retain_parent_span() {
+    let logs = protocol_logs(|| {
+        let mut fixture = Fixture::new();
+        let span = tracing::info_span!(
+            target: "cagents::browser_capability", "browser_protocol_probe", generation = "fixture"
+        );
+        let factory = {
+            let _entered = span.enter();
+            fixture.factory()
+        };
+        assert_eq!(factory.poll_capability(), CapabilityProbe::Pending);
+        fixture.pump();
+        assert_eq!(factory.poll_capability(), CapabilityProbe::Pending);
+        fixture.pump();
+        assert_eq!(fixture.until_settled(&factory), CapabilityProbe::Available);
+        factory.release_parent();
+    });
+    for phase in [
+        "first_poll",
+        "registry_sync_complete",
+        "bound_sync_queued",
+        "bound_sync_complete",
+    ] {
+        let records = logs
+            .lines()
+            .filter(|line| line.contains(&format!("phase=\"{phase}\"")))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{phase}: {logs}");
+        assert!(records[0].contains("generation=\"fixture\""), "{logs}");
+    }
+    assert!(logs.contains("sync_stage=\"registry_sync\""), "{logs}");
+    assert!(logs.contains("sync_stage=\"bound_sync\""), "{logs}");
+}
+
+#[test]
+fn unread_owner_diagnostics_are_bounded_and_retirement_reports_pending_stage() {
+    let logs = protocol_logs(|| {
+        let fixture = Fixture::new();
+        let factory = fixture.factory();
+        for _ in 0..16 {
+            assert_eq!(factory.poll_capability(), CapabilityProbe::Pending);
+        }
+        factory.release_parent();
+        factory.release_parent();
+    });
+    let records = logs
+        .lines()
+        .filter(|line| line.contains("browser protocol capability progress"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2, "{logs}");
+    let retired = records
+        .iter()
+        .find(|line| line.contains("phase=\"retired\""))
+        .unwrap();
+    for field in [
+        "sync_stage=\"registry_sync\"",
+        "globals=0",
+        "bound=false",
+        "sync_complete=false",
+        "polls=16",
+        "dispatched=0",
+        "flush_would_block=0",
+    ] {
+        assert!(retired.contains(field), "{field}: {logs}");
+    }
+}
+
 #[test]
 fn each_missing_global_is_exact_and_engine_registration_is_refused() {
     for index in 0..3 {
