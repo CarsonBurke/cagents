@@ -87,7 +87,7 @@ impl Reader {
 }
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    if request.protocol != crate::terminal_ipc::PROTOCOL_VERSION
+    if !current::supports_protocol(request.protocol)
         && request.protocol != 77
         && request.protocol != 68
     {
@@ -103,8 +103,8 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         .ok_or("Saved conversations have no authenticated source service")?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| "Source service namespace is unavailable")?;
-    if request.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
-        current::Client::connect(&socket, proof, deadline).map(Reader::Current)
+    if current::supports_protocol(request.protocol) {
+        current::Client::connect(&socket, proof, deadline, request.protocol).map(Reader::Current)
     } else if request.protocol == 68 {
         v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68)
     } else {
