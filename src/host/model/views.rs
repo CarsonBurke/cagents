@@ -1490,17 +1490,26 @@ mod tests {
     }
 
     #[test]
-    fn transfer_requires_the_current_process_after_same_id_successor_adoption() {
+    fn authenticated_adoption_refreshes_canonical_panes_and_stale_transfer_still_refuses() {
         use crate::{
             agent::Provider,
             agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
         };
-        for (native_chat, console, changed_launch) in [
-            (false, false, false),
-            (false, false, true),
-            (true, false, false),
-            (true, false, true),
-            (true, true, false),
+        for (native_chat, console, changed_launch, evidence) in [
+            (false, false, false, "exact"),
+            (false, false, true, "exact"),
+            (true, false, false, "exact"),
+            (true, false, true, "exact"),
+            (true, true, false, "exact"),
+            (true, false, false, "thread"),
+            (true, false, false, "recipe"),
+            (true, false, false, "proof"),
+            (true, false, false, "unproved"),
+            (true, false, false, "alias"),
+            (true, false, false, "absent"),
+            (true, false, false, "retired"),
+            (true, false, false, "changed-thread"),
+            (true, false, false, "learn-thread"),
         ] {
             let (mut r, _directory, a, b) = setup();
             let accepted = r
@@ -1551,7 +1560,7 @@ mod tests {
                     host_incarnation: crate::model::HostIncarnation::new("host"),
                 },
             };
-            let source = if native_chat {
+            let mut source = if native_chat {
                 HostedSession::Chat(crate::chat::Session {
                     id: terminal.id,
                     launch: crate::chat::Launch {
@@ -1567,6 +1576,11 @@ mod tests {
             } else {
                 HostedSession::Terminal(terminal.clone())
             };
+            if evidence == "learn-thread"
+                && let HostedSession::Chat(session) = &mut source
+            {
+                session.launch.session_id = None;
+            }
             let original = r
                 .bind_agent(accepted.agent.id, None, source.clone())
                 .unwrap();
@@ -1581,15 +1595,55 @@ mod tests {
                 }
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
-            let p = Pane {
+            let mut p = Pane {
                 id: CardId::from_uuid(original.id.as_uuid()),
                 kind: presentation(&source),
+                user_title: Some("My retained actor".into()),
+                width_fraction: 0.75,
                 ..pane()
             };
-            seed(&mut r, a, vec![p.clone()]);
+            if let CardKind::Chat(session) = &mut p.kind {
+                match evidence {
+                    "thread" => session.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                    "recipe" => session.launch.recipe.arguments.push("unrelated".into()),
+                    "proof" => {
+                        session.proof.as_mut().unwrap().host_incarnation =
+                            crate::model::HostIncarnation::new("unrelated")
+                    }
+                    "unproved" => session.proof = None,
+                    _ => {}
+                }
+            }
+            if evidence == "alias" {
+                p.id = CardId::new();
+            }
+            seed(
+                &mut r,
+                a,
+                if evidence == "absent" {
+                    vec![]
+                } else {
+                    vec![p.clone()]
+                },
+            );
+            if evidence == "retired" {
+                let removal = edit(&mut r, a, Change::Remove { id: p.id });
+                r.apply(&removal).unwrap();
+            }
+            r.apply(&ModelEdit::SuggestChannelTitle {
+                id: a,
+                title: "Retained conversation".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            })
+            .unwrap();
+            let before_adoption = r.model().unwrap();
+            let before_view = read(&r.db, &Scope::Channel(a)).unwrap();
             let mut successor = source.clone();
             match &mut successor {
                 HostedSession::Chat(session) => {
+                    if matches!(evidence, "changed-thread" | "learn-thread") {
+                        session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    }
                     if changed_launch {
                         session.launch.recipe.arguments.push("successor".into());
                     } else {
@@ -1615,15 +1669,99 @@ mod tests {
                     }
                 }
             }
+            if !changed_launch && matches!(evidence, "exact" | "learn-thread") {
+                // A failed pane write must roll back Agent ownership as well.
+                r.db.execute_batch("CREATE TRIGGER reject_pane_adoption BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(ABORT, 'fixture failed pane commit'); END;").unwrap();
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .is_err()
+                );
+                assert_eq!(r.model().unwrap(), before_adoption);
+                r.db.execute_batch("DROP TRIGGER reject_pane_adoption;")
+                    .unwrap();
+                // Here the pane write succeeds first; a later ownership write
+                // must roll it back together with the model revision/sequence.
+                r.db.execute_batch("CREATE TRIGGER reject_agent_adoption BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture failed agent commit'); END;").unwrap();
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .is_err()
+                );
+                assert_eq!(r.model().unwrap(), before_adoption);
+                r.db.execute_batch("DROP TRIGGER reject_agent_adoption;")
+                    .unwrap();
+            }
             assert!(
                 r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
                     .unwrap()
             );
-            assert_eq!(
-                read(&r.db, &Scope::Channel(a)).unwrap().panes,
-                vec![p.clone()],
-                "adoption need not refresh shared panes atomically"
-            );
+            let refreshed = Pane {
+                kind: presentation(&successor),
+                ..p.clone()
+            };
+            let current = r.model().unwrap();
+            let current_agent = r.agent(original.id).unwrap();
+            let current_view = read(&r.db, &Scope::Channel(a)).unwrap();
+            assert_eq!(current.sequence, before_adoption.sequence + 1);
+            if !matches!(evidence, "exact" | "learn-thread") {
+                assert_eq!(
+                    current_view, before_view,
+                    "{evidence} must not authorize canonical pane recovery"
+                );
+                continue;
+            }
+            if !changed_launch || !native_chat {
+                assert_eq!(current_view.panes, vec![refreshed.clone()]);
+                assert_eq!(current_view.revision, before_view.revision + 1);
+                let display = crate::workspace_model::views::ManagedDisplayIndex::new(&current);
+                assert!(display.permits_projection(&current_agent, &refreshed));
+                assert!(display.resolve(&current_agent).is_some());
+                let mut ambiguous = current.clone();
+                ambiguous.views.push(current_view.clone());
+                assert!(
+                    crate::workspace_model::views::ManagedDisplayIndex::new(&ambiguous)
+                        .resolve(&current_agent)
+                        .is_none()
+                );
+                assert_eq!(current.channels, before_adoption.channels);
+                // Recreate a genuinely stale source after the atomic adoption.
+                // This simulates replacement/corrupt old evidence, rather than
+                // requiring normal holder recovery to publish an inert pane.
+                r.db.execute(
+                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
+                    params![
+                        key(&Scope::Channel(a)).unwrap(),
+                        serde_json::to_string(&vec![p.clone()]).unwrap()
+                    ],
+                )
+                .unwrap();
+                let stale_sequence = r.model().unwrap().sequence;
+                assert!(
+                    r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .unwrap()
+                );
+                assert_eq!(
+                    read(&r.db, &Scope::Channel(a)).unwrap().panes,
+                    vec![refreshed.clone()]
+                );
+                assert_eq!(r.model().unwrap().sequence, stale_sequence + 1);
+                assert!(
+                    !r.adopt_authenticated_agent_session(std::slice::from_ref(&source), &successor)
+                        .unwrap()
+                );
+                r.db.execute(
+                    "UPDATE shared_views SET panes=?2 WHERE scope=?1",
+                    params![
+                        key(&Scope::Channel(a)).unwrap(),
+                        serde_json::to_string(&vec![p.clone()]).unwrap()
+                    ],
+                )
+                .unwrap();
+            } else {
+                assert_eq!(
+                    current_view, before_view,
+                    "changed launch is not pane continuity"
+                );
+            }
             let change = Change::Transfer {
                 id: p.id,
                 destination: Scope::Channel(b),
@@ -1643,10 +1781,6 @@ mod tests {
                 before,
                 "stale proof/launch must preserve both views, agent and sequence"
             );
-            let refreshed = Pane {
-                kind: presentation(&successor),
-                ..p.clone()
-            };
             let refresh = edit(
                 &mut r,
                 a,
