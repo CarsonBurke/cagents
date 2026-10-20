@@ -692,7 +692,7 @@ pub(crate) mod handoff {
                 Ok(())
             }
             let mut ids = std::collections::BTreeSet::new();
-            let mut conversations = std::collections::BTreeSet::new();
+            let mut conversations = std::collections::BTreeMap::new();
             let mut chat_ids = std::collections::BTreeSet::new();
             // Each source daemon either relaunched its terminal from the
             // source's safe recipe, or carried it, launched as it was.
@@ -762,7 +762,9 @@ pub(crate) mod handoff {
                     &terminal.relaunches,
                 )?;
                 if let Some((provider, id)) = exact_conversation(&terminal.recipe)
-                    && !conversations.insert((provider.executable(), id))
+                    && conversations
+                        .insert((provider.executable(), id), terminal.source.id)
+                        .is_some()
                 {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
@@ -790,14 +792,22 @@ pub(crate) mod handoff {
                     .map(|(provider, id)| (provider.executable(), id))
                     .collect::<Vec<_>>();
                 writes.dedup();
-                if writes
-                    .into_iter()
-                    .any(|conversation| !conversations.insert(conversation))
-                {
+                if writes.into_iter().any(|conversation| {
+                    conversations
+                        .insert(conversation, carried.source.id)
+                        .is_some()
+                }) {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
             }
             for chat in &self.chats {
+                let paired_carried = self
+                    .carried
+                    .iter()
+                    .find(|carried| carried.source.id == chat.source.id);
+                if let Some(carried) = paired_carried {
+                    paired_carried_source(chat, carried, &self.proof)?;
+                }
                 let paired_codex = chat.launch.provider == crate::agent::Provider::Codex
                     && self.terminals.iter().any(|terminal| {
                         terminal.source.id == chat.source.id
@@ -817,7 +827,7 @@ pub(crate) mod handoff {
                     paired_terminal_source(chat, terminal)?;
                 }
                 if !chat_ids.insert(chat.source.id)
-                    || (!ids.insert(chat.source.id) && !paired_codex)
+                    || (!ids.insert(chat.source.id) && !paired_codex && paired_carried.is_none())
                     || chat.source.proof.as_ref() != Some(&self.proof)
                     || chat.source.launch.provider != chat.launch.provider
                 {
@@ -888,7 +898,12 @@ pub(crate) mod handoff {
                     .ok_or("Native chat has no exact resumable provider identity")?;
                 let (provider, id) = exact_conversation(&recipe)
                     .ok_or("Native chat has no exact resumable provider identity")?;
-                if !conversations.insert((provider.executable(), id)) && !paired_codex {
+                if conversations
+                    .insert((provider.executable(), id), chat.source.id)
+                    .is_some_and(|owner| {
+                        owner != chat.source.id || (!paired_codex && paired_carried.is_none())
+                    })
+                {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
             }
@@ -905,6 +920,37 @@ pub(crate) mod handoff {
             }
             Ok(())
         }
+    }
+
+    /// A retained execution carries its console without replaying its recipe.
+    /// Only the live/detached presentation may differ from the issued pair;
+    /// every ownership and execution field must remain exactly the same.
+    #[cfg(any(feature = "host", test))]
+    fn paired_carried_source(
+        chat: &Chat,
+        carried: &Carried,
+        proof: &HostSessionProof,
+    ) -> Result<(), String> {
+        validate_chat_source(&chat.source, &chat.launch)?;
+        let issued = chat
+            .source
+            .terminal
+            .as_ref()
+            .ok_or("Carried native console has no issued pair")?;
+        if !chat.source.native_continuity.retains_provider()
+            || issued.id != chat.source.id
+            || carried.source.id != chat.source.id
+            || issued.continuity.live_proof().as_ref() != Some(proof)
+            || carried.source.continuity.live_proof().as_ref() != Some(proof)
+        {
+            return Err("Carried native console has inconsistent ownership".into());
+        }
+        let mut owner = carried.source.clone();
+        owner.continuity = issued.continuity.clone();
+        if owner != *issued {
+            return Err("Carried native console differs from its exact issued source".into());
+        }
+        Ok(())
     }
 
     /// Keep the descriptor already issued to the chat while validating the
@@ -2767,6 +2813,44 @@ mod tests {
                 forged.validate().is_err(),
                 "accepted forged console mutation {mutation}"
             );
+        }
+        for provider in [
+            crate::agent::Provider::Claude,
+            crate::agent::Provider::Codex,
+        ] {
+            let mut known = saved.clone();
+            let source = &mut known.chats[0].source;
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            if provider == crate::agent::Provider::Codex {
+                source.launch.provider = provider;
+                source.launch.recipe.program = "codex".into();
+                source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                assert!(source.claim_owned_codex_listener(directory.path(), &known.proof));
+                source.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.157.1".into(),
+                };
+            }
+            known.chats[0].launch = known.chats[0].source.launch.clone();
+            known
+                .validate()
+                .expect("a retained confirmed thread may carry its exact console");
+            let recipe = known.chats[0].launch.terminal_recipe().unwrap();
+            // A paired console does not excuse a second execution elsewhere
+            // that writes this same thread, even when the console has no hint.
+            let mut duplicate = known.clone();
+            let mut writer = checkpoint(directory.path()).terminals.remove(0);
+            writer.source.launch = recipe.clone();
+            writer.recipe = recipe.clone();
+            duplicate.terminals.push(writer);
+            assert!(duplicate.validate().is_err());
+            // The console's own exact observed thread is the same execution,
+            // not a second provider writer.
+            let hint = crate::model::agent_recovery::hint_from_launch(&recipe);
+            known.carried[0].source.resume_hint = hint.clone();
+            known.chats[0].source.terminal.as_mut().unwrap().resume_hint = hint;
+            known
+                .validate()
+                .expect("the paired execution may share its observed thread");
         }
     }
 

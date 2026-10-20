@@ -3012,8 +3012,12 @@ pub(super) fn close_captured(
         (retained, state.native_closing.contains_key(&chat_id))
     };
     if handle.actor_identity().is_some() {
-        retained_actor::finish_close(host, &handle, &retained).map_err(unavailable)?;
-        target.require_current(host)?;
+        // The actor's final transcript is available, but its paired console
+        // still needs an authenticated terminal cleanup receipt. Keep helper
+        // discovery and exact close authority until both owners are proved
+        // closed and their semantic retirement has committed.
+        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
+        return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     let closed_receipt = if matches!(
         retained.native_continuity,
