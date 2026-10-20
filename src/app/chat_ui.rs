@@ -20319,10 +20319,26 @@ mod tests {
             } else {
                 source.launch.provider = Provider::Claude;
                 source.launch.recipe.program = "claude".into();
+                source.launch.recipe.arguments.clear();
+                source.owned_codex_listener = None;
                 source.launch.session_id = (mode == 2).then(|| KNOWN_THREAD.into());
                 source.native_continuity =
                     chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
             }
+            assert!(
+                source.has_valid_native_continuity(),
+                "invalid writer fixture source: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
+            assert_eq!(
+                source.owned_codex_listener.is_some(),
+                codex_resume,
+                "unexpected fixture allocation: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
+            assert_eq!(
+                source.owns_codex_listener(),
+                codex_resume,
+                "invalid fixture allocation: mode={mode}, stale_reply={stale_reply}, refused={refused}"
+            );
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let draft = "Keep this unsent thought\n  with λ and spacing";
             write(&mut app, card, draft);

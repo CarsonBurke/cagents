@@ -4516,7 +4516,7 @@ mod tests {
         };
         let mut replacement = source.clone();
         replacement.proof = Some(proof("new"));
-        // Upgrade recovery advances ownership of the same confirmed thread.
+        // Upgrade recovery advances the same still-unnamed retained actor.
         let mut snapshot = workspace();
         let card = snapshot.cards[0].id;
         snapshot.cards[0].kind = CardKind::Chat(source.clone());
@@ -4524,11 +4524,46 @@ mod tests {
         writes.workspace = Some(Arc::new(snapshot.clone()));
         assert!(writes.flush(&store).is_empty());
 
-        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let (raw_reply, raw_receipt) = std::sync::mpsc::sync_channel(1);
         writes
             .conversions
             .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
                 kind: ChatRecoveryKind::Upgrade,
+                card,
+                source: source.clone(),
+                replacement: replacement.clone(),
+                reply: raw_reply,
+            }));
+        assert!(writes.flush(&store).is_empty());
+        assert!(
+            raw_receipt.recv().unwrap().is_err(),
+            "raw retained descriptors cannot authorize an upgrade or queued-snapshot translation"
+        );
+        assert!(writes.chat_rebindings.is_empty());
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+
+        let handle = crate::chat::client::ClientHandle::fixture_upgrade_handshake(
+            source.clone(),
+            replacement.clone(),
+            crate::chat::Snapshot {
+                session_id: replacement.launch.session_id.clone(),
+                ready: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let recovery = handle.authenticated_upgrade_recovery().unwrap().clone();
+        assert!(recovery.validate());
+        assert_eq!(recovery.source(), &source);
+        assert_eq!(recovery.replacement(), &replacement);
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
+                kind: ChatRecoveryKind::AuthenticatedUpgrade(recovery),
                 card,
                 source,
                 replacement: replacement.clone(),
