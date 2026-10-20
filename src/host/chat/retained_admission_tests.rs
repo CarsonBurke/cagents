@@ -167,6 +167,7 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
     requested.proof = Some(proof.clone());
     requested.native_continuity = chat::NativeContinuity::ReconnectOnly;
     let directory = holders::directory(Kind::Native).unwrap();
+    crate::secure_file::prepare_private_directory(&directory).unwrap();
     let socket = holders::socket(&directory, requested.id);
     let listener = holders::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();

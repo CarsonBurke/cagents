@@ -536,6 +536,7 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
     assert!(before.launch.session_id.is_none());
     fixture.attach(11, &before).unwrap();
     fixture.no_prompt();
+    let scope = fixture.handle().launch_account_scope().cloned().unwrap();
 
     fixture
         .handle()
@@ -549,21 +550,34 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
         || fixture.root.join("provider-done").exists(),
         "offline turn did not finish",
     );
-    wait(
-        || {
-            fixture.host.lock().unwrap().chats[&fixture.original.id]
-                .session
-                .launch
-                .session_id
-                .is_some()
-        },
-        "semantic broker did not publish confirmed identity",
+    let published = fixture.publicly_attached_identity(
+        None,
+        "public descriptor never learned the provider-confirmed identity",
     );
+    assert_eq!(published.launch.provider, fixture.original.launch.provider);
+    assert_eq!(published.launch.recipe, fixture.original.launch.recipe);
+    assert_eq!(
+        published.proof.as_ref(),
+        Some(fixture.host.lock().unwrap().proof())
+    );
+    assert_eq!(
+        published.native_continuity,
+        fixture.original.native_continuity
+    );
+    assert_eq!(
+        fixture.handle().actor_identity(),
+        Some(fixture.identity.clone())
+    );
+    assert_eq!(fixture.handle().launch_account_scope(), Ok(&scope));
     let resolved = fixture.resolve(11, &fixture.original).unwrap();
     let confirmed = fixture
         .handle()
         .confirmed_session_id()
         .expect("actual provider confirmation required");
+    assert_eq!(
+        published.launch.session_id.as_deref(),
+        Some(confirmed.as_str())
+    );
     assert_eq!(
         resolved.launch.session_id.as_deref(),
         Some(confirmed.as_str())

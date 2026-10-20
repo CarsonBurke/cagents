@@ -337,7 +337,11 @@ fn captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor() 
         .unwrap()
         .handle = second.clone();
     let error = super::super::chat::close_captured(&host, target).unwrap_err();
-    assert!(error.message.contains("thread changed"), "{error:?}");
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
     {
         let state = host.lock().unwrap();
         let record = &state.chats[&source.id];
@@ -553,7 +557,11 @@ fn captured_owning_close_refuses_a_replaced_host_execution_instance() {
         .unwrap()
         .execution_instance = uuid::Uuid::new_v4();
     let error = super::super::chat::close_captured(&host, target).unwrap_err();
-    assert!(error.message.contains("thread changed"), "{error:?}");
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
     assert!(!handle.is_completed());
     assert!(
         !registry(&host)

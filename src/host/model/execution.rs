@@ -1993,7 +1993,11 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE shared_view_terminal_sources; PRAGMA user_version=12;",
+                        "DROP TABLE native_actor_retirements;
+                         DROP TABLE native_actor_ownerships;
+                         DROP TABLE native_actor_cursors;
+                         DROP TABLE shared_view_terminal_sources;
+                         PRAGMA user_version=12;",
                     )
                     .unwrap();
                 drop(registry);

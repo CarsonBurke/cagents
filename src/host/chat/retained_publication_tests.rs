@@ -255,6 +255,49 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
             .count(),
         40
     );
+    // An internal restore owns the actor without subscribing a window. Use
+    // its public descriptor to establish the client attachment before close.
+    let ServerResponse::ChatListed { sessions } =
+        process(&successor, 0, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("expected actual public chat inventory");
+    };
+    let listed = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .unwrap();
+    assert_eq!(listed.launch.provider, Provider::Claude);
+    assert_eq!(listed.launch.recipe, published.launch.recipe);
+    assert_eq!(
+        listed.proof.as_ref(),
+        Some(successor.lock().unwrap().proof())
+    );
+    assert_eq!(
+        listed.launch.session_id.as_deref(),
+        Some(confirmed.as_str())
+    );
+    let ServerResponse::ChatAttached { session, snapshot } = process(
+        &successor,
+        0,
+        ClientRequest::ChatAttach {
+            session: listed.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected actual public chat attachment");
+    };
+    assert_eq!(session, listed);
+    assert_eq!(snapshot.session_id.as_deref(), Some(confirmed.as_str()));
+    assert_eq!(snapshot.native_continuity, session.native_continuity);
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "public attachment must not replay the confirmed prompt"
+    );
     process(&successor, 0, ClientRequest::ChatClose { chat_id: id }).unwrap();
     wait(
         || !identity.record.root.is_current() && !identity.record.holder.is_current(),

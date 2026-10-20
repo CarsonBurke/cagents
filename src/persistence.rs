@@ -1375,7 +1375,16 @@ impl StateStore {
         source: &crate::chat::Session,
         replacement: &crate::chat::Session,
     ) -> Result<()> {
-        if !(crate::chat::is_upgrade_recovery(source, replacement)
+        // Retained actor recovery requires the immutable witness from the
+        // authenticated Resolve/Attach/snapshot handshake. Descriptor values
+        // alone cannot certify either an actor epoch or a learned identity.
+        if matches!(
+            source.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) || matches!(
+            replacement.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) || !(crate::chat::is_upgrade_recovery(source, replacement)
             || crate::chat::is_upgrade_identity_learning(source, replacement))
         {
             return Err(StoreError::InvalidState(
@@ -8730,13 +8739,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let store =
             StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
-        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Omp);
         source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
         source.terminal = None;
-        source.launch.session_id = None;
-        source.launch.recipe.arguments.clear();
-        source.native_continuity =
-            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         let card = workspace.cards[0].id;
         workspace.cards[0].kind = CardKind::Chat(source.clone());
         let mut lane = SaveLane::default();
@@ -8767,7 +8772,7 @@ mod tests {
             let mut refused = replacement.clone();
             match altered {
                 0 => refused.id = TerminalId::new(),
-                1 => refused.launch.provider = crate::agent::Provider::Codex,
+                1 => refused.launch.provider = crate::agent::Provider::Claude,
                 2 => refused.launch.recipe.program = "other-provider".into(),
                 3 => {
                     refused
@@ -8778,7 +8783,7 @@ mod tests {
                 }
                 4 => refused.proof = None,
                 5 => refused.proof = source.proof.clone(),
-                6 => refused.launch.session_id = Some("not-a-provider-uuid".into()),
+                6 => refused.launch.session_id = None,
                 _ => refused.proof.as_mut().unwrap().host_incarnation = "".into(),
             }
             assert!(
@@ -8812,6 +8817,60 @@ mod tests {
             reopened.load_card(card, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
         );
+    }
+
+    #[test]
+    fn raw_retained_upgrade_rebind_cannot_replace_authenticated_actor_evidence() {
+        for known in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = StateStore::open(
+                directory.path().join("retained-upgrade.sqlite3"),
+                boot("chat-boot"),
+            )
+            .unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+            source.terminal = None;
+            source.launch.recipe.arguments.clear();
+            if !known {
+                source.launch.session_id = None;
+            }
+            source.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let card = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace
+                .chat_drafts
+                .insert(card, "Keep this unsent draft".into());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            for learn_or_replace in [false, true] {
+                let mut replacement = source.clone();
+                replacement.proof.as_mut().unwrap().host_incarnation = "successor".into();
+                if learn_or_replace {
+                    replacement.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                }
+                assert!(
+                    store
+                        .rebind_chat_upgrade(card, &source, &replacement)
+                        .is_err(),
+                    "descriptor-only rebind must require the authenticated retained witness"
+                );
+                assert_eq!(
+                    store.load_card(card, None).unwrap().unwrap().kind,
+                    CardKind::Chat(source.clone())
+                );
+                assert_eq!(
+                    store
+                        .load_workspace(workspace.id, None)
+                        .unwrap()
+                        .unwrap()
+                        .chat_drafts,
+                    workspace.chat_drafts,
+                    "a refused transition preserves the committed draft"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11186,6 +11245,4 @@ mod tests {
             CardKind::Chat(reset)
         );
     }
-
-
 }

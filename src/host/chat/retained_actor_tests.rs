@@ -339,7 +339,8 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     );
     // Invalid hybrids must still be refused by the actual current helper;
     // recovery must project a genuine issued descriptor rather than relax it.
-    let inspection = Handle::inspect_remote(&identity.record, first.clone()).unwrap();
+    let inspection =
+        Handle::inspect_remote(&identity.record, requested.proof.clone().unwrap()).unwrap();
     let mut invalid = inspection.source.clone();
     invalid.launch.session_id = handle.confirmed_session_id();
     assert!(invalid.launch.session_id.is_some());
@@ -560,6 +561,41 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         },
         "explicit close left a native or paired owner",
         || close_owner_diagnostic(&identity.record, &pair),
+    );
+    let retirement = registry
+        .lock()
+        .unwrap()
+        .native_actor_retirement(identity.instance)
+        .unwrap()
+        .expect("owning Close must durably retire the exact actor");
+    assert_eq!(retirement.owner(), &identity.record);
+    let canonical = retirement.source().clone();
+    assert!(canonical.terminal.is_some());
+    let confirmed = retirement.confirmed_session().unwrap().to_owned();
+    assert_eq!(
+        canonical.launch.session_id.as_deref(),
+        Some(confirmed.as_str())
+    );
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &successor,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: canonical.clone(),
+        },
+    )
+    .expect("ordinary hosted Close must prove paired cleanup before disk resume") else {
+        panic!("expected exact disk-resume preparation");
+    };
+    assert_ne!(session.id, canonical.id);
+    assert_eq!(session.launch, canonical.launch);
+    assert!(session.terminal.is_none());
+    assert!(successor.lock().unwrap().chats.is_empty());
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
     drop(lease);
 }
@@ -2147,8 +2183,8 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
         "no accepted input may be replayed or synthesized"
     );
     // A later explicit first prompt names the thread without another Ready
-    // edge. Its durable hosted descriptor must learn that ID even though no
-    // UI ever hydrated a transcript or opened this conversation.
+    // edge. Public metadata must publish that helper-confirmed identity while
+    // the immutable startup alias remains usable, without transcript hydration.
     let notifications = super::super::notifications::Broker::start(
         &successor,
         crate::notifications::Application::Cagents,
@@ -2166,22 +2202,45 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
         || root.join("provider-done").exists(),
         "provider never finished its explicit first prompt",
     );
+    let mut listed = None;
     wait_until(
         || {
-            successor.lock().unwrap().chats[&id]
-                .session
-                .launch
-                .session_id
-                .is_some()
+            let (response, _, _) =
+                super::super::client::process_request(&successor, 0, ClientRequest::ChatList)
+                    .unwrap();
+            let ServerResponse::ChatListed { sessions } = response else {
+                panic!("public metadata did not return chat inventory");
+            };
+            listed = sessions.into_iter().find(|session| session.id == id);
+            listed.as_ref().is_some_and(|session| {
+                session.launch.session_id.is_some()
+                    && session.launch.session_id == handle.confirmed_session_id()
+            })
         },
-        "unopened hosted descriptor did not retain late confirmed identity",
+        "unopened public inventory did not publish late confirmed identity",
     );
+    let listed = listed.unwrap();
+    assert_eq!(listed.launch.session_id, handle.confirmed_session_id());
+    let mut expected = replacement.clone();
+    expected.launch.session_id = handle.confirmed_session_id();
+    assert_eq!(listed, expected);
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    {
+        let state = successor.lock().unwrap();
+        assert_eq!(state.chats[&id].session, replacement);
+        assert!(state.chats[&id].subscribers.is_empty());
+    }
+    let inspection =
+        Handle::inspect_remote(&identity.record, listed.proof.clone().unwrap()).unwrap();
+    assert_eq!(inspection.identity, identity);
+    assert_eq!(inspection.source, replacement);
+    assert!(inspection.previous_sources.contains(&listed));
     assert_eq!(
-        successor.lock().unwrap().chats[&id]
-            .session
-            .launch
-            .session_id,
-        handle.confirmed_session_id()
+        inspection
+            .launch_account_scope
+            .as_ref()
+            .map_err(String::as_str),
+        handle.launch_account_scope()
     );
     assert_eq!(
         fs::read_to_string(root.join("prompts"))
@@ -2718,21 +2777,37 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
         "fixture provider never confirmed its completed conversation",
     );
+    let mut confirmed_source = None;
     wait_until(
         || {
-            host.lock().unwrap().chats[&id]
-                .session
-                .launch
-                .session_id
-                .is_some()
+            let (response, _, _) =
+                super::super::client::process_request(&host, 17, ClientRequest::ChatList).unwrap();
+            let ServerResponse::ChatListed { sessions } = response else {
+                panic!("public metadata did not return chat inventory");
+            };
+            confirmed_source = sessions.into_iter().find(|session| session.id == id);
+            confirmed_source.as_ref().is_some_and(|session| {
+                session.launch.session_id.is_some()
+                    && session.launch.session_id == handle.confirmed_session_id()
+            })
         },
-        "host never retained its provider-confirmed descriptor",
+        "public inventory never published its provider-confirmed descriptor",
     );
-    let confirmed_source = host.lock().unwrap().chats[&id].session.clone();
+    let confirmed_source = confirmed_source.unwrap();
     assert_eq!(
         confirmed_source.launch.session_id,
         handle.confirmed_session_id()
     );
+    let mut expected = requested.clone();
+    expected.launch.session_id = handle.confirmed_session_id();
+    assert_eq!(confirmed_source, expected);
+    assert_eq!(host.lock().unwrap().chats[&id].session, requested);
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    let inspection = Handle::inspect_remote(&identity.record, first.clone()).unwrap();
+    assert_eq!(inspection.identity, identity);
+    assert_eq!(inspection.source, requested);
+    assert!(inspection.previous_sources.contains(&confirmed_source));
+    assert_eq!(inspection.launch_account_scope, Ok(original_scope.clone()));
     let ServerResponse::ChatResumePrepared { session: live } = process_inner(
         &host,
         17,

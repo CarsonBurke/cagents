@@ -4011,11 +4011,14 @@ mod tests {
         const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_HISTORY_TEST";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
+            crate::secure_file::prepare_private_directory(&directory.path().join("runtime"))
+                .unwrap();
             assert!(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "host::chat::tests::removed_claude_account_is_reported_before_missing_resume_history", "--nocapture"])
                 .env_clear().env(CHILD, "1").env("HOME", directory.path())
                 .env("XDG_DATA_HOME", directory.path().join("data"))
                 .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
                 .env("PATH", "/usr/bin:/bin")
                 .status().unwrap().success());
             return;

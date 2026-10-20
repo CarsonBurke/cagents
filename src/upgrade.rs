@@ -1012,18 +1012,13 @@ pub(crate) mod handoff {
             && source
                 .proof
                 .as_ref()
-                .is_some_and(crate::model::HostSessionProof::is_complete)
-            && saved.launch.session_id == source.launch.session_id))
+                .is_some_and(crate::model::HostSessionProof::is_complete)))
             && source.proof.is_some()
             && saved.proof == source.proof
             && saved.id == source.id
             && saved.launch.provider == source.launch.provider
             && saved.launch.recipe == source.launch.recipe
-            && source
-                .launch
-                .session_id
-                .as_ref()
-                .is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
+            && saved.launch.session_id == source.launch.session_id
             && saved.owned_codex_listener == source.owned_codex_listener
             && saved.terminal == source.terminal
     }
@@ -1858,6 +1853,43 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "host")]
+    #[test]
+    fn issued_generic_source_preserves_only_actual_pre_id_and_confirmed_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        for provider in [crate::agent::Provider::Codex, crate::agent::Provider::Omp] {
+            let checkpoint = retained_claude_checkpoint(directory.path());
+            let mut source = checkpoint.chats[0].source.clone();
+            source.launch.provider = provider;
+            source.launch.recipe.program = provider.executable().into();
+            source.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            let mut effective = source.launch.clone();
+            effective.session_id = Some(uuid::Uuid::new_v4().to_string());
+            let saved = handoff::ChatSource {
+                source: source.clone(),
+                launch: effective.clone(),
+            };
+            let mut confirmed = source.clone();
+            confirmed.launch.session_id = effective.session_id.clone();
+            assert!(handoff::issued_chat_source_matches(&saved, &source));
+            assert!(handoff::issued_chat_source_matches(&saved, &confirmed));
+            let known_only = handoff::ChatSource {
+                source: confirmed.clone(),
+                launch: effective,
+            };
+            assert!(handoff::issued_chat_source_matches(&known_only, &confirmed));
+            assert!(
+                !handoff::issued_chat_source_matches(&known_only, &source),
+                "{provider:?}: a known source cannot manufacture a pre-ID alias"
+            );
+            confirmed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            assert!(
+                !handoff::issued_chat_source_matches(&saved, &confirmed),
+                "{provider:?}: neither recorded alias authorizes another conversation"
+            );
+        }
+    }
+
     #[test]
     fn retained_claude_pre_id_checkpoint_requires_actor_aware_reader_and_exact_launch() {
         let directory = tempfile::tempdir().unwrap();
@@ -2685,6 +2717,57 @@ mod tests {
         mislabelled["version"] = 1.into();
         fs::write(&store.path, serde_json::to_vec(&mislabelled).unwrap()).unwrap();
         assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn retained_chat_accepts_only_its_exact_carried_console() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = retained_claude_checkpoint(directory.path());
+        let mut console = carry(checkpoint(directory.path()).terminals.remove(0));
+        console.source.id = saved.chats[0].source.id;
+        let mut issued = console.source.clone();
+        issued.continuity = TerminalContinuity::Live {
+            host_session_id: saved.proof.host_session_id.clone(),
+            boot_id: saved.proof.boot_id.clone(),
+            host_incarnation: saved.proof.host_incarnation.clone(),
+        };
+        saved.chats[0].source.terminal = Some(issued);
+        saved.carried.push(console);
+        saved
+            .validate()
+            .expect("one retained execution may carry its exact console");
+        for mutation in 0..9 {
+            let mut forged = saved.clone();
+            match mutation {
+                0 => forged.carried[0]
+                    .source
+                    .launch
+                    .arguments
+                    .push("--other".into()),
+                1 => forged.carried[0].source.transcript_path = None,
+                2 => forged.carried[0].source.recovery_origin = Some(TerminalId::new()),
+                3 => forged.carried[0].source.resume_hint = Some("unissued".into()),
+                4 => forged.chats[0].source.terminal.as_mut().unwrap().id = TerminalId::new(),
+                5 => {
+                    forged.chats[0].source.terminal.as_mut().unwrap().continuity =
+                        TerminalContinuity::RelaunchAvailable {
+                            recipe: forged.carried[0].source.launch.clone(),
+                            last_exit: None,
+                        }
+                }
+                6 => {
+                    forged.chats[0].source.native_continuity =
+                        crate::chat::NativeContinuity::ReconnectOnly
+                }
+                7 => forged.chats[0].source.terminal = None,
+                8 => forged.carried.push(forged.carried[0].clone()),
+                _ => unreachable!(),
+            }
+            assert!(
+                forged.validate().is_err(),
+                "accepted forged console mutation {mutation}"
+            );
+        }
     }
 
     #[test]

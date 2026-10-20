@@ -206,6 +206,36 @@ fn pending_uninstalled_adoption_publishes_one_retained_authority_tuple() {
     drop(notifications);
     drop(original);
     assert!(identity.record.root.is_current());
+    // Internal orphan adoption does not subscribe a client. Obtain the exact
+    // public descriptor and attach before exercising the client close path.
+    let ServerResponse::ChatListed { sessions } =
+        process(&successor, 0, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("expected actual public chat inventory");
+    };
+    let listed = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .unwrap();
+    assert_eq!(listed, hosted);
+    let ServerResponse::ChatAttached { session, snapshot } = process(
+        &successor,
+        0,
+        ClientRequest::ChatAttach {
+            session: listed.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected actual public chat attachment");
+    };
+    assert_eq!(session, listed);
+    assert_eq!(snapshot.session_id, session.launch.session_id);
+    assert_eq!(snapshot.native_continuity, session.native_continuity);
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    assert!(
+        !root.join("prompts").exists(),
+        "attachment must not invent provider input"
+    );
     process(&successor, 0, ClientRequest::ChatClose { chat_id: id }).unwrap();
     wait(
         || !identity.record.root.is_current() && !identity.record.holder.is_current(),

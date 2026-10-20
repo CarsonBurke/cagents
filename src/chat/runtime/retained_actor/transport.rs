@@ -3146,17 +3146,22 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Idle);
         let mut initial = adapter.initialize().unwrap();
         if let Some(text) = body {
-            initial.events.push(chat::Event::Item(chat::Item {
-                id: "retained-body".into(),
-                role: chat::Role::Assistant,
-                content: chat::ItemContent::Text {
-                    text,
-                    thinking: false,
-                    phase: Default::default(),
-                },
-                started_at: None,
-                at: None,
-            }));
+            // Readiness is the fixture's startup barrier. Publish its body
+            // first so a ready reader cannot race an empty Copy source list.
+            initial.events.insert(
+                0,
+                chat::Event::Item(chat::Item {
+                    id: "retained-body".into(),
+                    role: chat::Role::Assistant,
+                    content: chat::ItemContent::Text {
+                        text,
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    started_at: None,
+                    at: None,
+                }),
+            );
         }
         let store = super::super::super::preflight(&spec, &mut initial).unwrap();
         let actor = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
