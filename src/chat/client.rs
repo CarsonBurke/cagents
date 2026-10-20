@@ -2429,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_previously_named_upgrade_rotation_carries_persistence_provenance() {
+    fn authenticated_upgrade_rotation_preserves_provenance_and_known_thread_identity() {
         let live = host_proof("live");
         for previous in [None, Some(CONVERSATION), Some("previous-conversation")] {
             let source = omp_card(previous, Some(host_proof("previous")));
@@ -2445,17 +2445,17 @@ mod tests {
                     },
                 },
             );
-            assert!(
-                matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == resolved)
-            );
-            assert_eq!(
-                recovery,
-                previous
-                    .filter(|id| *id != CONVERSATION)
-                    .map(|_| (source, resolved))
-            );
+            if previous.is_some_and(|id| id != CONVERSATION) {
+                assert!(outcome.is_err(), "a known provider thread cannot rotate");
+                assert!(recovery.is_none());
+            } else {
+                assert!(
+                    matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == resolved)
+                );
+                assert_eq!(recovery, Some((source, resolved)));
+            }
         }
-        let source = omp_card(Some("previous-conversation"), Some(host_proof("previous")));
+        let source = omp_card(Some(CONVERSATION), Some(host_proof("previous")));
         let mut resolved = source.clone();
         resolved.proof = Some(live.clone());
         resolved.launch.session_id = Some(CONVERSATION.into());

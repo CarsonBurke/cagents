@@ -4933,10 +4933,9 @@ for line in sys.stdin:
             .recipe
             .environment
             .insert("HOME".into(), "/another/account".into());
-        assert!(
-            restore_upgrade(&host, &saved)
-                .unwrap_err()
-                .contains("differs from its issued conversation")
+        assert_eq!(
+            restore_upgrade(&host, &saved).unwrap_err(),
+            "Upgrade native source recipe is inconsistent"
         );
         assert!(
             host.lock()
