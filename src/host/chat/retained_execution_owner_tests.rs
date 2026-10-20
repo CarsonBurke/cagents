@@ -416,26 +416,31 @@ fn answer_watermark_never_accepts_revoked_source_account_or_attachment_authority
                     .session_id = Some(uuid::Uuid::new_v4().to_string())
             }
             "account" => {
-                let mut scope = synchronization
-                    .owner
-                    .as_ref()
-                    .unwrap()
-                    .0
-                    .scope()
-                    .unwrap()
-                    .clone();
-                scope.inode += 1;
-                synchronization
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .register_native_actor_ownership(
-                        synchronization.target.identity.instance,
-                        &synchronization.target.identity.record,
-                        &synchronization.target.source,
-                        Ok(&scope),
+                // Physical admission correctly refuses a fabricated inode.
+                // Model a durable row mutation after the exact capture using
+                // only this private fixture's database, preserving admission.
+                let changed =
+                    rusqlite::Connection::open(root.path().join("registry.sqlite3")).unwrap();
+                let actor = synchronization.target.identity.instance.to_string();
+                let stored: String = changed
+                    .query_row(
+                        "SELECT ownership FROM native_actor_ownerships WHERE actor=?1",
+                        [&actor],
+                        |row| row.get(0),
                     )
                     .unwrap();
+                let mut ownership: serde_json::Value = serde_json::from_str(&stored).unwrap();
+                let inode = ownership["scope"]["Ok"]["inode"].as_u64().unwrap();
+                ownership["scope"]["Ok"]["inode"] = (inode + 1).into();
+                assert_eq!(
+                    changed
+                        .execute(
+                            "UPDATE native_actor_ownerships SET ownership=?1 WHERE actor=?2",
+                            rusqlite::params![serde_json::to_string(&ownership).unwrap(), actor],
+                        )
+                        .unwrap(),
+                    1
+                );
             }
             "attachment" => host.lock().unwrap().chats.get_mut(&id).unwrap().handle = replacement,
             "actor" => {

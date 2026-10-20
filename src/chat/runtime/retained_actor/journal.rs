@@ -1302,8 +1302,24 @@ mod tests {
         journal.ack(0).unwrap();
         assert_eq!(journal.acknowledged().unwrap(), 2);
         drop(journal);
-        let journal = Journal::open(dir.path()).unwrap();
-        assert_eq!(journal.acknowledged().unwrap(), 2);
-        assert!(journal.page(2).unwrap().is_empty());
+        // Journals are exclusively created, never reopened for replay. Verify
+        // the committed cursor and deletion with an independent read-only DB.
+        let persisted = Connection::open_with_flags(
+            dir.path().join("actor-journal.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let acknowledged: String = persisted
+            .query_row(
+                "SELECT value FROM metadata WHERE key='outcome_ack'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acknowledged, "2");
+        let queued: u64 = persisted
+            .query_row("SELECT COUNT(*) FROM outcomes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 }
