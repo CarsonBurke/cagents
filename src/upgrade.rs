@@ -2820,7 +2820,6 @@ mod tests {
         ] {
             let mut known = saved.clone();
             let source = &mut known.chats[0].source;
-            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
             if provider == crate::agent::Provider::Codex {
                 source.launch.provider = provider;
                 source.launch.recipe.program = "codex".into();
@@ -2830,6 +2829,7 @@ mod tests {
                     provider_version: "0.157.1".into(),
                 };
             }
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
             known.chats[0].launch = known.chats[0].source.launch.clone();
             known
                 .validate()
