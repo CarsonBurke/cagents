@@ -339,8 +339,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     );
     // Invalid hybrids must still be refused by the actual current helper;
     // recovery must project a genuine issued descriptor rather than relax it.
-    let inspection =
-        Handle::inspect_remote(&identity.record, requested.proof.clone().unwrap()).unwrap();
+    let inspection = Handle::inspect_remote(&identity.record, first.clone()).unwrap();
     let mut invalid = inspection.source.clone();
     invalid.launch.session_id = handle.confirmed_session_id();
     assert!(invalid.launch.session_id.is_some());
@@ -2721,7 +2720,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
     let first = proof("first");
     let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &first).unwrap());
     let registry_path = root.join("registry.sqlite3");
-    let mut state = HostState::new(first);
+    let mut state = HostState::new(first.clone());
     state.enable_holder_recovery();
     state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
     let host = Arc::new(HostLock::new(state));

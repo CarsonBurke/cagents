@@ -339,7 +339,7 @@ fn captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor() 
     let error = super::super::chat::close_captured(&host, target).unwrap_err();
     assert_eq!(
         error.code,
-        crate::terminal_ipc::ErrorCode::TerminalUnavailable,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
         "{error:?}"
     );
     {
@@ -559,7 +559,7 @@ fn captured_owning_close_refuses_a_replaced_host_execution_instance() {
     let error = super::super::chat::close_captured(&host, target).unwrap_err();
     assert_eq!(
         error.code,
-        crate::terminal_ipc::ErrorCode::TerminalUnavailable,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
         "{error:?}"
     );
     assert!(!handle.is_completed());
