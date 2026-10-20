@@ -1,5 +1,8 @@
 #![cfg(feature = "host")]
 
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -13,6 +16,7 @@ use std::{
 struct Fixture {
     root: tempfile::TempDir,
     daemon: Child,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -57,7 +61,11 @@ impl Fixture {
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         let daemon = Self::start(root.path());
-        let mut fixture = Self { root, daemon };
+        let mut fixture = Self {
+            root,
+            daemon,
+            agents: Default::default(),
+        };
         fixture.ready();
         fixture
     }
@@ -122,7 +130,9 @@ impl Fixture {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        self.agents.observe(&output);
+        output
     }
 
     fn cli(&self, arguments: &[&str]) -> Value {
@@ -344,8 +354,44 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.daemon.kill();
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+        }
+        // Fresh firings retire their execution through the scheduler. Cancel
+        // any still-active private firing only after contract assertions; the
+        // intentional stop/restart boundaries in the tests remain unchanged.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
+            }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
+            }
+        }
     }
 }
 
