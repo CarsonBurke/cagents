@@ -19,6 +19,7 @@ pub(in crate::app::chat_ui) struct Catalog {
     positions: HashMap<u64, usize>,
     plain_bytes: usize,
     prefix_hashes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
+    owners: HashMap<u64, Arc<str>>,
 }
 impl Catalog {
     pub fn retained_plain_bytes(&self) -> usize {
@@ -34,6 +35,18 @@ impl Catalog {
             .collect()
     }
 
+    pub fn owned_search_blocks(&self, items: &HashSet<String>) -> Vec<(Arc<str>, u64, Arc<str>)> {
+        self.read
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                let owner = self.owners.get(&block.identity)?;
+                items
+                    .contains(owner.as_ref())
+                    .then(|| (owner.clone(), block.identity, block.plain.clone()))
+            })
+            .collect()
+    }
     pub fn is_empty(&self) -> bool {
         self.read.blocks.is_empty()
     }
@@ -52,6 +65,8 @@ impl Catalog {
         Builder {
             read: Read::new(None),
             prefixes: HashMap::new(),
+            owners: HashMap::new(),
+            owner_pool: HashMap::new(),
         }
     }
     pub fn endpoints(&self) -> Option<(Endpoint, Endpoint)> {
@@ -122,6 +137,8 @@ pub(in crate::app::chat_ui) fn identity(item: &str, path: &[u32]) -> u64 {
 pub(in crate::app::chat_ui) struct Builder {
     read: Read,
     prefixes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
+    owners: HashMap<u64, Arc<str>>,
+    owner_pool: HashMap<String, Arc<str>>,
 }
 impl Builder {
     pub fn logical(&mut self, identity: u64, text: Arc<str>) {
@@ -132,7 +149,13 @@ impl Builder {
         self.read.custom(None, Rectangle::default(), &mut logical);
     }
     pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
-        self.logical(identity(item, path), text);
+        let identity = identity(item, path);
+        self.logical(identity, text);
+        let owner = self
+            .owner_pool
+            .entry(item.to_owned())
+            .or_insert_with(|| Arc::from(item));
+        self.owners.insert(identity, owner.clone());
     }
     pub fn indexed(
         &mut self,
@@ -142,7 +165,7 @@ impl Builder {
         prefixes: Arc<Vec<[u8; 32]>>,
     ) {
         let key = identity(item, path);
-        self.logical(key, text);
+        self.plain(item, path, text);
         self.prefixes.insert(key, prefixes);
     }
     fn enter(&mut self, item: &str, path: &[u32], kind: Kind) {
@@ -285,6 +308,7 @@ impl Builder {
             positions,
             plain_bytes,
             prefix_hashes,
+            owners: self.owners,
         })
     }
 }

@@ -21,6 +21,7 @@ mod closed_draft;
 mod completion;
 mod coordination;
 mod find;
+mod find_navigation;
 mod flow_layout;
 mod fold;
 mod hover;
@@ -278,6 +279,20 @@ pub enum Action {
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
+    FindResume(Target, find_navigation::Intent, bool),
+    FindExpired(Target, find_navigation::Intent),
+    FindIndexed(
+        Target,
+        find_navigation::Intent,
+        find_navigation::DocumentEpoch,
+        Option<find_navigation::Hit>,
+    ),
+    FindLocated(
+        Target,
+        find_navigation::Intent,
+        find_navigation::DocumentEpoch,
+        Option<scroll::LogicalLocation>,
+    ),
     CloseFind(Target),
     FindFocused(Target, bool),
     Tick,
@@ -342,6 +357,10 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::FindResume(..)
+                | Self::FindExpired(..)
+                | Self::FindIndexed(..)
+                | Self::FindLocated(..)
                 | Self::FlowAvailable
                 | Self::FlowRequest(..)
                 | Self::FlowReady(..)
@@ -1794,6 +1813,7 @@ pub(super) struct Runtime {
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
+    find_navigation: find_navigation::State,
     copied: Option<(String, Instant)>,
     /// When a cancel that would also stop background subagents was pressed,
     /// until it is pressed again or lapses.
@@ -2447,6 +2467,7 @@ impl Runtime {
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
             find_index: 0,
+            find_navigation: find_navigation::State::default(),
             copied: None,
             interrupt_armed: None,
             drop_hover: false,
@@ -2971,6 +2992,7 @@ impl Runtime {
         self.child_cache_context.clone_from(&context);
         if presentation_changed {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            self.find_navigation.changed_document();
         }
     }
 
@@ -2999,6 +3021,7 @@ impl Runtime {
         };
         prepared.install(cached, managed, expanded);
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        self.find_navigation.changed_document();
         self.refresh_find();
     }
 
@@ -3176,6 +3199,7 @@ impl Runtime {
                 selected.is_some_and(|agent| agent.items.iter().any(|item| &item.id == id))
             });
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            self.find_navigation.changed_document();
         }
         let live_ids: HashSet<&str> = snapshot
             .items
@@ -3432,6 +3456,10 @@ impl Runtime {
         }
         if expand
             && disclosure.item(key, self.child_expanded.entry(child).or_default())
+            && !self
+                .child_cache
+                .get(key)
+                .is_some_and(|cached| cached.preparing)
             && (CachedItem::prose(&item.content).is_none()
                 || self
                     .child_cache
@@ -3525,6 +3553,9 @@ impl Runtime {
             });
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
+        if !visible {
+            self.find_navigation.cancel();
+        }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
         images::sync(self);
         let result = self.present();
@@ -3567,6 +3598,7 @@ impl Runtime {
         self.child_cache_context = None;
         self.selection_document.get_mut().take();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        self.find_navigation.changed_document();
         self.presentation_evicted = true;
     }
 
@@ -4442,6 +4474,14 @@ impl Cagents {
             return Task::none();
         };
         if runtime.find_matches.is_empty() {
+            runtime.find_navigation.cancel();
+            if runtime.find.as_ref().is_some_and(|query| !query.is_empty())
+                && (runtime.presentation_evicted
+                    || runtime.snapshot.history_loading
+                    || runtime.preparation.queued_bytes() != 0)
+            {
+                return self.begin_find_navigation(target, None);
+            }
             return Task::none();
         }
         runtime.find_index = if forward {
@@ -4452,11 +4492,7 @@ impl Cagents {
         let key = runtime.find_matches[runtime.find_index].clone();
         if runtime.selected_subagent.is_some() {
             runtime.reveal_child_find_match(&key);
-            return crate::document_link::scroll_to_heading_anchored(
-                card_control_id(target.card, "chat-transcript"),
-                runtime.find_anchor(&key),
-                true,
-            );
+            return self.begin_find_navigation(target, Some(key));
         }
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
             runtime.find_disclosure.turn(&key, &mut runtime.opened);
@@ -4495,6 +4531,13 @@ impl Cagents {
                         .find_disclosure
                         .item(&item.id, &mut runtime.expanded)
                 {
+                    if runtime
+                        .cache
+                        .get(&item.id)
+                        .is_some_and(|cached| cached.preparing)
+                    {
+                        continue;
+                    }
                     let previous = runtime.cache.remove(&item.id);
                     runtime.cache.insert(
                         item.id.clone(),
@@ -4525,11 +4568,7 @@ impl Cagents {
                 }
             }
         }
-        crate::document_link::scroll_to_heading_anchored(
-            card_control_id(target.card, "chat-transcript"),
-            iced::advanced::widget::Id::new(format!("chat-turn-{}-{key}", target.card)),
-            true,
-        )
+        self.begin_find_navigation(target, Some(key))
     }
     fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
         if crate::device::is_remote() {
@@ -5015,7 +5054,7 @@ impl Cagents {
         }
     }
 
-    pub(super) fn chat_scroll_key(&self, event: &keyboard::Event) -> Option<Task<Message>> {
+    pub(super) fn chat_scroll_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
             modifiers,
@@ -5028,7 +5067,7 @@ impl Cagents {
             return None;
         }
         let card = self.workspace.focused()?;
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return None;
         };
         use keyboard::key::Named;
@@ -5053,6 +5092,7 @@ impl Cagents {
             ),
             _ => return None,
         };
+        runtime.find_navigation.cancel();
         Some(task.map(cosmic::Action::App))
     }
 
@@ -7183,11 +7223,14 @@ impl Cagents {
                         }
                     }
                 }
+                return self.resume_current_find(target, true);
             }
+
             Action::MarkdownPrepared(target, id, run, ready) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.markdown_prepared(target, &id, run, ready);
                 }
+                return self.resume_current_find(target, true);
             }
             Action::RetryMarkdown(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
@@ -8089,6 +8132,7 @@ impl Cagents {
                         }
                         return Task::batch([
                             self.list_chat_models(target.card),
+                            self.resume_current_find(target, true),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
@@ -8751,6 +8795,7 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     runtime.restore_find_disclosures();
                     runtime.find = Some(query);
                     runtime.refresh_find();
@@ -8759,8 +8804,19 @@ impl Cagents {
                 return self.chat_find_next(target, true);
             }
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            Action::FindResume(target, intent, geometry_changed) => {
+                return self.resume_find_navigation(target, intent, geometry_changed);
+            }
+            Action::FindExpired(target, intent) => self.expire_find_navigation(target, intent),
+            Action::FindIndexed(target, intent, epoch, hit) => {
+                return self.find_indexed(target, intent, epoch, hit);
+            }
+            Action::FindLocated(target, intent, epoch, location) => {
+                return self.find_located(target, intent, epoch, location);
+            }
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     runtime.restore_find_disclosures();
                     runtime.find = None;
                     runtime.find_focused = false;
@@ -9061,6 +9117,7 @@ impl Cagents {
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     let expanded = if let Some(child) = &runtime.selected_subagent {
                         if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
                             disclosure.manual_item(&id);
@@ -9106,6 +9163,7 @@ impl Cagents {
             }
             Action::ToggleTurn(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     // Invert the visible default on the first toggle, then
                     // remember explicit choices across paging. Ignore stale keys.
                     if runtime.turns.iter().any(|turn| turn.key == key) {
@@ -9121,6 +9179,7 @@ impl Cagents {
             Action::SelectSubagent(target, id) => {
                 text_copy::invalidate();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     let selected = id.filter(|id| {
                         runtime
                             .snapshot
@@ -9195,6 +9254,7 @@ impl Cagents {
             }
             Action::Unfold(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     let unfolded = if let Some(child) = &runtime.selected_subagent {
                         if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
                             disclosure.manual_part(&key);
@@ -9334,6 +9394,7 @@ impl Cagents {
             }
             Action::Latest(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_navigation.cancel();
                     if runtime.selected_subagent.is_none() {
                         if runtime.pending.is_some() {
                             if !runtime
@@ -9865,6 +9926,9 @@ impl Cagents {
                 };
                 if runtime.selected_subagent != subagent {
                     return Task::none();
+                }
+                if user_input {
+                    runtime.find_navigation.cancel();
                 }
                 if let Some(id) = subagent {
                     runtime.subagent_scroll.insert(id, scroll);

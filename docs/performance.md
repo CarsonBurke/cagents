@@ -341,6 +341,19 @@ rehashing/copying the full body during UI installation. Hiding evicts these
 body owners with the rest of the cache. A rewrite cannot overwrite a valid
 bookmark before verification.
 
+Find Next/Previous retains its existing matching-turn/item counts and temporary
+disclosure ownership. Each selected group is resolved on a single admitted
+worker to its first matching rendered logical block and UTF-8 byte. Navigation
+then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
+geometry, including horizontal readers. At most sixteen coordinate passes and
+one thirty-second deadline belong to an intent; parser and shape completions
+wake pending geometry without a timer subscription. Matching metadata without rendered
+plaintext keeps the coarse group anchor. Loading is never an exact glyph match.
+Independent intent and rendered-document epochs guard both async replies and
+the eventual native scroll mutation. Query/context/disclosure/hide changes and
+native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
+queued corrections. A Find scroll does not masquerade as new user input.
+
 The pane inspector's diagnostics disclose known source, prepared-presentation
 and logical-selection payload owners for the selected chat. These counters
 exclude opaque parser/font/renderer/image allocations and allocator retention;

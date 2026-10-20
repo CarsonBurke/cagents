@@ -1325,6 +1325,7 @@ impl Runtime {
             let catalog =
                 builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
             *document = Some((fingerprint, catalog));
+            self.find_navigation.changed_document();
         }
         let catalog = document.as_ref().unwrap().1.clone();
         let bookmark = self
@@ -1871,6 +1872,7 @@ impl Runtime {
                         .collect(),
                     self.observed_scroll.clone(),
                     self.scroll_memory.clone(),
+                    Some(self.find_navigation.guard()),
                 ),
                 target,
                 self.selected_subagent.as_deref(),
@@ -6149,6 +6151,331 @@ mod tests {
                     "Find navigation must resolve the selected child row, not an absent parent turn"
                 );
             });
+        }
+        executor.shutdown_background();
+    }
+
+    #[test]
+    fn actual_find_actions_mount_deep_logical_matches_and_reject_late_navigation() {
+        use iced::advanced::{
+            Layout, Shell, layout, mouse,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::{StreamExt, stream::BoxStream};
+        type Effect = iced::runtime::Action<cosmic::Action<Message>>;
+        struct Visible {
+            identity: u64,
+            byte: usize,
+            translation: iced::Vector,
+            pending: Option<(iced::Vector, iced::Rectangle)>,
+            clips: Vec<iced::Rectangle>,
+            found: bool,
+        }
+        impl Operation for Visible {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let old = self.translation;
+                let pushed = if let Some((translation, viewport)) = self.pending.take() {
+                    let viewport = iced::Rectangle {
+                        x: viewport.x - self.translation.x,
+                        y: viewport.y - self.translation.y,
+                        ..viewport
+                    };
+                    self.clips.push(viewport);
+                    self.translation += translation;
+                    true
+                } else {
+                    false
+                };
+                visit(self);
+                if pushed {
+                    self.clips.pop();
+                }
+                self.translation = old;
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                viewport: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.pending = Some((translation, viewport));
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                    && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
+                {
+                    let glyph = iced::Rectangle {
+                        x: bounds.x + local.x - self.translation.x,
+                        y: bounds.y + local.y - self.translation.y,
+                        ..local
+                    };
+                    self.found |= !self.clips.is_empty()
+                        && self
+                            .clips
+                            .iter()
+                            .all(|clip| glyph.intersection(clip).is_some());
+                }
+            }
+        }
+        fn view<'a>(
+            runtime: &'a Runtime,
+            shortcuts: &'a crate::settings::KeyboardShortcuts,
+        ) -> Element<'a, Message> {
+            runtime.view(
+                None,
+                false,
+                true,
+                shortcuts,
+                600.0,
+                Place {
+                    name: "fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        fn push(streams: &mut Vec<BoxStream<'static, Effect>>, task: Task<Message>) {
+            if let Some(stream) = iced::runtime::task::into_stream(task) {
+                streams.push(stream.boxed());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let needle = "FW16_UNIQUE_DEEP_NEEDLE";
+        let paragraph = format!("{} {needle}", "wide prose café λ ".repeat(16_000));
+        let code = format!(
+            "```text\n{}{} {needle}\n```",
+            "bounded line\n".repeat(2_000),
+            "W".repeat(8_000)
+        );
+        let nested = format!(
+            "{}> {needle}",
+            (0..300)
+                .map(|index| format!("> Nested paragraph {index}\n>\n"))
+                .collect::<String>()
+        );
+        let output = format!(
+            "{}{} {needle}",
+            "tool line\n".repeat(2_000),
+            "Z".repeat(8_000)
+        );
+        for (child, content, path, byte) in [
+            (
+                false,
+                ItemContent::Text {
+                    text: paragraph.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0],
+                paragraph.find(needle).unwrap(),
+            ),
+            (
+                true,
+                ItemContent::Text {
+                    text: code.clone(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0],
+                code.find(needle).unwrap() - "```text\n".len(),
+            ),
+            (
+                false,
+                ItemContent::Text {
+                    text: nested,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                vec![0, 0, 300],
+                0,
+            ),
+            (
+                false,
+                ItemContent::Tool {
+                    name: "FixtureInspect".into(),
+                    input: "fixture".into(),
+                    output: output.clone(),
+                    status: chat::ToolStatus::Succeeded,
+                },
+                vec![5],
+                output.find(needle).unwrap(),
+            ),
+        ] {
+            let item = chat::Item {
+                id: "deep-answer".into(),
+                role: chat::Role::Assistant,
+                content,
+                at: None,
+                started_at: None,
+            };
+            let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let target = runtime.target;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+            if child {
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.subagents = vec![chat::Subagent {
+                    id: "deep-child".into(),
+                    items: vec![Arc::new(item.clone())],
+                    ..native_child_fixture()
+                }];
+                handle.publish_snapshot_for_test(snapshot);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("deep-child".into()))));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            }
+            let mut streams = Vec::new();
+            push(
+                &mut streams,
+                app.handle_chat_ui(Action::Find(target, needle.into())),
+            );
+            let identity = selection::logical_identity(&item.id, &path);
+            let mut tree = Tree::empty();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
+            let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut seen = false;
+            let mut passes = 0;
+            while Instant::now() < deadline && passes < 1_000 {
+                passes += 1;
+                let mut effects = Vec::new();
+                executor.block_on(async {
+                    for stream in &mut streams {
+                        for _ in 0..8 {
+                            match tokio::time::timeout(Duration::from_millis(1), stream.next())
+                                .await
+                            {
+                                Ok(Some(effect)) => effects.push(effect),
+                                _ => break,
+                            }
+                        }
+                    }
+                });
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                let mut element = view(runtime, &shortcuts);
+                element.as_widget_mut().diff(&mut tree);
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut messages = Vec::new();
+                for effect in effects {
+                    match effect {
+                        iced::runtime::Action::Widget(operation) => {
+                            let mut current = Some(operation);
+                            while let Some(mut operation) = current.take() {
+                                element.as_widget_mut().operate(
+                                    &mut tree,
+                                    Layout::new(&node),
+                                    &renderer,
+                                    operation.as_mut(),
+                                );
+                                if let operation::Outcome::Chain(next) = operation.finish() {
+                                    current = Some(next);
+                                }
+                            }
+                            node = element
+                                .as_widget_mut()
+                                .layout(&mut tree, &renderer, &limits);
+                        }
+                        iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                            messages.push(message)
+                        }
+                        _ => {}
+                    }
+                }
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    )),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                let mut visible = Visible {
+                    identity,
+                    byte,
+                    translation: iced::Vector::ZERO,
+                    pending: None,
+                    clips: Vec::new(),
+                    found: false,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut visible,
+                );
+                let pending = runtime.find_navigation.pending();
+                drop(element);
+                for message in messages {
+                    let completed = matches!(&message, Message::ChatUi(Action::FlowReady(..)));
+                    push(&mut streams, app.update(message));
+                    // Deliver the production availability event after a real
+                    // FlowReady releases its actual output admission.
+                    if completed {
+                        push(&mut streams, app.handle_chat_ui(Action::FlowAvailable));
+                    }
+                }
+                if !pending && visible.found {
+                    seen = true;
+                    break;
+                }
+            }
+            assert!(
+                seen,
+                "actual Find action must expose the deep mounted glyph; child={child}, passes={passes}"
+            );
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().find_matches.len(),
+                1,
+                "main matching-group count is preserved"
+            );
+            for forward in [true, false] {
+                // The single match wraps in both directions through the real
+                // action and creates a fresh guarded navigation intent.
+                drop(app.handle_chat_ui(Action::FindNext(target, forward)));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                assert_eq!(runtime.find_index, 0);
+                let intent = runtime.find_navigation.guard();
+                assert!(intent.current());
+                drop(app.handle_chat_ui(Action::Scrolled(
+                    target,
+                    child.then(|| "deep-child".into()),
+                    Scroll::new(0.0, 10_000.0, 500.0),
+                    true,
+                )));
+                assert!(
+                    !intent.current(),
+                    "a late queued correction cannot override actual user navigation"
+                );
+                assert!(
+                    !app.chat_runtime_mut(target)
+                        .unwrap()
+                        .find_navigation
+                        .pending()
+                );
+            }
         }
         executor.shutdown_background();
     }

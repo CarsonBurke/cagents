@@ -33,6 +33,7 @@ pub(super) fn transcript<'a>(
         items,
         None,
         Memory::default(),
+        None,
     )
 }
 
@@ -164,6 +165,7 @@ pub(super) fn transcript_observed<'a>(
     items: Vec<(Id, &'a str)>,
     observations: Observations,
     memory: Memory,
+    find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     transcript_impl(
         content.into(),
@@ -174,6 +176,7 @@ pub(super) fn transcript_observed<'a>(
         items,
         Some(observations),
         memory,
+        find_intent,
     )
 }
 
@@ -186,6 +189,7 @@ fn transcript_impl<'a>(
     items: Vec<(Id, &'a str)>,
     observations: Option<Observations>,
     memory: Memory,
+    find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -209,6 +213,7 @@ fn transcript_impl<'a>(
         items,
         observations,
         memory,
+        find_intent,
     })
 }
 
@@ -225,6 +230,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         items: Vec::new(),
         observations: None,
         memory: Memory::default(),
+        find_intent: None,
     })
 }
 
@@ -266,11 +272,12 @@ pub(super) fn steps_id(id: &str) -> Id {
 /// its current query/document/navigation generations, applies `offset`, waits
 /// for the resulting layout, and retries until `exact` or its bounded limit.
 /// Wheel/drag navigation must cancel that pending correction in the caller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct LogicalLocation {
     pub offset: f32,
     pub exact: bool,
     pub stage: u8,
+    horizontal: Vec<(Id, f32)>,
 }
 
 struct LocateLogical {
@@ -281,6 +288,9 @@ struct LocateLogical {
     content: Option<Rectangle>,
     viewport: Option<Rectangle>,
     found: Option<(Rectangle, u8)>,
+    frames: Vec<(Id, Rectangle, Rectangle)>,
+    pending: Option<(Id, Rectangle, Rectangle)>,
+    horizontal: Vec<(Id, f32)>,
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
@@ -290,12 +300,37 @@ impl LocateLogical {
             .is_none_or(|(_, previous)| stage >= *previous)
         {
             self.found = Some((bounds, stage));
+            self.horizontal = self
+                .frames
+                .iter()
+                .filter_map(|(id, viewport, content)| {
+                    let travel = (content.width - viewport.width).max(0.0);
+                    (travel > 0.5).then(|| {
+                        (
+                            id.clone(),
+                            (bounds.x
+                                - content.x
+                                - (viewport.width - bounds.width.min(viewport.width)) / 2.0)
+                                .clamp(0.0, travel),
+                        )
+                    })
+                })
+                .collect();
         }
     }
 }
 impl Operation<Option<LogicalLocation>> for LocateLogical {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
+        let pushed = if let Some(frame) = self.pending.take() {
+            self.frames.push(frame);
+            true
+        } else {
+            false
+        };
         visit(self);
+        if pushed {
+            self.frames.pop();
+        }
     }
     fn scrollable(
         &mut self,
@@ -308,6 +343,8 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         if id == Some(&self.scroll) {
             self.content = Some(content);
             self.viewport = Some(viewport);
+        } else if let Some(id) = id {
+            self.pending = Some((id.clone(), viewport, content));
         }
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -344,6 +381,7 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
                     offset: travel - from_top,
                     exact: stage == 3,
                     stage,
+                    horizontal: self.horizontal.clone(),
                 }
             },
         ))
@@ -364,6 +402,151 @@ pub(super) fn locate_logical(
         content: None,
         viewport: None,
         found: None,
+        frames: Vec::new(),
+        pending: None,
+        horizontal: Vec::new(),
+    })
+}
+
+/// Marker consumed only by Find operations. Keyboard/history operations keep
+/// the existing input semantics; a Find correction cannot cancel itself.
+struct FindCorrection(bool);
+struct ApplyFind {
+    scroll: Id,
+    location: LogicalLocation,
+    intent: find_navigation::Intent,
+    document: Option<find_navigation::DocumentEpoch>,
+}
+impl ApplyFind {
+    fn current(&self) -> bool {
+        self.document.map_or_else(
+            || self.intent.current(),
+            |epoch| self.intent.document_current(epoch),
+        )
+    }
+}
+impl<T: 'static> Operation<T> for ApplyFind {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+        if self.current() {
+            visit(self);
+        }
+    }
+    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+        if self.current()
+            && let Some(marker) = state.downcast_mut::<FindCorrection>()
+        {
+            marker.0 = true;
+        }
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        _: Rectangle,
+        _: Rectangle,
+        _: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if !self.current() {
+            return;
+        }
+        if id == Some(&self.scroll) {
+            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(self.location.offset),
+            });
+        } else if let Some((_, x)) = self
+            .location
+            .horizontal
+            .iter()
+            .find(|(wanted, _)| Some(wanted) == id)
+        {
+            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                x: Some(*x),
+                y: None,
+            });
+        }
+    }
+}
+pub(super) fn apply_find_location(
+    target: Target,
+    location: LogicalLocation,
+    intent: find_navigation::Intent,
+    document: Option<find_navigation::DocumentEpoch>,
+) -> iced::Task<Message> {
+    iced::advanced::widget::operate(ApplyFind {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        location,
+        intent,
+        document,
+    })
+}
+pub(super) fn find_anchor(
+    target: Target,
+    anchor: Id,
+    intent: find_navigation::Intent,
+) -> iced::Task<Message> {
+    struct Anchor {
+        scroll: Id,
+        anchor: Id,
+        intent: find_navigation::Intent,
+        content: Option<Rectangle>,
+        found: Option<Rectangle>,
+        viewport: Option<Rectangle>,
+    }
+    impl<T: 'static> Operation<T> for Anchor {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            if self.intent.current() {
+                visit(self);
+            }
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            viewport: Rectangle,
+            content: Rectangle,
+            _: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.scroll) {
+                self.content = Some(content);
+                self.viewport = Some(viewport);
+            }
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.anchor) {
+                self.found = Some(bounds);
+            }
+        }
+        fn finish(&self) -> operation::Outcome<T> {
+            if !self.intent.current() {
+                return operation::Outcome::None;
+            }
+            let Some(((content, viewport), found)) =
+                self.content.zip(self.viewport).zip(self.found)
+            else {
+                return operation::Outcome::None;
+            };
+            let travel = (content.height - viewport.height).max(0.0);
+            operation::Outcome::Chain(Box::new(ApplyFind {
+                scroll: self.scroll.clone(),
+                intent: self.intent.clone(),
+                document: None,
+                location: LogicalLocation {
+                    offset: travel - (found.y - content.y).clamp(0.0, travel),
+                    exact: false,
+                    stage: 0,
+                    horizontal: Vec::new(),
+                },
+            }))
+        }
+    }
+    iced::advanced::widget::operate(Anchor {
+        scroll: card_control_id(target.card, "chat-transcript"),
+        anchor,
+        intent,
+        content: None,
+        found: None,
+        viewport: None,
     })
 }
 
@@ -403,6 +586,7 @@ struct Anchored<'a> {
     items: Vec<(Id, &'a str)>,
     observations: Option<Observations>,
     memory: Memory,
+    find_intent: Option<find_navigation::Intent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1003,10 +1187,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut before,
             );
         }
+        let mut correction = FindCorrection(false);
+        operation.custom(None, layout.bounds(), &mut correction);
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
-        if self.target.is_some() {
+        if self.target.is_some() && !correction.0 {
             let mut after = ReadTop::default();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1043,6 +1229,22 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Some(intent) = &self.find_intent
+            && layout.bounds().intersection(viewport).is_some()
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::WheelScrolled { .. })
+                    | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    | Event::Touch(_)
+                    | Event::Window(iced::window::Event::Resized(_))
+            )
+            && (matches!(
+                event,
+                Event::Touch(_) | Event::Window(iced::window::Event::Resized(_))
+            ) || cursor.is_over(layout.bounds().intersection(viewport).unwrap()))
+        {
+            intent.cancel();
+        }
         let mut before = ReadTop::default();
         if self.target.is_some() {
             self.content.as_widget_mut().operate(
@@ -1307,6 +1509,7 @@ mod tests {
                     .collect(),
                 observations.clone(),
                 memory.clone(),
+                None,
             )
         };
         let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1344,6 +1547,187 @@ mod tests {
             Some(600.0),
             "revealing a hidden transcript does not jump to its end"
         );
+    }
+
+    #[test]
+    fn queued_find_operations_check_live_intent_and_document_before_native_scroll() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let state = find_navigation::State::default();
+        let guard = state.guard();
+        let epoch = state.document_epoch();
+        let location = LogicalLocation {
+            offset: 600.0,
+            exact: true,
+            stage: 3,
+            horizontal: Vec::new(),
+        };
+        let mut element = transcript(
+            widget::Space::new().height(5000).width(Length::Fill),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut apply = ApplyFind {
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: location.clone(),
+            intent: guard.clone(),
+            document: Some(epoch),
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut apply);
+        let mut before = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        assert!(
+            before.0.is_some_and(|top| top > 0.0),
+            "positive control actually changed native scroll"
+        );
+        state.changed_document();
+        let mut stale = ApplyFind {
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 0.0,
+                ..location.clone()
+            },
+            intent: guard.clone(),
+            document: Some(epoch),
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut stale);
+        let mut after = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(
+            before.0, after.0,
+            "document changed after task creation rejects actual mutation"
+        );
+        guard.cancel();
+        let mut canceled = ApplyFind {
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 0.0,
+                ..location
+            },
+            intent: guard,
+            document: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut canceled);
+        let mut after = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(
+            before.0, after.0,
+            "even a coarse queued operation cannot override newer input"
+        );
+    }
+
+    #[test]
+    fn find_corrections_preserve_their_intent_but_native_nested_wheels_cancel_it() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        let viewport = Rectangle::with_size(Size::new(400.0, 400.0));
+        for nested in [false, true] {
+            let state = find_navigation::State::default();
+            let guard = state.guard();
+            let content: Element<'_, Message> = if nested {
+                widget::scrollable(widget::Space::new().height(10_000).width(400))
+                    .height(200)
+                    .into()
+            } else {
+                widget::Space::new().height(10_000).width(400).into()
+            };
+            let mut element = transcript_observed(
+                content,
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+                Observations::default(),
+                Memory::default(),
+                Some(guard.clone()),
+            );
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut apply = ApplyFind {
+                scroll: card_control_id(target.card, "chat-transcript"),
+                location: LogicalLocation {
+                    offset: 600.0,
+                    exact: true,
+                    stage: 3,
+                    horizontal: Vec::new(),
+                },
+                intent: guard.clone(),
+                document: Some(state.document_epoch()),
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut apply);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(guard.current());
+            assert!(
+                !messages.iter().any(|message| matches!(
+                    message,
+                    Message::ChatUi(Action::Scrolled(_, _, _, true))
+                )),
+                "Find's own correction must not claim user input"
+            );
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(
+                !guard.current(),
+                "a wheel cancels before either outer or nested reader consumes it"
+            );
+        }
     }
 
     #[test]
@@ -1450,6 +1834,9 @@ mod tests {
                         content: None,
                         viewport: None,
                         found: None,
+                        frames: Vec::new(),
+                        pending: None,
+                        horizontal: Vec::new(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;
@@ -1580,6 +1967,7 @@ mod tests {
                 vec![],
                 observations.clone(),
                 Memory::default(),
+                None,
             )
         };
         let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
