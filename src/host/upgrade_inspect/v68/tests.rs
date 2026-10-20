@@ -467,17 +467,22 @@ fn expired_68_inspection_sends_no_request_and_oversized_frames_are_refused() {
 
 #[test]
 fn full_68_inventories_obey_caps_and_stale_lease_sends_no_request() {
-    for terminals in [false, true] {
+    for (terminals, count, expected_refusal) in [
+        (false, 129, false),
+        (false, crate::upgrade::handoff::MAX_CHATS as u64, false),
+        (false, crate::upgrade::handoff::MAX_CHATS as u64 + 1, true),
+        (true, 1025, true),
+    ] {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         peer.set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let worker = std::thread::spawn(move || {
             let request = receive_raw(&mut peer).unwrap();
-            let (count, variant, item) = if terminals {
-                (1025, 1, frozen_terminal(&proof()))
+            let (variant, item) = if terminals {
+                (1, frozen_terminal(&proof()))
             } else {
-                (129, 13, frozen_session(&proof()))
+                (13, frozen_session(&proof()))
             };
             let mut payload = Vec::new();
             uint(count, &mut payload);
@@ -500,7 +505,10 @@ fn full_68_inventories_obey_caps_and_stale_lease_sends_no_request() {
         };
         drop(client);
         let request = worker.join().unwrap();
-        assert!(refused);
+        assert_eq!(
+            refused, expected_refusal,
+            "terminals={terminals}, count={count}"
+        );
         assert_eq!(
             request,
             expected_request(&proof(), 1, if terminals { 1 } else { 29 })
