@@ -509,6 +509,34 @@ pub(crate) mod handoff {
     pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
 
+    /// Enforce the durable limit while serializing, before allocating a full
+    /// report. Launch environments and recovery lineages are client supplied.
+    #[cfg(any(feature = "host", test))]
+    fn encode_bounded(value: &impl Serialize, overflow: &'static str) -> Result<Vec<u8>, String> {
+        struct Bounded {
+            bytes: Vec<u8>,
+            overflow: &'static str,
+        }
+        impl Write for Bounded {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() as u64 > MAX_BYTES - self.bytes.len() as u64 {
+                    return Err(io::Error::other(self.overflow));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Bounded {
+            bytes: Vec::new(),
+            overflow,
+        };
+        serde_json::to_writer(&mut output, value).map_err(|error| error.to_string())?;
+        Ok(output.bytes)
+    }
+
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub(crate) enum Phase {
@@ -1199,23 +1227,6 @@ pub(crate) mod handoff {
         #[cfg(any(feature = "host", test))]
         pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
             checkpoint.validate()?;
-            // Serialization is bounded independently of the number of records:
-            // launch environments and paths are supplied by clients.
-            struct Bounded(Vec<u8>);
-            impl Write for Bounded {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    if bytes.len() as u64 > MAX_BYTES - self.0.len() as u64 {
-                        return Err(io::Error::other(
-                            "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
-                        ));
-                    }
-                    self.0.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
             #[derive(Serialize)]
             struct Versioned<'a> {
                 version: u16,
@@ -1226,9 +1237,11 @@ pub(crate) mod handoff {
                 version: checkpoint.format(),
                 checkpoint,
             };
-            let mut bytes = Bounded(Vec::new());
-            serde_json::to_writer(&mut bytes, &versioned).map_err(|error| error.to_string())?;
-            self.write_named(FILE, &bytes.0)
+            let bytes = encode_bounded(
+                &versioned,
+                "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
+            )?;
+            self.write_named(FILE, &bytes)
         }
 
         /// Atomically and durably replaces `name` with `bytes`.
@@ -1360,15 +1373,13 @@ pub(crate) mod handoff {
             if previous.len() > MAX_CHATS {
                 return Err("Unconfirmed pane recovery evidence reached its capacity; existing evidence was preserved".into());
             }
-            let bytes = serde_json::to_vec(&UnattachedReport {
-                version: 1,
-                conversations: previous,
-            })
-            .map_err(|error| error.to_string())?;
-            if bytes.len() as u64 > MAX_BYTES {
-                return Err("Unconfirmed pane recovery evidence exceeds its byte limit; existing evidence was preserved".into());
-            }
-            Ok(bytes)
+            encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: previous,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )
         }
 
         #[cfg(feature = "host")]
@@ -1542,14 +1553,13 @@ pub(crate) mod handoff {
                     }),
                 };
             }
-            let bytes = serde_json::to_vec(&UnattachedReport {
-                version: UNATTACHED_VERSION,
-                conversations: &conversations,
-            })
-            .map_err(|error| error.to_string())?;
-            if bytes.len() as u64 > MAX_BYTES {
-                return Err("Unattached conversation evidence exceeds the 8 MiB byte limit; existing evidence and the upgrade checkpoint were preserved".into());
-            }
+            let bytes = encode_bounded(
+                &UnattachedReport {
+                    version: UNATTACHED_VERSION,
+                    conversations: &conversations,
+                },
+                "Unattached conversation evidence exceeds the 8 MiB byte limit; existing evidence and the upgrade checkpoint were preserved",
+            )?;
             self.write_named(UNATTACHED_FILE, &bytes)
         }
 
@@ -1603,6 +1613,24 @@ pub(crate) mod handoff {
     mod timeout_tests {
         use super::*;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[test]
+        fn evidence_encoding_stops_before_serializing_the_tail_of_an_oversized_report() {
+            struct Oversized;
+            impl Serialize for Oversized {
+                fn serialize<S: serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut sequence = serializer.serialize_seq(Some(2))?;
+                    sequence.serialize_element(&"x".repeat(MAX_BYTES as usize))?;
+                    panic!("the tail of an oversized report must never be visited");
+                }
+            }
+            let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
+            assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
 
         #[test]
         fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
@@ -2298,6 +2326,20 @@ mod tests {
         checkpoint.chats[0].launch = checkpoint.chats[0].source.launch.clone();
         assert!(store.save(&checkpoint).unwrap_err().contains("8 MiB"));
         assert_eq!(fs::read(&store.path).unwrap(), before);
+        let recovered_file = directory.path().join("daemon-upgrade.recovered.json");
+        let previous = fs::read(&recovered_file).unwrap();
+        let oversized = handoff::RecoveredChat {
+            evidence: checkpoint.chats[0].clone(),
+            replacement: checkpoint.chats[0].source.clone(),
+            aliases: Vec::new(),
+        };
+        assert!(
+            store
+                .record_recovered(&[oversized])
+                .unwrap_err()
+                .contains("8 MiB")
+        );
+        assert_eq!(fs::read(&recovered_file).unwrap(), previous);
     }
 
     #[test]
