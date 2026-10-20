@@ -3640,6 +3640,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
                 |_| {},
             )
             .unwrap();
@@ -3811,6 +3812,7 @@ mod tests {
                     Intent::Start,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     |_| {},
