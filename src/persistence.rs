@@ -2568,7 +2568,7 @@ pub(crate) struct MigrationInspectionBudget {
 impl MigrationInspectionBudget {
     pub(crate) fn new(deadline: Instant) -> Self {
         Self {
-            remaining_rows: 4096,
+            remaining_rows: crate::upgrade::handoff::MAX_SESSIONS,
             remaining_bytes: 64 * 1024 * 1024,
             deadline,
         }

@@ -4,6 +4,7 @@ use std::{fs, os::fd::AsRawFd, process::Command};
 
 const PROGRESS_CAPABILITY: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
 const FIXTURE_OUTPUT: &str = "CAGENTS_TEST_STARTUP_REPORT_OUTPUT";
+const FIXTURE_COUNT: &str = "CAGENTS_TEST_STARTUP_REPORT_COUNT";
 const FIXTURE_FAILURE: &str = "CAGENTS_TEST_STARTUP_REPORT_FAILURE";
 
 /// Exercise the public UI reporting functions in a fresh process, including
@@ -19,7 +20,11 @@ fn startup_report_fixture() {
         unsafe { libc::dup2(output.as_raw_fd(), libc::STDOUT_FILENO) },
         -1
     );
-    cagents::instance::report_ui_recovery_progress(1).unwrap();
+    let count = std::env::var(FIXTURE_COUNT)
+        .ok()
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(1);
+    cagents::instance::report_ui_recovery_progress(count).unwrap();
     cagents::instance::report_ui_recovery_progress(1).unwrap();
     let result = if std::env::var_os(FIXTURE_FAILURE).is_some() {
         Err("recovery-incomplete: retained pane is still reconnecting".into())
@@ -61,6 +66,7 @@ fn startup_progress_requires_an_explicit_launcher_capability() {
             .args(["--exact", "startup_report_fixture", "--nocapture"])
             .env(FIXTURE_OUTPUT, &output)
             .env("XDG_STATE_HOME", directory.path().join("state"))
+            .env_remove(FIXTURE_COUNT)
             .env_remove(FIXTURE_FAILURE)
             .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
             .env_remove(PROGRESS_CAPABILITY);
@@ -80,5 +86,33 @@ fn startup_progress_requires_an_explicit_launcher_capability() {
             expected,
             "handshake={handshake:?}, capability={capability:?}, failed={failed}"
         );
+    }
+}
+
+#[test]
+fn startup_progress_accepts_supported_inventory_and_refuses_excess() {
+    let directory = tempfile::tempdir().unwrap();
+    for count in [129, 4096, 5120, 5121] {
+        let output = directory.path().join(format!("count-{count}"));
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "startup_report_fixture", "--nocapture"])
+            .env(FIXTURE_OUTPUT, &output)
+            .env(FIXTURE_COUNT, count.to_string())
+            .env("XDG_STATE_HOME", directory.path().join("state"))
+            .env(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV, "1")
+            .env(PROGRESS_CAPABILITY, "1")
+            .env_remove(FIXTURE_FAILURE)
+            .output()
+            .unwrap();
+        if count <= 5120 {
+            assert!(child.status.success(), "{child:?}");
+            assert_eq!(
+                fs::read_to_string(output).unwrap(),
+                format!("recovering: {count}\nready\n")
+            );
+        } else {
+            assert!(!child.status.success());
+            assert!(!fs::read_to_string(output).unwrap().contains("ready"));
+        }
     }
 }
