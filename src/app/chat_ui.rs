@@ -153,6 +153,7 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
+    FlowAvailable,
     FlowRequest(Target, flow_layout::Request),
     FlowReady(
         Target,
@@ -341,6 +342,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::FlowAvailable
                 | Self::FlowRequest(..)
                 | Self::FlowReady(..)
                 | Self::AccountCommitted(..)
@@ -1013,6 +1015,7 @@ struct CachedItem {
     stamp: Option<(u64, String, String)>,
     preview: tool_text::Preview,
     tool_input: Option<tool_text::ToolText>,
+    prepared_tools: Option<Arc<tool_text::PreparedSources>>,
     tool_output: Option<tool_text::ToolText>,
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
@@ -1051,7 +1054,11 @@ struct CachedItem {
 }
 impl Drop for CachedItem {
     fn drop(&mut self) {
-        if !self.markdown.items().is_empty() || !self.blocks.is_empty() {
+        if self.markdown.has_retained_allocations()
+            || self.source.retained_capacity() != 0
+            || !self.blocks.is_empty()
+            || self.prepared_tools.is_some()
+        {
             preparation::retire_presentation(preparation::Presentation {
                 parsed: preparation::Parsed {
                     source: std::mem::take(&mut self.source),
@@ -1060,6 +1067,7 @@ impl Drop for CachedItem {
                 blocks: std::mem::take(&mut self.blocks),
                 palettes: self.palette_views.take(),
                 item: self.item.take(),
+                prepared_tools: self.prepared_tools.take(),
             });
         }
     }
@@ -1143,6 +1151,23 @@ impl CachedItem {
         growing: bool,
         coordination: Option<chat::coordination::Coordination>,
     ) -> Self {
+        // Only the exact immutable item authorizes descriptor reuse. A tail
+        // token cannot prove that a same-ID replacement has the same body.
+        let prepared_tools = previous
+            .as_ref()
+            .filter(|cached| {
+                CachedItem::prose(content).is_none()
+                    && cached
+                        .item
+                        .as_ref()
+                        .is_some_and(|item| std::ptr::eq(&item.content, content))
+            })
+            .map(|cached| {
+                cached
+                    .prepared_tools
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(tool_text::PreparedSources::retained(cached)))
+            });
         let item = previous.as_ref().and_then(|cached| cached.item.clone());
         let stamp = previous.as_ref().and_then(|cached| cached.stamp.clone());
         // Weak descriptors survive append publication; only mounted row owners
@@ -1200,11 +1225,36 @@ impl CachedItem {
                 let mut previous = patches.into_iter();
                 changes
                     .iter()
-                    .map(|change| ToolText::update(previous.next(), &change.diff, Language::Diff))
+                    .enumerate()
+                    .map(|(index, change)| {
+                        let old = previous.next();
+                        if let Some(prepared) = prepared_tools
+                            .as_ref()
+                            .and_then(|sources| sources.patches.get(index))
+                        {
+                            ToolText::from_prepared(old, prepared)
+                        } else {
+                            ToolText::update(old, &change.diff, Language::Diff)
+                        }
+                    })
                     .collect()
             }
             _ => Vec::new(),
         };
+        let prepare_text =
+            |previous, text: &str, language, prepared: Option<&tool_text::PreparedText>| {
+                if let Some(prepared) = prepared {
+                    ToolText::from_prepared(previous, prepared)
+                } else {
+                    ToolText::update(previous, text, language)
+                }
+            };
+        let prepared_input = prepared_tools
+            .as_ref()
+            .and_then(|sources| sources.input.as_ref());
+        let prepared_output = prepared_tools
+            .as_ref()
+            .and_then(|sources| sources.output.as_ref());
         let (tool_input, tool_output) = match content {
             _ if !expanded => (None, None),
             ItemContent::Command {
@@ -1212,19 +1262,47 @@ impl CachedItem {
                 output: text,
                 ..
             } => (
-                Some(ToolText::update(input, command, Language::Shell)),
-                Some(ToolText::update(output, text, Language::structured(text))),
+                Some(prepare_text(
+                    input,
+                    command,
+                    Language::Shell,
+                    prepared_input,
+                )),
+                Some(prepare_text(
+                    output,
+                    text,
+                    if prepared_output.is_some() {
+                        Language::Plain
+                    } else {
+                        Language::structured(text)
+                    },
+                    prepared_output,
+                )),
             ),
             ItemContent::Tool {
                 input: text,
                 output: result,
                 ..
             } => (
-                Some(ToolText::update(input, text, Language::structured(text))),
-                Some(ToolText::update(
+                Some(prepare_text(
+                    input,
+                    text,
+                    if prepared_input.is_some() {
+                        Language::Plain
+                    } else {
+                        Language::structured(text)
+                    },
+                    prepared_input,
+                )),
+                Some(prepare_text(
                     output,
                     result,
-                    Language::structured(result),
+                    if prepared_output.is_some() {
+                        Language::Plain
+                    } else {
+                        Language::structured(result)
+                    },
+                    prepared_output,
                 )),
             ),
             _ => (None, None),
@@ -1234,6 +1312,7 @@ impl CachedItem {
             placeholder: false,
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
+            prepared_tools,
             tool_output,
             patches,
             token: ChangeToken::of(content),
@@ -1259,6 +1338,16 @@ impl CachedItem {
             coordination: coordination
                 .map(|reading| Box::new(coordination::Coordinated::new(reading))),
         };
+        if expanded
+            && matches!(
+                content,
+                ItemContent::Command { .. }
+                    | ItemContent::Tool { .. }
+                    | ItemContent::Changes { .. }
+            )
+        {
+            cached.prepared_tools = Some(Arc::new(tool_text::PreparedSources::retained(&cached)));
+        }
         if cached.coordination.is_some() {
             cached.highlight(theme);
             cached.settle_blocks();
@@ -2750,10 +2839,8 @@ impl Runtime {
         for (index, item) in items.iter().enumerate() {
             let growing = busy && index == newest;
             let coordinated = chat::coordination::recognize(item, provider);
-            let reader_only = CachedItem::prose(&item.content).is_none()
-                && expanded.contains(&item.id)
-                && !reader_proofs.is_empty()
-                && preparation::source_bytes(&item.content).is_some();
+            let reader_only = !reader_proofs.is_empty()
+                && preparation::has_tool_reader_proofs(item, &reader_proofs);
             if (CachedItem::prose(&item.content).is_some() || reader_only) && coordinated.is_none()
             {
                 let current = cache.get(&item.id);
@@ -5507,6 +5594,11 @@ impl Cagents {
             }
         }
         if self.cards.values().any(|card| {
+            matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed))
+        }) {
+            subscriptions.push(flow_layout::availability());
+        }
+        if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
             if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
         }) {
@@ -7039,6 +7131,25 @@ impl Cagents {
             }
             Action::DiscardClosedDraft(target, revision) => {
                 return self.discard_closed_chat_draft(target, revision);
+            }
+            Action::FlowAvailable => {
+                let targets: Vec<_> = self
+                    .cards
+                    .values()
+                    .filter_map(|card| match card {
+                        CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed) => {
+                            Some(runtime.target)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let mut tasks = Vec::new();
+                for target in targets {
+                    for request in flow_layout::deferred_requests(target) {
+                        tasks.push(self.handle_chat_action(Action::FlowRequest(target, request)));
+                    }
+                }
+                return Task::batch(tasks);
             }
             Action::FlowRequest(target, request) => {
                 if self.chat_runtime_mut(target).is_some()
@@ -8969,6 +9080,17 @@ impl Cagents {
                                 .get(&id)
                                 .is_some_and(|cached| cached.coordination.is_some())
                     }) {
+                        // A collapsed item can still be awaiting authenticated
+                        // bookmark-prefix verification. Opening it must not
+                        // replace that owner with an unverified cold reader;
+                        // completion installs using the current disclosure.
+                        if runtime
+                            .presentation_cache()
+                            .get(&id)
+                            .is_some_and(|cached| cached.preparing)
+                        {
+                            return Task::none();
+                        }
                         let previous = runtime.presentation_cache_mut().remove(&id);
                         let cached = CachedItem::updated(
                             &item.content,
@@ -22167,6 +22289,294 @@ mod tests {
                 read.0.iter().any(|plain| plain.as_ref() == source),
                 "completed glyph owner survives context recreation"
             );
+        }
+    }
+
+    #[test]
+    fn collapsed_tool_bookmarks_survive_runtime_updates_and_reopen_only_after_worker_verification()
+    {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        struct Move;
+        impl Operation for Move {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                    x: Some(100.0),
+                    y: Some(300.0),
+                });
+            }
+        }
+        #[derive(Default)]
+        struct Read(Vec<iced::Vector>);
+        impl Operation for Read {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0.push(translation);
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0));
+        for child in [false, true] {
+            for hidden in [false, true] {
+                for rewrite in [false, true] {
+                    let mut app = crate::app::tests::context_inspector_test_app(false);
+                    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                    let target = chat_runtime(&app, card).target;
+                    let original = format!("{}old-tail", "x".repeat(4096));
+                    let item = Arc::new(chat::Item {
+                        id: "bookmarked-tool".into(),
+                        role: chat::Role::Assistant,
+                        content: ItemContent::Tool {
+                            name: "FixtureInspect".into(),
+                            input: original.clone(),
+                            output: original.clone(),
+                            status: chat::ToolStatus::Running,
+                        },
+                        started_at: None,
+                        at: None,
+                    });
+                    let mut snapshot = Snapshot {
+                        generation: 5,
+                        session_id: Some(KNOWN_THREAD.into()),
+                        ready: true,
+                        items: vec![item.clone()],
+                        ..Snapshot::default()
+                    };
+                    if child {
+                        snapshot.subagents.push(chat::Subagent {
+                            id: "selected-child".into(),
+                            kind: "fixture".into(),
+                            description: "Child".into(),
+                            status: chat::ToolStatus::Running,
+                            model: None,
+                            waiting: false,
+                            detail: String::new(),
+                            background: true,
+                            items: vec![item.clone()],
+                        });
+                    }
+                    show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+                    if child {
+                        drop(app.handle_chat_ui(Action::SelectSubagent(
+                            target,
+                            Some("selected-child".into()),
+                        )));
+                    }
+                    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    let memory = runtime.scroll_memory.clone();
+                    let context = runtime.selected_subagent.clone();
+                    // Mount native reader geometry with the actual cached
+                    // ToolText source authority, then destroy every native tree.
+                    let mount = |source: reader_source::Source, part, axis, narrow: bool| {
+                        let logical = selection::logical_identity(&item.id, &[part]);
+                        let key = scroll::reader_key(logical, axis);
+                        let remembered = memory.reader_width_for(context.as_deref(), key, &source);
+                        scroll::block_source(
+                            widget::scrollable(scroll::minimum_width(
+                                widget::container(
+                                    widget::Space::new()
+                                        .width(if narrow { 100.0 } else { 2000.0 })
+                                        .height(2000),
+                                ),
+                                remembered,
+                            ))
+                            .direction(iced::widget::scrollable::Direction::Both {
+                                vertical: design::scrollbar(),
+                                horizontal: design::scrollbar(),
+                            })
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                            memory.clone(),
+                            context.clone(),
+                            key,
+                            false,
+                            Some(source),
+                        )
+                    };
+                    for part in [4, 5] {
+                        let cached = &runtime.presentation_cache()[&item.id];
+                        let source = if part == 4 {
+                            &cached.tool_input
+                        } else {
+                            &cached.tool_output
+                        }
+                        .as_ref()
+                        .unwrap()
+                        .reader_source
+                        .clone();
+                        for axis in [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical] {
+                            let mut element = mount(source.clone(), part, axis, false);
+                            let mut tree = Tree::new(&element);
+                            let node = element
+                                .as_widget_mut()
+                                .layout(&mut tree, &renderer, &limits);
+                            element.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                &mut Move,
+                            );
+                            element
+                                .as_widget_mut()
+                                .layout(&mut tree, &renderer, &limits);
+                        }
+                    }
+                    let original_proofs = memory.reader_proofs(context.as_deref());
+                    assert_eq!(original_proofs.len(), 4);
+                    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                    assert!(
+                        !app.chat_runtime_mut(target)
+                            .unwrap()
+                            .item_expanded(&item.id)
+                    );
+                    let handle = app
+                        .chat_runtime_mut(target)
+                        .unwrap()
+                        .handle()
+                        .unwrap()
+                        .clone();
+                    if hidden {
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .set_visible(false)
+                            .unwrap();
+                        preparation::retirement_barrier();
+                        assert!(
+                            app.chat_runtime_mut(target)
+                                .unwrap()
+                                .presentation_cache()
+                                .is_empty()
+                        );
+                        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .set_visible(true)
+                            .unwrap();
+                    }
+                    let changed = if rewrite {
+                        format!("{}new-tail", "x".repeat(4096))
+                    } else {
+                        format!("{original} appended while collapsed")
+                    };
+                    let next = Arc::new(chat::Item {
+                        content: ItemContent::Tool {
+                            name: "FixtureInspect".into(),
+                            input: changed.clone(),
+                            output: changed.clone(),
+                            status: chat::ToolStatus::Running,
+                        },
+                        ..(*item).clone()
+                    });
+                    snapshot.generation += 1;
+                    snapshot.items[0] = next.clone();
+                    if child {
+                        snapshot.subagents[0].items[0] = next.clone();
+                    }
+                    handle.replace_snapshot_for_test(snapshot);
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    runtime.refresh();
+                    assert!(
+                        runtime.preparation.contains(&item.id),
+                        "collapsed bookmarked items use actual worker admission"
+                    );
+                    assert_eq!(
+                        *memory.reader_proofs(context.as_deref()),
+                        *original_proofs,
+                        "prefix evidence changes only after worker completion"
+                    );
+                    // Reopen before output arrives: Toggle must preserve the
+                    // actual admitted owner rather than construct a cold reader.
+                    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    assert!(runtime.item_expanded(&item.id));
+                    assert!(runtime.presentation_cache()[&item.id].preparing);
+                    preparation::drain_fixture(runtime);
+                    let cached = &runtime.presentation_cache()[&item.id];
+                    assert!(!cached.preparing);
+                    for part in [4, 5] {
+                        let reader = if part == 4 {
+                            &cached.tool_input
+                        } else {
+                            &cached.tool_output
+                        }
+                        .as_ref()
+                        .unwrap();
+                        assert_eq!(reader.text.as_ref(), changed);
+                        // Exact precomputed source/Arc descriptors survive a
+                        // later disclosure rebuild without rehashing or copying.
+                        let shared = reader.text.clone();
+                        for axis in [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical] {
+                            let key = scroll::reader_key(
+                                selection::logical_identity(&item.id, &[part]),
+                                axis,
+                            );
+                            let remembered = memory.reader_width_for(
+                                context.as_deref(),
+                                key,
+                                &reader.reader_source,
+                            );
+                            assert_eq!(remembered >= 2000.0, !rewrite);
+                            let mut element = mount(reader.reader_source.clone(), part, axis, true);
+                            let mut tree = Tree::new(&element);
+                            let node = element
+                                .as_widget_mut()
+                                .layout(&mut tree, &renderer, &limits);
+                            let mut read = Read::default();
+                            element.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                &mut read,
+                            );
+                            assert_eq!(
+                                read.0,
+                                [if rewrite {
+                                    iced::Vector::ZERO
+                                } else {
+                                    iced::Vector::new(100.0, 300.0)
+                                }]
+                            );
+                        }
+                        assert!(Arc::ptr_eq(&shared, &reader.text));
+                    }
+                    let source_owner = cached.tool_output.as_ref().unwrap().text.clone();
+                    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                    assert!(
+                        Arc::ptr_eq(
+                            &source_owner,
+                            &app.chat_runtime_mut(target).unwrap().presentation_cache()[&item.id]
+                                .tool_output
+                                .as_ref()
+                                .unwrap()
+                                .text
+                        ),
+                        "reopening shares worker-prepared immutable body"
+                    );
+                }
+            }
         }
     }
 

@@ -33,6 +33,70 @@ impl Language {
     }
 }
 
+/// Immutable reader allocations can be built by a worker and shared through
+/// disclosure changes. Native interaction state remains on the event thread.
+#[derive(Clone)]
+pub(super) struct PreparedText {
+    key: u64,
+    language: Language,
+    pub(super) text: Arc<str>,
+    source: reader_source::Source,
+}
+impl PreparedText {
+    fn new(text: &str, language: Language) -> Self {
+        let language = if text.len() > CachedItem::HIGHLIGHT_LIMIT {
+            Language::Plain
+        } else {
+            language
+        };
+        Self {
+            key: tail_digest(language as u64, text),
+            language,
+            text: Arc::from(text),
+            source: reader_source::Source::new(text),
+        }
+    }
+}
+#[derive(Clone, Default)]
+pub(super) struct PreparedSources {
+    pub(super) input: Option<PreparedText>,
+    pub(super) output: Option<PreparedText>,
+    pub(super) patches: Vec<PreparedText>,
+}
+impl PreparedSources {
+    pub(super) fn new(content: &ItemContent) -> Self {
+        match content {
+            ItemContent::Command {
+                command, output, ..
+            } => Self {
+                input: Some(PreparedText::new(command, Language::Shell)),
+                output: Some(PreparedText::new(output, Language::structured(output))),
+                ..Self::default()
+            },
+            ItemContent::Tool { input, output, .. } => Self {
+                input: Some(PreparedText::new(input, Language::structured(input))),
+                output: Some(PreparedText::new(output, Language::structured(output))),
+                ..Self::default()
+            },
+            ItemContent::Changes { changes, .. } => Self {
+                patches: changes
+                    .iter()
+                    .map(|change| PreparedText::new(&change.diff, Language::Diff))
+                    .collect(),
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+    pub(super) fn retained(cached: &CachedItem) -> Self {
+        Self {
+            input: cached.tool_input.as_ref().map(ToolText::prepared),
+            output: cached.tool_output.as_ref().map(ToolText::prepared),
+            patches: cached.patches.iter().map(ToolText::prepared).collect(),
+        }
+    }
+}
+
 pub(super) struct ToolText {
     key: u64,
     // Reader identity survives body appends; source provenance decides when
@@ -253,6 +317,35 @@ impl Preview {
 }
 
 impl ToolText {
+    fn prepared(&self) -> PreparedText {
+        PreparedText {
+            key: self.key,
+            language: self.language,
+            text: self.text.clone(),
+            source: self.reader_source.clone(),
+        }
+    }
+    pub(super) fn from_prepared(previous: Option<Self>, prepared: &PreparedText) -> Self {
+        if previous.as_ref().is_some_and(|previous| {
+            previous.language == prepared.language && Arc::ptr_eq(&previous.text, &prepared.text)
+        }) {
+            return previous.unwrap();
+        }
+        Self {
+            key: prepared.key,
+            reader_identity: previous
+                .as_ref()
+                .map_or(prepared.key, |previous| previous.reader_identity),
+            reader_source: prepared.source.clone(),
+            flow_cache: previous
+                .as_ref()
+                .map(|previous| previous.flow_cache.clone())
+                .unwrap_or_default(),
+            language: prepared.language,
+            text: prepared.text.clone(),
+            syntax: std::cell::RefCell::new(None),
+        }
+    }
     pub(super) fn retained_bytes(&self) -> usize {
         self.text.len()
             + self

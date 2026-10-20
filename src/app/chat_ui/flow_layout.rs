@@ -499,12 +499,52 @@ impl std::fmt::Debug for Request {
 }
 
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
+fn available() -> &'static tokio::sync::watch::Sender<u64> {
+    static AVAILABLE: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+        std::sync::OnceLock::new();
+    AVAILABLE.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+/// One coalesced event source, including a current-state event on subscription:
+/// permit release after stale-output reclamation must wake an otherwise idle UI.
+pub(super) fn availability() -> Subscription<Message> {
+    Subscription::run(availability_stream)
+}
+fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+    iced::futures::stream::unfold(
+        (available().subscribe(), true),
+        |(mut receiver, initial)| async move {
+            if !initial {
+                receiver.changed().await.ok()?;
+            }
+            receiver.borrow_and_update();
+            Some((action(Action::FlowAvailable), (receiver, false)))
+        },
+    )
+}
+pub(super) fn deferred_requests(target: Target) -> Vec<Request> {
+    REQUESTS.with(|requests| {
+        requests
+            .borrow()
+            .values()
+            .filter_map(|entry| {
+                let entry = entry.upgrade()?;
+                let mut entry = entry.borrow_mut();
+                if entry.target != Some(target) || entry.deferred.is_none() {
+                    return None;
+                }
+                entry.request()
+            })
+            .collect()
+    })
+}
+
 #[derive(Debug)]
 pub(super) struct WorkSlot(Option<tokio::sync::OwnedSemaphorePermit>);
 impl Drop for WorkSlot {
     fn drop(&mut self) {
         self.0.take();
-        COMPLETED.fetch_add(1, Ordering::AcqRel);
+        let epoch = COMPLETED.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        available().send_replace(epoch);
     }
 }
 
@@ -1851,6 +1891,101 @@ fn last_geometry_owner_retires_off_thread_after_widget_and_cache_release() {
         weak_plain.upgrade().is_none(),
         "retirement releases the actual source owner"
     );
+}
+
+#[test]
+fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_release() {
+    use iced::futures::StreamExt;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let stale = Prepared::new(
+        &[Span::new("old geometry")],
+        iced::Pixels(16.0),
+        iced::Font::DEFAULT,
+        400.0,
+        iced::widget::text::Wrapping::WordOrGlyph,
+    );
+    *stale.admission.lock().unwrap() =
+        Some(WorkSlot(Some(slots.clone().try_acquire_owned().unwrap())));
+    let cache = Cache::default();
+    let entry = cache.entry(91, vec![Span::new("new idle reader")].into());
+    entry.borrow_mut().bind_target(target);
+    entry
+        .borrow_mut()
+        .configure(400.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+    let request = entry.borrow_mut().request().unwrap();
+    let epoch = run_with_slots(target, request.clone(), slots.clone())
+        .err()
+        .expect("old output owns actual slot");
+    entry.borrow_mut().defer(&request, epoch);
+    let events = availability_stream();
+    let mut events = Box::pin(events);
+    executor
+        .block_on(events.next())
+        .expect("initial current-state wake");
+    let release = preparation::hold_retirement();
+    drop(stale);
+    assert!(
+        slots.clone().try_acquire_owned().is_err(),
+        "stale output cannot release admission before geometry retirement"
+    );
+    // A UI wake/redraw before the reclaimer advances cannot admit B. Other
+    // tests may also advance the shared epoch; actual semaphore admission,
+    // rather than a guessed epoch value, is the control's authority.
+    for retry in deferred_requests(target) {
+        let epoch = run_with_slots(target, retry.clone(), slots.clone())
+            .err()
+            .expect("stalled destructor still owns admission");
+        entry.borrow_mut().defer(&retry, epoch);
+    }
+    release.send(()).unwrap();
+    let retry = executor.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(matches!(
+                    events.next().await,
+                    Some(Message::ChatUi(Action::FlowAvailable))
+                ));
+                // This is the production availability dispatch contract: only
+                // already deferred live entries retry, without native input,
+                // provider publication, tick or an assumed extra redraw.
+                for retry in deferred_requests(target) {
+                    match run_with_slots(target, retry.clone(), slots.clone()) {
+                        Ok(task) => return (retry, task),
+                        Err(epoch) => entry.borrow_mut().defer(&retry, epoch),
+                    }
+                }
+            }
+        })
+        .await
+        .expect("permit release itself wakes deferred B")
+    });
+    let (request, task) = retry;
+    let output = executor.block_on(async {
+        let mut outputs = iced::runtime::task::into_stream(task).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(output) = outputs.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    Action::FlowReady(_, _, Some(ready)),
+                ))) = output
+                {
+                    return ready;
+                }
+            }
+            panic!("retried reader produces actual geometry");
+        })
+        .await
+        .expect("bounded admitted retry")
+    });
+    assert!(entry.borrow_mut().complete(&request, Some(output)));
+    assert!(entry.borrow().prepared().is_some());
 }
 
 #[test]

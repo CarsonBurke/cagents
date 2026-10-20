@@ -33,6 +33,7 @@ const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
     send::<prose::CodeBlock>();
+    send::<tool_text::PreparedSources>();
 };
 
 #[derive(Default)]
@@ -185,6 +186,28 @@ fn verify_markdown_readers(
         }
     }
 }
+/// Bookmarked readers need source verification even while their disclosure is
+/// collapsed. Match only this item's exact paths; unrelated bookmarks must not
+/// enqueue every collapsed tool in a long transcript.
+pub(super) fn has_tool_reader_proofs(
+    item: &chat::Item,
+    proofs: &HashMap<u64, reader_source::Proof>,
+) -> bool {
+    let has_path = |path: &[u32]| {
+        let logical = selection::logical_identity(&item.id, path);
+        [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical]
+            .into_iter()
+            .any(|axis| proofs.contains_key(&scroll::reader_key(logical, axis)))
+    };
+    match &item.content {
+        ItemContent::Command { .. } | ItemContent::Tool { .. } => has_path(&[4]) || has_path(&[5]),
+        ItemContent::Changes { changes, .. } => {
+            (0..changes.len()).any(|index| has_path(&[6, index as u32]))
+        }
+        _ => false,
+    }
+}
+
 fn verify_tool_reader(
     item_id: &str,
     path: &[u32],
@@ -483,6 +506,7 @@ pub(super) struct Prepared {
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
     reader_verifications: HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+    prepared_tools: Option<Arc<tool_text::PreparedSources>>,
     #[cfg(test)]
     syntax_work: (usize, usize),
     // Retain the source lease through queued output as well as execution.
@@ -505,6 +529,7 @@ impl Prepared {
             _blocks: self.blocks,
             _palettes: Some(self.palettes),
             _item: Some(self.request.item),
+            _prepared_tools: self.prepared_tools,
             _owner: self._owner,
             _permit: self._permit,
         });
@@ -513,11 +538,14 @@ impl Prepared {
         cached
             .reader_memory
             .verified_readers(cached.reader_context.as_deref(), self.reader_verifications);
+        let previous_tools = cached.prepared_tools.take();
         if CachedItem::prose(&self.request.item.content).is_none() {
-            let previous = std::mem::replace(
+            let mut previous = std::mem::replace(
                 cached,
                 CachedItem::preparing(&self.request.item, self.request.theme),
             );
+            previous.item = Some(self.request.item.clone());
+            previous.prepared_tools.clone_from(&self.prepared_tools);
             *cached = CachedItem::updated(
                 &self.request.item.content,
                 self.request.theme,
@@ -537,6 +565,7 @@ impl Prepared {
             _blocks: std::mem::replace(&mut cached.blocks, self.blocks),
             _palettes: std::mem::replace(&mut cached.palette_views, Some(self.palettes)),
             _item: cached.item.replace(self.request.item.clone()),
+            _prepared_tools: previous_tools,
             _owner: self._owner,
             _permit: self._permit,
         };
@@ -558,6 +587,7 @@ struct Retired {
     _blocks: HashMap<u64, prose::CodeBlock>,
     _palettes: Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
+    _prepared_tools: Option<Arc<tool_text::PreparedSources>>,
     _owner: Arc<Shared>,
     // Declared last so retirement completes before the next parser is admitted.
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -568,6 +598,7 @@ pub(super) struct Presentation {
     pub(super) blocks: HashMap<u64, prose::CodeBlock>,
     pub(super) palettes: Option<prose::Palettes>,
     pub(super) item: Option<Arc<chat::Item>>,
+    pub(super) prepared_tools: Option<Arc<tool_text::PreparedSources>>,
 }
 
 enum Retirement {
@@ -578,6 +609,8 @@ enum Retirement {
     // destructors finish, including cancelled/hidden sources without output.
     Detached(Arc<Shared>),
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
+    #[cfg(test)]
+    Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
 }
 pub(super) fn retire_geometry(
     geometry: Box<flow_layout::Geometry>,
@@ -622,6 +655,8 @@ fn enqueue_retirement(retired: Retirement) {
                 Retirement::Installed(retired) => drop(retired),
                 Retirement::Detached(owner) => drop(owner),
                 Retirement::Barrier(reply) => { let _ = reply.send(std::thread::current().id()); }
+                #[cfg(test)]
+                Retirement::Hold(entered, release) => { let _ = entered.send(()); let _ = release.recv_timeout(Duration::from_secs(10)); }
             }
             let remaining = RETIRING.fetch_sub(1, Ordering::AcqRel) - 1;
             tracing::trace!(target: "cagents::memory", owner = "chat_retirement", pending_items = remaining);
@@ -649,6 +684,16 @@ fn reclamation_barrier() -> Result<std::thread::ThreadId, String> {
 /// while holding a parser, reader, font-system or reclaimer lock.
 pub(super) fn reclaim_before_work() -> Result<(), String> {
     reclamation_barrier().map(|_| ())
+}
+#[cfg(test)]
+pub(super) fn hold_retirement() -> std::sync::mpsc::Sender<()> {
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    enqueue_retirement(Retirement::Hold(entered, held));
+    observed
+        .recv_timeout(Duration::from_secs(10))
+        .expect("retirement fixture entered");
+    release
 }
 #[cfg(test)]
 pub(super) fn retirement_barrier() -> std::thread::ThreadId {
@@ -860,12 +905,16 @@ fn execute(
         parsed.markdown.discard_continuation();
     }
     let palettes = prose::palettes(&blocks);
+    let prepared_tools = CachedItem::prose(&request.item.content)
+        .is_none()
+        .then(|| Arc::new(tool_text::PreparedSources::new(&request.item.content)));
     Ok(Prepared {
         request,
         parsed,
         blocks,
         palettes,
         reader_verifications,
+        prepared_tools,
         #[cfg(test)]
         syntax_work,
         _owner: shared,
@@ -1041,8 +1090,21 @@ mod tests {
                 (reader_source::Source::new(output).proof(), previous)
             );
         }
+        let worker_output = prepared
+            .prepared_tools
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .text
+            .clone();
         let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Auto);
         prepared.install(&mut cached, false, true);
+        assert!(
+            Arc::ptr_eq(&worker_output, &cached.tool_output.as_ref().unwrap().text),
+            "UI installation shares the worker allocation"
+        );
         assert!(!cached.placeholder && !cached.preparing);
         assert_eq!(cached.tool_input.as_ref().unwrap().text.as_ref(), input);
         assert_eq!(cached.tool_output.as_ref().unwrap().text.as_ref(), output);
@@ -1266,6 +1328,41 @@ mod tests {
         assert_eq!(cached.markdown.items().len(), 1);
         drop(admitted);
     }
+    #[test]
+    fn zero_rendered_reference_document_retires_its_actual_parser_off_thread() {
+        let body: String = (0..4_000)
+            .map(|index| format!("[reference-{index}]: https://example.test/{index}\n"))
+            .collect();
+        let source = item(&body);
+        let mut state = configured(target(), &source);
+        state.stage(
+            &source,
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let output = execute(shared, permit()).unwrap();
+        let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Auto);
+        output.install(&mut cached, true, false);
+        assert!(cached.markdown.items().is_empty());
+        assert!(cached.blocks.is_empty());
+        assert!(cached.markdown.reference_count() >= 3_999);
+        assert!(cached.markdown.has_retained_allocations());
+        // Remove the canonical copy first: the cached document is the final
+        // owner, including its non-rendered reference definitions.
+        drop(state);
+        retirement_barrier();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cached.markdown.watch_disposal(sender);
+        drop(cached);
+        let disposed = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actual Content disposal");
+        assert_eq!(disposed, retirement_barrier());
+        assert_ne!(disposed, std::thread::current().id());
+    }
+
     #[test]
     fn syntax_theme_change_rejects_old_worker_palette_without_losing_input() {
         let source = item("```rust\nlet value = 42;\n```\n");

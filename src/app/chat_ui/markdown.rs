@@ -54,6 +54,17 @@ pub struct Content {
     reparse_items: usize,
     #[cfg(test)]
     parsed_bytes: usize,
+    #[cfg(test)]
+    disposal: Option<Arc<Disposal>>,
+}
+#[cfg(test)]
+#[derive(Debug)]
+struct Disposal(std::sync::mpsc::Sender<std::thread::ThreadId>);
+#[cfg(test)]
+impl Drop for Disposal {
+    fn drop(&mut self) {
+        let _ = self.0.send(std::thread::current().id());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +342,29 @@ impl Content {
         self.open_plain = false;
         self.pending_spaces = 0;
         self.reparse_items = 0;
+    }
+
+    /// A document can own substantial references or unfinished input without
+    /// producing a single rendered item. Cache disposal must account for all
+    /// these owners, using constant-time container checks.
+    pub(super) fn has_retained_allocations(&self) -> bool {
+        self.items.capacity() != 0
+            || self.incomplete.capacity() != 0
+            || self.state.leftover.capacity() != 0
+            || self.state.references.capacity() != 0
+            || self.state.images.capacity() != 0
+            || self.open_fence.is_some()
+    }
+    #[cfg(test)]
+    pub(super) fn watch_disposal(
+        &mut self,
+        sender: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    ) {
+        self.disposal = Some(Arc::new(Disposal(sender)));
+    }
+    #[cfg(test)]
+    pub(super) fn reference_count(&self) -> usize {
+        self.state.references.len()
     }
 
     /// Returns the Markdown items, ready to be rendered.
