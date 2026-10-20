@@ -162,6 +162,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    RetainedCopyCommitted(CardId, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -322,6 +323,7 @@ impl Action {
             Self::Ready(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -420,6 +422,8 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
+    upgrade_admission: Option<chat::Session>,
 }
 
 struct LocalReturn {
@@ -536,7 +540,6 @@ impl State {
         !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
     }
 
-    #[cfg(test)]
     fn attempt(&self, card: CardId) -> Option<&Attempt> {
         match self.phases.get(&card) {
             Some(Phase::Starting(attempt)) => Some(attempt),
@@ -2358,6 +2361,30 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// Readiness for the updater's saved-pane gate; no provider is launched here.
+    pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
+        if self.is_draft() {
+            return Err("A hosted conversation became an unstarted draft".into());
+        }
+        if self.disconnected {
+            return Err(self
+                .error
+                .clone()
+                .unwrap_or_else(|| "Conversation is disconnected".into()));
+        }
+        let handle = self
+            .handle()
+            .ok_or("Conversation has no native attachment")?;
+        if !handle.is_connected() {
+            return Err("Conversation connection closed during recovery".into());
+        }
+        let snapshot = handle.snapshot();
+        if snapshot.exited || snapshot.read_only_reason.is_some() {
+            return Err("Conversation cannot accept a message after recovery".into());
+        }
+        Ok(snapshot.ready && !snapshot.history_loading)
+    }
+
     pub(super) fn parent_transcript_selected(&self) -> bool {
         self.selected_subagent.is_none()
     }
@@ -4249,6 +4276,7 @@ impl Cagents {
                 target,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
                     committed: false,
@@ -4621,7 +4649,19 @@ impl Cagents {
         if agent_updates != self.durable.agent_updates {
             Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
         }
+        let admission_sources = self
+            .chat_ui
+            .phases
+            .iter()
+            .filter_map(|(card, phase)| match phase {
+                Phase::Starting(attempt) if attempt.upgrade_admission.is_some() => {
+                    Some((*card, &attempt.session))
+                }
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         if defaults.is_empty()
+            && admission_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
             && repository_navigation == self.durable.repository_navigation
         {
@@ -4630,6 +4670,16 @@ impl Cagents {
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
         saved.repository_navigation = repository_navigation;
+        for card in &mut saved.cards {
+            if let Some(source) = admission_sources.get(&card.id) {
+                // The canonical view permits an attachment, not a speculative
+                // snapshot rewrite of the saved conversation's ownership.
+                card.kind = CardKind::Chat((**source).clone());
+                saved
+                    .pending_chat_admissions
+                    .insert(card.id, (**source).clone());
+            }
+        }
         if defaults.is_empty() {
             return Arc::new(saved);
         }
@@ -5606,6 +5656,34 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
+        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+    }
+
+    pub(in crate::app) fn start_shared_chat_upgrade(
+        &mut self,
+        card: CardId,
+        source: chat::Session,
+        canonical: chat::Session,
+    ) -> Task<Message> {
+        self.start_chat_with_upgrade(
+            card,
+            source,
+            chat::Intent::Restore,
+            None,
+            false,
+            Some(canonical),
+        )
+    }
+
+    fn start_chat_with_upgrade(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+        intent: chat::Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        upgrade_admission: Option<chat::Session>,
+    ) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
@@ -5619,6 +5697,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                upgrade_admission: upgrade_admission.clone(),
             }),
         );
         let sender = self.chat_ui.sender.clone();
@@ -5629,16 +5708,22 @@ impl Cagents {
                 // UI thread then only sees a join error and can still draw.
                 Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || {
-                        ClientHandle::connect(
-                            session,
-                            intent,
-                            source,
-                            terminate_source,
-                            selection,
-                            move |wake| {
-                                let _ = sender.try_send((target, wake));
-                            },
-                        )
+                        let wake = move |wake| {
+                            let _ = sender.try_send((target, wake));
+                        };
+                        match upgrade_admission {
+                            Some(canonical) => {
+                                ClientHandle::connect_upgrade(session, canonical, wake)
+                            }
+                            None => ClientHandle::connect(
+                                session,
+                                intent,
+                                source,
+                                terminate_source,
+                                selection,
+                                wake,
+                            ),
+                        }
                         .map(Arc::new)
                     },
                 )))
@@ -6648,6 +6733,21 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::RetainedCopyCommitted(card, result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(format!(
+                        "The saved draft copy could not be stored: {error}. Keep this window open and retry saving."
+                    )));
+                } else if !self
+                    .card_state(card)
+                    .is_some_and(|state| state.existence.is_open())
+                {
+                    // An explicit disposal may have followed the checkpoint.
+                    // Its ordinary snapshot remains the latest intention.
+                    self.persist();
+                }
+                return Task::none();
+            }
             Action::UpgradeCommitted(target, ready, result) => {
                 match result {
                     Ok(()) => {
@@ -6720,12 +6820,19 @@ impl Cagents {
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
-                            CardKind::Chat(session) => account_source
-                                .as_ref()
-                                .or(upgrade_source)
-                                .map_or(session.id == attempt.session.id, |source| {
-                                    session == source
-                                }),
+                            CardKind::Chat(session) => {
+                                attempt.upgrade_admission.as_ref().map_or_else(
+                                    || {
+                                        account_source
+                                            .as_ref()
+                                            .or(upgrade_source)
+                                            .map_or(session.id == attempt.session.id, |source| {
+                                                session == source
+                                            })
+                                    },
+                                    |canonical| session == canonical,
+                                )
+                            }
                             CardKind::Terminal(session) => {
                                 attempt.session.terminal.as_ref().is_some_and(|source| {
                                     source.id == session.id && source.launch == session.launch
@@ -6734,6 +6841,16 @@ impl Cagents {
                             _ => false,
                         }
                 }) {
+                    if attempt.upgrade_admission.is_some() {
+                        // A newer authoritative descriptor cannot inherit
+                        // this old source's Content, even if a receipt landed
+                        // before its UI acknowledgment. Preserve it under a
+                        // fresh inert identity; the late handle only detaches.
+                        drop(result);
+                        let retained = self.retain_shared_upgrade_source(target.card);
+                        self.persist();
+                        return retained.0;
+                    }
                     // The conversation started, but this card can no longer
                     // hold it. Leaving it alone left a daemon writer and its
                     // provider process running with nothing on screen able to
@@ -6749,14 +6866,50 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                if result.is_err() && attempt.upgrade_admission.is_some() {
+                    // Unproved lineage cannot bind the saved Content to the
+                    // canonical actor. Keep it as an inert copy and leave
+                    // reconnection explicit; no provider restart is authorized.
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                        runtime.connection = Connection::AwaitingAdmission;
+                    }
+                    if let Some(pane) = self
+                        .workspace_model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .find(|pane| {
+                            pane.id == target.card
+                                && matches!(&pane.kind, CardKind::Chat(session)
+                                if Some(session) == attempt.upgrade_admission.as_ref())
+                        })
+                        .cloned()
+                    {
+                        let retained = self.retain_unresolved_shared_upgrade(&pane);
+                        self.persist();
+                        return retained.0;
+                    }
+                    return Task::none();
+                }
                 match result {
                     Ok(handle) => {
+                        if attempt.upgrade_admission.as_ref().is_some_and(|canonical| {
+                            handle.upgrade_recovery().is_none_or(|(source, resolved)| {
+                                source != &attempt.session || resolved != canonical
+                            })
+                        }) {
+                            self.status = Some(TransientNotice::error(
+                                "The shared conversation did not confirm its saved upgrade lineage.",
+                            ));
+                            return Task::none();
+                        }
                         if let Some((source, resolved)) = handle.upgrade_recovery() {
                             let replacement = handle.session();
                             if account_source.is_some()
                                 || source != &attempt.session
                                 || &replacement != resolved
-                                || !chat::is_upgrade_recovery(source, &replacement)
+                                || !(chat::is_upgrade_recovery(source, &replacement)
+                                    || chat::is_upgrade_identity_learning(source, &replacement))
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6849,6 +7002,11 @@ impl Cagents {
                                 });
                             }
                         }
+                        if attempt.upgrade_admission.is_some() {
+                            Arc::make_mut(&mut self.durable)
+                                .pending_chat_admissions
+                                .remove(&target.card);
+                        }
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -6908,7 +7066,10 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
-                        if account_source.is_some() {
+                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                            // Shared projection may already hold the canonical
+                            // descriptor. Still save the confirmed draft and
+                            // removal of its pending marker after the receipt.
                             self.install_chat_session(target.card, session.clone());
                             self.persist();
                         } else {
@@ -11072,6 +11233,136 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_gate_requires_all_hundred_saved_panes_and_preserves_their_composers() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut cards = Vec::new();
+        for index in 0..100 {
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text(&format!("Draft {index}")));
+            cards.push((card, target));
+        }
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        let (card, target) = cards[99];
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.disconnected = true;
+        runtime.error = Some("Upgrade replacement changed configuration".into());
+        assert!(
+            app.startup_pane_check()
+                .unwrap_err()
+                .contains(&card.to_string())
+        );
+        assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
+        app.chat_runtime_mut(target).unwrap().disconnected = false;
+        assert_eq!(app.startup_pane_check(), Ok(true));
+    }
+
+    #[test]
+    fn upgrade_gate_requires_every_live_terminal_without_provider_activity_heuristics() {
+        for program in ["omp", "my-agent-wrapper", "bash"] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let card = app.durable.cards[0].id;
+            let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind
+            else {
+                unreachable!()
+            };
+            session.launch.program = program.into();
+            assert_eq!(
+                app.startup_pane_check(),
+                Ok(false),
+                "{program} is still loading"
+            );
+            app.cards.insert(
+                card,
+                CardRuntime::Failed("Fixture terminal failed to attach".into()),
+            );
+            assert!(
+                app.startup_pane_check()
+                    .unwrap_err()
+                    .contains(&card.to_string())
+            );
+            app.cards.remove(&card);
+            assert_eq!(
+                app.startup_pane_check(),
+                Ok(false),
+                "missing runtime is not ready"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_updater_pipe_after_surface_open_keeps_the_conversation_and_unsaved_draft() {
+        use iced::futures::StreamExt;
+
+        let drain = |task| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => {
+                            tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
+                                .await
+                                .expect("startup report effects must settle")
+                        }
+                        None => Vec::new(),
+                    }
+                })
+        };
+        let failure = || {
+            Message::StartupReported(Err(
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe).to_string()
+            ))
+        };
+        let mut unopened = crate::app::tests::context_inspector_test_app(false);
+        assert!(
+            drain(unopened.update(failure()))
+                .iter()
+                .any(|effect| matches!(effect, iced::runtime::Action::Exit)),
+            "the control must observe the real exit before a recovery window opens"
+        );
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text(
+                "  Unsent recovery draft 🦀\n\n",
+            ));
+        let draft = chat_runtime(&app, card).composer.text();
+        let handle = chat_runtime(&app, card).handle().cloned().unwrap();
+        app.startup_gate = crate::app::startup_gate::State::fixture_opened();
+        let cards = app.durable.cards.clone();
+        // Public dispatch also schedules ordinary attention effects. Inspect
+        // what the runtime receives, not whether a batch allocated a stream.
+        let effects = drain(app.update(failure()));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                iced::runtime::Action::Exit
+                    | iced::runtime::Action::Window(iced::runtime::window::Action::Close(_))
+            )),
+            "report failure must not issue window exit or close: {effects:?}"
+        );
+        assert!(app.exit.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            draft,
+            "unsent whitespace and UTF-8 must survive the failed report"
+        );
+        assert!(app.status.is_some());
+    }
+
+    #[test]
     fn history_reconnect_discards_old_request_generation_and_navigation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, _) = history_fixture(&mut app);
@@ -14116,18 +14407,22 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
-                while let Some(action) = stream.next().await {
-                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                        message @ Message::ChatUi(
-                            Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
-                        ),
-                    )) = action
-                    {
-                        return message;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::ChatUi(
+                                Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                            ),
+                        )) = action
+                        {
+                            return message;
+                        }
                     }
-                }
-                panic!("account commit produced no acknowledgment");
+                    panic!("account commit produced no acknowledgment");
+                })
+                .await
+                .expect("session writer did not acknowledge the exact transition within 10 seconds")
             })
     }
 
@@ -17068,13 +17363,40 @@ mod tests {
 
     #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for (stale_reply, codex_resume) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (
+            stale_reply,
+            codex_resume,
+            legacy_paired,
+            learns_identity,
+            paired_recipe,
+            writer_refused,
+        ) in [
+            (false, false, false, false, 0, false),
+            (true, false, false, false, 0, false),
+            (false, true, false, false, 0, false),
+            (true, true, false, false, 0, false),
+            (false, false, true, false, 0, false),
+            (true, false, true, false, 0, false),
+            (false, false, true, true, 0, false),
+            (true, false, true, true, 0, false),
+            (false, false, true, false, 1, false),
+            (true, false, true, false, 1, false),
+            (false, false, true, false, 2, false),
+            (true, false, true, false, 2, false),
+            (false, false, true, false, 1, true),
+            (false, false, true, false, 2, true),
+        ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            // This assertion observes the presented history. Hidden panes
+            // intentionally keep no rendered snapshot until they are shown.
+            app.workspace.resize_viewport(1_600.0);
+            assert_eq!(
+                app.workspace.visibility(card),
+                Some(VisibilityClass::Visible)
+            );
             let mut source = chat_runtime(&app, card).session.clone();
-            if codex_resume {
+            if codex_resume || legacy_paired {
                 source.launch.provider = Provider::Codex;
                 source.launch.recipe.program = "codex".into();
                 source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
@@ -17085,9 +17407,53 @@ mod tests {
                     &allocator
                 ));
                 source.launch.session_id = Some(KNOWN_THREAD.into());
-                source.native_continuity = chat::NativeContinuity::Durable {
-                    provider_version: "0.100.0".into(),
-                };
+                if !legacy_paired {
+                    source.native_continuity = chat::NativeContinuity::Durable {
+                        provider_version: "0.100.0".into(),
+                    };
+                } else {
+                    let proof = source.proof.clone().unwrap();
+                    source.terminal = Some(TerminalSession {
+                        id: source.id,
+                        launch: source.launch.terminal_recipe().unwrap(),
+                        continuity: TerminalContinuity::Live {
+                            host_session_id: proof.host_session_id,
+                            boot_id: proof.boot_id,
+                            host_incarnation: proof.host_incarnation,
+                        },
+                        transcript_path: None,
+                        resume_hint: None,
+                        owned_codex_listener: None,
+                        recovery_origin: None,
+                        predecessor: None,
+                    });
+                }
+                if learns_identity {
+                    source.launch.session_id = None;
+                }
+                if paired_recipe != 0 {
+                    // An old converted chat keeps its fresh issued recipe,
+                    // while its terminal can have been a fresh CLI or shell.
+                    // The daemon owns no private listener for this pairing.
+                    source.reset_owned_codex_listener();
+                    source.launch.recipe.arguments = vec![
+                        "--remote".into(),
+                        "unix:///run/test-paired-codex.sock".into(),
+                    ];
+                    source
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/private/test-codex-home".into());
+                    let mut issued = source.launch.recipe.clone();
+                    if paired_recipe == 2 {
+                        issued.program = "/bin/bash".into();
+                        issued.arguments = vec!["--login".into()];
+                    }
+                    let terminal = source.terminal.as_mut().unwrap();
+                    terminal.launch = issued;
+                    terminal.transcript_path = Some("/private/test-paired-transcript".into());
+                }
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             }
             let directory = tempfile::tempdir().unwrap();
@@ -17103,7 +17469,18 @@ mod tests {
                 .unwrap()
                 .flush(Duration::from_secs(10))
                 .unwrap();
+            if writer_refused {
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .operation_store()
+                    .shutdown()
+                    .unwrap();
+            }
             let mut replacement = source.clone();
+            if learns_identity {
+                replacement.launch.session_id = Some(KNOWN_THREAD.into());
+            }
             replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
             if codex_resume {
                 replacement
@@ -17111,18 +17488,37 @@ mod tests {
                     .recipe
                     .arguments
                     .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
-            } else {
-                replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            } else if legacy_paired {
+                let proof = replacement.proof.clone().unwrap();
+                replacement.terminal.as_mut().unwrap().continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
+                };
             }
-            let handle = Arc::new(ClientHandle::fixture_upgrade(
-                source.clone(),
-                replacement.clone(),
-                Snapshot {
-                    session_id: replacement.launch.session_id.clone(),
-                    ready: true,
-                    ..Snapshot::default()
-                },
-            ));
+            let history = vec![Arc::new(chat::Item {
+                id: "paired-upgrade-existing-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("Existing paired answer survives upgrade"),
+                started_at: None,
+                at: None,
+            })];
+            let snapshot = Snapshot {
+                session_id: replacement.launch.session_id.clone(),
+                ready: true,
+                items: history.clone(),
+                ..Snapshot::default()
+            };
+            let handle = Arc::new(if legacy_paired {
+                ClientHandle::fixture_upgrade_handshake(
+                    source.clone(),
+                    replacement.clone(),
+                    snapshot,
+                )
+                .unwrap()
+            } else {
+                ClientHandle::fixture_upgrade(source.clone(), replacement.clone(), snapshot)
+            });
             let target = app.chat_ui.next_target(card);
             app.chat_ui.phases.insert(
                 card,
@@ -17131,6 +17527,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    upgrade_admission: None,
                 }),
             );
             app.cards.remove(&card);
@@ -17145,6 +17542,35 @@ mod tests {
             );
             assert!(!app.cards.contains_key(&card));
             let receipt = account_commit_reply(task);
+            if writer_refused {
+                assert!(matches!(&receipt,
+                    Message::ChatUi(Action::UpgradeCommitted(_, _, Err(reason)))
+                        if reason == &crate::persistence::StoreError::Closed.to_string()));
+                let _ = app.update(receipt);
+                assert!(!app.chat_start_pending(card));
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(source.clone())
+                );
+                assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+                let database = rusqlite::Connection::open_with_flags(
+                    directory.path().join("state.sqlite3"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let stored: String = database
+                    .query_row(
+                        "SELECT content_json FROM cards WHERE card_id=?1",
+                        [card.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<chat::Session>(&stored).unwrap(),
+                    source
+                );
+                continue;
+            }
             assert!(matches!(
                 receipt,
                 Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
@@ -17158,6 +17584,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        upgrade_admission: None,
                     }),
                 );
                 let _ = app.update(receipt);
@@ -17173,6 +17600,7 @@ mod tests {
                     CardKind::Chat(replacement.clone())
                 );
                 assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                assert_eq!(chat_runtime(&app, card).snapshot.items, history);
                 app.persist();
                 let writer = app.session.as_ref().unwrap();
                 writer.flush(Duration::from_secs(10)).unwrap();

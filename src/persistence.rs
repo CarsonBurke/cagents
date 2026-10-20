@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -325,6 +325,100 @@ pub struct PendingOperation {
     pub status: PendingOperationStatus,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
+}
+
+/// A fresh local view of saved bytes. This grants no provider, retirement,
+/// descriptor replacement, or canonical-pane ownership authority.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct RetainedChatCopy {
+    pub workspace: WorkspaceId,
+    pub source_card: CardId,
+    pub source: crate::chat::Session,
+    pub copy: CardState,
+    pub draft: String,
+    pub scope: Option<PathBuf>,
+    pub channel: Option<crate::model::ChannelId>,
+}
+
+impl RetainedChatCopy {
+    fn validate(&self) -> Result<()> {
+        if self.copy.id == self.source_card
+            || !self.copy.existence.is_open()
+            || !self.copy.width_fraction.is_finite()
+            || self.copy.width_fraction <= 0.0
+            || !matches!(&self.copy.kind, CardKind::Chat(session) if session == &self.source)
+            || !self.source.has_valid_native_continuity()
+            || (self.source.owned_codex_listener.is_some() && !self.source.owns_codex_listener())
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy changed its captured source".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Keep a committed copy reachable in snapshots captured before its receipt.
+    /// Only an explicit tombstone can remove it; omission cannot spend it.
+    pub(crate) fn project(&self, state: &mut WorkspaceState) -> Result<()> {
+        self.validate()?;
+        if state.id != self.workspace {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy belongs to another workspace".into(),
+            ));
+        }
+        if let Some(card) = state.cards.iter().find(|card| card.id == self.copy.id) {
+            if !card.existence.is_open() {
+                return Ok(());
+            }
+            if card.kind != self.copy.kind {
+                return Err(StoreError::InvalidState(
+                    "Retained chat copy source changed before saving".into(),
+                ));
+            }
+        } else {
+            state.cards.push(self.copy.clone());
+        }
+        if state
+            .chat_drafts
+            .get(&self.copy.id)
+            .is_some_and(|draft| draft != &self.draft)
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy text changed before saving".into(),
+            ));
+        }
+        state.chat_drafts.insert(self.copy.id, self.draft.clone());
+        state.local_only_cards.insert(self.copy.id);
+        state
+            .pending_chat_admissions
+            .insert(self.copy.id, self.source.clone());
+        let channel = self
+            .channel
+            .and_then(|id| state.channels.iter_mut().find(|channel| channel.id == id));
+        if let Some(channel) = channel {
+            if !channel.cards.contains(&self.copy.id) {
+                let index = channel
+                    .cards
+                    .iter()
+                    .position(|card| *card == self.source_card)
+                    .map_or(channel.cards.len(), |index| index + 1);
+                channel.cards.insert(index, self.copy.id);
+            }
+        } else {
+            // Do not recreate a channel another client deleted. The source's
+            // directory still provides a local navigation home for its text.
+            state.card_scopes.insert(
+                self.copy.id,
+                self.scope
+                    .clone()
+                    .unwrap_or_else(|| self.source.launch.recipe.working_directory.clone()),
+            );
+        }
+        if let Some(scope) = &self.scope {
+            state.card_scopes.insert(self.copy.id, scope.clone());
+        }
+        Ok(())
+    }
 }
 
 /// The storage generations a snapshot is written against.
@@ -1277,7 +1371,9 @@ impl StateStore {
         source: &crate::chat::Session,
         replacement: &crate::chat::Session,
     ) -> Result<()> {
-        if !crate::chat::is_upgrade_recovery(source, replacement) {
+        if !(crate::chat::is_upgrade_recovery(source, replacement)
+            || crate::chat::is_upgrade_identity_learning(source, replacement))
+        {
             return Err(StoreError::InvalidState(
                 "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs".into(),
             ));
@@ -1296,6 +1392,7 @@ impl StateStore {
         let transaction = inner
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_descriptor_write(&transaction)?;
         let (kind, content, existence): (String, Option<String>, String) = transaction.query_row(
             "SELECT kind_tag, content_json, existence_json FROM cards WHERE card_id = ?1",
             [card_id.to_string()],
@@ -1330,6 +1427,149 @@ impl StateStore {
         transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Commit only a new inert copy, even when a newer canonical descriptor
+    /// makes the caller's full workspace snapshot unacceptable. Existing card
+    /// payloads and generations are never rewritten by this operation.
+    pub fn preserve_chat_copy(&self, copy: &RetainedChatCopy) -> Result<WorkspaceCommit> {
+        copy.validate()?;
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_descriptor_write(&transaction)?;
+        let workspace = copy.workspace.to_string();
+        let generation = select_generation(&transaction, SELECT_WORKSPACE_GENERATION, &workspace)?
+            .ok_or_else(|| {
+                StoreError::InvalidState("Retained chat copy needs its existing workspace".into())
+            })?;
+        if !select_existence(&transaction, SELECT_WORKSPACE_EXISTENCE, &workspace)?
+            .is_some_and(|existence| existence.is_open())
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy workspace is closed".into(),
+            ));
+        }
+        let owner: Option<String> = transaction
+            .query_row(
+                SELECT_CARD_WORKSPACE,
+                [copy.source_card.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(workspace.as_str()) {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy origin is outside this workspace".into(),
+            ));
+        }
+        let receipt_key = format!("workspace:{workspace}:retained_chat_copy:{}", copy.copy.id);
+        use sha2::Digest;
+        // A receipt verifies retries without retaining another hidden copy of
+        // draft text or account configuration after an explicit discard.
+        let digest = format!("{:x}", sha2::Sha256::digest(to_json(copy)?.as_bytes()));
+        let mut manifest = load_workspace_manifest_connection(&transaction, copy.workspace)?
+            .ok_or_else(|| {
+                StoreError::InvalidState("Retained chat copy workspace disappeared".into())
+            })?;
+        let existing = existing_cards(&transaction, &workspace)?;
+        if let Some(receipt) = metadata(&transaction, &receipt_key)? {
+            if receipt != digest
+                || !existing
+                    .get(&copy.copy.id)
+                    .is_some_and(|card| card.existence.is_open())
+                || load_card_connection(&transaction, copy.copy.id, &self.boot_id, None)?
+                    .is_none_or(|card| card.kind != copy.copy.kind)
+                || manifest.chat_drafts.get(&copy.copy.id) != Some(&copy.draft)
+                || !manifest.local_only_cards.contains(&copy.copy.id)
+                || manifest.pending_chat_admissions.get(&copy.copy.id) != Some(&copy.source)
+                || !(manifest.card_scopes.contains_key(&copy.copy.id)
+                    || manifest
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&copy.copy.id)))
+            {
+                return Err(StoreError::InvalidState(
+                    "Retained chat copy retry changed its committed payload".into(),
+                ));
+            }
+            return Ok(WorkspaceCommit {
+                generation,
+                card_generations: existing
+                    .into_iter()
+                    .map(|(id, card)| (id, card.generation))
+                    .collect(),
+            });
+        }
+        if transaction
+            .query_row(SELECT_CARD_WORKSPACE, [copy.copy.id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy identity is already occupied".into(),
+            ));
+        }
+        let ordinal: usize = transaction.query_row(
+            "SELECT coalesce(max(ordinal) + 1, 0) FROM cards WHERE workspace_id = ?1",
+            [&workspace],
+            |row| row.get(0),
+        )?;
+        let card_generation = save_card(
+            &transaction,
+            &workspace,
+            ordinal,
+            &copy.copy,
+            0,
+            None,
+            now_unix_ms(),
+        )?;
+        // Merge navigation from the current transaction, never from a captured
+        // UI snapshot that could replace the canonical pane or unrelated edits.
+        manifest
+            .chat_drafts
+            .insert(copy.copy.id, copy.draft.clone());
+        manifest.local_only_cards.insert(copy.copy.id);
+        manifest
+            .pending_chat_admissions
+            .insert(copy.copy.id, copy.source.clone());
+        let mut state = WorkspaceState::default();
+        state.id = copy.workspace;
+        state.channels = manifest.channels;
+        state.card_scopes = manifest.card_scopes;
+        copy.project(&mut state)?;
+        for (name, value) in [
+            ("chat_drafts", to_json(&manifest.chat_drafts)?),
+            ("local_only_cards", to_json(&manifest.local_only_cards)?),
+            (
+                "pending_chat_admissions",
+                to_json(&manifest.pending_chat_admissions)?,
+            ),
+            (CHANNELS_FIELD, to_json(&state.channels)?),
+            ("card_scopes", to_json(&state.card_scopes)?),
+        ] {
+            set_metadata(
+                &transaction,
+                &format!("workspace:{workspace}:navigation:{name}"),
+                &value,
+            )?;
+        }
+        set_metadata(&transaction, &receipt_key, &digest)?;
+        let next = next_generation(generation, "workspace", copy.workspace)?;
+        transaction.execute("UPDATE workspaces SET generation = ?1, updated_at_unix_ms = ?2 WHERE workspace_id = ?3", params![u64_to_i64(next, "workspace generation")?, now_unix_ms(), &workspace])?;
+        let mut card_generations = existing
+            .into_iter()
+            .map(|(id, card)| (id, card.generation))
+            .collect::<BTreeMap<_, _>>();
+        card_generations.insert(copy.copy.id, card_generation);
+        transaction.commit()?;
+        Ok(WorkspaceCommit {
+            generation: next,
+            card_generations,
+        })
     }
 
     pub fn save_project(&self, project: &ProjectState) -> Result<u64> {
@@ -2315,6 +2555,237 @@ pub enum SavedSessionOwner {
     Directory(PathBuf),
 }
 
+/// One budget spans all source windows. Per-row bounds alone would allow
+/// thousands of individually valid descriptors to exhaust updater memory.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct MigrationInspectionBudget {
+    remaining_rows: usize,
+    remaining_bytes: u64,
+    deadline: Instant,
+}
+
+#[cfg(any(feature = "host", test))]
+impl MigrationInspectionBudget {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self {
+            remaining_rows: 4096,
+            remaining_bytes: 64 * 1024 * 1024,
+            deadline,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(StoreError::InvalidState(
+                "Saved pane inspection exceeded its bounded budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self, bytes: u64) -> Result<()> {
+        self.check_deadline()?;
+        if self.remaining_rows == 0 || bytes > self.remaining_bytes {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        self.remaining_rows -= 1;
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> {
+    read_open_migration_sessions_with_budget(
+        path,
+        &mut MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30)),
+    )
+}
+
+/// Read exact open descriptors without migrating or writing a source database.
+/// Refuse unreadable or over-budget rows instead of omitting recovery work.
+#[cfg(any(feature = "host", test))]
+pub(crate) fn read_open_migration_sessions_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<(CardId, CardKind)>> {
+    // Local presentation markers are not daemon authority. Read them under
+    // the same snapshot and budget as their exact saved source descriptors.
+    fn retained_metadata<T: serde::de::DeserializeOwned + Default>(
+        transaction: &Transaction<'_>,
+        workspace: WorkspaceId,
+        name: &str,
+        budget: &mut MigrationInspectionBudget,
+    ) -> Result<T> {
+        budget.check_deadline()?;
+        let key = format!("workspace:{workspace}:navigation:{name}");
+        let bytes: Option<u64> = transaction
+            .query_row(
+                "SELECT length(CAST(value AS BLOB)) FROM metadata WHERE key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(bytes) = bytes else {
+            return Ok(T::default());
+        };
+        if bytes > 4 * 1024 * 1024 {
+            return Err(StoreError::InvalidState(
+                "Saved pane admission metadata exceeds the migration inspection limit".into(),
+            ));
+        }
+        if bytes > budget.remaining_bytes {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        budget.remaining_bytes -= bytes;
+        let value = metadata(transaction, &key)?.ok_or_else(|| {
+            StoreError::InvalidState("Saved pane admission metadata disappeared".into())
+        })?;
+        let value = from_json("saved pane admission metadata", &value)?;
+        budget.check_deadline()?;
+        Ok(value)
+    }
+
+    budget.check_deadline()?;
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::from_millis(100))?;
+    let transaction = connection.transaction()?;
+    let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    let mut statement = transaction.prepare(
+        "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
+         CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
+         CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
+         CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END,
+         CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
+         ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+               FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
+         END,
+         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
+         FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
+         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut sessions = Vec::new();
+    let mut retained =
+        HashMap::<WorkspaceId, (HashSet<CardId>, HashMap<CardId, crate::chat::Session>)>::new();
+    while let Some(row) = rows.next()? {
+        budget.check_deadline()?;
+        let existence: String = row.get(3)?;
+        let workspace: String = row.get(4)?;
+        if !from_json::<Existence>("migration card existence", &existence)?.is_open()
+            || !from_json::<Existence>("migration workspace existence", &workspace)?.is_open()
+        {
+            continue;
+        }
+        let bytes: u64 = row.get(5)?;
+        // Reserve before allocating the descriptor's JSON or normalized fields.
+        budget.reserve(bytes)?;
+        let card: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let content: Option<String> = row.get(2)?;
+        let card = parse_id("migration card", &card)?;
+        let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
+        if let CardKind::Chat(source) = &session {
+            let workspace: String = row.get(6)?;
+            let workspace = parse_id("migration workspace", &workspace)?;
+            let (local, pending) = match retained.entry(workspace) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let local =
+                        retained_metadata(&transaction, workspace, "local_only_cards", budget)?;
+                    let pending = retained_metadata(
+                        &transaction,
+                        workspace,
+                        "pending_chat_admissions",
+                        budget,
+                    )?;
+                    entry.insert((local, pending))
+                }
+            };
+            // A shared cache awaiting authority may still name a hosted actor.
+            // Only a deliberately retained local copy with an exact source
+            // marker is inert text rather than required hosted migration.
+            if local.contains(&card) && pending.get(&card) == Some(source) {
+                if !source.has_valid_native_continuity()
+                    || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
+                {
+                    return Err(StoreError::InvalidState(
+                        "Retained saved pane has invalid native continuity".into(),
+                    ));
+                }
+                continue;
+            }
+        }
+        sessions.push((card, session));
+    }
+    budget.check_deadline()?;
+    Ok(sessions)
+}
+
+/// Decode the exact row inside an existing read-only inspection transaction.
+/// Terminal ownership lives in normalized tables, not cards.content_json.
+/// The caller must read and validate this card's kind/existence in that same
+/// transaction; this helper never opens a store or changes its schema/state.
+pub(crate) fn read_migration_session_at(
+    connection: &Connection,
+    card: CardId,
+    kind: &str,
+    content: Option<&str>,
+) -> Result<CardKind> {
+    const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
+    match kind {
+        "terminal" => {
+            // Check lengths in SQLite before allocating any descriptor fields
+            // in Rust, including the nullable provenance and transcript path.
+            let bounded:Option<bool>=connection.query_row(
+                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
+                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
+                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
+            if bounded != Some(true) {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            }
+            load_terminal_record(connection, card).map(CardKind::Terminal)
+        }
+        "chat" => from_json(
+            "migration chat",
+            content
+                .filter(|value| value.len() <= MAX_DESCRIPTOR_BYTES)
+                .ok_or_else(|| {
+                    StoreError::corrupt_row(
+                        format!("migration chat card {card}"),
+                        "missing or oversized session descriptor",
+                    )
+                })?,
+        )
+        .map(CardKind::Chat),
+        _ => Err(StoreError::InvalidState(
+            "Migration inspection requires a saved native or terminal pane".into(),
+        )),
+    }
+}
+
 /// Read one consistent snapshot without migrating or writing another window's
 /// database. Only open cards with explicit navigation ownership contribute.
 pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
@@ -2712,6 +3183,11 @@ fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Resu
          PRAGMA synchronous = NORMAL;",
     )?;
 
+    verify_connection_profile(connection)
+}
+
+// Read-only verification: never repair a connection while admitting a writer.
+fn verify_connection_profile(connection: &Connection) -> Result<()> {
     let foreign_keys: i64 =
         connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if foreign_keys != 1 {
@@ -2734,6 +3210,33 @@ fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Resu
         )));
     }
     Ok(())
+}
+
+// Descriptor CAS is a separate UI StateStore writer, not a Host Registry
+// transaction. Its already-open connection may have waited behind a newer
+// application. Read admission from THIS database under its actual writer
+// reservation, before even the idempotent descriptor-return path. Never
+// migrate, stamp or repair here. Other StateStore writers are not covered by
+// this helper until they explicitly adopt it.
+fn require_current_descriptor_write(transaction: &Transaction<'_>) -> Result<()> {
+    if transaction.transaction_state(Some("main"))? != rusqlite::TransactionState::Write {
+        return Err(StoreError::InvalidState(
+            "Descriptor replacement requires the main StateStore writer reservation".into(),
+        ));
+    }
+    let found: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    if found != CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidState(format!(
+            "Descriptor replacement requires current StateStore schema {CURRENT_SCHEMA_VERSION}, found {found}"
+        )));
+    }
+    verify_connection_profile(transaction)
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -6484,6 +6987,472 @@ mod tests {
     }
 
     #[test]
+    fn retained_chat_copy_is_atomic_idempotent_and_never_rewrites_canonical() {
+        for stage in ["source", "upgraded", "replaced"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("copy.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            source.terminal = None;
+            source.proof = Some(HostSessionProof {
+                host_session_id: "old".into(),
+                boot_id: boot("chat-boot"),
+                host_incarnation: "old".into(),
+            });
+            let original = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace
+                .chat_drafts
+                .insert(original, "Canonical draft untouched".into());
+            workspace.agent_updates.insert(original, None);
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            let mut canonical = source.clone();
+            if stage != "source" {
+                canonical.proof.as_mut().unwrap().host_incarnation = "new".into();
+                store
+                    .rebind_chat_upgrade(original, &source, &canonical)
+                    .unwrap();
+            }
+            if stage == "replaced" {
+                let expected = canonical.id;
+                canonical.id = TerminalId::new();
+                // An explicit replacement first installs an unstarted
+                // conversation; its first confirmed snapshot names the thread.
+                let proof = canonical.proof.take();
+                canonical.launch.session_id = None;
+                canonical.launch.recipe.arguments = vec!["--verbose".into()];
+                store
+                    .replace_chat_identity(original, expected, &canonical)
+                    .unwrap();
+                canonical.launch.session_id = Some("replacement-thread".into());
+                canonical.proof = proof;
+                let mut started = workspace.clone();
+                started.cards[0].kind = CardKind::Chat(canonical.clone());
+                lane.save(&store, &started).unwrap();
+            }
+            let before = store.load_card(original, None).unwrap().unwrap();
+            let mut card = workspace.cards[0].clone();
+            card.id = CardId::new();
+            let copy = RetainedChatCopy {
+                workspace: workspace.id,
+                source_card: original,
+                source: source.clone(),
+                copy: card,
+                draft: "Exact saved text  \nsecond line 🦀".into(),
+                scope: None,
+                channel: None,
+            };
+            let committed = store.preserve_chat_copy(&copy).unwrap();
+            let retry = store.preserve_chat_copy(&copy).unwrap();
+            assert_eq!(retry, committed, "{stage}");
+            assert_eq!(
+                store.load_card(original, None).unwrap().unwrap(),
+                before,
+                "{stage}"
+            );
+            for mutation in ["text", "source", "descriptor", "origin", "occupied"] {
+                let mut changed = copy.clone();
+                match mutation {
+                    "text" => changed.draft.push('!'),
+                    "source" => {
+                        changed
+                            .source
+                            .launch
+                            .recipe
+                            .arguments
+                            .push("--changed".into());
+                        changed.copy.kind = CardKind::Chat(changed.source.clone());
+                    }
+                    "descriptor" => changed.source.id = TerminalId::new(),
+                    "origin" => changed.source_card = CardId::new(),
+                    "occupied" => changed.copy.id = original,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    store.preserve_chat_copy(&changed).is_err(),
+                    "{stage}: {mutation}"
+                );
+                assert_eq!(
+                    store.stored_generations(workspace.id).unwrap().workspace,
+                    committed.generation
+                );
+            }
+            drop(store);
+            let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let saved = reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved
+                    .cards
+                    .iter()
+                    .find(|card| card.id == copy.copy.id)
+                    .unwrap()
+                    .kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+            assert_eq!(saved.chat_drafts[&original], "Canonical draft untouched");
+            assert_eq!(saved.agent_updates, workspace.agent_updates);
+            assert!(saved.local_only_cards.contains(&copy.copy.id));
+            assert_eq!(saved.pending_chat_admissions[&copy.copy.id], source);
+            assert_eq!(
+                saved.card_scopes[&copy.copy.id],
+                source.launch.recipe.working_directory
+            );
+            let inner = reopened.lock_inner().unwrap();
+            let receipt = metadata(
+                &inner.connection,
+                &format!(
+                    "workspace:{}:retained_chat_copy:{}",
+                    workspace.id, copy.copy.id
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt.len(), 64);
+            assert!(!receipt.contains("Exact saved text"));
+        }
+    }
+
+    #[test]
+    fn migration_inspection_omits_only_exact_retained_local_chat_sources() {
+        for mode in [
+            "retained",
+            "shared",
+            "unmarked",
+            "wrong-source",
+            "wrong-card",
+            "legacy",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            let card = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace.chat_drafts.insert(card, "Saved text only".into());
+            if mode != "shared" {
+                workspace.local_only_cards.insert(card);
+            }
+            if mode != "unmarked" {
+                workspace
+                    .pending_chat_admissions
+                    .insert(card, source.clone());
+            }
+            SaveLane::default().save(&store, &workspace).unwrap();
+            // Valid writers prune mismatched markers. Model damaged/stale
+            // metadata internally to prove the read-only intake also refuses
+            // to infer inertness from a different source or card identity.
+            if matches!(mode, "wrong-source" | "wrong-card" | "legacy") {
+                let mut inner = store.lock_inner().unwrap();
+                let transaction = inner.connection.transaction().unwrap();
+                let key = format!(
+                    "workspace:{}:navigation:pending_chat_admissions",
+                    workspace.id
+                );
+                if mode == "legacy" {
+                    transaction
+                        .execute("DELETE FROM metadata WHERE key = ?1", [&key])
+                        .unwrap();
+                    transaction
+                        .execute(
+                            "DELETE FROM metadata WHERE key = ?1",
+                            [format!(
+                                "workspace:{}:navigation:local_only_cards",
+                                workspace.id
+                            )],
+                        )
+                        .unwrap();
+                } else {
+                    let mut marked = source.clone();
+                    let marked_card = if mode == "wrong-card" {
+                        CardId::new()
+                    } else {
+                        marked.launch.recipe.arguments.push("--different".into());
+                        card
+                    };
+                    set_metadata(
+                        &transaction,
+                        &key,
+                        &to_json(&HashMap::from([(marked_card, marked)])).unwrap(),
+                    )
+                    .unwrap();
+                }
+                transaction.commit().unwrap();
+            }
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            let sessions = read_open_migration_sessions(&path).unwrap();
+            if mode == "retained" {
+                assert!(sessions.is_empty());
+            } else {
+                assert_eq!(sessions, vec![(card, CardKind::Chat(source))], "{mode}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{mode}");
+        }
+    }
+
+    #[test]
+    fn migration_inspection_retained_metadata_is_bounded_and_fail_closed() {
+        for value in ["not JSON".to_owned(), " ".repeat(4 * 1024 * 1024 + 1)] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            let card = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source.clone());
+            workspace.local_only_cards.insert(card);
+            workspace.pending_chat_admissions.insert(card, source);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner.connection.transaction().unwrap();
+            set_metadata(
+                &transaction,
+                &format!(
+                    "workspace:{}:navigation:pending_chat_admissions",
+                    workspace.id
+                ),
+                &value,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            drop(inner);
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            assert!(read_open_migration_sessions(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn migration_session_inventory_budget_spans_windows_and_precedes_json_decode() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("source-{index}.sqlite3"));
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            workspace.cards[0].kind = CardKind::Chat(source);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            drop(store);
+            paths.push(path);
+        }
+        let before = paths
+            .iter()
+            .map(std::fs::read)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let connection =
+            Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let inspection_bytes: u64 = connection
+            .query_row(
+                "SELECT length(CAST(content_json AS BLOB)) +
+                 (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM metadata
+                  WHERE key LIKE '%:navigation:local_only_cards'
+                     OR key LIKE '%:navigation:pending_chat_admissions')
+                 FROM cards WHERE kind_tag='chat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        for row_limited in [false, true] {
+            let mut budget =
+                MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            if row_limited {
+                budget.remaining_rows = 1;
+            } else {
+                budget.remaining_bytes = inspection_bytes;
+            }
+            assert_eq!(
+                read_open_migration_sessions_with_budget(&paths[0], &mut budget)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inventory exceeds")
+            );
+        }
+        for (path, original) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+
+        let connection = Connection::open(&paths[1]).unwrap();
+        connection
+            .execute(
+                "UPDATE cards SET content_json='not valid JSON' WHERE kind_tag='chat'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        budget.remaining_bytes = 0;
+        assert!(
+            read_open_migration_sessions_with_budget(&paths[1], &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory exceeds"),
+            "budget must refuse before decoding the oversized inventory"
+        );
+        let missing = directory.path().join("must-not-open.sqlite3");
+        let mut expired = MigrationInspectionBudget::new(Instant::now());
+        assert!(
+            read_open_migration_sessions_with_budget(&missing, &mut expired)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded budget")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn migration_session_inspection_refuses_future_window_schema_without_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("future-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        let error = read_open_migration_sessions(&path).unwrap_err();
+        assert!(
+            matches!(error, StoreError::UnsupportedSchema { found, supported }
+            if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_session_sql_bounds_all_normalized_fields_before_decoding() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("bounded-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        let card = workspace.cards[0].id;
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT content_json IS NULL FROM cards WHERE card_id=?1",
+                    [card.to_string()],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
+        // Non-ASCII forces a byte limit rather than a character-count limit.
+        let oversized = "🦀".repeat(1024 * 1024 + 1);
+        // Deliberately corrupt a referenced terminal identity only inside this
+        // rollback-only fixture transaction. Otherwise SQLite correctly refuses
+        // the UPDATE before the read-only allocation guard can inspect it.
+        connection
+            .execute_batch("BEGIN; PRAGMA defer_foreign_keys=ON;")
+            .unwrap();
+        for column in [
+            "terminal_id",
+            "recipe_json",
+            "continuity_json",
+            "resume_hint",
+            "recovery_origin",
+            "owned_codex_listener",
+            "predecessor",
+        ] {
+            let original: Option<String> = connection
+                .query_row(
+                    &format!("SELECT {column} FROM terminal_recipes WHERE card_id=?1"),
+                    [card.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), &oversized],
+                )
+                .unwrap();
+            let error = read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("oversized immutable descriptor"),
+                "field {column}: {error}"
+            );
+            connection
+                .execute(
+                    &format!("UPDATE terminal_recipes SET {column}=?2 WHERE card_id=?1"),
+                    params![card.to_string(), original],
+                )
+                .unwrap();
+        }
+        let original:String=connection.query_row("SELECT path_json FROM transcript_metadata WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",[card.to_string()],|row|row.get(0)).unwrap();
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),&oversized]).unwrap();
+        assert!(
+            read_migration_session_at(&connection, card, "terminal", None)
+                .unwrap_err()
+                .to_string()
+                .contains("oversized immutable descriptor")
+        );
+        connection.execute("UPDATE transcript_metadata SET path_json=?2 WHERE terminal_id=(SELECT terminal_id FROM terminal_recipes WHERE card_id=?1)",params![card.to_string(),original]).unwrap();
+        assert_eq!(
+            read_migration_session_at(&connection, card, "terminal", None).unwrap(),
+            workspace.cards[0].kind
+        );
+        connection.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn migration_session_inspection_is_read_only_and_reconstructs_exact_terminal_and_chat_rows() {
+        for chat in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("migration-source.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, source) = agent_workspace(crate::agent::Provider::Codex);
+            if chat {
+                workspace.cards[0].kind = CardKind::Chat(source);
+            }
+            let expected = (workspace.cards[0].id, workspace.cards[0].kind.clone());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+            drop(store);
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(read_open_migration_sessions(&path).unwrap(), vec![expected]);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "inspection cannot migrate or update the database"
+            );
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            workspace.cards[0].existence = Existence::Closed {
+                tombstone: Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("fixture closed".into()),
+                },
+            };
+            workspace.focused = None;
+            lane.save(&store, &workspace).unwrap();
+            assert!(read_open_migration_sessions(&path).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn editor_navigation_is_window_local_and_legacy_metadata_defaults_empty() {
         use crate::model::{RepositoryNavigation, RepositoryView};
         use std::os::unix::ffi::OsStringExt;
@@ -6935,6 +7904,273 @@ mod tests {
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
     }
 
+    fn descriptor_admission_fixture(
+        path: &Path,
+    ) -> (
+        StateStore,
+        CardId,
+        crate::chat::Session,
+        crate::chat::Session,
+    ) {
+        let store = StateStore::open(path, boot("chat-boot")).unwrap();
+        let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement
+            .launch
+            .recipe
+            .environment
+            .insert("DESCRIPTOR_TEST".into(), "replacement".into());
+        (store, card, source, replacement)
+    }
+
+    #[test]
+    fn descriptor_writer_admission_preserves_exact_cas_and_idempotent_current_profile() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let (store, card, source, replacement) = descriptor_admission_fixture(&path);
+        let mut stale = source.clone();
+        stale
+            .launch
+            .recipe
+            .environment
+            .insert("DESCRIPTOR_TEST".into(), "stale".into());
+        assert!(
+            store
+                .rebind_chat_descriptor(card, &stale, &replacement)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        store
+            .rebind_chat_descriptor(card, &source, &replacement)
+            .unwrap();
+        let changes = store.lock_inner().unwrap().connection.total_changes();
+        store
+            .rebind_chat_descriptor(card, &source, &replacement)
+            .unwrap();
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            changes,
+            "idempotence still writes nothing"
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
+    #[test]
+    fn descriptor_writer_refuses_old_schema_and_changed_connection_without_repair() {
+        for refusal in ["old-schema", "foreign-keys", "synchronous", "journal"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("state.sqlite3");
+            let (store, card, source, replacement) = descriptor_admission_fixture(&path);
+            let changes = {
+                let inner = store.lock_inner().unwrap();
+                match refusal {
+                    "old-schema" => inner
+                        .connection
+                        .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
+                        .unwrap(),
+                    "foreign-keys" => inner
+                        .connection
+                        .pragma_update(None, "foreign_keys", false)
+                        .unwrap(),
+                    "synchronous" => inner
+                        .connection
+                        .pragma_update(None, "synchronous", 0)
+                        .unwrap(),
+                    "journal" => inner
+                        .connection
+                        .pragma_update(None, "journal_mode", "DELETE")
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                inner.connection.total_changes()
+            };
+            assert!(
+                matches!(
+                    store.rebind_chat_descriptor(card, &source, &replacement),
+                    Err(StoreError::InvalidState(_))
+                ),
+                "{refusal}"
+            );
+            assert!(
+                store
+                    .rebind_chat_descriptor(card, &source, &source)
+                    .is_err(),
+                "even idempotent return requires admission: {refusal}"
+            );
+            let inner = store.lock_inner().unwrap();
+            assert_eq!(
+                inner.connection.total_changes(),
+                changes,
+                "refusal must not mutate card/hash: {refusal}"
+            );
+            let stored: String = inner
+                .connection
+                .query_row(
+                    "SELECT content_json FROM cards WHERE card_id=?1",
+                    [card.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                from_json::<crate::chat::Session>("chat card", &stored).unwrap(),
+                source
+            );
+            match refusal {
+                "old-schema" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<u32, _>(None, "user_version", |row| row.get(0))
+                        .unwrap(),
+                    CURRENT_SCHEMA_VERSION - 1
+                ),
+                "foreign-keys" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<i64, _>(None, "foreign_keys", |row| row.get(0))
+                        .unwrap(),
+                    0
+                ),
+                "synchronous" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<i64, _>(None, "synchronous", |row| row.get(0))
+                        .unwrap(),
+                    0
+                ),
+                "journal" => assert_eq!(
+                    inner
+                        .connection
+                        .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                        .unwrap(),
+                    "delete"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    std::thread_local! {
+        // This connection's real busy callback fences a second connection's
+        // pending writer; no timing assertion stands in for actual contention.
+        static DESCRIPTOR_BUSY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    }
+    fn descriptor_busy_gate(attempt: i32) -> bool {
+        if let Some((entered, proceed)) = DESCRIPTOR_BUSY_GATE.with(|gate| gate.borrow_mut().take())
+        {
+            if entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err() {
+                return false;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        attempt < 5000
+    }
+
+    #[test]
+    fn descriptor_writer_readmits_future_schema_after_actual_second_connection_wait() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let (store, card, source, replacement) = descriptor_admission_fixture(&path);
+        let observed = store.schema_version().unwrap();
+        assert_eq!(observed, CURRENT_SCHEMA_VERSION);
+        let changes = store.lock_inner().unwrap().connection.total_changes();
+        let mut winner = Connection::open(&path).unwrap();
+        configure_connection(&winner, DEFAULT_BUSY_TIMEOUT).unwrap();
+        let transaction = winner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction.execute_batch("CREATE TABLE future_descriptor_owner (evidence TEXT NOT NULL) STRICT; INSERT INTO future_descriptor_owner VALUES ('keep future bytes');").unwrap();
+        transaction
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let delayed = std::thread::spawn(move || {
+            DESCRIPTOR_BUSY_GATE.with(|gate| *gate.borrow_mut() = Some((entered_tx, proceed_rx)));
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .busy_handler(Some(descriptor_busy_gate))
+                .unwrap();
+            let result = store.rebind_chat_descriptor(card, &source, &replacement);
+            (store, card, source, result)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        transaction.commit().unwrap();
+        let database_before = std::fs::read(&path).unwrap();
+        let wal_path = path.with_file_name("state.sqlite3-wal");
+        let wal_before = std::fs::read(&wal_path).unwrap();
+        let schema_before: Vec<(String, Option<String>)> = winner
+            .prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        let (store, card, source, result) = delayed.join().unwrap();
+        assert!(
+            matches!(result, Err(StoreError::UnsupportedSchema {found, supported}) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
+        );
+        assert!(
+            matches!(
+                store.rebind_chat_descriptor(card, &source, &source),
+                Err(StoreError::UnsupportedSchema { .. })
+            ),
+            "future schema refuses idempotent return too"
+        );
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            changes
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            database_before,
+            "refusal must not write database bytes"
+        );
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            wal_before,
+            "refusal must not append WAL frames"
+        );
+        let schema_after: Vec<(String, Option<String>)> = winner
+            .prepare("SELECT name, sql FROM sqlite_schema ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(schema_before, schema_after);
+        assert_eq!(
+            winner
+                .query_row("SELECT evidence FROM future_descriptor_owner", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep future bytes"
+        );
+        let stored: String = winner
+            .query_row(
+                "SELECT content_json FROM cards WHERE card_id=?1",
+                [card.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            from_json::<crate::chat::Session>("chat card", &stored).unwrap(),
+            source
+        );
+    }
+
     #[test]
     fn codex_resume_normalization_is_transactional_and_ordinary_saves_stay_strict() {
         let directory = tempdir().unwrap();
@@ -7004,6 +8240,194 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_durable_codex_hundred_panes_save_reopen_across_three_generations() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite3");
+        let boot_id = boot("chat-boot");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let (mut workspace, template) = agent_workspace(crate::agent::Provider::Codex);
+        let card_template = workspace.cards[0].clone();
+        let proof = template
+            .terminal
+            .as_ref()
+            .unwrap()
+            .continuity
+            .live_proof()
+            .unwrap();
+        workspace.cards.clear();
+        for index in 0..100 {
+            let mut source = template.clone();
+            source.id = TerminalId::new();
+            source.proof = Some(proof.clone());
+            source.terminal = None;
+            source.launch.session_id = None;
+            source.launch.recipe.arguments = vec![
+                "--remote".into(),
+                "unix://".into(),
+                "--model".into(),
+                "fixture-luna".into(),
+            ];
+            source.launch.recipe.environment.insert(
+                "CODEX_HOME".into(),
+                format!(
+                    "/fixture/{}/account-{index}",
+                    if index % 2 == 0 { "system" } else { "managed" }
+                ),
+            );
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .insert("OPENAI_API_KEY".into());
+            assert!(source.claim_owned_codex_listener(Path::new("/fixture/listeners"), &proof));
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            if index % 3 == 0 {
+                source.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.162.0".into(),
+                };
+            }
+            if index % 5 == 0 {
+                let mut terminal = template.terminal.clone().unwrap();
+                terminal.id = source.id;
+                terminal.launch = source.launch.terminal_recipe().unwrap();
+                source.terminal = Some(terminal);
+            }
+            let mut card = card_template.clone();
+            card.id = CardId::new();
+            card.exposure = if index == 0 {
+                Exposure::Visible
+            } else {
+                Exposure::Offscreen
+            };
+            card.kind = CardKind::Chat(source);
+            workspace
+                .chat_drafts
+                .insert(card.id, format!("Unsent draft for pane {index}"));
+            workspace.cards.push(card);
+        }
+        workspace.focused = Some(workspace.cards[0].id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        for generation in 1..=3 {
+            for card in &mut workspace.cards {
+                let CardKind::Chat(source) = &card.kind else {
+                    unreachable!()
+                };
+                let mut replacement = source.clone();
+                replacement.proof.as_mut().unwrap().host_incarnation =
+                    format!("migration-{generation}").into();
+                if let Some(terminal) = replacement.terminal.as_mut() {
+                    terminal.continuity = TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id.clone(),
+                        boot_id: proof.boot_id.clone(),
+                        host_incarnation: format!("migration-{generation}").into(),
+                    };
+                }
+                assert!(crate::chat::is_upgrade_recovery(source, &replacement));
+                store
+                    .rebind_chat_upgrade(card.id, source, &replacement)
+                    .unwrap();
+                card.kind = CardKind::Chat(replacement);
+            }
+            lane.save(&store, &workspace).unwrap();
+            let reopened = StateStore::open(&path, boot_id.clone()).unwrap();
+            let restored = reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.cards.len(), 100);
+            assert_eq!(restored.chat_drafts, workspace.chat_drafts);
+            for (expected, actual) in workspace.cards.iter().zip(&restored.cards) {
+                assert_eq!(actual.kind, expected.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_upgrade_identity_learning_is_transactional_and_keeps_pair_and_account_exact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("identity-learning.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Codex);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        let conversation = source.launch.session_id.take().unwrap();
+        let mut replacement = source.clone();
+        replacement.launch.session_id = Some(conversation);
+        replacement.proof.as_mut().unwrap().host_incarnation = "learned-daemon".into();
+        let proof = replacement.proof.as_ref().unwrap();
+        replacement.terminal.as_mut().unwrap().continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        assert!(!crate::chat::is_upgrade_recovery(&source, &replacement));
+        assert!(crate::chat::is_upgrade_identity_learning(
+            &source,
+            &replacement
+        ));
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        for mutation in 0..9 {
+            let mut changed = replacement.clone();
+            match mutation {
+                0 => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/different-account".into());
+                }
+                1 => {
+                    changed
+                        .launch
+                        .recipe
+                        .unset_environment
+                        .insert("CHANGED_SETTING".into());
+                }
+                2 => changed
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-options".into()),
+                3 => changed.launch.recipe.working_directory = "/different-project".into(),
+                4 => changed.proof = source.proof.clone(),
+                5 => changed.proof.as_mut().unwrap().boot_id = boot("another-boot"),
+                6 => changed.terminal.as_mut().unwrap().resume_hint = Some("another-thread".into()),
+                7 => changed
+                    .terminal
+                    .as_mut()
+                    .unwrap()
+                    .launch
+                    .arguments
+                    .push("--different-listener".into()),
+                _ => changed.terminal.as_mut().unwrap().id = TerminalId::new(),
+            }
+            assert!(
+                !crate::chat::is_upgrade_identity_learning(&source, &changed),
+                "mutation {mutation}"
+            );
+            assert!(store.rebind_chat_upgrade(card, &source, &changed).is_err());
+        }
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(
+            lane.save(&store, &workspace).is_err(),
+            "ordinary save cannot learn a paired upgrade identity"
+        );
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let reopened = StateStore::open(path, boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
+    #[test]
     fn upgrade_recovery_requires_exact_lineage_and_keeps_snapshots_strict() {
         let directory = tempdir().unwrap();
         let store =
@@ -7017,15 +8441,26 @@ mod tests {
         lane.save(&store, &workspace).unwrap();
 
         // Restarting the same provider conversation with its issued recipe
-        // remains an ordinary save; only cross-proof ID rotation needs a CAS.
+        // remains an ordinary save; an explicit upgrade still preserves its known ID.
         source.proof.as_mut().unwrap().host_incarnation = "second-daemon".into();
         workspace.cards[0].kind = CardKind::Chat(source.clone());
         lane.save(&store, &workspace).unwrap();
         let mut replacement = source.clone();
         replacement.proof.as_mut().unwrap().host_incarnation = "third-daemon".into();
-        replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
-        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        let mut wrong_thread = replacement.clone();
+        wrong_thread.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        workspace.cards[0].kind = CardKind::Chat(wrong_thread.clone());
         assert!(lane.save(&store, &workspace).is_err());
+        assert!(
+            store
+                .rebind_chat_upgrade(card, &source, &wrong_thread)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
         for altered in 0..8 {
             let mut refused = replacement.clone();
             match altered {

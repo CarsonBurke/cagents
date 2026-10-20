@@ -71,14 +71,139 @@ impl Cagents {
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
     }
 
+    fn checkpoint_retained_chat_copy(&self, source_card: CardId, copy: CardId) -> Task<Message> {
+        let Some(writer) = &self.session else {
+            return Task::none();
+        };
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&copy) else {
+            return Task::none();
+        };
+        let payload = crate::persistence::RetainedChatCopy {
+            workspace: self.durable.id,
+            source_card,
+            source: runtime.session.clone(),
+            copy: self.card_state(copy).expect("retained card exists").clone(),
+            draft: runtime.unsent_text(),
+            scope: self.durable.card_scopes.get(&copy).cloned(),
+            channel: self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&copy))
+                .map(|channel| channel.id),
+        };
+        let receipt = writer.preserve_chat_copy(payload);
+        cosmic::task::future(async move {
+            let result = match receipt {
+                Ok(receipt) => tokio::task::spawn_blocking(move || {
+                    receipt
+                        .recv()
+                        .map_err(|error| format!("Session writer disconnected: {error}"))?
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result),
+                Err(error) => Err(error),
+            };
+            Message::ChatUi(Action::RetainedCopyCommitted(copy, result))
+        })
+    }
+
+    /// A newer projection cannot reinterpret an in-flight source's Content.
+    /// Strict upgrade connections only attach, so forgetting their generation
+    /// detaches a late handle rather than retiring a daemon-owned actor.
+    pub(in crate::app) fn preserve_pending_shared_upgrade(
+        &mut self,
+        card: CardId,
+    ) -> (Task<Message>, Option<CardId>) {
+        if !self
+            .chat_ui
+            .attempt(card)
+            .is_some_and(|attempt| attempt.upgrade_admission.is_some())
+        {
+            return (Task::none(), None);
+        }
+        self.chat_ui.phases.remove(&card);
+        self.retain_shared_upgrade_source(card)
+    }
+
+    pub(in crate::app) fn retain_shared_upgrade_source(
+        &mut self,
+        card: CardId,
+    ) -> (Task<Message>, Option<CardId>) {
+        let Some(pane) = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())
+            .and_then(|state| {
+                crate::workspace_model::views::Pane::from_card(
+                    state,
+                    self.durable.card_scopes.get(&card).cloned(),
+                )
+            })
+        else {
+            return (Task::none(), None);
+        };
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return (Task::none(), None);
+        };
+        runtime.connection = Connection::AwaitingAdmission;
+        self.retain_unresolved_shared_upgrade(&pane)
+    }
+
+    pub(in crate::app) fn shared_upgrade_target_changed(
+        &self,
+        pane: &crate::workspace_model::views::Pane,
+    ) -> bool {
+        self.chat_ui
+            .attempt(pane.id)
+            .and_then(|attempt| attempt.upgrade_admission.as_ref())
+            .is_some_and(
+                |canonical| !matches!(&pane.kind, CardKind::Chat(session) if session == canonical),
+            )
+    }
+
     pub(in crate::app) fn admit_shared_chat(
         &mut self,
         pane: &crate::workspace_model::views::Pane,
+    ) -> (Task<Message>, Option<CardId>) {
+        self.admit_shared_chat_inner(pane, true)
+    }
+
+    pub(in crate::app) fn retain_unresolved_shared_upgrade(
+        &mut self,
+        pane: &crate::workspace_model::views::Pane,
+    ) -> (Task<Message>, Option<CardId>) {
+        self.admit_shared_chat_inner(pane, false)
+    }
+
+    fn admit_shared_chat_inner(
+        &mut self,
+        pane: &crate::workspace_model::views::Pane,
+        resolve_upgrade: bool,
     ) -> (Task<Message>, Option<CardId>) {
         let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&pane.id) else {
             return (Task::none(), None);
         };
         assert!(runtime.awaiting_admission());
+        if resolve_upgrade
+            && let CardKind::Chat(canonical) = &pane.kind
+            && (chat::is_upgrade_recovery(&runtime.session, canonical)
+                || chat::is_upgrade_identity_learning(&runtime.session, canonical))
+        {
+            // Similar descriptors are only candidates. Resolve the old source
+            // on the authenticated connection and attach this exact target;
+            // the existing Ready path waits for the durable upgrade receipt.
+            let source = runtime.session.clone();
+            runtime.connection = Connection::Connecting;
+            self.cards.insert(pane.id, CardRuntime::Chat(runtime));
+            if let Some(card) = self.card_state_mut(pane.id) {
+                card.kind = pane.kind.clone();
+            }
+            return (
+                self.start_shared_chat_upgrade(pane.id, source, canonical.clone()),
+                None,
+            );
+        }
         Arc::make_mut(&mut self.durable)
             .pending_chat_admissions
             .remove(&pane.id);
@@ -96,6 +221,10 @@ impl Cagents {
                 .expect("cached pane exists")
                 .clone();
             state.id = retained;
+            // The shared descriptor may already have advanced while a
+            // strict upgrade attachment was in flight. The copy still owns
+            // the runtime's original source, never that newer descriptor.
+            state.kind = CardKind::Chat(runtime.session.clone());
             state.residency = Residency::Hot;
             let local_card = state.clone();
             runtime.target = self.chat_ui.next_target(retained);
@@ -114,6 +243,7 @@ impl Cagents {
             durable.cards.push(state);
             self.retain_local_pane(retained);
             self.cards.insert(retained, CardRuntime::Chat(runtime));
+            presentation = self.checkpoint_retained_chat_copy(pane.id, retained);
             saved_copy = Some(retained);
             let position = self.workspace.order().position(|id| id == pane.id);
             if let Some(index) = position {
@@ -127,7 +257,8 @@ impl Cagents {
                     .workspace
                     .add_card(card, index + 1, false)
                     .expect("saved draft has a fresh card identity");
-                presentation = self.apply_viewport(update, false, false);
+                presentation =
+                    Task::batch([presentation, self.apply_viewport(update, false, false)]);
             }
         } else if same_source {
             // Keep the Content object (including cursor/selection) through the
@@ -137,6 +268,19 @@ impl Cagents {
         }
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();
+        }
+        if !resolve_upgrade {
+            // Failed exact lineage is not permission to restart either actor.
+            // Keep the source copy inert and leave the canonical pane's retry
+            // explicit instead of falling through to ordinary resume/start.
+            let notice = if saved_copy.is_some() {
+                "Could not reconnect this conversation. Your draft is in the pane beside it. Retry to reconnect."
+            } else {
+                "Could not reconnect this conversation. Retry to reconnect."
+            };
+            self.cards
+                .insert(pane.id, CardRuntime::Failed(notice.into()));
+            return (presentation, saved_copy);
         }
         let task = match &pane.kind {
             CardKind::Chat(session) if session.is_unstarted() => {

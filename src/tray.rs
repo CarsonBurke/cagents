@@ -211,6 +211,7 @@ mod service {
             // the child appends a startup-protocol line to the stdout this
             // function shows the user as the shutdown result.
             .env_remove(instance::UI_LAUNCH_HANDSHAKE_ENV)
+            .env_remove(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
             .process_group(0)
             .output()
             .map_err(|error| {

@@ -15,6 +15,7 @@ struct RetainedPair {
     source: Option<crate::model::TerminalSession>,
     holder: crate::terminal::holder::Record,
     handle: Option<crate::terminal::TerminalHandle>,
+    original_role: Option<registry::OriginalRole>,
 }
 
 /// Cleanup does not require provider history or a successful protocol attach.
@@ -103,7 +104,7 @@ fn close_retained_inner(
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
             .map(Ok)
             .unwrap_or_else(|| {
-                registry::evidence(&socket, Kind::Native).and_then(|record| {
+                registry::recovery_candidate(&socket, Kind::Native).and_then(|record| {
                     record.ok_or_else(|| {
                         "No exact native holder or confirmed close receipt is available".to_owned()
                     })
@@ -120,14 +121,11 @@ fn close_retained_inner(
                 let (record, _) = receipt.unwrap();
                 let pending = NativeClose {
                     source: source.clone(),
-                    owner: chat::native_holder::Detached {
-                        record,
-                        source: source.clone(),
-                        proof: proof.clone(),
-                    },
+                    owner: chat::native_holder::Detached::from_receipt(record, source.clone(), proof.clone())?,
                     closed: true,
                     paired: retained_pair(
                         host,
+                        source,
                         source.terminal.as_ref(),
                         Some(&chat::native_holder::closed_pair_holder(source, &proof)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
                         &proof,
@@ -140,7 +138,7 @@ fn close_retained_inner(
                 pending
             }
             None => {
-                let record = registry::evidence(&socket, Kind::Native)?
+                let record = registry::recovery_candidate(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
                 let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
                 if &recovery.source != source && !recovery.previous_sources.contains(source) {
@@ -150,6 +148,7 @@ fn close_retained_inner(
                 }
                 let paired = retained_pair(
                     host,
+                    &recovery.source,
                     recovery.source.terminal.as_ref(),
                     recovery.paired_holder.as_ref(),
                     &proof,
@@ -198,7 +197,11 @@ fn close_retained_inner(
                     pair.source.as_ref().expect("captured worker source"),
                     &proof,
                 )?;
-            } else if !crate::terminal::holder::cleanup::confirmed_owner(&pair.holder, &proof)? {
+            } else if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+                &pair.holder,
+                &proof,
+                pair.original_role.as_ref(),
+            )? {
                 return Err(
                     "Paired terminal teardown is not proved; its ownership was retained".into(),
                 );
@@ -255,6 +258,7 @@ fn close_retained_inner(
         }
         drop(state);
         super::super::state::retire_unattached_upgrade_chat(host, source.id);
+        super::super::state::retire_recovered_upgrade_chat(host, source.id);
     }
     result
 }
@@ -341,6 +345,7 @@ fn retire_closed_execution(
 
 fn retained_pair(
     host: &SharedHost,
+    native_source: &Session,
     terminal: Option<&crate::model::TerminalSession>,
     holder: Option<&crate::terminal::holder::Record>,
     proof: &HostSessionProof,
@@ -352,6 +357,16 @@ fn retained_pair(
     if terminal.is_some_and(|terminal| terminal.id != holder.terminal) {
         return Err("The paired source differs from its authenticated holder identity".into());
     }
+    // The caller has already matched this native source against the live
+    // holder's full recovery or its exact durable source-digest receipt.
+    let original_role = registry::OriginalRole::authenticated(
+        holder,
+        native_source
+            .proof
+            .as_ref()
+            .ok_or("Paired native source has no proof")?,
+        proof,
+    )?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(current) = state.terminals.get(&holder.terminal) {
         if current.handle.holder_identity() != Some(holder) {
@@ -375,12 +390,17 @@ fn retained_pair(
             source: Some(descriptor.session),
             holder: holder.clone(),
             handle: Some(current.handle.clone()),
+            original_role,
         }));
     }
     drop(state);
     // The native holder's authenticated recovery/receipt owns this exact
     // terminal incarnation, even when the caller predates pair publication.
-    if !crate::terminal::holder::cleanup::confirmed_owner(holder, proof)? {
+    if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
+        holder,
+        proof,
+        original_role.as_ref(),
+    )? {
         return Err(
             "The original paired terminal is unavailable and its teardown is not proved".into(),
         );
@@ -389,5 +409,6 @@ fn retained_pair(
         source: None,
         holder: holder.clone(),
         handle: None,
+        original_role,
     }))
 }

@@ -1,3 +1,5 @@
+#[cfg(all(test, target_os = "linux"))]
+mod paired_upgrade_tests;
 mod presentation;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
@@ -60,6 +62,8 @@ pub(crate) struct TerminalRecord {
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    /// The actual validated worker command, independent of its issued pane.
+    execution_recipe: Option<crate::model::LaunchRecipe>,
     options: TerminalSpawnOptions,
     upgrade_sources: Vec<TerminalSession>,
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
@@ -76,6 +80,12 @@ pub(crate) struct TerminalRecord {
 }
 
 impl TerminalRecord {
+    pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
+        self.execution_recipe
+            .as_ref()
+            .unwrap_or(&self.session.launch)
+    }
+
     /// The title the provider last set, for the session directory.
     pub(super) fn conversation_title(&self) -> Option<&str> {
         self.conversation_title
@@ -303,7 +313,7 @@ pub(crate) struct HostState {
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
     /// retained conversations a restore could not reattach.
-    upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
+    pub(super) upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
 }
 
 /// A checkpoint saved and awaiting this daemon's exit.
@@ -1234,9 +1244,21 @@ impl HostState {
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
+        session: TerminalSession,
+        handle: TerminalHandle,
+        initially_visible: bool,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.finish_spawn_with_execution(client_id, session, handle, initially_visible, None, None)
+    }
+
+    fn finish_spawn_with_execution(
+        &mut self,
+        client_id: ClientId,
         mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
+        execution_recipe: Option<crate::model::LaunchRecipe>,
+        execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         let terminal_id = session.id;
         self.cancel_spawn(terminal_id);
@@ -1258,7 +1280,8 @@ impl HostState {
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
-                execution_environment: None,
+                execution_environment,
+                execution_recipe,
                 upgrade_sources: Vec::new(),
                 upgrade_relaunches: Vec::new(),
                 running: true,
@@ -2050,8 +2073,9 @@ fn prepare_upgrade_with_carry_policy(
                 crate::chat::NativeContinuity::Durable { .. }
             ) {
                 source.launch.session_id = record.handle.confirmed_session_id();
-                crate::chat::protocol::align_resume_identity(&mut source.launch)
-                    .map_err(upgrade_error)?;
+                // This is an issued descriptor, including after a provider
+                // changed its thread. Only the separate effective launch below
+                // may normalize resume argv for that confirmed identity.
             }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
@@ -2068,6 +2092,10 @@ fn prepare_upgrade_with_carry_policy(
                     source.id
                 )));
             }
+            crate::upgrade::handoff::validate_chat_source(&source, &launch)
+                .map_err(|reason| upgrade_error(format!(
+                    "Native chat {} cannot migrate: {reason}. Its existing provider remains active.", source.id
+                )))?;
             // The successor restarts this conversation from its terminal only
             // if that terminal is checkpointed, which a completed one is not,
             // and is restored first, which it is not for a conversation that
@@ -2080,11 +2108,9 @@ fn prepare_upgrade_with_carry_policy(
             super::chat::validate_upgrade_environment(&launch, hosted_source, &record.handle)
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
-                && state.terminals.contains_key(&source.id)
-                && !matches!(
-                    source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && state.terminals.get(&source.id).is_some_and(|terminal| {
+                    !terminal.handle.is_completed() && !carries(&source.id, terminal)
+                })
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -2143,6 +2169,7 @@ fn prepare_upgrade_with_carry_policy(
             store.path.display()
         )));
     }
+    store.preflight_recovered(&chats).map_err(upgrade_error)?;
     let mut frozen = Vec::with_capacity(terminals.len());
     let mut saved = Vec::with_capacity(terminals.len());
     // Every terminal that would refuse the upgrade is reported at once, so the
@@ -2160,10 +2187,9 @@ fn prepare_upgrade_with_carry_policy(
     ) in terminals
     {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
-        source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
-            // The worker's argv hint can be fresh or name an older TUI thread.
-            // Only the still-confirmed attachment may supersede it, and only
-            // after freezing and revalidating its exact process/account.
+        let recipe = if let Some((selected, native)) = paired_codex.get(&source.id) {
+            // Only the still-confirmed attachment can supply execution for
+            // the exact terminal descriptor already issued to its chat pane.
             let current = handle.observe_agent_process().ok_or_else(|| {
                 upgrade_error("The paired Codex source disappeared before upgrade")
             })?;
@@ -2186,25 +2212,27 @@ fn prepare_upgrade_with_carry_policy(
                 native.confirmed_session_id().as_deref(),
             )
             .map_err(upgrade_error)?;
-            Some(
-                crate::model::agent_recovery::hint_from_launch(&recipe).ok_or_else(|| {
-                    upgrade_error("The paired Codex exact recipe cannot be saved")
-                })?,
+            source = super::chat::restored_terminal_source(
+                chat.source.terminal.as_ref().expect("validated pair"),
+                &source,
             )
+            .map_err(upgrade_error)?;
+            recipe
         } else {
-            snapshot.hint.clone()
-        };
-        let Some(recipe) = upgrade_recipe(
-            &source,
-            &handle,
-            &snapshot,
-            &mut relaunches,
-            relaunch_agents,
-        )
-        .map_err(upgrade_error)?
-        else {
-            blockers.push(describe_upgrade_blocker(&source));
-            continue;
+            source.resume_hint = snapshot.hint.clone();
+            let Some(recipe) = upgrade_recipe(
+                &source,
+                &handle,
+                &snapshot,
+                &mut relaunches,
+                relaunch_agents,
+            )
+            .map_err(upgrade_error)?
+            else {
+                blockers.push(describe_upgrade_blocker(&source));
+                continue;
+            };
+            recipe
         };
         if !relaunches.iter().any(|accepted| accepted.source == source) {
             tracing::info!(
@@ -2532,11 +2560,15 @@ fn carry_terminals(
         // Completion can race the carry, or VT serialization can fail while
         // its process still runs. A registered holder can keep either result
         // without converting ownership into permission to execute a recipe.
-        if crate::terminal::holder::evidence(&holder_socket(holders, id))
-            .ok()
-            .flatten()
-            .is_some_and(|record| record.holder.is_current())
-            && handle.preserve_for_restart().is_ok()
+        if crate::daemon::holder_registry::recovery_candidate(
+            &holder_socket(holders, id),
+            crate::daemon::holder_registry::Kind::Terminal,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            handle.holder_identity() == Some(&record) && record.holder.is_current()
+        }) && handle.preserve_for_restart().is_ok()
         {
             tracing::warn!(terminal = %id, %error,
                 "upgrade preserves the registered holder without a new parser snapshot");
@@ -2674,7 +2706,11 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let records = crate::terminal::holder::discover(&directory, &proof.boot_id)?;
+    let records = crate::daemon::holder_registry::recovery_candidates(
+        &directory,
+        &proof.boot_id,
+        crate::daemon::holder_registry::Kind::Terminal,
+    )?;
     for record in records {
         if crate::daemon::termination_requested() {
             break;
@@ -2926,8 +2962,23 @@ fn restore_upgrade_from(
                 chat.terminal = Some(terminal.clone());
                 continue;
             }
-            let mut session = terminal.source.clone();
-            session.launch = terminal.recipe.clone();
+            let pair = checkpoint.chats.iter().find(|chat| {
+                chat.launch.provider == crate::agent::Provider::Codex
+                    && chat.source.id == terminal.source.id
+                    && chat
+                        .source
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal.source.id)
+            });
+            let mut session = if let Some(chat) = pair {
+                crate::upgrade::handoff::paired_terminal_source(chat, terminal)?
+            } else {
+                terminal.source.clone()
+            };
+            if pair.is_none() {
+                session.launch = terminal.recipe.clone();
+            }
             session.continuity = TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
                 last_exit: None,
@@ -2942,9 +2993,24 @@ fn restore_upgrade_from(
                     true
                 })
             };
-            let descriptor =
+            let descriptor = if pair.is_some() {
+                start_terminal_view_owned(
+                    host,
+                    0,
+                    session,
+                    terminal.options.clone(),
+                    None,
+                    paired,
+                    None,
+                    None,
+                    None,
+                    Some(terminal.recipe.clone()),
+                )
+                .map(|(descriptor, _)| descriptor)
+            } else {
                 spawn_terminal_view(host, 0, session, terminal.options.clone(), None, paired)
-                    .map_err(|error| error.message)?;
+            }
+            .map_err(|error| error.message)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
@@ -2967,6 +3033,31 @@ fn restore_upgrade_from(
             }
             super::chat::restore_upgrade(host, chat)?;
         }
+        let recovered = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            checkpoint
+                .chats
+                .iter()
+                .filter_map(|chat| {
+                    if unattached
+                        .iter()
+                        .any(|entry| entry.summary.id == chat.source.id)
+                    {
+                        return None;
+                    }
+                    let record = state.chats.get(&chat.source.id)?;
+                    let mut replacement = record.session.clone();
+                    replacement.launch.session_id = record.handle.session_id();
+                    replacement.native_continuity = record.handle.native_continuity();
+                    Some(crate::upgrade::handoff::RecoveredChat {
+                        evidence: chat.clone(),
+                        replacement,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        store.record_recovered(&recovered)?;
         // Until this is durable, the checkpoint is the only record of what
         // was left unattached, so it must be written before that is consumed.
         store.record_unattached(&unattached, &reattached)?;
@@ -3067,6 +3158,20 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     }
 }
 
+/// Explicit conversation closure ends the need to retain its issued pane aliases.
+pub(super) fn retire_recovered_upgrade_chat(host: &SharedHost, id: TerminalId) {
+    let store = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone();
+    if let Some(store) = store
+        && let Err(error) = store.retire_recovered(id)
+    {
+        tracing::warn!(session = %id, %error, "could not retire closed conversation recovery evidence");
+    }
+}
+
 /// Forgets that a retained native conversation was left unattached by an
 /// upgrade, once it has been reattached or explicitly closed.
 pub(super) fn retire_unattached_upgrade_chat(host: &SharedHost, id: TerminalId) {
@@ -3113,7 +3218,10 @@ fn adopt_carried_terminal(
         let socket = holder_socket(holders, id);
         for attempt in 1..=ADOPTION_ATTEMPTS {
             let previous = (|| {
-                if let Some(record) = crate::terminal::holder::evidence(&socket)? {
+                if let Some(record) = crate::daemon::holder_registry::recovery_candidate(
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
+                )? {
                     let proof = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3143,6 +3251,7 @@ fn adopt_carried_terminal(
                         relaunches: terminal.relaunches.clone(),
                         options: terminal.options.clone(),
                         execution_environment: None,
+                        execution_recipe: None,
                     },
                     false,
                 ))
@@ -3460,6 +3569,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3521,6 +3631,7 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3536,6 +3647,9 @@ fn start_terminal_view(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    let execution_recipe = previous
+        .as_ref()
+        .and_then(|previous| previous.execution_recipe.clone());
     start_terminal_view_owned(
         shared,
         client_id,
@@ -3546,6 +3660,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        execution_recipe,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3562,11 +3677,33 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    if let Some(recipe) = &execution_recipe {
+        if crate::upgrade::exact_conversation(recipe).is_none()
+            || (adoption.is_some()
+                && previous
+                    .as_ref()
+                    .and_then(|previous| previous.execution_recipe.as_ref())
+                    != Some(recipe))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Terminal restart execution does not match its authenticated source",
+                false,
+            ));
+        }
+        let mut effective = session.clone();
+        effective.launch = recipe.clone();
+        validate_launch(&effective)?;
+    }
     if let Some(environment) = &mut execution_environment {
-        session.launch.remove_unset_environment(&mut environment.0);
+        execution_recipe
+            .as_ref()
+            .unwrap_or(&session.launch)
+            .remove_unset_environment(&mut environment.0);
     }
     if adoption.is_some() {
         super::account_lifecycle::ensure_terminal_adoption(
@@ -3585,6 +3722,29 @@ fn start_terminal_view_owned(
         &crate::account::launch_credential_overrides(&session.launch),
         execution_environment.is_none(),
     )?;
+    if let Some(recipe) = &execution_recipe {
+        // The pane retains its issued recipe, while the validated restart can
+        // use another credential directory. Admit the command actually passed
+        // to Worker as well as the immutable source retained above.
+        let removals = crate::account::launch_credential_overrides(recipe);
+        if adoption.is_some() {
+            super::account_lifecycle::ensure_terminal_adoption(
+                shared,
+                execution_environment.as_ref().map(|value| &value.0),
+                &removals,
+            )?;
+        }
+        super::account_lifecycle::ensure_launch(
+            shared,
+            &recipe.working_directory,
+            execution_environment
+                .as_ref()
+                .map(|value| &value.0)
+                .unwrap_or(&recipe.environment),
+            &removals,
+            execution_environment.is_none(),
+        )?;
+    }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
@@ -3652,6 +3812,7 @@ fn start_terminal_view_owned(
                 relaunches,
                 options: options.clone(),
                 execution_environment: retained_environment.clone(),
+                execution_recipe: execution_recipe.clone(),
             }
         })
     };
@@ -3749,9 +3910,14 @@ fn start_terminal_view_owned(
         ..TerminalConfig::default()
     };
     let wake_redraw = Arc::clone(&redraw);
-    let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
-        wake_redraw.publish(wake.generation);
-    }) {
+    let handle = match TerminalHandle::spawn_with_execution(
+        session.clone(),
+        config,
+        execution_recipe.clone(),
+        move |wake| {
+            wake_redraw.publish(wake.generation);
+        },
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             shared
@@ -3797,16 +3963,30 @@ fn start_terminal_view_owned(
                 return Err(error);
             }
         }
-        let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
-        if descriptor.is_ok() && pending_pane.is_some() {
-            finish_pending_terminal(&mut state, terminal_id);
-        }
-        if descriptor.is_ok() {
+        let issued_hint = execution_recipe
+            .as_ref()
+            .map(|_| session.resume_hint.clone());
+        let mut descriptor = state.finish_spawn_with_execution(
+            client_id,
+            session,
+            handle,
+            options.initially_visible,
+            execution_recipe.clone(),
+            retained_environment,
+        );
+        if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
             state
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("finished spawn")
-                .execution_environment = retained_environment;
+                .session
+                .resume_hint = hint.clone();
+            descriptor.session.resume_hint = hint;
+        }
+        if descriptor.is_ok() && pending_pane.is_some() {
+            finish_pending_terminal(&mut state, terminal_id);
+        }
+        if descriptor.is_ok() {
             state
                 .terminals
                 .get_mut(&terminal_id)

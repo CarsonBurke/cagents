@@ -401,11 +401,10 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
-                if session.launch.session_id.is_some()
-                    && (session.launch.session_id != restored.launch.session_id
-                        || session.launch.recipe != restored.launch.recipe)
-                {
-                    if !super::is_upgrade_recovery(&session, &restored) {
+                if session != restored {
+                    if !(super::is_upgrade_recovery(&session, &restored)
+                        || super::is_upgrade_identity_learning(&session, &restored))
+                    {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
                     *upgrade_recovery = Some((session, restored.clone()));
@@ -516,6 +515,23 @@ impl ClientHandle {
         inner.proof = proof;
         inner.upgrade_recovery = Some((source, session));
         handle
+    }
+
+    /// Drives the production connect/lineage/attach path for UI writer tests.
+    #[cfg(test)]
+    pub(crate) fn fixture_upgrade_handshake(
+        source: Session,
+        session: Session,
+        snapshot: Snapshot,
+    ) -> Result<Self, StartFailure> {
+        tests::restore_with_lineage(source, Some(session), move |request| {
+            let ClientRequest::ChatAttach { session } = request else {
+                panic!("expected exact upgrade attach");
+            };
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached { session, snapshot },
+            }
+        })
     }
 
     /// Publishes `snapshot` as the reader thread would on a presentation
@@ -687,6 +703,34 @@ impl ClientHandle {
             terminate_source,
             selection,
             None,
+            None,
+            wake,
+        )
+    }
+
+    /// Attach only the exact canonical replacement authenticated from this
+    /// saved source. Unlike ordinary restore, this never starts a provider.
+    pub fn connect_upgrade(
+        source: Session,
+        expected: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !(super::is_upgrade_recovery(&source, &expected)
+            || super::is_upgrade_identity_learning(&source, &expected))
+        {
+            return Err("The canonical chat is not an exact upgrade of the saved source".into());
+        }
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::connect_on(
+            stream,
+            source,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            Some(expected),
             wake,
         )
     }
@@ -709,6 +753,7 @@ impl ClientHandle {
             false,
             None,
             Some((source, None)),
+            None,
             wake,
         )
     }
@@ -732,6 +777,7 @@ impl ClientHandle {
             false,
             None,
             Some((source, Some(generation))),
+            None,
             wake,
         )
     }
@@ -751,6 +797,7 @@ impl ClientHandle {
             false,
             None,
             None,
+            None,
             |_| {},
         )
     }
@@ -763,8 +810,20 @@ impl ClientHandle {
         terminate_source: bool,
         selection: Option<String>,
         account_recovery: Option<(Session, Option<u64>)>,
+        upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        if let Some(expected) = &upgrade_expected
+            && (intent != Intent::Restore
+                || source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || !(super::is_upgrade_recovery(&session, expected)
+                    || super::is_upgrade_identity_learning(&session, expected)))
+        {
+            return Err("The canonical chat is not an exact upgrade of the saved source".into());
+        }
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
         stream
             .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
@@ -773,7 +832,10 @@ impl ClientHandle {
             .set_write_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| e.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-        let expected = source.clone();
+        let expected = upgrade_expected
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .or_else(|| source.clone());
         codec
             .write(
                 &mut stream,
@@ -808,7 +870,33 @@ impl ClientHandle {
         let id = session.id;
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
-        let request = if let Some((source, idle_generation)) = account_recovery {
+        let request = if let Some(expected) = upgrade_expected {
+            if expected.proof.as_ref() != Some(&proof) {
+                return Err("The canonical chat belongs to a different daemon".into());
+            }
+            let request_id = attach_request;
+            attach_request += 1;
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ResolveUpgradeChat {
+                            source: session.clone(),
+                        },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+                ServerResponse::UpgradeChatResolved { session: resolved }
+                    if resolved == expected => {}
+                _ => return Err("The daemon did not authenticate the exact canonical chat".into()),
+            }
+            upgrade_recovery = Some((session, expected.clone()));
+            ClientRequest::ChatAttach { session: expected }
+        } else if let Some((source, idle_generation)) = account_recovery {
             let execution_environment = native_environment(&session, true);
             ClientRequest::ChatRecoverAccount {
                 source,
@@ -1193,6 +1281,10 @@ impl ClientHandle {
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner.upgrade_recovery.as_ref()
     }
+    pub(crate) fn is_connected(&self) -> bool {
+        self.inner.alive.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
             .snapshot
@@ -2337,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_previously_named_upgrade_rotation_carries_persistence_provenance() {
+    fn authenticated_upgrade_rotation_preserves_provenance_and_known_thread_identity() {
         let live = host_proof("live");
         for previous in [None, Some(CONVERSATION), Some("previous-conversation")] {
             let source = omp_card(previous, Some(host_proof("previous")));
@@ -2353,17 +2445,17 @@ mod tests {
                     },
                 },
             );
-            assert!(
-                matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == resolved)
-            );
-            assert_eq!(
-                recovery,
-                previous
-                    .filter(|id| *id != CONVERSATION)
-                    .map(|_| (source, resolved))
-            );
+            if previous.is_some_and(|id| id != CONVERSATION) {
+                assert!(outcome.is_err(), "a known provider thread cannot rotate");
+                assert!(recovery.is_none());
+            } else {
+                assert!(
+                    matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == resolved)
+                );
+                assert_eq!(recovery, Some((source, resolved)));
+            }
         }
-        let source = omp_card(Some("previous-conversation"), Some(host_proof("previous")));
+        let source = omp_card(Some(CONVERSATION), Some(host_proof("previous")));
         let mut resolved = source.clone();
         resolved.proof = Some(live.clone());
         resolved.launch.session_id = Some(CONVERSATION.into());
@@ -2510,10 +2602,24 @@ mod tests {
         };
         assert_eq!(session, restored);
 
+        let mut wrong_thread = restored.clone();
+        wrong_thread.launch.session_id = Some("different-known-thread".into());
+        let (outcome, _) = negotiate(
+            &live,
+            saved.clone(),
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved {
+                    session: wrong_thread,
+                },
+            },
+        );
+        assert!(
+            outcome.is_err(),
+            "a confirmed replacement cannot change a saved known thread"
+        );
+
         // A replacement for a different chat proves nothing about this one.
-        // The conversation identifier deliberately is not part of that
-        // comparison: the daemon reports the conversation its restarted writer
-        // actually holds, which is the answer being asked for.
+        // A known conversation identifier remains part of its exact source.
         let mut other = restored.clone();
         other.id = TerminalId::new();
         let (outcome, _) = negotiate(
@@ -2565,13 +2671,16 @@ mod tests {
         restore_with_lineage(session, None, answer)
     }
 
-    fn restore_with_lineage(
+    pub(super) fn restore_with_lineage(
         session: Session,
         resolved: Option<Session>,
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
-        let live = host_proof("live");
+        let live = resolved
+            .as_ref()
+            .and_then(|session| session.proof.clone())
+            .unwrap_or_else(|| host_proof("live"));
         let (client, mut server) = UnixStream::pair().unwrap();
         let proof = live.clone();
         let worker = thread::spawn(move || {
@@ -2641,6 +2750,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             |_| {},
         );
         worker.join().unwrap();
@@ -2648,9 +2758,149 @@ mod tests {
     }
 
     #[test]
+    fn canonical_upgrade_requires_exact_lineage_before_attach_and_never_starts() {
+        // 0: exact success; 1: no lineage; 2: different resolved descriptor;
+        // 3: changed live daemon; 4: changed attached descriptor;
+        // 5: unconfirmed snapshot; 6: invalid canonical source transition;
+        // 7: an unnamed source learns its authenticated identity.
+        for case in 0..8 {
+            let source = omp_card(
+                (case != 7).then_some(CONVERSATION),
+                Some(host_proof("prior")),
+            );
+            let mut expected = source.clone();
+            expected.proof = Some(host_proof("live"));
+            expected.launch.session_id = Some(CONVERSATION.into());
+            if case == 6 {
+                expected.launch.recipe.program = "another-program".into();
+            }
+            let mut live = host_proof("live");
+            if case == 3 {
+                live = host_proof("unexpected-live");
+            }
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let original = source.clone();
+            let canonical = expected.clone();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let mut requests = Vec::new();
+                while let Some(request) = codec.read::<ClientEnvelope>(&mut server).unwrap() {
+                    let finished = matches!(&request.request, ClientRequest::ChatAttach { .. });
+                    let response = match &request.request {
+                        ClientRequest::Connect { expected_host, .. } => {
+                            assert_eq!(expected_host, &canonical.proof);
+                            ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: live.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            }
+                        }
+                        ClientRequest::ResolveUpgradeChat { source } => {
+                            assert_eq!(source, &original);
+                            assert_eq!(request.proof.as_ref(), Some(&live));
+                            if case == 1 {
+                                ServerMessage::Error(ipc::ProtocolError::new(
+                                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                                    "No authenticated upgrade lineage",
+                                    false,
+                                ))
+                            } else {
+                                let mut resolved = canonical.clone();
+                                if case == 2 {
+                                    resolved.launch.recipe.arguments.push("--changed".into());
+                                }
+                                ServerMessage::Response {
+                                    response: ServerResponse::UpgradeChatResolved {
+                                        session: resolved,
+                                    },
+                                }
+                            }
+                        }
+                        ClientRequest::ChatAttach { session } => {
+                            assert_eq!(session, &canonical);
+                            assert_eq!(request.proof.as_ref(), Some(&live));
+                            let mut session = session.clone();
+                            if case == 4 {
+                                session.launch.recipe.arguments.push("--changed".into());
+                            }
+                            ServerMessage::Response {
+                                response: ServerResponse::ChatAttached {
+                                    session,
+                                    snapshot: Snapshot {
+                                        session_id: Some(
+                                            if case == 5 {
+                                                "other-thread"
+                                            } else {
+                                                CONVERSATION
+                                            }
+                                            .into(),
+                                        ),
+                                        ready: true,
+                                        ..Default::default()
+                                    },
+                                },
+                            }
+                        }
+                        other => panic!("strict upgrade must never issue {other:?}"),
+                    };
+                    requests.push(request.request);
+                    codec
+                        .write(
+                            &mut server,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: live.clone(),
+                                message: response,
+                            },
+                        )
+                        .unwrap();
+                    if finished {
+                        break;
+                    }
+                }
+                requests
+            });
+            let result = ClientHandle::connect_on(
+                client,
+                source.clone(),
+                Intent::Restore,
+                None,
+                false,
+                None,
+                None,
+                Some(expected.clone()),
+                |_| {},
+            );
+            let requests = worker.join().unwrap();
+            let count = match case {
+                6 => 0,
+                3 => 1,
+                1 | 2 => 2,
+                _ => 3,
+            };
+            assert_eq!(requests.len(), count, "case {case}");
+            if case == 0 || case == 7 {
+                let handle = result.unwrap();
+                assert_eq!(handle.session(), expected);
+                assert_eq!(handle.upgrade_recovery(), Some(&(source, expected)));
+            } else {
+                assert!(result.is_err(), "case {case} must refuse");
+            }
+        }
+    }
+
+    #[test]
     fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
         for mismatch in 0..3 {
-            let source = omp_card(Some("prior-conversation"), Some(host_proof("prior")));
+            let source = omp_card(Some(CONVERSATION), Some(host_proof("prior")));
             let mut resolved = source.clone();
             resolved.proof = Some(host_proof("live"));
             resolved.launch.session_id = Some(CONVERSATION.into());
@@ -2930,6 +3180,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             move |wake| {
                 let _ = wake_tx.send(wake);
             },
@@ -3100,6 +3351,7 @@ mod tests {
                     Intent::Start,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     |_| {},

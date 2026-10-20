@@ -63,8 +63,15 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
+/// Older launchers understand only the final ready/error response. Progress
+/// requires a separate explicit capability to keep their stdout protocol valid.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
 pub const UI_LAUNCH_READY: &str = "ready";
 pub const UI_LAUNCH_ERROR_PREFIX: &str = "error: ";
+/// A usable recovery window remains open while the updater reports failure.
+pub const UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX: &str = "recovery-incomplete: ";
+/// One bounded inventory announcement extends startup, without claiming ready.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -270,6 +277,26 @@ pub fn ui_launch_handshake_requested() -> bool {
     env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref() == Some("1".as_ref())
 }
 
+/// Advertise the saved-pane inventory before the final readiness acknowledgement.
+/// This is progress only: the launcher must still await `report_ui_startup`.
+pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if ui_launch_handshake_requested()
+        && env::var_os(UI_LAUNCH_RECOVERY_PROGRESS_ENV).as_deref() == Some("1".as_ref())
+        && !REPORTED.swap(true, Ordering::AcqRel)
+    {
+        if saved_chats > 1152 {
+            return Err(io::Error::other(
+                "saved conversation inventory exceeds the recovery limit",
+            ));
+        }
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
@@ -472,7 +499,7 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
-fn editor_executable(
+pub(crate) fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
 ) -> io::Result<Option<PathBuf>> {
@@ -681,6 +708,31 @@ pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
 pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
     validate_stage_guard()?;
     verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
+}
+
+/// A candidate whose exact daemon already owns the runtime may reopen while an
+/// older coordinator retains its shared legacy fence. Keep legacy exclusive UI
+/// owners excluded, and authenticate every modern window before routing.
+/// The caller must hold the launch fence and retain the returned legacy guard.
+pub(crate) fn verified_windows_for_daemon(
+    executable: &Path,
+) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
+    let runtime = runtime_directory()?;
+    let legacy = owned_lock(
+        &runtime.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
+    let windows = verified_window_lease_owners_in(&runtime, Path::new("/proc"))?;
+    if crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .as_deref()
+        != Some(executable)
+    {
+        return Err(io::Error::other(
+            "candidate daemon ownership changed while checking windows",
+        ));
+    }
+    Ok((windows, legacy))
 }
 
 fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
@@ -908,6 +960,15 @@ impl UiUpdateGuard {
     }
 
     pub fn prepare_and_close_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
+        self.prepare_and_close_windows_with_preflight(timeout, |_| Ok(()))
+    }
+
+    /// Check flushed saved panes before committing any source window to close.
+    pub(crate) fn prepare_and_close_windows_with_preflight(
+        &mut self,
+        timeout: Duration,
+        preflight: impl FnOnce(&Self) -> io::Result<()>,
+    ) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
@@ -919,6 +980,13 @@ impl UiUpdateGuard {
                 "update-prepare",
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
+        }
+        preflight(self)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Source inspection exceeded the window preparation allowance; source windows remain usable",
+            ));
         }
         for slot in &slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
@@ -2306,6 +2374,85 @@ mod tests {
         drop(guard);
         for worker in workers {
             assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+    }
+
+    #[test]
+    fn source_inspection_veto_cancels_all_prepared_windows_before_commit() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            let lease =
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (finished, completion) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let _lease = lease;
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "window request was not received"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                finished.send(actions).unwrap();
+            });
+            workers.push((worker, completion));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            _legacy_fence: legacy,
+            runtime: runtime.path().into(),
+            prepared: vec![],
+            closed: vec![],
+            fallback_executable: None,
+        };
+        let error = guard
+            .prepare_and_close_windows_with_preflight(Duration::from_secs(5), |guard| {
+                assert_eq!(guard.prepared.len(), 2);
+                assert!(guard.closed.is_empty());
+                Err(io::Error::other("saved native pane has no exact migration"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("saved native pane"));
+        assert!(guard.closed.is_empty());
+        drop(guard);
+        for (worker, completion) in workers {
+            assert_eq!(
+                completion.recv_timeout(Duration::from_secs(6)).unwrap(),
+                ["update-prepare", "update-cancel"]
+            );
+            worker.join().unwrap();
         }
     }
 
