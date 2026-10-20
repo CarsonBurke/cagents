@@ -53,6 +53,36 @@ struct Tail {
 }
 
 impl CodeBlock {
+    /// Owned span storage and logical text bytes. Plain palettes share their
+    /// Arc; count that backing only once. Highlighter state is not estimated.
+    pub(super) fn retained_span_bytes(&self) -> usize {
+        let bytes = |spans: &Arc<[Span<'static, String>]>| {
+            spans.len() * std::mem::size_of::<Span<'static, String>>()
+                + spans
+                    .iter()
+                    .map(|span| {
+                        let text: &str = span.text.as_ref();
+                        text.len()
+                    })
+                    .sum::<usize>()
+        };
+        bytes(&self.spans[0])
+            + if Arc::ptr_eq(&self.spans[0], &self.spans[1]) {
+                0
+            } else {
+                bytes(&self.spans[1])
+            }
+    }
+
+    /// Share immutable prepared palettes across worker snapshots. Streaming
+    /// highlighter continuations are never cloned or transferred this way.
+    pub(super) fn settled_clone(&self) -> Self {
+        Self {
+            spans: self.spans.clone(),
+            tail: None,
+        }
+    }
+
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
@@ -232,6 +262,34 @@ pub(super) fn fence_language(info: &str) -> Option<&str> {
         .find(|word| !word.is_empty())
 }
 
+pub(super) type PaletteMap = HashMap<u64, Arc<[Span<'static, String>]>>;
+pub(super) type Palettes = [Arc<PaletteMap>; 2];
+pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
+    std::array::from_fn(|dark| {
+        Arc::new(
+            blocks
+                .iter()
+                .map(|(key, block)| (*key, block.spans(dark != 0).clone()))
+                .collect(),
+        )
+    })
+}
+fn palette(cached: &CachedItem, dark: bool) -> Arc<PaletteMap> {
+    cached
+        .palette_views
+        .as_ref()
+        .map(|palettes| palettes[usize::from(dark)].clone())
+        .unwrap_or_else(|| {
+            Arc::new(
+                cached
+                    .blocks
+                    .iter()
+                    .map(|(key, block)| (*key, block.spans(dark).clone()))
+                    .collect(),
+            )
+        })
+}
+
 /// An item's parsed Markdown as an element that owns what it draws.
 pub(super) fn view(
     cached: &CachedItem,
@@ -239,11 +297,27 @@ pub(super) fn view(
     target: Target,
     find: Option<&str>,
 ) -> Element<'static, Message> {
+    if cached.placeholder {
+        return widget::text::caption("Loading message…").into();
+    }
     Renderer {
         target,
-        cached,
+        blocks: palette(cached, cosmic::theme::is_dark()),
+        revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
+        path: vec![0],
         dark: cosmic::theme::is_dark(),
-        find,
+        find: find.map(Arc::from),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -260,9 +334,33 @@ pub(super) fn content_view(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        cached,
+        blocks: palette(cached, cosmic::theme::is_dark()),
+        revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
+        path: vec![
+            1,
+            cached
+                .coordination
+                .as_ref()
+                .and_then(|coordinated| {
+                    coordinated
+                        .contents()
+                        .position(|candidate| std::ptr::eq(candidate, content))
+                })
+                .unwrap_or_default() as u32,
+        ],
         dark: cosmic::theme::is_dark(),
-        find,
+        find: find.map(Arc::from),
     }
     .items(content.items(), settings)
 }
@@ -275,7 +373,20 @@ pub(super) fn items_for_test(
 ) -> Element<'static, Message> {
     Renderer {
         target,
-        cached,
+        blocks: palette(cached, cosmic::theme::is_dark()),
+        revision: cached.revision,
+        flow_cache: cached.flow_cache.clone(),
+        reader_memory: cached.reader_memory.clone(),
+        reader_context: cached.reader_context.clone(),
+        item: cached
+            .item
+            .as_ref()
+            .map_or_else(
+                || format!("unbound-{}", cached.revision),
+                |item| item.id.clone(),
+            )
+            .into(),
+        path: vec![0],
         dark: true,
         find: None,
     }
@@ -285,28 +396,204 @@ pub(super) fn items_for_test(
     )
 }
 
-struct Renderer<'c> {
-    find: Option<&'c str>,
+#[derive(Clone)]
+struct Renderer {
+    flow_cache: flow_layout::Cache,
+    reader_memory: scroll::Memory,
+    reader_context: Option<String>,
+    item: Arc<str>,
+    path: Vec<u32>,
+    find: Option<Arc<str>>,
     target: Target,
-    cached: &'c CachedItem,
+    blocks: Arc<HashMap<u64, Arc<[Span<'static, String>]>>>,
+    revision: u64,
     dark: bool,
 }
 
-impl Renderer<'_> {
+impl Renderer {
+    /// Describe logical leaves without plain-text extraction, styling, widget
+    /// creation or shaping. Composite ancestors expose these aliases so Find
+    /// can realize the correct nested row before measuring its exact glyph.
+    fn logical_descendants(&self, items: &[markdown::Item]) -> Vec<virtualized::LogicalRange> {
+        let mut leaves = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            self.child(index as u32).describe(item, &mut leaves);
+        }
+        leaves
+    }
+    fn describe(&self, item: &markdown::Item, leaves: &mut Vec<virtualized::LogicalRange>) {
+        let length = match item {
+            markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => Some(text.len()),
+            markdown::Item::CodeBlock { code, .. } => Some(code.len()),
+            _ => None,
+        };
+        if let Some(length) = length {
+            leaves.push(virtualized::LogicalRange {
+                identity: selection::logical_identity(&self.item, &self.path),
+                bytes: 0..length,
+                chunk: false,
+            });
+            return;
+        }
+        match item {
+            markdown::Item::Quote(items) => leaves.extend(self.logical_descendants(items)),
+            markdown::Item::List { bullets, .. } => {
+                for (index, bullet) in bullets.iter().enumerate() {
+                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                        bullet;
+                    leaves.extend(self.child(index as u32).logical_descendants(items));
+                }
+            }
+            markdown::Item::Table { columns, rows } => {
+                for (column, header) in columns.iter().enumerate() {
+                    leaves.extend(
+                        self.child(0)
+                            .child(column as u32)
+                            .logical_descendants(&header.header),
+                    );
+                }
+                for (row, cells) in rows.iter().enumerate() {
+                    for (column, cells) in cells.cells.iter().enumerate() {
+                        leaves.extend(
+                            self.child(row as u32 + 1)
+                                .child(column as u32)
+                                .logical_descendants(cells),
+                        );
+                    }
+                }
+            }
+            markdown::Item::Image { alt, title, .. } => {
+                if alt.len() > 0 {
+                    leaves.push(virtualized::LogicalRange {
+                        identity: selection::logical_identity(&self.item, &self.child(0).path),
+                        bytes: 0..alt.len(),
+                        chunk: false,
+                    });
+                }
+                if !title.is_empty() {
+                    leaves.push(virtualized::LogicalRange {
+                        identity: selection::logical_identity(&self.item, &self.child(1).path),
+                        bytes: 0..title.len(),
+                        chunk: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    fn child(&self, index: u32) -> Self {
+        let mut path = self.path.clone();
+        path.push(index);
+        Self {
+            flow_cache: self.flow_cache.clone(),
+            item: self.item.clone(),
+            path,
+            find: self.find.clone(),
+            target: self.target,
+            reader_memory: self.reader_memory.clone(),
+            reader_context: self.reader_context.clone(),
+            blocks: self.blocks.clone(),
+            revision: self.revision,
+            dark: self.dark,
+        }
+    }
+    fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
+        self.logical_identity(start)
+    }
+    fn logical_identity(&self, start: usize) -> selectable_prose::Logical {
+        selectable_prose::Logical {
+            identity: selection::logical_identity(&self.item, &self.path),
+            start,
+        }
+    }
     fn items(
         &self,
         items: &[markdown::Item],
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        widget::column::with_children(
-            items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| self.item(item, index, settings))
-                .collect::<Vec<_>>(),
-        )
-        .spacing(settings.spacing.0)
-        .into()
+        if items.len() <= 4 {
+            return widget::column::with_children(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| self.child(index as u32).item(item, index, settings))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(settings.spacing.0)
+            .into();
+        }
+        let rows = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                use std::hash::{Hash, Hasher};
+                let renderer = self.child(index as u32);
+                let key = selection::logical_identity(&renderer.item, &renderer.path);
+                let mut revision = std::hash::DefaultHasher::new();
+                (
+                    self.revision,
+                    settings.text_size.0.to_bits(),
+                    settings.style.font,
+                    &self.find,
+                    self.dark,
+                )
+                    .hash(&mut revision);
+                let revision = revision.finish();
+                let estimate = match item {
+                    markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
+                        (text.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE)
+                            .ceil()
+                            .max(1.0)
+                            * settings.text_size.0
+                            * 1.3
+                    }
+                    markdown::Item::CodeBlock { code, .. } => {
+                        (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32)
+                            * settings.code_size.0
+                            * 1.3
+                            + 48.0
+                    }
+                    _ => 80.0,
+                } + if index == 0 { 0.0 } else { settings.spacing.0 };
+                let logical_len = match item {
+                    markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
+                        Some(text.len())
+                    }
+                    markdown::Item::CodeBlock { code, .. } => Some(code.len()),
+                    _ => None,
+                };
+                let descendants = if logical_len.is_none() {
+                    let mut leaves = Vec::new();
+                    renderer.describe(item, &mut leaves);
+                    leaves
+                } else {
+                    vec![]
+                };
+                let item = item.clone();
+                let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
+                    let renderer = renderer.clone();
+                    let item = item.clone();
+                    retained::kept(revision, move || {
+                        widget::container(renderer.item(&item, index, settings))
+                            .padding(iced::Padding::ZERO.top(if index == 0 {
+                                0.0
+                            } else {
+                                settings.spacing.0
+                            }))
+                            .into()
+                    })
+                });
+                row.anchor = true;
+                row.descendants = descendants;
+                row.logical = logical_len.map(|len| virtualized::LogicalRange {
+                    identity: key,
+                    bytes: 0..len,
+                    chunk: false,
+                });
+                row
+            })
+            .collect();
+        virtualized::column(rows, Default::default())
     }
 
     fn item(
@@ -317,13 +604,31 @@ impl Renderer<'_> {
     ) -> Element<'static, Message> {
         use markdown::Item;
         match item {
-            Item::Heading(level, text) => {
-                heading(settings, *level, text, index, self.target, self.find)
-            }
-            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find),
-            Item::CodeBlock { language, code, .. } => {
-                self.code_block(settings, language.as_deref(), code)
-            }
+            Item::Heading(level, text) => heading(
+                settings,
+                *level,
+                text,
+                index,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical_identity(0)),
+                Some(&self.flow_cache),
+            ),
+            Item::Paragraph(text) => paragraph(
+                settings,
+                text,
+                self.target,
+                self.find.as_deref(),
+                Some(self.logical_identity(0)),
+                Some(&self.flow_cache),
+            ),
+            Item::CodeBlock {
+                language,
+                code,
+                source,
+                reader_source,
+                ..
+            } => self.code_block(settings, language.as_deref(), code, source, reader_source),
             Item::List { start, bullets } => self.list(settings, *start, bullets),
             Item::Quote(items) => {
                 iced::widget::row![iced::widget::rule::vertical(4), self.items(items, settings),]
@@ -337,21 +642,23 @@ impl Renderer<'_> {
                 let mut rows = Vec::new();
                 let alt = alt.spans(settings.style);
                 if !alt.is_empty() {
-                    rows.push(selectable_prose::text(
+                    rows.push(leaf_text(
                         alt,
                         settings.text_size,
                         iced::Font::default(),
                         self.target,
-                        self.find,
+                        self.find.as_deref(),
+                        Some(self.child(0).logical(Arc::from(""), 0)),
                     ));
                 }
                 if !title.is_empty() {
-                    rows.push(selectable_prose::text(
+                    rows.push(leaf_text(
                         vec![Span::new(title.clone())].into(),
                         design::TEXT_CAPTION.into(),
                         iced::Font::default(),
                         self.target,
-                        self.find,
+                        self.find.as_deref(),
+                        Some(self.child(1).logical(Arc::from(""), 0)),
                     ));
                 }
                 rows.push(
@@ -386,57 +693,87 @@ impl Renderer<'_> {
                 .log10()
                 .ceil()
         });
-        let rows: Vec<Element<'static, Message>> = bullets
+        let rows = bullets
             .iter()
             .enumerate()
             .map(|(index, bullet)| {
-                let (marker, items): (Element<'static, Message>, _) = match (bullet, start) {
-                    (markdown::Bullet::Point { items }, Some(start))
-                    | (markdown::Bullet::Task { items, .. }, Some(start)) => (
-                        iced::widget::text(format!("{}.", index as u64 + start))
-                            .size(settings.text_size)
-                            .align_x(iced::alignment::Horizontal::Right)
-                            .width(
-                                settings.text_size * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
-                            )
-                            .into(),
-                        items,
-                    ),
-                    (markdown::Bullet::Point { items }, None) => (
-                        iced::widget::text("•").size(settings.text_size).into(),
-                        items,
-                    ),
-                    (markdown::Bullet::Task { items, done }, None) => (
-                        widget::container(iced::widget::checkbox(*done).size(settings.text_size))
-                            .center_y(
-                                iced::widget::text::LineHeight::default()
-                                    .to_absolute(settings.text_size),
-                            )
-                            .into(),
-                        items,
-                    ),
-                };
-                let mut prefix = start.map_or_else(
-                    || "-".to_owned(),
-                    |start| format!("{}.", index as u64 + start),
+                let renderer = self.clone();
+                let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                    bullet;
+                let descendants = self.child(index as u32).logical_descendants(items);
+                let bullet = bullet.clone();
+                let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
+                let mut descriptor = virtualized::Row::new(
+                    key,
+                    self.revision,
+                    64.0 + settings.spacing.0 * 0.75,
+                    None,
+                    move || {
+                        let (marker, items): (Element<'static, Message>, _) = match (&bullet, start)
+                        {
+                            (markdown::Bullet::Point { items }, Some(start))
+                            | (markdown::Bullet::Task { items, .. }, Some(start)) => (
+                                iced::widget::text(format!("{}.", index as u64 + start))
+                                    .size(settings.text_size)
+                                    .align_x(iced::alignment::Horizontal::Right)
+                                    .width(
+                                        settings.text_size
+                                            * ((digits.unwrap_or(1.0) / 2.0).ceil() + 1.0),
+                                    )
+                                    .into(),
+                                items,
+                            ),
+                            (markdown::Bullet::Point { items }, None) => (
+                                iced::widget::text("•").size(settings.text_size).into(),
+                                items,
+                            ),
+                            (markdown::Bullet::Task { items, done }, None) => (
+                                widget::container(
+                                    iced::widget::checkbox(*done).size(settings.text_size),
+                                )
+                                .center_y(
+                                    iced::widget::text::LineHeight::default()
+                                        .to_absolute(settings.text_size),
+                                )
+                                .into(),
+                                items,
+                            ),
+                        };
+                        let mut prefix = start.map_or_else(
+                            || "-".to_owned(),
+                            |start| format!("{}.", index as u64 + start),
+                        );
+                        if let markdown::Bullet::Task { done, .. } = &bullet {
+                            prefix.push_str(if *done { " [x]" } else { " [ ]" });
+                        }
+                        widget::container(
+                            iced::widget::row![
+                                marker,
+                                selection::wrap(
+                                    renderer.child(index as u32).items(items, nested),
+                                    selection::Kind::ListItem(prefix)
+                                )
+                            ]
+                            .spacing(settings.spacing.0),
+                        )
+                        .padding(iced::Padding::ZERO.bottom(settings.spacing.0 * 0.75))
+                        .into()
+                    },
                 );
-                if let markdown::Bullet::Task { done, .. } = bullet {
-                    prefix.push_str(if *done { " [x]" } else { " [ ]" });
-                }
-                iced::widget::row![
-                    marker,
-                    selection::wrap(self.items(items, nested), selection::Kind::ListItem(prefix))
-                ]
-                .spacing(settings.spacing.0)
-                .into()
+                descriptor.descendants = descendants;
+                descriptor.anchor = true;
+                descriptor
             })
             .collect();
-        let list = widget::column::with_children(rows).spacing(settings.spacing.0 * 0.75);
-        if start.is_some() {
-            list.into()
-        } else {
-            list.padding([0.0, settings.spacing.0]).into()
-        }
+        widget::container(virtualized::column(rows, Default::default()))
+            .padding(if start.is_none() {
+                iced::Padding::ZERO
+                    .left(settings.spacing.0)
+                    .right(settings.spacing.0)
+            } else {
+                iced::Padding::ZERO
+            })
+            .into()
     }
 
     fn table(
@@ -445,50 +782,102 @@ impl Renderer<'_> {
         columns: &[markdown::Column],
         rows: &[markdown::Row],
     ) -> Element<'static, Message> {
-        use iced::widget::table;
-        let table = table::table(
-            columns.iter().enumerate().map(|(index, column)| {
-                table::column(
-                    selection::wrap(
-                        self.items(&column.header, settings),
-                        selection::Kind::Cell {
-                            row: 0,
-                            column: index,
-                        },
-                    ),
-                    move |row: usize| {
-                        let content: Element<'static, Message> = match rows[row].cells.get(index) {
-                            Some(cells) => self.items(cells, settings),
-                            None => iced::widget::text("").into(),
-                        };
-                        selection::wrap(
-                            content,
-                            selection::Kind::Cell {
-                                row: row + 1,
-                                column: index,
-                            },
-                        )
+        // Stable column widths let independently mounted rows agree without
+        // shaping every hidden cell to discover its natural width.
+        let width = 240.0;
+        let alignments: Arc<[_]> = columns.iter().map(alignment).collect::<Vec<_>>().into();
+        let header = columns
+            .iter()
+            .map(|column| column.header.clone())
+            .collect::<Vec<_>>();
+        let descriptors = std::iter::once(header)
+            .chain(rows.iter().map(|row| row.cells.clone()))
+            .enumerate()
+            .map(|(row, cells)| {
+                let renderer = self.child(row as u32);
+                let key = selection::logical_identity(&self.item, &renderer.path);
+                let descendants = cells
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(column, cells)| {
+                        renderer.child(column as u32).logical_descendants(cells)
+                    })
+                    .collect();
+                let alignments = alignments.clone();
+                let mut descriptor = virtualized::Row::new(
+                    key,
+                    self.revision,
+                    48.0 + settings.spacing.0,
+                    None,
+                    move || {
+                        let descriptors = alignments
+                            .iter()
+                            .enumerate()
+                            .map(|(column, alignment)| {
+                                let renderer = renderer.child(column as u32);
+                                let key =
+                                    selection::logical_identity(&renderer.item, &renderer.path);
+                                let alignment = *alignment;
+                                let cells = cells.get(column).cloned().unwrap_or_default();
+                                let mut descendants = renderer.logical_descendants(&cells);
+                                // Horizontal estimates can realize a far-away cell
+                                // before an exact glyph exists in the mounted tree.
+                                for logical in &mut descendants {
+                                    logical.chunk = true;
+                                }
+                                let mut descriptor = virtualized::Row::new(
+                                    key,
+                                    renderer.revision,
+                                    width,
+                                    None,
+                                    move || {
+                                        let content = renderer.items(&cells, settings);
+                                        widget::container(selection::wrap(
+                                            content,
+                                            selection::Kind::Cell { row, column },
+                                        ))
+                                        .width(width)
+                                        .align_x(alignment)
+                                        .padding([settings.spacing.0 / 2.0, settings.spacing.0])
+                                        .into()
+                                    },
+                                );
+                                descriptor.descendants = descendants;
+                                descriptor
+                            })
+                            .collect();
+                        virtualized::row(descriptors, 48.0 + settings.spacing.0, Default::default())
                     },
-                )
-                .align_x(alignment(column))
-            }),
-            0..rows.len(),
+                );
+                descriptor.descendants = descendants;
+                descriptor.anchor = true;
+                descriptor
+            })
+            .collect();
+        let table = widget::container(virtualized::column(descriptors, Default::default()))
+            .width(width * columns.len().max(1) as f32);
+        scroll::block(
+            iced::widget::scrollable(selection::wrap(
+                table,
+                selection::Kind::Table {
+                    columns: columns.len(),
+                    rows: rows.len() + 1,
+                },
+            ))
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .id(scroll::block_id(
+                self.target,
+                self.reader_context.as_deref(),
+                selection::logical_identity(&self.item, &self.path),
+            ))
+            .spacing(settings.spacing.0 / 2.0),
+            self.reader_memory.clone(),
+            self.reader_context.clone(),
+            selection::logical_identity(&self.item, &self.path),
+            false,
         )
-        .padding_x(settings.spacing.0)
-        .padding_y(settings.spacing.0 / 2.0)
-        .separator_x(0);
-        iced::widget::scrollable(selection::wrap(
-            table,
-            selection::Kind::Table {
-                columns: columns.len(),
-                rows: rows.len() + 1,
-            },
-        ))
-        .direction(iced::widget::scrollable::Direction::Horizontal(
-            design::scrollbar(),
-        ))
-        .spacing(settings.spacing.0 / 2.0)
-        .into()
     }
 
     /// A fenced block on the sunken surface commands and outputs use, drawn
@@ -499,27 +888,58 @@ impl Renderer<'_> {
         settings: markdown::Settings,
         language: Option<&str>,
         code: &str,
+        source: &Arc<str>,
+        reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
-        let spans = self
-            .cached
-            .block(language, code)
-            .map(|block| block.spans(self.dark).clone())
-            .unwrap_or_else(|| vec![Span::new(code.to_owned())].into());
-        let text = selectable_prose::text(
+        let spans = (code.len() <= CachedItem::HIGHLIGHT_LIMIT)
+            .then(|| {
+                self.blocks
+                    .get(&fence_key(language.unwrap_or_default(), code))
+            })
+            .flatten()
+            .cloned()
+            .unwrap_or_else(|| {
+                if code.len() > 2048 {
+                    Arc::from([])
+                } else {
+                    vec![Span::new(code.to_owned())].into()
+                }
+            });
+        let text = code_text(
+            source.clone(),
             spans,
             settings.code_size,
             CodeBlock::FONT,
             self.target,
-            self.find,
+            self.find.as_deref(),
+            Some(self.logical(Arc::from(""), 0)),
+            Some(self.flow_cache.clone()),
+            Some(reader_source.clone()),
         );
         step::code_frame(
-            widget::scrollable(
-                widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            ))
-            .into(),
+            scroll::block_source(
+                widget::scrollable(scroll::minimum_width(
+                    widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
+                    self.reader_memory.reader_width_for(
+                        self.reader_context.as_deref(),
+                        selection::logical_identity(&self.item, &self.path),
+                        reader_source,
+                    ),
+                ))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .id(scroll::block_id(
+                    self.target,
+                    self.reader_context.as_deref(),
+                    selection::logical_identity(&self.item, &self.path),
+                )),
+                self.reader_memory.clone(),
+                self.reader_context.clone(),
+                selection::logical_identity(&self.item, &self.path),
+                false,
+                Some(reader_source.clone()),
+            ),
             Some(
                 language
                     .and_then(fence_language)
@@ -538,21 +958,28 @@ fn heading(
     index: usize,
     target: Target,
     find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(selectable_prose::text(
-        text.spans(heading_style(settings, level)),
-        match level {
-            HeadingLevel::H1 => settings.h1_size,
-            HeadingLevel::H2 => settings.h2_size,
-            HeadingLevel::H3 => settings.h3_size,
-            HeadingLevel::H4 => settings.h4_size,
-            HeadingLevel::H5 => settings.h5_size,
-            HeadingLevel::H6 => settings.h6_size,
+    widget::container(paragraph(
+        markdown::Settings {
+            text_size: match level {
+                HeadingLevel::H1 => settings.h1_size,
+                HeadingLevel::H2 => settings.h2_size,
+                HeadingLevel::H3 => settings.h3_size,
+                HeadingLevel::H4 => settings.h4_size,
+                HeadingLevel::H5 => settings.h5_size,
+                HeadingLevel::H6 => settings.h6_size,
+            },
+            style: heading_style(settings, level),
+            ..settings
         },
-        settings.style.font,
+        text,
         target,
         find,
+        logical,
+        flow_cache,
     ))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
@@ -582,18 +1009,292 @@ fn heading_style(settings: markdown::Settings, level: markdown::HeadingLevel) ->
     }
 }
 
+fn leaf_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+) -> Element<'static, Message> {
+    if let Some(logical) = logical {
+        selectable_prose::logical_text(spans, size, font, target, find, logical)
+    } else {
+        selectable_prose::text(spans, size, font, target, find)
+    }
+}
+
+/// Read-only code shares one source, and only styles/shapes bounded mounted
+/// ranges. The logical block keeps source newlines intact for selection/copy.
+pub(super) fn code_text(
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>,
+    reader_source: Option<reader_source::Source>,
+) -> Element<'static, Message> {
+    if text.len() <= 2048 {
+        let spans = if spans.is_empty() {
+            vec![Span::new(text.to_string())].into()
+        } else {
+            spans
+        };
+        return leaf_text(spans, size, font, target, find, logical);
+    }
+    let mut starts = Vec::with_capacity(spans.len() + 1);
+    starts.push(0usize);
+    for span in spans.iter() {
+        starts.push(starts.last().copied().unwrap() + span.text.len());
+    }
+    let starts: Arc<[usize]> = starts.into();
+    let find: Option<Arc<str>> = find.map(Arc::from);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        ranges.push(start..start + line.len());
+        start += line.len();
+    }
+    if text.ends_with('\n') {
+        ranges.push(text.len()..text.len());
+    }
+    let rows = ranges
+        .into_iter()
+        .map(|range| {
+            use std::hash::{Hash, Hasher};
+            let mut key = std::hash::DefaultHasher::new();
+            (
+                logical.as_ref().map(|logical| logical.identity),
+                range.start,
+            )
+                .hash(&mut key);
+            let key = key.finish();
+            let mut revision = std::hash::DefaultHasher::new();
+            (
+                Arc::as_ptr(&text) as *const u8 as usize,
+                &range,
+                &find,
+                font,
+                size.0.to_bits(),
+            )
+                .hash(&mut revision);
+            let revision = revision.finish();
+            let text = text.clone();
+            let spans = spans.clone();
+            let starts = starts.clone();
+            let find = find.clone();
+            let flow_cache = flow_cache.clone();
+            let reader_source = reader_source.clone();
+            let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
+                identity: logical.identity,
+                bytes: logical.start + range.start..logical.start + range.end,
+                chunk: false,
+            });
+            let logical = logical.clone().map(|mut logical| {
+                logical.start += range.start;
+                logical
+            });
+            let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
+                // Newlines belong to the logical document. Each physical line
+                // contributes one visual row, including the real terminal empty
+                // line, instead of an extra empty paragraph at every chunk seam.
+                let mut display = range.clone();
+                if text[display.clone()].ends_with('\n') {
+                    display.end -= 1;
+                    if text[display.clone()].ends_with('\r') {
+                        display.end -= 1;
+                    }
+                }
+                if display.is_empty() {
+                    // Empty physical lines still own a logical caret position,
+                    // including the final newline. A Space cannot participate
+                    // in pointer selection or copy across that source boundary.
+                    return leaf_text(
+                        vec![Span::new(String::new())].into(),
+                        size,
+                        font,
+                        target,
+                        find.as_deref(),
+                        logical.clone(),
+                    );
+                }
+                code_line(
+                    text.clone(),
+                    spans.clone(),
+                    starts.clone(),
+                    display,
+                    size,
+                    font,
+                    target,
+                    find.clone(),
+                    logical.clone(),
+                    flow_cache.clone(),
+                    reader_source.clone(),
+                )
+            });
+            row.anchor = true;
+            row.logical = descriptor;
+            row
+        })
+        .collect();
+    virtualized::column(rows, Default::default())
+}
+
+fn code_line(
+    text: Arc<str>,
+    spans: Arc<[Span<'static, String>]>,
+    starts: Arc<[usize]>,
+    range: std::ops::Range<usize>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<Arc<str>>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<flow_layout::Cache>,
+    reader_source: Option<reader_source::Source>,
+) -> Element<'static, Message> {
+    if range.len() > 2048
+        && let (Some(cache), Some(source)) = (flow_cache, reader_source)
+    {
+        // The worker shapes the complete physical line with its original
+        // ligatures, Bidi context and tab stops; display projection may cull
+        // glyphs but never introduces an artificial source boundary.
+        use std::hash::{Hash, Hasher};
+        let mut key = std::hash::DefaultHasher::new();
+        (
+            "code-line",
+            logical.as_ref().map(|logical| logical.identity),
+            logical
+                .as_ref()
+                .map_or(range.start, |logical| logical.start),
+        )
+            .hash(&mut key);
+        let flow = cache.code_entry(key.finish(), text, range, spans, starts, source);
+        return selectable_prose::flow_source_optional(
+            size,
+            font,
+            target,
+            find.as_deref(),
+            logical,
+            flow,
+        );
+    }
+    let styled = if spans.is_empty() {
+        vec![Span::new(text[range.clone()].to_owned())].into()
+    } else {
+        sliced_spans(&spans, &starts, range)
+    };
+    leaf_text(styled, size, font, target, find.as_deref(), logical)
+}
+
+pub(super) fn sliced_spans(
+    spans: &[Span<'static, String>],
+    starts: &[usize],
+    range: std::ops::Range<usize>,
+) -> Arc<[Span<'static, String>]> {
+    let first = starts
+        .partition_point(|start| *start <= range.start)
+        .saturating_sub(1);
+    spans
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take_while(|(index, _)| starts[*index] < range.end)
+        .filter_map(|(index, span)| {
+            let start = range.start.saturating_sub(starts[index]);
+            let end = range.end.saturating_sub(starts[index]).min(span.text.len());
+            (start < end).then(|| Span {
+                text: span.text[start..end].to_owned().into(),
+                size: span.size,
+                line_height: span.line_height,
+                font: span.font,
+                color: span.color,
+                link: span.link.clone(),
+                highlight: span.highlight,
+                padding: span.padding,
+                underline: span.underline,
+                strikethrough: span.strikethrough,
+            })
+        })
+        .collect()
+}
+
+/// A bounded visual chunk. Copy and selection keep the original logical
+/// paragraph, so splitting here introduces no whitespace into clipboard text.
+pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    const BYTES: usize = 2048;
+    const LINES: usize = 40;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + BYTES).min(text.len());
+        use unicode_segmentation::UnicodeSegmentation;
+        let boundary = text[start..]
+            .grapheme_indices(true)
+            .map(|(at, _)| start + at)
+            .chain(std::iter::once(text.len()))
+            .take_while(|at| *at <= end)
+            .last()
+            .unwrap_or(start);
+        if boundary > start {
+            end = boundary;
+        } else {
+            end = start + text[start..].graphemes(true).next().map_or(0, str::len);
+        }
+        if let Some((line, _)) = text[start..end].match_indices('\n').nth(LINES - 1) {
+            end = start + line + 1;
+        }
+        // Prefer a source whitespace boundary near the cap. A giant token is
+        // still bounded and wraps with the same glyph fallback as short prose.
+        if end < text.len()
+            && let Some((at, grapheme)) = text[start..end]
+                .grapheme_indices(true)
+                .rev()
+                .find(|(_, grapheme)| grapheme.chars().all(char::is_whitespace))
+        {
+            let boundary = start + at + grapheme.len();
+            if boundary >= start + BYTES / 2 {
+                end = boundary;
+            }
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
 fn paragraph(
     settings: markdown::Settings,
     text: &markdown::Text,
     target: Target,
     find: Option<&str>,
+    logical: Option<selectable_prose::Logical>,
+    flow_cache: Option<&flow_layout::Cache>,
 ) -> Element<'static, Message> {
-    selectable_prose::text(
+    if text.len() > 2048
+        && let Some(cache) = flow_cache
+        && let Some(logical) = logical.clone()
+    {
+        let flow = cache.markdown_entry(logical.identity, text.clone(), settings.style);
+        return selectable_prose::flow_source(
+            settings.text_size,
+            settings.style.font,
+            target,
+            find,
+            logical,
+            flow,
+        );
+    }
+    leaf_text(
         text.spans(settings.style),
         settings.text_size,
         settings.style.font,
         target,
         find,
+        logical,
     )
 }
 
@@ -613,6 +1314,275 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_palette_maps_are_shared_across_views_in_both_appearances() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let blocks = (0..200)
+            .map(|key| (key, CodeBlock::new(Some("rust"), "let value = 1;", theme)))
+            .collect();
+        let prepared = palettes(&blocks);
+        let mut cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "body".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            theme,
+        );
+        cached.blocks = blocks;
+        cached.palette_views = Some(prepared.clone());
+        for _ in 0..1000 {
+            for dark in [false, true] {
+                assert!(Arc::ptr_eq(
+                    &palette(&cached, dark),
+                    &prepared[usize::from(dark)]
+                ));
+            }
+        }
+        let weak = Arc::downgrade(&prepared[0]);
+        drop(prepared);
+        drop(cached);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn huge_inline_paragraph_does_not_materialize_presentation_on_ui_layout() {
+        use iced::advanced::{layout, widget::Tree};
+        let source =
+            "**bold** ordinary *emphasis* [link](https://example.com) `code` ".repeat(4000);
+        let content = markdown::Content::parse(&source);
+        let markdown::Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph fixture")
+        };
+        let before = markdown::materialized_bytes();
+        let cache = flow_layout::Cache::default();
+        let mut element = paragraph(
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            text,
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+            Some(selectable_prose::Logical {
+                identity: 7,
+                start: 0,
+            }),
+            Some(&cache),
+        );
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().layout(
+            &mut tree,
+            &crate::app::tests::headless_renderer(),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+        );
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "UI realization must not copy full plain text or style thousands of inline spans"
+        );
+    }
+
+    #[test]
+    fn giant_single_list_table_and_heading_keep_only_viewport_widget_trees() {
+        use iced::advanced::{layout, widget::Tree};
+        fn residents(tree: &Tree) -> (usize, usize) {
+            let prose = usize::from(
+                tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>(),
+            );
+            tree.children
+                .iter()
+                .fold((1, prose), |(widgets, prose), child| {
+                    let (children, leaves) = residents(child);
+                    (widgets + children, prose + leaves)
+                })
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let sources = [
+            "- list row with meaningful text\n".repeat(20_000),
+            format!(
+                "| First | Second |\n| --- | --- |\n{}",
+                "| table cell | other cell |\n".repeat(20_000)
+            ),
+            format!("# {}", "heading-word ".repeat(40_000)),
+        ];
+        for source in sources {
+            let cached = CachedItem::new(
+                &ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
+            assert_eq!(
+                cached.markdown.items().len(),
+                1,
+                "adversarial single top-level item"
+            );
+            let mut element = view(
+                &cached,
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                Target {
+                    card: CardId::new(),
+                    generation: 0,
+                },
+                None,
+            );
+            let mut tree = Tree::new(&element);
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+            );
+            let (widgets, prose) = residents(&tree);
+            assert!(
+                prose < 100,
+                "hidden leaf shaping escaped viewport bound: {prose}"
+            );
+            assert!(
+                widgets < 2000,
+                "hidden widget construction escaped viewport bound: {widgets}"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_code_lines_keep_height_and_horizontal_extent() {
+        use iced::advanced::{layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let size: iced::Pixels = 14.0.into();
+        let limits = layout::Limits::new(
+            iced::Size::ZERO,
+            iced::Size::new(f32::INFINITY, f32::INFINITY),
+        );
+        for source in [
+            "a".repeat(6000),
+            format!("{}e\u{301}{}", "a".repeat(2047), "z".repeat(4000)),
+            format!("{}👩‍💻{}", "a".repeat(2047), "z".repeat(4000)),
+            format!("{}\t{}", "a".repeat(2047), "z".repeat(4000)),
+            format!("{}العربية עברית{}", "a".repeat(2047), "z".repeat(4000)),
+            "line\n".repeat(1000),
+            "first\n\nthird\n".repeat(400),
+            "first\r\nsecond\r\n".repeat(400),
+        ] {
+            let mut reference = leaf_text(
+                vec![Span::new(source.clone())].into(),
+                size,
+                CodeBlock::FONT,
+                target,
+                None,
+                None,
+            );
+            let mut reference_tree = Tree::new(&reference);
+            let reference_node =
+                reference
+                    .as_widget_mut()
+                    .layout(&mut reference_tree, &renderer, &limits);
+            let mut actual = code_text(
+                Arc::from(source.as_str()),
+                Arc::from([]),
+                size,
+                CodeBlock::FONT,
+                target,
+                None,
+                None,
+                None,
+                None,
+            );
+            let mut tree = Tree::new(&actual);
+            let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert!(
+                (node.size().height - reference_node.size().height).abs() < 1.0,
+                "physical line count changed: {:?} vs {:?}",
+                node.size(),
+                reference_node.size()
+            );
+            if !source.contains('\n') {
+                assert!(
+                    node.size().width > 3000.0 * size.0,
+                    "one physical line must extend horizontally: {:?}",
+                    node.size()
+                );
+                assert!(
+                    (node.size().width / reference_node.size().width - 1.0).abs() < 0.03,
+                    "horizontal estimates must preserve physical extent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_boundaries_preserve_complete_graphemes() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for seam in ["e\u{301}", "👩‍💻", "🇨🇦", "\r\n", " \u{301}"] {
+            let source = format!(
+                "{}{seam}{}",
+                "a".repeat(if seam.starts_with(' ') { 1500 } else { 2047 }),
+                "z".repeat(4096)
+            );
+            let boundaries: HashSet<_> = source
+                .grapheme_indices(true)
+                .map(|(at, _)| at)
+                .chain(std::iter::once(source.len()))
+                .collect();
+            let ranges = chunk_ranges(&source);
+            assert_eq!(
+                ranges
+                    .iter()
+                    .map(|range| &source[range.clone()])
+                    .collect::<String>(),
+                source
+            );
+            for range in ranges {
+                assert!(boundaries.contains(&range.start) && boundaries.contains(&range.end));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_table_only_shapes_cells_near_horizontal_viewport() {
+        use iced::advanced::{layout, widget::Tree};
+        let source = format!(
+            "|{}|\n|{}|\n|{}|",
+            "cell|".repeat(10000),
+            "---|".repeat(10000),
+            "value|".repeat(10000)
+        );
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let mut element = view(
+            &cached,
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let before = virtualized::constructed_rows();
+        element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+        );
+        assert!(
+            virtualized::constructed_rows() - before < 100,
+            "wide rows must not instantiate all cells"
+        );
+    }
 
     #[test]
     fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {

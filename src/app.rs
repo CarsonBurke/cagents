@@ -17715,6 +17715,16 @@ impl Application for Cagents {
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
+                    let model = if self.inspector_diagnostics_card == Some(card) {
+                        match self.cards.get(&card) {
+                            Some(CardRuntime::Chat(runtime)) => {
+                                inspector::with_chat_memory(model, runtime.memory_diagnostics())
+                            }
+                            _ => model,
+                        }
+                    } else {
+                        model
+                    };
                     Some(match self.lsp_context(card) {
                         Some(lsp) => inspector::with_lsp(model, card, lsp),
                         None => model,
@@ -20960,8 +20970,10 @@ mod tests {
         }
 
         fn assert_saving(app: &Cagents, card: CardId) {
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                if runtime.is_saving() && !runtime.can_abandon_unsaved_changes()));
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.is_saving() && !runtime.can_abandon_unsaved_changes())
+            );
             assert!(app.operation_recovery_pending());
         }
 
@@ -20997,18 +21009,21 @@ mod tests {
             let Message::Repository(RepositoryAction::RetainedSaveFinished {
                 result: Err(error @ crate::editor::retained_save::RetainedSaveError::Io(_)),
                 ..
-            }) = &completed else {
+            }) = &completed
+            else {
                 panic!("removing the target causes an actual pre-publication failure");
             };
             let error = error.to_string();
             assert!(!self.path.exists(), "failed Save must not publish A");
             assert!(!app.operation_recovery_pending());
             drop(app.update(completed));
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
                 if !runtime.is_saving() && runtime.is_dirty() && runtime.blocks_navigation()
                     && runtime.editor_text().as_deref() == Some("A\n")
                     && runtime.save_error().is_some_and(|message|
-                        message.contains(&error) && message.contains("replaced on disk"))));
+                        message.contains(&error) && message.contains("replaced on disk")))
+            );
             let mut target = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -21373,16 +21388,20 @@ mod tests {
         // in the middle of the row rather than at its end.
         std::fs::remove_file(&fixture.path).unwrap();
         let failed = task_app_message(task);
-        assert!(matches!(&failed, Message::Repository(
-            RepositoryAction::RetainedSaveFinished {
-                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)), ..
-            }
-        )));
+        assert!(matches!(
+            &failed,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            })
+        ));
         assert!(!fixture.path.exists());
         assert!(!app.operation_recovery_pending());
         let _ = app.update(failed);
-        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
-            if runtime.is_dirty() && runtime.can_abandon_unsaved_changes()));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && runtime.can_abandon_unsaved_changes())
+        );
         assert!(
             app.dirty_repository_close.is_some(),
             "a failed save leaves the dialog up"
@@ -21443,9 +21462,11 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, first);
         let warning = fixture.post_persist_warning(&mut app, first);
         drop(app.update(warning));
-        assert!(matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime))
+        assert!(
+            matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime))
             if runtime.is_dirty() && !runtime.is_saving() && runtime.blocks_navigation()
-                && runtime.save_error().is_some_and(|warning| warning.contains("replaced on disk"))));
+                && runtime.save_error().is_some_and(|warning| warning.contains("replaced on disk")))
+        );
         app.cards.insert(
             second,
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),

@@ -17,6 +17,8 @@ static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 pub(super) struct State {
     pub(super) identity: u64,
+    pub(super) logical: Option<Logical>,
+    pub(super) logical_active: bool,
     a11y_id: iced::advanced::widget::Id,
     pub(super) plain: Arc<str>,
     pub(super) target: Option<Target>,
@@ -26,9 +28,21 @@ pub(super) struct State {
     /// How the spans were last laid out, which is what they are shaped as
     /// when something asks where a point falls among them.
     shape: Option<Shape>,
-    /// One paragraph supplies drawing, links and selection hit testing.
-    /// Selection and Find backgrounds do not change the shaped spans.
+    /// One shaped paragraph shared by painting, links and selection hits.
+    /// Selection/find backgrounds are painted from glyph positions and never
+    /// change the paragraph's spans or trigger reshaping.
     paragraph: std::cell::OnceCell<ParagraphBuffer>,
+    flow: Option<flow_layout::Handle>,
+    flow_ready: Option<Arc<flow_layout::Prepared>>,
+    flow_projection: std::cell::RefCell<
+        Option<(
+            std::sync::Weak<flow_layout::Prepared>,
+            [u32; 4],
+            flow_layout::Projection,
+        )>,
+    >,
+    #[cfg(test)]
+    paragraph_builds: std::cell::Cell<usize>,
     pub(super) anchor: usize,
     pub(super) end: usize,
     dragging: bool,
@@ -40,6 +54,8 @@ impl Default for State {
         Self {
             a11y_id: iced::advanced::widget::Id::unique(),
             identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
+            logical: None,
+            logical_active: false,
             plain: Arc::from(""),
             target: None,
             managed: false,
@@ -47,6 +63,11 @@ impl Default for State {
             spans: None,
             shape: None,
             paragraph: std::cell::OnceCell::new(),
+            flow: None,
+            flow_ready: None,
+            flow_projection: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            paragraph_builds: std::cell::Cell::new(0),
             anchor: 0,
             end: 0,
             dragging: false,
@@ -81,22 +102,94 @@ impl Shape {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(super) fn flow_readiness(&self) -> Option<bool> {
+        self.flow.as_ref().map(|_| self.flow_ready.is_some())
+    }
     fn paragraph(&self) -> &ParagraphBuffer {
+        debug_assert!(
+            self.flow.is_none(),
+            "flow text must never shape synchronously"
+        );
         self.paragraph
             .get_or_init(|| match (&self.spans, self.shape) {
                 (Some(spans), Some(shape)) => {
                     let _stage = chat_stage::scope(Stage::Shape);
+                    #[cfg(test)]
+                    self.paragraph_builds.set(self.paragraph_builds.get() + 1);
                     ParagraphBuffer::with_spans(shape.text(spans.as_ref()))
                 }
                 _ => ParagraphBuffer::default(),
             })
     }
 
+    pub(super) fn empty_line_caret(&self) -> bool {
+        self.logical.is_some() && self.flow.is_none() && self.plain.is_empty()
+    }
+
+    /// A mounted glyph cluster containing a logical byte. This inspects the
+    /// existing bounded paragraph and never shapes an offscreen source.
+    pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {
+        let logical = self.logical.as_ref()?;
+        if logical.identity != identity || byte < logical.start {
+            return None;
+        }
+        let byte = byte - logical.start;
+        if byte > self.plain.len() {
+            return None;
+        }
+        if self.flow.is_some() {
+            return self
+                .flow_ready
+                .as_ref()?
+                .byte_bounds(byte, self.plain.len());
+        }
+        let paragraph = self.paragraph();
+        if self.empty_line_caret() {
+            return Some(Rectangle::with_size(Size::new(
+                1.0,
+                paragraph.min_bounds().height.max(self.shape?.size.0 * 1.3),
+            )));
+        }
+        let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
+        let mut offset = 0;
+        for line in &paragraph.buffer().lines {
+            prefixes.push(offset);
+            offset += line.text().len() + line.ending().as_str().len();
+        }
+        let mut last = None;
+        for run in paragraph.buffer().layout_runs() {
+            for glyph in run.glyphs {
+                let bounds = Rectangle::new(
+                    Point::new(glyph.x.min(glyph.x + glyph.w), run.line_top),
+                    Size::new(glyph.w.abs(), run.line_height),
+                );
+                if prefixes[run.line_i] + glyph.start <= byte
+                    && byte < prefixes[run.line_i] + glyph.end
+                {
+                    return Some(bounds);
+                }
+                last = Some(bounds);
+            }
+        }
+        (byte == self.plain.len()).then_some(last).flatten()
+    }
+
     pub(super) fn hit(&self, position: Point) -> usize {
+        if self.flow.is_some() {
+            return self
+                .flow_ready
+                .as_ref()
+                .map_or(0, |ready| ready.hit(position, self.plain.len()));
+        }
         hit(self.paragraph(), &self.plain, position)
     }
 
     pub(super) fn link(&self, position: Point) -> Option<String> {
+        if self.flow.is_some() {
+            let metadata = self.flow_ready.as_ref()?.link(position)?;
+            return self.spans.as_ref()?.get(metadata)?.link.clone();
+        }
         // Link activation uses the glyph under the pointer, rather than a
         // caret offset: iced's hit_span rejects line.len() even with Before
         // affinity, losing the right half of the last linked glyph.
@@ -122,12 +215,92 @@ impl State {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct Logical {
+    pub identity: u64,
+    pub start: usize,
+}
+
+pub(super) fn logical_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, Some(logical), None)
+}
+
 pub(super) fn text(
     spans: Arc<[Span<'static, String>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
     find: Option<&str>,
+) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, None, None)
+}
+pub(super) fn flow_source(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
+    flow_source_optional(size, font, target, find, Some(logical), flow)
+}
+pub(super) fn flow_source_optional(
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
+    let ready = flow.borrow().prepared();
+    let spans = ready
+        .as_ref()
+        .map_or_else(|| Arc::from([]), |ready| ready.spans.clone());
+    let plain: Arc<str> = ready
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
+    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
+    Element::new(Selectable {
+        logical,
+        flow: Some(flow),
+        flow_ready: ready,
+        matches: highlights.ranges,
+        spans,
+        plain,
+        size,
+        font,
+        target,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn flow_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Logical,
+    flow: flow_layout::Handle,
+) -> Element<'static, Message> {
+    build_text(spans, size, font, target, find, Some(logical), Some(flow))
+}
+
+fn build_text(
+    spans: Arc<[Span<'static, String>]>,
+    size: iced::Pixels,
+    font: iced::Font,
+    target: Target,
+    find: Option<&str>,
+    logical: Option<Logical>,
+    flow: Option<flow_layout::Handle>,
 ) -> Element<'static, Message> {
     let plain: Arc<str> = spans
         .iter()
@@ -136,12 +309,16 @@ pub(super) fn text(
         .into();
     let highlights = super::find::highlights(&plain, find.unwrap_or_default());
     let truncated = highlights.truncated;
+    let flow_ready = flow.as_ref().and_then(|flow| flow.borrow().prepared());
     let body = Element::new(Selectable {
+        flow_ready,
         spans,
         plain,
         size,
         font,
         target,
+        logical,
+        flow,
         matches: highlights.ranges,
     });
     if truncated {
@@ -173,6 +350,9 @@ pub(super) fn plain(
 }
 
 struct Selectable {
+    flow: Option<flow_layout::Handle>,
+    flow_ready: Option<Arc<flow_layout::Prepared>>,
+    logical: Option<Logical>,
     matches: Vec<std::ops::Range<usize>>,
     spans: Arc<[Span<'static, String>]>,
     plain: Arc<str>,
@@ -182,8 +362,132 @@ struct Selectable {
 }
 
 impl Selectable {
+    #[cfg(test)]
+    fn selected_spans(&self, state: &State) -> Arc<[Span<'static, String>]> {
+        let start = state.anchor.min(state.end);
+        let end = state.anchor.max(state.end);
+        if start == end && self.matches.is_empty() {
+            return self.spans.clone();
+        }
+        let mut offset = 0;
+        let mut result = Vec::new();
+        for span in self.spans.iter() {
+            let next = offset + span.text.len();
+            let lo = start.clamp(offset, next) - offset;
+            let hi = end.clamp(offset, next) - offset;
+            let mut boundaries = vec![0, lo, hi, span.text.len()];
+            let first = self.matches.partition_point(|found| found.end <= offset);
+            let last = self.matches.partition_point(|found| found.start < next);
+            let matching = &self.matches[first..last];
+            for found in matching {
+                boundaries.push(found.start.clamp(offset, next) - offset);
+                boundaries.push(found.end.clamp(offset, next) - offset);
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            for pair in boundaries.windows(2) {
+                let range = pair[0]..pair[1];
+                let selected = range.start >= lo && range.end <= hi && lo != hi;
+                let position = offset + range.start;
+                let candidate = matching.partition_point(|found| found.end <= position);
+                let found = matching
+                    .get(candidate)
+                    .is_some_and(|found| found.contains(&position));
+                if range.is_empty() {
+                    continue;
+                }
+                let mut part = span.clone();
+                part.text = span.text[range].to_owned().into();
+                if selected || found {
+                    part.highlight = Some(iced::advanced::text::Highlight {
+                        background: if selected {
+                            design::accent_color(&cosmic::theme::active())
+                        } else {
+                            design::accent_wash(&cosmic::theme::active())
+                        }
+                        .into(),
+                        border: iced::Border::default(),
+                    });
+                }
+                result.push(part);
+            }
+            offset = next;
+        }
+        result.into()
+    }
+
     fn hit(&self, state: &State, position: Point) -> usize {
-        hit(state.paragraph(), &self.plain, position)
+        state.hit(position)
+    }
+}
+
+/// Paint byte-range backgrounds against the existing shaped glyph runs. This
+/// is independent of syntax span count and never reshapes selected text.
+fn paint_ranges(
+    renderer: &mut cosmic::Renderer,
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    translation: iced::Vector,
+    color: iced::Color,
+) {
+    visit_range_bounds(paragraph, ranges, |bounds| {
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: Rectangle {
+                    x: bounds.x + translation.x,
+                    y: bounds.y + translation.y,
+                    ..bounds
+                },
+                ..Default::default()
+            },
+            color,
+        );
+    });
+}
+
+fn visit_range_bounds(
+    paragraph: &ParagraphBuffer,
+    ranges: &[std::ops::Range<usize>],
+    mut paint: impl FnMut(Rectangle),
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut starts = Vec::with_capacity(paragraph.buffer().lines.len());
+    let mut offset = 0;
+    for line in &paragraph.buffer().lines {
+        starts.push(offset);
+        offset += line.text().len() + line.ending().as_str().len();
+    }
+    for run in paragraph.buffer().layout_runs() {
+        let prefix = starts[run.line_i];
+        let mut bounds: Option<(f32, f32)> = None;
+        let mut flush = |bounds: &mut Option<(f32, f32)>| {
+            if let Some((left, right)) = bounds.take() {
+                paint(Rectangle::new(
+                    Point::new(left, run.line_top),
+                    Size::new(right - left, run.line_height),
+                ));
+            }
+        };
+        for glyph in run.glyphs {
+            let start = prefix + glyph.start;
+            let end = prefix + glyph.end;
+            let found = ranges.partition_point(|range| range.end <= start);
+            if ranges.get(found).is_some_and(|range| range.start < end) {
+                let left = glyph.x.min(glyph.x + glyph.w);
+                let right = glyph.x.max(glyph.x + glyph.w);
+                if let Some((lo, hi)) = bounds.as_mut() {
+                    *lo = lo.min(left);
+                    *hi = hi.max(right);
+                } else {
+                    bounds = Some((left, right));
+                }
+            } else {
+                flush(&mut bounds);
+            }
+        }
+        flush(&mut bounds);
     }
 }
 
@@ -298,7 +602,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         bounds.x -= layout.virtual_offset().x;
         bounds.y -= layout.virtual_offset().y;
         let mut node = Node::new(Role::Label);
-        node.set_value(self.plain.to_string());
+        node.set_value(tree.state.downcast_ref::<State>().plain.to_string());
         node.set_bounds(Rect::new(
             bounds.x as f64,
             bounds.y as f64,
@@ -314,38 +618,98 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     fn state(&self) -> tree::State {
         tree::State::new(State::default())
     }
+    fn children(&self) -> Vec<Tree> {
+        vec![]
+    }
+    fn diff(&mut self, _tree: &mut Tree) {}
     fn size(&self) -> Size<Length> {
         Size::new(Length::Shrink, Length::Shrink)
     }
     fn layout(
         &mut self,
         tree: &mut Tree,
-        renderer: &cosmic::Renderer,
+        _renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         state.dirty = false;
+        let same_target = state.target == Some(self.target);
+        let same_logical = state
+            .logical
+            .as_ref()
+            .map(|logical| (logical.identity, logical.start))
+            == self
+                .logical
+                .as_ref()
+                .map(|logical| (logical.identity, logical.start));
+        let mut flow = self.flow.clone();
+        if same_target
+            && same_logical
+            && let (Some(previous), Some(current)) = (&state.flow, &self.flow)
+            && !std::rc::Rc::ptr_eq(previous, current)
+            && previous.borrow_mut().adopt(&current.borrow())
+        {
+            flow = Some(previous.clone());
+        }
+        let same_flow = state
+            .flow
+            .as_ref()
+            .zip(flow.as_ref())
+            .is_some_and(|(old, current)| std::rc::Rc::ptr_eq(old, current));
         state.target = Some(self.target);
+        state.logical = self.logical.clone();
+        if !same_flow {
+            state.flow_ready = None;
+            state.flow_projection.borrow_mut().take();
+        }
+        state.flow = flow;
         if state
             .spans
             .as_ref()
             .is_none_or(|previous| !Arc::ptr_eq(previous, &self.spans))
         {
-            if !self.plain.starts_with(state.plain.as_ref()) {
+            if if self.flow.is_some() {
+                !same_flow
+            } else {
+                !self.plain.starts_with(state.plain.as_ref())
+            } {
                 state.identity = NEXT_SELECTION.fetch_add(1, Ordering::Relaxed);
                 state.anchor = 0;
                 state.end = 0;
                 state.dragging = false;
             }
-            state.plain = self.plain.clone();
+            if state.flow.is_none() || !same_flow {
+                state.plain = self.plain.clone();
+            }
         }
         // Selection bytes cannot outlive a streamed paragraph's replacement.
-        state.validate_selection(&self.plain);
+        if state.flow.is_none() {
+            state.validate_selection(&self.plain);
+        }
         let shape = Shape {
             bounds: limits.max(),
             size: self.size,
             font: self.font,
         };
+        if let Some(flow) = state.flow.clone() {
+            state.paragraph.take();
+            state.spans = Some(self.spans.clone());
+            state.shape = Some(shape);
+            let mut flow = flow.borrow_mut();
+            flow.configure(shape.bounds.width, self.size, self.font);
+            flow.bind_target(self.target);
+            state.flow_ready = flow.prepared();
+            if let Some(ready) = &state.flow_ready {
+                state.plain = ready.plain.clone();
+                state.spans = Some(ready.spans.clone());
+            }
+            state.validate_selection(&state.plain.clone());
+            return layout::Node::new(limits.resolve(
+                Length::Shrink,
+                Length::Shrink,
+                flow.bounds(state.plain.len()),
+            ));
+        }
         if state
             .spans
             .as_ref()
@@ -363,11 +727,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             }
         }
         state.shape = Some(shape);
-        layout::Node::new(limits.resolve(
-            Length::Shrink,
-            Length::Shrink,
-            state.paragraph().min_bounds(),
-        ))
+        let mut natural = state.paragraph().min_bounds();
+        if state.empty_line_caret() {
+            natural.height = natural.height.max(self.size.0 * 1.3);
+        }
+        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, natural))
     }
 
     fn operate(
@@ -390,10 +754,67 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        if !layout.bounds().intersects(viewport) {
+        if layout.bounds().intersection(viewport).is_none() {
             return;
         }
         let state = tree.state.downcast_ref::<State>();
+        if let Some(flow) = &state.flow {
+            if let Some(ready) = &state.flow_ready {
+                let top = (viewport.y - layout.bounds().y).max(0.0);
+                // LayoutGlyph exposes placed advances rather than exact ink
+                // outlines. Keep four ems of raster overscan on either edge;
+                // native font/edge fixtures qualify the supported fonts.
+                let overscan = self.size.0 * 4.0;
+                let left = viewport.x - layout.bounds().x - overscan;
+                let right = viewport.x + viewport.width - layout.bounds().x + overscan;
+                let bottom = top + viewport.height + self.size.0 * 1.3;
+                let key = (
+                    Arc::downgrade(ready),
+                    [
+                        top.to_bits(),
+                        bottom.to_bits(),
+                        left.to_bits(),
+                        right.to_bits(),
+                    ],
+                );
+                let mut cached = state.flow_projection.borrow_mut();
+                if cached
+                    .as_ref()
+                    .is_none_or(|(owner, bounds, _)| !owner.ptr_eq(&key.0) || *bounds != key.1)
+                {
+                    *cached = ready
+                        .projection_rect(top, bottom, left, right)
+                        .map(|projection| (key.0, key.1, projection));
+                }
+                if let Some((_, _, projection)) = cached.as_ref() {
+                    flow_layout::paint(
+                        renderer,
+                        projection,
+                        &ready.spans,
+                        &self.matches,
+                        state.anchor.min(state.end)..state.anchor.max(state.end),
+                        self.size,
+                        layout.position(),
+                        theme,
+                        defaults,
+                        viewport,
+                    );
+                }
+            } else if let Some(shape) = state.shape {
+                let label = if flow.borrow().failed() {
+                    "Text could not be displayed"
+                } else {
+                    "Loading…"
+                };
+                renderer.fill_text(
+                    shape.text(label.to_owned()),
+                    layout.position(),
+                    defaults.text_color,
+                    *viewport,
+                );
+            }
+            return;
+        }
         let paragraph = state.paragraph();
         let translation = layout.position() - Point::ORIGIN;
         // Preserve inline code surfaces, emphasis, links and strike-throughs
@@ -484,6 +905,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             shell.invalidate_layout();
             shell.request_redraw();
         }
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) && layout.bounds().intersection(viewport).is_some()
+            && let Some(flow) = &state.flow
+            && let Some(request) = flow.borrow_mut().request()
+        {
+            shell.publish(action(Action::FlowRequest(self.target, request)));
+        }
         if state.managed {
             return;
         }
@@ -491,7 +921,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             state.dragging = false;
         }
         let previous = state.anchor.min(state.end)..state.anchor.max(state.end);
-        state.validate_selection(&self.plain);
+        let current_plain = state.plain.clone();
+        state.validate_selection(&current_plain);
         let position = cursor.position_in(layout.bounds());
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -525,8 +956,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 }
                 if state.anchor == state.end
                     && let Some(position) = position
-                    && let Some(span) = state.paragraph().hit_span(position)
-                    && let Some(link) = self.spans.get(span).and_then(|span| span.link.clone())
+                    && let Some(link) = state.link(position)
                 {
                     shell.publish(action(Action::OpenDocument(self.target, link)));
                 }
@@ -545,13 +975,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                     super::text_copy::invalidate();
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
-                        self.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]
+                        state.plain[state.anchor.min(state.end)..state.anchor.max(state.end)]
                             .to_owned(),
                     );
                     shell.capture_event();
                 } else if key.eq_ignore_ascii_case("a") {
                     state.anchor = 0;
-                    state.end = self.plain.len();
+                    state.end = state.plain.len();
                     shell.capture_event();
                     shell.invalidate_layout();
                 }
@@ -644,6 +1074,9 @@ mod tests {
                         card: CardId::new(),
                         generation: 0,
                     },
+                    logical: None,
+                    flow: None,
+                    flow_ready: None,
                 };
                 let mut tree =
                     Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -720,6 +1153,9 @@ mod tests {
                         card: CardId::new(),
                         generation: 0,
                     },
+                    logical: None,
+                    flow: None,
+                    flow_ready: None,
                 };
                 let mut tree =
                     Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -808,6 +1244,9 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
+            logical: None,
+            flow: None,
+            flow_ready: None,
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -910,6 +1349,9 @@ mod tests {
     fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
+            logical: None,
+            flow: None,
+            flow_ready: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
             matches: vec![],
@@ -947,6 +1389,102 @@ mod tests {
     }
 
     #[test]
+    fn direct_paint_and_logical_navigation_use_bounded_unicode_glyph_geometry() {
+        let renderer = crate::app::tests::headless_renderer();
+        let source = "Latin fi e\u{301} αβ العربية text";
+        let identity = 0x1234;
+        let mut element = logical_text(
+            vec![Span::new(source.to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+            Logical {
+                identity,
+                start: 100,
+            },
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(150.0, f32::INFINITY)),
+        );
+        let state = tree.state.downcast_ref::<State>();
+        for (byte, ch) in source.char_indices().filter(|(_, ch)| !ch.is_whitespace()) {
+            let mut painted = Vec::new();
+            visit_range_bounds(state.paragraph(), &[byte..byte + ch.len_utf8()], |bounds| {
+                painted.push(bounds)
+            });
+            assert!(
+                !painted.is_empty(),
+                "every selected grapheme paints its existing cluster"
+            );
+            for bounds in painted {
+                assert!(bounds.x >= -0.5 && bounds.x + bounds.width <= 150.5);
+                assert!(bounds.y >= -0.5 && bounds.y + bounds.height <= node.size().height + 0.5);
+            }
+            assert!(state.logical_byte_bounds(identity, 100 + byte).is_some());
+        }
+        assert!(state.logical_byte_bounds(identity, 99).is_none());
+        assert!(state.logical_byte_bounds(identity + 1, 100).is_none());
+        assert_eq!(
+            state.paragraph_builds.get(),
+            1,
+            "paint/navigation reuse the same paragraph"
+        );
+    }
+
+    #[test]
+    fn selection_reuses_the_paragraph_used_for_drawing_and_hit_testing() {
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = text(
+            vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
+            design::TEXT_PROSE.into(),
+            iced::Font::default(),
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            Some("prose"),
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, f32::INFINITY));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let state = tree.state.downcast_ref::<State>();
+        let buffer = state.paragraph().buffer() as *const _ as usize;
+        assert_eq!(state.paragraph_builds.get(), 1);
+        assert!(
+            tree.children.is_empty(),
+            "no second rich-text paragraph tree"
+        );
+        for end in [1, 20, 100, 300] {
+            let state = tree.state.downcast_mut::<State>();
+            state.anchor = 0;
+            state.end = end;
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let state = tree.state.downcast_ref::<State>();
+            assert_eq!(
+                state.paragraph_builds.get(),
+                1,
+                "selection does not construct another paragraph"
+            );
+            assert_eq!(
+                buffer,
+                state.paragraph().buffer() as *const _ as usize,
+                "selection changes paint bounds instead of reshaping spans"
+            );
+        }
+    }
+
+    #[test]
     fn long_tokens_wrap_with_accessible_glyphs_and_matching_hit_geometry() {
         let renderer = crate::app::tests::headless_renderer();
         let source = "w".repeat(3000);
@@ -962,6 +1500,9 @@ mod tests {
                 card: CardId::new(),
                 generation: 0,
             },
+            logical: None,
+            flow: None,
+            flow_ready: None,
         };
         let mut tree =
             Tree::new(&selectable as &dyn Widget<Message, cosmic::Theme, cosmic::Renderer>);
@@ -1059,5 +1600,183 @@ mod tests {
         };
         state.validate_selection("new");
         assert_eq!((state.anchor, state.end, state.dragging), (0, 0, false));
+    }
+
+    #[test]
+    fn selection_preserves_links_fonts_and_unicode_across_span_boundaries() {
+        let spans: Arc<[Span<'static, String>]> = vec![
+            Span::new("before α").font(iced::Font::MONOSPACE),
+            Span::new("β linked").link("src/app.rs:42"),
+        ]
+        .into();
+        let selectable = Selectable {
+            logical: None,
+            flow: None,
+            flow_ready: None,
+            plain: "before αβ linked".into(),
+            spans,
+            matches: vec![],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+        };
+        let state = State {
+            anchor: "before ".len(),
+            end: "before αβ".len(),
+            ..State::default()
+        };
+        let selected = selectable.selected_spans(&state);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            selectable.plain.as_ref()
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|span| span.highlight.is_some())
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "αβ"
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|span| span.link.as_deref() == Some("src/app.rs:42"))
+        );
+        assert_eq!(selected[0].font, Some(iced::Font::MONOSPACE));
+    }
+
+    #[test]
+    fn unicode_find_highlights_original_text_across_syntax_spans() {
+        let selectable = Selectable {
+            logical: None,
+            flow: None,
+            flow_ready: None,
+            plain: "Straße CAFÉ".into(),
+            spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
+            matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+        };
+        assert_eq!(
+            selectable
+                .selected_spans(&State::default())
+                .iter()
+                .filter(|span| span.highlight.is_some())
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "Straße"
+        );
+    }
+
+    #[test]
+    fn find_marks_only_the_matching_text() {
+        let selectable = Selectable {
+            logical: None,
+            flow: None,
+            flow_ready: None,
+            plain: "one needle two".into(),
+            spans: vec![Span::new("one needle two")].into(),
+            matches: vec![4..10],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+        };
+        let spans = selectable.selected_spans(&State::default());
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.highlight.is_some())
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "needle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+    #[test]
+    fn huge_flow_layout_defers_shaping_and_requests_only_when_native_visible() {
+        let renderer = crate::app::tests::headless_renderer();
+        let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(210_000))].into();
+        let cache = flow_layout::Cache::default();
+        let flow = cache.entry(99, spans.clone());
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let mut element = flow_text(
+            spans,
+            iced::Pixels(16.0),
+            iced::Font::DEFAULT,
+            target,
+            None,
+            Logical {
+                identity: 99,
+                start: 0,
+            },
+            flow,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY)),
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
+        assert!(tree.children.is_empty());
+        let mut messages = Vec::new();
+        let event = Event::Window(iced::window::Event::RedrawRequested(
+            iced::time::Instant::now(),
+        ));
+        let hidden = Rectangle::new(Point::new(1000.0, 0.0), Size::new(100.0, 400.0));
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &hidden,
+        );
+        assert!(messages.is_empty());
+        let visible = Rectangle::with_size(Size::new(720.0, 400.0));
+        for _ in 0..2 {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &visible,
+            );
+        }
+        assert_eq!(
+            messages.len(),
+            1,
+            "one pending request per source/font/width generation"
+        );
+        assert!(
+            matches!(messages[0], Message::ChatUi(Action::FlowRequest(found, _)) if found == target)
+        );
+        assert_eq!(tree.state.downcast_ref::<State>().paragraph_builds.get(), 0);
     }
 }
