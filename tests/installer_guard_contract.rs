@@ -554,6 +554,70 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
         -1,
         "validation must not release the coordinator's exclusive fence"
     );
+    assert_eq!(unsafe { libc::flock(update.as_raw_fd(), libc::LOCK_UN) }, 0);
+    // An older coordinator releases its launch fence before native reopen, but
+    // keeps the shared legacy fence until the new window handshakes. Pin an
+    // actual candidate executable with the daemon's kernel lease, not a stale
+    // path/marker claim. No provider or production daemon is contacted.
+    let daemon_dir = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate_daemon = prefix.join("versions/new/bin/cagentsd");
+    fs::copy("/bin/sleep", &candidate_daemon).unwrap();
+    let daemon_lock_path = daemon_dir.join("cagentsd.lock");
+    let daemon_lock = file(&daemon_lock_path);
+    assert_eq!(
+        unsafe { libc::flock(daemon_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let mut command = Command::new(&candidate_daemon);
+    command.arg("30");
+    let descriptor = daemon_lock.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(descriptor, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let daemon = OwnedProcess(command.spawn().unwrap());
+    fs::write(&daemon_lock_path, format!(r#"{{"pid":{}}}"#, daemon.0.id())).unwrap();
+    let native = prefix.join("versions/new/bin/cagents-ui");
+    fs::copy(std::env::current_exe().unwrap(), &native).unwrap();
+    let reopened = Command::new(&native)
+        .args(["--exact", "staged_native_ui_owner_fixture", "--nocapture"])
+        .env("CAGENTS_TEST_STAGED_NATIVE_OWNER", "candidate")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .output()
+        .unwrap();
+    assert!(reopened.status.success(), "{reopened:?}");
+    let candidate_status = run(None, None);
+    assert!(candidate_status.status.success(), "{candidate_status:?}");
+    let result: serde_json::Value = serde_json::from_slice(&candidate_status.stdout).unwrap();
+    assert_eq!(result["data"]["running"], true);
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let legacy_owner = run(None, None);
+    assert!(
+        !legacy_owner.status.success(),
+        "an exclusive legacy UI cannot be bypassed by a candidate daemon: {legacy_owner:?}"
+    );
+    assert_eq!(
+        unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    drop(daemon);
+    drop(daemon_lock);
+    let stopped_candidate = run(None, None);
+    assert!(
+        !stopped_candidate.status.success(),
+        "a stopped candidate cannot relax unknown shared legacy ownership: {stopped_candidate:?}"
+    );
 }
 
 #[test]

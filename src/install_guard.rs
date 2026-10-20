@@ -498,15 +498,20 @@ pub(crate) fn staged_owner_bin(
     // Shared with every UI launch, exclusive against reviewed update/close.
     // Keep it through synchronous daemon recovery and ownership revalidation.
     let launch = crate::instance::LaunchFence::recovery()?;
-    let windows = if std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_some() {
+    let running = crate::daemon::running_executable().map_err(io::Error::other)?;
+    let (windows, _legacy) = if std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_some() {
         // The reviewed updater also holds the shared legacy fence after all
         // windows close. Authenticate its exact exclusive inherited guard;
         // probing legacy exclusivity here would mistake our coordinator for UI.
-        crate::instance::verified_staged_windows()?
+        (crate::instance::verified_staged_windows()?, None)
+    } else if running.as_deref() == Some(layout.version_root.join("bin/cagentsd").as_path()) {
+        let (windows, legacy) = crate::instance::verified_windows_for_daemon(
+            &layout.version_root.join("bin/cagentsd"),
+        )?;
+        (windows, Some(legacy))
     } else {
-        crate::instance::verified_running_windows()?
+        (crate::instance::verified_running_windows()?, None)
     };
-    let running = crate::daemon::running_executable().map_err(io::Error::other)?;
     let window_bin = window_owner_bin(&layout.prefix, &windows)?;
     if running.as_ref() == Some(&layout.version_root.join("bin/cagentsd")) && windows.is_empty() {
         return Ok(None);
