@@ -8845,13 +8845,11 @@ impl Cagents {
                 }
                 TerminalEvent::ConversationTitleChanged(title) => {
                     if let Some(title) = crate::workspace_model::channel_title(&title) {
-                        let previous = Arc::clone(&self.durable);
-                        self.suggest_channel_title(
+                        metadata_changed |= self.suggest_channel_title(
                             card,
                             title,
                             crate::model::ChannelTitleSource::Provider,
                         );
-                        metadata_changed |= !Arc::ptr_eq(&previous, &self.durable);
                     }
                 }
                 TerminalEvent::ResumeHintChanged(hint) => {
