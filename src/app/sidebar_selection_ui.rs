@@ -186,7 +186,11 @@ mod tests {
     fn group_confirmation_names_all_targets_and_preserves_unrelated_active_channel() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
-        drop(app.begin_sidebar_group_delete());
+        let opening = app.begin_sidebar_group_delete();
+        assert_eq!(
+            super::super::tests::focused_element(app.sidebar_selection_dialog().unwrap(), opening),
+            Some(close_focus_id())
+        );
         let dialog = app.sidebar_selection_ui.dialog.as_ref().unwrap();
         assert_eq!(dialog.targets.len(), 2);
         assert!(
@@ -398,14 +402,9 @@ impl Dialog {
         self.targets[0].row
     }
 
-    /// Confirm, unless a blocker disables it; then Cancel, so focus never
-    /// lands on a dead control.
+    /// Every group deletion opens on its non-destructive dismissal.
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.blocked() > 0 {
-            close_focus_id()
-        } else {
-            focus_id()
-        }
+        close_focus_id()
     }
 
     fn blocked(&self) -> usize {
