@@ -1727,9 +1727,11 @@ mod tests {
 
     #[test]
     fn fenced_copy_button_retains_the_original_raw_arc_instead_of_its_display_projection() {
-        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation},
+        };
         use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
-        use iced_accessibility::accesskit::Role;
         let raw: Arc<str> = "  original λ é *literal*\r\ntrailing\n".repeat(3000).into();
         let display: Arc<str> = "DISPLAY PROJECTION".into();
         let target = Target {
@@ -1760,23 +1762,37 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
-        let accessible =
-            element
-                .as_widget()
-                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-        let button = accessible
-            .root()
-            .iter()
-            .chain(accessible.children())
-            .find(|node| {
-                node.node().role() == Role::Button && node.node().label() == Some("Copy this block")
-            })
-            .expect("actual fenced source Copy button");
-        let bounds = button.node().bounds().unwrap();
-        let cursor = mouse::Cursor::Available(Point::new(
-            ((bounds.x0 + bounds.x1) / 2.0) as f32,
-            ((bounds.y0 + bounds.y1) / 2.0) as f32,
-        ));
+        // iced::widget::hover forwards native operations to its two real
+        // children, but currently does not forward their accessibility nodes.
+        // This isolated fence has exactly one focusable native control: Copy.
+        // Obtain its actual layout bounds, then click that button through the
+        // production event path rather than constructing its Action in a test.
+        #[derive(Default)]
+        struct Controls(Vec<Rectangle>);
+        impl Operation for Controls {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                self.0.push(bounds);
+            }
+        }
+        let mut controls = Controls::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
+        assert_eq!(
+            controls.0.len(),
+            1,
+            "actual fenced source Copy button is the sole focusable control"
+        );
+        let bounds = controls.0[0];
+        let cursor = mouse::Cursor::Available(Point::new(bounds.center_x(), bounds.center_y()));
         let mut messages = Vec::new();
         for event in [
             mouse::Event::ButtonPressed(mouse::Button::Left),
