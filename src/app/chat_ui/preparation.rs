@@ -1819,10 +1819,15 @@ mod tests {
                 builder.markdown(&source.id, &[1,index as u32], content.items());
                 let catalog = builder.finish();
                 let (first,last) = catalog.endpoints().unwrap();
-                (first.identity,catalog.copy(first,last).unwrap())
+                (catalog.search_blocks(),catalog.copy(first,last).unwrap())
             }).collect::<Vec<_>>();
             let catalog = runtime.selection_document().0;
-            for (identity, text) in contents { assert_eq!(catalog.text(identity).is_some(), true); assert!(text.contains("λ") || text.contains("Report")); }
+            for (blocks, text) in contents {
+                for (identity, plain) in blocks {
+                    assert_eq!(catalog.text(identity).as_deref(), Some(plain.as_ref()), "actual card catalog preserves every prepared logical source block");
+                }
+                assert!(text.contains("λ") || text.contains("Report"));
+            }
             drop(catalog);
             let previous = runtime.cache.remove("message").unwrap();
             let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
