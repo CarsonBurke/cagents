@@ -20286,6 +20286,359 @@ mod tests {
                 .is_none()
         );
     }
+    struct LiveSharedRecovery {
+        app: Cagents,
+        _directory: tempfile::TempDir,
+        card: CardId,
+        target: Target,
+        source: chat::Session,
+        canonical: chat::Session,
+        model: crate::workspace_model::WorkspaceModel,
+        allocation: usize,
+        draft: String,
+        cursor: text_editor::Cursor,
+        selection: Option<String>,
+    }
+
+    fn live_shared_recovery_fixture() -> LiveSharedRecovery {
+        use crate::model::{ChannelId, ProjectChannel, ProjectId, ProjectKind, ProjectState};
+        use crate::workspace_model::{
+            ModelChannel, ModelProject, WorkspaceModel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let mut source = chat_runtime(&app, card).session.clone();
+        source.launch.provider = Provider::Claude;
+        source.launch.recipe.program = "claude".into();
+        source.launch.recipe.arguments.clear();
+        source.launch.recipe.environment.clear();
+        source.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            "/private/retained-recovery-account".into(),
+        );
+        source.owned_codex_listener = None;
+        source.terminal = None;
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(source.has_valid_native_continuity());
+        app.install_chat_session(card, source.clone());
+        let before = Arc::new(chat::Item {
+            id: "native-before-recovery".into(),
+            role: chat::Role::Assistant,
+            content: text("BEFORE_RECOVERY"),
+            started_at: None,
+            at: None,
+        });
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    session_id: source.launch.session_id.clone(),
+                    ready: true,
+                    items: vec![before],
+                    ..Snapshot::default()
+                },
+            )));
+            runtime.show(true);
+        }
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let identity = uuid::Uuid::new_v4();
+        let repository = PathBuf::from(FIXTURE_DIRECTORY);
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.workspace_model_identity = Some(identity);
+            durable.active_channel = Some(channel);
+            durable.projects.push(ProjectState {
+                id: project,
+                generation: durable.generation,
+                name: "Recovery fixture".into(),
+                repository: repository.clone(),
+                kind: ProjectKind::Folder,
+                existence: Existence::Open,
+            });
+            durable.channels.push(ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Recovery fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        let mut view = View::empty(Scope::Channel(channel));
+        view.panes.push(
+            Pane::from_card(app.card_state(card).unwrap(), Some(repository.clone())).unwrap(),
+        );
+        let mut model = WorkspaceModel {
+            identity,
+            sequence: 1,
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "Recovery fixture".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            }],
+            channels: vec![ModelChannel {
+                id: channel,
+                repository,
+                title: "Recovery fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            }],
+            views: vec![view],
+            ..WorkspaceModel::default()
+        };
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                scope: Scope::Channel(channel),
+                operation: None,
+                model: model.clone(),
+            },
+        )));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(&app, card).session, source);
+        let draft = "Keep this unsent thought\n  with λ and spacing".to_owned();
+        write(&mut app, card, &draft);
+        let (allocation, cursor, selection) = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+            runtime
+                .composer
+                .perform(text_editor::Action::Select(text_editor::Motion::Right));
+            (
+                runtime as *const Runtime as usize,
+                runtime.composer.cursor(),
+                runtime.composer.selection(),
+            )
+        };
+        assert_eq!(selection.as_deref(), Some("K"));
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        drop(app.update(Message::ChatUi(Action::Wake(
+            target,
+            Wake::Disconnected("fixture native HOST lost".into()),
+        ))));
+        assert!(chat_runtime(&app, card).disconnected);
+        let mut canonical = source.clone();
+        canonical.proof.as_mut().unwrap().host_incarnation = "recovered-daemon".into();
+        assert!(chat::is_upgrade_recovery(&source, &canonical));
+        model.sequence += 1;
+        model.views[0].revision += 1;
+        model.views[0].panes[0].kind = CardKind::Chat(canonical.clone());
+        LiveSharedRecovery {
+            app,
+            _directory: directory,
+            card,
+            target,
+            source,
+            canonical,
+            model,
+            allocation,
+            draft,
+            cursor,
+            selection,
+        }
+    }
+
+    fn assert_live_recovery_content(fixture: &LiveSharedRecovery) {
+        let runtime = chat_runtime(&fixture.app, fixture.card);
+        assert_eq!(
+            runtime as *const Runtime as usize, fixture.allocation,
+            "recovery must retain the original live Runtime/Content owner"
+        );
+        assert_eq!(runtime.composer.text(), fixture.draft);
+        assert_eq!(runtime.composer.cursor(), fixture.cursor);
+        assert_eq!(runtime.composer.selection(), fixture.selection);
+        assert!(
+            runtime.queued.is_none(),
+            "an unsent draft is never a provider replay"
+        );
+        assert!(runtime.followups.is_empty());
+    }
+
+    fn exercise_live_shared_recovery(reconnect_first: bool) {
+        let mut f = live_shared_recovery_fixture();
+        let old_attempt = reconnect_first.then(|| {
+            drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
+            f.app.chat_ui.attempt(f.card).unwrap().target
+        });
+        // The actual watcher message projects a same-ID authoritative descriptor,
+        // independently of the old live connection's unsent Content.
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        assert_eq!(
+            f.app.card_state(f.card).unwrap().kind,
+            CardKind::Chat(f.canonical.clone())
+        );
+        assert_live_recovery_content(&f);
+        assert_eq!(
+            chat_runtime(&f.app, f.card).snapshot.items[0].content,
+            text("BEFORE_RECOVERY")
+        );
+        let saved = f.app.persistent_workspace();
+        assert_eq!(
+            saved.cards.iter().find(|c| c.id == f.card).unwrap().kind,
+            CardKind::Chat(f.source.clone()),
+            "ModelUpdate cannot autosave canonical ownership before authenticated lineage and durable ACK"
+        );
+        assert_eq!(saved.chat_drafts.get(&f.card), Some(&f.draft));
+        f.app.persist();
+        f.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            f.app
+                .session
+                .as_ref()
+                .unwrap()
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(f.source.clone())
+        );
+        let admitted = f
+            .app
+            .chat_ui
+            .attempt(f.card)
+            .expect("canonical projection must enter strict upgrade admission")
+            .target;
+        assert_eq!(
+            f.app
+                .chat_ui
+                .attempt(f.card)
+                .unwrap()
+                .upgrade_admission
+                .as_ref(),
+            Some(&f.canonical)
+        );
+        if let Some(old) = old_attempt {
+            assert_ne!(
+                old, admitted,
+                "canonical admission supersedes the ordinary source attachment"
+            );
+        }
+        // Retry from the still-rendered disconnected runtime cannot replace the
+        // already admitted strict attachment with an ordinary restore.
+        drop(f.app.update(Message::ChatUi(Action::Reconnect(f.target))));
+        assert_eq!(f.app.chat_ui.attempt(f.card).unwrap().target, admitted);
+        let snapshot = Snapshot {
+            session_id: f.canonical.launch.session_id.clone(),
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: "native-after-recovery".into(),
+                role: chat::Role::Assistant,
+                content: text("BEFORE_RECOVERY\nAFTER_RECOVERY_EXACT_ONCE"),
+                started_at: None,
+                at: None,
+            })],
+            ..Snapshot::default()
+        };
+        if let Some(old) = old_attempt {
+            let stale = Arc::new(
+                ClientHandle::fixture_upgrade_handshake(
+                    f.source.clone(),
+                    f.canonical.clone(),
+                    snapshot.clone(),
+                )
+                .unwrap(),
+            );
+            answer_start(&mut f.app, old, Ok(stale));
+            assert_eq!(f.app.chat_ui.attempt(f.card).unwrap().target, admitted);
+            assert!(!f.app.chat_ui.attempt(f.card).unwrap().upgrade_committed);
+        }
+        let handle = Arc::new(
+            ClientHandle::fixture_upgrade_handshake(
+                f.source.clone(),
+                f.canonical.clone(),
+                snapshot.clone(),
+            )
+            .unwrap(),
+        );
+        let witness = handle.authenticated_upgrade_recovery().unwrap();
+        assert!(witness.validate());
+        assert_eq!(witness.source(), &f.source);
+        assert_eq!(witness.replacement(), &f.canonical);
+        let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
+            admitted,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert_live_recovery_content(&f);
+        assert_eq!(
+            chat_runtime(&f.app, f.card).session,
+            f.source,
+            "a connected handle is not the durable writer ACK"
+        );
+        let receipt = account_commit_reply(checkpoint);
+        assert!(matches!(
+            &receipt,
+            Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+        ));
+        drop(f.app.update(receipt));
+        assert!(!f.app.chat_start_pending(f.card));
+        assert_live_recovery_content(&f);
+        let runtime = chat_runtime(&f.app, f.card);
+        assert_eq!(runtime.session, f.canonical);
+        assert!(!runtime.disconnected);
+        assert!(runtime.connected());
+        assert_eq!(runtime.snapshot.items, snapshot.items);
+        assert!(
+            f.app
+                .persistent_workspace()
+                .pending_chat_admissions
+                .is_empty()
+        );
+        f.app.persist();
+        let writer = f.app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        assert_eq!(writer.last_error(), None);
+        assert_eq!(
+            writer
+                .operation_store()
+                .load_card(f.card, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(f.canonical)
+        );
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_reconnect_holds_source_through_real_writer_ack() {
+        exercise_live_shared_recovery(false);
+    }
+
+    #[test]
+    fn retained_live_model_upgrade_supersedes_inflight_ordinary_reconnect_without_replaying_draft()
+    {
+        exercise_live_shared_recovery(true);
+    }
+
     #[test]
     fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() {
         // pre-ID learning, Codex normalization, and grant-bound retained reset.
