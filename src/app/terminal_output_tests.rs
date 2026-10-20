@@ -405,7 +405,7 @@ fn terminal_control_failure_reports_a_notice_and_clears_pending_copy() {
 fn confirmed_host_proof_refreshes_uncertain_terminal_metadata() {
     let (mut app, card, mut peer) = fixture();
     app.uncertain_terminal_proofs
-        .insert(card, peer.handle.host_proof().unwrap());
+        .insert(card, peer.handle.proof().unwrap());
     apply(&mut app, card, &mut peer, None);
     assert_eq!(counts(), (1, 1));
     assert!(!app.uncertain_terminal_proofs.contains_key(&card));
