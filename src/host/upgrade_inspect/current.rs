@@ -416,11 +416,10 @@ mod tests {
         (source, terminal)
     }
 
-    // Generate once with --nocapture, then replace the emitted bytes with
-    // frozen source-version fixtures. A current-DTO roundtrip alone cannot
-    // detect layout changes shared by both sides of the reader.
+    // Frozen frames detect historical layout changes which a current-DTO
+    // roundtrip would accept on both sides.
     #[test]
-    fn emit_populated_source_100_inventory_wire_fixtures() {
+    fn frozen_populated_source_100_inventory_wire_fixtures() {
         let (source, terminal) = populated_inventory();
         let connect = ClientEnvelope {
             version: 100,
@@ -437,7 +436,10 @@ mod tests {
         };
         let mut bytes = Vec::new();
         ipc::write_frame(&mut bytes, &connect).unwrap();
-        println!("FREEZE_CONNECT_100={bytes:?}");
+        assert_eq!(
+            bytes.as_slice(),
+            include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connect.bin")
+        );
         for (name, response) in [
             (
                 "CONNECTED",
@@ -471,8 +473,23 @@ mod tests {
             };
             let mut bytes = Vec::new();
             ipc::write_frame(&mut bytes, &envelope).unwrap();
-            println!("FREEZE_{name}_100={bytes:?}");
-            assert_eq!(read_response(&mut bytes.as_slice()).unwrap(), envelope);
+            let frozen: &[u8] = match name {
+                "CONNECTED" => {
+                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connected.bin")
+                }
+                "LISTED" => {
+                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/listed.bin")
+                }
+                "CHAT_LISTED" => include_bytes!(
+                    "../../../tests/fixtures/upgrade-inspection-v100/chat_listed.bin"
+                ),
+                "RESOLVED" => {
+                    include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/resolved.bin")
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(bytes.as_slice(), frozen);
+            assert_eq!(read_response(&mut &frozen[..]).unwrap(), envelope);
         }
     }
 

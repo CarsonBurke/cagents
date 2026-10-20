@@ -797,6 +797,7 @@ impl ClientHandle {
             false,
             None,
             None,
+            None,
             |_| {},
         )
     }
