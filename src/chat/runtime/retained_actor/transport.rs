@@ -2481,6 +2481,7 @@ impl Server {
                         .continuity_loss()?
                 {
                     snapshot.error = Some(loss.reason.clone());
+                    snapshot.ready = false;
                 }
                 if let Some(snapshot) = &snapshot {
                     self.remember_publication(
@@ -2494,6 +2495,17 @@ impl Server {
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
                 if id != self.source.id {
                     return Err("Retained presentation names another chat".into());
+                }
+                // Loss is outside the reducer's transcript generation. Refuse
+                // even an unchanged-generation read instead of hiding it as
+                // an empty publication or inventing a transcript revision.
+                if let Some(loss) = self
+                    .journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .continuity_loss()?
+                {
+                    return Err(loss.reason);
                 }
                 let response = self.actor.presentation(id, after);
                 let snapshot = match &response {
@@ -3088,6 +3100,9 @@ mod tests {
         }
     }
     fn resident_fixture() -> Fixture {
+        resident_fixture_with_body(None)
+    }
+    fn resident_fixture_with_body(body: Option<String>) -> Fixture {
         use crate::chat::protocol::{Adapter, Step};
         struct Idle;
         impl Adapter for Idle {
@@ -3130,6 +3145,19 @@ mod tests {
         let spec = ProcessSpec::from(&recipe);
         let mut adapter: Box<dyn Adapter> = Box::new(Idle);
         let mut initial = adapter.initialize().unwrap();
+        if let Some(text) = body {
+            initial.events.push(chat::Event::Item(chat::Item {
+                id: "retained-body".into(),
+                role: chat::Role::Assistant,
+                content: chat::ItemContent::Text {
+                    text,
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            }));
+        }
         let store = super::super::super::preflight(&spec, &mut initial).unwrap();
         let actor = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3172,6 +3200,78 @@ mod tests {
             },
             _root: root,
         }
+    }
+    #[test]
+    fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_copy() {
+        let body = "Retained answer λ\n  preserve source and copy";
+        let mut fixture = resident_fixture_with_body(Some(body.into()));
+        let server = &mut fixture.server;
+        let source = server.source.clone();
+        let proof = server.proof.clone();
+        let epoch = server.epoch;
+        let id = source.id;
+        let request = |method: &str, args| Invocation {
+            proof: proof.clone(),
+            epoch: Some(epoch),
+            method: method.into(),
+            args,
+        };
+        let before: Snapshot =
+            serde_json::from_value(server.invoke(request("snapshot", json!([null]))).unwrap())
+                .unwrap();
+        assert!(before.ready);
+        let copy = before.text_copy_sources.conversation[0].clone().unwrap();
+        let before_page: chat::TextCopyPage = serde_json::from_value(
+            server
+                .invoke(request("text_copy", json!([copy, 0])))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before_page.text, body);
+        let generation = before.generation;
+        assert_eq!(
+            server
+                .invoke(request("presentation", json!([id, generation])))
+                .unwrap(),
+            Value::Null,
+        );
+        let loss = "Retained outcome journal commit failed; run outcome is unconfirmed";
+        server.journal.lock().unwrap().record_loss(loss).unwrap();
+        // FULL, matching, and lagged cursors all report the same loss before
+        // the reducer can suppress reads or hydrate a transcript window.
+        for after in [None, Some(generation), Some(generation.saturating_sub(1))] {
+            assert_eq!(
+                server
+                    .invoke(request("presentation", json!([id, after])))
+                    .unwrap_err(),
+                loss,
+            );
+        }
+        let after: Snapshot =
+            serde_json::from_value(server.invoke(request("snapshot", json!([null]))).unwrap())
+                .unwrap();
+        assert_eq!(
+            after.generation, generation,
+            "loss invents no transcript revision"
+        );
+        assert_eq!(after.error.as_deref(), Some(loss));
+        assert!(!after.ready);
+        assert_eq!(after.items, before.items);
+        assert_eq!(after.text_copy_sources, before.text_copy_sources);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.exited, before.exited);
+        assert_eq!(server.source, source);
+        assert!(server.actor.owns_work());
+        assert!(!server.actor.is_completed());
+        assert!(!server.session_stopping);
+        assert!(server.closed_snapshot.is_none());
+        let copied: chat::TextCopyPage = serde_json::from_value(
+            server
+                .invoke(request("text_copy", json!([copy, 0])))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(copied, before_page);
     }
     #[test]
     fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {

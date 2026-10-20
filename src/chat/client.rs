@@ -1368,6 +1368,9 @@ impl ClientHandle {
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
                     let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
                     let _ = reply.try_send(result);
+                    // Request-specific command failures are delivered to the
+                    // caller; they do not make presentation unavailable.
+                    continue;
                 }
                 match envelope.message {
                     ServerMessage::ChatChanged { chat_id } if chat_id == id && visible.load(Ordering::Acquire) => {
@@ -1424,7 +1427,13 @@ impl ClientHandle {
                     ServerMessage::Error(error) => {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
-                        Arc::make_mut(&mut state).error = Some(error.message);
+                        {
+                            let snapshot = Arc::make_mut(&mut state);
+                            if error.code == ipc::ProtocolErrorCode::TerminalUnavailable {
+                                snapshot.ready = false;
+                            }
+                            snapshot.error = Some(error.message);
+                        }
                         drop(state); wake(Wake::Changed);
                     },
                     ServerMessage::HostShuttingDown => break "Chat daemon is shutting down".into(),
@@ -4294,5 +4303,189 @@ mod tests {
             .unwrap();
             assert_eq!(handle.upgrade_recovery(), Some(&(source, resolved)));
         }
+    }
+    #[test]
+    fn unavailable_presentation_disables_readiness_but_preserves_body_and_copy_authority() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (released, release) = std::sync::mpsc::channel();
+        let (changed, changes) = std::sync::mpsc::channel();
+        let session = omp_card(Some(CONVERSATION), Some(host_proof("presentation")));
+        let source = session.clone();
+        let body = Arc::new(super::super::Item {
+            id: "retained-body".into(),
+            role: super::super::Role::Assistant,
+            content: super::super::ItemContent::Text {
+                text: "Preserved private answer λ".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let initial = Snapshot {
+            generation: 7,
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            items: vec![body.clone()],
+            text_copy_sources: super::super::TextCopySources {
+                conversation_revision: 3,
+                conversation: vec![Some(text_copy_source(11, 28))],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let before = initial.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("presentation");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(start.request, ClientRequest::ChatStart { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            let command: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(command.request, ClientRequest::ChatCommand { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(command.request_id),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "one command was refused",
+                    true,
+                )),
+            );
+            let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                visible.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(visible.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id: source.id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(7),
+                    ..
+                }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "retained presentation is unavailable",
+                    true,
+                )),
+            );
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            source.clone(),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                if matches!(wake, Wake::Changed) {
+                    let _ = changed.send(());
+                }
+            },
+        )
+        .unwrap();
+        let decoded_body = handle.snapshot().items[0].clone();
+        assert_eq!(
+            handle.send(Command::Refresh).unwrap_err(),
+            "one command was refused"
+        );
+        assert!(
+            handle.snapshot().ready,
+            "request-specific refusal must not disable presentation"
+        );
+        assert_eq!(handle.snapshot().error, None);
+        handle.set_visible(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let after = loop {
+            let snapshot = handle.snapshot();
+            if !snapshot.ready
+                && snapshot.error.as_deref() == Some("retained presentation is unavailable")
+            {
+                break snapshot;
+            }
+            changes
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        };
+        assert!(!after.ready);
+        assert_eq!(
+            after.error.as_deref(),
+            Some("retained presentation is unavailable")
+        );
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.items, before.items);
+        assert!(Arc::ptr_eq(&after.items[0], &decoded_body));
+        assert_eq!(after.text_copy_sources, before.text_copy_sources);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.exited, before.exited);
+        assert_eq!(handle.session(), source);
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        released.send(()).unwrap();
+        worker.join().unwrap();
     }
 }

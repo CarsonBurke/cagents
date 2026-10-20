@@ -2672,17 +2672,18 @@ fn process_inner(
             }
             let handle = record.handle.clone();
             drop(state);
-            let response = handle.presentation(chat_id, after_generation).unwrap_or(
-                ServerResponse::ChatSnapshot {
+            let response = handle
+                .presentation(chat_id, after_generation)
+                .map_err(unavailable)?
+                .unwrap_or(ServerResponse::ChatSnapshot {
                     chat_id,
                     snapshot: None,
-                },
-            );
+                });
             // A close, detach, replacement actor, or visibility change during
             // hydration must not publish data under the old attachment.
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let current = attached(&state, client, chat_id)?;
-            if !current.handle.same_actor(&handle)
+            if !current.handle.same_attachment(&handle)
                 || !current.subscribers.get(&client).copied().unwrap_or(false)
             {
                 return Err(error(
@@ -3646,6 +3647,68 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn chat_read_reports_remote_endpoint_failure_without_retiring_owned_chat() {
+        let (handle, _other_attachment) = Handle::fixture_remote_attachment_pair();
+        let identity = handle.actor_identity().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: "presentation-host".into(),
+            boot_id: "presentation-boot".into(),
+            host_incarnation: "presentation-incarnation".into(),
+        };
+        let source = Session {
+            id: identity.record.terminal,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe::shell("/".into()).unwrap(),
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        let mut state = HostState::new(proof);
+        state.register_client(1);
+        state.chats.insert(
+            source.id,
+            Record {
+                execution_instance: identity.instance,
+                console_recipe: None,
+                paired_terminal: None,
+                session: source.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::from([(1, true)]),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let host = Arc::new(HostLock::new(state));
+        for after_generation in [None, Some(1)] {
+            let failure = process(
+                &host,
+                1,
+                ClientRequest::ChatRead {
+                    chat_id: source.id,
+                    after_generation,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+            assert!(!failure.message.is_empty());
+            let state = host.lock().unwrap();
+            let retained = &state.chats[&source.id];
+            assert_eq!(retained.session, source);
+            assert!(retained.handle.same_attachment(&handle));
+            assert!(retained.handle.owns_work());
+            assert!(!retained.handle.is_completed());
+            assert!(state.native_closing.is_empty());
+            assert!(state.chat_spawning.is_empty());
+        }
+    }
 
     #[test]
     fn native_constructor_environment_is_private_once_and_preserves_precedence_and_removals() {

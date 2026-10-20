@@ -466,13 +466,12 @@ impl Handle {
         &self,
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
-    ) -> Option<crate::terminal_ipc::ServerResponse> {
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
         match &self.0 {
-            Owner::Local(local) => local.presentation(chat_id, after),
-            Owner::Remote(remote) => remote
-                .call("presentation", serde_json::json!([chat_id, after]))
-                .ok()
-                .flatten(),
+            Owner::Local(local) => Ok(local.presentation(chat_id, after)),
+            Owner::Remote(remote) => {
+                remote.call("presentation", serde_json::json!([chat_id, after]))
+            }
         }
     }
     pub fn session_id(&self) -> Option<String> {
