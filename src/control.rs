@@ -5820,6 +5820,18 @@ mod tests {
     }
 
     #[test]
+    fn ui_launcher_advertises_recovery_progress_support() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "test \"$CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS\" = 1 || exit 94; printf 'ready\\n'",
+            ])
+            .env_remove("CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS");
+        spawn_ui_process(&mut command).unwrap();
+    }
+
+    #[test]
     fn ui_launch_handshake_waits_for_saved_pane_recovery() {
         let mut child = Command::new("sh")
             .args([
