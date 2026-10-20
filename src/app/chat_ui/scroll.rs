@@ -105,9 +105,45 @@ impl Memory {
             .borrow()
             .entries
             .get(&(context.map(str::to_owned), identity))
-            .filter(|saved| saved.source.is_some_and(|digest| source.accepts(digest)))
+            .filter(|saved| {
+                saved
+                    .source
+                    .is_some_and(|proof| source.accepts(proof.digest))
+            })
             .map_or(0.0, |saved| saved.content_width)
             .max(0.0)
+    }
+    pub(super) fn reader_proofs(
+        &self,
+        context: Option<&str>,
+    ) -> Arc<HashMap<u64, reader_source::Proof>> {
+        Arc::new(
+            self.1
+                .borrow()
+                .entries
+                .iter()
+                .filter(|((saved_context, _), _)| saved_context.as_deref() == context)
+                .filter_map(|((_, identity), saved)| saved.source.map(|proof| (*identity, proof)))
+                .collect(),
+        )
+    }
+    /// Advance only the exact bookmark that the worker verified. This changes
+    /// no geometry, retains no bodies, and cannot bless another logical reader.
+    pub(super) fn verified_readers(
+        &self,
+        context: Option<&str>,
+        proofs: HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+    ) {
+        let mut positions = self.1.borrow_mut();
+        for (identity, (current, previous)) in proofs {
+            if let Some(saved) = positions
+                .entries
+                .get_mut(&(context.map(str::to_owned), identity))
+                && saved.source == Some(previous)
+            {
+                saved.source = Some(current);
+            }
+        }
     }
     pub fn retained_rows(&self) -> usize {
         self.0

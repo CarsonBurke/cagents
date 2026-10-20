@@ -322,6 +322,16 @@ active graph as one batch; this bounds generation amplification, not total live
 glyph storage or process RSS. Optional `cagents::memory=trace` includes pending
 retirement item counts for native visit/hide qualification.
 
+Nested reader bookmarks retain a byte length and full source digest, alongside
+geometry and the exact logical reader identity. After hiding releases bodies,
+the admitted parser worker verifies that exact prefix in the authoritative new
+code/tool source, including its partial final hash chunk. Only the matching
+context/reader bookmark advances to the verified new digest. Inputs and outputs
+are bounded by the existing 1,024 bookmark entries; unbookmarked sources need no
+extra verification pass. No source bytes or acceptance graph remain hidden.
+Expanded tools with remembered geometry wait for the same admitted worker before
+remounting, so a rewrite cannot overwrite a valid bookmark before verification.
+
 The pane inspector's diagnostics disclose known source, prepared-presentation
 and logical-selection payload owners for the selected chat. These counters
 exclude opaque parser/font/renderer/image allocations and allocator retention;

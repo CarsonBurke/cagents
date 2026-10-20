@@ -18,6 +18,7 @@ struct Request {
     growing: bool,
     version: u64,
     theme: crate::settings::EditorSyntaxTheme,
+    reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
 }
 
 #[derive(Clone, Default)]
@@ -95,10 +96,129 @@ pub(super) struct State {
     context: Option<(Target, Option<String>, Option<String>)>,
     entries: HashMap<String, Entry>,
     errors: HashMap<String, (std::sync::Weak<chat::Item>, String)>,
+    reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
 }
 impl Drop for State {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+/// Reader-only work shares the parser's source and output admission. It is
+/// requested only when a remounted expanded tool has remembered geometry.
+pub(super) fn source_bytes(content: &ItemContent) -> Option<usize> {
+    CachedItem::prose(content)
+        .map(str::len)
+        .or_else(|| match content {
+            ItemContent::Command {
+                command, output, ..
+            } => Some(command.len().saturating_add(output.len())),
+            ItemContent::Tool { input, output, .. } => {
+                Some(input.len().saturating_add(output.len()))
+            }
+            ItemContent::Changes { changes, .. } => {
+                Some(changes.iter().fold(0usize, |bytes, change| {
+                    bytes.saturating_add(change.diff.len())
+                }))
+            }
+            _ => None,
+        })
+}
+fn verify_reader(
+    identity: u64,
+    text: &str,
+    proofs: &HashMap<u64, reader_source::Proof>,
+    verified: &mut HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+) {
+    if let Some(previous) = proofs.get(&identity)
+        && let Some(pair) = reader_source::verify_prefix(text, *previous)
+    {
+        verified.insert(identity, pair);
+    }
+}
+// Match Renderer::items/child exactly: sources are bound to the same logical
+// item/path used by mounted readers, rather than compared with every bookmark.
+fn verify_markdown_readers(
+    item_id: &str,
+    path: &[u32],
+    items: &[markdown::Item],
+    proofs: &HashMap<u64, reader_source::Proof>,
+    verified: &mut HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+) {
+    for (index, item) in items.iter().enumerate() {
+        let mut path = path.to_vec();
+        path.push(index as u32);
+        match item {
+            markdown::Item::CodeBlock { source, .. } => verify_reader(
+                selection::logical_identity(item_id, &path),
+                source,
+                proofs,
+                verified,
+            ),
+            markdown::Item::Quote(items) => {
+                verify_markdown_readers(item_id, &path, items, proofs, verified)
+            }
+            markdown::Item::List { bullets, .. } => {
+                for (index, bullet) in bullets.iter().enumerate() {
+                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                        bullet;
+                    let mut nested = path.clone();
+                    nested.push(index as u32);
+                    verify_markdown_readers(item_id, &nested, items, proofs, verified);
+                }
+            }
+            markdown::Item::Table { columns, rows } => {
+                for (column, header) in columns.iter().enumerate() {
+                    let mut nested = path.clone();
+                    nested.extend([0, column as u32]);
+                    verify_markdown_readers(item_id, &nested, &header.header, proofs, verified);
+                }
+                for (row, cells) in rows.iter().enumerate() {
+                    for (column, cell) in cells.cells.iter().enumerate() {
+                        let mut nested = path.clone();
+                        nested.extend([row as u32 + 1, column as u32]);
+                        verify_markdown_readers(item_id, &nested, cell, proofs, verified);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+fn verify_tool_reader(
+    item_id: &str,
+    path: &[u32],
+    text: &str,
+    proofs: &HashMap<u64, reader_source::Proof>,
+    verified: &mut HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+) {
+    let logical = selection::logical_identity(item_id, path);
+    for axis in [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical] {
+        verify_reader(scroll::reader_key(logical, axis), text, proofs, verified);
+    }
+}
+fn verify_tool_readers(
+    item: &chat::Item,
+    proofs: &HashMap<u64, reader_source::Proof>,
+    verified: &mut HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
+) {
+    match &item.content {
+        ItemContent::Command {
+            command, output, ..
+        } => {
+            verify_tool_reader(&item.id, &[4], command, proofs, verified);
+            verify_tool_reader(&item.id, &[5], output, proofs, verified);
+        }
+        ItemContent::Tool { input, output, .. } => {
+            verify_tool_reader(&item.id, &[4], input, proofs, verified);
+            verify_tool_reader(&item.id, &[5], output, proofs, verified);
+        }
+        ItemContent::Changes { changes, .. } => {
+            for (index, change) in changes.iter().enumerate() {
+                verify_tool_reader(&item.id, &[6, index as u32], &change.diff, proofs, verified);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -125,6 +245,9 @@ fn same_kind(previous: &chat::Item, current: &chat::Item) -> bool {
 }
 
 impl State {
+    pub(super) fn set_reader_proofs(&mut self, proofs: Arc<HashMap<u64, reader_source::Proof>>) {
+        self.reader_proofs = proofs;
+    }
     pub(super) fn clear(&mut self) {
         for (_, entry) in self.entries.drain() {
             entry.shared.cancel();
@@ -196,7 +319,7 @@ impl State {
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
     ) -> bool {
-        let Some(body) = CachedItem::prose(&item.content) else {
+        let Some(bytes) = source_bytes(&item.content) else {
             return false;
         };
         if self
@@ -207,7 +330,7 @@ impl State {
             return false;
         }
         self.errors.remove(&item.id);
-        if body.len() > SOURCE_BYTES {
+        if bytes > SOURCE_BYTES && CachedItem::prose(&item.content).is_some() {
             if let Some(entry) = self.entries.get(&item.id) {
                 entry.shared.cancel();
             }
@@ -234,12 +357,13 @@ impl State {
             if latest.theme == theme
                 && (same || (same_kind(&latest.item, item) && append(&latest.item, item)))
             {
-                if entry.shared.lease.resize(body.len()) {
+                if entry.shared.lease.resize(bytes) {
                     *latest = Request {
                         item: item.clone(),
                         growing,
                         version: latest.version.wrapping_add(1),
                         theme,
+                        reader_proofs: self.reader_proofs.clone(),
                     };
                     if !entry.running {
                         entry.run = next_attempt();
@@ -252,7 +376,7 @@ impl State {
         }
         self.remove(&item.id);
         let lease = Lease::default();
-        if self.entries.len() >= QUEUED_ITEMS || !lease.resize(body.len()) {
+        if self.entries.len() >= QUEUED_ITEMS || !lease.resize(bytes) {
             self.errors.insert(item.id.clone(), (Arc::downgrade(item), "Some messages could not be loaded. Retry when another message has finished loading.".into()));
             return true;
         }
@@ -267,6 +391,7 @@ impl State {
                         growing,
                         version: 1,
                         theme,
+                        reader_proofs: self.reader_proofs.clone(),
                     }),
                     canonical: Mutex::new(None),
                     cancelled: AtomicBool::new(false),
@@ -357,6 +482,7 @@ pub(super) struct Prepared {
     pub(super) parsed: Parsed,
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
+    reader_verifications: HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
     #[cfg(test)]
     syntax_work: (usize, usize),
     // Retain the source lease through queued output as well as execution.
@@ -383,7 +509,24 @@ impl Prepared {
             _permit: self._permit,
         });
     }
-    pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
+    pub(super) fn install(self, cached: &mut CachedItem, managed: bool, expanded: bool) {
+        cached
+            .reader_memory
+            .verified_readers(cached.reader_context.as_deref(), self.reader_verifications);
+        if CachedItem::prose(&self.request.item.content).is_none() {
+            let previous = std::mem::replace(
+                cached,
+                CachedItem::preparing(&self.request.item, self.request.theme),
+            );
+            *cached = CachedItem::updated(
+                &self.request.item.content,
+                self.request.theme,
+                Some(previous),
+                expanded,
+                false,
+                None,
+            );
+        }
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         let retired = Retired {
@@ -642,14 +785,31 @@ fn execute(
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .unwrap_or_default();
-    let body = CachedItem::prose(&request.item.content).ok_or("The source is not Markdown.")?;
-    parse_publication(
-        &mut canonical.parsed,
-        body,
-        request.growing,
-        &shared.cancelled,
-    )?;
-    prime_plain(canonical.parsed.markdown.items(), &shared.cancelled)?;
+    let mut reader_verifications = HashMap::new();
+    if let Some(body) = CachedItem::prose(&request.item.content) {
+        parse_publication(
+            &mut canonical.parsed,
+            body,
+            request.growing,
+            &shared.cancelled,
+        )?;
+        prime_plain(canonical.parsed.markdown.items(), &shared.cancelled)?;
+        if !request.reader_proofs.is_empty() {
+            verify_markdown_readers(
+                &request.item.id,
+                &[0],
+                canonical.parsed.markdown.items(),
+                &request.reader_proofs,
+                &mut reader_verifications,
+            );
+        }
+    } else {
+        verify_tool_readers(
+            &request.item,
+            &request.reader_proofs,
+            &mut reader_verifications,
+        );
+    }
     let mut previous = std::mem::take(&mut canonical.blocks);
     #[cfg(test)]
     let mut syntax_work = (0, 0);
@@ -705,6 +865,7 @@ fn execute(
         parsed,
         blocks,
         palettes,
+        reader_verifications,
         #[cfg(test)]
         syntax_work,
         _owner: shared,
@@ -799,6 +960,98 @@ mod tests {
     }
 
     #[test]
+    fn rehydrated_readers_verify_only_exact_logical_paths_and_actual_prefixes_on_worker() {
+        let previous = reader_source::Source::new("wide line\n").proof();
+        let code = "wide line\nnew hidden tail\n";
+        let source = item(&format!("```text\n{code}```\n\n```text\n{code}```"));
+        let target = target();
+        let mut state = configured(target, &source);
+        let identity = selection::logical_identity(&source.id, &[0, 0]);
+        let unmounted = selection::logical_identity(&source.id, &[9]);
+        state.set_reader_proofs(Arc::new(
+            [(identity, previous), (unmounted, previous)].into(),
+        ));
+        assert!(state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false
+        ));
+        let (_, shared) = job(&state);
+        let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(
+            output.reader_verifications.len(),
+            1,
+            "equal text cannot bless another logical path"
+        );
+        assert_eq!(
+            output.reader_verifications[&identity],
+            (reader_source::Source::new(code).proof(), previous)
+        );
+        output.discard();
+        drop(state);
+        retirement_barrier();
+
+        let input = "rewritten input";
+        let output = "wide line\nnew hidden tail\n";
+        let source = Arc::new(chat::Item {
+            content: ItemContent::Tool {
+                name: "fixture".into(),
+                input: input.into(),
+                output: output.into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            ..(*source).clone()
+        });
+        let mut state = configured(target, &source);
+        let mut proofs = HashMap::new();
+        let old_input = reader_source::Source::new("original input").proof();
+        for (part, proof) in [(4, old_input), (5, previous)] {
+            let logical = selection::logical_identity(&source.id, &[part]);
+            for axis in [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical] {
+                proofs.insert(scroll::reader_key(logical, axis), proof);
+            }
+        }
+        state.set_reader_proofs(Arc::new(proofs));
+        assert!(state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false
+        ));
+        let (_, shared) = job(&state);
+        let prepared = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        assert!(
+            prepared.parsed.markdown.items().is_empty(),
+            "tool verification does not parse its output as Markdown"
+        );
+        assert_eq!(
+            prepared.reader_verifications.len(),
+            2,
+            "both output axes survive; rewritten input axes fail closed"
+        );
+        let output_logical = selection::logical_identity(&source.id, &[5]);
+        for axis in [scroll::ReaderAxis::Horizontal, scroll::ReaderAxis::Vertical] {
+            assert_eq!(
+                prepared.reader_verifications[&scroll::reader_key(output_logical, axis)],
+                (reader_source::Source::new(output).proof(), previous)
+            );
+        }
+        let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Auto);
+        prepared.install(&mut cached, false, true);
+        assert!(!cached.placeholder && !cached.preparing);
+        assert_eq!(cached.tool_input.as_ref().unwrap().text.as_ref(), input);
+        assert_eq!(cached.tool_output.as_ref().unwrap().text.as_ref(), output);
+        drop(cached);
+        drop(state);
+        retirement_barrier();
+    }
+
+    #[test]
     fn owned_parser_moves_across_thread_and_matches_whole_document() {
         let body = format!(
             "# Owned\n\n[ref]: https://example.com\n\n```rust\n{}\n```\n\n| a | b |\n| - | - |\n| [reference][ref] | 🦀 |\n",
@@ -865,7 +1118,7 @@ mod tests {
         assert_eq!(format!("{dark:?}"), format!("{:?}", expected.spans(true)));
         assert_eq!(format!("{light:?}"), format!("{:?}", expected.spans(false)));
         let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Mocha);
-        output.install(&mut cached, false);
+        output.install(&mut cached, false, false);
         assert!(
             Arc::ptr_eq(&dark, cached.blocks[&key].spans(true)),
             "installation moves the worker's spans without re-highlighting"
@@ -999,7 +1252,7 @@ mod tests {
         let (_, shared) = job(&state);
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         let output = execute(shared, permits.clone().try_acquire_owned().unwrap()).unwrap();
-        output.install(&mut cached, false);
+        output.install(&mut cached, false, false);
         let admitted = iced::futures::executor::block_on(permits.clone().acquire_owned()).unwrap();
         assert!(
             weak.upgrade().is_none(),

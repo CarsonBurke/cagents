@@ -10,7 +10,7 @@ pub(super) struct Saved {
     at_end: bool,
     used: u64,
     pub(super) content_width: f32,
-    pub(super) source: Option<blake3::Hash>,
+    pub(super) source: Option<super::super::reader_source::Proof>,
 }
 #[derive(Default)]
 pub(super) struct Positions {
@@ -50,7 +50,7 @@ struct Block<'a> {
     bottom: bool,
     source: Option<super::super::reader_source::Source>,
 }
-struct Mounted(Option<(Key, Option<blake3::Hash>)>);
+struct Mounted(Option<(Key, Option<super::super::reader_source::Proof>)>);
 struct Position {
     restore: Option<Saved>,
     bottom: bool,
@@ -103,10 +103,10 @@ impl Operation for Position {
     }
 }
 impl Block<'_> {
-    fn accepts(&self, previous: Option<blake3::Hash>) -> bool {
+    fn accepts(&self, previous: Option<super::super::reader_source::Proof>) -> bool {
         match (&self.source, previous) {
             (None, None) => true,
-            (Some(source), Some(previous)) => source.accepts(previous),
+            (Some(source), Some(previous)) => source.accepts(previous.digest),
             _ => false,
         }
     }
@@ -124,7 +124,7 @@ impl Block<'_> {
             let mut memory = self.memory.1.borrow_mut();
             memory.clock = memory.clock.wrapping_add(1);
             saved.used = memory.clock;
-            saved.source = self.source.as_ref().map(|source| source.digest());
+            saved.source = self.source.as_ref().map(|source| source.proof());
             if !memory.entries.contains_key(&self.key) && memory.entries.len() >= 1024 {
                 if let Some(key) = memory
                     .entries
@@ -184,12 +184,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Block<'_> {
         if mounted.0.as_ref()
             != Some(&(
                 self.key.clone(),
-                self.source.as_ref().map(|source| source.digest()),
+                self.source.as_ref().map(|source| source.proof()),
             ))
         {
             mounted.0 = Some((
                 self.key.clone(),
-                self.source.as_ref().map(|source| source.digest()),
+                self.source.as_ref().map(|source| source.proof()),
             ));
             let saved = self
                 .memory
@@ -429,6 +429,102 @@ mod tests {
             "replacement restores native top anchoring"
         );
     }
+    #[test]
+    fn hidden_append_restores_offsets_and_width_from_worker_verified_body_free_proof() {
+        use crate::app::chat_ui::reader_source::{self, Source};
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 200.0));
+        let memory = Memory::default();
+        let make = |source: Source, width: f32| {
+            let remembered = memory.reader_width_for(None, 7, &source);
+            block_source(
+                widget::scrollable(super::minimum_width(
+                    widget::container(widget::Space::new().width(width).height(2000)),
+                    remembered,
+                ))
+                .direction(iced::widget::scrollable::Direction::Both {
+                    vertical: design::scrollbar(),
+                    horizontal: design::scrollbar(),
+                })
+                .width(Length::Fill)
+                .height(Length::Fill),
+                memory.clone(),
+                None,
+                7,
+                false,
+                Some(source),
+            )
+        };
+        let body = format!("{}last partial chunk", "λ line\n".repeat(800));
+        let mut element = make(Source::new(&body), 2000.0);
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut Move);
+        assert_eq!(
+            memory.1.borrow().entries[&(None, 7)].position,
+            Point::new(100.0, 300.0)
+        );
+        let proofs = memory.reader_proofs(None);
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[&7].bytes, body.len());
+        drop(tree);
+        drop(element);
+        // This is a new immutable publication after all old Source/tree
+        // objects were discarded; no in-memory append ancestry survives.
+        let grown = format!("{body}\nappended while hidden");
+        let worker_body = grown.clone();
+        let verified = std::thread::spawn(move || {
+            proofs
+                .iter()
+                .filter_map(|(key, proof)| {
+                    reader_source::verify_prefix(&worker_body, *proof).map(|pair| (*key, pair))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .join()
+        .unwrap();
+        memory.verified_readers(None, verified);
+        let mut revealed = make(Source::new(&grown), 100.0);
+        let mut tree = Tree::new(&revealed);
+        revealed
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let saved = memory.1.borrow().entries[&(None, 7)];
+        assert_eq!(saved.position, Point::new(100.0, 300.0));
+        assert!(saved.content_width >= 2000.0);
+        drop(tree);
+        drop(revealed);
+        let proofs = memory.reader_proofs(None);
+        // Rewrite the old body's partial final chunk, retaining its length
+        // and earlier 4 KiB checkpoints. A prefix checkpoint alone is unsafe.
+        let rewritten = grown.replace("last partial chunk", "lost partial chunk");
+        let worker_body = rewritten.clone();
+        let verified = std::thread::spawn(move || {
+            proofs
+                .iter()
+                .filter_map(|(key, proof)| {
+                    reader_source::verify_prefix(&worker_body, *proof).map(|pair| (*key, pair))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .join()
+        .unwrap();
+        assert!(verified.is_empty());
+        memory.verified_readers(None, verified);
+        let mut revealed = make(Source::new(&rewritten), 100.0);
+        let mut tree = Tree::new(&revealed);
+        revealed
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let saved = memory.1.borrow().entries[&(None, 7)];
+        assert_eq!(saved.position, Point::ORIGIN);
+        assert!(saved.content_width <= 400.0);
+    }
+
     #[test]
     fn nested_positions_survive_tree_eviction_without_retaining_widget_state() {
         let renderer = crate::app::tests::headless_renderer();

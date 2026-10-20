@@ -2,9 +2,17 @@
 //! a verified append can keep them, while a replacement starts at native defaults.
 use std::{collections::VecDeque, sync::Arc};
 
+/// Exact body-free evidence retained with a reader bookmark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Proof {
+    pub(super) bytes: usize,
+    pub(super) digest: blake3::Hash,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Source {
     digest: blake3::Hash,
+    bytes: usize,
     // Allocate incremental state only once this source actually grows.
     hasher: Option<Arc<blake3::Hasher>>,
     ancestors: Arc<VecDeque<blake3::Hash>>,
@@ -22,6 +30,7 @@ impl Source {
         hasher.update(chunks.remainder());
         Self {
             digest: hasher.finalize(),
+            bytes: text.len(),
             hasher: None,
             ancestors: Arc::default(),
             prefixes: Arc::new(prefixes),
@@ -32,6 +41,12 @@ impl Source {
     }
     pub fn digest(&self) -> blake3::Hash {
         self.digest
+    }
+    pub fn proof(&self) -> Proof {
+        Proof {
+            bytes: self.bytes,
+            digest: self.digest,
+        }
     }
     pub fn accepts(&self, previous: blake3::Hash) -> bool {
         self.digest == previous || self.ancestors.contains(&previous)
@@ -64,6 +79,7 @@ impl Source {
             }
         }
         self.digest = hasher.finalize();
+        self.bytes = seen;
     }
     pub fn updated(previous: &Self, old: &str, new: &str) -> Self {
         if let Some(suffix) = new.strip_prefix(old) {
@@ -74,6 +90,26 @@ impl Source {
             Self::new(new)
         }
     }
+}
+
+/// Verify an exact bookmark prefix against a new immutable reader body on a
+/// worker. The final partial chunk is included; a matching 4 KiB checkpoint
+/// alone cannot authenticate the old body. No old source text is retained.
+pub(super) fn verify_prefix(text: &str, previous: Proof) -> Option<(Proof, Proof)> {
+    let prefix = text.as_bytes().get(..previous.bytes)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix);
+    if hasher.finalize() != previous.digest {
+        return None;
+    }
+    hasher.update(&text.as_bytes()[previous.bytes..]);
+    Some((
+        Proof {
+            bytes: text.len(),
+            digest: hasher.finalize(),
+        },
+        previous,
+    ))
 }
 
 #[cfg(test)]

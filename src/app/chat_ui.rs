@@ -2705,6 +2705,8 @@ impl Runtime {
         let theme = self.syntax_theme;
         let provider = self.session.launch.provider;
         let handle = self.handle().cloned();
+        let reader_proofs = self.scroll_memory.reader_proofs(context.as_deref());
+        self.preparation.set_reader_proofs(reader_proofs.clone());
         let expanded = context
             .as_ref()
             .and_then(|id| self.child_expanded.get(id))
@@ -2748,7 +2750,12 @@ impl Runtime {
         for (index, item) in items.iter().enumerate() {
             let growing = busy && index == newest;
             let coordinated = chat::coordination::recognize(item, provider);
-            if CachedItem::prose(&item.content).is_some() && coordinated.is_none() {
+            let reader_only = CachedItem::prose(&item.content).is_none()
+                && expanded.contains(&item.id)
+                && !reader_proofs.is_empty()
+                && preparation::source_bytes(&item.content).is_some();
+            if (CachedItem::prose(&item.content).is_some() || reader_only) && coordinated.is_none()
+            {
                 let current = cache.get(&item.id);
                 let exact = current
                     .and_then(|cached| cached.item.as_ref())
@@ -2769,11 +2776,13 @@ impl Runtime {
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if pending || !exact {
-                    let replaced = self.preparation.stage(item, growing, theme, |old, new| {
-                        handle
-                            .as_ref()
-                            .is_some_and(|handle| handle.known_append(old, new))
-                    });
+                    let replaced =
+                        self.preparation
+                            .stage(item, growing && !reader_only, theme, |old, new| {
+                                handle
+                                    .as_ref()
+                                    .is_some_and(|handle| handle.known_append(old, new))
+                            });
                     if replaced && !exact && !proven_from_cache {
                         cache.insert(item.id.clone(), CachedItem::preparing(item, theme));
                         presentation_changed = true;
@@ -2896,11 +2905,12 @@ impl Runtime {
             return;
         };
         let managed = self.preparation.contains(id);
+        let expanded = self.item_expanded(id);
         let Some(cached) = self.presentation_cache_mut().get_mut(id) else {
             prepared.discard();
             return;
         };
-        prepared.install(cached, managed);
+        prepared.install(cached, managed, expanded);
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.refresh_find();
     }
@@ -19277,10 +19287,14 @@ mod tests {
             }],
             ..Snapshot::default()
         };
-        handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().show(true);
+        handle.publish_snapshot_for_test(snapshot.clone());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("actual-child".into()))));
         let runtime = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(runtime);
         assert!(runtime.cache[&parent.id].source.retained_tail_capacity() >= 256 * 1024);
         assert!(
             runtime.child_cache[&child.id]
@@ -19288,36 +19302,60 @@ mod tests {
                 .retained_tail_capacity()
                 >= 256 * 1024
         );
-        let parent_revision = runtime.cache[&parent.id].revision;
-        let child_revision = runtime.child_cache[&child.id].revision;
+        runtime.replace_draft(text_editor::Content::with_text("Unsent child draft"));
+        let (catalog, bookmark) = runtime.selection_document();
+        let (anchor, end) = catalog.endpoints().unwrap();
+        *bookmark.borrow_mut() = selection::Bookmark {
+            anchor: Some(anchor),
+            end: Some(end),
+            anchor_prefix: catalog.fingerprint(anchor),
+            end_prefix: catalog.fingerprint(end),
+        };
+        drop(catalog);
         runtime.set_visible(false).unwrap();
-        assert_eq!(runtime.cache[&parent.id].source.retained_tail_capacity(), 0);
-        assert_eq!(
-            runtime.child_cache[&child.id]
-                .source
-                .retained_tail_capacity(),
-            0
-        );
-        assert_eq!(runtime.cache[&parent.id].revision, parent_revision);
-        assert_eq!(runtime.child_cache[&child.id].revision, child_revision);
-        assert_eq!(runtime.child_cache_context.as_deref(), Some("actual-child"));
+        preparation::retirement_barrier();
+        assert!(runtime.cache.is_empty());
+        assert!(runtime.child_cache.is_empty());
+        assert!(runtime.child_cache_context.is_none());
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("actual-child"));
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent child draft");
+        assert_eq!(bookmark.borrow().anchor, Some(anchor));
+        assert_eq!(bookmark.borrow().end, Some(end));
         let appended = format!("{}\nnew child tail", "c".repeat(256 * 1024));
         snapshot.generation += 1;
         snapshot.subagents[0].items[0] = Arc::new(chat::Item {
             content: text(&appended),
             ..(*child).clone()
         });
+        // Hidden publications carry metadata only. Reveal first, then install
+        // the authoritative complete resnapshot through the client fixture.
         handle.publish_snapshot_for_test(snapshot.clone());
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.show(true);
+        runtime.set_visible(true).unwrap();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
         let fresh = CachedItem::new(&text(&appended), runtime.syntax_theme);
         assert_eq!(shown(&runtime.child_cache[&child.id]), shown(&fresh));
-        assert_eq!(runtime.cache[&parent.id].revision, parent_revision);
+        assert!(
+            runtime.cache.is_empty(),
+            "unselected parent stays lazy after rehydration"
+        );
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("actual-child"));
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent child draft");
+        assert_eq!(bookmark.borrow().anchor, Some(anchor));
+        assert_eq!(bookmark.borrow().end, Some(end));
+        let (catalog, _) = runtime.selection_document();
+        assert_eq!(catalog.fingerprint(anchor), bookmark.borrow().anchor_prefix);
+        assert_eq!(catalog.fingerprint(end), bookmark.borrow().end_prefix);
         snapshot.generation += 1;
         snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
         handle.publish_snapshot_for_test(snapshot);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
+        preparation::drain_fixture(runtime);
         assert_eq!(
             runtime.child_cache[&child.id]
                 .source
