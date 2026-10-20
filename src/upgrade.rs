@@ -1434,11 +1434,13 @@ pub(crate) mod handoff {
                     .map_err(|error| error.to_string())?;
                 return fs_safety::sync_directory(&self.root).map_err(|error| error.to_string());
             }
-            let bytes = serde_json::to_vec(&UnattachedReport {
-                version: 1,
-                conversations: entries,
-            })
-            .map_err(|error| error.to_string())?;
+            let bytes = encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: entries,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )?;
             self.write_named(RECOVERED_FILE, &bytes)
         }
 
