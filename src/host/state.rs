@@ -1164,6 +1164,26 @@ impl HostState {
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
+        self.reserve_spawn_for_view_reserved(terminal_id, paired, None)
+    }
+
+    fn reserve_spawn_for_view_reserved(
+        &mut self,
+        terminal_id: TerminalId,
+        paired: Option<&TerminalSession>,
+        transition: Option<&super::chat::TerminalViewReservation<'_>>,
+    ) -> Result<(), ProtocolError> {
+        let owns_transition = transition.is_some_and(|transition| {
+            paired.is_some_and(|source| source.id == terminal_id)
+                && transition.authorizes(self, terminal_id)
+        });
+        if transition.is_some() && !owns_transition {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "The reserved native attachment changed before opening its CLI view",
+                true,
+            ));
+        }
         if self.shutting_down {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -1171,7 +1191,7 @@ impl HostState {
                 true,
             ));
         }
-        if self.chat_spawning.contains_key(&terminal_id)
+        if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
                     && !paired.is_some_and(|terminal| {
@@ -3691,12 +3711,63 @@ fn start_terminal_view_owned(
     client_id: ClientId,
     session: TerminalSession,
     options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+    pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_reserved(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+        pending_pane,
+        execution_recipe,
+        None,
+    )
+}
+
+pub(super) fn spawn_codex_view_reserved(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    transition: &super::chat::TerminalViewReservation<'_>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_reserved(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        true,
+        None,
+        None,
+        None,
+        None,
+        Some(transition),
+    )
+}
+
+fn start_terminal_view_owned_reserved(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
     mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
     execution_recipe: Option<crate::model::LaunchRecipe>,
+    transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3795,7 +3866,11 @@ fn start_terminal_view_owned(
                 false,
             ));
         }
-        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
+        state.reserve_spawn_for_view_reserved(
+            terminal_id,
+            paired.then_some(&session),
+            transition,
+        )?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.

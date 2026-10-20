@@ -148,6 +148,13 @@ struct ClosePublication {
     snapshot: Snapshot,
     resident: Resident,
 }
+/// Additive private operation: older protocol-2 helpers refuse the method.
+/// A retryable generation mismatch must never be inferred from an error string.
+#[derive(Serialize, Deserialize)]
+enum ConditionalClosePublication {
+    Changed,
+    Closed(ClosePublication),
+}
 #[derive(Serialize, Deserialize)]
 struct Startup {
     protocol: u32,
@@ -1559,7 +1566,20 @@ impl RemoteActor {
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
-        let (snapshot, resident) = match self.call::<ClosePublication>(method, args) {
+        self.publish_close_result(self.call(method, args))
+    }
+    pub fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+        let publication = match self.call("try_close_if_idle", json!([generation])) {
+            Ok(ConditionalClosePublication::Changed) => return Ok(false),
+            Ok(ConditionalClosePublication::Closed(publication)) => Ok(publication),
+            Err(error) => Err(error),
+        };
+        // A lost reply remains uncertain unless the existing exact durable
+        // final publication independently proves this provider's cleanup.
+        self.publish_close_result(publication).map(|()| true)
+    }
+    fn publish_close_result(&self, result: Result<ClosePublication, String>) -> Result<(), String> {
+        let (snapshot, resident) = match result {
             Ok(publication) => (publication.snapshot, Some(publication.resident)),
             Err(error) => {
                 if !final_snapshot::close_proved(&self.0.identity, &self.0.proof, &self.0.source)? {
@@ -1670,6 +1690,7 @@ fn close_only_method(method: &str) -> bool {
             | "ack_inputs"
             | "update_source"
             | "close_if_idle"
+            | "try_close_if_idle"
             | "close"
             | "retire"
     )
@@ -2249,6 +2270,7 @@ impl Server {
                     | "close_until"
                     | "close_if_revision"
                     | "close_if_idle"
+                    | "try_close_if_idle"
                     | "relocate_directory"
                     | "update_source"
             )
@@ -2640,14 +2662,16 @@ impl Server {
             }
             "close_if_idle" => {
                 let (generation,) = decode!((u64,));
-                if self.closed_snapshot.is_none() {
-                    if !self.actor.try_close_if_idle(generation)? {
-                        return Err("Provider state changed before conditional idle close".into());
+                match self.try_close_if_idle(generation)? {
+                    ConditionalClosePublication::Changed => {
+                        Err("Provider state changed before conditional idle close".into())
                     }
-                    reap_orphans()?;
-                    self.finish_inputs();
+                    ConditionalClosePublication::Closed(publication) => value!(publication),
                 }
-                value!(self.publish_close()?)
+            }
+            "try_close_if_idle" => {
+                let (generation,) = decode!((u64,));
+                value!(self.try_close_if_idle(generation)?)
             }
             "close" => {
                 if self.closed_snapshot.is_none() {
@@ -2731,6 +2755,20 @@ impl Server {
             );
         }
         Ok(())
+    }
+    fn try_close_if_idle(
+        &mut self,
+        generation: u64,
+    ) -> Result<ConditionalClosePublication, String> {
+        if self.closed_snapshot.is_none() {
+            if !self.actor.try_close_if_idle(generation)? {
+                return Ok(ConditionalClosePublication::Changed);
+            }
+            reap_orphans()?;
+            self.finish_inputs();
+        }
+        self.publish_close()
+            .map(ConditionalClosePublication::Closed)
     }
     fn publish_close(&mut self) -> Result<ClosePublication, String> {
         let snapshot = if let Some(snapshot) = &self.closed_snapshot {
@@ -4335,6 +4373,32 @@ mod tests {
             server.invoke(request).is_err(),
             "commit must not admit invented thread IDs"
         );
+    }
+    #[test]
+    fn conditional_idle_close_refuses_stale_or_preserved_attachment_without_stopping_provider() {
+        for refusal in ["epoch", "proof", "preserved"] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let generation = server.actor.snapshot(None).unwrap().generation;
+            let mut request = Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: "try_close_if_idle".into(),
+                args: json!([generation]),
+            };
+            match refusal {
+                "epoch" => request.epoch = Some(uuid::Uuid::new_v4()),
+                "proof" => {
+                    request.proof.host_incarnation = crate::model::HostIncarnation::new("old")
+                }
+                "preserved" => server.attachment_preserved = true,
+                _ => unreachable!(),
+            }
+            assert!(server.invoke(request).is_err(), "{refusal}");
+            assert!(!server.actor.is_completed(), "{refusal}");
+            assert!(server.closed_snapshot.is_none(), "{refusal}");
+            assert_eq!(server.actor.snapshot(None).unwrap().generation, generation);
+        }
     }
 
     #[test]

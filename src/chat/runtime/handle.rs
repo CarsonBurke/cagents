@@ -413,9 +413,7 @@ impl Handle {
     pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
         match &self.0 {
             Owner::Local(local) => local.try_close_if_idle(generation),
-            Owner::Remote(_) => Err(
-                "Retained provider ownership requires authenticated close before release".into(),
-            ),
+            Owner::Remote(remote) => remote.try_close_if_idle(generation),
         }
     }
     pub(crate) fn usage(&self) -> chat::Usage {
