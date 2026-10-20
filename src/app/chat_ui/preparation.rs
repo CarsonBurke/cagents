@@ -1761,12 +1761,12 @@ mod tests {
         catalog.markdown(&source.id, &[0], cached.markdown.items());
         let catalog = catalog.finish();
         for (identity, expected) in [(alt_id, expected_alt.as_str()), (title_id, title.as_str())] {
-            let first = selection::Endpoint { identity, byte: 0 };
-            let last = selection::Endpoint {
-                identity,
-                byte: expected.len(),
-            };
-            assert_eq!(catalog.text(identity).unwrap().as_ref(), expected);
+            let plain = catalog.text(identity).unwrap();
+            assert_eq!(plain.as_ref(), expected);
+            let mut leaf = selection::Catalog::builder();
+            leaf.logical(identity, plain);
+            let leaf = leaf.finish();
+            let (first, last) = leaf.endpoints().unwrap();
             assert_eq!(
                 catalog.copy(first, last).as_deref(),
                 Some(expected),
