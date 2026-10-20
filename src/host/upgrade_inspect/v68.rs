@@ -294,7 +294,9 @@ impl Client {
 
     pub(super) fn list(&mut self) -> Result<Vec<Session>, String> {
         match self.request(Request::ListChats, Some(self.proof.clone()))? {
-            Response::Listed(sessions) if sessions.len() <= 128 => Ok(sessions),
+            Response::Listed(sessions) if sessions.len() <= crate::upgrade::handoff::MAX_CHATS => {
+                Ok(sessions)
+            }
             _ => Err("Source chat inventory is unsupported or exceeds the inspection limit".into()),
         }
     }

@@ -285,7 +285,7 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
         && env::var_os(UI_LAUNCH_RECOVERY_PROGRESS_ENV).as_deref() == Some("1".as_ref())
         && !REPORTED.swap(true, Ordering::AcqRel)
     {
-        if saved_chats > 1152 {
+        if saved_chats > crate::upgrade::handoff::MAX_SESSIONS {
             return Err(io::Error::other(
                 "saved conversation inventory exceeds the recovery limit",
             ));

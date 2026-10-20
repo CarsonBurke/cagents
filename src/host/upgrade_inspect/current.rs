@@ -139,7 +139,11 @@ impl Client {
 
     pub(super) fn list(&mut self) -> Result<Vec<Session>, String> {
         match self.request(ClientRequest::ChatList, true)? {
-            ServerResponse::ChatListed { sessions } if sessions.len() <= 128 => Ok(sessions),
+            ServerResponse::ChatListed { sessions }
+                if sessions.len() <= crate::upgrade::handoff::MAX_CHATS =>
+            {
+                Ok(sessions)
+            }
             _ => Err("Source chat inventory is unsupported or exceeds the inspection limit".into()),
         }
     }
@@ -624,6 +628,50 @@ mod tests {
         }
         assert!(read_response(&mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice()).is_err());
         assert!(read_response(&mut [0, 0].as_slice()).is_err());
+    }
+
+    #[test]
+    fn source_inventory_accepts_129_and_capacity_ceiling_but_refuses_excess() {
+        for count in [
+            129,
+            crate::upgrade::handoff::MAX_CHATS,
+            crate::upgrade::handoff::MAX_CHATS + 1,
+        ] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let source = populated_inventory().0;
+            let worker = std::thread::spawn(move || {
+                let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+                assert!(matches!(request.request, ClientRequest::ChatList));
+                ipc::write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: ipc::PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatListed {
+                                sessions: vec![source; count],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = Client {
+                stream,
+                proof: proof(),
+                next: 1,
+                protocol: ipc::PROTOCOL_VERSION,
+                deadline: Instant::now() + Duration::from_secs(10),
+            };
+            let result = client.list();
+            worker.join().unwrap();
+            if count <= crate::upgrade::handoff::MAX_CHATS {
+                assert_eq!(result.unwrap().len(), count);
+            } else {
+                assert!(result.unwrap_err().contains("inspection limit"));
+            }
+        }
     }
 
     #[test]

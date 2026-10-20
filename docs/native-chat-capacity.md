@@ -24,6 +24,18 @@ capacity file causes daemon startup to report an error rather than silently
 change the limit. If the atomic replacement succeeds but directory syncing fails,
 the new limit takes effect and the CLI reports a durability warning.
 
+Cooperative upgrades and retained recovery inventories use the same 4096-chat
+ceiling for stored inventory. Recovery still obeys the destination admission
+preference when it creates resident handles; set that preference high enough
+for the inventory being restored. The checkpoint and each recovery evidence
+file still have an 8 MiB limit; source inspection retains its
+4 MiB response limit and 30-second deadline. Large launch environments or long
+recovery lineages can exceed these byte budgets before reaching the count limit.
+An oversized checkpoint refuses the upgrade before stopping source owners; an
+oversized recovery report preserves existing evidence and the replay checkpoint.
+Reduce the inventory or launch environment and retry. This count bound does not
+qualify 4096-provider performance or a multi-pane native upgrade.
+
 ## Repair a capacity file that prevents startup
 
 `chat capacity set` needs a running daemon. If this setting prevents startup,

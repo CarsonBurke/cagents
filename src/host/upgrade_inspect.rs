@@ -132,7 +132,7 @@ fn inspect(request: Request) -> Result<(), String> {
                 .into_iter()
                 .map(|(card, kind)| (path.clone(), card, kind)),
         );
-        if saved.len() > 4096 {
+        if saved.len() > handoff::MAX_SESSIONS {
             return Err("Saved pane inventory exceeds the migration inspection limit".into());
         }
     }
@@ -151,7 +151,7 @@ fn inspect(request: Request) -> Result<(), String> {
     let mut reader = connect(&request, deadline)?;
     let inventory = reader.list()?;
     let terminals = reader.terminals()?;
-    if inventory.len() > 128 || terminals.len() > 1024 {
+    if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
         return Err("Source inventory exceeds the qualified migration limit; reduce the inventory before updating. Source windows remain usable".into());
     }
     let proof = request

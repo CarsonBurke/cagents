@@ -504,9 +504,38 @@ pub(crate) mod handoff {
     const VERSION: u16 = 4;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
-    const MAX_TERMINALS: usize = 1024;
-    const MAX_CHATS: usize = 128;
+    pub(crate) const MAX_TERMINALS: usize = 1024;
+    pub(crate) const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
+    pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
+
+    /// Enforce the durable limit while serializing, before allocating a full
+    /// report. Launch environments and recovery lineages are client supplied.
+    #[cfg(any(feature = "host", test))]
+    fn encode_bounded(value: &impl Serialize, overflow: &'static str) -> Result<Vec<u8>, String> {
+        struct Bounded {
+            bytes: Vec<u8>,
+            overflow: &'static str,
+        }
+        impl Write for Bounded {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() as u64 > MAX_BYTES - self.bytes.len() as u64 {
+                    return Err(io::Error::other(self.overflow));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Bounded {
+            bytes: Vec::new(),
+            overflow,
+        };
+        serde_json::to_writer(&mut output, value).map_err(|error| error.to_string())?;
+        Ok(output.bytes)
+    }
 
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1198,23 +1227,6 @@ pub(crate) mod handoff {
         #[cfg(any(feature = "host", test))]
         pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
             checkpoint.validate()?;
-            // Serialization is bounded independently of the number of records:
-            // launch environments and paths are supplied by clients.
-            struct Bounded(Vec<u8>);
-            impl Write for Bounded {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    if bytes.len() as u64 > MAX_BYTES - self.0.len() as u64 {
-                        return Err(io::Error::other(
-                            "Upgrade checkpoint exceeds durable byte limit",
-                        ));
-                    }
-                    self.0.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
             #[derive(Serialize)]
             struct Versioned<'a> {
                 version: u16,
@@ -1225,9 +1237,11 @@ pub(crate) mod handoff {
                 version: checkpoint.format(),
                 checkpoint,
             };
-            let mut bytes = Bounded(Vec::new());
-            serde_json::to_writer(&mut bytes, &versioned).map_err(|error| error.to_string())?;
-            self.write_named(FILE, &bytes.0)
+            let bytes = encode_bounded(
+                &versioned,
+                "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
+            )?;
+            self.write_named(FILE, &bytes)
         }
 
         /// Atomically and durably replaces `name` with `bytes`.
@@ -1359,15 +1373,13 @@ pub(crate) mod handoff {
             if previous.len() > MAX_CHATS {
                 return Err("Unconfirmed pane recovery evidence reached its capacity; existing evidence was preserved".into());
             }
-            let bytes = serde_json::to_vec(&UnattachedReport {
-                version: 1,
-                conversations: previous,
-            })
-            .map_err(|error| error.to_string())?;
-            if bytes.len() as u64 > MAX_BYTES {
-                return Err("Unconfirmed pane recovery evidence exceeds its byte limit; existing evidence was preserved".into());
-            }
-            Ok(bytes)
+            encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: previous,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )
         }
 
         #[cfg(feature = "host")]
@@ -1422,11 +1434,13 @@ pub(crate) mod handoff {
                     .map_err(|error| error.to_string())?;
                 return fs_safety::sync_directory(&self.root).map_err(|error| error.to_string());
             }
-            let bytes = serde_json::to_vec(&UnattachedReport {
-                version: 1,
-                conversations: entries,
-            })
-            .map_err(|error| error.to_string())?;
+            let bytes = encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: entries,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )?;
             self.write_named(RECOVERED_FILE, &bytes)
         }
 
@@ -1463,9 +1477,9 @@ pub(crate) mod handoff {
 
         /// Adds conversations to the unattached record, replacing any earlier
         /// entry for the same conversation, and forgets `resolved` ones, in one
-        /// durable replacement. The record stays within its count and byte
-        /// bounds: the entries recorded longest ago give way first, because an
-        /// oversized record must never make a restore fail.
+        /// durable replacement. Entries beyond the supported inventory give
+        /// way oldest first. Byte overflow refuses the replacement, preserving
+        /// existing evidence and the replay checkpoint rather than losing entries.
         #[cfg(any(feature = "host", test))]
         pub fn record_unattached(
             &self,
@@ -1529,34 +1543,26 @@ pub(crate) mod handoff {
             self.write_unattached(conversations)
         }
 
-        /// Durably replaces the record, or removes it when empty, evicting the
-        /// oldest entries while it exceeds the durable byte limit.
+        /// Durably replaces the record, or removes it when empty. Refuse byte
+        /// overflow so even a large supported inventory retains every entry.
         #[cfg(any(feature = "host", test))]
-        fn write_unattached(&self, mut conversations: Vec<UnattachedChat>) -> Result<(), String> {
-            loop {
-                if conversations.is_empty() {
-                    return match fs_safety::unlink_within(&self.root, OsStr::new(UNATTACHED_FILE)) {
-                        Err(error) if error.is_not_found() => Ok(()),
-                        result => result.map_err(|error| error.to_string()).and_then(|()| {
-                            fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
-                        }),
-                    };
-                }
-                let bytes = serde_json::to_vec(&UnattachedReport {
+        fn write_unattached(&self, conversations: Vec<UnattachedChat>) -> Result<(), String> {
+            if conversations.is_empty() {
+                return match fs_safety::unlink_within(&self.root, OsStr::new(UNATTACHED_FILE)) {
+                    Err(error) if error.is_not_found() => Ok(()),
+                    result => result.map_err(|error| error.to_string()).and_then(|()| {
+                        fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                    }),
+                };
+            }
+            let bytes = encode_bounded(
+                &UnattachedReport {
                     version: UNATTACHED_VERSION,
                     conversations: &conversations,
-                })
-                .map_err(|error| error.to_string())?;
-                if bytes.len() as u64 <= MAX_BYTES {
-                    return self.write_named(UNATTACHED_FILE, &bytes);
-                }
-                let evicted = conversations.remove(0);
-                tracing::warn!(session = %evicted.summary.id,
-                    conversation = ?evicted.summary.conversation,
-                    working_directory = %evicted.summary.working_directory.display(),
-                    reason = %evicted.summary.reason,
-                    "unattached-conversation evidence exceeded its byte limit; forgot the oldest entry");
-            }
+                },
+                "Unattached conversation evidence exceeds the 8 MiB byte limit; existing evidence and the upgrade checkpoint were preserved",
+            )?;
+            self.write_named(UNATTACHED_FILE, &bytes)
         }
 
         pub fn archive(&self) -> Result<PathBuf, String> {
@@ -1611,6 +1617,24 @@ pub(crate) mod handoff {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         #[test]
+        fn evidence_encoding_stops_before_serializing_the_tail_of_an_oversized_report() {
+            struct Oversized;
+            impl Serialize for Oversized {
+                fn serialize<S: serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut sequence = serializer.serialize_seq(Some(2))?;
+                    sequence.serialize_element(&"x".repeat(MAX_BYTES as usize))?;
+                    panic!("the tail of an oversized report must never be visited");
+                }
+            }
+            let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
+            assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
+
+        #[test]
         fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path()).unwrap();
@@ -1651,6 +1675,19 @@ pub(crate) mod handoff {
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());
+            for chats in [129, MAX_CHATS] {
+                save(
+                    &serde_json::to_vec(&serde_json::json!({
+                        "version": VERSION, "terminals": [],
+                        "chats": vec![serde_json::Value::Null; chats],
+                    }))
+                    .unwrap(),
+                );
+                assert_eq!(
+                    store.startup_timeout().unwrap(),
+                    std::time::Duration::from_secs(5 + 30 * chats as u64)
+                );
+            }
             for (terminals, chats) in [(MAX_TERMINALS + 1, 0), (0, MAX_CHATS + 1)] {
                 save(
                     &serde_json::to_vec(&serde_json::json!({
@@ -2206,6 +2243,108 @@ mod tests {
     }
 
     #[test]
+    fn native_upgrade_capacity_round_trips_supported_inventory_without_evidence_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        checkpoint.terminals.clear();
+        let maximum = crate::native_chat_capacity::MAX_LIMIT as usize;
+        for _ in 0..maximum {
+            let thread = uuid::Uuid::new_v4().to_string();
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: vec!["--resume".into(), thread.clone()],
+                        working_directory: directory.path().into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(thread),
+                },
+                proof: Some(checkpoint.proof.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            checkpoint.chats.push(handoff::Chat {
+                launch: source.launch.clone(),
+                source,
+                previous_sources: Vec::new(),
+            });
+        }
+        for count in [129, maximum] {
+            let mut inventory = checkpoint.clone();
+            inventory.chats.truncate(count);
+            store.save(&inventory).unwrap();
+            let loaded = store.load().unwrap().unwrap();
+            assert_eq!(loaded.chats.len(), count);
+            assert_eq!(loaded.chats[0].source, inventory.chats[0].source);
+            assert_eq!(
+                loaded.chats[count - 1].source,
+                inventory.chats[count - 1].source
+            );
+            let recovered = inventory
+                .chats
+                .iter()
+                .map(|chat| handoff::RecoveredChat {
+                    evidence: chat.clone(),
+                    replacement: chat.source.clone(),
+                    aliases: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            store.record_recovered(&recovered).unwrap();
+            let unattached = inventory
+                .chats
+                .iter()
+                .map(|chat| handoff::UnattachedChat::new(chat.clone(), "holder unavailable".into()))
+                .collect::<Vec<_>>();
+            store.record_unattached(&unattached, &[]).unwrap();
+            assert_eq!(store.unattached().unwrap().len(), count);
+            assert_eq!(
+                store.unattached().unwrap()[0].id,
+                inventory.chats[0].source.id
+            );
+        }
+        let before = fs::read(&store.path).unwrap();
+        let mut overflow = checkpoint.clone();
+        overflow.chats.push(checkpoint.chats[0].clone());
+        assert!(
+            store
+                .save(&overflow)
+                .unwrap_err()
+                .contains("session limits")
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        // Byte overflow must refuse even a count-supported checkpoint atomically.
+        checkpoint.chats[0]
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("PAYLOAD".into(), "x".repeat(8 * 1024 * 1024));
+        checkpoint.chats[0].launch = checkpoint.chats[0].source.launch.clone();
+        assert!(store.save(&checkpoint).unwrap_err().contains("8 MiB"));
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        let recovered_file = directory.path().join("daemon-upgrade.recovered.json");
+        let previous = fs::read(&recovered_file).unwrap();
+        let oversized = handoff::RecoveredChat {
+            evidence: checkpoint.chats[0].clone(),
+            replacement: checkpoint.chats[0].source.clone(),
+            aliases: Vec::new(),
+        };
+        assert!(
+            store
+                .record_recovered(&[oversized])
+                .unwrap_err()
+                .contains("8 MiB")
+        );
+        assert_eq!(fs::read(&recovered_file).unwrap(), previous);
+    }
+
+    #[test]
     fn retained_native_checkpoint_requires_a_holder_aware_reader() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -2476,12 +2615,15 @@ mod tests {
         store.retire_unattached(second.summary.id).unwrap();
         assert_eq!(store.unattached().unwrap(), vec![again.summary.clone()]);
         // The record stays bounded, giving way oldest first.
-        let many = (0..130)
+        let many = (0..crate::native_chat_capacity::MAX_LIMIT + 2)
             .map(|_| unattached("unavailable"))
             .collect::<Vec<_>>();
         store.record_unattached(&many, &[]).unwrap();
         let listed = store.unattached().unwrap();
-        assert_eq!(listed.len(), 128);
+        assert_eq!(
+            listed.len(),
+            crate::native_chat_capacity::MAX_LIMIT as usize
+        );
         assert_eq!(listed[0], many[2].summary);
         // Resolution and new refusals land in one replacement.
         let resolved = many[2..]
@@ -2497,7 +2639,7 @@ mod tests {
             !store.unattached_path().exists(),
             "nothing left needs attention"
         );
-        // An oversized record gives way oldest first rather than failing.
+        // Byte overflow preserves all prior evidence and refuses the replacement.
         let bulky = |reason: &str| {
             let mut entry = unattached(reason);
             entry.evidence.launch.recipe.environment =
@@ -2505,16 +2647,17 @@ mod tests {
             entry
         };
         let (old, newer, newest) = (bulky("old"), bulky("newer"), bulky("newest"));
-        store.record_unattached(&[old, newer.clone()], &[]).unwrap();
         store
-            .record_unattached(std::slice::from_ref(&newest), &[])
+            .record_unattached(&[old.clone(), newer.clone()], &[])
             .unwrap();
-        assert_eq!(
-            store.unattached().unwrap(),
-            vec![newer.summary.clone(), newest.summary.clone()]
-        );
+        let before = fs::read(store.unattached_path()).unwrap();
+        let error = store
+            .record_unattached(std::slice::from_ref(&newest), &[])
+            .unwrap_err();
+        assert!(error.contains("8 MiB"), "{error}");
+        assert_eq!(fs::read(store.unattached_path()).unwrap(), before);
         store
-            .record_unattached(&[], &[newer.summary.id, newest.summary.id])
+            .record_unattached(&[], &[newer.summary.id, old.summary.id])
             .unwrap();
         assert!(!store.unattached_path().exists());
         // Unreadable evidence is an error, never an empty report.

@@ -2664,11 +2664,11 @@ fn parse_ui_recovery_progress(response: &[u8]) -> io::Result<Option<u64>> {
     let Some(count) = response.strip_prefix(UI_LAUNCH_RECOVERY_PROGRESS_PREFIX) else {
         return Ok(None);
     };
-    // Match the handoff's maximum 1024 terminals plus 128 native sessions.
+    // Use the same inventory bound as the durable handoff.
     let count = count
         .parse::<u64>()
         .ok()
-        .filter(|count| *count <= 1152)
+        .filter(|count| *count <= crate::upgrade::handoff::MAX_SESSIONS as u64)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -5852,11 +5852,11 @@ mod tests {
     #[test]
     fn ui_launch_recovery_inventory_is_bounded_and_announced_once() {
         assert_eq!(
-            parse_ui_recovery_progress(b"recovering: 1152").unwrap(),
-            Some(1152)
+            parse_ui_recovery_progress(b"recovering: 5120").unwrap(),
+            Some(5120)
         );
         assert_eq!(parse_ui_recovery_progress(b"ready").unwrap(), None);
-        for invalid in ["recovering: 1153", "recovering: -1", "recovering: unknown"] {
+        for invalid in ["recovering: 5121", "recovering: -1", "recovering: unknown"] {
             assert_eq!(
                 parse_ui_recovery_progress(invalid.as_bytes())
                     .unwrap_err()
