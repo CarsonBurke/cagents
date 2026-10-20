@@ -720,8 +720,11 @@ fn prime_plain(items: &[markdown::Item], cancelled: &AtomicBool) -> Result<(), S
             markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
                 text.plain_prefixes();
             }
-            markdown::Item::Image { alt, .. } => {
+            markdown::Item::Image {
+                alt, title_text, ..
+            } => {
                 alt.plain_prefixes();
+                title_text.plain_prefixes();
             }
             markdown::Item::Quote(items) => prime_plain(items, cancelled)?,
             markdown::Item::List { bullets, .. } => {
@@ -1548,6 +1551,110 @@ mod tests {
         assert_eq!(thread, barrier);
         assert_ne!(thread, std::thread::current().id());
         drop(state);
+    }
+
+    #[test]
+    fn large_image_alt_and_literal_title_use_flow_and_keep_exact_child_selection_sources() {
+        use iced::advanced::{
+            layout,
+            widget::{Tree, tree},
+        };
+        let alt = format!(
+            "{}**strong**{}",
+            "ALT λ é office ".repeat(1800),
+            " suffix".repeat(200)
+        );
+        let expected_alt = alt.replace("**", "");
+        let title = "TITLE *literal* λ é ".repeat(1800);
+        let source = item(&format!(
+            "![{alt}](https://example.test/private.png \"{title}\")"
+        ));
+        let mut state = configured(target(), &source);
+        state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        let [
+            markdown::Item::Image {
+                alt, title_text, ..
+            },
+        ] = output.parsed.markdown.items()
+        else {
+            panic!("actual parsed image");
+        };
+        assert!(alt.plain_ready() && title_text.plain_ready());
+        assert_eq!(alt.plain().as_ref(), expected_alt);
+        assert_eq!(title_text.plain().as_ref(), title);
+        let mut cached = CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Auto);
+        output.install(&mut cached, false, false);
+        let before = markdown::materialized_bytes();
+        let mut element = prose::view(
+            &cached,
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            target(),
+            None,
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 900.0)),
+        );
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "image views never style/materialize their full long alt or title on the UI thread"
+        );
+        fn collect(tree: &Tree, result: &mut Vec<(u64, Option<bool>)>) {
+            if tree.tag == tree::Tag::of::<selectable_prose::State>() {
+                let state = tree.state.downcast_ref::<selectable_prose::State>();
+                result.push((
+                    state.logical.as_ref().unwrap().identity,
+                    state.flow_readiness(),
+                ));
+            }
+            for child in &tree.children {
+                collect(child, result);
+            }
+        }
+        let mut leaves = Vec::new();
+        collect(&tree, &mut leaves);
+        assert_eq!(leaves.len(), 2);
+        let alt_id = selection::logical_identity(&source.id, &[0, 0, 0]);
+        let title_id = selection::logical_identity(&source.id, &[0, 0, 1]);
+        assert_eq!(
+            leaves,
+            vec![(alt_id, Some(false)), (title_id, Some(false))],
+            "both actual native image leaves await the worker, with original child0/1 identities"
+        );
+        let mut catalog = selection::Catalog::builder();
+        catalog.markdown(&source.id, &[0], cached.markdown.items());
+        let catalog = catalog.finish();
+        for (identity, expected) in [(alt_id, expected_alt.as_str()), (title_id, title.as_str())] {
+            let first = selection::Endpoint { identity, byte: 0 };
+            let last = selection::Endpoint {
+                identity,
+                byte: expected.len(),
+            };
+            assert_eq!(catalog.text(identity).unwrap().as_ref(), expected);
+            assert_eq!(
+                catalog.copy(first, last).as_deref(),
+                Some(expected),
+                "full original image selection source survives virtual worker preparation"
+            );
+        }
+        drop(element);
+        drop(tree);
+        drop(cached);
+        drop(state);
+        retirement_barrier();
     }
 
     #[test]

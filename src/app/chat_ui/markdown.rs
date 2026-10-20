@@ -508,6 +508,8 @@ pub enum Item {
         url: Uri,
         /// The title of the image.
         title: String,
+        /// Literal title text prepared alongside the image, never parsed as Markdown.
+        title_text: Text,
         /// The alternative text of the image.
         alt: Text,
     },
@@ -548,9 +550,15 @@ impl Clone for Item {
                 start: *start,
                 bullets: bullets.clone(),
             },
-            Self::Image { url, title, alt } => Self::Image {
+            Self::Image {
+                url,
+                title,
+                title_text,
+                alt,
+            } => Self::Image {
                 url: url.clone(),
                 title: title.clone(),
+                title_text: title_text.clone(),
                 alt: alt.clone(),
             },
             Self::Quote(items) => Self::Quote(items.clone()),
@@ -1312,7 +1320,20 @@ fn parse_with<'a>(
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
 
-                RefCell::borrow_mut(&inline_items).push(Item::Image { url, title, alt });
+                let title_text = Text::new(vec![Span::Standard {
+                    text: title.clone(),
+                    strikethrough: false,
+                    link: None,
+                    strong: false,
+                    emphasis: false,
+                    code: false,
+                }]);
+                RefCell::borrow_mut(&inline_items).push(Item::Image {
+                    url,
+                    title,
+                    title_text,
+                    alt,
+                });
                 None
             }
             pulldown_cmark::TagEnd::CodeBlock if !metadata => {
@@ -1535,9 +1556,9 @@ mod tests {
                             }
                             out.push("/table".into());
                         }
-                        $module::Item::Image { url, title, alt } => {
-                            out.push(format!("image {url} {title} {}", ($plain)(alt)))
-                        }
+                        $module::Item::Image {
+                            url, title, alt, ..
+                        } => out.push(format!("image {url} {title} {}", ($plain)(alt))),
                         $module::Item::Rule => out.push("rule".into()),
                     }
                 }

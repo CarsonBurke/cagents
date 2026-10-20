@@ -668,27 +668,41 @@ impl Renderer {
             }
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
-            Item::Image { url, title, alt } => {
+            Item::Image {
+                url,
+                title,
+                title_text,
+                alt,
+            } => {
                 let mut rows = Vec::new();
-                let alt = alt.spans(settings.style);
-                if !alt.is_empty() {
-                    rows.push(leaf_text(
+                let image_settings = markdown::Settings {
+                    style: markdown::Style {
+                        font: iced::Font::default(),
+                        ..settings.style
+                    },
+                    ..settings
+                };
+                if alt.len() > 0 {
+                    rows.push(paragraph(
+                        image_settings,
                         alt,
-                        settings.text_size,
-                        iced::Font::default(),
                         self.target,
                         self.find.as_deref(),
-                        Some(self.child(0).logical(Arc::from(""), 0)),
+                        Some(self.child(0).logical_identity(0)),
+                        Some(&self.flow_cache),
                     ));
                 }
                 if !title.is_empty() {
-                    rows.push(leaf_text(
-                        vec![Span::new(title.clone())].into(),
-                        design::TEXT_CAPTION.into(),
-                        iced::Font::default(),
+                    rows.push(paragraph(
+                        markdown::Settings {
+                            text_size: design::TEXT_CAPTION.into(),
+                            ..image_settings
+                        },
+                        title_text,
                         self.target,
                         self.find.as_deref(),
-                        Some(self.child(1).logical(Arc::from(""), 0)),
+                        Some(self.child(1).logical_identity(0)),
+                        Some(&self.flow_cache),
                     ));
                 }
                 rows.push(

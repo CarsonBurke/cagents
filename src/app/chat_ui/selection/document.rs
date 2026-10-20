@@ -250,7 +250,12 @@ impl Builder {
                     }
                     self.exit();
                 }
-                markdown::Item::Image { title, alt, .. } => {
+                markdown::Item::Image {
+                    title,
+                    title_text,
+                    alt,
+                    ..
+                } => {
                     let mut part = key.clone();
                     part.push(0);
                     if !alt.plain().is_empty() {
@@ -259,7 +264,7 @@ impl Builder {
                     if !title.is_empty() {
                         part.pop();
                         part.push(1);
-                        self.plain(item, &part, Arc::from(title.as_str()));
+                        self.indexed(item, &part, title_text.plain(), title_text.plain_prefixes());
                     }
                 }
                 markdown::Item::Rule => {}
