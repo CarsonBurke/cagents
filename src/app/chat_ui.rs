@@ -20415,6 +20415,13 @@ mod tests {
         )));
         assert!(!app.chat_start_pending(card));
         assert_eq!(chat_runtime(&app, card).session, source);
+        // The assertions inspect the presented body. Hidden panes deliberately
+        // defer snapshot presentation even after their connection is admitted.
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let draft = "Keep this unsent thought\n  with λ and spacing".to_owned();
         write(&mut app, card, &draft);
         let (allocation, cursor, selection) = {
@@ -20606,6 +20613,10 @@ mod tests {
         assert!(witness.validate());
         assert_eq!(witness.source(), &f.source);
         assert_eq!(witness.replacement(), &f.canonical);
+        assert_eq!(
+            f.app.workspace.visibility(f.card),
+            Some(VisibilityClass::Visible)
+        );
         let checkpoint = f.app.update(Message::ChatUi(Action::Ready(
             admitted,
             Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
@@ -20659,6 +20670,20 @@ mod tests {
     fn retained_live_model_upgrade_supersedes_inflight_ordinary_reconnect_without_replaying_draft()
     {
         exercise_live_shared_recovery(true);
+    }
+
+    fn assert_no_live_upgrade_checkpoint(task: Task<Message>) {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else { return };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(action) = stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        assert!(!matches!(message, Message::ChatUi(Action::UpgradeCommitted(..) | Action::AccountCommitted(..) | Action::Ready(..) | Action::Retired(..))), "refused or stale Ready cannot checkpoint, activate or retire an actor");
+                    }
+                }
+            }).await.expect("ancillary UI tasks must settle without an upgrade checkpoint");
+        });
     }
 
     fn live_shared_recovery_handle(f: &LiveSharedRecovery) -> Arc<ClientHandle> {
@@ -20792,12 +20817,12 @@ mod tests {
                 Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
             )));
             if case == "unproved" {
-                assert!(cosmic::iced::runtime::task::into_stream(checkpoint).is_none());
+                assert_no_live_upgrade_checkpoint(checkpoint);
                 assert_live_recovery_content(&f);
                 assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
                 assert!(!chat_runtime(&f.app, f.card).connected());
             } else if case == "newer canonical before Ready" {
-                assert!(cosmic::iced::runtime::task::into_stream(checkpoint).is_none());
+                assert_no_live_upgrade_checkpoint(checkpoint);
                 assert_inert_live_recovery_copy(&f);
             } else {
                 let receipt = account_commit_reply(checkpoint);
