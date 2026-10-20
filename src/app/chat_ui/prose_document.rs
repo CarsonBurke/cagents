@@ -13,8 +13,9 @@ pub(super) struct Data {
     disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
 }
 impl Data {
-    /// Called by admitted parser workers for transcript publications and all
-    /// rich coordination parts, before their output reaches the UI.
+    /// Full transcript publications and rich coordination parts snapshot on
+    /// admitted parser workers. The bounded inline cache path also uses this
+    /// storage constructor; admission and input bounds belong to its caller.
     pub(super) fn snapshot(content: &markdown::Content) -> Self {
         Self::items(content.items().to_vec())
     }
@@ -68,6 +69,12 @@ pub(super) enum Node<'a> {
 impl Document {
     pub(super) fn new(data: Data) -> Self {
         Self(Rc::new(Owner(Some(data))))
+    }
+    /// Snapshot CachedItem::extend's bounded inline cache input, including
+    /// empty loading placeholders, once per cache change. Row factories never
+    /// call this; full worker publications transfer Data through Self::new.
+    pub(super) fn snapshot(content: &markdown::Content) -> Self {
+        Self::new(Data::snapshot(content))
     }
     #[cfg(test)]
     pub(super) fn from_items(items: &[markdown::Item]) -> Self {
