@@ -10,7 +10,6 @@ use crate::{
 };
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
-const TEST: &str = "host::chat::retained_actor_tests::slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation";
 const MODE: &str = "CAGENTS_CLAUDE_HOLDER_TEST";
 
 pub(super) fn retained_helper_executable() -> std::path::PathBuf {
@@ -27,8 +26,35 @@ pub(super) fn retained_helper_executable() -> std::path::PathBuf {
 
 #[test]
 fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
+    retained_turn_final_action("close");
+}
+
+#[test]
+fn retained_terminal_handoff_proves_original_console_cleanup() {
+    retained_turn_final_action("handoff");
+}
+
+#[test]
+fn retained_checked_terminal_close_proves_original_console_cleanup() {
+    retained_turn_final_action("checked");
+}
+
+#[test]
+fn retained_completed_terminal_release_proves_original_console_cleanup() {
+    retained_turn_final_action("release");
+}
+
+fn retained_turn_final_action(action: &str) {
     let _helper_executable = retained_helper_executable();
     if std::env::var(MODE).as_deref() != Ok("fixture") {
+        let name = match action {
+            "close" => "slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation",
+            "handoff" => "retained_terminal_handoff_proves_original_console_cleanup",
+            "checked" => "retained_checked_terminal_close_proves_original_console_cleanup",
+            "release" => "retained_completed_terminal_release_proves_original_console_cleanup",
+            _ => unreachable!(),
+        };
+        let test = format!("host::chat::retained_actor_tests::{name}");
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = directory.path();
         for path in [
@@ -43,7 +69,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
             fs::create_dir_all(root.join(path)).unwrap();
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
+            .args(["--exact", &test, "--nocapture"])
             .env_clear()
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
@@ -545,12 +571,132 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         committed, 1,
         "the retained attention must commit once before helper ACK"
     );
-    super::super::agent_execution::process(
-        &successor,
-        Authority::default(),
-        crate::agent_execution::Operation::Close(accepted.agent.id),
-    )
-    .unwrap();
+    let mut expected_retirement = successor.lock().unwrap().chats[&id].session.clone();
+    expected_retirement.launch.session_id = handle.confirmed_session_id();
+    let proof = successor.lock().unwrap().proof().clone();
+    if action == "close" {
+        super::super::agent_execution::process(
+            &successor,
+            Authority::default(),
+            crate::agent_execution::Operation::Close(accepted.agent.id),
+        )
+        .unwrap();
+    } else if action == "handoff" {
+        process_inner(
+            &successor,
+            0,
+            ClientRequest::ChatAttach {
+                session: expected_retirement.clone(),
+            },
+        )
+        .unwrap();
+        let other_transition = {
+            let mut state = successor.lock().unwrap();
+            capacity::Reservation::closing(&successor, &mut state, &expected_retirement).unwrap()
+        };
+        assert!(
+            process_inner(
+                &successor,
+                0,
+                ClientRequest::ChatReturnTerminal { chat_id: id }
+            )
+            .is_err(),
+            "a second handoff cannot stop an actor or spawn a writer through another transition's reservation"
+        );
+        assert!(identity.record.root.is_current() && pair.root.is_current());
+        assert!(!handle.is_completed());
+        assert_eq!(successor.lock().unwrap().terminals.len(), 1);
+        drop(other_transition);
+        let ServerResponse::ChatTerminal {
+            session, snapshot, ..
+        } = process_inner(
+            &successor,
+            0,
+            ClientRequest::ChatReturnTerminal { chat_id: id },
+        )
+        .unwrap()
+        else {
+            panic!("expected exact terminal handoff");
+        };
+        assert_eq!(snapshot.session_id, expected_retirement.launch.session_id);
+        assert_eq!(
+            session.launch,
+            expected_retirement
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .unwrap()
+        );
+        assert_ne!(session.id, id);
+        {
+            let state = successor.lock().unwrap();
+            assert!(!state.chats.contains_key(&id));
+            assert!(
+                !state.terminals.contains_key(&id),
+                "handoff must remove the exact original console"
+            );
+            assert!(state.terminals.contains_key(&session.id));
+        }
+        let ServerResponse::ChatTerminal {
+            session: repeated, ..
+        } = process_inner(
+            &successor,
+            0,
+            ClientRequest::ChatReturnTerminal { chat_id: id },
+        )
+        .unwrap()
+        else {
+            panic!("expected idempotent handoff receipt");
+        };
+        assert_eq!(repeated, session);
+        assert_eq!(successor.lock().unwrap().terminals.len(), 1);
+        let replacement = successor.lock().unwrap().terminals[&session.id]
+            .handle
+            .clone();
+        replacement.close_with_receipt(&session, &proof).unwrap();
+        successor.lock().unwrap().retire_terminal(session.id);
+        process_inner(
+            &successor,
+            0,
+            ClientRequest::ChatCommitTerminal {
+                terminal_id: session.id,
+            },
+        )
+        .unwrap();
+    } else {
+        super::super::client::process_request(
+            &successor,
+            0,
+            ClientRequest::Attach {
+                terminal_id: id,
+                after_generation: 0,
+                after_event_sequence: 0,
+            },
+        )
+        .unwrap();
+        let request = if action == "checked" {
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: id,
+                allow_active: true,
+            }
+        } else {
+            let worker = successor.lock().unwrap().terminals[&id].handle.clone();
+            assert_eq!(
+                worker.close_checked(true),
+                crate::terminal_ipc::TerminalCloseResult::Closed
+            );
+            let session = successor.lock().unwrap().descriptor(0, id).unwrap().session;
+            ClientRequest::ReleaseCompletedTerminal {
+                session,
+                allow_active: true,
+            }
+        };
+        let (response, _, _) =
+            super::super::client::process_request(&successor, 0, request).unwrap();
+        assert!(matches!(response, ServerResponse::TerminalCloseChecked {
+            terminal_id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+        } if terminal_id == id));
+        assert!(!successor.lock().unwrap().chats.contains_key(&id));
+    }
     wait_until_with_diagnostic(
         || {
             !identity.record.holder.is_current()
@@ -569,6 +715,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         .expect("owning Close must durably retire the exact actor");
     assert_eq!(retirement.owner(), &identity.record);
     let canonical = retirement.source().clone();
+    assert_eq!(canonical, expected_retirement);
     assert!(canonical.terminal.is_some());
     let confirmed = retirement.confirmed_session().unwrap().to_owned();
     assert_eq!(
@@ -1999,7 +2146,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
 /// No prompt is written in this fixture: an initialized actor still lacks a
 /// provider-confirmed thread while its exact ownership proof rotates.
 #[test]
-fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
+fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provider_result() {
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNNAMED_ACTOR_PERSISTENCE_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -2161,12 +2308,15 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     let replacement = successor.lock().unwrap().chats[&id].session.clone();
     assert!(replacement.launch.session_id.is_none());
     assert_ne!(source.proof, replacement.proof);
-    // The UI-only real client socket contract is tested separately. This
-    // writer receipt is backed by authenticated execed-helper adoption above.
+    // Authenticated helper adoption is not a UI writer witness. The separate
+    // real client/socket contract must confirm Attach and snapshot before its
+    // writer can commit this retained transition.
     assert!(chat::is_upgrade_recovery(&source, &replacement));
-    storage
-        .rebind_chat_upgrade(pane, &source, &replacement)
-        .unwrap();
+    assert!(
+        storage
+            .rebind_chat_upgrade(pane, &source, &replacement)
+            .is_err()
+    );
     drop(storage);
     let reopened = crate::persistence::StateStore::open(
         &storage_path,
@@ -2175,7 +2325,7 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     .unwrap();
     assert_eq!(
         reopened.load_card(pane, None).unwrap().unwrap().kind,
-        crate::model::CardKind::Chat(replacement.clone())
+        crate::model::CardKind::Chat(source.clone())
     );
     assert!(
         !root.join("prompts").exists(),

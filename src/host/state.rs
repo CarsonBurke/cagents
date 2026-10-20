@@ -5513,9 +5513,9 @@ for line in sys.stdin:
         assert_ne!(restored.proof, source.proof);
         let mut hidden = source.clone();
         hidden.launch.session_id = None;
-        assert_eq!(
-            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
-            restored
+        assert!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).is_err(),
+            "a known issued source cannot manufacture an unissued pre-ID alias"
         );
         let mut changed = source.clone();
         changed.launch.recipe.arguments = vec!["--resume".into(), B.into()];

@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+#[cfg(target_os = "linux")]
+mod retained_automation;
 
 use super::*;
 use crate::{
