@@ -3701,13 +3701,16 @@ pub(super) fn close_terminal_actor(
     super::agent_execution::retired(host, &owners.target.source).map_err(unavailable)?;
     let removed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let paired = owners.remove_pair(&mut state, &closing)?;
+        owners.require_locked(&state, &closing)?;
+        // Explicit terminal close retains its completed descriptor for history
+        // and the caller's exact-worker attention fence. A successful native
+        // handoff removes the old pair when it publishes its replacement.
         let record = state
             .chats
             .remove(&terminal_id)
             .expect("validated exact attachment");
         state.inventory_generation += 1;
-        (record, paired)
+        record
     };
     drop(removed);
     super::state::retire_recovered_upgrade_chat(host, terminal_id);
