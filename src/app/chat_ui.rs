@@ -262,6 +262,7 @@ pub enum Action {
     ImageFit,
     ImageExternal,
     CopyLiteral(String),
+    CopySharedCode(Target, Arc<str>),
     Latest(Target),
     /// Takes a waiting message back into the composer to be revised: the one
     /// named, or the newest that can be taken back.
@@ -9374,6 +9375,17 @@ impl Cagents {
                         Message::ExternalLinkOpened(open_system_url(url).await)
                     });
                 }
+            }
+            Action::CopySharedCode(target, text) => {
+                if self.chat_runtime_mut(target).is_none()
+                    || self
+                        .card_state(target.card)
+                        .is_none_or(|state| !state.existence.is_open())
+                {
+                    return Task::none();
+                }
+                self.status = Some(TransientNotice::success("Copied code block"));
+                return text_copy::write_shared_literal(text);
             }
             Action::CopyLiteral(text) => {
                 text_copy::invalidate();
@@ -20893,6 +20905,31 @@ mod tests {
         )));
         assert_chat_copy_task_writes(task, &body);
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+    }
+
+    #[test]
+    fn shared_code_copy_keeps_exact_bytes_typed_target_and_clipboard_intent_until_effect() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let raw: Arc<str> = "  literal *code* λ é\r\ntrailing\n".repeat(3000).into();
+        let task = app.handle_chat_ui(Action::CopySharedCode(target, raw.clone()));
+        assert_chat_copy_task_writes(task, &raw);
+        let stale = Target {
+            generation: target.generation.wrapping_add(1),
+            ..target
+        };
+        assert_chat_copy_task_has_no_effects(
+            app.handle_chat_ui(Action::CopySharedCode(stale, raw.clone())),
+            "a stale retained block target cannot copy into another UI generation",
+        );
+        let task = app.handle_chat_ui(Action::CopySharedCode(target, raw));
+        drop(app.handle_chat_ui(Action::CopyLiteral("newer selection".into())));
+        assert_chat_copy_task_has_no_clipboard_write(
+            task,
+            "newer clipboard intent wins before the deferred shared-source write",
+        );
     }
 
     #[test]

@@ -930,7 +930,7 @@ impl Renderer {
         &self,
         settings: markdown::Settings,
         language: Option<&str>,
-        code: &str,
+        code: &Arc<str>,
         source: &Arc<str>,
         reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
@@ -945,7 +945,7 @@ impl Renderer {
                 if code.len() > 2048 {
                     Arc::from([])
                 } else {
-                    vec![Span::new(code.to_owned())].into()
+                    vec![Span::new(code.as_ref().to_owned())].into()
                 }
             });
         let text = code_text(
@@ -989,7 +989,7 @@ impl Renderer {
                     .unwrap_or("Code")
                     .to_owned(),
             ),
-            Some(Action::CopyLiteral(code.to_owned())),
+            Some(Action::CopySharedCode(self.target, code.clone())),
         )
     }
 }
@@ -1723,6 +1723,90 @@ mod tests {
                 "source action must retain its card/generation and exact URI"
             );
         }
+    }
+
+    #[test]
+    fn fenced_copy_button_retains_the_original_raw_arc_instead_of_its_display_projection() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        use iced_accessibility::accesskit::Role;
+        let raw: Arc<str> = "  original λ é *literal*\r\ntrailing\n".repeat(3000).into();
+        let display: Arc<str> = "DISPLAY PROJECTION".into();
+        let target = Target {
+            card: CardId::new(),
+            generation: 71,
+        };
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: String::new(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let item = markdown::Item::CodeBlock {
+            language: None,
+            code: raw.clone(),
+            source: display.clone(),
+            lines: vec![],
+            reader_source: reader_source::Source::new(&display),
+        };
+        let mut element = items_for_test(&cached, &[item], target);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(640.0, 600.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let button = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| {
+                node.node().role() == Role::Button && node.node().label() == Some("Copy this block")
+            })
+            .expect("actual fenced source Copy button");
+        let bounds = button.node().bounds().unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        let (actual_target, actual) = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::ChatUi(Action::CopySharedCode(target, text)) => Some((*target, text)),
+                _ => None,
+            })
+            .expect("button emits the shared raw source action");
+        assert_eq!(actual_target, target);
+        assert!(
+            Arc::ptr_eq(actual, &raw),
+            "view and button retain the exact immutable source allocation"
+        );
+        assert_ne!(actual.as_ref(), display.as_ref());
+        assert!(actual.ends_with("trailing\n"));
     }
 
     const THEMES: [crate::settings::EditorSyntaxTheme; 2] = [
