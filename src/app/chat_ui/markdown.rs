@@ -467,8 +467,16 @@ impl OpenFence {
     }
 }
 
+#[cfg(test)]
+thread_local! { static ITEM_CLONES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn cloned_items() -> usize {
+    ITEM_CLONES.with(Cell::get)
+}
+
 /// A Markdown item.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(not(test), derive(Clone))]
 pub enum Item {
     /// A heading.
     Heading(pulldown_cmark::HeadingLevel, Text),
@@ -514,6 +522,45 @@ pub enum Item {
         /// The rows of the table.
         rows: Vec<Row>,
     },
+}
+
+#[cfg(test)]
+impl Clone for Item {
+    fn clone(&self) -> Self {
+        ITEM_CLONES.with(|count| count.set(count.get() + 1));
+        match self {
+            Self::Heading(level, text) => Self::Heading(*level, text.clone()),
+            Self::Paragraph(text) => Self::Paragraph(text.clone()),
+            Self::CodeBlock {
+                language,
+                code,
+                source,
+                lines,
+                reader_source,
+            } => Self::CodeBlock {
+                language: language.clone(),
+                code: code.clone(),
+                source: source.clone(),
+                lines: lines.clone(),
+                reader_source: reader_source.clone(),
+            },
+            Self::List { start, bullets } => Self::List {
+                start: *start,
+                bullets: bullets.clone(),
+            },
+            Self::Image { url, title, alt } => Self::Image {
+                url: url.clone(),
+                title: title.clone(),
+                alt: alt.clone(),
+            },
+            Self::Quote(items) => Self::Quote(items.clone()),
+            Self::Rule => Self::Rule,
+            Self::Table { columns, rows } => Self::Table {
+                columns: columns.clone(),
+                rows: rows.clone(),
+            },
+        }
+    }
 }
 
 /// The column of a table.

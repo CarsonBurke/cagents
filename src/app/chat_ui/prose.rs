@@ -301,6 +301,8 @@ pub(super) fn view(
         return widget::text::caption("Loading message…").into();
     }
     Renderer {
+        document: cached.document.clone().expect("prepared prose document"),
+        root_path: 1,
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
@@ -333,6 +335,13 @@ pub(super) fn content_view(
     find: Option<&str>,
 ) -> Element<'static, Message> {
     Renderer {
+        document: cached
+            .coordination
+            .as_ref()
+            .and_then(|value| value.document(content))
+            .expect("prepared coordinated document")
+            .clone(),
+        root_path: 2,
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
@@ -372,6 +381,8 @@ pub(super) fn items_for_test(
     target: Target,
 ) -> Element<'static, Message> {
     Renderer {
+        document: prose_document::Document::from_items(items),
+        root_path: 1,
         target,
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
@@ -398,6 +409,8 @@ pub(super) fn items_for_test(
 
 #[derive(Clone)]
 struct Renderer {
+    document: prose_document::Document,
+    root_path: usize,
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
@@ -485,6 +498,8 @@ impl Renderer {
         let mut path = self.path.clone();
         path.push(index);
         Self {
+            document: self.document.clone(),
+            root_path: self.root_path,
             flow_cache: self.flow_cache.clone(),
             item: self.item.clone(),
             path,
@@ -496,6 +511,23 @@ impl Renderer {
             revision: self.revision,
             dark: self.dark,
         }
+    }
+    fn node(&self) -> prose_document::Node<'_> {
+        self.document
+            .node(&self.path[self.root_path..])
+            .expect("immutable renderer path")
+    }
+    fn item_at(&self, index: usize, settings: markdown::Settings) -> Element<'static, Message> {
+        let prose_document::Node::Item(item) = self.node() else {
+            unreachable!("item path")
+        };
+        self.item(item, index, settings)
+    }
+    fn items_at(&self, settings: markdown::Settings) -> Element<'static, Message> {
+        let prose_document::Node::Items(items) = self.node() else {
+            unreachable!("items path")
+        };
+        self.items(items, settings)
     }
     fn logical(&self, _text: Arc<str>, start: usize) -> selectable_prose::Logical {
         self.logical_identity(start)
@@ -569,12 +601,10 @@ impl Renderer {
                 } else {
                     vec![]
                 };
-                let item = item.clone();
                 let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
                     let renderer = renderer.clone();
-                    let item = item.clone();
                     retained::kept(revision, move || {
-                        widget::container(renderer.item(&item, index, settings))
+                        widget::container(renderer.item_at(index, settings))
                             .padding(iced::Padding::ZERO.top(if index == 0 {
                                 0.0
                             } else {
@@ -697,11 +727,10 @@ impl Renderer {
             .iter()
             .enumerate()
             .map(|(index, bullet)| {
-                let renderer = self.clone();
+                let renderer = self.child(index as u32);
                 let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
                     bullet;
-                let descendants = self.child(index as u32).logical_descendants(items);
-                let bullet = bullet.clone();
+                let descendants = renderer.logical_descendants(items);
                 let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
                 let mut descriptor = virtualized::Row::new(
                     key,
@@ -709,7 +738,10 @@ impl Renderer {
                     64.0 + settings.spacing.0 * 0.75,
                     None,
                     move || {
-                        let (marker, items): (Element<'static, Message>, _) = match (&bullet, start)
+                        let prose_document::Node::Bullet(bullet) = renderer.node() else {
+                            unreachable!("bullet path")
+                        };
+                        let (marker, items): (Element<'static, Message>, _) = match (bullet, start)
                         {
                             (markdown::Bullet::Point { items }, Some(start))
                             | (markdown::Bullet::Task { items, .. }, Some(start)) => (
@@ -743,14 +775,14 @@ impl Renderer {
                             || "-".to_owned(),
                             |start| format!("{}.", index as u64 + start),
                         );
-                        if let markdown::Bullet::Task { done, .. } = &bullet {
+                        if let markdown::Bullet::Task { done, .. } = bullet {
                             prefix.push_str(if *done { " [x]" } else { " [ ]" });
                         }
                         widget::container(
                             iced::widget::row![
                                 marker,
                                 selection::wrap(
-                                    renderer.child(index as u32).items(items, nested),
+                                    renderer.items(items, nested),
                                     selection::Kind::ListItem(prefix)
                                 )
                             ]
@@ -786,21 +818,19 @@ impl Renderer {
         // shaping every hidden cell to discover its natural width.
         let width = 240.0;
         let alignments: Arc<[_]> = columns.iter().map(alignment).collect::<Vec<_>>().into();
-        let header = columns
-            .iter()
-            .map(|column| column.header.clone())
-            .collect::<Vec<_>>();
-        let descriptors = std::iter::once(header)
-            .chain(rows.iter().map(|row| row.cells.clone()))
-            .enumerate()
-            .map(|(row, cells)| {
+        let descriptors = (0..=rows.len())
+            .map(|row| {
                 let renderer = self.child(row as u32);
                 let key = selection::logical_identity(&self.item, &renderer.path);
-                let descendants = cells
+                let descendants = columns
                     .iter()
                     .enumerate()
-                    .flat_map(|(column, cells)| {
-                        renderer.child(column as u32).logical_descendants(cells)
+                    .flat_map(|(column, _)| {
+                        let cell = renderer.child(column as u32);
+                        let prose_document::Node::Items(items) = cell.node() else {
+                            unreachable!("cell path")
+                        };
+                        cell.logical_descendants(items)
                     })
                     .collect();
                 let alignments = alignments.clone();
@@ -818,10 +848,10 @@ impl Renderer {
                                 let key =
                                     selection::logical_identity(&renderer.item, &renderer.path);
                                 let alignment = *alignment;
-                                let cells = cells.get(column).cloned().unwrap_or_default();
-                                let mut descendants = renderer.logical_descendants(&cells);
-                                // Horizontal estimates can realize a far-away cell
-                                // before an exact glyph exists in the mounted tree.
+                                let prose_document::Node::Items(items) = renderer.node() else {
+                                    unreachable!("cell path")
+                                };
+                                let mut descendants = renderer.logical_descendants(items);
                                 for logical in &mut descendants {
                                     logical.chunk = true;
                                 }
@@ -831,9 +861,8 @@ impl Renderer {
                                     width,
                                     None,
                                     move || {
-                                        let content = renderer.items(&cells, settings);
                                         widget::container(selection::wrap(
-                                            content,
+                                            renderer.items_at(settings),
                                             selection::Kind::Cell { row, column },
                                         ))
                                         .width(width)

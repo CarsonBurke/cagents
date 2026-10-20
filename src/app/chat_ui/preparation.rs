@@ -32,6 +32,7 @@ pub(super) struct Parsed {
 const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
+    send::<prose_document::Data>();
     send::<prose::CodeBlock>();
     send::<tool_text::PreparedSources>();
 };
@@ -503,6 +504,7 @@ impl State {
 pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
+    document: prose_document::Data,
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
     reader_verifications: HashMap<u64, (reader_source::Proof, reader_source::Proof)>,
@@ -526,6 +528,7 @@ impl Prepared {
     pub(super) fn discard(self) {
         retire(Retired {
             _parsed: self.parsed,
+            _document: Some(self.document),
             _blocks: self.blocks,
             _palettes: Some(self.palettes),
             _item: Some(self.request.item),
@@ -557,7 +560,9 @@ impl Prepared {
         }
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
+        cached.document = Some(prose_document::Document::new(self.document));
         let retired = Retired {
+            _document: None,
             _parsed: Parsed {
                 source: std::mem::replace(&mut cached.source, self.parsed.source),
                 markdown: std::mem::replace(&mut cached.markdown, self.parsed.markdown),
@@ -584,6 +589,7 @@ impl Prepared {
 /// Reader Rc state and renderer trees never leave the event thread.
 struct Retired {
     _parsed: Parsed,
+    _document: Option<prose_document::Data>,
     _blocks: HashMap<u64, prose::CodeBlock>,
     _palettes: Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
@@ -602,6 +608,7 @@ pub(super) struct Presentation {
 }
 
 enum Retirement {
+    Document(prose_document::Data),
     Geometry(Box<flow_layout::Geometry>, Option<flow_layout::WorkSlot>),
     Presentation(Presentation),
     Installed(Retired),
@@ -611,6 +618,9 @@ enum Retirement {
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
     #[cfg(test)]
     Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+}
+pub(super) fn retire_document(document: prose_document::Data) {
+    enqueue_retirement(Retirement::Document(document));
 }
 pub(super) fn retire_geometry(
     geometry: Box<flow_layout::Geometry>,
@@ -650,6 +660,7 @@ fn enqueue_retirement(retired: Retirement) {
                 pending.pop_front().expect("queued retirement")
             };
             match retired {
+                Retirement::Document(document) => drop(document),
                 Retirement::Geometry(geometry, admission) => { drop(geometry); drop(admission); }
                 Retirement::Presentation(presentation) => drop(presentation),
                 Retirement::Installed(retired) => drop(retired),
@@ -908,9 +919,11 @@ fn execute(
     let prepared_tools = CachedItem::prose(&request.item.content)
         .is_none()
         .then(|| Arc::new(tool_text::PreparedSources::new(&request.item.content)));
+    let document = prose_document::Data::snapshot(&parsed.markdown);
     Ok(Prepared {
         request,
         parsed,
+        document,
         blocks,
         palettes,
         reader_verifications,
@@ -1361,6 +1374,180 @@ mod tests {
             .expect("actual Content disposal");
         assert_eq!(disposed, retirement_barrier());
         assert_ne!(disposed, std::thread::current().id());
+    }
+
+    #[test]
+    fn retained_composite_factories_keep_one_real_worker_graph_until_last_ui_owner_drops() {
+        use iced::advanced::{layout, widget::Tree};
+        let body = (0..120).map(|index| format!(
+            "> Quote {index} λ\n>\n> - nested **list**\n> - second item\n\n- outer {index}\n  - inner cell\n\n| header | second |\n| --- | --- |\n| row {index} | Unicode é |\n\n"
+        )).collect::<String>();
+        for cache_first in [true, false] {
+            let source = item(&body);
+            let mut state = configured(target(), &source);
+            state.stage(
+                &source,
+                false,
+                crate::settings::EditorSyntaxTheme::Auto,
+                |_, _| false,
+            );
+            let (_, shared) = job(&state);
+            let mut output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            assert_ne!(output.document.created_on, std::thread::current().id());
+            let roots = output.parsed.markdown.items().len();
+            assert!(roots > 4);
+            assert!(
+                output
+                    .parsed
+                    .markdown
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, markdown::Item::Quote(_)))
+            );
+            assert!(
+                output
+                    .parsed
+                    .markdown
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, markdown::Item::List { .. }))
+            );
+            assert!(
+                output
+                    .parsed
+                    .markdown
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, markdown::Item::Table { .. }))
+            );
+            let (sent, disposed) = std::sync::mpsc::channel();
+            output.document.watch_disposal(sent);
+            let mut cached =
+                CachedItem::preparing(&source, crate::settings::EditorSyntaxTheme::Auto);
+            output.install(&mut cached, false, false);
+            let document = cached.document.as_ref().unwrap();
+            let mut leaves = Vec::new();
+            fn plain(items: &[markdown::Item], leaves: &mut Vec<String>) {
+                for item in items {
+                    match item {
+                        markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
+                            leaves.push(text.plain().to_string())
+                        }
+                        markdown::Item::Quote(items) => plain(items, leaves),
+                        markdown::Item::List { bullets, .. } => {
+                            for bullet in bullets {
+                                let (markdown::Bullet::Point { items }
+                                | markdown::Bullet::Task { items, .. }) = bullet;
+                                plain(items, leaves);
+                            }
+                        }
+                        markdown::Item::Table { columns, rows } => {
+                            for column in columns {
+                                plain(&column.header, leaves);
+                            }
+                            for row in rows {
+                                for cell in &row.cells {
+                                    plain(cell, leaves);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            plain(cached.markdown.items(), &mut leaves);
+            let mut shared_leaves = Vec::new();
+            plain(document.items(), &mut shared_leaves);
+            assert_eq!(
+                shared_leaves, leaves,
+                "the immutable graph preserves every rendered source in parser order"
+            );
+            let clones = markdown::cloned_items();
+            let mut element = prose::view(
+                &cached,
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                target(),
+                None,
+            );
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(&element);
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 900.0)),
+            );
+            assert_eq!(
+                markdown::cloned_items(),
+                clones,
+                "real AST Item::clone never runs while rebuilding/mounting composite UI factories"
+            );
+            drop(state);
+            retirement_barrier();
+            if cache_first {
+                drop(cached);
+                retirement_barrier();
+                assert!(
+                    disposed.try_recv().is_err(),
+                    "actual retained row factories still own the original graph"
+                );
+                let held = hold_retirement();
+                drop(element);
+                drop(tree);
+                assert!(
+                    disposed.try_recv().is_err(),
+                    "UI eviction transfers raw graph; it does not destruct it"
+                );
+                drop(held);
+            } else {
+                drop(element);
+                drop(tree);
+                retirement_barrier();
+                assert!(
+                    disposed.try_recv().is_err(),
+                    "the current cache still owns the graph after widget eviction"
+                );
+                drop(cached);
+            }
+            let (thread, actual_roots) = disposed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("actual composite graph disposal");
+            assert_eq!(actual_roots, roots);
+            assert_ne!(thread, std::thread::current().id());
+            assert_eq!(thread, retirement_barrier());
+        }
+    }
+
+    #[test]
+    fn rejected_composite_output_destroys_raw_graph_before_reclaimer_barrier_and_admission_release()
+    {
+        let source = item(&"> quote\n>\n> - nested list\n\n".repeat(200));
+        let mut state = configured(target(), &source);
+        state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let mut output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        let (sent, disposed) = std::sync::mpsc::channel();
+        output.document.watch_disposal(sent);
+        let held = hold_retirement();
+        output.discard();
+        assert!(disposed.try_recv().is_err());
+        drop(held);
+        let barrier = retirement_barrier();
+        let (thread, roots) = disposed.try_recv().expect(
+            "outer retirement disposes its actual raw AST before acknowledging the barrier",
+        );
+        assert!(roots > 0);
+        assert_eq!(thread, barrier);
+        assert_ne!(thread, std::thread::current().id());
+        drop(state);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub(super) struct Coordinated {
     brief: Option<markdown::Content>,
     /// Each message the step printed, or a started agent's result.
     answers: Vec<markdown::Content>,
+    documents: Vec<prose_document::Document>,
 }
 
 impl Coordinated {
@@ -59,11 +60,19 @@ impl Coordinated {
         {
             answers.push(markdown::Content::parse(&run.result));
         }
+        let documents = prompts
+            .iter()
+            .flatten()
+            .chain(&brief)
+            .chain(&answers)
+            .map(prose_document::Document::snapshot)
+            .collect();
         Self {
             reading,
             prompts,
             brief,
             answers,
+            documents,
         }
     }
 
@@ -74,6 +83,15 @@ impl Coordinated {
             .flatten()
             .chain(&self.brief)
             .chain(&self.answers)
+    }
+
+    pub(super) fn document(
+        &self,
+        content: &markdown::Content,
+    ) -> Option<&prose_document::Document> {
+        self.contents()
+            .position(|candidate| std::ptr::eq(candidate, content))
+            .and_then(|index| self.documents.get(index))
     }
 
     pub(super) fn is_card(&self) -> bool {

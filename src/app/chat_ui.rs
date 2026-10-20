@@ -34,6 +34,7 @@ mod pending_admission;
 mod permissions;
 mod preparation;
 mod prose;
+mod prose_document;
 mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
@@ -1044,6 +1045,7 @@ struct CachedItem {
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
+    document: Option<prose_document::Document>,
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
@@ -1339,6 +1341,7 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
+            document: None,
             flow_cache,
             reader_memory,
             reader_context,
@@ -1451,6 +1454,7 @@ impl CachedItem {
                 }
             }
         }
+        self.document = Some(prose_document::Document::snapshot(&self.markdown));
         self.highlight(theme);
         if !growing {
             self.suspend_continuations();
