@@ -66,6 +66,28 @@ pub struct Request {
     conversation_revision: u64,
 }
 
+impl Request {
+    fn snapshot_is_current(&self, snapshot: &Snapshot) -> bool {
+        match &self.source.scope {
+            // Paging and verified appends do not revoke the captured prefix.
+            chat::TextCopyScope::Conversation => {
+                snapshot.text_copy_sources.conversation_revision == self.conversation_revision
+            }
+            // Child authority belongs to its bounded resident items.
+            chat::TextCopyScope::Subagent { id } => snapshot
+                .text_copy_sources
+                .children
+                .get(id)
+                .is_some_and(|sources| {
+                    sources
+                        .iter()
+                        .flatten()
+                        .any(|source| compatible(&self.source, source))
+                }),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Request {
     pub(super) fn for_test(handle: Arc<ClientHandle>, source: chat::TextCopySource) -> Self {
@@ -111,19 +133,12 @@ impl Runtime {
             })
     }
     fn contains_copy_source(&self, captured: &chat::TextCopySource) -> bool {
-        self.snapshot_contains_copy_source(&self.snapshot, captured)
-    }
-    fn snapshot_contains_copy_source(
-        &self,
-        snapshot: &Snapshot,
-        captured: &chat::TextCopySource,
-    ) -> bool {
         let sources = match (&captured.scope, self.selected_subagent.as_deref()) {
             (chat::TextCopyScope::Conversation, None) => {
-                Some(&snapshot.text_copy_sources.conversation)
+                Some(&self.snapshot.text_copy_sources.conversation)
             }
             (chat::TextCopyScope::Subagent { id }, Some(selected)) if id == selected => {
-                snapshot.text_copy_sources.children.get(id)
+                self.snapshot.text_copy_sources.children.get(id)
             }
             _ => None,
         };
@@ -196,28 +211,23 @@ impl Cagents {
         };
         // A publication may have reached the client before the next UI refresh.
         let current_snapshot = handle.snapshot();
-        let source_is_current = match &request.source.scope {
-            // The resident window can move while canonical pages are read.
-            // Its constant-sized destructive-edit fence preserves refusal
-            // even if a reset/removal arrives after the final page reply.
-            chat::TextCopyScope::Conversation => {
-                runtime.selected_subagent.is_none()
-                    && current_snapshot.text_copy_sources.conversation_revision
-                        == request.conversation_revision
-            }
-            chat::TextCopyScope::Subagent { .. } => {
-                runtime.snapshot_contains_copy_source(&current_snapshot, &request.source)
-            }
+        let scope_is_current = match &request.source.scope {
+            chat::TextCopyScope::Conversation => runtime.selected_subagent.is_none(),
+            chat::TextCopyScope::Subagent { id } => runtime.selected_subagent.as_ref() == Some(id),
         };
-        if !source_is_current {
+        if !scope_is_current || !request.snapshot_is_current(&current_snapshot) {
             return Task::none();
         }
         match result {
             Ok(text) => {
                 let at = Instant::now();
                 runtime.copied = Some((id, at));
+                let context = request.context.clone();
+                let intent = request.intent;
                 Task::batch([
-                    clipboard_write(request.context, request.intent, text),
+                    clipboard_write(context, intent, text, move || {
+                        request.snapshot_is_current(&request.handle.snapshot())
+                    }),
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         Message::ChatUi(Action::ClearCopied(target, at))
@@ -233,11 +243,17 @@ impl Cagents {
 }
 
 /// Check again when the returned task is polled, not just when completion is
-/// handled: another copy may be requested while this effect is still pending.
-fn clipboard_write(context: ClipboardContext, intent: u64, text: String) -> Task<Message> {
+/// handled: clipboard intent or source authority may change while this effect
+/// is still pending. Keep both checks next to the emitted clipboard effect.
+fn clipboard_write(
+    context: ClipboardContext,
+    intent: u64,
+    text: String,
+    authority_is_current: impl Fn() -> bool + Send + 'static,
+) -> Task<Message> {
     let mut text = Some(text);
     iced::Task::done(()).then(move |_| {
-        if context.is_current(intent) {
+        if authority_is_current() && context.is_current(intent) {
             iced::clipboard::write(text.take().unwrap_or_default()).map(cosmic::Action::App)
         } else {
             Task::none()
@@ -293,6 +309,7 @@ mod tests {
             context.clone(),
             context.advance(),
             "old logical message".into(),
+            || true,
         );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.update(Message::Repository(RepositoryAction::Clipboard {
@@ -321,7 +338,9 @@ mod tests {
             invalidate();
             assert!(first.is_current(intent));
         }
-        let task = clipboard_write(first.clone(), intent, "first context source".into());
+        let task = clipboard_write(first.clone(), intent, "first context source".into(), || {
+            true
+        });
         let copied = std::thread::spawn(move || {
             // This thread has no injected context. The task must use its
             // captured first context rather than the process default.

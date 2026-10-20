@@ -19839,6 +19839,31 @@ mod tests {
         assert_eq!(copied, expected);
     }
 
+    fn assert_chat_copy_task_has_no_clipboard_write(task: Task<Message>, reason: &str) {
+        use iced::futures::StreamExt;
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => stream.collect::<Vec<_>>().await,
+                        None => Vec::new(),
+                    }
+                })
+                .await
+                .expect("deferred copy and its acknowledgement timer must settle")
+            });
+        assert!(
+            effects.iter().all(|effect| !matches!(
+                effect,
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write { .. })
+            )),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() {
         let _context = text_copy::isolated_context();
@@ -19992,6 +20017,137 @@ mod tests {
             )));
             assert_chat_copy_task_has_no_effects(task, change);
             assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        }
+    }
+
+    #[test]
+    fn logical_message_copy_deferred_write_refuses_destructive_publication_before_poll() {
+        let _context = text_copy::isolated_context();
+        for change in ["rewrite", "remove", "reset"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, request, body) = valid_message_copy_completion(&mut app);
+            // Finish while the source is valid, but retain its unpolled task.
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                "last-part".into(),
+                request,
+                Ok(body),
+            )));
+            let handle = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .handle()
+                .unwrap()
+                .clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.text_copy_sources.conversation_revision += 1;
+            if change == "rewrite" {
+                snapshot.text_copy_sources.conversation[0]
+                    .as_mut()
+                    .unwrap()
+                    .revision += 1;
+            } else {
+                snapshot.items.clear();
+                snapshot.text_copy_sources.conversation.clear();
+            }
+            if change == "reset" {
+                snapshot.session_id = None;
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            // The ordinary UI refresh has not consumed this publication.
+            assert_chat_copy_task_has_no_clipboard_write(task, change);
+        }
+    }
+
+    #[test]
+    fn logical_message_copy_deferred_write_preserves_paging_and_append_authority() {
+        let _context = text_copy::isolated_context();
+        for change in ["paging", "append"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, request, body) = valid_message_copy_completion(&mut app);
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                "last-part".into(),
+                request,
+                Ok(body.clone()),
+            )));
+            let handle = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .handle()
+                .unwrap()
+                .clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            if change == "paging" {
+                snapshot.items = vec![presentation_text("another-page", "another body")];
+                snapshot.text_copy_sources.conversation = vec![None];
+            } else {
+                snapshot.text_copy_sources.conversation[0]
+                    .as_mut()
+                    .unwrap()
+                    .bytes += 10;
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            assert_chat_copy_task_writes(task, &body);
+        }
+    }
+
+    #[test]
+    fn logical_message_copy_deferred_child_write_rechecks_resident_authority() {
+        let _context = text_copy::isolated_context();
+        for change in ["rewrite", "trim", "append"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, handle) = history_fixture(&mut app);
+            app.workspace.focus(card).unwrap();
+            let body = "complete child 🦀";
+            let source = chat::TextCopySource {
+                cache: uuid::Uuid::new_v4(),
+                scope: chat::TextCopyScope::Subagent { id: "child".into() },
+                token: 1,
+                revision: 1,
+                bytes: body.len() as u64,
+            };
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.subagents = vec![presentation_child(
+                "child",
+                presentation_text("child-message", body),
+            )];
+            snapshot
+                .text_copy_sources
+                .children
+                .insert("child".into(), vec![Some(source.clone())]);
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.selected_subagent = Some("child".into());
+            runtime.refresh();
+            let request = text_copy::Request::for_test(handle.clone(), source);
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                "child-message".into(),
+                request,
+                Ok(body.into()),
+            )));
+            let mut snapshot = (*handle.snapshot()).clone();
+            let sources = snapshot
+                .text_copy_sources
+                .children
+                .get_mut("child")
+                .unwrap();
+            match change {
+                "rewrite" => sources[0].as_mut().unwrap().cache = uuid::Uuid::new_v4(),
+                "trim" => sources.clear(),
+                _ => sources[0].as_mut().unwrap().bytes += 10,
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            if change == "append" {
+                assert_chat_copy_task_writes(task, body);
+            } else {
+                assert_chat_copy_task_has_no_clipboard_write(task, change);
+            }
         }
     }
 
