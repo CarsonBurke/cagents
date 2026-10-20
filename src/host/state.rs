@@ -5659,9 +5659,9 @@ for line in sys.stdin:
         let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(third.launch.session_id.as_deref(), Some(B));
         assert_ne!(third.proof, restored.proof);
-        assert_eq!(
-            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
-            third
+        assert!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).is_err(),
+            "another daemon generation cannot legitimize an unissued pre-ID alias"
         );
         assert_eq!(
             super::super::chat::resolve_upgrade(&replacement, &restored).unwrap(),
