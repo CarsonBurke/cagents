@@ -1228,6 +1228,11 @@ pub struct TextCopyPage {
 /// source identity outside Item avoids changing provider-owned item IDs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopySources {
+    /// Changes only when canonical parent text is rewritten, removed, or reset.
+    /// Paging and verified append preserve pending clipboard authority. An
+    /// unrelated destructive edit conservatively cancels a pending copy too.
+    #[serde(default)]
+    pub conversation_revision: u64,
     pub conversation: Vec<Option<TextCopySource>>,
     pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
 }

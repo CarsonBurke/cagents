@@ -49,7 +49,15 @@ impl Store {
         id: &str,
         bytes: Option<usize>,
         prefix: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        let invalidated = !prefix
+            && db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM copy_sources WHERE item=?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())?;
         match bytes {
             Some(bytes) => {
                 db.execute("INSERT INTO copy_sources(item,revision,bytes) VALUES(?1,1,?2) ON CONFLICT(item) DO UPDATE SET revision=revision+?3,bytes=excluded.bytes",params![id,bytes as i64,i64::from(!prefix)]).map_err(|error|error.to_string())?;
@@ -59,7 +67,7 @@ impl Store {
                     .map_err(|error| error.to_string())?;
             }
         }
-        Ok(())
+        Ok(invalidated)
     }
     pub(super) fn copy_parent_append(
         db: &Connection,
@@ -76,16 +84,23 @@ impl Store {
     }
     pub(super) fn copy_remove(&mut self, ids: &[String]) -> Result<(), String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let mut invalidated = false;
         for id in ids {
-            transaction
+            invalidated |= transaction
                 .execute("DELETE FROM copy_sources WHERE item=?1", [id])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                > 0;
         }
-        transaction.commit().map_err(|error| error.to_string())
+        transaction.commit().map_err(|error| error.to_string())?;
+        if invalidated {
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+        }
+        Ok(())
     }
     pub(crate) fn publish_copy_sources(&self, state: &mut crate::chat::Snapshot) {
         // Child descriptors belong to the existing bounded runtime items;
         // publishing parent pages must not replace that independent authority.
+        state.text_copy_sources.conversation_revision = self.copy_revision;
         state.text_copy_sources.conversation = self.copy_projection.clone();
     }
     pub(crate) fn text_copy(
@@ -290,12 +305,76 @@ mod tests {
     }
 
     #[test]
+    fn logical_copy_completion_fence_tracks_destructive_edits_but_not_paging_or_append() {
+        let mut store = Store::new().unwrap();
+        store.apply(Event::Item(item("answer", "first"))).unwrap();
+        let original = source(&mut store, "answer");
+        let mut snapshot = crate::chat::Snapshot::default();
+        store.publish_copy_sources(&mut snapshot);
+        let revision = snapshot.text_copy_sources.conversation_revision;
+        store
+            .apply(Event::Item(item("answer", "first suffix")))
+            .unwrap();
+        store
+            .apply(Event::Item(item("other", "other body")))
+            .unwrap();
+        for index in 0..WINDOW_ITEMS + 1 {
+            store
+                .apply(Event::Item(item(&format!("later-{index}"), "later body")))
+                .unwrap();
+        }
+        assert!(
+            store
+                .window()
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| item.id != "answer")
+        );
+        assert!(store.earlier().unwrap());
+        store.window().unwrap();
+        store.publish_copy_sources(&mut snapshot);
+        assert_eq!(snapshot.text_copy_sources.conversation_revision, revision);
+        assert_eq!(read(&store, &original).unwrap(), "first");
+        store
+            .apply(Event::Item(item("answer", "rewritten")))
+            .unwrap();
+        store.publish_copy_sources(&mut snapshot);
+        assert_eq!(
+            snapshot.text_copy_sources.conversation_revision,
+            revision + 1
+        );
+        // An unrelated removal also cancels pending completion conservatively.
+        store
+            .apply(Event::ItemsRemoved {
+                ids: vec!["other".into()],
+            })
+            .unwrap();
+        store.publish_copy_sources(&mut snapshot);
+        assert_eq!(
+            snapshot.text_copy_sources.conversation_revision,
+            revision + 2
+        );
+        store
+            .apply(Event::Reset {
+                reason: "reset".into(),
+            })
+            .unwrap();
+        store.publish_copy_sources(&mut snapshot);
+        assert_eq!(
+            snapshot.text_copy_sources.conversation_revision,
+            revision + 3
+        );
+    }
+
+    #[test]
     fn logical_copy_authority_commits_with_body_before_failing_file_index() {
         let mut store = Store::new().unwrap();
         store
             .apply(Event::Item(item("answer", "old text")))
             .unwrap();
         let old = source(&mut store, "answer");
+        let old_revision = store.copy_revision;
         store.db.execute("DROP TABLE file_edits", []).unwrap();
         assert!(
             store
@@ -306,6 +385,7 @@ mod tests {
             read(&store, &old).is_err(),
             "index failure cannot leave old authority over new bytes"
         );
+        assert_eq!(store.copy_revision, old_revision + 1);
         let new = store.copy_parent_source("answer").unwrap().unwrap();
         assert_eq!(read(&store, &new).unwrap(), "new text");
     }

@@ -63,11 +63,13 @@ pub struct Request {
     intent: u64,
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
+    conversation_revision: u64,
 }
 
 #[cfg(test)]
 impl Request {
     pub(super) fn for_test(handle: Arc<ClientHandle>, source: chat::TextCopySource) -> Self {
+        let conversation_revision = handle.snapshot().text_copy_sources.conversation_revision;
         let context = current_context();
         let intent = context.advance();
         Self {
@@ -75,6 +77,7 @@ impl Request {
             intent,
             handle,
             source,
+            conversation_revision,
         }
     }
 }
@@ -108,12 +111,19 @@ impl Runtime {
             })
     }
     fn contains_copy_source(&self, captured: &chat::TextCopySource) -> bool {
+        self.snapshot_contains_copy_source(&self.snapshot, captured)
+    }
+    fn snapshot_contains_copy_source(
+        &self,
+        snapshot: &Snapshot,
+        captured: &chat::TextCopySource,
+    ) -> bool {
         let sources = match (&captured.scope, self.selected_subagent.as_deref()) {
             (chat::TextCopyScope::Conversation, None) => {
-                Some(&self.snapshot.text_copy_sources.conversation)
+                Some(&snapshot.text_copy_sources.conversation)
             }
             (chat::TextCopyScope::Subagent { id }, Some(selected)) if id == selected => {
-                self.snapshot.text_copy_sources.children.get(id)
+                snapshot.text_copy_sources.children.get(id)
             }
             _ => None,
         };
@@ -152,6 +162,7 @@ impl Cagents {
             intent,
             handle: handle.clone(),
             source: source.clone(),
+            conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
@@ -177,11 +188,28 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        if !runtime
+        let Some(handle) = runtime
             .handle()
-            .is_some_and(|handle| Arc::ptr_eq(handle, &request.handle))
-            || !runtime.contains_copy_source(&request.source)
-        {
+            .filter(|handle| Arc::ptr_eq(handle, &request.handle))
+        else {
+            return Task::none();
+        };
+        // A publication may have reached the client before the next UI refresh.
+        let current_snapshot = handle.snapshot();
+        let source_is_current = match &request.source.scope {
+            // The resident window can move while canonical pages are read.
+            // Its constant-sized destructive-edit fence preserves refusal
+            // even if a reset/removal arrives after the final page reply.
+            chat::TextCopyScope::Conversation => {
+                runtime.selected_subagent.is_none()
+                    && current_snapshot.text_copy_sources.conversation_revision
+                        == request.conversation_revision
+            }
+            chat::TextCopyScope::Subagent { .. } => {
+                runtime.snapshot_contains_copy_source(&current_snapshot, &request.source)
+            }
+        };
+        if !source_is_current {
             return Task::none();
         }
         match result {

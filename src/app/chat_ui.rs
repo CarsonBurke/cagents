@@ -19813,6 +19813,32 @@ mod tests {
         assert!(effects.is_empty(), "{reason}");
     }
 
+    fn assert_chat_copy_task_writes(task: Task<Message>, expected: &str) {
+        use iced::futures::StreamExt;
+        let copied = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task)
+                    .expect("valid completion must produce clipboard work");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Clipboard(
+                            iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) = effect
+                        {
+                            return contents;
+                        }
+                    }
+                    panic!("valid completion must emit a real clipboard write");
+                })
+                .await
+                .expect("valid completion clipboard deadline")
+            });
+        assert_eq!(copied, expected);
+    }
+
     #[test]
     fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() {
         let _context = text_copy::isolated_context();
@@ -19877,7 +19903,6 @@ mod tests {
     fn valid_message_copy_completion(
         app: &mut Cagents,
     ) -> (CardId, Target, text_copy::Request, String) {
-        use iced::futures::StreamExt;
         let (card, target, handle) = history_fixture(app);
         app.workspace.focus(card).unwrap();
         let body = "x".repeat(300 * 1024);
@@ -19901,31 +19926,119 @@ mod tests {
             request.clone(),
             Ok(body.clone()),
         ));
-        let copied = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut effects = iced::runtime::task::into_stream(control)
-                    .expect("valid completion must produce clipboard work");
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    while let Some(effect) = effects.next().await {
-                        if let iced::runtime::Action::Clipboard(
-                            iced::runtime::clipboard::Action::Write { contents, .. },
-                        ) = effect
-                        {
-                            return contents;
-                        }
-                    }
-                    panic!("valid completion must emit a real clipboard write");
-                })
-                .await
-                .expect("valid completion clipboard deadline")
-            });
-        assert_eq!(copied, body);
+        assert_chat_copy_task_writes(control, &body);
         assert_eq!(app.workspace.focused(), Some(card));
         app.chat_runtime_mut(target).unwrap().copied = None;
         (card, target, request, body)
+    }
+
+    #[test]
+    fn logical_message_copy_completion_survives_parent_window_eviction() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (_, target, request, body) = valid_message_copy_completion(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![presentation_text("another-page", "another resident body")];
+        snapshot.text_copy_sources.conversation = vec![None];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        // The worker has verified canonical pages; the loaded presentation no
+        // longer contains the clicked part when its completion reaches App.
+        let task = app.update(Message::ChatUi(Action::MessageCopied(
+            target,
+            "last-part".into(),
+            request,
+            Ok(body.clone()),
+        )));
+        assert_chat_copy_task_writes(task, &body);
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+    }
+
+    #[test]
+    fn logical_message_copy_completion_refuses_destructive_changes_after_last_page() {
+        let _context = text_copy::isolated_context();
+        for change in ["rewrite", "remove", "reset"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, request, body) = valid_message_copy_completion(&mut app);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let handle = runtime.handle().unwrap().clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.text_copy_sources.conversation_revision += 1;
+            if change == "rewrite" {
+                snapshot.items = vec![presentation_text("last-part", "replacement")];
+                snapshot.text_copy_sources.conversation[0]
+                    .as_mut()
+                    .unwrap()
+                    .revision += 1;
+            } else {
+                snapshot.items.clear();
+                snapshot.text_copy_sources.conversation.clear();
+            }
+            if change == "reset" {
+                snapshot.session_id = None;
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            // Completion must consult the latest client publication even when
+            // the UI's ordinary refresh has not consumed it yet.
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                "last-part".into(),
+                request,
+                Ok(body),
+            )));
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        }
+    }
+
+    #[test]
+    fn logical_message_copy_completion_refuses_scope_handle_focus_and_failed_canonical_read() {
+        let _context = text_copy::isolated_context();
+        for change in ["scope", "handle", "focus", "canonical read"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, request, body) = valid_message_copy_completion(&mut app);
+            match change {
+                "scope" => {
+                    app.chat_runtime_mut(target).unwrap().selected_subagent =
+                        Some("other-child".into())
+                }
+                "handle" => {
+                    app.chat_runtime_mut(target).unwrap().connection = Connection::Connecting
+                }
+                "focus" => {
+                    let other = live_chat(&mut app, Some(KNOWN_THREAD));
+                    app.workspace.focus(other).unwrap();
+                }
+                _ => {}
+            }
+            let result = if change == "canonical read" {
+                Err("Message changed; copy its current text again".into())
+            } else {
+                Ok(body)
+            };
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                "last-part".into(),
+                request,
+                result,
+            )));
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+            if change == "canonical read" {
+                assert!(
+                    app.chat_runtime_mut(target)
+                        .unwrap()
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("Message changed")
+                );
+            }
+        }
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub(super) struct Window {
 pub(crate) struct Store {
     db: Connection,
     copy_cache: uuid::Uuid,
+    copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
     child_file_ordinal: i64,
@@ -239,6 +240,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             Ok(Self {
                 copy_cache: uuid::Uuid::new_v4(),
+                copy_revision: 0,
                 copy_projection: Default::default(),
                 file_revision: 0,
                 child_file_ordinal: 0,
@@ -469,13 +471,16 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
-        Self::copy_parent_put(
+        let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
             matches!(item.content, ItemContent::Text { .. }).then_some(len0 as usize),
             copy_prefix,
         )?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if copy_invalidated {
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -906,6 +911,7 @@ impl Store {
                     .execute("DELETE FROM copy_sources", [])
                     .map_err(|e| e.to_string())?;
                 self.copy_cache = uuid::Uuid::new_v4();
+                self.copy_revision = self.copy_revision.wrapping_add(1);
                 self.copy_projection.clear();
                 self.db
                     .execute("DELETE FROM items", [])
