@@ -12,6 +12,15 @@ pub(super) struct State {
     parent: Option<window::Id>,
     generation: Option<Uuid>,
     phase: Phase,
+    progress: Option<ProbeProgress>,
+}
+
+struct ProbeProgress {
+    started: Instant,
+    polls: u32,
+    probes_started: u32,
+    probes_completed: u32,
+    pending_reported: bool,
 }
 
 #[derive(Default)]
@@ -41,7 +50,43 @@ impl State {
             binding: None,
             probe_pending: None,
         };
+        self.progress = Some(ProbeProgress {
+            started: now,
+            polls: 0,
+            probes_started: 0,
+            probes_completed: 0,
+            pending_reported: false,
+        });
+        self.trace_check("started", now);
         Some(generation)
+    }
+
+    // Call only at transitions or settlement, never on every timer tick.
+    fn trace_check(&self, event: &'static str, now: Instant) {
+        let (
+            Some(generation),
+            Some(progress),
+            Phase::Checking {
+                binding,
+                probe_pending,
+                ..
+            },
+        ) = (self.generation, self.progress.as_ref(), &self.phase)
+        else {
+            return;
+        };
+        tracing::info!(
+            target: "cagents::browser_capability",
+            %generation,
+            phase = event,
+            elapsed_ms = now.saturating_duration_since(progress.started).as_millis() as u64,
+            polls = progress.polls,
+            probes_started = progress.probes_started,
+            probes_completed = progress.probes_completed,
+            binding_ready = binding.is_some(),
+            probe_pending = probe_pending.is_some(),
+            "browser capability progress"
+        );
     }
 
     fn checking(&self, generation: Uuid, parent: Option<window::Id>) -> bool {
@@ -58,6 +103,7 @@ impl State {
     }
 
     pub(super) fn retire(&mut self) {
+        self.trace_check("retired", Instant::now());
         // Clear protocol owners explicitly: window::run closures may still
         // retain a factory Arc after the application's actual parent closes.
         if let Phase::Checking {
@@ -71,6 +117,7 @@ impl State {
         self.phase = Phase::Idle;
         self.parent = None;
         self.generation = None;
+        self.progress = None;
     }
 }
 
@@ -91,6 +138,8 @@ impl Cagents {
             return Task::none();
         };
         let binding = window::run(parent_id, move |parent| {
+            tracing::info!(target: "cagents::browser_capability", %generation,
+                phase = "binding_callback", "browser capability progress");
             let result = (|| {
                 let display = parent
                     .display_handle()
@@ -102,6 +151,10 @@ impl Cagents {
                     .as_raw();
                 let parent_lifetime = Arc::new(ParentWindowLifetime::new(parent_id));
                 let lifetime_guard: Arc<dyn Any + Send + Sync> = parent_lifetime.clone();
+                let _probe_span = tracing::info_span!(
+                    target: "cagents::browser_capability", "browser_protocol_probe", %generation
+                )
+                .entered();
                 // SAFETY: Cagents retains this actual-parent token, joins
                 // every browser worker, then explicitly clears all protocol
                 // queues before the owner closes. This constructor creates
@@ -143,6 +196,8 @@ impl Cagents {
         if let Phase::Checking { deadline, .. } = &self.browser_backend.phase
             && Instant::now() >= *deadline
         {
+            self.browser_backend
+                .trace_check("binding_result_timeout", Instant::now());
             if let Ok(binding) = result {
                 self.discard_browser_binding(binding);
             }
@@ -153,6 +208,8 @@ impl Cagents {
                 if Some(binding.parent_lifetime.window_id) != self.core.main_window_id()
                     || !binding.parent_lifetime.active.load(Ordering::Acquire)
                 {
+                    self.browser_backend
+                        .trace_check("binding_parent_unavailable", Instant::now());
                     self.discard_browser_binding(binding);
                     return self.browser_factory_unavailable(BrowserUnavailable::ParentUnavailable);
                 }
@@ -161,11 +218,17 @@ impl Cagents {
                     if slot.is_none() {
                         self.browser_parent_lifetime = Some(binding.parent_lifetime.clone());
                         *slot = Some(binding);
+                        self.browser_backend
+                            .trace_check("binding_ready", Instant::now());
                     }
                 }
                 Task::none()
             }
-            Err(reason) => self.browser_factory_unavailable(reason),
+            Err(reason) => {
+                self.browser_backend
+                    .trace_check("binding_error", Instant::now());
+                self.browser_factory_unavailable(reason)
+            }
         }
     }
 
@@ -193,6 +256,9 @@ impl Cagents {
         {
             return Task::none();
         }
+        if let Some(progress) = &mut self.browser_backend.progress {
+            progress.polls = progress.polls.saturating_add(1);
+        }
         let Phase::Checking {
             deadline,
             binding,
@@ -202,6 +268,8 @@ impl Cagents {
             return Task::none();
         };
         if Instant::now() >= *deadline {
+            self.browser_backend
+                .trace_check("poll_timeout", Instant::now());
             return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         }
         let timer = probe_timer(generation);
@@ -213,7 +281,23 @@ impl Cagents {
         *probe_pending = Some(operation);
         let factory = binding.factory.clone();
         let lifetime = binding.parent_lifetime.clone();
+        let first_probe = self
+            .browser_backend
+            .progress
+            .as_mut()
+            .is_some_and(|progress| {
+                progress.probes_started = progress.probes_started.saturating_add(1);
+                progress.probes_started == 1
+            });
+        if first_probe {
+            self.browser_backend
+                .trace_check("first_probe_queued", Instant::now());
+        }
         let task = window::run(lifetime.window_id, move |parent| {
+            if first_probe {
+                tracing::info!(target: "cagents::browser_capability", %generation,
+                    phase = "first_probe_callback", "browser capability progress");
+            }
             let result = if !lifetime.active.load(Ordering::Acquire) {
                 CapabilityProbe::Unavailable(BrowserUnavailable::ParentUnavailable)
             } else {
@@ -253,23 +337,43 @@ impl Cagents {
         if let Phase::Checking { deadline, .. } = &self.browser_backend.phase
             && Instant::now() >= *deadline
         {
+            self.browser_backend
+                .trace_check("probe_result_timeout", Instant::now());
             return self.browser_factory_unavailable(BrowserUnavailable::TimedOut);
         }
-        let Phase::Checking {
-            binding,
-            probe_pending,
-            ..
-        } = &mut self.browser_backend.phase
-        else {
+        let Phase::Checking { probe_pending, .. } = &mut self.browser_backend.phase else {
             return Task::none();
         };
         if *probe_pending != Some(operation) {
             return Task::none();
         }
         *probe_pending = None;
+        if let Some(progress) = &mut self.browser_backend.progress {
+            progress.probes_completed = progress.probes_completed.saturating_add(1);
+        }
         match result {
-            CapabilityProbe::Pending => Task::none(),
+            CapabilityProbe::Pending => {
+                let first_pending =
+                    self.browser_backend
+                        .progress
+                        .as_mut()
+                        .is_some_and(|progress| {
+                            let first = !progress.pending_reported;
+                            progress.pending_reported = true;
+                            first
+                        });
+                if first_pending {
+                    self.browser_backend
+                        .trace_check("first_probe_pending", Instant::now());
+                }
+                Task::none()
+            }
             CapabilityProbe::Available => {
+                self.browser_backend
+                    .trace_check("probe_available", Instant::now());
+                let Phase::Checking { binding, .. } = &mut self.browser_backend.phase else {
+                    unreachable!()
+                };
                 let Some(binding) = binding.take() else {
                     return self.browser_factory_unavailable(BrowserUnavailable::ParentUnavailable);
                 };
@@ -278,7 +382,11 @@ impl Cagents {
                 self.register_deferred_browsers();
                 self.lifecycle_sweep()
             }
-            CapabilityProbe::Unavailable(reason) => self.browser_factory_unavailable(reason),
+            CapabilityProbe::Unavailable(reason) => {
+                self.browser_backend
+                    .trace_check("probe_unavailable", Instant::now());
+                self.browser_factory_unavailable(reason)
+            }
         }
     }
 
@@ -484,6 +592,14 @@ mod action_tests {
         );
         assert!(matches!(&app.browser_backend.phase,
             Phase::Checking { probe_pending: Some(current), .. } if *current == operation));
+        assert_eq!(
+            app.browser_backend
+                .progress
+                .as_ref()
+                .unwrap()
+                .probes_completed,
+            0
+        );
         let _ = app.browser_factory_probed(generation, operation, CapabilityProbe::Pending);
         assert!(matches!(
             &app.browser_backend.phase,
@@ -492,6 +608,15 @@ mod action_tests {
                 ..
             }
         ));
+        let progress = app.browser_backend.progress.as_ref().unwrap();
+        assert_eq!(progress.probes_completed, 1);
+        assert!(progress.pending_reported);
+        app.release_browser_parent();
+        assert!(app.browser_backend.progress.is_none());
+        app.browser_backend.begin(parent, Instant::now()).unwrap();
+        let progress = app.browser_backend.progress.as_ref().unwrap();
+        assert_eq!(progress.probes_completed, 0);
+        assert!(!progress.pending_reported);
     }
 
     #[test]
