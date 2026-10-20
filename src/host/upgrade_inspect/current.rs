@@ -1,4 +1,4 @@
-//! Read-only inspection of the stable 99/100/current inventory subset.
+//! Read-only inspection of the stable 99/100/101/current inventory subset.
 //! The frozen protocol-77 reader remains separate from this matched connection.
 use crate::{
     chat::Session,
@@ -169,10 +169,11 @@ impl Client {
 }
 
 // These versions have identical Connect/List/ChatList/ResolveUpgradeChat tags
-// and inventory DTOs. Version 100 appends capacity operations; Copy changes
-// Snapshot, which this deliberately restricted reader never accepts.
+// and inventory DTOs. Version 100 appends capacity operations; 101 requires
+// atomic managed-pane adoption without changing these DTOs. This restricted
+// reader never accepts Snapshot, whose layout may change independently.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    protocol == 99 || protocol == 100 || protocol == ipc::PROTOCOL_VERSION
+    [99, 100, 101, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
 
 fn read_response(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
@@ -321,6 +322,22 @@ impl Write for DeadlineStream<'_> {
 mod tests {
     use super::*;
 
+    fn source_protocols() -> std::collections::BTreeSet<u16> {
+        [99, 100, 101, ipc::PROTOCOL_VERSION].into()
+    }
+
+    fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
+        // The captured source frame starts with a four-byte length and the
+        // one-byte postcard version 100. Reframe only that version scalar;
+        // the historical inventory DTO bytes remain frozen.
+        assert_eq!(frame[4], 100);
+        let mut payload = postcard::to_allocvec(&protocol).unwrap();
+        payload.extend_from_slice(&frame[5..]);
+        let mut result = (payload.len() as u32).to_be_bytes().to_vec();
+        result.extend(payload);
+        result
+    }
+
     fn proof() -> HostSessionProof {
         HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("private-source"),
@@ -440,6 +457,13 @@ mod tests {
             bytes.as_slice(),
             include_bytes!("../../../tests/fixtures/upgrade-inspection-v100/connect.bin")
         );
+        for protocol in source_protocols() {
+            let mut request = connect.clone();
+            request.version = protocol;
+            let mut current = Vec::new();
+            ipc::write_frame(&mut current, &request).unwrap();
+            assert_eq!(current, source_frame_version(&bytes, protocol));
+        }
         for (name, response) in [
             (
                 "CONNECTED",
@@ -490,11 +514,20 @@ mod tests {
             };
             assert_eq!(bytes.as_slice(), frozen);
             assert_eq!(read_response(&mut &frozen[..]).unwrap(), envelope);
+            for protocol in source_protocols() {
+                let historical = source_frame_version(frozen, protocol);
+                let mut expected = envelope.clone();
+                expected.version = protocol;
+                let mut current = Vec::new();
+                ipc::write_frame(&mut current, &expected).unwrap();
+                assert_eq!(current, historical);
+                assert_eq!(read_response(&mut historical.as_slice()).unwrap(), expected);
+            }
         }
     }
 
     #[test]
-    fn frozen_inventory_subset_accepts_99_100_and_current_only() {
+    fn frozen_inventory_subset_accepts_99_100_101_and_current_only() {
         assert!(!supports_protocol(98));
         assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);
@@ -518,7 +551,8 @@ mod tests {
             .unwrap()[0],
             38
         );
-        for protocol in [99, 100, ipc::PROTOCOL_VERSION] {
+        for protocol in source_protocols() {
+            assert!(supports_protocol(protocol));
             // Frozen postcard envelope with request 7, proof s/b/i and an empty
             // ChatListed response. The only version-specific byte is first.
             let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
@@ -594,7 +628,7 @@ mod tests {
 
     #[test]
     fn compatible_source_request_uses_its_own_version() {
-        for protocol in [99, 100, ipc::PROTOCOL_VERSION] {
+        for protocol in source_protocols() {
             let (stream, mut peer) = UnixStream::pair().unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let worker = std::thread::spawn(move || {

@@ -155,7 +155,11 @@ use crate::{
 /// Version 98 combines notification context with account-default selection.
 /// Version 99 preserves version 98 and adds the version 96 terminal-title
 /// descriptor layout, requiring matched positional postcard peers.
-pub const PROTOCOL_VERSION: u16 = 100;
+/// Version 100 appends native chat capacity and guarded release controls.
+/// Version 101 requires atomic adoption of recovered native identities into
+/// managed panes and shared admission. The updater must replace older hosts
+/// even though the read-only inventory DTO layout remains unchanged.
+pub const PROTOCOL_VERSION: u16 = 101;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
