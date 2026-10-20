@@ -205,6 +205,159 @@ fn require_execution_owner(
 #[path = "retained_execution_owner_tests.rs"]
 mod execution_owner_tests;
 
+struct SemanticTarget {
+    handle: Handle,
+    source: Session,
+    identity: chat::runtime::ActorIdentity,
+    notifications: Option<super::super::notifications::Handle>,
+}
+
+impl SemanticTarget {
+    fn require_current(&self, host: &SharedHost) -> Result<(), String> {
+        let current = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .get(&self.source.id)
+            .is_some_and(|record| {
+                record.handle.same_attachment(&self.handle)
+                    && record.session == self.source
+                    && record.execution_instance == self.identity.instance
+            });
+        if current {
+            Ok(())
+        } else {
+            Err("Retained actor ownership changed before semantic acknowledgement".into())
+        }
+    }
+}
+
+/// An Answer's input receipt proves adapter acceptance, not a committed HOST
+/// run transition. Capture authority before sending it, then synchronize only
+/// through the helper's post-acknowledgement semantic watermark.
+pub(in crate::host) struct AnswerSync {
+    target: SemanticTarget,
+    registry: super::super::agent_execution::SharedRegistry,
+    owner: Option<ExecutionOwner>,
+}
+
+impl AnswerSync {
+    pub(in crate::host) fn capture(
+        host: &SharedHost,
+        handle: &Handle,
+    ) -> Result<Option<Self>, String> {
+        let Some(identity) = handle.actor_identity() else {
+            return Ok(None);
+        };
+        let target = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state
+                .chats
+                .get(&identity.record.terminal)
+                .filter(|record| {
+                    record.handle.same_attachment(handle)
+                        && record.execution_instance == identity.instance
+                })
+                .ok_or("The exact retained Answer attachment changed")?;
+            SemanticTarget {
+                handle: handle.clone(),
+                source: record.session.clone(),
+                identity,
+                notifications: state.notifications.clone(),
+            }
+        };
+        let registry = super::super::agent_execution::registry(host)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let registered = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownership(target.identity.instance)?;
+        let owner = ExecutionOwner::authenticate(
+            registered,
+            &target.identity,
+            &target.source,
+            target.handle.launch_account_scope(),
+            |sources| {
+                target
+                    .handle
+                    .recognize_retained_sources_until(sources, deadline)
+            },
+        )?;
+        let captured = Self {
+            target,
+            registry,
+            owner: Some(owner),
+        };
+        captured.require_current(host)?;
+        Ok(Some(captured))
+    }
+
+    fn require_current(&self, host: &SharedHost) -> Result<(), String> {
+        self.target.require_current(host)?;
+        require_execution_owner(
+            &self.registry.lock().unwrap_or_else(|p| p.into_inner()),
+            self.owner.as_ref(),
+            true,
+        )
+    }
+
+    fn require_committed_through(&self, through: u64) -> Result<(), String> {
+        let registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        require_execution_owner(&registry, self.owner.as_ref(), true)?;
+        let committed = registry.native_actor_committed_through(
+            self.target.identity.instance,
+            &self.target.identity.record,
+        )?;
+        if committed < through {
+            return Err(
+                "The helper Answer acknowledgement exceeds the exact durable HOST semantic cursor"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(in crate::host) fn complete(mut self, host: &SharedHost) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        self.require_current(host)?;
+        let (mut acknowledged, through) =
+            self.target.handle.retained_outcome_clock_until(deadline)?;
+        // The journal admits at most 4096 entries; a byte-limited page may
+        // contain just one. The deadline also bounds every RPC and receipt wait.
+        for _ in 0..=4096 {
+            self.require_current(host)?;
+            if acknowledged >= through {
+                return self.require_committed_through(through);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            let page = self.target.handle.uncommitted_outcomes_until(deadline)?;
+            for entry in page
+                .into_iter()
+                .take_while(|entry| entry.sequence <= through)
+            {
+                self.require_current(host)?;
+                commit_semantic_entry(
+                    host,
+                    &self.target,
+                    &self.registry,
+                    &mut self.owner,
+                    (entry.sequence, entry.update),
+                    false,
+                    deadline,
+                )?;
+            }
+            let (next, _) = self.target.handle.retained_outcome_clock_until(deadline)?;
+            if next <= acknowledged {
+                return Err("Retained Answer semantic watermark made no committed progress".into());
+            }
+            acknowledged = next;
+        }
+        Err("Retained Answer semantic watermark remains uncommitted".into())
+    }
+}
+
 fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let (handle, source, identity, notifications) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -269,89 +422,120 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     // cannot prove that a notification committed before a previous daemon died.
     let page = handle.uncommitted_outcomes()?;
     let more = !page.is_empty();
+    let target = SemanticTarget {
+        handle,
+        source,
+        identity,
+        notifications,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
     for entry in page {
-        let semantic = match entry.update {
-            Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
-            Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
-            Update::AttentionContext { evidence, content } => {
-                NativeActorEvent::AttentionContext { evidence, content }
-            }
-            _ => return Err("The retained semantic outbox contains an unsupported event".into()),
-        };
-        let execution = matches!(semantic, NativeActorEvent::Execution { .. });
-        let owner = capture_execution_owner(
+        commit_semantic_entry(
+            host,
+            &target,
             &registry,
-            &handle,
-            &identity,
-            &source,
-            execution,
             &mut execution_owner,
+            (entry.sequence, entry.update),
+            loss.is_some(),
+            deadline,
         )?;
-        let (changed, automation) = {
-            let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(&registry, owner, execution)?;
-            let changed = registry.commit_native_actor_event(
-                identity.instance,
-                &identity.record,
-                &source,
-                entry.sequence,
-                &semantic,
-                chat::now_ms().unwrap_or(0),
-            )?;
-            let automation = registry.agent_for_session(id)?.is_some_and(|agent| {
-                matches!(
-                    agent.origin,
-                    crate::agent_execution::Origin::Automation { .. }
-                )
-            });
-            (changed, automation)
-        };
-        if changed {
-            super::super::agent_execution::announce(host, &registry);
-        }
-        if let Some((evidence, content)) = semantic.attention() {
-            // Scheduled notifications are produced from committed run outcomes.
-            if !automation
-                && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
-            {
-                let mut event = crate::notifications::Event::session(
-                    id,
-                    source.launch.provider,
-                    source.launch.recipe.working_directory.clone(),
-                    evidence,
-                );
-                // This bounded immutable context belongs to this exact semantic
-                // event; neither a later snapshot nor a transcript page can
-                // replace it while the FULL notification commit is retried.
-                event.content = content;
-                let receipt = notifications
-                    .as_ref()
-                    .ok_or("The notification journal is unavailable; attention remains retained")?
-                    .record_committed(event)?;
-                receipt.recv_timeout(Duration::from_secs(10)).map_err(
-                    |_| "The notification journal has not confirmed this attention outcome",
-                )??;
-            }
-        }
-        let current = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .get(&id)
-            .is_some_and(|record| {
-                record.handle.same_attachment(&handle)
-                    && record.session == source
-                    && record.execution_instance == identity.instance
-            });
-        if !current {
-            return Err("Retained actor ownership changed before semantic acknowledgement".into());
-        }
-        handle.commit_retained_outcomes(entry.sequence)?;
     }
     // One bounded page per actor per pass. A detached actor can have many
     // pages without another latest-sequence edge; explicitly revisit it until
     // an empty page confirms the helper's entire outbox is acknowledged.
     Ok(more)
+}
+
+/// The broker and synchronous Answer boundary share the same semantic writes,
+/// exact owner checks, notification receipts and commit-before-ACK ordering.
+fn commit_semantic_entry(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    registry: &super::super::agent_execution::SharedRegistry,
+    execution_owner: &mut Option<ExecutionOwner>,
+    entry: (u64, Update),
+    lost: bool,
+    deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("Retained semantic acknowledgement deadline expired".into());
+    }
+    target.require_current(host)?;
+    let (sequence, update) = entry;
+    let semantic = match update {
+        Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
+        Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
+        Update::AttentionContext { evidence, content } => {
+            NativeActorEvent::AttentionContext { evidence, content }
+        }
+        _ => return Err("The retained semantic outbox contains an unsupported event".into()),
+    };
+    let execution = matches!(semantic, NativeActorEvent::Execution { .. });
+    capture_execution_owner(
+        registry,
+        &target.handle,
+        &target.identity,
+        &target.source,
+        execution,
+        execution_owner,
+    )?;
+    let authenticated = execution || execution_owner.is_some();
+    let (changed, automation) = {
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        require_execution_owner(&registry, execution_owner.as_ref(), authenticated)?;
+        let changed = registry.commit_native_actor_event(
+            target.identity.instance,
+            &target.identity.record,
+            &target.source,
+            sequence,
+            &semantic,
+            chat::now_ms().unwrap_or(0),
+        )?;
+        let automation = registry
+            .agent_for_session(target.source.id)?
+            .is_some_and(|agent| {
+                matches!(
+                    agent.origin,
+                    crate::agent_execution::Origin::Automation { .. }
+                )
+            });
+        (changed, automation)
+    };
+    if changed {
+        super::super::agent_execution::announce(host, registry);
+    }
+    if let Some((evidence, content)) = semantic.attention()
+        && !automation
+        && !(lost && evidence.kind == crate::notifications::Kind::Succeeded)
+    {
+        let mut event = crate::notifications::Event::session(
+            target.source.id,
+            target.source.launch.provider,
+            target.source.launch.recipe.working_directory.clone(),
+            evidence,
+        );
+        event.content = content;
+        let receipt = target
+            .notifications
+            .as_ref()
+            .ok_or("The notification journal is unavailable; attention remains retained")?
+            .record_committed(event)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Retained semantic acknowledgement deadline expired")?;
+        receipt
+            .recv_timeout(remaining.min(Duration::from_secs(10)))
+            .map_err(|_| "The notification journal has not confirmed this attention outcome")??;
+    }
+    target.require_current(host)?;
+    require_execution_owner(
+        &registry.lock().unwrap_or_else(|p| p.into_inner()),
+        execution_owner.as_ref(),
+        authenticated,
+    )?;
+    target
+        .handle
+        .commit_retained_outcomes_until(sequence, deadline)
 }
 
 /// Keep the exact cleanup owner even when helper spawn/installation replies

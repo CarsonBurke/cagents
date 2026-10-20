@@ -1013,10 +1013,16 @@ fn control(
                 action,
                 answers,
             };
+            let synchronization = super::chat::retained_actor::AnswerSync::capture(host, &handle)?;
             if run.state.is_terminal() {
                 handle.decline_answer(command)?;
             } else {
                 handle.command(command)?;
+            }
+            if let Some(synchronization) = synchronization {
+                synchronization.complete(host).map_err(|error| format!(
+                    "The answer was accepted, but its durable run state is unconfirmed: {error}. Do not repeat the answer."
+                ))?;
             }
             Some(request_id)
         }

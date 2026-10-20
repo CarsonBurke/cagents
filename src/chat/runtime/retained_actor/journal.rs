@@ -321,8 +321,10 @@ impl Journal {
     pub fn ack(&mut self, through: u64) -> Result<(), String> {
         self.ensure_writable()?;
         let previous = self.number("outcome_ack")?;
-        if through < previous {
-            return Err("Outcome acknowledgement moved backwards".into());
+        if through <= previous {
+            // Independent guarded HOST drainers may commit overlapping pages.
+            // A stale ACK is idempotent; it never rewinds the durable cursor.
+            return Ok(());
         }
         let latest: u64 = self
             .db
@@ -1287,5 +1289,21 @@ mod tests {
         journal.ack(1).unwrap();
         assert!(journal.page(0).is_err());
         assert!(journal.page(1).unwrap().is_empty());
+        journal
+            .append(&Update::Attention(crate::notifications::Evidence {
+                key: "next-turn".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            }))
+            .unwrap();
+        journal.ack(2).unwrap();
+        // A broker can finish a newer overlapping page before the synchronous
+        // Answer drainer acknowledges its captured, already committed page.
+        journal.ack(1).unwrap();
+        journal.ack(0).unwrap();
+        assert_eq!(journal.acknowledged().unwrap(), 2);
+        drop(journal);
+        let journal = Journal::open(dir.path()).unwrap();
+        assert_eq!(journal.acknowledged().unwrap(), 2);
+        assert!(journal.page(2).unwrap().is_empty());
     }
 }

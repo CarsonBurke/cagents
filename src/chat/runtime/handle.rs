@@ -184,6 +184,38 @@ impl Handle {
             _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
+    pub(crate) fn retained_outcome_clock_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(u64, u64), String> {
+        let Owner::Remote(remote) = &self.0 else {
+            return Err("This actor has no retained outcome outbox".into());
+        };
+        remote.outcome_clock_until(deadline)
+    }
+    pub(crate) fn uncommitted_outcomes_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<OutboxEntry>, String> {
+        match &self.0 {
+            Owner::Remote(remote) => {
+                remote.call_until("outbox_unacked", serde_json::Value::Null, deadline)
+            }
+            _ => Err("This actor has no retained outcome outbox".into()),
+        }
+    }
+    pub(crate) fn recognize_retained_sources_until(
+        &self,
+        sources: &[chat::Session],
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Remote(remote) => {
+                remote.call_until("recognize_sources", serde_json::json!([sources]), deadline)
+            }
+            _ => Err("This actor has no retained source authority".into()),
+        }
+    }
     pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         match &self.0 {
             Owner::Local(local) => local.provider_process(),
@@ -206,6 +238,18 @@ impl Handle {
         match &self.0 {
             Owner::Remote(remote) => remote.call("ack_outbox", serde_json::json!([through])),
             _ => Err("This actor has no remote outbox".into()),
+        }
+    }
+    pub(crate) fn commit_retained_outcomes_until(
+        &self,
+        through: u64,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Remote(remote) => {
+                remote.call_until("ack_outbox", serde_json::json!([through]), deadline)
+            }
+            _ => Err("This actor has no retained outcome outbox".into()),
         }
     }
     pub(crate) fn retained_input(

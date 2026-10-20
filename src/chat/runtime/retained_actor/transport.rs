@@ -592,6 +592,9 @@ impl RemoteActor {
             .clone()
     }
     pub fn refresh_state(&self) -> Result<(), String> {
+        self.refresh_state_until(Instant::now() + TIMEOUT)
+    }
+    fn refresh_state_until(&self, deadline: Instant) -> Result<(), String> {
         let closed = self
             .0
             .final_snapshot
@@ -602,7 +605,7 @@ impl RemoteActor {
             return Err("This retained actor attachment is unavailable; authenticate a new attachment before refreshing".into());
         }
         if let Some(mut resident) =
-            self.call::<Option<Resident>>("state", json!([self.state().changed]))?
+            self.call_until::<Option<Resident>>("state", json!([self.state().changed]), deadline)?
         {
             if self.0.stop.load(Ordering::Acquire) {
                 if !closed || !resident.close.completed {
@@ -623,6 +626,31 @@ impl RemoteActor {
             }
         }
         Ok(())
+    }
+    pub fn outcome_clock_until(&self, deadline: Instant) -> Result<(u64, u64), String> {
+        if self.0.stop.load(Ordering::Acquire) {
+            return Err("This retained Answer attachment is no longer authoritative".into());
+        }
+        // Revision zero predates every helper publication. Consume the fresh
+        // authenticated response itself: a concurrent observer can supersede
+        // the cached UI projection, but cannot replace this causal watermark.
+        let state = self
+            .call_until::<Option<Resident>>("state", json!([0]), deadline)?
+            .ok_or("The retained helper omitted its Answer semantic watermark")?;
+        if state.continuity_loss.is_some() || state.outbox_ack > state.outbox_latest {
+            return Err(
+                "Retained semantic continuity is unconfirmed; the answer must not be repeated"
+                    .into(),
+            );
+        }
+        let clock = (state.outbox_ack, state.outbox_latest);
+        self.publish_resident(state);
+        if self.0.stop.load(Ordering::Acquire) {
+            return Err(
+                "The retained Answer attachment changed during semantic synchronization".into(),
+            );
+        }
+        Ok(clock)
     }
     pub fn set_visible(&self, visible: bool) {
         *self
@@ -1211,7 +1239,7 @@ impl RemoteActor {
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
         self.call_until(method, args, Instant::now() + TIMEOUT)
     }
-    fn call_until<T: DeserializeOwned>(
+    pub(in crate::chat::runtime) fn call_until<T: DeserializeOwned>(
         &self,
         method: &str,
         args: Value,

@@ -346,3 +346,201 @@ fn a_registered_descriptor_also_needs_exact_helper_alias_recognition() {
     assert!(fixture.settle_loss().is_err());
     fixture.assert_unsettled();
 }
+
+fn answer_sync_fixture() -> (tempfile::TempDir, SharedHost, AnswerSync, Run, Handle) {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    let owner = fixture.authenticate().unwrap();
+    // Same retained actor, different attachments. These proxies deliberately
+    // have no helper socket: rejected guards must not reach input or ACK RPCs.
+    let (handle, replacement) = Handle::fixture_remote_attachment_pair();
+    let mut state = HostState::new(fixture.source.proof.clone().unwrap());
+    state.install_model(fixture.registry);
+    state.chats.insert(
+        fixture.source.id,
+        super::super::Record {
+            execution_instance: fixture.identity.instance,
+            console_recipe: None,
+            paired_terminal: None,
+            session: fixture.source.clone(),
+            handle: handle.clone(),
+            source_process: None,
+            subscribers: Default::default(),
+            observations: Default::default(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    let host = Arc::new(HostLock::new(state));
+    let registry = super::super::super::agent_execution::registry(&host).unwrap();
+    let synchronization = AnswerSync {
+        target: SemanticTarget {
+            handle,
+            source: fixture.source,
+            identity: fixture.identity,
+            notifications: None,
+        },
+        registry,
+        owner: Some(owner),
+    };
+    synchronization.require_current(&host).unwrap();
+    (
+        fixture.root,
+        host,
+        synchronization,
+        fixture.run,
+        replacement,
+    )
+}
+
+#[test]
+fn answer_watermark_never_accepts_revoked_source_account_or_attachment_authority() {
+    for mutation in ["missing", "source", "account", "attachment", "actor"] {
+        let (root, host, synchronization, run, replacement) = answer_sync_fixture();
+        let id = synchronization.target.source.id;
+        match mutation {
+            "missing" => {
+                rusqlite::Connection::open(root.path().join("registry.sqlite3"))
+                    .unwrap()
+                    .execute("DELETE FROM native_actor_ownerships", [])
+                    .unwrap();
+            }
+            "source" => {
+                host.lock()
+                    .unwrap()
+                    .chats
+                    .get_mut(&id)
+                    .unwrap()
+                    .session
+                    .launch
+                    .session_id = Some(uuid::Uuid::new_v4().to_string())
+            }
+            "account" => {
+                let mut scope = synchronization
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .scope()
+                    .unwrap()
+                    .clone();
+                scope.inode += 1;
+                synchronization
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .register_native_actor_ownership(
+                        synchronization.target.identity.instance,
+                        &synchronization.target.identity.record,
+                        &synchronization.target.source,
+                        Ok(&scope),
+                    )
+                    .unwrap();
+            }
+            "attachment" => host.lock().unwrap().chats.get_mut(&id).unwrap().handle = replacement,
+            "actor" => {
+                host.lock()
+                    .unwrap()
+                    .chats
+                    .get_mut(&id)
+                    .unwrap()
+                    .execution_instance = uuid::Uuid::new_v4()
+            }
+            _ => unreachable!(),
+        }
+        let registry = synchronization.registry.clone();
+        let handle = synchronization.target.handle.clone();
+        let actor = synchronization.target.identity.instance;
+        assert!(synchronization.complete(&host).is_err(), "{mutation}");
+        let registry = registry.lock().unwrap();
+        assert_eq!(registry.agent_run(run.id).unwrap(), run, "{mutation}");
+        assert_eq!(registry.native_actor_cursor_for_test(actor).unwrap(), None);
+        assert!(
+            handle.pending_retained_inputs().is_empty(),
+            "no answer was regenerated"
+        );
+    }
+}
+
+#[test]
+fn answer_watermark_shared_commit_does_not_ack_a_failed_durable_write() {
+    let (root, host, mut synchronization, run, _) = answer_sync_fixture();
+    let fault = rusqlite::Connection::open(root.path().join("registry.sqlite3")).unwrap();
+    fault.execute_batch("CREATE TRIGGER reject_answer_cursor BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture Answer cursor commit failure'); END;").unwrap();
+    let error = commit_semantic_entry(
+        &host,
+        &synchronization.target,
+        &synchronization.registry,
+        &mut synchronization.owner,
+        (
+            1,
+            Update::Execution {
+                run: run.id,
+                update: crate::agent_execution::Update::Started {
+                    provider_key: "exact-fixture-provider".into(),
+                },
+            },
+        ),
+        false,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("fixture Answer cursor commit failure"),
+        "{error}"
+    );
+    let registry = synchronization.registry.lock().unwrap();
+    assert_eq!(registry.agent_run(run.id).unwrap(), run);
+    assert_eq!(
+        registry
+            .native_actor_cursor_for_test(synchronization.target.identity.instance)
+            .unwrap(),
+        None
+    );
+    assert!(
+        synchronization
+            .target
+            .handle
+            .pending_retained_inputs()
+            .is_empty()
+    );
+}
+
+#[test]
+fn answer_helper_ack_cannot_replace_a_missing_or_different_durable_cursor() {
+    let (_root, _host, synchronization, run, _) = answer_sync_fixture();
+    // Model an already-ACKed helper watermark. It is not accepted when the
+    // corresponding HOST cursor is absent, even with exact installed ownership.
+    assert!(synchronization.require_committed_through(1).is_err());
+    let identity = &synchronization.target.identity;
+    synchronization
+        .registry
+        .lock()
+        .unwrap()
+        .commit_native_actor_event(
+            identity.instance,
+            &identity.record,
+            &synchronization.target.source,
+            1,
+            &NativeActorEvent::Execution {
+                run: run.id,
+                update: crate::agent_execution::Update::Started {
+                    provider_key: "exact-fixture-provider".into(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+    synchronization.require_committed_through(1).unwrap();
+    assert!(synchronization.require_committed_through(2).is_err());
+    let mut different = identity.record.clone();
+    different.holder.start += 1;
+    assert!(
+        synchronization
+            .registry
+            .lock()
+            .unwrap()
+            .native_actor_committed_through(identity.instance, &different)
+            .is_err()
+    );
+}

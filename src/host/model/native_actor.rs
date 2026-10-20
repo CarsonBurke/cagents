@@ -48,6 +48,32 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
 }
 
 impl Registry {
+    /// A helper ACK cannot substitute for this exact durable HOST cursor.
+    pub(in crate::host) fn native_actor_committed_through(
+        &self,
+        actor: Uuid,
+        owner: &Record,
+    ) -> Result<u64, String> {
+        let cursor: Option<(String, u64)> = self
+            .db
+            .query_row(
+                "SELECT owner, sequence FROM native_actor_cursors WHERE actor=?1",
+                [actor.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored, sequence)) = cursor else {
+            return Ok(0);
+        };
+        let expected = serde_json::to_string(owner).map_err(|error| error.to_string())?;
+        if stored != expected {
+            return Err(
+                "The durable semantic cursor belongs to another exact retained actor".into(),
+            );
+        }
+        Ok(sequence)
+    }
     #[cfg(test)]
     pub(in crate::host) fn native_actor_cursor_for_test(
         &self,
