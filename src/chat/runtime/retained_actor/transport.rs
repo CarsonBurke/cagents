@@ -188,7 +188,7 @@ struct Pending {
     identity: InputIdentity,
     payload: Value,
     bytes: usize,
-    reply: Option<crossbeam_channel::Sender<Result<(), String>>>,
+    reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
 }
 struct Remote {
     close_only: bool,
@@ -394,6 +394,55 @@ impl RemoteActor {
             startup: Mutex::new(None),
         }))
     }
+    /// Complete the actual proxy's pending envelope without any external
+    /// helper. Tests still use production enqueue, receipt and disconnection
+    /// handling; only the authenticated peer's observed outcome is supplied.
+    #[cfg(test)]
+    pub(in crate::chat::runtime) fn settle_input_fixture(
+        &self,
+        outcome: super::super::handle::RetainedInputOutcome,
+    ) -> u64 {
+        use super::super::handle::RetainedInputOutcome;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let identity = loop {
+            if let Some(identity) = self.pending_inputs().into_iter().next() {
+                break identity;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy did not admit the fixture input"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        match outcome {
+            RetainedInputOutcome::Acknowledged(result) => self.apply_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state: InputState::Acknowledged(result),
+            }]),
+            RetainedInputOutcome::Unknown(error) => self.apply_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state: InputState::Unknown(error),
+            }]),
+            RetainedInputOutcome::Unavailable => {
+                self.publish_unavailable("Retained actor attachment was superseded");
+            }
+            RetainedInputOutcome::Disconnected => {
+                // Closing the completion channel after admission gives no
+                // information about whether the provider consumed the input.
+                self.0
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|pending| pending.identity == identity)
+                    .unwrap()
+                    .reply
+                    .take();
+            }
+        }
+        identity.sequence
+    }
+
     #[cfg(test)]
     pub(in crate::chat::runtime) fn distinct_attachment_fixture(&self) -> Self {
         let mut other = Self::fixture();
@@ -1138,10 +1187,10 @@ impl RemoteActor {
         }
         for pending in &mut *self.0.pending.lock().unwrap_or_else(|p| p.into_inner()) {
             if let Some(reply) = pending.reply.take() {
-                let _ = reply.send(Err(format!(
+                let _ = reply.send(Err(Rejection::Unacknowledged(format!(
                     "{reason}; input {} sequence {} remains unknown and must not be regenerated",
                     pending.identity.id, pending.identity.sequence
-                )));
+                ))));
             }
         }
         (self.0.notify)(Update::Activity {
@@ -1184,7 +1233,7 @@ impl RemoteActor {
         &self,
         run: Option<crate::model::RunId>,
         command: Command,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
         self.enqueue_payload(InputPayload::Command {
             run,
             command,
@@ -1203,6 +1252,7 @@ impl RemoteActor {
             "Retained refusal acknowledgement remains unknown; never resend automatically"
                 .to_owned()
         })?
+        .map_err(String::from)
     }
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
@@ -1216,7 +1266,7 @@ impl RemoteActor {
     fn enqueue_payload(
         &self,
         payload: InputPayload,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
         if self.0.close_only {
             return Err(close_only_refusal());
         }
@@ -1356,14 +1406,14 @@ impl RemoteActor {
             match &receipt.state {
                 InputState::Acknowledged(result) => {
                     if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(result.clone());
+                        let _ = reply.send(result.clone().map_err(Rejection::Refused));
                     }
                     completed.push(pending.identity.clone());
                     false
                 }
                 InputState::Unknown(error) => {
                     if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(Err(error.clone()));
+                        let _ = reply.send(Err(Rejection::Unacknowledged(error.clone())));
                     }
                     true
                 }
@@ -1446,7 +1496,7 @@ impl RemoteActor {
         command: Command,
     ) -> Result<(), Rejection> {
         let receiver = self.enqueue(run, command).map_err(Rejection::Refused)?;
-        receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?.map_err(Rejection::Refused)
+        receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
     }
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         let receiver = self
@@ -1454,7 +1504,6 @@ impl RemoteActor {
             .map_err(Rejection::Refused)?;
         receiver.recv_timeout(Duration::from_secs(10))
             .map_err(|_| Rejection::Unacknowledged("Retained idle prompt acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
-            .map_err(Rejection::Refused)
     }
     pub fn interrupt(
         &self,
@@ -1471,6 +1520,7 @@ impl RemoteActor {
                 "Retained interrupt acknowledgement remains unknown; never resend automatically"
                     .to_owned()
             })?
+            .map_err(String::from)
     }
 
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
@@ -4762,6 +4812,30 @@ done"#;
     }
 
     #[test]
+    fn submitted_input_preserves_refusal_and_uncertain_completion_types() {
+        use super::super::super::handle::RetainedInputOutcome;
+        for outcome in [
+            RetainedInputOutcome::Acknowledged(Err("explicit refusal".into())),
+            RetainedInputOutcome::Unknown("provider effect is unknown".into()),
+            RetainedInputOutcome::Unavailable,
+            RetainedInputOutcome::Disconnected,
+        ] {
+            let refused = matches!(&outcome, RetainedInputOutcome::Acknowledged(Err(_)));
+            let actor = RemoteActor::fixture();
+            let submitter = actor.clone();
+            let delivery = thread::spawn(move || submitter.submit(None, Command::Refresh));
+            assert_eq!(actor.settle_input_fixture(outcome), 1);
+            let result = delivery.join().unwrap();
+            assert!(if refused {
+                matches!(result, Err(Rejection::Refused(_)))
+            } else {
+                matches!(result, Err(Rejection::Unacknowledged(_)))
+            });
+            assert_eq!(*actor.0.input_sequence.lock().unwrap(), 2);
+        }
+    }
+
+    #[test]
     fn lost_retirement_reply_keeps_bounded_ack_metadata_and_never_resends_input() {
         let actor = RemoteActor::fixture();
         let response = actor.enqueue(None, Command::Refresh).unwrap();
@@ -4816,13 +4890,10 @@ done"#;
             state.owns_work,
             "disconnection is not provider cleanup proof"
         );
-        assert!(
-            response
-                .try_recv()
-                .unwrap()
-                .unwrap_err()
-                .contains("must not be regenerated")
-        );
+        assert!(matches!(
+            response.try_recv().unwrap(),
+            Err(Rejection::Unacknowledged(error)) if error.contains("must not be regenerated")
+        ));
     }
     #[test]
     fn connection_loss_requires_death_or_positive_authority_loss_evidence() {

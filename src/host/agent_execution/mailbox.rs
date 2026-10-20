@@ -766,6 +766,94 @@ mod tests {
     }
 
     #[test]
+    fn retained_idle_uncertainty_keeps_the_courier_claim_and_explicit_refusal_requeues() {
+        use crate::chat::runtime::{Handle as RuntimeHandle, RetainedInputOutcome};
+        for outcome in [
+            RetainedInputOutcome::Acknowledged(Err("provider refused idle input".into())),
+            RetainedInputOutcome::Unknown("provider effect remains unknown".into()),
+            RetainedInputOutcome::Unavailable,
+            RetainedInputOutcome::Disconnected,
+        ] {
+            let refused = matches!(&outcome, RetainedInputOutcome::Acknowledged(Err(_)));
+            let directory = tempfile::tempdir().unwrap();
+            let registry = Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            ));
+            let session = TerminalId::new();
+            let message = Message {
+                id: MessageId::new(),
+                from: Party::user(),
+                to: Party {
+                    lineage: Some(Lineage(session)),
+                    session: None,
+                    title: None,
+                },
+                reply_to: None,
+                body: "A courier input must not be regenerated after an uncertain effect".into(),
+                wait_until_ms: None,
+                state: State::Pending,
+                created_ms: super::super::now(),
+            };
+            registry.lock().unwrap().post_message(&message).unwrap();
+            let courier = Handle(Arc::new(Inner {
+                host: Weak::new(),
+                registry: registry.clone(),
+                seal: Arc::new(Seal::new([9; 32])),
+                state: Mutex::default(),
+                changed: Condvar::new(),
+                scanned_generation: Mutex::new(None),
+                scanned: Condvar::new(),
+            }));
+            let stored = || {
+                registry
+                    .lock()
+                    .unwrap()
+                    .message(message.id)
+                    .unwrap()
+                    .unwrap()
+            };
+            let (actor, answer) = RuntimeHandle::fixture_retained_input();
+            let delivery_courier = courier.clone();
+            let delivery_actor = actor.clone();
+            let delivery_message = message.clone();
+            let delivery = std::thread::spawn(move || {
+                delivery_courier.hand_over(&delivery_message, session, &delivery_actor)
+            });
+            // This completes a genuinely pending Remote IdlePrompt envelope;
+            // hand_over has already committed its claim before invoking it.
+            assert_eq!(answer(outcome), 1);
+            delivery.join().unwrap().unwrap();
+            let settled = stored();
+            if refused {
+                assert_eq!(settled.state, State::Pending);
+                assert_eq!(settled.to.session, None);
+                assert!(actor.pending_retained_inputs().is_empty());
+                // A later positive receipt can deliver the same durable mail.
+                let (retry_actor, answer) = RuntimeHandle::fixture_retained_input();
+                let retry_courier = courier.clone();
+                let retry_message = message.clone();
+                let retry = std::thread::spawn(move || {
+                    retry_courier.hand_over(&retry_message, session, &retry_actor)
+                });
+                assert_eq!(answer(RetainedInputOutcome::Acknowledged(Ok(()))), 1);
+                retry.join().unwrap().unwrap();
+                assert_eq!(stored().state, State::Delivered);
+            } else {
+                assert_eq!(settled.state, State::Delivered);
+                assert_eq!(settled.to.session, Some(session));
+                let retained = actor.pending_retained_inputs();
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].sequence, 1);
+                // The real courier path must observe Delivered and return
+                // before allocating any replacement input envelope.
+                courier.hand_over(&message, session, &actor).unwrap();
+                assert_eq!(stored(), settled);
+                assert_eq!(actor.pending_retained_inputs(), retained);
+            }
+        }
+    }
+
+    #[test]
     fn terminal_attention_requires_a_unique_live_provider_and_tracks_successor() {
         use crate::{agent::Provider, agent_execution::directory::Surface};
         let original = TerminalId::new();

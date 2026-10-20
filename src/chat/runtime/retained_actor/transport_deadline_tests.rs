@@ -37,14 +37,14 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
         )
         .err()
         .expect("full backlog must refuse adoption");
-        assert!(error.contains("timed out"), "{error}");
+        assert!(error.contains("deadline expired"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
     let start = Instant::now();
     let error = actor
         .call_until::<Value>("state", json!([0]), start + Duration::from_millis(80))
         .unwrap_err();
-    assert!(error.contains("timed out"), "{error}");
+    assert!(error.contains("deadline expired"), "{error}");
     assert!(start.elapsed() < Duration::from_secs(2));
     let (_accepted, _) = listener.accept().unwrap();
     assert!(original.peer_addr().is_ok());

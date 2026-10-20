@@ -14,7 +14,29 @@ enum Owner {
     Local(LocalHandle),
     Remote(RemoteActor),
 }
+/// Outcome observed after a fixture proxy has admitted an exact envelope.
+#[cfg(test)]
+pub(crate) enum RetainedInputOutcome {
+    Acknowledged(Result<(), String>),
+    Unknown(String),
+    Unavailable,
+    Disconnected,
+}
+
 impl Handle {
+    /// A real remote proxy with no external provider or helper. The returned
+    /// responder waits for actual production admission before settling it.
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_input() -> (
+        Self,
+        impl FnOnce(RetainedInputOutcome) -> u64 + Send + 'static,
+    ) {
+        let remote = RemoteActor::fixture();
+        let responder = remote.clone();
+        (Self(Owner::Remote(remote)), move |outcome| {
+            responder.settle_input_fixture(outcome)
+        })
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]

@@ -26,6 +26,8 @@ pub(crate) mod courier_tests;
 mod execution;
 mod handle;
 pub use handle::Handle;
+#[cfg(test)]
+pub(crate) use handle::RetainedInputOutcome;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
