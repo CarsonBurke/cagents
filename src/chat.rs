@@ -609,6 +609,10 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 /// It does not authorize an ordinary snapshot to change saved ownership.
 pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> bool {
     if source.launch.session_id.is_some()
+        || (matches!(
+            replacement.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ) && !source.has_unnamed_retained_claude_actor())
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
