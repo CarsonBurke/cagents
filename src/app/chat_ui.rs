@@ -1051,7 +1051,7 @@ struct CachedItem {
 }
 impl Drop for CachedItem {
     fn drop(&mut self) {
-        if !self.markdown.items().is_empty() || !self.blocks.is_empty() || self.item.is_some() {
+        if !self.markdown.items().is_empty() || !self.blocks.is_empty() {
             preparation::retire_presentation(preparation::Presentation {
                 parsed: preparation::Parsed {
                     source: std::mem::take(&mut self.source),

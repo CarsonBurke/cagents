@@ -466,6 +466,13 @@ impl Entry {
         self.requested = false;
         self.failed = ready.is_none();
         self.ready_revision = ready.as_ref().map(|_| request.source_revision);
+        if let Some(ready) = &ready {
+            ready
+                .admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
         self.ready = ready;
         true
     }
@@ -492,7 +499,8 @@ impl std::fmt::Debug for Request {
 }
 
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
-struct WorkSlot(Option<tokio::sync::OwnedSemaphorePermit>);
+#[derive(Debug)]
+pub(super) struct WorkSlot(Option<tokio::sync::OwnedSemaphorePermit>);
 impl Drop for WorkSlot {
     fn drop(&mut self) {
         self.0.take();
@@ -507,6 +515,13 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
     let slots = SLOTS
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
         .clone();
+    run_with_slots(target, request, slots)
+}
+fn run_with_slots(
+    target: Target,
+    request: Request,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<Task<Message>, u64> {
     let epoch = COMPLETED.load(Ordering::Acquire);
     let permit = WorkSlot(Some(slots.try_acquire_owned().map_err(|_| epoch)?));
     // Share this font-version input snapshot. Repeated paragraph requests
@@ -540,8 +555,10 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
     Ok(cosmic::task::future(async move {
         let work = request.clone();
         let ready = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if work.cancelled.load(Ordering::Acquire) {
+            // Admission remains attached to the output until UI consumption;
+            // a stalled event loop cannot queue full-context glyph snapshots.
+            if preparation::reclaim_before_work().is_err() || work.cancelled.load(Ordering::Acquire)
+            {
                 return None;
             }
             let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(
@@ -562,7 +579,15 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
                 },
                 &mut fonts,
             );
-            (!work.cancelled.load(Ordering::Acquire)).then(|| Arc::new(prepared))
+            if work.cancelled.load(Ordering::Acquire) {
+                // Keep the slot until this discarded geometry is reclaimed.
+                *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
+                drop(prepared);
+                None
+            } else {
+                *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
+                Some(Arc::new(prepared))
+            }
         })
         .await
         .ok()
@@ -576,6 +601,7 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
 #[derive(Debug)]
 pub(super) struct Prepared {
     owned: Option<Box<Geometry>>,
+    admission: Mutex<Option<WorkSlot>>,
 }
 
 // A widget or result may own the final Arc. Its last release must remain
@@ -595,7 +621,12 @@ impl std::ops::DerefMut for Prepared {
 impl Drop for Prepared {
     fn drop(&mut self) {
         if let Some(geometry) = self.owned.take() {
-            preparation::retire_geometry(geometry);
+            let admission = self
+                .admission
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            preparation::retire_geometry(geometry, admission);
         }
     }
 }
@@ -694,6 +725,7 @@ impl Prepared {
             .into_layout_snapshot()
             .expect("complete paragraph layout");
         Self {
+            admission: Mutex::new(None),
             owned: Some(Box::new(Geometry {
                 #[cfg(test)]
                 retired_on: None,
@@ -1819,4 +1851,78 @@ fn last_geometry_owner_retires_off_thread_after_widget_and_cache_release() {
         weak_plain.upgrade().is_none(),
         "retirement releases the actual source owner"
     );
+}
+
+#[test]
+fn stalled_ui_delivery_holds_output_admission_until_installation_or_discard() {
+    use iced::futures::StreamExt;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for install in [false, true] {
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let spans: Arc<[Span<'static, String>]> =
+            vec![Span::new("streamed paragraph ".repeat(2000))].into();
+        let cache = Cache::default();
+        let entry = cache.entry(1, spans);
+        entry.borrow_mut().bind_target(target);
+        entry
+            .borrow_mut()
+            .configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+        let request = entry.borrow_mut().request().unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let task =
+            run_with_slots(target, request.clone(), slots.clone()).expect("first worker admitted");
+        let (completed_request, output) = executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                        Action::FlowReady(_, request, Some(output)),
+                    ))) = effect
+                    {
+                        return (request, output);
+                    }
+                }
+                panic!("real worker must produce its complete layout");
+            })
+            .await
+            .expect("finite real worker completion")
+        });
+        // Receiving/queueing the message does not mean the UI consumed it.
+        let duplicate_message = output.clone();
+        assert!(slots.clone().try_acquire_owned().is_err());
+        assert!(
+            run_with_slots(target, request, slots.clone()).is_err(),
+            "a stalled UI must not accumulate full-context outputs"
+        );
+        drop(duplicate_message);
+        assert!(slots.clone().try_acquire_owned().is_err());
+        if install {
+            assert!(
+                entry
+                    .borrow_mut()
+                    .complete(&completed_request, Some(output))
+            );
+            let next = slots
+                .clone()
+                .try_acquire_owned()
+                .expect("installation releases admission while geometry remains resident");
+            assert!(entry.borrow().prepared().is_some());
+            drop(next);
+        } else {
+            drop(output);
+            preparation::retirement_barrier();
+            let next = slots
+                .clone()
+                .try_acquire_owned()
+                .expect("discard releases admission after expensive retirement");
+            assert!(entry.borrow().prepared().is_none());
+            drop(next);
+        }
+    }
 }

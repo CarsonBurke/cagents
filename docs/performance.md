@@ -313,6 +313,15 @@ must return within 30 MB of its prior baseline. Repeat hide/reveal and close
 cycles, including Hide tab. Use the isolated development runner described in
 [development.md](development.md), preserving existing sessions.
 
+Full-context shaping holds one output permit through UI consumption; queued
+completion messages do not release it. Accepted installation releases the permit
+while the visible paragraph keeps its geometry. Discarded results retain the
+permit through background disposal. Parser and shaper workers wait for earlier
+retirement before allocating another generation. A hide can retire its existing
+active graph as one batch; this bounds generation amplification, not total live
+glyph storage or process RSS. Optional `cagents::memory=trace` includes pending
+retirement item counts for native visit/hide qualification.
+
 The pane inspector's diagnostics disclose known source, prepared-presentation
 and logical-selection payload owners for the selected chat. These counters
 exclude opaque parser/font/renderer/image allocations and allocator retention;

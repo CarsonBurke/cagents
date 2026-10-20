@@ -428,17 +428,19 @@ pub(super) struct Presentation {
 }
 
 enum Retirement {
-    Geometry(Box<flow_layout::Geometry>),
+    Geometry(Box<flow_layout::Geometry>, Option<flow_layout::WorkSlot>),
     Presentation(Presentation),
     Installed(Retired),
     // Keep the existing queued-source lease until canonical parser/source
     // destructors finish, including cancelled/hidden sources without output.
     Detached(Arc<Shared>),
-    #[cfg(test)]
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
 }
-pub(super) fn retire_geometry(geometry: Box<flow_layout::Geometry>) {
-    enqueue_retirement(Retirement::Geometry(geometry));
+pub(super) fn retire_geometry(
+    geometry: Box<flow_layout::Geometry>,
+    admission: Option<flow_layout::WorkSlot>,
+) {
+    enqueue_retirement(Retirement::Geometry(geometry, admission));
 }
 pub(super) fn retire_presentation(presentation: Presentation) {
     enqueue_retirement(Retirement::Presentation(presentation));
@@ -449,42 +451,65 @@ fn retire_shared(shared: Arc<Shared>) {
 fn retire(retired: Retired) {
     enqueue_retirement(Retirement::Installed(retired));
 }
+// Ownership already resident in the active graph may retire as one batch.
+// Worker producers fence reclamation before allocating another generation, so
+// repeated hide/reveal cannot add generations behind an unfinished batch. The
+// queue is process-owned: a stopped worker never falls back to UI destruction.
+struct Reclaimer {
+    pending: Mutex<std::collections::VecDeque<Retirement>>,
+    wake: std::sync::Condvar,
+}
+static RETIRING: AtomicUsize = AtomicUsize::new(0);
 fn enqueue_retirement(retired: Retirement) {
-    static RETIRE: std::sync::OnceLock<std::sync::mpsc::Sender<Retirement>> =
-        std::sync::OnceLock::new();
-    let sender = RETIRE.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Retirement>();
-        std::thread::Builder::new()
-            .name("chat-markdown-retire".into())
-            .spawn(move || {
-                while let Ok(retired) = receiver.recv() {
-                    match retired {
-                        Retirement::Geometry(geometry) => drop(geometry),
-                        Retirement::Presentation(presentation) => drop(presentation),
-                        Retirement::Installed(retired) => drop(retired),
-                        Retirement::Detached(owner) => drop(owner),
-                        #[cfg(test)]
-                        Retirement::Barrier(reply) => {
-                            let _ = reply.send(std::thread::current().id());
-                        }
-                    }
+    static RETIRE: std::sync::OnceLock<Arc<Reclaimer>> = std::sync::OnceLock::new();
+    let reclaimer = RETIRE.get_or_init(|| {
+        let owner = Arc::new(Reclaimer { pending: Mutex::default(), wake: std::sync::Condvar::new() });
+        let worker = owner.clone();
+        std::thread::Builder::new().name("chat-presentation-retire".into()).spawn(move || loop {
+            let retired = {
+                let mut pending = worker.pending.lock().unwrap_or_else(|e| e.into_inner());
+                while pending.is_empty() {
+                    pending = worker.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
                 }
-            })
-            .expect("start Markdown retirement worker");
-        sender
+                pending.pop_front().expect("queued retirement")
+            };
+            match retired {
+                Retirement::Geometry(geometry, admission) => { drop(geometry); drop(admission); }
+                Retirement::Presentation(presentation) => drop(presentation),
+                Retirement::Installed(retired) => drop(retired),
+                Retirement::Detached(owner) => drop(owner),
+                Retirement::Barrier(reply) => { let _ = reply.send(std::thread::current().id()); }
+            }
+            let remaining = RETIRING.fetch_sub(1, Ordering::AcqRel) - 1;
+            tracing::trace!(target: "cagents::memory", owner = "chat_retirement", pending_items = remaining);
+        }).expect("start presentation retirement worker");
+        owner
     });
-    // The receiver only drops owned standard containers and never exits.
-    // An exceptional worker failure still releases ownership safely.
-    if let Err(error) = sender.send(retired) {
-        drop(error.0);
-    }
+    let queued = RETIRING.fetch_add(1, Ordering::AcqRel) + 1;
+    reclaimer
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(retired);
+    reclaimer.wake.notify_one();
+    tracing::trace!(target: "cagents::memory", owner = "chat_retirement", pending_items = queued);
 }
 
-#[cfg(test)]
-pub(super) fn retirement_barrier() -> std::thread::ThreadId {
+fn reclamation_barrier() -> Result<std::thread::ThreadId, String> {
     let (sender, receiver) = std::sync::mpsc::channel();
     enqueue_retirement(Retirement::Barrier(sender));
-    receiver.recv().expect("retirement worker remains alive")
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| "Previous message storage could not be released; retry loading it.".to_owned())
+}
+/// Blocking worker boundary only. Never call this from update/layout/draw or
+/// while holding a parser, reader, font-system or reclaimer lock.
+pub(super) fn reclaim_before_work() -> Result<(), String> {
+    reclamation_barrier().map(|_| ())
+}
+#[cfg(test)]
+pub(super) fn retirement_barrier() -> std::thread::ThreadId {
+    reclamation_barrier().expect("retirement worker remains alive")
 }
 
 fn prime_plain(items: &[markdown::Item], cancelled: &AtomicBool) -> Result<(), String> {
@@ -605,6 +630,7 @@ fn execute(
     shared: Arc<Shared>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Prepared, String> {
+    reclaim_before_work()?;
     let request = shared
         .latest
         .lock()
