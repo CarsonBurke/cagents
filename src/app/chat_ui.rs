@@ -11294,26 +11294,70 @@ mod tests {
 
     #[test]
     fn a_closed_updater_pipe_after_surface_open_keeps_the_conversation_and_unsaved_draft() {
+        use iced::futures::StreamExt;
+
+        let drain = |task| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    match iced::runtime::task::into_stream(task) {
+                        Some(stream) => {
+                            tokio::time::timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
+                                .await
+                                .expect("startup report effects must settle")
+                        }
+                        None => Vec::new(),
+                    }
+                })
+        };
+        let failure = || {
+            Message::StartupReported(Err(
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe).to_string()
+            ))
+        };
+        let mut unopened = crate::app::tests::context_inspector_test_app(false);
+        assert!(
+            drain(unopened.update(failure()))
+                .iter()
+                .any(|effect| matches!(effect, iced::runtime::Action::Exit)),
+            "the control must observe the real exit before a recovery window opens"
+        );
+
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         app.chat_runtime_mut(target)
             .unwrap()
-            .replace_draft(text_editor::Content::with_text("Unsent recovery draft"));
+            .replace_draft(text_editor::Content::with_text(
+                "  Unsent recovery draft 🦀\n\n",
+            ));
+        let draft = chat_runtime(&app, card).composer.text();
+        let handle = chat_runtime(&app, card).handle().cloned().unwrap();
         app.startup_gate = crate::app::startup_gate::State::fixture_opened();
         let cards = app.durable.cards.clone();
-        let task = app.update(Message::StartupReported(Err(std::io::Error::from(
-            std::io::ErrorKind::BrokenPipe,
-        )
-        .to_string())));
+        // Public dispatch also schedules ordinary attention effects. Inspect
+        // what the runtime receives, not whether a batch allocated a stream.
+        let effects = drain(app.update(failure()));
         assert!(
-            iced::runtime::task::into_stream(task).is_none(),
-            "report failure must not issue window exit"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                iced::runtime::Action::Exit
+                    | iced::runtime::Action::Window(iced::runtime::window::Action::Close(_))
+            )),
+            "report failure must not issue window exit or close: {effects:?}"
         );
+        assert!(app.exit.is_none());
         assert_eq!(app.durable.cards, cards);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
         assert_eq!(
-            chat_runtime(&app, card).composer.text().trim(),
-            "Unsent recovery draft"
+            chat_runtime(&app, card).composer.text(),
+            draft,
+            "unsent whitespace and UTF-8 must survive the failed report"
         );
         assert!(app.status.is_some());
     }
