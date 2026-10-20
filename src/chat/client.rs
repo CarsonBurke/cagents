@@ -452,7 +452,7 @@ fn transmit_text_copy(
             io::Write::flush(self.stream)
         }
     }
-    let Wire { stream, codec } = &mut *wire;
+    let Wire { stream, codec, .. } = &mut *wire;
     let previous_timeout = stream.write_timeout().map_err(|error| error.to_string())?;
     let result = codec
         .write(

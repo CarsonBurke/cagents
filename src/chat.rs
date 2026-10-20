@@ -1219,7 +1219,7 @@ impl Snapshot {
     /// Drop renderable history while retaining provider continuity, controls,
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     pub(crate) fn evict_transcript(&mut self) {
         self.items = Vec::new();
         for child in &mut self.subagents {
@@ -1229,7 +1229,7 @@ impl Snapshot {
 
     /// Logical body bytes referenced by this owner, not unique heap bytes:
     /// immutable items can be Arc-shared with other snapshots and caches.
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     pub(crate) fn transcript_bytes(&self) -> usize {
         self.items
             .iter()
