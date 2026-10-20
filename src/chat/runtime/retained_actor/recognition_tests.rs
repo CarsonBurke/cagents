@@ -60,6 +60,24 @@ fn text_items(snapshot: &Snapshot) -> Vec<String> {
         })
         .collect()
 }
+fn copied_text(actor: &RemoteActor, source: &chat::TextCopySource) -> String {
+    let mut text = String::new();
+    loop {
+        let page: chat::TextCopyPage = actor
+            .call("text_copy", json!([source, text.len() as u64]))
+            .unwrap();
+        assert_eq!(&page.source, source);
+        assert_eq!(page.offset, text.len() as u64);
+        assert!(page.text.len() <= chat::TEXT_COPY_PAGE_BYTES);
+        assert!(!page.text.is_empty() || page.done);
+        text.push_str(&page.text);
+        if page.done {
+            break;
+        }
+    }
+    assert_eq!(text.len() as u64, source.bytes);
+    text
+}
 fn delivered(snapshot: &Snapshot, body: &str) -> bool {
     snapshot.items.iter().any(|item| {
         matches!(&item.content,
@@ -261,6 +279,27 @@ for line in sys.stdin:
     }
     submit(&original.0, "emit forged provider frame");
     assert!(text_items(&original.0.snapshot(None).unwrap()).contains(&fake_provider));
+    let long_copy = "retained-copy-λ ".repeat(20_000);
+    submit(&original.0, &long_copy);
+    let copy_snapshot = original.0.snapshot(None).unwrap();
+    let copy_source = copy_snapshot
+        .text_copy_sources
+        .conversation
+        .iter()
+        .flatten()
+        .find(|source| source.bytes == long_copy.len() as u64)
+        .expect("helper must publish the complete logical Copy authority")
+        .clone();
+    assert!(copy_source.bytes > chat::TEXT_COPY_PAGE_BYTES as u64);
+    assert_eq!(copied_text(&original.0, &copy_source), long_copy);
+    let mut foreign_copy = copy_source.clone();
+    foreign_copy.cache = uuid::Uuid::new_v4();
+    assert!(
+        original
+            .0
+            .call::<chat::TextCopyPage>("text_copy", json!([foreign_copy, 0]))
+            .is_err()
+    );
     submit(&original.0, "fill window");
     let latest = original.0.snapshot(None).unwrap();
     assert!(
@@ -323,6 +362,14 @@ print(read(struct.unpack('<I',read(4))[0]).decode())
             .is_err()
     );
     wait_idle(&adopted.0);
+    // The source is outside the Store window and survived actual lease rotation.
+    assert_eq!(copied_text(&adopted.0, &copy_source), long_copy);
+    assert!(
+        adopted
+            .0
+            .call::<chat::TextCopyPage>("text_copy", json!([foreign_copy, 0]))
+            .is_err()
+    );
     // Use the current valid daemon proof with the superseded epoch. An old
     // proof would fail lease authentication before exercising the epoch fence.
     // Refresh is supported and harmless, but accepting it would advance the

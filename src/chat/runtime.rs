@@ -20,9 +20,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
-mod child_text_copy;
 mod execution;
 mod handle;
 pub use handle::Handle;
@@ -704,6 +704,9 @@ impl LocalHandle {
             .map_err(String::from)
     }
 
+    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
+        self.submit_command(None, command, false)
+    }
     /// Rechecks courier eligibility on the actor, immediately before preparing
     /// the prompt. A caller's earlier idle observation is only a hint. Refusal
     /// permits retry; an unacknowledged command may already have run.

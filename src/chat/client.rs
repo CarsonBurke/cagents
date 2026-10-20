@@ -708,7 +708,10 @@ impl ClientHandle {
         let mut handle = Self::fixture(session.clone(), snapshot);
         let inner = Arc::get_mut(&mut handle.inner).unwrap();
         inner.proof = proof;
-        inner.upgrade_recovery = Some(UpgradeRecovery { sessions: (source, session), kind: UpgradeRecoveryKind::Exact });
+        inner.upgrade_recovery = Some(UpgradeRecovery {
+            sessions: (source, session),
+            kind: UpgradeRecoveryKind::Exact,
+        });
         handle
     }
 
@@ -910,9 +913,7 @@ impl ClientHandle {
         expected: Session,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        if !(super::is_upgrade_recovery(&source, &expected)
-            || super::is_upgrade_identity_learning(&source, &expected))
-        {
+        if UpgradeRecovery::candidate(&source, &expected).is_none() {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
         let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
@@ -1014,8 +1015,7 @@ impl ClientHandle {
                 || terminate_source
                 || selection.is_some()
                 || account_recovery.is_some()
-                || !(super::is_upgrade_recovery(&session, expected)
-                    || super::is_upgrade_identity_learning(&session, expected)))
+                || UpgradeRecovery::candidate(&session, expected).is_none())
         {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
@@ -4295,6 +4295,4 @@ mod tests {
             assert_eq!(handle.upgrade_recovery(), Some(&(source, resolved)));
         }
     }
-
-
 }

@@ -39,8 +39,9 @@ pub(super) fn close_captured(
     host: &SharedHost,
     source: &Session,
     target: &super::CloseTarget,
+    closing: &capacity::Reservation,
 ) -> Result<(), String> {
-    close_retained_inner(host, source, None, Some(target))
+    close_retained_inner(host, source, Some(closing), Some(target))
 }
 
 fn close_retained_inner(
@@ -50,7 +51,9 @@ fn close_retained_inner(
     expected: Option<&super::CloseTarget>,
 ) -> Result<(), String> {
     if let Some(expected) = expected {
-        expected.require_current(host).map_err(|error| error.message)?;
+        expected
+            .require_current(host)
+            .map_err(|error| error.message)?;
     }
     super::super::agent_execution::preflight_retirement(host, source)?;
     if source.launch.provider == Provider::Claude {
@@ -85,7 +88,7 @@ fn close_retained_inner(
             })
         {
             return if let Some(expected) = expected {
-                super::retained_actor::close_captured(host, source, expected)
+                super::retained_actor::close_captured(host, source, expected, closing)
             } else {
                 super::retained_actor::close_unattached(host, source, owner)
             };

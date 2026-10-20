@@ -504,6 +504,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         "retained transcript failed to hydrate",
     );
     let snapshot = handle.snapshot(None).unwrap();
+    assert_retained_copy_sources(&handle, &snapshot);
     let transcript = snapshot
         .items
         .iter()
@@ -753,6 +754,44 @@ fn running_commit_diagnostic(
         "run={run} state={state:?} cursor={cursor:?}; cached HOST source(id, session, proof matches fixture)={source:?}; helper ACK/latest/source/inspection/adoption=unobserved (deadline exhausted; no RPC); {}",
         slow_turn_diagnostic(root, handle),
     )
+}
+
+fn assert_retained_copy_sources(handle: &Handle, snapshot: &chat::Snapshot) {
+    assert_eq!(
+        snapshot.items.len(),
+        snapshot.text_copy_sources.conversation.len()
+    );
+    let mut checked = 0;
+    for (item, source) in snapshot
+        .items
+        .iter()
+        .zip(&snapshot.text_copy_sources.conversation)
+    {
+        let chat::ItemContent::Text { text: visible, .. } = &item.content else {
+            continue;
+        };
+        let source = source
+            .as_ref()
+            .expect("retained helper must preserve logical text Copy");
+        let mut copied = String::new();
+        loop {
+            let page = handle.text_copy(source, copied.len() as u64).unwrap();
+            assert_eq!(&page.source, source);
+            assert_eq!(page.offset, copied.len() as u64);
+            assert!(!page.text.is_empty() || page.done);
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied.len() as u64, source.bytes);
+        assert!(copied.contains(visible.as_str()));
+        checked += 1;
+    }
+    assert!(
+        checked >= 40,
+        "all actual streamed frames must remain copyable"
+    );
 }
 
 fn wait_until_with_diagnostic(
@@ -1743,6 +1782,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
         "transcript did not hydrate after host SIGKILL",
     );
     let snapshot = handle.snapshot(None).unwrap();
+    assert_retained_copy_sources(&handle, &snapshot);
     let text = snapshot
         .items
         .iter()

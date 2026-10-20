@@ -242,6 +242,22 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(None, command),
         }
     }
+    pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+        match &self.0 {
+            Owner::Local(local) => local.try_idle_prompt(text),
+            Owner::Remote(remote) => remote.try_idle_prompt(text),
+        }
+    }
+    /// Exact source recognition is checked by the helper under this attachment epoch.
+    pub(crate) fn recognize_retained_sources(
+        &self,
+        sources: &[chat::Session],
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.call("recognize_sources", serde_json::json!([sources])),
+            Owner::Local(_) => Err("This actor has no retained source authority".into()),
+        }
+    }
     pub(crate) fn command_for_run(
         &self,
         run: crate::model::RunId,
@@ -254,7 +270,13 @@ impl Handle {
     }
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         match &self.0 {
-            Owner::Local(local) => local.close_if_idle(generation),
+            Owner::Local(local) => local.try_close_if_idle(generation).and_then(|closed| {
+                if closed {
+                    Ok(())
+                } else {
+                    Err("Provider state changed before conditional idle close".into())
+                }
+            }),
             Owner::Remote(remote) => {
                 remote.close_method("close_if_idle", serde_json::json!([generation]))
             }
@@ -322,6 +344,49 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.file_query(command),
             Owner::Remote(remote) => remote.call("file_query", serde_json::json!([command])),
+        }
+    }
+    /// Copy is served by the same Store which published the immutable source.
+    pub(crate) fn text_copy(
+        &self,
+        source: &chat::TextCopySource,
+        offset: u64,
+    ) -> Result<chat::TextCopyPage, String> {
+        match &self.0 {
+            Owner::Local(local) => local.text_copy(source, offset),
+            Owner::Remote(remote) => remote.call("text_copy", serde_json::json!([source, offset])),
+        }
+    }
+    pub(crate) fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
+        match &self.0 {
+            Owner::Local(local) => local.history_is_covered_by(reloaded),
+            Owner::Remote(_) => Err(
+                "Retained provider ownership requires authenticated close before release".into(),
+            ),
+        }
+    }
+    pub(crate) fn is_read_only_history(&self) -> bool {
+        matches!(&self.0, Owner::Local(local) if local.is_read_only_history())
+    }
+    pub(crate) fn resident_generation(&self) -> u64 {
+        match &self.0 {
+            Owner::Local(local) => {
+                local
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .generation
+            }
+            Owner::Remote(remote) => remote.state().generation,
+        }
+    }
+    pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+        match &self.0 {
+            Owner::Local(local) => local.try_close_if_idle(generation),
+            Owner::Remote(_) => Err(
+                "Retained provider ownership requires authenticated close before release".into(),
+            ),
         }
     }
     pub(crate) fn usage(&self) -> chat::Usage {

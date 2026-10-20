@@ -1001,7 +1001,20 @@ pub(crate) mod handoff {
 
     #[cfg(feature = "host")]
     pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
-        source.proof.is_some()
+        // Actor aliases are an explicit helper journal. A known issued source
+        // cannot synthesize an earlier unnamed capability.
+        (!matches!(
+            saved.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) || (saved.has_valid_native_continuity()
+            && source.has_valid_native_continuity()
+            && saved.native_continuity == source.native_continuity
+            && source
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+            && saved.launch.session_id == source.launch.session_id))
+            && source.proof.is_some()
             && saved.proof == source.proof
             && saved.id == source.id
             && saved.launch.provider == source.launch.provider

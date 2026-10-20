@@ -45,6 +45,9 @@ fn payload_digest(bytes: &[u8]) -> [u8; 32] {
 
 #[derive(Serialize, Deserialize)]
 enum InputPayload {
+    IdlePrompt {
+        text: String,
+    },
     Command {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -1416,6 +1419,14 @@ impl RemoteActor {
         let receiver = self.enqueue(run, command).map_err(Rejection::Refused)?;
         receiver.recv_timeout(Duration::from_secs(10)).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?.map_err(Rejection::Refused)
     }
+    pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+        let receiver = self
+            .enqueue_payload(InputPayload::IdlePrompt { text })
+            .map_err(Rejection::Refused)?;
+        receiver.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| Rejection::Unacknowledged("Retained idle prompt acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+            .map_err(Rejection::Refused)
+    }
     pub fn interrupt(
         &self,
         run: Option<crate::model::RunId>,
@@ -1563,6 +1574,7 @@ fn close_only_method(method: &str) -> bool {
         method,
         "state"
             | "execution_environment"
+            | "recognize_sources"
             | "snapshot"
             | "presentation"
             | "visible"
@@ -2177,6 +2189,26 @@ impl Server {
             | "exit_output" => {
                 Err("This retained actor protocol does not support this optional operation".into())
             }
+            "recognize_sources" => {
+                if !self.installed {
+                    return Err("Retained source recognition requires installed ownership".into());
+                }
+                let (sources,) = decode!((Vec<chat::Session>,));
+                if sources.is_empty() || sources.len() > 2 {
+                    return Err("Retained source recognition requires one exact source pair".into());
+                }
+                // The journal and authenticated update_source path record exact
+                // issued aliases. No descriptor normalization grants authority.
+                let journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+                if !sources.iter().all(|source| {
+                    source == &self.source
+                        || self.lineage.contains(source)
+                        || journal.published_sources().contains(source)
+                }) {
+                    return Err("Retained execution source is not an exact issued alias".into());
+                }
+                Ok(Value::Null)
+            }
             "resolve_source" => {
                 if !self.installed
                     || self.session_stopping
@@ -2314,6 +2346,9 @@ impl Server {
                 let (command, run, effects) = match serde_json::from_value::<InputPayload>(payload)
                     .map_err(|error| error.to_string())?
                 {
+                    InputPayload::IdlePrompt { text } => {
+                        (super::super::ActorCommand::IdlePrompt(text), None, None)
+                    }
                     InputPayload::Command {
                         run,
                         command,
@@ -2399,6 +2434,10 @@ impl Server {
                     )?;
                 }
                 value!(response)
+            }
+            "text_copy" => {
+                let (source, offset) = decode!((chat::TextCopySource, u64));
+                value!(self.actor.text_copy(&source, offset)?)
             }
             "file_query" => {
                 let (command,) = decode!((Command,));
@@ -2511,7 +2550,9 @@ impl Server {
             "close_if_idle" => {
                 let (generation,) = decode!((u64,));
                 if self.closed_snapshot.is_none() {
-                    self.actor.close_if_idle(generation)?;
+                    if !self.actor.try_close_if_idle(generation)? {
+                        return Err("Provider state changed before conditional idle close".into());
+                    }
                     reap_orphans()?;
                     self.finish_inputs();
                 }
@@ -3214,7 +3255,14 @@ mod tests {
                     .call::<()>("file_query", json!([Command::Refresh]))
                     .is_err()
             );
-            for method in ["input", "file_query", "preserve", "commit", "restart"] {
+            for method in [
+                "input",
+                "file_query",
+                "text_copy",
+                "preserve",
+                "commit",
+                "restart",
+            ] {
                 assert!(
                     bypass_proxy(&close.0, method, Value::Null)
                         .unwrap_err()

@@ -119,23 +119,91 @@ fn run(host: Weak<HostLock>, inbox: Arc<Inbox>) {
     }
 }
 
-/// Cleanup intent cannot create run authority. Non-run attention still commits
-/// its durable cursor and notification journal before any helper ACK. Unexpected
-/// run evidence remains retained for diagnosis instead of being discarded.
+/// An exact durable registration recognized by this helper attachment. The
+/// census can predate an acknowledged console or daemon-proof projection; both
+/// descriptors must be actual issued aliases, never inferred normalizations.
+struct ExecutionOwner(super::super::model::NativeActorOwnership);
+
+impl ExecutionOwner {
+    fn authenticate(
+        owner: Option<super::super::model::NativeActorOwnership>,
+        identity: &chat::runtime::ActorIdentity,
+        source: &Session,
+        scope: Result<&crate::account::scope::LaunchAccountScope, &str>,
+        recognize: impl FnOnce(&[Session]) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let owner = owner.ok_or("Retained execution lost its durable ownership registration")?;
+        if owner.is_pending() {
+            return Err("Pending cleanup intent cannot commit execution or affected-run loss; evidence remains unacknowledged".into());
+        }
+        if owner.actor() != identity.instance
+            || owner.owner() != &identity.record
+            || owner.scope() != scope
+        {
+            return Err("Retained execution changed its registered actor or captured account; evidence remains unacknowledged".into());
+        }
+        recognize(&[owner.source().clone(), source.clone()])?;
+        Ok(Self(owner))
+    }
+}
+
+/// Acquire epoch-authenticated source recognition once per drain, outside both
+/// HOST and Registry locks. Non-run attention and zero-run loss remain usable
+/// by cleanup-only owners and do not acquire execution authority.
+fn capture_execution_owner<'a>(
+    registry: &super::super::agent_execution::SharedRegistry,
+    handle: &Handle,
+    identity: &chat::runtime::ActorIdentity,
+    source: &Session,
+    execution: bool,
+    captured: &'a mut Option<ExecutionOwner>,
+) -> Result<Option<&'a ExecutionOwner>, String> {
+    if !execution {
+        return Ok(None);
+    }
+    if captured.is_none() {
+        let owner = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_actor_ownership(identity.instance)?;
+        *captured = Some(ExecutionOwner::authenticate(
+            owner,
+            identity,
+            source,
+            handle.launch_account_scope(),
+            |sources| handle.recognize_retained_sources(sources),
+        )?);
+    }
+    Ok(captured.as_ref())
+}
+
+/// Recheck the exact captured row under the same Registry mutex as settlement.
+/// Revocation, mutation or retirement after helper recognition cannot authorize
+/// a durable run transition or the helper ACK that follows it.
 fn require_execution_owner(
     registry: &super::super::model::Registry,
-    actor: uuid::Uuid,
+    captured: Option<&ExecutionOwner>,
     execution: bool,
 ) -> Result<(), String> {
-    if execution
-        && registry
-            .native_actor_ownership(actor)?
-            .is_some_and(|owner| owner.is_pending())
-    {
-        return Err("Pending cleanup intent cannot commit execution or affected-run loss; evidence remains unacknowledged".into());
+    if !execution {
+        return Ok(());
+    }
+    let captured = captured.ok_or("Retained execution lacks authenticated source ownership")?;
+    let owner = registry
+        .native_actor_ownership(captured.0.actor())?
+        .ok_or("Retained execution lost its durable ownership registration")?;
+    if owner != captured.0 || owner.is_pending() {
+        return Err("Retained execution ownership changed after source authentication; evidence remains unacknowledged".into());
+    }
+    if registry.native_actor_retirement(owner.actor())?.is_some() {
+        return Err("A retired actor cannot commit execution or affected-run loss; evidence remains unacknowledged".into());
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "retained_execution_owner_tests.rs"]
+mod execution_owner_tests;
 
 fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let (handle, source, identity, notifications) = {
@@ -154,12 +222,22 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         )
     };
     let registry = super::super::agent_execution::registry(host)?;
+    let mut execution_owner = None;
     handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
+        let execution = !loss.affected_runs.is_empty();
+        let owner = capture_execution_owner(
+            &registry,
+            &handle,
+            &identity,
+            &source,
+            execution,
+            &mut execution_owner,
+        )?;
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(&registry, identity.instance, !loss.affected_runs.is_empty())?;
+            require_execution_owner(&registry, owner, execution)?;
             registry.commit_native_actor_loss(
                 identity.instance,
                 &identity.record,
@@ -178,7 +256,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             .chats
             .get(&id)
             .is_some_and(|record| {
-                record.handle.same_actor(&handle)
+                record.handle.same_attachment(&handle)
                     && record.execution_instance == identity.instance
                     && record.session == source
             });
@@ -200,13 +278,18 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             }
             _ => return Err("The retained semantic outbox contains an unsupported event".into()),
         };
+        let execution = matches!(semantic, NativeActorEvent::Execution { .. });
+        let owner = capture_execution_owner(
+            &registry,
+            &handle,
+            &identity,
+            &source,
+            execution,
+            &mut execution_owner,
+        )?;
         let (changed, automation) = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(
-                &registry,
-                identity.instance,
-                matches!(semantic, NativeActorEvent::Execution { .. }),
-            )?;
+            require_execution_owner(&registry, owner, execution)?;
             let changed = registry.commit_native_actor_event(
                 identity.instance,
                 &identity.record,
@@ -256,7 +339,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
             .chats
             .get(&id)
             .is_some_and(|record| {
-                record.handle.same_actor(&handle)
+                record.handle.same_attachment(&handle)
                     && record.session == source
                     && record.execution_instance == identity.instance
             });
@@ -666,7 +749,7 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None)
+    close_with_target(host, requested, discovered, None, None)
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -674,8 +757,9 @@ pub(super) fn close_captured(
     host: &SharedHost,
     requested: &Session,
     target: &super::CloseTarget,
+    closing: Option<&super::capacity::Reservation>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target))
+    close_with_target(host, requested, None, Some(target), closing)
 }
 
 fn close_with_target(
@@ -683,6 +767,7 @@ fn close_with_target(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
     expected: Option<&super::CloseTarget>,
+    closing: Option<&super::capacity::Reservation>,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -700,7 +785,10 @@ fn close_with_target(
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
-            || state.chat_spawning.contains_key(&requested.id)
+            || closing.map_or_else(
+                || state.chat_spawning.contains_key(&requested.id),
+                |closing| !closing.holds(&state, requested.id),
+            )
             || state.chat_handoffs.contains_key(&requested.id)
             || state.native_closing.contains_key(&requested.id)
         {
@@ -714,14 +802,16 @@ fn close_with_target(
         {
             return Err("The exact hosted attachment changed before retained cleanup".into());
         }
-        state.chat_spawning.insert(requested.id, requested.clone());
-        state.inventory_generation += 1;
+        if closing.is_none() {
+            state.chat_spawning.insert(requested.id, requested.clone());
+            state.inventory_generation += 1;
+        }
         state.proof().clone()
     };
-    let _reservation = Reservation {
+    let _reservation = closing.is_none().then(|| Reservation {
         host: host.clone(),
         source: requested.clone(),
-    };
+    });
     let present = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1179,15 +1269,21 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
     };
     let registry = super::super::agent_execution::registry(host)?;
     for (handle, source, identity) in actors {
+        let mut execution_owner = None;
         handle.refresh_retained_state()?;
         if let Some(loss) = handle.continuity_loss() {
+            let execution = !loss.affected_runs.is_empty();
+            let owner = capture_execution_owner(
+                &registry,
+                &handle,
+                &identity,
+                &source,
+                execution,
+                &mut execution_owner,
+            )?;
             let changed = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                require_execution_owner(
-                    &registry,
-                    identity.instance,
-                    !loss.affected_runs.is_empty(),
-                )?;
+                require_execution_owner(&registry, owner, execution)?;
                 registry.commit_native_actor_loss(
                     identity.instance,
                     &identity.record,
@@ -1199,6 +1295,21 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
             };
             if changed {
                 super::super::agent_execution::announce(host, &registry);
+            }
+            let current = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| {
+                    record.handle.same_attachment(&handle)
+                        && record.execution_instance == identity.instance
+                        && record.session == source
+                });
+            if !current {
+                return Err(
+                    "Retained startup ownership changed before loss acknowledgement".into(),
+                );
             }
             handle.ack_continuity_loss(loss.id)?;
         }
@@ -1393,6 +1504,7 @@ pub(in crate::host) fn finish_close(
         RetirementInspection::Running => {}
     }
     let registry = super::super::agent_execution::registry(host)?;
+    let mut execution_owner = None;
     let source = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         match registry
@@ -1413,9 +1525,18 @@ pub(in crate::host) fn finish_close(
     handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
+        let execution = !loss.affected_runs.is_empty();
+        let owner = capture_execution_owner(
+            &registry,
+            &handle,
+            &identity,
+            &source,
+            execution,
+            &mut execution_owner,
+        )?;
         let changed = {
             let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_execution_owner(&registry, identity.instance, !loss.affected_runs.is_empty())?;
+            require_execution_owner(&registry, owner, execution)?;
             registry.commit_native_actor_loss(
                 identity.instance,
                 &identity.record,
@@ -1434,7 +1555,7 @@ pub(in crate::host) fn finish_close(
                 && state
                     .chats
                     .get(&source.id)
-                    .is_some_and(|record| record.handle.same_actor(handle))
+                    .is_some_and(|record| record.handle.same_attachment(handle))
         };
         if !current {
             return Err(
@@ -1462,13 +1583,18 @@ pub(in crate::host) fn finish_close(
                     );
                 }
             };
+            let execution = matches!(event, NativeActorEvent::Execution { .. });
+            let owner = capture_execution_owner(
+                &registry,
+                &handle,
+                &identity,
+                &source,
+                execution,
+                &mut execution_owner,
+            )?;
             let (changed, automation) = {
                 let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                require_execution_owner(
-                    &registry,
-                    identity.instance,
-                    matches!(event, NativeActorEvent::Execution { .. }),
-                )?;
+                require_execution_owner(&registry, owner, execution)?;
                 let changed = registry.commit_native_actor_event(
                     identity.instance,
                     &identity.record,
@@ -1512,7 +1638,7 @@ pub(in crate::host) fn finish_close(
                     && state
                         .chats
                         .get(&source.id)
-                        .is_some_and(|record| record.handle.same_actor(handle))
+                        .is_some_and(|record| record.handle.same_attachment(handle))
             };
             if !current {
                 return Err("Actor close ownership changed before final acknowledgement".into());

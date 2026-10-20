@@ -611,7 +611,7 @@ fn current_session_snapshot(
         || state.chats.get(&session.id).is_none_or(|current| {
             current.session != session
                 || current.execution_instance != execution_instance
-                || !current.handle.same_actor(&handle)
+                || !current.handle.same_attachment(&handle)
         })
     {
         return Err(unavailable(
@@ -968,8 +968,7 @@ fn start_with_execution(
             "A terminal handoff must use the proven source environment, not a client override",
         ));
     }
-    if session.native_continuity.retains_provider() || has_native_owner(&session)?
-    {
+    if session.native_continuity.retains_provider() || has_native_owner(&session)? {
         return native_recovery::restore_with_admission(host, client, &session, admission)
             .map_err(unavailable);
     }
@@ -2979,6 +2978,19 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
+    let closing = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state
+            .chats
+            .get(&chat_id)
+            .is_some_and(|record| target.matches(record))
+        {
+            return Err(unavailable(
+                "The exact native attachment changed before close",
+            ));
+        }
+        capacity::Reservation::closing(host, &mut state, &source)?
+    };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
     handle.close_for_resume().map_err(unavailable)?;
@@ -3018,7 +3030,7 @@ pub(super) fn close_captured(
         // gone. A server preserved by an earlier failed adoption must
         // also acknowledge exact cleanup before this close can succeed.
         target.require_current(host)?;
-        native_cleanup::close_captured(host, &retained, &target).map_err(unavailable)?;
+        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     let terminal = {
@@ -3063,10 +3075,11 @@ pub(super) fn close_captured(
     }
     let record = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state
-            .chats
-            .get(&chat_id)
-            .is_some_and(|record| target.matches(record))
+        if !closing.holds(&state, chat_id)
+            || !state
+                .chats
+                .get(&chat_id)
+                .is_some_and(|record| target.matches(record))
         {
             return Err(unavailable(
                 "The thread changed while its previous actor was closing.",
@@ -3096,6 +3109,7 @@ pub(super) fn close_captured(
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     drop(record);
+    super::state::retire_recovered_upgrade_chat(host, chat_id);
     Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
 
