@@ -289,14 +289,20 @@ pub enum Action {
     FindRetry(Target),
     FindGroups(Target, u64, u64, u64, Option<find_navigation::RawResult>),
     FindHighlight(Target, u64),
-    FindHighlighted(Target, u64, Option<find_navigation::HighlightResult>),
+    FindHighlighted(
+        Target,
+        u64,
+        Arc<AtomicBool>,
+        Option<find_navigation::HighlightResult>,
+    ),
     FindResume(Target, find_navigation::Intent, bool),
     FindExpired(Target, find_navigation::Intent),
     FindIndexed(
         Target,
         find_navigation::Intent,
         find_navigation::DocumentEpoch,
-        Option<find_navigation::Ready<Option<find_navigation::Hit>>>,
+        Arc<AtomicBool>,
+        Option<find_navigation::CatalogResult>,
     ),
     FindLocated(
         Target,
@@ -8922,15 +8928,15 @@ impl Cagents {
                 return self.find_groups(target, epoch, query_epoch, run, result);
             }
             Action::FindHighlight(target, id) => return self.find_highlight(target, id),
-            Action::FindHighlighted(target, id, ready) => {
-                return self.find_highlighted(target, id, ready);
+            Action::FindHighlighted(target, id, attempt, ready) => {
+                return self.find_highlighted(target, id, attempt, ready);
             }
             Action::FindResume(target, intent, geometry_changed) => {
                 return self.resume_find_navigation(target, intent, geometry_changed);
             }
             Action::FindExpired(target, intent) => self.expire_find_navigation(target, intent),
-            Action::FindIndexed(target, intent, epoch, hit) => {
-                return self.find_indexed(target, intent, epoch, hit);
+            Action::FindIndexed(target, intent, epoch, attempt, hit) => {
+                return self.find_indexed(target, intent, epoch, attempt, hit);
             }
             Action::FindLocated(target, intent, epoch, location) => {
                 return self.find_located(target, intent, epoch, location);

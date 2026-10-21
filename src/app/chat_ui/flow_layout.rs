@@ -2627,8 +2627,12 @@ impl Entry {
     pub(super) fn complete_find_highlights(
         &mut self,
         target: Target,
+        attempt: &Arc<AtomicBool>,
         result: Option<find_navigation::Highlight>,
     ) {
+        if !self.matches_find_request(attempt) {
+            return;
+        }
         self.find_requested = None;
         self.find_deferred = None;
         if let Some(result) = result.filter(|found| {
@@ -2639,11 +2643,34 @@ impl Entry {
             self.find_highlight = Some(result);
         }
     }
+    pub(super) fn matches_find_request(&self, attempt: &Arc<AtomicBool>) -> bool {
+        self.find_requested
+            .as_ref()
+            .is_some_and(|(_, _, _, current)| Arc::ptr_eq(current, attempt))
+    }
+    pub(super) fn current_find_request(&self, target: Target, attempt: &Arc<AtomicBool>) -> bool {
+        self.matches_find_request(attempt)
+            && find_navigation::has_highlight_context(target)
+            && self
+                .find_requested
+                .as_ref()
+                .is_some_and(|(clock, epoch, source, _)| {
+                    clock.load(Ordering::Acquire) == *epoch
+                        && self.ready.as_ref().is_some_and(|ready| {
+                            std::ptr::eq(source.as_ptr(), Arc::as_ptr(&ready.plain))
+                        })
+                })
+    }
 }
 
 #[cfg(test)]
 impl Entry {
     pub(super) fn id_for_find_test(&self) -> u64 {
         self.id
+    }
+    pub(super) fn find_attempt_for_test(&self) -> Option<Arc<AtomicBool>> {
+        self.find_requested
+            .as_ref()
+            .map(|(_, _, _, attempt)| attempt.clone())
     }
 }

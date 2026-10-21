@@ -286,7 +286,8 @@ impl Cagents {
             .as_ref()
             .is_some_and(|alive| !alive.load(Ordering::Acquire))
         {
-            pending.worker_alive = None;
+            // A finished worker may still own a queued Ready and the sole
+            // slot. Preserve its token until consumption or new admission.
             pending.in_flight = false;
         }
         if pending.in_flight || (pending.wait_for_shape && !geometry_changed) {
@@ -322,6 +323,7 @@ impl Cagents {
         }
         pending.wait_for_shape = false;
         let task = if let Some(hit) = &pending.hit {
+            pending.worker_alive = None;
             pending.in_flight = true;
             let intent = intent.clone();
             scroll::locate_logical(target, hit.item.clone(), hit.identity, hit.byte).map(
@@ -344,7 +346,8 @@ impl Cagents {
             let ids = current.iter().map(|item| item.id.clone()).collect();
             let (_, catalog) = document(runtime);
             let work = Work::new(Input::Catalog(catalog.owned_search_blocks(&ids)), permit);
-            pending.worker_alive = Some(work.alive());
+            let attempt = work.alive();
+            pending.worker_alive = Some(attempt.clone());
             let plan = runtime
                 .find_navigation
                 .raw
@@ -356,29 +359,32 @@ impl Cagents {
             pending.in_flight = true;
             cosmic::task::future(async move {
                 let hit = tokio::task::spawn_blocking(move || {
-                    let Input::Catalog(blocks) = work.input() else {
-                        unreachable!()
-                    };
-                    let mut hit = None;
-                    for (item, identity, text) in blocks {
-                        let found = find::matched_pattern_checked(text, &plan.pattern, 1, &|| {
-                            proof.document_current(epoch)
-                        })?;
-                        if let Some(range) = found.ranges.first() {
-                            hit = Some(Hit {
-                                item: item.to_string(),
-                                identity: *identity,
-                                byte: range.start,
-                            });
-                            break;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Input::Catalog(blocks) = work.input() else {
+                            unreachable!()
+                        };
+                        for (item, identity, text) in blocks {
+                            let found =
+                                find::matched_pattern_checked(text, &plan.pattern, 1, &|| {
+                                    proof.document_current(epoch)
+                                })
+                                .ok_or(RawFailure::Canceled)?;
+                            if let Some(range) = found.ranges.first() {
+                                return Ok(Some(Hit {
+                                    item: item.to_string(),
+                                    identity: *identity,
+                                    byte: range.start,
+                                }));
+                            }
                         }
-                    }
-                    Some(work.finish(hit))
+                        Ok(None)
+                    }))
+                    .unwrap_or(Err(RawFailure::Worker));
+                    work.finish(outcome)
                 })
                 .await
-                .ok()
-                .flatten();
-                action(Action::FindIndexed(target, intent, epoch, hit))
+                .ok();
+                action(Action::FindIndexed(target, intent, epoch, attempt, hit))
             })
         };
         runtime.find_navigation.pending = Some(pending);
@@ -412,9 +418,9 @@ impl Cagents {
         target: Target,
         intent: Intent,
         epoch: DocumentEpoch,
-        hit: Option<Ready<Option<Hit>>>,
+        attempt: Arc<AtomicBool>,
+        hit: Option<CatalogResult>,
     ) -> Task<Message> {
-        let hit = hit.and_then(Ready::take).flatten();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -422,7 +428,13 @@ impl Cagents {
             .find_navigation
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.intent.epoch == intent.epoch);
+            .is_some_and(|pending| {
+                pending.intent.epoch == intent.epoch
+                    && pending
+                        .worker_alive
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &attempt))
+            });
         if !current {
             return self.resume_current_find(target, true);
         }
@@ -437,7 +449,19 @@ impl Cagents {
         pending.in_flight = false;
         pending.worker_alive = None;
         if epoch == now && intent.current() {
-            pending.hit = hit;
+            match hit.and_then(Ready::take).unwrap_or(Err(RawFailure::Worker)) {
+                Ok(hit) => pending.hit = hit,
+                Err(RawFailure::Canceled) => {
+                    pending.hit = None;
+                    pending.document = None;
+                    return self.resume_current_find(target, true);
+                }
+                Err(_) => {
+                    runtime.find_navigation.raw.failed = Some(RawFailure::Worker);
+                    runtime.find_navigation.cancel_navigation();
+                    return Task::none();
+                }
+            }
             if pending.hit.is_none() {
                 // Matching metadata has no rendered plaintext byte. Keep the
                 // honest coarse anchor behavior without inventing glyph proof.
@@ -736,6 +760,7 @@ impl<T: Send + Sync + 'static> Ready<T> {
     }
 }
 pub(super) type RawResult = Ready<Result<RawOutput, RawFailure>>;
+pub(super) type CatalogResult = Ready<Result<Option<Hit>, RawFailure>>;
 #[derive(Clone)]
 pub(super) struct RawOutput(Arc<RawOwner>);
 struct RawOwner(Option<RawData>);
@@ -1485,7 +1510,7 @@ impl Highlight {
             && std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(source))
     }
 }
-pub(super) type HighlightResult = Ready<Highlight>;
+pub(super) type HighlightResult = Ready<Result<Highlight, RawFailure>>;
 impl Cagents {
     pub(super) fn find_highlight(&mut self, target: Target, id: u64) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -1539,52 +1564,88 @@ impl Cagents {
         };
         let proof = Arc::downgrade(&source);
         let work = Work::new(Input::Highlight(source), permit);
+        let attempt = work.alive();
         entry.borrow_mut().request_find_highlights(
             &context.clock,
             context.epoch,
             &proof,
-            work.alive(),
+            attempt.clone(),
         );
         cosmic::task::future(async move {
             let ready = tokio::task::spawn_blocking(move || {
-                let Input::Highlight(source) = work.input() else {
-                    unreachable!()
-                };
-                let found = find::matched_pattern_checked(
-                    source,
-                    &context.plan.pattern,
-                    find::HIGHLIGHT_LIMIT,
-                    &|| context.current(),
-                )?;
-                Some(work.finish(Highlight {
-                    clock: context.clock.clone(),
-                    epoch: context.epoch,
-                    source: proof,
-                    marks: Marks(Arc::new(MarkData {
-                        ranges: found.ranges,
-                        truncated: found.truncated,
-                        _budget: Some(MarkBudget(Some(output))),
-                    })),
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Input::Highlight(source) = work.input() else {
+                        unreachable!()
+                    };
+                    let found = find::matched_pattern_checked(
+                        source,
+                        &context.plan.pattern,
+                        find::HIGHLIGHT_LIMIT,
+                        &|| context.current(),
+                    )
+                    .ok_or(RawFailure::Canceled)?;
+                    Ok(Highlight {
+                        clock: context.clock.clone(),
+                        epoch: context.epoch,
+                        source: proof,
+                        marks: Marks(Arc::new(MarkData {
+                            ranges: found.ranges,
+                            truncated: found.truncated,
+                            _budget: Some(MarkBudget(Some(output))),
+                        })),
+                    })
                 }))
+                .unwrap_or(Err(RawFailure::Worker));
+                work.finish(outcome)
             })
             .await
-            .ok()
-            .flatten();
-            action(Action::FindHighlighted(target, id, ready))
+            .ok();
+            action(Action::FindHighlighted(target, id, attempt, ready))
         })
     }
     pub(super) fn find_highlighted(
         &mut self,
         target: Target,
         id: u64,
+        attempt: Arc<AtomicBool>,
         ready: Option<HighlightResult>,
     ) -> Task<Message> {
-        let result = ready.and_then(Ready::take);
-        if self.chat_runtime_mut(target).is_some()
-            && let Some(entry) = flow_layout::find_id(target, id)
-        {
-            entry.borrow_mut().complete_find_highlights(target, result);
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.visible.load(Ordering::Relaxed) {
+            return Task::none();
         }
+        let Some(entry) = flow_layout::find_id(target, id) else {
+            return Task::none();
+        };
+        if !entry.borrow().matches_find_request(&attempt) {
+            return Task::none();
+        }
+        if !entry.borrow().current_find_request(target, &attempt) {
+            entry
+                .borrow_mut()
+                .complete_find_highlights(target, &attempt, None);
+            return self.resume_current_find(target, true);
+        }
+        let result = match ready
+            .and_then(Ready::take)
+            .unwrap_or(Err(RawFailure::Worker))
+        {
+            Ok(found) => Some(found),
+            Err(RawFailure::Canceled) => None,
+            Err(_) => {
+                entry
+                    .borrow_mut()
+                    .complete_find_highlights(target, &attempt, None);
+                runtime.find_navigation.raw.failed = Some(RawFailure::Worker);
+                runtime.find_navigation.cancel_navigation();
+                return Task::none();
+            }
+        };
+        entry
+            .borrow_mut()
+            .complete_find_highlights(target, &attempt, result);
         self.resume_current_find(target, true)
     }
 }
@@ -1887,11 +1948,11 @@ mod tests {
         let mut accepted = false;
         for effect in effects {
             if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
-                Action::FindHighlighted(found, key, result),
+                Action::FindHighlighted(found, key, attempt, result),
             ))) = effect
             {
                 assert_eq!((found, key), (target, id));
-                drop(app.find_highlighted(found, key, result));
+                drop(app.find_highlighted(found, key, attempt, result));
                 accepted = true;
             }
         }
@@ -1899,6 +1960,198 @@ mod tests {
             accepted,
             "actual admitted Find worker returned its typed result"
         );
+    }
+    fn completion_reply(task: Task<Message>) -> Action {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("actual admitted completion task");
+            while let Some(effect) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    reply @ (Action::FindIndexed(..) | Action::FindHighlighted(..)),
+                ))) = effect
+                {
+                    return reply;
+                }
+            }
+            panic!("admitted Catalog/Highlight returns its typed completion")
+        })
+    }
+    #[test]
+    fn catalog_attempt_survives_queued_ready_and_rejects_old_none_and_duplicate_some_after_rewrite()
+    {
+        preparation::retirement_barrier();
+        let (mut app, target, handle) = runtime("original needle body");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let intent = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .guard();
+        let reply = completion_reply(app.resume_find_navigation(target, intent.clone(), false));
+        let duplicate = reply.clone();
+        let Action::FindIndexed(_, _, old_document, old_attempt, _) = &reply else {
+            panic!("actual Catalog reply")
+        };
+        let (old_document, old_attempt) = (*old_document, old_attempt.clone());
+        assert!(!old_attempt.load(Ordering::Acquire));
+        assert!(
+            admit().is_none(),
+            "queued Catalog Ready retains the SAME slot before UI consumption"
+        );
+        drop(app.resume_find_navigation(target, intent.clone(), false));
+        assert!(
+            Arc::ptr_eq(
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .worker_alive
+                    .as_ref()
+                    .unwrap(),
+                &old_attempt
+            ),
+            "a queued Ready keeps its exact token after worker_alive becomes false"
+        );
+        drop(app.handle_chat_ui(reply));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .find_navigation
+                .pending
+                .as_ref()
+                .unwrap()
+                .hit
+                .is_some()
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        let old = snapshot.items[0].clone();
+        snapshot.items[0] = Arc::new(chat::Item {
+            content: ItemContent::Text {
+                text: "rewritten current needle body".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ..(*old).clone()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        let newer = app.resume_find_navigation(target, intent.clone(), false);
+        let pending = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .pending
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            pending.intent.epoch, intent.epoch,
+            "real source rewrite preserves the same navigation intent"
+        );
+        let current = pending.worker_alive.as_ref().unwrap().clone();
+        let passes = pending.passes;
+        assert!(!Arc::ptr_eq(&current, &old_attempt));
+        assert!(current.load(Ordering::Acquire));
+        // Body-free exceptional completion injection is a consumer control;
+        // the runtime is not claimed to have generated a JoinError here.
+        drop(app.handle_chat_ui(Action::FindIndexed(
+            target,
+            intent.clone(),
+            old_document,
+            old_attempt,
+            None,
+        )));
+        drop(app.handle_chat_ui(duplicate));
+        let pending = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .pending
+            .as_ref()
+            .unwrap();
+        assert!(
+            pending.in_flight && Arc::ptr_eq(pending.worker_alive.as_ref().unwrap(), &current),
+            "old Catalog None and duplicate consumed Some cannot clear a newer same-intent attempt"
+        );
+        assert_eq!(pending.passes, passes);
+        let reply = completion_reply(newer);
+        drop(app.handle_chat_ui(reply));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(
+            runtime
+                .find_navigation
+                .pending
+                .as_ref()
+                .unwrap()
+                .hit
+                .as_ref()
+                .unwrap()
+                .byte,
+            "rewritten current ".len()
+        );
+        assert!(runtime.find_error().is_none());
+        drop(app);
+        preparation::retirement_barrier();
+    }
+    #[test]
+    fn highlight_attempt_rejects_old_none_and_duplicate_some_before_clearing_current_request() {
+        preparation::retirement_barrier();
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let cache = flow_layout::Cache::default();
+        let entry = cache.entry(
+            991,
+            vec![iced::widget::text::Span::new("needle ".repeat(80))].into(),
+        );
+        entry.borrow_mut().bind_target(target);
+        entry
+            .borrow_mut()
+            .configure(600.0, iced::Pixels(14.0), iced::Font::default());
+        entry.borrow_mut().set_find_visible(true);
+        assert!(cache.complete_fixture());
+        let id = entry.borrow_mut().find_request_id(target).unwrap();
+        let reply = completion_reply(app.find_highlight(target, id));
+        let duplicate = reply.clone();
+        let Action::FindHighlighted(_, _, old_attempt, _) = &reply else {
+            panic!("actual Highlight reply")
+        };
+        let old_attempt = old_attempt.clone();
+        assert!(
+            admit().is_none(),
+            "queued Highlight Ready retains the SAME slot"
+        );
+        drop(app.handle_chat_ui(reply));
+        assert_eq!(entry.borrow_mut().find_highlights(target).len(), 80);
+        drop(app.handle_chat_ui(Action::Find(target, "NEEDLE".into())));
+        let newer = app.find_highlight(target, id);
+        let current = entry.borrow().find_attempt_for_test().unwrap();
+        assert!(!Arc::ptr_eq(&current, &old_attempt));
+        assert!(current.load(Ordering::Acquire));
+        drop(app.handle_chat_ui(Action::FindHighlighted(target, id, old_attempt, None)));
+        drop(app.handle_chat_ui(duplicate));
+        assert!(
+            entry.borrow().matches_find_request(&current),
+            "old Highlight None and duplicate consumed Some cannot clear a newer request"
+        );
+        assert!(!entry.borrow_mut().needs_find_highlights(target));
+        assert!(app.chat_runtime_mut(target).unwrap().find_error().is_none());
+        let reply = completion_reply(newer);
+        drop(app.handle_chat_ui(reply));
+        assert_eq!(entry.borrow_mut().find_highlights(target).len(), 80);
+        assert!(entry.borrow_mut().find_request_id(target).is_none());
+        drop(app);
+        drop(entry);
+        drop(cache);
+        preparation::retirement_barrier();
     }
     #[test]
     fn unpolled_find_input_retires_before_the_same_sole_permit() {
@@ -2423,7 +2676,7 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         let old = runtime.find_navigation.search.load(Ordering::Acquire);
         assert!(
-            runtime.find_error().unwrap().contains("capacity"),
+            runtime.find_error().is_some(),
             "actual admitted query overflow is a visible refusal, never 0 successful matches"
         );
         assert!(!runtime.find_searching());
@@ -2503,9 +2756,9 @@ fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
 impl Runtime {
     pub(super) fn find_error(&self) -> Option<&'static str> {
         match self.find_navigation.raw.failed {
-            Some(RawFailure::TooLarge) => {
-                Some("Search exceeds indexing capacity. Narrow the query or transcript.")
-            }
+            Some(RawFailure::TooLarge) => Some(
+                "Search is too large to finish. Try a shorter query or a smaller conversation.",
+            ),
             Some(RawFailure::Worker) => Some("Search could not finish. Retry search."),
             _ => None,
         }
@@ -2514,5 +2767,16 @@ impl Runtime {
         self.find.as_ref().is_some_and(|query| !query.is_empty())
             && !self.find_navigation.raw.complete
             && self.find_error().is_none()
+    }
+}
+
+/// Rendering transports only an enabled query epoch. Actual query text and
+/// matching authority stay in the admitted shared Pattern context.
+pub(super) fn query_epoch(target: Target) -> u64 {
+    highlight_context(target).map_or(0, |context| context.epoch)
+}
+impl State {
+    pub(super) fn search_epoch(&self) -> u64 {
+        self.search.load(Ordering::Acquire)
     }
 }
