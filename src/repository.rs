@@ -874,6 +874,16 @@ pub struct WorkingFiles {
     pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
 }
 
+/// The paths one worktree's index tracks, for watching them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexPaths {
+    /// Sorted, with conflict stages collapsed into one path.
+    pub paths: Vec<RepoPath>,
+    /// Whether any entry is a gitlink: a submodule, whose contents the index
+    /// does not list.
+    pub gitlinks: bool,
+}
+
 /// Everything the source-control surfaces need about one worktree in one shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
@@ -3542,6 +3552,30 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let parsed = parse_working_files(&output.stdout);
+        invalid_output(parsed, output)
+    }
+
+    /// What the index of `worktree` tracks. Entry modes tell submodules apart,
+    /// where [`Self::tracked_files`] would need a `stat` per path.
+    pub fn index_paths(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<IndexPaths, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(worktree, ["ls-files", "-s", "-z"]),
+            cancellation,
+        )?;
+        let parsed = parse_index_entries(&output.stdout).map(|entries| {
+            let gitlinks = entries.iter().any(|entry| entry.mode == GITLINK_MODE);
+            let mut paths = entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            // Git lists the index in path order, conflict stages adjacent.
+            paths.dedup();
+            IndexPaths { paths, gitlinks }
+        });
         invalid_output(parsed, output)
     }
 
