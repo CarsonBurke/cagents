@@ -54,6 +54,11 @@ pub(super) struct Entry {
     failed: bool,
     ready: Option<Arc<Prepared>>,
     cancelled: Arc<AtomicBool>,
+    find_highlight: Option<find_navigation::Highlight>,
+    find_requested: Option<(Arc<AtomicU64>, u64, std::sync::Weak<str>, Arc<AtomicBool>)>,
+    find_touched: u64,
+    find_visible: bool,
+    find_deferred: Option<u64>,
 }
 impl Drop for Entry {
     fn drop(&mut self) {
@@ -320,6 +325,11 @@ impl Cache {
             failed: false,
             ready: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            find_highlight: None,
+            find_requested: None,
+            find_touched: 0,
+            find_visible: false,
+            find_deferred: None,
         }));
         // Prune in batches rather than walking visited history on each
         // request or keeping an unbounded set of dead presentation headers.
@@ -2132,6 +2142,7 @@ fn last_flow_entry_request_and_action_retire_real_raw_spans_after_canonical_and_
             palettes: None,
             item: None,
             prepared_tools: None,
+            prompt: None,
         });
         drop(document);
         preparation::retirement_barrier();
@@ -2283,6 +2294,7 @@ fn queued_none_flow_results_hold_admission_through_cancellation_error_and_worker
             palettes: None,
             item: None,
             prepared_tools: None,
+            prompt: None,
         });
         drop(document);
         preparation::retirement_barrier();
@@ -2526,5 +2538,112 @@ fn stalled_ui_delivery_holds_output_admission_until_installation_or_discard() {
             assert!(entry.borrow().prepared().is_none());
             drop(next);
         }
+    }
+}
+
+pub(super) fn find_id(target: Target, id: u64) -> Option<Handle> {
+    REQUESTS
+        .with(|requests| requests.borrow().get(&id).and_then(std::rc::Weak::upgrade))
+        .filter(|entry| entry.borrow().target == Some(target))
+}
+pub(super) fn evict_find_highlights(except: u64) {
+    let oldest = REQUESTS.with(|requests| {
+        requests
+            .borrow()
+            .values()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|entry| {
+                let entry = entry.borrow();
+                entry.id != except && !entry.find_visible && entry.find_highlight.is_some()
+            })
+            .min_by_key(|entry| entry.borrow().find_touched)
+    });
+    if let Some(entry) = oldest {
+        entry.borrow_mut().find_highlight = None;
+    }
+}
+impl Entry {
+    pub(super) fn find_highlights(&mut self, target: Target) -> find_navigation::Marks {
+        static TOUCH: AtomicU64 = AtomicU64::new(1);
+        self.find_touched = TOUCH.fetch_add(1, Ordering::Relaxed);
+        if self
+            .find_highlight
+            .as_ref()
+            .zip(self.ready.as_ref())
+            .is_some_and(|(found, ready)| found.current(target, &ready.plain))
+        {
+            return self.find_highlight.as_ref().unwrap().marks.clone();
+        }
+        self.find_highlight = None;
+        find_navigation::Marks::default()
+    }
+    pub(super) fn needs_find_highlights(&mut self, target: Target) -> bool {
+        if !self.find_visible || !find_navigation::has_highlight_context(target) {
+            return false;
+        }
+        if self.find_deferred == Some(find_navigation::available_epoch()) {
+            return false;
+        }
+        let Some(ready) = &self.ready else {
+            return false;
+        };
+        if self
+            .find_highlight
+            .as_ref()
+            .is_some_and(|found| found.current(target, &ready.plain))
+        {
+            return false;
+        }
+        !self
+            .find_requested
+            .as_ref()
+            .is_some_and(|(clock, epoch, source, alive)| {
+                alive.load(Ordering::Acquire)
+                    && clock.load(Ordering::Acquire) == *epoch
+                    && std::ptr::eq(source.as_ptr(), Arc::as_ptr(&ready.plain))
+            })
+    }
+    pub(super) fn set_find_visible(&mut self, visible: bool) {
+        if self.find_visible != visible {
+            self.find_deferred = None;
+        }
+        self.find_visible = visible;
+    }
+    pub(super) fn defer_find_highlights(&mut self) {
+        self.find_deferred = Some(find_navigation::available_epoch());
+    }
+    pub(super) fn find_request_id(&mut self, target: Target) -> Option<u64> {
+        self.needs_find_highlights(target).then_some(self.id)
+    }
+    pub(super) fn request_find_highlights(
+        &mut self,
+        clock: &Arc<AtomicU64>,
+        epoch: u64,
+        source: &std::sync::Weak<str>,
+        alive: Arc<AtomicBool>,
+    ) {
+        self.find_requested = Some((clock.clone(), epoch, source.clone(), alive));
+    }
+    pub(super) fn complete_find_highlights(
+        &mut self,
+        target: Target,
+        result: Option<find_navigation::Highlight>,
+    ) {
+        self.find_requested = None;
+        self.find_deferred = None;
+        if let Some(result) = result.filter(|found| {
+            self.ready
+                .as_ref()
+                .is_some_and(|ready| found.current(target, &ready.plain))
+        }) {
+            self.find_highlight = Some(result);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Entry {
+    pub(super) fn id_for_find_test(&self) -> u64 {
+        self.id
     }
 }

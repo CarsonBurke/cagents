@@ -290,18 +290,35 @@ pub(super) fn flow_source_optional(
     let plain: Arc<str> = ready
         .as_ref()
         .map_or_else(|| Arc::from(""), |ready| ready.plain.clone());
-    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    Element::new(Selectable {
+    let highlights = if find.is_some() {
+        flow.borrow_mut().find_highlights(target)
+    } else {
+        super::find_navigation::Marks::default()
+    };
+    let truncated = highlights.truncated();
+    let body = Element::new(Selectable {
+        find_enabled: find.is_some(),
         logical,
         flow: Some(flow),
         flow_ready: ready,
-        matches: highlights.ranges,
+        matches: highlights,
         spans,
         plain,
         size,
         font,
         target,
-    })
+    });
+    if truncated {
+        widget::column::with_children(vec![
+            design::caption("Find highlights limited to the first 4096 matches in this block.")
+                .into(),
+            body,
+        ])
+        .width(iced::Length::Fill)
+        .into()
+    } else {
+        body
+    }
 }
 
 #[cfg(test)]
@@ -331,10 +348,15 @@ fn build_text(
         .map(|span| span.text.as_ref())
         .collect::<String>()
         .into();
-    let highlights = super::find::highlights(&plain, find.unwrap_or_default());
-    let truncated = highlights.truncated;
+    let highlights = if find.is_some() {
+        super::find_navigation::inline_highlights(target, &plain)
+    } else {
+        super::find_navigation::Marks::default()
+    };
+    let truncated = highlights.truncated();
     let flow_ready = flow.as_ref().and_then(|flow| flow.borrow().prepared());
     let body = Element::new(Selectable {
+        find_enabled: find.is_some(),
         flow_ready,
         spans,
         plain,
@@ -343,7 +365,7 @@ fn build_text(
         target,
         logical,
         flow,
-        matches: highlights.ranges,
+        matches: highlights,
     });
     if truncated {
         widget::column::with_children(vec![
@@ -374,10 +396,11 @@ pub(super) fn plain(
 }
 
 struct Selectable {
+    find_enabled: bool,
     flow: Option<flow_layout::Handle>,
     flow_ready: Option<Arc<flow_layout::Prepared>>,
     logical: Option<Logical>,
-    matches: Vec<std::ops::Range<usize>>,
+    matches: super::find_navigation::Marks,
     spans: Arc<[Span<'static, String>]>,
     plain: Arc<str>,
     size: iced::Pixels,
@@ -872,6 +895,26 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         {
             shell.publish(action(Action::FlowRequest(self.target, request)));
         }
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) && let Some(flow) = &state.flow
+        {
+            flow.borrow_mut().set_find_visible(
+                self.find_enabled && layout.bounds().intersection(viewport).is_some(),
+            );
+        }
+        if self.find_enabled
+            && matches!(
+                event,
+                Event::Window(iced::window::Event::RedrawRequested(_))
+            )
+            && layout.bounds().intersection(viewport).is_some()
+            && let Some(flow) = &state.flow
+            && let Some(id) = flow.borrow_mut().find_request_id(self.target)
+        {
+            shell.publish(action(Action::FindHighlight(self.target, id)));
+        }
         if state.managed {
             return;
         }
@@ -1023,9 +1066,10 @@ mod tests {
                     .collect::<String>()
                     .into();
                 let mut selectable = Selectable {
+                    find_enabled: true,
                     plain: plain.clone(),
                     spans,
-                    matches: vec![],
+                    matches: vec![].into(),
                     size: size.into(),
                     font: iced::Font::default(),
                     target: Target {
@@ -1060,7 +1104,7 @@ mod tests {
                         state.anchor = 0;
                         state.end = plain.len();
                     }
-                    2 => selectable.matches = vec![0..plain.len()],
+                    2 => selectable.matches = vec![0..plain.len()].into(),
                     _ => {}
                 }
                 let viewport = Rectangle::with_size(Size::new(400.0, 100.0));
@@ -1102,9 +1146,10 @@ mod tests {
             for find in [false, true] {
                 let mut renderer = crate::app::tests::headless_renderer();
                 let mut selectable = Selectable {
+                    find_enabled: true,
                     plain: source.into(),
                     spans: vec![Span::new(source)].into(),
-                    matches: vec![],
+                    matches: vec![].into(),
                     size: 32.0.into(),
                     font: iced::Font::with_name("DejaVu Sans"),
                     target: Target {
@@ -1151,7 +1196,7 @@ mod tests {
                 );
                 assert_eq!(&source[start..end], expected);
                 if find {
-                    selectable.matches = vec![start..end];
+                    selectable.matches = vec![start..end].into();
                 } else {
                     state.anchor = start;
                     state.end = end;
@@ -1193,9 +1238,10 @@ mod tests {
         let mut renderer = crate::app::tests::headless_renderer();
         let source = "hello שלום world";
         let mut selectable = Selectable {
+            find_enabled: true,
             plain: source.into(),
             spans: vec![Span::new(source)].into(),
-            matches: vec![],
+            matches: vec![].into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
@@ -1215,7 +1261,7 @@ mod tests {
         let start = "hello ש".len();
         let state = tree.state.downcast_mut::<State>();
         if find {
-            selectable.matches = vec![start..source.len()];
+            selectable.matches = vec![start..source.len()].into();
         } else {
             state.anchor = start;
             state.end = source.len();
@@ -1318,12 +1364,13 @@ mod tests {
     fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {
         let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
+            find_enabled: true,
             logical: None,
             flow: None,
             flow_ready: None,
             plain: "α first\nβ second".into(),
             spans: spans.clone(),
-            matches: vec![],
+            matches: vec![].into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
@@ -1461,9 +1508,10 @@ mod tests {
         let spans: Arc<[Span<'static, String>]> =
             vec![Span::new(source.clone()).link("https://example.com".to_owned())].into();
         let mut selectable = Selectable {
+            find_enabled: true,
             plain: source.clone().into(),
             spans,
-            matches: vec![],
+            matches: vec![].into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
@@ -1580,12 +1628,13 @@ mod tests {
         ]
         .into();
         let selectable = Selectable {
+            find_enabled: true,
             logical: None,
             flow: None,
             flow_ready: None,
             plain: "before αβ linked".into(),
             spans,
-            matches: vec![],
+            matches: vec![].into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
@@ -1625,12 +1674,13 @@ mod tests {
     #[test]
     fn unicode_find_highlights_original_text_across_syntax_spans() {
         let selectable = Selectable {
+            find_enabled: true,
             logical: None,
             flow: None,
             flow_ready: None,
             plain: "Straße CAFÉ".into(),
             spans: vec![Span::new("Stra"), Span::new("ße"), Span::new(" CAFÉ")].into(),
-            matches: super::super::find::ranges("Straße CAFÉ", "STRASSE"),
+            matches: super::super::find::ranges("Straße CAFÉ", "STRASSE").into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {
@@ -1652,12 +1702,13 @@ mod tests {
     #[test]
     fn find_marks_only_the_matching_text() {
         let selectable = Selectable {
+            find_enabled: true,
             logical: None,
             flow: None,
             flow_ready: None,
             plain: "one needle two".into(),
             spans: vec![Span::new("one needle two")].into(),
-            matches: vec![4..10],
+            matches: vec![4..10].into(),
             size: design::TEXT_PROSE.into(),
             font: iced::Font::default(),
             target: Target {

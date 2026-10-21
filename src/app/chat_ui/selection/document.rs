@@ -14,12 +14,26 @@ pub(in crate::app::chat_ui) struct Bookmark {
     pub end_prefix: Option<[u8; 32]>,
 }
 
-pub(in crate::app::chat_ui) struct Catalog {
+pub(in crate::app::chat_ui) struct Catalog(Option<Box<CatalogData>>);
+pub(in crate::app::chat_ui) struct CatalogData {
     read: Read,
     positions: HashMap<u64, usize>,
     plain_bytes: usize,
     prefix_hashes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
     owners: HashMap<u64, Arc<str>>,
+}
+impl std::ops::Deref for Catalog {
+    type Target = CatalogData;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("live selection catalog")
+    }
+}
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        if let Some(data) = self.0.take() {
+            super::super::preparation::retire_catalog(data);
+        }
+    }
 }
 impl Catalog {
     pub fn retained_plain_bytes(&self) -> usize {
@@ -308,19 +322,53 @@ impl Builder {
                 (block.identity, Arc::new(prefixes))
             })
             .collect();
-        Arc::new(Catalog {
+        Arc::new(Catalog(Some(Box::new(CatalogData {
             read: self.read,
             positions,
             plain_bytes,
             prefix_hashes,
             owners: self.owners,
-        })
+        }))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_catalog_last_owner_retires_plain_prefixes_and_descriptors_off_ui() {
+        let plain: Arc<str> = "actual retained selection body λ\n".repeat(32_768).into();
+        let source = super::super::super::reader_source::Source::new(&plain);
+        let prefixes = source.prefixes();
+        let weak_plain = Arc::downgrade(&plain);
+        let weak_prefixes = Arc::downgrade(&prefixes);
+        let mut builder = Catalog::builder();
+        builder.indexed("retained-item", &[0], plain.clone(), prefixes.clone());
+        let catalog = builder.finish();
+        let widget_owner = catalog.clone();
+        drop(catalog);
+        drop(plain);
+        drop(prefixes);
+        drop(source);
+        super::super::super::preparation::retirement_barrier();
+        assert!(weak_plain.upgrade().is_some());
+        assert!(weak_prefixes.upgrade().is_some());
+        let held = super::super::super::preparation::hold_retirement();
+        drop(widget_owner);
+        assert!(
+            weak_plain.upgrade().is_some(),
+            "retained widget's final catalog cannot free full plain text on UI"
+        );
+        assert!(
+            weak_prefixes.upgrade().is_some(),
+            "actual prefix table survives until its raw catalog is reclaimed"
+        );
+        drop(held);
+        super::super::super::preparation::retirement_barrier();
+        assert!(weak_plain.upgrade().is_none());
+        assert!(weak_prefixes.upgrade().is_none());
+    }
+
     #[test]
     fn worker_prepared_prefix_checkpoints_are_adopted_without_body_hashing() {
         let plain: Arc<str> = "prepared λ paragraph ".repeat(100_000).into();

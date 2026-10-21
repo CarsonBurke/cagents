@@ -39,8 +39,22 @@ fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
 }
 
 #[derive(Clone)]
+enum Input {
+    Transcript(Arc<chat::Item>),
+    Local(Arc<prompt::LocalSource>),
+}
+impl Input {
+    fn transcript(&self) -> Option<&Arc<chat::Item>> {
+        match self {
+            Self::Transcript(item) => Some(item),
+            Self::Local(_) => None,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Request {
-    item: Arc<chat::Item>,
+    input: Input,
     provider: Provider,
     growing: bool,
     version: u64,
@@ -59,6 +73,7 @@ pub(super) struct Parsed {
 const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
+    send::<prompt::Prepared>();
     send::<coordination::Prepared>();
     send::<prose_document::Data>();
     send::<prose::CodeBlock>();
@@ -72,7 +87,7 @@ struct Canonical {
 }
 
 #[derive(Default)]
-struct Lease(AtomicUsize);
+pub(super) struct Lease(AtomicUsize);
 impl Lease {
     fn resize(&self, bytes: usize) -> bool {
         let old = self.0.load(Ordering::Relaxed);
@@ -208,13 +223,35 @@ impl Drop for MetadataRetirement {
     }
 }
 
-struct Shared {
+struct Shared(Option<Box<SharedData>>);
+struct SharedData {
     latest: Mutex<Request>,
     canonical: Mutex<Option<Canonical>>,
     cancelled: AtomicBool,
-    lease: Lease,
+    // Actual request/canonical allocations are destroyed before this lease.
+    lease: Arc<Lease>,
+}
+impl std::ops::Deref for Shared {
+    type Target = SharedData;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("live preparation owner")
+    }
+}
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Some(data) = self.0.take() {
+            if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+                drop(data);
+            } else {
+                enqueue_retirement(Retirement::SharedData(data));
+            }
+        }
+    }
 }
 impl Shared {
+    fn new(data: SharedData) -> Self {
+        Self(Some(Box::new(data)))
+    }
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
@@ -232,6 +269,8 @@ struct Entry {
 pub(super) struct State {
     context: Option<(Target, Option<String>, Option<String>)>,
     entries: HashMap<String, Entry>,
+    local: Option<(Target, Entry)>,
+    local_error: Option<(std::sync::Weak<prompt::LocalSource>, String)>,
     errors: HashMap<String, (std::sync::Weak<chat::Item>, String)>,
     reader_proofs: Arc<HashMap<u64, reader_source::Proof>>,
     provider: Option<Provider>,
@@ -409,15 +448,137 @@ fn same_kind(previous: &chat::Item, current: &chat::Item) -> bool {
 }
 
 impl State {
+    pub(super) fn clear_local(&mut self) {
+        if let Some((_, entry)) = self.local.take() {
+            entry.shared.cancel();
+            retire_shared(entry.shared);
+            notify_available();
+        }
+    }
+    pub(super) fn stage_local(
+        &mut self,
+        target: Target,
+        source: &Arc<prompt::LocalSource>,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) {
+        if self
+            .local_error
+            .as_ref()
+            .is_some_and(|(previous, _)| previous.as_ptr() == Arc::as_ptr(source))
+        {
+            return;
+        }
+        self.local_error = None;
+        if source.allocation() > QUEUED_BYTES {
+            self.clear_local();
+            self.local_error = Some((
+                Arc::downgrade(source),
+                "This queued message is too large to display.".into(),
+            ));
+            return;
+        }
+        if self.local.as_ref().is_some_and(|(current, entry)| {
+            let latest = entry
+                .shared
+                .latest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *current == target
+                && latest.theme == theme
+                && matches!(&latest.input, Input::Local(previous) if Arc::ptr_eq(previous, source))
+        }) {
+            return;
+        }
+        self.clear_local();
+        if self.entries.len() >= QUEUED_ITEMS {
+            return;
+        }
+        let lease = {
+            let mut retained = source.lease.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lease) = &*retained {
+                lease.clone()
+            } else {
+                let lease = Arc::new(Lease::default());
+                if !lease.resize(source.allocation()) {
+                    return;
+                }
+                *retained = Some(lease.clone());
+                lease
+            }
+        };
+        self.local = Some((
+            target,
+            Entry {
+                run: next_attempt(),
+                running: true,
+                shared: Arc::new(Shared::new(SharedData {
+                    latest: Mutex::new(Request {
+                        input: Input::Local(source.clone()),
+                        provider: Provider::Claude,
+                        growing: false,
+                        version: 1,
+                        theme,
+                        reader_proofs: Arc::default(),
+                    }),
+                    canonical: Mutex::default(),
+                    cancelled: AtomicBool::new(false),
+                    lease,
+                })),
+            },
+        ));
+    }
+    pub(super) fn accept_local(
+        &mut self,
+        target: Target,
+        run: u64,
+        source: &Arc<prompt::LocalSource>,
+        ready: Ready,
+    ) -> Option<Prepared> {
+        let (current, entry) = self.local.as_ref()?;
+        let latest = entry
+            .shared
+            .latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *current != target
+            || entry.run != run
+            || entry.shared.cancelled.load(Ordering::Acquire)
+            || !matches!(&latest.input, Input::Local(previous) if Arc::ptr_eq(previous, source))
+        {
+            return None;
+        }
+        let result = ready.0.0.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(latest);
+                self.clear_local();
+                self.local_error = Some((Arc::downgrade(source), error));
+                return None;
+            }
+        };
+        if prepared.request.version != latest.version
+            || !matches!(&prepared.request.input, Input::Local(previous) if Arc::ptr_eq(previous, source))
+        {
+            prepared.discard();
+            return None;
+        }
+        drop(latest);
+        self.clear_local();
+        Some(prepared)
+    }
+
     pub(super) fn set_reader_proofs(&mut self, proofs: Arc<HashMap<u64, reader_source::Proof>>) {
         self.reader_proofs = proofs;
     }
     pub(super) fn clear(&mut self) {
+        self.clear_local();
         for (_, entry) in self.entries.drain() {
             entry.shared.cancel();
             retire_shared(entry.shared);
         }
         self.errors.clear();
+        self.local_error = None;
         self.context = None;
         self.deferred = None;
         self.last_deferred = false;
@@ -436,7 +597,16 @@ impl State {
         );
         let changed = self.context.as_ref() != Some(&context);
         if changed {
+            let local = self.local.take();
             self.clear();
+            self.local = local;
+            if self
+                .local
+                .as_ref()
+                .is_some_and(|(current, _)| *current != target)
+            {
+                self.clear_local();
+            }
             self.context = Some(context);
         }
         let ids: HashSet<_> = items.iter().map(|item| item.id.as_str()).collect();
@@ -489,7 +659,10 @@ impl State {
         let latest = entry.shared.latest.lock().unwrap();
         if entry.running
             || !latest.growing
-            || !Arc::ptr_eq(&latest.item, item)
+            || !latest
+                .input
+                .transcript()
+                .is_some_and(|previous| Arc::ptr_eq(previous, item))
             || entry.shared.cancelled.load(Ordering::Acquire)
         {
             return None;
@@ -509,16 +682,31 @@ impl State {
         self.entries
             .values()
             .map(|entry| entry.shared.lease.0.load(Ordering::Relaxed))
+            .chain(
+                self.local
+                    .iter()
+                    .map(|(_, entry)| entry.shared.lease.0.load(Ordering::Relaxed)),
+            )
             .sum()
     }
     pub(super) fn global_queued_bytes() -> usize {
         RESERVED.load(Ordering::Relaxed)
     }
     pub(super) fn error(&self) -> Option<&str> {
-        self.errors.values().next().map(|(_, error)| error.as_str())
+        self.errors
+            .values()
+            .next()
+            .map(|(_, error)| error.as_str())
+            .or_else(|| {
+                self.local_error
+                    .as_ref()
+                    .filter(|(source, _)| source.strong_count() != 0)
+                    .map(|(_, error)| error.as_str())
+            })
     }
     pub(super) fn retry(&mut self) {
         self.errors.clear();
+        self.local_error = None;
     }
 
     /// `append` is proof from the immutable source publication, not a tail
@@ -565,16 +753,22 @@ impl State {
                 .latest
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let same = Arc::ptr_eq(&latest.item, item);
+            let same = latest
+                .input
+                .transcript()
+                .is_some_and(|previous| Arc::ptr_eq(previous, item));
             if same && latest.growing == growing && latest.theme == theme {
                 return false;
             }
             if latest.theme == theme
-                && (same || (same_kind(&latest.item, item) && append(&latest.item, item)))
+                && (same
+                    || (latest.input.transcript().is_some_and(|previous| {
+                        same_kind(previous, item) && append(previous, item)
+                    })))
             {
                 if entry.shared.lease.resize(bytes) {
                     *latest = Request {
-                        item: item.clone(),
+                        input: Input::Transcript(item.clone()),
                         provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: latest.version.wrapping_add(1),
@@ -591,8 +785,14 @@ impl State {
             entry.shared.cancel();
         }
         self.remove(&item.id);
-        let lease = Lease::default();
-        if self.entries.len() >= QUEUED_ITEMS || !lease.resize(bytes) {
+        let lease = Arc::new(Lease::default());
+        if self
+            .entries
+            .len()
+            .saturating_add(usize::from(self.local.is_some()))
+            >= QUEUED_ITEMS
+            || !lease.resize(bytes)
+        {
             // A valid source waits in the selected Snapshot. Saturation is
             // temporary backpressure, never a sticky same-Arc parse error.
             self.last_deferred = true;
@@ -603,9 +803,9 @@ impl State {
             Entry {
                 run: next_attempt(),
                 running: true,
-                shared: Arc::new(Shared {
+                shared: Arc::new(Shared::new(SharedData {
                     latest: Mutex::new(Request {
-                        item: item.clone(),
+                        input: Input::Transcript(item.clone()),
                         provider: self.provider.unwrap_or(Provider::Claude),
                         growing,
                         version: 1,
@@ -615,7 +815,7 @@ impl State {
                     canonical: Mutex::new(None),
                     cancelled: AtomicBool::new(false),
                     lease,
-                }),
+                })),
             },
         );
         true
@@ -643,7 +843,10 @@ impl State {
                 .latest
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !Arc::ptr_eq(&latest.item, previous)
+            if !latest
+                .input
+                .transcript()
+                .is_some_and(|old| Arc::ptr_eq(old, previous))
                 || latest.growing != growing
                 || latest.theme != theme
                 || self.provider != Some(latest.provider)
@@ -651,7 +854,12 @@ impl State {
             {
                 return false;
             }
-            retired.push(std::mem::replace(&mut latest.item, current.clone()));
+            let Input::Transcript(previous) =
+                std::mem::replace(&mut latest.input, Input::Transcript(current.clone()))
+            else {
+                unreachable!("transcript entry")
+            };
+            retired.push(previous);
             true
         } else {
             !preparing && !growing && !provisional && retired.reserve(previous)
@@ -659,21 +867,37 @@ impl State {
     }
 
     pub(super) fn subscriptions(&self, target: Target) -> Vec<Subscription<Message>> {
-        self.entries
+        let mut subscriptions: Vec<_> = self
+            .entries
             .iter()
             .filter(|(_, entry)| entry.running)
             .map(|(id, entry)| {
                 Subscription::run_with(
                     Job {
                         target,
-                        id: id.clone(),
+                        id: Some(id.clone()),
                         run: entry.run,
                         shared: entry.shared.clone(),
                     },
                     stream,
                 )
             })
-            .collect()
+            .collect();
+        if let Some((current, entry)) = &self.local
+            && *current == target
+            && entry.running
+        {
+            subscriptions.push(Subscription::run_with(
+                Job {
+                    target,
+                    id: None,
+                    run: entry.run,
+                    shared: entry.shared.clone(),
+                },
+                stream,
+            ));
+        }
+        subscriptions
     }
 
     pub(super) fn accept(
@@ -702,7 +926,9 @@ impl State {
                     .latest
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .item
+                    .input
+                    .transcript()
+                    .expect("transcript entry")
                     .clone();
                 entry.shared.cancel();
                 self.remove(id);
@@ -737,6 +963,7 @@ pub(super) struct Prepared {
     request: Request,
     pub(super) parsed: Parsed,
     document: prose_document::Data,
+    prompt: Option<Box<prompt::Prepared>>,
     coordination: Option<coordination::Prepared>,
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
@@ -752,11 +979,19 @@ pub(super) struct Prepared {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl Prepared {
+    pub(super) fn install_local(mut self, presentation: &mut prompt::LocalPresentation) {
+        let previous = std::mem::replace(&mut presentation.prepared, self.prompt.take());
+        presentation.revision = CachedItem::next_revision();
+        if let Some(previous) = previous {
+            retire_prompt(previous);
+        }
+        self.discard();
+    }
     pub(super) fn is_coordination(&self) -> bool {
         self.coordination.is_some()
     }
     pub(super) fn item(&self) -> &Arc<chat::Item> {
-        &self.request.item
+        self.request.input.transcript().expect("transcript output")
     }
     pub(super) fn growing(&self) -> bool {
         self.request.growing
@@ -766,9 +1001,14 @@ impl Prepared {
             _parsed: self.parsed,
             _document: Some(self.document),
             _coordination: self.coordination,
+            _prompt: self.prompt,
             _blocks: self.blocks,
             _palettes: Some(self.palettes),
-            _item: Some(self.request.item),
+            _item: self.request.input.transcript().cloned(),
+            _local: match self.request.input {
+                Input::Local(source) => Some(source),
+                _ => None,
+            },
             _prepared_tools: self.prepared_tools,
             _owner: self._owner,
             _permit: self._permit,
@@ -778,17 +1018,41 @@ impl Prepared {
         cached
             .reader_memory
             .verified_readers(cached.reader_context.as_deref(), self.reader_verifications);
+        let previous_prompt = std::mem::replace(&mut cached.prompt, self.prompt);
         let previous_tools = cached.prepared_tools.take();
         let previous_coordination = cached.coordination.take();
-        if CachedItem::prose(&self.request.item.content).is_none() {
+        if CachedItem::prose(
+            &self
+                .request
+                .input
+                .transcript()
+                .expect("transcript output")
+                .content,
+        )
+        .is_none()
+        {
             let mut previous = std::mem::replace(
                 cached,
-                CachedItem::preparing(&self.request.item, self.request.theme),
+                CachedItem::preparing(
+                    self.request.input.transcript().expect("transcript output"),
+                    self.request.theme,
+                ),
             );
-            previous.item = Some(self.request.item.clone());
+            previous.item = Some(
+                self.request
+                    .input
+                    .transcript()
+                    .expect("transcript output")
+                    .clone(),
+            );
             previous.prepared_tools.clone_from(&self.prepared_tools);
             *cached = CachedItem::updated(
-                &self.request.item.content,
+                &self
+                    .request
+                    .input
+                    .transcript()
+                    .expect("transcript output")
+                    .content,
                 self.request.theme,
                 Some(previous),
                 expanded,
@@ -806,18 +1070,33 @@ impl Prepared {
         let retired = Retired {
             _document: None,
             _coordination: None,
+            _prompt: previous_prompt,
             _parsed: Parsed {
                 source: std::mem::replace(&mut cached.source, self.parsed.source),
                 markdown: std::mem::replace(&mut cached.markdown, self.parsed.markdown),
             },
             _blocks: std::mem::replace(&mut cached.blocks, self.blocks),
             _palettes: std::mem::replace(&mut cached.palette_views, Some(self.palettes)),
-            _item: cached.item.replace(self.request.item.clone()),
+            _item: cached.item.replace(
+                self.request
+                    .input
+                    .transcript()
+                    .expect("transcript output")
+                    .clone(),
+            ),
+            _local: None,
             _prepared_tools: previous_tools,
             _owner: self._owner,
             _permit: self._permit,
         };
-        cached.token = ChangeToken::of(&self.request.item.content);
+        cached.token = ChangeToken::of(
+            &self
+                .request
+                .input
+                .transcript()
+                .expect("transcript output")
+                .content,
+        );
         cached.preparing = self.request.growing || managed;
         cached.placeholder = false;
         cached.open = None;
@@ -834,9 +1113,11 @@ struct Retired {
     _parsed: Parsed,
     _document: Option<prose_document::Data>,
     _coordination: Option<coordination::Prepared>,
+    _prompt: Option<Box<prompt::Prepared>>,
     _blocks: HashMap<u64, prose::CodeBlock>,
     _palettes: Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
+    _local: Option<Arc<prompt::LocalSource>>,
     _prepared_tools: Option<Arc<tool_text::PreparedSources>>,
     _owner: Arc<Shared>,
     // Declared last so retirement completes before the next parser is admitted.
@@ -849,10 +1130,15 @@ pub(super) struct Presentation {
     pub(super) palettes: Option<prose::Palettes>,
     pub(super) item: Option<Arc<chat::Item>>,
     pub(super) prepared_tools: Option<Arc<tool_text::PreparedSources>>,
+    pub(super) prompt: Option<Box<prompt::Prepared>>,
 }
 
 enum Retirement {
+    Catalog(Box<selection::CatalogData>),
     Metadata(MetadataItems),
+    Find(find_navigation::RetiredWork),
+    LocalText(RawLocal),
+    Prompt(Box<prompt::Prepared>),
     FlowSource(flow_layout::RawSource),
     FlowOutput(flow_layout::OutputRetirement),
     Document(prose_document::Data),
@@ -867,6 +1153,7 @@ enum Retirement {
     // Keep the existing queued-source lease until canonical parser/source
     // destructors finish, including cancelled/hidden sources without output.
     Detached(Arc<Shared>),
+    SharedData(Box<SharedData>),
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
     #[cfg(test)]
     Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
@@ -876,6 +1163,53 @@ thread_local! {
     // Flow guard can be released by a retired Geometry; destroy its source and
     // slot inline there, before an already queued generation barrier.
     static RECLAIMING_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) struct RawLocal {
+    pub(super) text: String,
+    #[cfg(test)]
+    pub(super) disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
+    // Same admitted source reservation, released after the actual String.
+    #[allow(dead_code)]
+    pub(super) lease: Option<Arc<Lease>>,
+}
+impl Drop for RawLocal {
+    fn drop(&mut self) {
+        let text = std::mem::take(&mut self.text);
+        #[cfg(test)]
+        let bytes = text.len();
+        drop(text);
+        #[cfg(test)]
+        if let Some(disposed) = self.disposed.take() {
+            let _ = disposed.send((std::thread::current().id(), bytes));
+        }
+    }
+}
+pub(super) fn retire_local_text(text: RawLocal) {
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(text);
+    } else {
+        enqueue_retirement(Retirement::LocalText(text));
+    }
+}
+pub(super) fn retire_catalog(data: Box<selection::CatalogData>) {
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(data);
+    } else {
+        enqueue_retirement(Retirement::Catalog(data));
+    }
+}
+pub(super) fn retire_prompt(prompt: Box<prompt::Prepared>) {
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(prompt);
+    } else {
+        enqueue_retirement(Retirement::Prompt(prompt));
+    }
+}
+pub(super) fn reclaiming_find() -> bool {
+    RECLAIMING_FLOW.with(std::cell::Cell::get)
+}
+pub(super) fn retire_find(work: find_navigation::RetiredWork) {
+    enqueue_retirement(Retirement::Find(work));
 }
 pub(super) fn retire_flow_source(source: flow_layout::RawSource) {
     if RECLAIMING_FLOW.with(std::cell::Cell::get) {
@@ -943,7 +1277,11 @@ fn enqueue_retirement(retired: Retirement) {
                 pending.pop_front().expect("queued retirement")
             };
             match retired {
+                Retirement::Catalog(data) => drop(data),
                 Retirement::Metadata(owned) => drop(owned),
+                Retirement::Find(work) => drop(work),
+                Retirement::LocalText(text) => drop(text),
+                Retirement::Prompt(prompt) => drop(prompt),
                 Retirement::FlowSource(source) => drop(source),
                 Retirement::FlowOutput(output) => drop(output),
                 Retirement::Document(document) => drop(document),
@@ -953,6 +1291,7 @@ fn enqueue_retirement(retired: Retirement) {
                 Retirement::Presentation(presentation) => drop(presentation),
                 Retirement::Installed(retired) => drop(retired),
                 Retirement::Detached(owner) => drop(owner),
+                Retirement::SharedData(data) => drop(data),
                 Retirement::Barrier(reply) => { let _ = reply.send(std::thread::current().id()); }
                 #[cfg(test)]
                 Retirement::Hold(entered, release) => { let _ = entered.send(()); let _ = release.recv_timeout(Duration::from_secs(10)); }
@@ -1068,7 +1407,7 @@ impl std::fmt::Debug for Ready {
 #[derive(Clone)]
 struct Job {
     target: Target,
-    id: String,
+    id: Option<String>,
     run: u64,
     shared: Arc<Shared>,
 }
@@ -1095,12 +1434,10 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
     let job = job.clone();
     Box::pin(iced::futures::stream::once(async move {
         let result = run(job.shared).await;
-        action(Action::MarkdownPrepared(
-            job.target,
-            job.id,
-            job.run,
-            Ready::new(result),
-        ))
+        action(match job.id {
+            Some(id) => Action::MarkdownPrepared(job.target, id, job.run, Ready::new(result)),
+            None => Action::LocalPromptPrepared(job.target, job.run, Ready::new(result)),
+        })
     }))
 }
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
@@ -1127,6 +1464,25 @@ fn execute(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    if let Input::Local(source) = &request.input {
+        let prompt = prompt::Prepared::new(source.text().trim_end(), &shared.cancelled)?;
+        return Ok(Prepared {
+            request,
+            parsed: Parsed::default(),
+            document: prose_document::Data::snapshot(&markdown::Content::default()),
+            prompt: Some(prompt),
+            coordination: None,
+            blocks: HashMap::new(),
+            palettes: prose::palettes(&HashMap::new()),
+            reader_verifications: HashMap::new(),
+            prepared_tools: None,
+            #[cfg(test)]
+            syntax_work: (0, 0),
+            _owner: shared,
+            _permit: permit,
+        });
+    }
+    let item = request.input.transcript().expect("transcript dispatch");
     let mut canonical = shared
         .canonical
         .lock()
@@ -1134,7 +1490,15 @@ fn execute(
         .take()
         .unwrap_or_default();
     let mut reader_verifications = HashMap::new();
-    if let Some(body) = CachedItem::prose(&request.item.content) {
+    let prompt = match (&item.role, &item.content) {
+        (chat::Role::User, ItemContent::Text { text, .. }) => {
+            Some(prompt::Prepared::new(text, &shared.cancelled)?)
+        }
+        _ => None,
+    };
+    if prompt.is_none()
+        && let Some(body) = CachedItem::prose(&item.content)
+    {
         parse_publication(
             &mut canonical.parsed,
             body,
@@ -1144,7 +1508,7 @@ fn execute(
         prime_plain(canonical.parsed.markdown.items(), &shared.cancelled)?;
         if !request.reader_proofs.is_empty() {
             verify_markdown_readers(
-                &request.item.id,
+                &item.id,
                 &[0],
                 canonical.parsed.markdown.items(),
                 &request.reader_proofs,
@@ -1152,13 +1516,9 @@ fn execute(
             );
         }
     } else {
-        verify_tool_readers(
-            &request.item,
-            &request.reader_proofs,
-            &mut reader_verifications,
-        );
+        verify_tool_readers(&item, &request.reader_proofs, &mut reader_verifications);
     }
-    let coordinated = chat::coordination::recognize(&request.item, request.provider)
+    let coordinated = chat::coordination::recognize(&item, request.provider)
         .map(|reading| coordination::Prepared::prepare(reading, &shared.cancelled))
         .transpose()?;
     if let Some(coordinated) = &coordinated {
@@ -1167,7 +1527,7 @@ fn execute(
                 return Err("Message loading was cancelled.".into());
             }
             verify_markdown_readers(
-                &request.item.id,
+                &item.id,
                 &[1, index as u32],
                 content.items(),
                 &request.reader_proofs,
@@ -1234,14 +1594,15 @@ fn execute(
         parsed.markdown.discard_continuation();
     }
     let palettes = prose::palettes(&blocks);
-    let prepared_tools = CachedItem::prose(&request.item.content)
+    let prepared_tools = CachedItem::prose(&item.content)
         .is_none()
-        .then(|| Arc::new(tool_text::PreparedSources::new(&request.item.content)));
+        .then(|| Arc::new(tool_text::PreparedSources::new(&item.content)));
     let document = prose_document::Data::snapshot(&parsed.markdown);
     Ok(Prepared {
         request,
         parsed,
         document,
+        prompt,
         coordination: coordinated,
         blocks,
         palettes,
@@ -1252,6 +1613,29 @@ fn execute(
         _owner: shared,
         _permit: permit,
     })
+}
+
+#[cfg(test)]
+pub(super) fn local_reply_for_test(runtime: &mut Runtime) -> (u64, Ready) {
+    runtime.prepare_local_prompt();
+    let (_, entry) = runtime
+        .preparation
+        .local
+        .as_ref()
+        .expect("admitted actual local input");
+    let run = entry.run;
+    let shared = entry.shared.clone();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    (
+        run,
+        Ready::new(
+            std::thread::spawn(move || execute(shared, permit))
+                .join()
+                .unwrap(),
+        ),
+    )
 }
 
 /// Rendering fixtures explicitly complete the production engine before
@@ -1341,6 +1725,400 @@ mod tests {
     }
 
     #[test]
+    fn literal_user_source_uses_actual_worker_payload_and_refuses_rewrite_until_current_ready() {
+        let body = format!(
+            "**literal** [not a link](https://invalid.test)\r\n{}\r\nEND_LITERAL_λ",
+            "raw `code` & <tag> ".repeat(32_768)
+        );
+        let (mut runtime, handle) = view::prepared_runtime_for_test(&[]);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        let mut user = (*item(&body)).clone();
+        user.role = chat::Role::User;
+        snapshot.items.push(Arc::new(user));
+        handle.publish_delta_snapshot_for_test(snapshot);
+        let materialized = markdown::materialized_bytes();
+        runtime.refresh();
+        let source = runtime.snapshot.items[0].clone();
+        assert!(
+            runtime.prepared_prompt(&source).is_none(),
+            "cold literal source must wait for exact preparation"
+        );
+        assert_eq!(
+            markdown::materialized_bytes(),
+            materialized,
+            "cold literal staging cannot materialize the full UI body"
+        );
+        let (run, shared) = job(&runtime.preparation);
+        let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        assert!(
+            output.parsed.markdown.items().is_empty(),
+            "literal User is not Markdown parsed"
+        );
+        assert_eq!(output.parsed.markdown.parsed_work_bytes(), 0);
+        assert_ne!(
+            output.prompt.as_ref().unwrap().created_on,
+            std::thread::current().id()
+        );
+        runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+        let accepted = runtime
+            .prepared_prompt(&source)
+            .expect("actual worker accepted literal source");
+        assert_eq!(&*accepted.full.plain(), body);
+        assert_eq!(&*accepted.shown(false).plain(), prompt::preview(&body).0);
+        assert!(accepted.full.plain_ready());
+        let plain = accepted.full.plain();
+        let revision = runtime.cache["message"].revision;
+        let mut metadata = (*handle.snapshot()).clone();
+        metadata.generation += 1;
+        Arc::make_mut(&mut metadata.items[0]).at = Some(1_700_000_000_000);
+        handle.publish_delta_snapshot_for_test(metadata);
+        runtime.refresh();
+        let current = &runtime.snapshot.items[0];
+        assert!(Arc::ptr_eq(
+            &plain,
+            &runtime.prepared_prompt(current).unwrap().full.plain()
+        ));
+        assert_eq!(runtime.cache["message"].revision, revision);
+        let mut replacement = (*handle.snapshot()).clone();
+        replacement.generation += 1;
+        if let ItemContent::Text { text, .. } =
+            &mut Arc::make_mut(&mut replacement.items[0]).content
+        {
+            text.replace_range(..2, "!!");
+        }
+        handle.publish_snapshot_for_test(replacement);
+        runtime.refresh();
+        assert!(
+            runtime
+                .prepared_prompt(&runtime.snapshot.items[0])
+                .is_none(),
+            "same-ID rewrite must not relabel the old literal DTO"
+        );
+        drain_fixture(&mut runtime);
+        let ItemContent::Text { text, .. } = &runtime.snapshot.items[0].content else {
+            unreachable!()
+        };
+        assert_eq!(
+            &*runtime
+                .prepared_prompt(&runtime.snapshot.items[0])
+                .unwrap()
+                .full
+                .plain(),
+            text
+        );
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn local_prompt_retires_actual_raw_source_and_literal_spans_before_output_readmission() {
+        let source = prompt::LocalSource::new(format!(
+            "literal local **source**\r\n{}",
+            "λ raw queued bytes ".repeat(32_768)
+        ));
+        let body_len = source.text().len();
+        let target = target();
+        let mut state = State::default();
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        let (_, entry) = state.local.as_ref().unwrap();
+        let shared = entry.shared.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let admitted = slots.clone().try_acquire_owned().unwrap();
+        let mut output = std::thread::spawn(move || execute(shared, admitted).unwrap())
+            .join()
+            .unwrap();
+        let (raw_sent, raw_disposed) = std::sync::mpsc::channel();
+        *source.disposed.lock().unwrap() = Some(raw_sent);
+        let (spans_sent, spans_disposed) = std::sync::mpsc::channel();
+        output
+            .prompt
+            .as_mut()
+            .unwrap()
+            .full
+            .watch_raw_spans(spans_sent);
+        assert_eq!(
+            &*output.prompt.as_ref().unwrap().full.plain(),
+            source.text().trim_end()
+        );
+        let hold = hold_retirement();
+        state.clear_local();
+        drop(source);
+        Ready::new(Ok(output)); // discarded queued output, without UI installation
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "discarded literal reply retains output admission until actual raw retirement"
+        );
+        assert!(raw_disposed.try_recv().is_err());
+        assert!(spans_disposed.try_recv().is_err());
+        drop(hold);
+        let worker = retirement_barrier();
+        let (raw_thread, raw_bytes) = raw_disposed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (spans_thread, _) = spans_disposed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(raw_bytes, body_len);
+        assert_eq!(raw_thread, worker);
+        assert_eq!(spans_thread, worker);
+        assert_ne!(worker, std::thread::current().id());
+        assert!(
+            slots.try_acquire_owned().is_ok(),
+            "actual source and span payloads drop before this private admission returns"
+        );
+    }
+
+    #[test]
+    fn local_prompt_acceptance_is_exact_and_real_failures_retry_without_poisoning_replacements() {
+        let target = target();
+        let source = prompt::LocalSource::new("original raw local\r\n".repeat(4096));
+        let replacement = prompt::LocalSource::new("new source with same local role".into());
+        let mut state = State::default();
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        let (_, entry) = state.local.as_ref().unwrap();
+        let old_run = entry.run;
+        let old = Ready::new(execute(entry.shared.clone(), permit()));
+        state.stage_local(
+            target,
+            &replacement,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        assert!(
+            state
+                .accept_local(target, old_run, &replacement, old)
+                .is_none(),
+            "old queued reply cannot install on replacement source"
+        );
+        let (_, entry) = state.local.as_ref().unwrap();
+        let run = entry.run;
+        let wrong = Target {
+            generation: target.generation + 1,
+            ..target
+        };
+        assert!(
+            state
+                .accept_local(
+                    wrong,
+                    run,
+                    &replacement,
+                    Ready::new(Err("stale error".into()))
+                )
+                .is_none()
+        );
+        assert!(
+            state.error().is_none(),
+            "stale target error cannot quarantine the current queue"
+        );
+        assert!(
+            state
+                .accept_local(
+                    target,
+                    run,
+                    &replacement,
+                    Ready::new(Err("real local failure".into()))
+                )
+                .is_none()
+        );
+        assert!(state.local.is_none());
+        assert_eq!(state.error(), Some("real local failure"));
+        state.stage_local(
+            target,
+            &replacement,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        assert!(
+            state.local.is_none(),
+            "real failure is visible, not a silently stuck once-stream"
+        );
+        state.retry();
+        state.stage_local(
+            target,
+            &replacement,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let (_, entry) = state.local.as_ref().unwrap();
+        let run = entry.run;
+        let output = Ready::new(execute(entry.shared.clone(), permit()));
+        let mut presentation = prompt::LocalPresentation::default();
+        state
+            .accept_local(target, run, &replacement, output)
+            .unwrap()
+            .install_local(&mut presentation);
+        assert_eq!(
+            &*presentation.prepared.as_ref().unwrap().full.plain(),
+            replacement.text()
+        );
+        drop(presentation);
+        drop(state);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn local_input_reusing_a_retained_lease_still_obeys_shared_entry_admission() {
+        let target = target();
+        let source = prompt::LocalSource::new("local canonical bytes".into());
+        let mut state = State::default();
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        assert!(source.lease.lock().unwrap().is_some());
+        state.clear_local();
+        for index in 0..QUEUED_ITEMS {
+            let mut next = (*item("small actual prose source")).clone();
+            next.id = format!("history-{index}");
+            state.stage(
+                &Arc::new(next),
+                false,
+                crate::settings::EditorSyntaxTheme::Auto,
+                |_, _| false,
+            );
+        }
+        assert_eq!(state.entries.len(), QUEUED_ITEMS);
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        assert!(
+            state.local.is_none(),
+            "retained local lease cannot bypass the shared entry bound"
+        );
+        state.remove("history-0");
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        assert!(state.local.is_some());
+        let mut overflow = (*item("another valid source")).clone();
+        overflow.id = "overflow".into();
+        state.stage(
+            &Arc::new(overflow),
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        assert!(
+            state.was_deferred(),
+            "transcript admission counts the local entry too"
+        );
+        assert_eq!(
+            state.entries.len() + usize::from(state.local.is_some()),
+            QUEUED_ITEMS
+        );
+        drop(state);
+        drop(source);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn unpolled_transcript_subscription_retires_final_request_and_canonical_before_lease() {
+        let source =
+            item(&"# Actual retained transcript\n\nlarge literal body λ\n\n".repeat(16_384));
+        let raw = Arc::downgrade(&source);
+        let mut state = State::default();
+        state.stage(
+            &source,
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (run, shared) = job(&state);
+        let lease = Arc::downgrade(&shared.lease);
+        let worker = shared.clone();
+        let output = std::thread::spawn(move || execute(worker, permit()).unwrap())
+            .join()
+            .unwrap();
+        let canonical = shared
+            .canonical
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .parsed
+            .markdown
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => {
+                    Some(text.plain())
+                }
+                _ => None,
+            })
+            .expect("actual growing parser retains canonical text");
+        let plain = Arc::downgrade(&canonical);
+        drop(canonical);
+        output.discard();
+        let subscription = stream(&Job {
+            target: target(),
+            id: Some("message".into()),
+            run,
+            shared: shared.clone(),
+        });
+        state.clear();
+        drop(source);
+        drop(shared);
+        retirement_barrier();
+        assert!(raw.upgrade().is_some());
+        assert!(plain.upgrade().is_some());
+        let held = hold_retirement();
+        drop(subscription); // actual never-polled stream is now the final owner
+        assert!(
+            raw.upgrade().is_some(),
+            "UI stream cancellation cannot destroy the actual transcript request"
+        );
+        assert!(
+            plain.upgrade().is_some(),
+            "UI stream cancellation cannot destroy the canonical plain allocation"
+        );
+        assert!(
+            lease.upgrade().is_some(),
+            "same source admission survives until raw retirement"
+        );
+        drop(held);
+        retirement_barrier();
+        assert!(raw.upgrade().is_none());
+        assert!(plain.upgrade().is_none());
+        assert!(lease.upgrade().is_none());
+    }
+
+    #[test]
+    fn unpolled_local_subscription_retires_actual_source_before_its_surviving_lease() {
+        let target = target();
+        let source = prompt::LocalSource::new("actual unpolled local source λ\r\n".repeat(16_384));
+        let bytes = source.text().len();
+        let (sent, disposed) = std::sync::mpsc::channel();
+        *source.disposed.lock().unwrap() = Some(sent);
+        let mut state = State::default();
+        state.stage_local(target, &source, crate::settings::EditorSyntaxTheme::Auto);
+        let (_, entry) = state.local.as_ref().unwrap();
+        let lease = Arc::downgrade(&entry.shared.lease);
+        let subscription = stream(&Job {
+            target,
+            id: None,
+            run: entry.run,
+            shared: entry.shared.clone(),
+        });
+        // Never poll: the real captured async input must still carry source
+        // admission when its State/queued canonical owners disappear first.
+        state.clear_local();
+        drop(source);
+        retirement_barrier();
+        assert!(state.local.is_none());
+        assert!(disposed.try_recv().is_err());
+        assert!(
+            lease.upgrade().is_some(),
+            "unpolled local input still holds its actual source lease without an Entry"
+        );
+        let held = hold_retirement();
+        drop(subscription);
+        assert!(
+            lease.upgrade().is_some(),
+            "UI cancellation cannot release source capacity before raw retirement"
+        );
+        assert!(disposed.try_recv().is_err());
+        drop(held);
+        let worker = retirement_barrier();
+        let (thread, actual) = disposed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(thread, worker);
+        assert_ne!(thread, std::thread::current().id());
+        assert!(
+            lease.upgrade().is_none(),
+            "actual local raw source drops before its final source lease"
+        );
+    }
+
+    #[test]
     fn authenticated_metadata_retains_exact_graph_and_retires_old_snapshot_items_after_commit() {
         for growing in [false, true] {
             let source = item(&format!(
@@ -1425,7 +2203,12 @@ mod tests {
                 assert!(!entry.running);
                 let latest = entry.shared.latest.lock().unwrap();
                 assert_eq!(latest.version, version);
-                assert!(Arc::ptr_eq(&latest.item, &runtime.snapshot.items[0]));
+                assert!(
+                    latest
+                        .input
+                        .transcript()
+                        .is_some_and(|item| Arc::ptr_eq(item, &runtime.snapshot.items[0]))
+                );
             }
             // The managed canonical cursor must accept a later real append.
             let mut snapshot = (*handle.snapshot()).clone();

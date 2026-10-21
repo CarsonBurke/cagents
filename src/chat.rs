@@ -1121,12 +1121,12 @@ impl PermissionDenial {
 
 impl QueuedMessage {
     pub const LIMIT: usize = 128;
+    pub const PREVIEW_BYTES: usize = 16 * 1024;
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
-        const PREVIEW_BYTES: usize = 16 * 1024;
-        let whole = text.len() <= PREVIEW_BYTES;
+        let whole = text.len() <= Self::PREVIEW_BYTES;
         if !whole {
-            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.truncate(text.floor_char_boundary(Self::PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {

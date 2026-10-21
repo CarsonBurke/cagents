@@ -460,6 +460,10 @@ impl ToolText {
         )
     }
 
+    pub(super) fn find_identity(&self) -> u64 {
+        self.reader_identity
+    }
+
     fn surface(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
@@ -540,7 +544,10 @@ impl ToolText {
         };
         // Find reveals the matching source in the outer transcript. A nested
         // viewport would otherwise keep a deep match hidden at its old offset.
-        let limit = limit.filter(|_| !find.is_some_and(|query| find::contains(&self.text, query)));
+        let limit = limit.filter(|_| {
+            !find.is_some()
+                || !find_navigation::tool_uncapped(target, self.reader_identity, &self.text)
+        });
         let Some((height, follows)) = limit else {
             return body;
         };

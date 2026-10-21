@@ -17,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod boundary;
 mod document;
 pub(super) use boundary::{Kind, wrap};
+pub(super) use document::CatalogData;
 pub(super) use document::{
     Bookmark, Builder as DocumentBuilder, Catalog, identity as logical_identity,
 };

@@ -32,7 +32,9 @@ impl Intent {
 pub(super) struct State {
     clock: Arc<AtomicU64>,
     document: Arc<AtomicU64>,
+    search: Arc<AtomicU64>,
     pending: Option<Pending>,
+    raw: RawState,
 }
 impl State {
     #[cfg(test)]
@@ -75,6 +77,14 @@ impl State {
         )
     }
     pub(super) fn cancel(&mut self) {
+        self.cancel_navigation();
+    }
+    pub(super) fn cancel_all(&mut self) {
+        self.search.fetch_add(1, Ordering::AcqRel);
+        self.raw.cancel();
+        self.cancel_navigation();
+    }
+    fn cancel_navigation(&mut self) {
         self.clock.fetch_add(1, Ordering::AcqRel);
         self.pending = None;
     }
@@ -94,7 +104,7 @@ impl State {
 }
 impl Drop for State {
     fn drop(&mut self) {
-        self.cancel();
+        self.cancel_all();
     }
 }
 struct Pending {
@@ -106,6 +116,7 @@ struct Pending {
     document: Option<DocumentEpoch>,
     hit: Option<Hit>,
     in_flight: bool,
+    worker_alive: Option<Arc<AtomicBool>>,
     wait_for_shape: bool,
     passes: u8,
     previous: Option<(u8, f32)>,
@@ -118,9 +129,9 @@ pub(super) struct Hit {
     identity: u64,
     byte: usize,
 }
-fn items(runtime: &Runtime, key: &str) -> Vec<Arc<chat::Item>> {
+fn items<'a>(runtime: &'a Runtime, key: &str) -> Vec<&'a Arc<chat::Item>> {
     if runtime.selected_subagent.is_some() {
-        return runtime.active_item(key).cloned().into_iter().collect();
+        return runtime.active_item(key).into_iter().collect();
     }
     runtime
         .turns
@@ -135,7 +146,7 @@ fn items(runtime: &Runtime, key: &str) -> Vec<Arc<chat::Item>> {
                     .map(|placed| placed.index),
             )
         })
-        .filter_map(|index| runtime.snapshot.items.get(index).cloned())
+        .filter_map(|index| runtime.snapshot.items.get(index))
         .collect()
 }
 fn sources_match(runtime: &Runtime, pending: &Pending) -> bool {
@@ -165,7 +176,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.find_navigation.cancel();
+        runtime.find_navigation.cancel_navigation();
         let intent = runtime.find_navigation.guard();
         let expiry = intent.clone();
         let (deadline, handle) = cosmic::task::future(async move {
@@ -183,8 +194,9 @@ impl Cagents {
             document: None,
             hit: None,
             in_flight: false,
+            worker_alive: None,
             wait_for_shape: false,
-            passes: 0,
+            passes: u8::from(anchor.is_some()),
             previous: None,
             realized_pending: None,
             _deadline: handle.abort_on_drop(),
@@ -203,6 +215,9 @@ impl Cagents {
         intent: Intent,
         geometry_changed: bool,
     ) -> Task<Message> {
+        if let Some(task) = self.start_raw_find(target) {
+            return task;
+        }
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -221,16 +236,35 @@ impl Cagents {
             runtime.find_navigation.cancel();
             return Task::none();
         }
+        if pending
+            .key
+            .as_ref()
+            .is_some_and(|key| !runtime.find_matches.contains(key))
+        {
+            pending.key = None;
+            pending.hit = None;
+            pending.document = None;
+        }
         let Some(key) = &pending.key else {
             if runtime.find_matches.is_empty() {
                 runtime.find_navigation.pending = Some(pending);
                 return Task::none();
             }
-            // A query entered before authoritative body hydration gets the
-            // same disclosure/first-group behavior once that body arrives.
-            runtime.find_index = runtime.find_matches.len().saturating_sub(1);
+            runtime.find_index = (runtime.find_index + 1) % runtime.find_matches.len();
+            let key = runtime.find_matches[runtime.find_index].clone();
+            runtime.apply_find_plan(&key);
+            let anchor = runtime.find_anchor(&key);
+            pending.key = Some(key);
+            if pending.passes >= 16 {
+                runtime.find_navigation.cancel_navigation();
+                return Task::none();
+            }
+            pending.passes += 1;
             runtime.find_navigation.pending = Some(pending);
-            return self.chat_find_next(target, true);
+            return Task::batch([
+                scroll::find_anchor(target, anchor, intent.clone()).map(cosmic::Action::App),
+                later(target, intent, false),
+            ]);
         };
         let current = items(runtime, key);
         if current.is_empty() {
@@ -247,6 +281,14 @@ impl Cagents {
             pending.in_flight = false;
             pending.wait_for_shape = false;
         }
+        if pending
+            .worker_alive
+            .as_ref()
+            .is_some_and(|alive| !alive.load(Ordering::Acquire))
+        {
+            pending.worker_alive = None;
+            pending.in_flight = false;
+        }
         if pending.in_flight || (pending.wait_for_shape && !geometry_changed) {
             runtime.find_navigation.pending = Some(pending);
             return Task::none();
@@ -255,8 +297,10 @@ impl Cagents {
         // source changes. Wait for the exact current immutable item, not a
         // useful but older streaming prefix or a Loading caption.
         if current.iter().any(|item| {
-            item.role != chat::Role::User
-                && runtime
+            (item.role == chat::Role::User
+                && matches!(&item.content, ItemContent::Text { .. })
+                && runtime.prepared_prompt(item).is_none())
+                || runtime
                     .presentation_cache()
                     .get(&item.id)
                     .is_none_or(|cached| {
@@ -270,7 +314,7 @@ impl Cagents {
             runtime.find_navigation.pending = Some(pending);
             return Task::none();
         }
-        let (epoch, catalog) = document(runtime);
+        let epoch = runtime.find_navigation.document_epoch();
         if pending.document != Some(epoch) {
             pending.hit = None;
             pending.document = Some(epoch);
@@ -293,34 +337,43 @@ impl Cagents {
         } else {
             // No waiting worker queue and no source capture before admission:
             // rapid queries cannot accumulate whole-context Arc catalogs.
-            static WORKER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-                std::sync::OnceLock::new();
-            let Ok(permit) = WORKER
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-                .clone()
-                .try_acquire_owned()
-            else {
+            let Some(permit) = admit() else {
                 runtime.find_navigation.pending = Some(pending);
                 return later(target, intent, false);
             };
             let ids = current.iter().map(|item| item.id.clone()).collect();
-            let blocks = catalog.owned_search_blocks(&ids);
-            let query = pending.query.clone();
+            let (_, catalog) = document(runtime);
+            let work = Work::new(Input::Catalog(catalog.owned_search_blocks(&ids)), permit);
+            pending.worker_alive = Some(work.alive());
+            let plan = runtime
+                .find_navigation
+                .raw
+                .accepted
+                .as_ref()
+                .expect("accepted group plan")
+                .clone();
             let proof = intent.clone();
             pending.in_flight = true;
             cosmic::task::future(async move {
                 let hit = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    blocks.into_iter().find_map(|(item, identity, text)| {
-                        if !proof.current() {
-                            return None;
+                    let Input::Catalog(blocks) = work.input() else {
+                        unreachable!()
+                    };
+                    let mut hit = None;
+                    for (item, identity, text) in blocks {
+                        let found = find::matched_pattern_checked(text, &plan.pattern, 1, &|| {
+                            proof.document_current(epoch)
+                        })?;
+                        if let Some(range) = found.ranges.first() {
+                            hit = Some(Hit {
+                                item: item.to_string(),
+                                identity: *identity,
+                                byte: range.start,
+                            });
+                            break;
                         }
-                        find::first(&text, &query).map(|range| Hit {
-                            item: item.to_string(),
-                            identity,
-                            byte: range.start,
-                        })
-                    })
+                    }
+                    Some(work.finish(hit))
                 })
                 .await
                 .ok()
@@ -336,6 +389,9 @@ impl Cagents {
         target: Target,
         geometry_changed: bool,
     ) -> Task<Message> {
+        if let Some(task) = self.start_raw_find(target) {
+            return task;
+        }
         let intent = self.chat_runtime_mut(target).and_then(|runtime| {
             runtime
                 .find_navigation
@@ -356,8 +412,9 @@ impl Cagents {
         target: Target,
         intent: Intent,
         epoch: DocumentEpoch,
-        hit: Option<Hit>,
+        hit: Option<Ready<Option<Hit>>>,
     ) -> Task<Message> {
+        let hit = hit.and_then(Ready::take).flatten();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -378,6 +435,7 @@ impl Cagents {
             return Task::none();
         };
         pending.in_flight = false;
+        pending.worker_alive = None;
         if epoch == now && intent.current() {
             pending.hit = hit;
             if pending.hit.is_none() {
@@ -485,4 +543,1704 @@ impl Cagents {
             runtime.find_navigation.cancel();
         }
     }
+}
+
+// All Find phases share this one try-admitted executor. A canceled generation
+// cannot release its slot while its raw final owners still await retirement.
+struct Slot(Option<tokio::sync::OwnedSemaphorePermit>);
+impl Drop for Slot {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+fn available() -> &'static tokio::sync::watch::Sender<u64> {
+    static AVAILABLE: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+        std::sync::OnceLock::new();
+    AVAILABLE.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+pub(super) fn available_epoch() -> u64 {
+    *available().borrow()
+}
+pub(super) fn availability() -> Subscription<Message> {
+    Subscription::run(availability_stream)
+}
+pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+    iced::futures::stream::unfold(
+        (available().subscribe(), true),
+        |(mut receiver, initial)| async move {
+            if !initial {
+                receiver.changed().await.ok()?;
+            }
+            receiver.borrow_and_update();
+            Some((action(Action::FindAvailable), (receiver, false)))
+        },
+    )
+}
+fn admit() -> Option<Slot> {
+    static WORKER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .map(|permit| Slot(Some(permit)))
+}
+enum Input {
+    Raw(RawInput),
+    Catalog(Vec<(Arc<str>, u64, Arc<str>)>),
+    Highlight(Arc<str>),
+    Output(Box<dyn Send + Sync>),
+}
+pub(super) struct RetiredWork {
+    input: Input,
+    // Field order is authority: raw allocations die before the SAME sole slot.
+    _permit: Option<Slot>,
+}
+struct WorkOwner(Option<RetiredWork>, Arc<AtomicBool>);
+impl Drop for WorkOwner {
+    fn drop(&mut self) {
+        self.1.store(false, Ordering::Release);
+        if let Some(work) = self.0.take() {
+            preparation::retire_find(work);
+        }
+    }
+}
+struct Work(Arc<WorkOwner>);
+impl Work {
+    fn new(input: Input, permit: Slot) -> Self {
+        Self(Arc::new(WorkOwner(
+            Some(RetiredWork {
+                input,
+                _permit: Some(permit),
+            }),
+            Arc::new(AtomicBool::new(true)),
+        )))
+    }
+    fn alive(&self) -> Arc<AtomicBool> {
+        self.0.1.clone()
+    }
+    fn input(&self) -> &Input {
+        &self.0.0.as_ref().expect("live Find input").input
+    }
+    fn finish<T: Send + Sync + 'static>(self, value: T) -> Ready<T> {
+        let mut owner = Arc::try_unwrap(self.0).ok().expect("one Find worker owner");
+        let RetiredWork { input, _permit } = owner.0.take().expect("live Find work");
+        drop(input);
+        Ready(Arc::new(Mutex::new(Some(Admitted {
+            value: Some(value),
+            _permit,
+        }))))
+    }
+}
+struct SourceProof<T: ?Sized>(Weak<T>);
+impl<T: ?Sized> Clone for SourceProof<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T: ?Sized> PartialEq for SourceProof<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+impl<T: ?Sized> Eq for SourceProof<T> {}
+#[derive(Clone, PartialEq, Eq)]
+struct RawStamp {
+    context: Option<String>,
+    provider: Provider,
+    handle: Option<SourceProof<ClientHandle>>,
+    session: Option<String>,
+    query: (u64, usize, usize),
+    groups: Vec<(
+        String,
+        Vec<(SourceProof<chat::Item>, Vec<(u64, SourceProof<str>)>)>,
+    )>,
+}
+#[derive(Default)]
+struct RawState {
+    clock: Arc<AtomicU64>,
+    stamp: Option<RawStamp>,
+    in_flight: Option<Arc<AtomicBool>>,
+    failed: bool,
+    complete: bool,
+    deferred: Option<u64>,
+    accepted: Option<RawOutput>,
+    highlight_context: Option<Arc<HighlightContext>>,
+}
+impl RawState {
+    fn cancel(&mut self) {
+        self.clock.fetch_add(1, Ordering::AcqRel);
+        self.in_flight = None;
+        self.failed = false;
+        self.complete = false;
+        self.deferred = None;
+        self.stamp = None;
+        self.accepted = None;
+        self.highlight_context = None;
+    }
+}
+struct RawInput {
+    query: String,
+    groups: Vec<(String, Vec<RawItem>)>,
+    provider: Provider,
+}
+struct RawItem {
+    item: Arc<chat::Item>,
+    raw_disclosure: bool,
+    tools: Vec<(u64, Arc<str>)>,
+}
+#[derive(Clone)]
+struct ItemPlan {
+    id: String,
+    source: Weak<chat::Item>,
+    expand: bool,
+    parts: Vec<String>,
+}
+pub(super) struct Ready<T: Send + Sync + 'static>(Arc<Mutex<Option<Admitted<T>>>>);
+struct Admitted<T: Send + Sync + 'static> {
+    value: Option<T>,
+    _permit: Option<Slot>,
+}
+impl<T: Send + Sync + 'static> Drop for Admitted<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            retire_value(value, self._permit.take());
+        }
+    }
+}
+fn retire_value<T: Send + Sync + 'static>(value: T, permit: Option<Slot>) {
+    let work = RetiredWork {
+        input: Input::Output(Box::new(value)),
+        _permit: permit,
+    };
+    if preparation::reclaiming_find() {
+        drop(work)
+    } else {
+        preparation::retire_find(work)
+    }
+}
+impl<T: Send + Sync + 'static> Clone for Ready<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T: Send + Sync + 'static> Ready<T> {
+    fn take(self) -> Option<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .and_then(|mut ready| ready.value.take())
+    }
+}
+pub(super) type RawResult = Ready<RawOutput>;
+#[derive(Clone)]
+pub(super) struct RawOutput(Arc<RawOwner>);
+struct RawOwner(Option<RawData>);
+impl Drop for RawOwner {
+    fn drop(&mut self) {
+        if let Some(data) = self.0.take() {
+            retire_value(data, None)
+        }
+    }
+}
+impl std::ops::Deref for RawOutput {
+    type Target = RawData;
+    fn deref(&self) -> &RawData {
+        self.0.0.as_ref().expect("live Find plan")
+    }
+}
+pub(super) struct RawData {
+    epoch: u64,
+    query_epoch: u64,
+    pattern: Arc<find::Pattern>,
+    context: Option<String>,
+    groups: Vec<(String, Arc<[ItemPlan]>)>,
+    tools: Vec<(u64, Weak<str>, String, Weak<chat::Item>)>,
+    _metadata: MetadataBudget,
+}
+fn raw_groups(runtime: &Runtime) -> Vec<(String, Vec<(usize, bool)>)> {
+    if let Some(child) = &runtime.selected_subagent {
+        return runtime
+            .snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)
+            .into_iter()
+            .flat_map(|agent| agent.items.iter().enumerate())
+            .map(|(index, item)| {
+                (
+                    item.id.clone(),
+                    vec![(
+                        index,
+                        item.content.is_step()
+                            || turn::slot_of(item) == turn::Slot::Thinking
+                            || item.role == chat::Role::User,
+                    )],
+                )
+            })
+            .collect();
+    }
+    runtime
+        .turns
+        .iter()
+        .map(|turn| {
+            (
+                turn.key.clone(),
+                turn.prompt
+                    .iter()
+                    .map(|index| (*index, true))
+                    .chain(turn.steps.iter().map(|placed| (placed.index, true)))
+                    .chain(
+                        turn.prose
+                            .iter()
+                            .map(|placed| (placed.index, placed.slot == turn::Slot::Thinking)),
+                    )
+                    .collect(),
+            )
+        })
+        .collect()
+}
+fn raw_items(runtime: &Runtime) -> &[Arc<chat::Item>] {
+    runtime
+        .selected_subagent
+        .as_ref()
+        .and_then(|child| {
+            runtime
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+        })
+        .map_or(&runtime.snapshot.items, |agent| &agent.items)
+}
+fn tools(cached: Option<&CachedItem>) -> impl Iterator<Item = &tool_text::ToolText> {
+    cached.into_iter().flat_map(|cached| {
+        cached
+            .tool_input
+            .iter()
+            .chain(cached.tool_output.iter())
+            .chain(cached.patches.iter())
+    })
+}
+fn raw_stamp(runtime: &Runtime) -> RawStamp {
+    let items = raw_items(runtime);
+    RawStamp {
+        context: runtime.selected_subagent.clone(),
+        provider: runtime.session.provider,
+        handle: runtime
+            .handle()
+            .map(|handle| SourceProof(Arc::downgrade(handle))),
+        session: runtime.snapshot.session_id.clone(),
+        query: runtime.find.as_ref().map_or(
+            (runtime.find_navigation.search.load(Ordering::Acquire), 0, 0),
+            |query| {
+                (
+                    runtime.find_navigation.search.load(Ordering::Acquire),
+                    query.as_ptr() as usize,
+                    query.len(),
+                )
+            },
+        ),
+        groups: raw_groups(runtime)
+            .into_iter()
+            .map(|(key, group)| {
+                (
+                    key,
+                    group
+                        .into_iter()
+                        .filter_map(|(index, _)| items.get(index))
+                        .map(|item| {
+                            let cached =
+                                runtime.presentation_cache().get(&item.id).filter(|cached| {
+                                    cached
+                                        .item
+                                        .as_ref()
+                                        .is_some_and(|shown| Arc::ptr_eq(shown, item))
+                                });
+                            (
+                                SourceProof(Arc::downgrade(item)),
+                                tools(cached)
+                                    .map(|tool| {
+                                        (
+                                            tool.find_identity(),
+                                            SourceProof(Arc::downgrade(&tool.text)),
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    }
+}
+impl Runtime {
+    pub(super) fn refresh_find_work(&mut self) {
+        if self.find.as_ref().is_none_or(|query| query.is_empty()) {
+            if self.find_navigation.raw.stamp.is_some()
+                || self.find_navigation.raw.accepted.is_some()
+            {
+                self.find_navigation.raw.cancel();
+                self.find_matches.clear();
+                self.find_index = 0;
+                register_highlights(self);
+            }
+            return;
+        }
+        let mut stamp = raw_stamp(self);
+        if self.find_navigation.raw.stamp.as_ref() == Some(&stamp) {
+            return;
+        }
+        let same_scope = self.find_navigation.raw.stamp.as_ref().is_some_and(|old| {
+            old.context == stamp.context
+                && old.provider == stamp.provider
+                && old.handle == stamp.handle
+                && old.session == stamp.session
+                && old.query == stamp.query
+        });
+        let previous = self.find_matches.get(self.find_index).cloned();
+        if same_scope {
+            // A source publication coalesces behind the one running query.
+            // Stable item proofs remain usable while changed groups are pending.
+            self.find_navigation
+                .raw
+                .clock
+                .fetch_add(1, Ordering::AcqRel);
+            self.find_navigation.raw.complete = false;
+            self.find_navigation.raw.failed = false;
+            self.find_navigation.raw.deferred = None;
+        } else {
+            self.find_navigation.search.fetch_add(1, Ordering::AcqRel);
+            stamp.query.0 = self.find_navigation.search.load(Ordering::Acquire);
+            self.find_navigation.raw.cancel();
+        }
+        self.find_navigation.raw.stamp = Some(stamp);
+        self.find_matches = current_groups(self);
+        self.find_index = previous
+            .and_then(|key| {
+                self.find_matches
+                    .iter()
+                    .position(|candidate| candidate == &key)
+            })
+            .unwrap_or_else(|| self.find_matches.len().saturating_sub(1));
+        register_highlights(self);
+        if small_raw_work(self) {
+            let input = capture_raw(self);
+            let query = self.find.as_deref().unwrap_or_default();
+            if !query.is_empty()
+                && let Ok((groups, tools, metadata, pattern)) = raw_scan(&input, query, &|| true)
+            {
+                let result = RawOutput(Arc::new(RawOwner(Some(RawData {
+                    epoch: self.find_navigation.raw.clock.load(Ordering::Acquire),
+                    query_epoch: self.find_navigation.search.load(Ordering::Acquire),
+                    pattern,
+                    context: self.selected_subagent.clone(),
+                    groups,
+                    tools,
+                    _metadata: metadata,
+                }))));
+                self.find_matches = result.groups.iter().map(|(key, _)| key.clone()).collect();
+                self.find_index = self.find_matches.len().saturating_sub(1);
+                self.find_navigation.raw.accepted = Some(result);
+                self.find_navigation.raw.complete = true;
+                register_highlights(self);
+            }
+        }
+    }
+    pub(super) fn apply_find_plan(&mut self, key: &str) {
+        let plans = self
+            .find_navigation
+            .raw
+            .accepted
+            .as_ref()
+            .and_then(|result| result.groups.iter().find(|(group, _)| group == key))
+            .map(|(_, plans)| plans.clone())
+            .unwrap_or_default();
+        let child = self.selected_subagent.clone();
+        if child.is_none() {
+            self.find_disclosure.turn(key, &mut self.opened);
+        }
+        for plan in plans.iter() {
+            if !plan_in_group(self, key, plan) {
+                continue;
+            }
+            let Some(item) = self
+                .active_item(&plan.id)
+                .cloned()
+                .filter(|item| plan.source.as_ptr() == Arc::as_ptr(item))
+            else {
+                continue;
+            };
+            let changed = if let Some(child) = &child {
+                let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
+                for part in &plan.parts {
+                    disclosure.part(part, self.child_unfolded.entry(child.clone()).or_default());
+                }
+                plan.expand
+                    && disclosure.item(
+                        &plan.id,
+                        self.child_expanded.entry(child.clone()).or_default(),
+                    )
+            } else {
+                for part in &plan.parts {
+                    self.find_disclosure.part(part, &mut self.unfolded);
+                }
+                plan.expand && self.find_disclosure.item(&plan.id, &mut self.expanded)
+            };
+            if changed
+                && !self
+                    .presentation_cache()
+                    .get(&plan.id)
+                    .is_some_and(|cached| cached.preparing)
+                && (CachedItem::prose(&item.content).is_none()
+                    || self
+                        .presentation_cache()
+                        .get(&plan.id)
+                        .is_some_and(|cached| cached.coordination.is_some()))
+            {
+                let theme = self.syntax_theme;
+                let cache = self.presentation_cache_mut();
+                let previous = cache.remove(&plan.id);
+                cache.insert(
+                    plan.id.clone(),
+                    CachedItem::updated(&item.content, theme, previous, true, false, None),
+                );
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RawFailure {
+    Canceled,
+    TooLarge,
+    Pressure,
+    Worker,
+}
+type Scan = (
+    Vec<(String, Arc<[ItemPlan]>)>,
+    Vec<(u64, Weak<str>, String, Weak<chat::Item>)>,
+    MetadataBudget,
+    Arc<find::Pattern>,
+);
+fn raw_scan(
+    input: &RawInput,
+    query: &str,
+    current: &impl Fn() -> bool,
+) -> Result<Scan, RawFailure> {
+    let failure = std::cell::Cell::new(RawFailure::Canceled);
+    raw_scan_inner(input, query, current, &failure).ok_or(failure.get())
+}
+fn raw_scan_inner(
+    input: &RawInput,
+    query: &str,
+    current: &impl Fn() -> bool,
+    failure: &std::cell::Cell<RawFailure>,
+) -> Option<(
+    Vec<(String, Arc<[ItemPlan]>)>,
+    Vec<(u64, Weak<str>, String, Weak<chat::Item>)>,
+    MetadataBudget,
+    Arc<find::Pattern>,
+)> {
+    const MAX: usize = 8 * 1024 * 1024;
+    let pattern = Arc::new(find::Pattern::prepare(query, current)?);
+    let mut cost = pattern.bytes().checked_mul(2)?;
+    if cost > MAX {
+        failure.set(RawFailure::TooLarge);
+        return None;
+    }
+    let mut charge = |bytes: usize| {
+        failure.set(RawFailure::TooLarge);
+        cost = cost.checked_add(bytes.checked_mul(4)?)?;
+        if cost > MAX {
+            return None;
+        }
+        failure.set(RawFailure::Canceled);
+        Some(())
+    };
+    let mut groups = Vec::new();
+    let mut uncap = Vec::new();
+    for (key, items) in &input.groups {
+        charge(key.len().checked_add(128)?)?;
+        let mut plans = Vec::new();
+        for raw in items {
+            if !current() {
+                return None;
+            }
+            let item = &raw.item;
+            let matched = contains_checked(&item.content, &pattern, current)?;
+            let coordinated = chat::coordination::recognize(item, input.provider);
+            if !current() {
+                return None;
+            }
+            charge(item.id.len().checked_add(128)?)?;
+            let mut parts = Vec::new();
+            if let Some(reading) = &coordinated {
+                use chat::coordination::Kind;
+                let mut texts = Vec::new();
+                match &reading.kind {
+                    Kind::Message(message) => {
+                        texts.extend(message.body.inline().map(|text| ("body".to_owned(), text)))
+                    }
+                    Kind::Spawn(spawn) => {
+                        texts.push(("brief".into(), spawn.brief.as_str()));
+                        texts.extend(spawn.agents.iter().enumerate().filter_map(
+                            |(index, agent)| {
+                                Some((format!("prompt-{index}"), agent.prompt.inline()?))
+                            },
+                        ));
+                    }
+                    Kind::Act(_) => {}
+                }
+                texts.extend(
+                    reading
+                        .outcome
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, message)| (format!("answer-{index}"), message.body.as_str())),
+                );
+                texts.extend(
+                    reading
+                        .outcome
+                        .run
+                        .as_ref()
+                        .map(|run| ("result".into(), run.result.as_str())),
+                );
+                for (part, text) in texts {
+                    if matches_checked(text, &pattern, current)? {
+                        charge(item.id.len().checked_add(part.len())?.checked_add(128)?)?;
+                        parts.push(format!("{}#{part}", item.id));
+                    }
+                }
+            }
+            for (identity, text) in &raw.tools {
+                if matches_checked(text, &pattern, current)? {
+                    charge(item.id.len().checked_add(128)?)?;
+                    uncap.push((
+                        *identity,
+                        Arc::downgrade(text),
+                        item.id.clone(),
+                        Arc::downgrade(item),
+                    ));
+                }
+            }
+            let raw_disclosure = !matches!(&item.content, ItemContent::Delivery { .. })
+                && coordinated.as_ref().map_or(raw.raw_disclosure, |reading| {
+                    if reading.is_card() {
+                        parts.is_empty()
+                    } else {
+                        raw.raw_disclosure
+                    }
+                });
+            let delivery = matches!(&item.content, ItemContent::Delivery{body,..} if matches_checked(body,&pattern,current)?);
+            if matched || !parts.is_empty() {
+                plans.push(ItemPlan {
+                    id: item.id.clone(),
+                    source: Arc::downgrade(item),
+                    expand: (raw_disclosure && matched) || delivery,
+                    parts,
+                });
+            }
+        }
+        if !plans.is_empty() {
+            groups.push((key.clone(), plans.into()));
+        }
+    }
+    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let metadata = METADATA
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+        .clone()
+        .try_acquire_many_owned(cost.max(1) as u32)
+        .ok()
+        .or_else(|| {
+            failure.set(RawFailure::Pressure);
+            None
+        })?;
+    Some((groups, uncap, MetadataBudget(Some(metadata)), pattern))
+}
+fn matches_checked(
+    text: &str,
+    pattern: &find::Pattern,
+    current: &impl Fn() -> bool,
+) -> Option<bool> {
+    find::matched_pattern_checked(text, pattern, 0, current).map(|result| result.truncated)
+}
+fn contains_checked(
+    content: &ItemContent,
+    pattern: &find::Pattern,
+    current: &impl Fn() -> bool,
+) -> Option<bool> {
+    let mut texts: Vec<&str> = Vec::new();
+    match content {
+        ItemContent::Text { text, .. } => texts.push(text),
+        ItemContent::Command {
+            command,
+            output,
+            label,
+            working_directory,
+            ..
+        } => texts.extend([
+            command.as_str(),
+            output.as_str(),
+            label.as_str(),
+            working_directory.as_str(),
+        ]),
+        ItemContent::Tool {
+            name,
+            input,
+            output,
+            ..
+        } => texts.extend([name.as_str(), input.as_str(), output.as_str()]),
+        ItemContent::Changes { changes, .. } => {
+            for change in changes {
+                texts.extend([change.path.as_str(), change.diff.as_str()]);
+                if let chat::ChangeKind::Renamed { from } = &change.kind {
+                    texts.push(from)
+                }
+            }
+        }
+        ItemContent::WebSearch { query, results } => {
+            texts.push(query);
+            for result in results {
+                texts.extend([
+                    result.title.as_str(),
+                    result.url.as_str(),
+                    result.snippet.as_str(),
+                ]);
+            }
+        }
+        ItemContent::Image { path, description } => {
+            texts.extend([path.as_str(), description.as_str()])
+        }
+        ItemContent::Delivery {
+            from,
+            sender,
+            summary,
+            body,
+            ..
+        } => texts.extend([
+            from.as_str(),
+            sender.as_str(),
+            summary.as_str(),
+            body.as_str(),
+        ]),
+    }
+    for text in texts {
+        if matches_checked(text, pattern, current)? {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+impl Cagents {
+    fn start_raw_find(&mut self, target: Target) -> Option<Task<Message>> {
+        let runtime = self.chat_runtime_mut(target)?;
+        runtime.refresh_find_work();
+        if runtime.find.as_ref().is_none_or(|query| query.is_empty())
+            || !runtime.visible.load(Ordering::Relaxed)
+        {
+            return Some(Task::none());
+        }
+        let raw = &runtime.find_navigation.raw;
+        if raw.complete {
+            return None;
+        }
+        if raw.accepted.is_some()
+            && !runtime.find_matches.is_empty()
+            && runtime
+                .find_navigation
+                .pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending
+                        .key
+                        .as_ref()
+                        .is_none_or(|key| runtime.find_matches.contains(key))
+                })
+        {
+            return None;
+        }
+        if raw.failed || raw.deferred == Some(available_epoch()) {
+            return Some(Task::none());
+        }
+        if raw
+            .in_flight
+            .as_ref()
+            .is_some_and(|alive| alive.load(Ordering::Acquire))
+        {
+            return if raw.accepted.is_some() {
+                None
+            } else {
+                Some(Task::none())
+            };
+        }
+        let Some(permit) = admit() else {
+            return Some(later(target, runtime.find_navigation.guard(), false));
+        };
+        let context = runtime.selected_subagent.clone();
+        let work = Work::new(Input::Raw(capture_raw(runtime)), permit);
+        let clock = runtime.find_navigation.search.clone();
+        let query_epoch = clock.load(Ordering::Acquire);
+        let epoch = runtime.find_navigation.raw.clock.load(Ordering::Acquire);
+        runtime.find_navigation.raw.in_flight = Some(work.alive());
+        Some(cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let Input::Raw(input) = work.input() else {
+                    unreachable!()
+                };
+                let (groups, tools, metadata, pattern) = raw_scan(input, &input.query, &|| {
+                    clock.load(Ordering::Acquire) == query_epoch
+                })?;
+                Ok(work.finish(RawOutput(Arc::new(RawOwner(Some(RawData {
+                    epoch,
+                    query_epoch,
+                    pattern,
+                    context,
+                    groups,
+                    tools,
+                    _metadata: metadata,
+                }))))))
+            })
+            .await
+            .unwrap_or(Err(RawFailure::Worker));
+            action(Action::FindGroups(target, epoch, query_epoch, result))
+        }))
+    }
+    pub(super) fn find_groups(
+        &mut self,
+        target: Target,
+        epoch: u64,
+        query_epoch: u64,
+        result: Result<RawResult, RawFailure>,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.refresh_find_work();
+        if query_epoch != runtime.find_navigation.search.load(Ordering::Acquire) {
+            return self.resume_current_find(target, true);
+        }
+        runtime.find_navigation.raw.in_flight = None;
+        let result = match result.and_then(|ready| ready.take().ok_or(RawFailure::Canceled)) {
+            Ok(result) => result,
+            Err(RawFailure::Pressure) => {
+                runtime.find_navigation.raw.deferred = Some(available_epoch());
+                return Task::none();
+            }
+            Err(RawFailure::TooLarge | RawFailure::Worker) => {
+                runtime.find_navigation.raw.failed = true;
+                return Task::none();
+            }
+            Err(RawFailure::Canceled) => return self.resume_current_find(target, true),
+        };
+        let Some(result) = Some(result).filter(|result| {
+            result.query_epoch == runtime.find_navigation.search.load(Ordering::Acquire)
+                && runtime.selected_subagent == result.context
+                && runtime.visible.load(Ordering::Relaxed)
+        }) else {
+            return Task::none();
+        };
+        runtime.find_navigation.raw.complete =
+            epoch == runtime.find_navigation.raw.clock.load(Ordering::Acquire);
+        let previous = runtime.find_matches.get(runtime.find_index).cloned();
+        runtime.find_navigation.raw.accepted = Some(result);
+        runtime.find_matches = current_groups(runtime);
+        runtime.find_index = previous
+            .and_then(|key| {
+                runtime
+                    .find_matches
+                    .iter()
+                    .position(|candidate| candidate == &key)
+            })
+            .unwrap_or_else(|| runtime.find_matches.len().saturating_sub(1));
+        register_highlights(runtime);
+        self.resume_current_find(target, true)
+    }
+}
+
+struct HighlightContext {
+    clock: Arc<AtomicU64>,
+    epoch: u64,
+    plan: RawOutput,
+    tools: Vec<(u64, Weak<str>)>,
+}
+impl HighlightContext {
+    fn current(&self) -> bool {
+        self.clock.load(Ordering::Acquire) == self.epoch
+    }
+}
+thread_local! {
+    static HIGHLIGHTS: std::cell::RefCell<HashMap<Target,std::sync::Weak<HighlightContext>>> = std::cell::RefCell::new(HashMap::new());
+}
+fn register_highlights(runtime: &mut Runtime) {
+    let raw = &runtime.find_navigation.raw;
+    let context = raw
+        .accepted
+        .as_ref()
+        .map(|result| {
+            Arc::new(HighlightContext {
+                clock: runtime.find_navigation.search.clone(),
+                epoch: runtime.find_navigation.search.load(Ordering::Acquire),
+                plan: result.clone(),
+                tools: result
+                    .tools
+                    .iter()
+                    .filter(|(_, _, id, source)| {
+                        runtime
+                            .active_item(id)
+                            .is_some_and(|item| source.as_ptr() == Arc::as_ptr(item))
+                    })
+                    .map(|(id, source, _, _)| (*id, source.clone()))
+                    .collect(),
+            })
+        })
+        .or_else(|| {
+            raw.highlight_context
+                .as_ref()
+                .filter(|context| context.current())
+                .cloned()
+        });
+    HIGHLIGHTS.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|_, context| context.strong_count() != 0);
+        if let Some(context) = &context {
+            registry.insert(runtime.target, Arc::downgrade(context));
+        } else {
+            registry.remove(&runtime.target);
+        }
+    });
+    runtime.find_navigation.raw.highlight_context = context;
+}
+fn highlight_context(target: Target) -> Option<Arc<HighlightContext>> {
+    HIGHLIGHTS
+        .with(|contexts| contexts.borrow().get(&target).and_then(Weak::upgrade))
+        .filter(|context| context.current())
+}
+pub(super) fn tool_uncapped(target: Target, identity: u64, text: &Arc<str>) -> bool {
+    highlight_context(target).is_some_and(|context| {
+        context.tools.iter().any(|(key, source)| {
+            *key == identity && std::ptr::eq(source.as_ptr(), Arc::as_ptr(text))
+        })
+    })
+}
+pub(super) struct Highlight {
+    clock: Arc<AtomicU64>,
+    epoch: u64,
+    source: Weak<str>,
+    pub(super) marks: Marks,
+}
+impl Highlight {
+    pub(super) fn current(&self, target: Target, source: &Arc<str>) -> bool {
+        self.clock.load(Ordering::Acquire) == self.epoch
+            && highlight_context(target).is_some_and(|shown| {
+                shown.epoch == self.epoch && Arc::ptr_eq(&shown.clock, &self.clock)
+            })
+            && std::ptr::eq(self.source.as_ptr(), Arc::as_ptr(source))
+    }
+}
+pub(super) type HighlightResult = Ready<Highlight>;
+impl Cagents {
+    pub(super) fn find_highlight(&mut self, target: Target, id: u64) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.visible.load(Ordering::Relaxed) {
+            return Task::none();
+        }
+        let Some(context) = highlight_context(target) else {
+            return Task::none();
+        };
+        let Some(entry) = flow_layout::find_id(target, id) else {
+            return Task::none();
+        };
+        if !entry.borrow_mut().needs_find_highlights(target) {
+            return Task::none();
+        }
+        static BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let budget = BUDGET
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)))
+            .clone();
+        let bytes = entry
+            .borrow()
+            .prepared()
+            .map_or(0, |ready| ready.plain.len());
+        let charge =
+            (bytes.min(find::HIGHLIGHT_LIMIT) * std::mem::size_of::<std::ops::Range<usize>>() * 2
+                + 512) as u32;
+        let output = budget
+            .clone()
+            .try_acquire_many_owned(charge)
+            .ok()
+            .or_else(|| {
+                flow_layout::evict_find_highlights(id);
+                budget.try_acquire_many_owned(charge).ok()
+            });
+        let Some(output) = output else {
+            entry.borrow_mut().defer_find_highlights();
+            return Task::none();
+        };
+        let Some(permit) = admit() else {
+            entry.borrow_mut().defer_find_highlights();
+            return Task::none();
+        };
+        // Capture the exact PAINTED ready prefix only after both admissions.
+        let Some(source) = entry.borrow().prepared().map(|ready| ready.plain.clone()) else {
+            return Task::none();
+        };
+        let proof = Arc::downgrade(&source);
+        let work = Work::new(Input::Highlight(source), permit);
+        entry.borrow_mut().request_find_highlights(
+            &context.clock,
+            context.epoch,
+            &proof,
+            work.alive(),
+        );
+        cosmic::task::future(async move {
+            let ready = tokio::task::spawn_blocking(move || {
+                let Input::Highlight(source) = work.input() else {
+                    unreachable!()
+                };
+                let found = find::matched_pattern_checked(
+                    source,
+                    &context.plan.pattern,
+                    find::HIGHLIGHT_LIMIT,
+                    &|| context.current(),
+                )?;
+                Some(work.finish(Highlight {
+                    clock: context.clock.clone(),
+                    epoch: context.epoch,
+                    source: proof,
+                    marks: Marks(Arc::new(MarkData {
+                        ranges: found.ranges,
+                        truncated: found.truncated,
+                        _budget: Some(MarkBudget(Some(output))),
+                    })),
+                }))
+            })
+            .await
+            .ok()
+            .flatten();
+            action(Action::FindHighlighted(target, id, ready))
+        })
+    }
+    pub(super) fn find_highlighted(
+        &mut self,
+        target: Target,
+        id: u64,
+        ready: Option<HighlightResult>,
+    ) -> Task<Message> {
+        let result = ready.and_then(Ready::take);
+        if self.chat_runtime_mut(target).is_some()
+            && let Some(entry) = flow_layout::find_id(target, id)
+        {
+            entry.borrow_mut().complete_find_highlights(target, result);
+        }
+        self.resume_current_find(target, true)
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct Marks(Arc<MarkData>);
+#[derive(Default)]
+struct MarkData {
+    ranges: Vec<std::ops::Range<usize>>,
+    truncated: bool,
+    // Covers complete range allocation capacity and one result descriptor;
+    // retained by every painted widget clone, not just the Flow cache.
+    _budget: Option<MarkBudget>,
+}
+impl std::ops::Deref for Marks {
+    type Target = Vec<std::ops::Range<usize>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.ranges
+    }
+}
+impl From<Vec<std::ops::Range<usize>>> for Marks {
+    fn from(ranges: Vec<std::ops::Range<usize>>) -> Self {
+        Self(Arc::new(MarkData {
+            ranges,
+            ..MarkData::default()
+        }))
+    }
+}
+impl Marks {
+    pub(super) fn truncated(&self) -> bool {
+        self.0.truncated
+    }
+}
+pub(super) fn has_highlight_context(target: Target) -> bool {
+    highlight_context(target).is_some()
+}
+
+fn capture_raw(runtime: &Runtime) -> RawInput {
+    let all = raw_items(runtime);
+    let groups = raw_groups(runtime)
+        .into_iter()
+        .map(|(key, group)| {
+            (
+                key,
+                group
+                    .into_iter()
+                    .filter_map(|(index, raw_disclosure)| {
+                        let item = all.get(index)?.clone();
+                        let cached = runtime.presentation_cache().get(&item.id).filter(|cached| {
+                            cached
+                                .item
+                                .as_ref()
+                                .is_some_and(|shown| Arc::ptr_eq(shown, &item))
+                        });
+                        let tools = tools(cached)
+                            .map(|tool| (tool.find_identity(), tool.text.clone()))
+                            .collect();
+                        Some(RawItem {
+                            item,
+                            raw_disclosure,
+                            tools,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    RawInput {
+        query: runtime.find.clone().unwrap_or_default(),
+        groups,
+        provider: runtime.session.provider,
+    }
+}
+/// Aggregate source AND repeated query work, decided from lengths and bounded
+/// descriptors. No raw scan, JSON serialization or coordination parse chooses
+/// this path. The full prepared tool source counts separately from raw input.
+fn small_raw_work(runtime: &Runtime) -> bool {
+    let query = runtime.find.as_ref().map_or(0, String::len);
+    if query > 4096 {
+        return false;
+    }
+    let mut work = query;
+    let mut count = 0usize;
+    for item in raw_items(runtime) {
+        count += 1;
+        if count > 16 {
+            return false;
+        }
+        let before = work;
+        let mut fields = 0usize;
+        let mut add = |text: &str| {
+            fields += 1;
+            work = work.saturating_add(text.len()).saturating_add(query)
+        };
+        match &item.content {
+            ItemContent::Text { text, .. } => add(text),
+            ItemContent::Command {
+                command,
+                output,
+                label,
+                working_directory,
+                ..
+            } => {
+                add(command);
+                add(output);
+                add(label);
+                add(working_directory);
+            }
+            ItemContent::Tool {
+                name,
+                input,
+                output,
+                ..
+            } => {
+                add(name);
+                add(input);
+                add(output);
+            }
+            ItemContent::Delivery {
+                from,
+                sender,
+                summary,
+                body,
+                ..
+            } => {
+                add(from);
+                add(sender);
+                add(summary);
+                add(body);
+            }
+            ItemContent::Image { path, description } => {
+                add(path);
+                add(description);
+            }
+            // Variable compound descriptors require the worker. Their byte_len
+            // helpers walk collections and do not constitute O(1) admission.
+            ItemContent::Changes { .. } | ItemContent::WebSearch { .. } => return false,
+        }
+        // Coordination unquoting can expose at most the bounded input bytes;
+        // include worst-case per-byte matching/descriptor/query overhead.
+        if item.content.is_step() {
+            work = work.saturating_add(
+                work.saturating_sub(before)
+                    .saturating_mul(query.max(1))
+                    .saturating_mul(8),
+            );
+        }
+        let cached = runtime.presentation_cache().get(&item.id);
+        for tool in tools(cached) {
+            work = work.saturating_add(tool.text.len()).saturating_add(query);
+        }
+        work = work
+            .saturating_add(item.id.len())
+            .saturating_add(fields * 32);
+        if work > 4096 {
+            return false;
+        }
+    }
+    work <= 4096
+}
+
+struct MarkBudget(Option<tokio::sync::OwnedSemaphorePermit>);
+impl Drop for MarkBudget {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+
+/// Inline transcript leaves are intrinsically at most2048 bytes; larger
+/// prepared sources use Flow. The query was folded once by admitted Find work.
+pub(super) fn inline_highlights(target: Target, text: &str) -> Marks {
+    if text.len() > 2048 {
+        return Marks::default();
+    }
+    highlight_context(target)
+        .and_then(|context| {
+            find::matched_pattern_checked(
+                text,
+                &context.plan.pattern,
+                find::HIGHLIGHT_LIMIT,
+                &|| context.current(),
+            )
+        })
+        .map_or_else(Marks::default, |found| found.ranges.into())
+}
+
+fn current_groups(runtime: &Runtime) -> Vec<String> {
+    let Some(accepted) = &runtime.find_navigation.raw.accepted else {
+        return Vec::new();
+    };
+    let Some(stamp) = &runtime.find_navigation.raw.stamp else {
+        return Vec::new();
+    };
+    stamp
+        .groups
+        .iter()
+        .filter(|(key, sources)| {
+            accepted
+                .groups
+                .iter()
+                .find(|(group, _)| group == key)
+                .is_some_and(|(_, plans)| {
+                    plans.iter().any(|plan| {
+                        sources
+                            .iter()
+                            .any(|(source, _)| source.0.ptr_eq(&plan.source))
+                    })
+                })
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn plan_in_group(runtime: &Runtime, key: &str, plan: &ItemPlan) -> bool {
+    runtime
+        .find_navigation
+        .raw
+        .stamp
+        .as_ref()
+        .and_then(|stamp| stamp.groups.iter().find(|(group, _)| group == key))
+        .is_some_and(|(_, sources)| {
+            sources
+                .iter()
+                .any(|(source, _)| source.0.ptr_eq(&plan.source))
+        })
+}
+
+struct MetadataBudget(Option<tokio::sync::OwnedSemaphorePermit>);
+impl Drop for MetadataBudget {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn runtime(body: &str) -> (Cagents, Target, Arc<ClientHandle>) {
+        let account = Account::system(Provider::Claude);
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &account,
+            false,
+        )
+        .unwrap();
+        let item = Arc::new(chat::Item {
+            id: "source".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        });
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                items: vec![item],
+                ..Snapshot::default()
+            },
+        ));
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let mut runtime = Runtime::new(
+            target,
+            session,
+            Connection::Live(handle.clone()),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        preparation::drain_fixture(&mut runtime);
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        (app, target, handle)
+    }
+    fn finish_highlight(app: &mut Cagents, target: Target, id: u64) {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = app.find_highlight(target, id);
+        let effects = executor.block_on(async {
+            iced::runtime::task::into_stream(task)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        });
+        let mut accepted = false;
+        for effect in effects {
+            if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::FindHighlighted(found, key, result),
+            ))) = effect
+            {
+                assert_eq!((found, key), (target, id));
+                drop(app.find_highlighted(found, key, result));
+                accepted = true;
+            }
+        }
+        assert!(
+            accepted,
+            "actual admitted Find worker returned its typed result"
+        );
+    }
+    #[test]
+    fn unpolled_find_input_retires_before_the_same_sole_permit() {
+        preparation::retirement_barrier();
+        let held = preparation::hold_retirement();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let source: Arc<str> = "huge raw input λ ".repeat(30_000).into();
+        let weak = Arc::downgrade(&source);
+        let work = Work::new(
+            Input::Highlight(source),
+            Slot(Some(semaphore.clone().try_acquire_owned().unwrap())),
+        );
+        let alive = work.alive();
+        let future = async move { drop(work) };
+        drop(future);
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(
+            weak.upgrade().is_some(),
+            "the stalled FIFO owns actual raw input"
+        );
+        assert!(
+            semaphore.clone().try_acquire_owned().is_err(),
+            "canceling an unpolled task cannot amplify raw generations"
+        );
+        held.send(()).unwrap();
+        preparation::retirement_barrier();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+    #[test]
+    fn completed_find_keeps_slot_through_stale_reply_retirement() {
+        struct Output {
+            bytes: Option<Vec<u8>>,
+            sent: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+            semaphore: Arc<tokio::sync::Semaphore>,
+        }
+        impl Drop for Output {
+            fn drop(&mut self) {
+                drop(self.bytes.take());
+                self.sent
+                    .send((
+                        std::thread::current().id(),
+                        self.semaphore.available_permits(),
+                    ))
+                    .unwrap();
+            }
+        }
+        preparation::retirement_barrier();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let source: Arc<str> = "old raw source ".repeat(20_000).into();
+        let weak = Arc::downgrade(&source);
+        let work = Work::new(
+            Input::Highlight(source),
+            Slot(Some(semaphore.clone().try_acquire_owned().unwrap())),
+        );
+        let (sent, observed) = std::sync::mpsc::channel();
+        let output = Output {
+            bytes: Some(vec![17; 128 * 1024]),
+            sent,
+            semaphore: semaphore.clone(),
+        };
+        let ready = std::thread::spawn(move || work.finish(output))
+            .join()
+            .unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "worker releases raw source before returning the same admission"
+        );
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "queued completion retains admission"
+        );
+        let held = preparation::hold_retirement();
+        drop(ready);
+        assert!(observed.try_recv().is_err());
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "stale message drop keeps admission behind actual output destruction"
+        );
+        held.send(()).unwrap();
+        let worker = preparation::retirement_barrier();
+        assert_eq!(observed.recv().unwrap(), (worker, 0));
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+    #[test]
+    fn raw_plan_discovers_unquoted_parts_and_exact_prepared_readers_in_order() {
+        let query = "say \"NEEDLE λ\"";
+        let item = Arc::new(chat::Item {
+            id: "agent".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({"prompt":query,"run_in_background":true}).to_string(),
+                output: "Background task launched".into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+            started_at: None,
+        });
+        assert!(!find::contains(
+            match &item.content {
+                ItemContent::Tool { input, .. } => input,
+                _ => unreachable!(),
+            },
+            query
+        ));
+        let input = RawInput {
+            query: query.into(),
+            provider: Provider::Claude,
+            groups: vec![(
+                "group".into(),
+                vec![RawItem {
+                    item: item.clone(),
+                    raw_disclosure: true,
+                    tools: vec![(1, Arc::from("absent")), (2, Arc::from(query))],
+                }],
+            )],
+        };
+        let (groups, tools, _, _) = raw_scan(&input, query, &|| true).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1[0].parts, vec!["agent#prompt-0"]);
+        assert!(
+            !groups[0].1[0].expand,
+            "matching card part owns disclosure rather than raw command"
+        );
+        assert_eq!(
+            tools.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+    }
+    #[test]
+    fn two_mounted_common_match_leaves_keep_full_per_leaf_budget_and_refuse_stale_source() {
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let cache = flow_layout::Cache::default();
+        let text = "needle ".repeat(find::HIGHLIGHT_LIMIT + 1);
+        let entries: Vec<_> = (0..2)
+            .map(|identity| {
+                let entry = cache.entry(
+                    identity + 70,
+                    vec![iced::widget::text::Span::new(text.clone())].into(),
+                );
+                entry.borrow_mut().bind_target(target);
+                entry
+                    .borrow_mut()
+                    .configure(600.0, iced::Pixels(14.0), iced::Font::default());
+                entry.borrow_mut().set_find_visible(true);
+                entry
+            })
+            .collect();
+        assert!(cache.complete_fixture());
+        for entry in &entries {
+            let id = entry.borrow_mut().find_request_id(target).unwrap();
+            finish_highlight(&mut app, target, id);
+        }
+        for entry in &entries {
+            let marks = entry.borrow_mut().find_highlights(target);
+            assert_eq!(marks.len(), find::HIGHLIGHT_LIMIT);
+            assert!(marks.truncated(), "4096 is a truthful per-leaf limit");
+        }
+        let old = entries[0].borrow().prepared().unwrap();
+        let context = highlight_context(target).unwrap();
+        let found = Highlight {
+            clock: context.clock.clone(),
+            epoch: context.epoch,
+            source: Arc::downgrade(&old.plain),
+            marks: Marks::default(),
+        };
+        assert!(found.current(target, &old.plain));
+        let rewritten: Arc<str> = text.clone().into();
+        assert!(
+            !found.current(target, &rewritten),
+            "equal bytes in another ready allocation cannot certify painted prefix identity"
+        );
+        drop(app.handle_chat_ui(Action::Find(target, "NEEDLE".into())));
+        assert!(
+            !found.current(target, &old.plain),
+            "same-length query edit has a new explicit intent epoch"
+        );
+    }
+    #[test]
+    fn many_visible_leaves_admit_without_starvation_and_nonvisible_eviction_wakes_readmission() {
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let cache = flow_layout::Cache::default();
+        let entries: Vec<_> = (0..70)
+            .map(|identity| {
+                let entry = cache.entry(
+                    identity + 1000,
+                    vec![iced::widget::text::Span::new("needle ".repeat(80))].into(),
+                );
+                entry.borrow_mut().bind_target(target);
+                entry
+                    .borrow_mut()
+                    .configure(600.0, iced::Pixels(14.0), iced::Font::default());
+                entry.borrow_mut().set_find_visible(true);
+                entry
+            })
+            .collect();
+        assert!(cache.complete_fixture());
+        for entry in &entries {
+            let id = entry.borrow_mut().find_request_id(target).unwrap();
+            finish_highlight(&mut app, target, id);
+        }
+        for entry in &entries {
+            assert_eq!(entry.borrow_mut().find_highlights(target).len(), 80);
+            assert!(
+                entry.borrow_mut().find_request_id(target).is_none(),
+                "idle visible peers do not perpetually evict each other"
+            );
+        }
+        let id = entries[0].borrow().id_for_find_test();
+        let other = entries[1].borrow().id_for_find_test();
+        entries[0].borrow_mut().set_find_visible(false);
+        let before = available_epoch();
+        flow_layout::evict_find_highlights(other);
+        assert_ne!(
+            available_epoch(),
+            before,
+            "actual bounded output retirement emits coalesced availability"
+        );
+        entries[0].borrow_mut().set_find_visible(true);
+        let held = admit().unwrap();
+        drop(app.find_highlight(target, id));
+        assert!(
+            entries[0].borrow_mut().find_request_id(target).is_none(),
+            "busy executor demand coalesces rather than redraw-looping"
+        );
+        drop(held);
+        assert_eq!(
+            entries[0].borrow_mut().find_request_id(target),
+            Some(id),
+            "same slot release wakes deferred visible work"
+        );
+        finish_highlight(&mut app, target, id);
+        assert_eq!(entries[0].borrow_mut().find_highlights(target).len(), 80);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.borrow_mut().find_request_id(target).is_none())
+        );
+    }
+    #[test]
+    fn same_source_pointer_provider_transition_revokes_old_query_authority() {
+        let (mut app, target, _) = runtime("stable needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let source = runtime.snapshot.items[0].clone();
+        let old = runtime
+            .find_navigation
+            .raw
+            .accepted
+            .as_ref()
+            .unwrap()
+            .clone();
+        let old_epoch = old.query_epoch;
+        runtime.session.provider = Provider::Codex;
+        runtime.refresh_find_work();
+        assert!(Arc::ptr_eq(&source, &runtime.snapshot.items[0]));
+        assert_ne!(
+            old_epoch,
+            runtime.find_navigation.search.load(Ordering::Acquire),
+            "provider changes revoke coordination interpretation even with identical source pointers"
+        );
+        assert!(
+            old.query_epoch
+                != runtime
+                    .find_navigation
+                    .raw
+                    .accepted
+                    .as_ref()
+                    .unwrap()
+                    .query_epoch
+        );
+    }
+    #[test]
+    fn stable_group_and_query_marks_survive_unrelated_source_publication_but_rewrites_refuse() {
+        let (mut app, target, handle) = runtime("stable NEEDLE");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let stable = runtime.snapshot.items[0].clone();
+        let key = runtime.find_matches[0].clone();
+        let query_epoch = runtime.find_navigation.search.load(Ordering::Acquire);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "unrelated".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "later absent".repeat(10_000),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        }));
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(
+            runtime.find_navigation.search.load(Ordering::Acquire),
+            query_epoch
+        );
+        assert!(
+            runtime.find_matches.contains(&key),
+            "stable earlier result remains current during unrelated giant append"
+        );
+        assert!(
+            !runtime.find_navigation.raw.complete,
+            "changed/new sources remain pending"
+        );
+        snapshot.generation += 1;
+        snapshot.items[0] = Arc::new(chat::Item {
+            content: ItemContent::Text {
+                text: "same-id replacement absent".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ..(*stable).clone()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(
+            !app.chat_runtime_mut(target)
+                .unwrap()
+                .find_matches
+                .contains(&key),
+            "unknown same-ID rewrite cannot reuse old match authority"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(super) fn find_for_test(app: &mut Cagents, target: Target, query: String) -> Task<Message> {
+    use iced::futures::StreamExt;
+    let empty = query.is_empty();
+    let mut task = app.handle_chat_ui(Action::Find(target, query));
+    if empty {
+        return task;
+    }
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for _ in 0..64 {
+        if app
+            .chat_runtime_mut(target)
+            .is_some_and(|runtime| runtime.find_navigation.raw.complete)
+        {
+            let needs_reveal = app.chat_runtime_mut(target).is_some_and(|runtime| {
+                !runtime.find_matches.is_empty()
+                    && runtime
+                        .find_navigation
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.key.is_none())
+            });
+            return if needs_reveal {
+                app.resume_current_find(target, false)
+            } else {
+                task
+            };
+        }
+        let next = executor
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = iced::runtime::task::into_stream(task)?;
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(
+                                action @ (Action::FindResume(..)
+                                | Action::FindGroups(..)
+                                | Action::FindAvailable),
+                            ),
+                        )) = effect
+                        {
+                            return Some(action);
+                        }
+                    }
+                    None
+                })
+                .await
+                .expect("real bounded Find group worker completes")
+            })
+            .expect("Find produces a real continuation");
+        task = app.handle_chat_ui(next);
+    }
+    panic!("Find group preparation did not settle")
 }

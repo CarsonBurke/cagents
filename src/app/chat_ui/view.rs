@@ -312,7 +312,7 @@ const QUEUE_PREVIEW_LINES: usize = 2;
 /// How much of a waiting message is handed to its row to be laid out. Two
 /// lines never show more, and a hundred entries of sixteen kibibytes each
 /// would otherwise be shaped on every layout to draw two lines apiece.
-const QUEUE_PREVIEW_BYTES: usize = 480;
+const QUEUE_PREVIEW_BYTES: usize = prompt::QUEUE_PREVIEW_BYTES;
 
 /// When a waiting message goes to the agent, as its row marks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,7 +327,7 @@ enum QueueTiming {
 /// with it.
 fn queue_row<'a>(
     timing: QueueTiming,
-    text: &'a str,
+    text: Cow<'a, str>,
     attachments: &'a [Attachment],
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -359,14 +359,11 @@ fn queue_row<'a>(
             .join(", ")
     };
     // A message of files alone is named by them rather than left blank.
-    let preview: Cow<'a, str> = if text.trim().is_empty() {
-        names().into()
-    } else {
-        let text = text.trim();
-        text[..text.floor_char_boundary(QUEUE_PREVIEW_BYTES)].into()
-    };
+    debug_assert!(text.len() <= QUEUE_PREVIEW_BYTES);
+    let has_text = !text.is_empty();
+    let preview: Cow<'a, str> = if has_text { text } else { names().into() };
     let mut details: Vec<Element<'a, Message>> = Vec::new();
-    if !attachments.is_empty() && !text.trim().is_empty() {
+    if !attachments.is_empty() && has_text {
         details.push(crate::interaction::tooltip(
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Attachment, design::COMPACT_ICON_SIZE),
@@ -1257,7 +1254,7 @@ impl Runtime {
             .hash(&mut fingerprint);
         self.queued
             .as_ref()
-            .map(|queued| &queued.text)
+            .map(|queued| (queued.source.id, queued.presentation.revision))
             .hash(&mut fingerprint);
         let fingerprint = fingerprint.finish();
         let mut document = self.selection_document.borrow_mut();
@@ -1312,8 +1309,15 @@ impl Runtime {
                         );
                     }
                 }
-                if let Some(queued) = &self.queued {
-                    builder.plain("queued-prompt", &[2], Arc::from(queued.text.trim_end()));
+                if let Some(queued) = &self.queued
+                    && let Some(prepared) = &queued.presentation.prepared
+                {
+                    builder.indexed(
+                        "queued-prompt",
+                        &[2],
+                        prepared.full.plain(),
+                        prepared.full.plain_prefixes(),
+                    );
                 }
             }
             if let Some(error) = self.error.as_ref().or(self.snapshot.error.as_ref())
@@ -1345,8 +1349,15 @@ impl Runtime {
         detail: bool,
     ) {
         if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
-            let (text, _, _) = self.prompt_text(item);
-            builder.plain(&item.id, &[2], text.into());
+            if matches!(item.content, ItemContent::Text { .. }) {
+                if let Some(prompt) = self.prepared_prompt(item) {
+                    let text = prompt.shown(self.item_expanded(&item.id));
+                    builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
+                }
+            } else {
+                let (text, _, _) = self.prompt_text(item);
+                builder.plain(&item.id, &[2], text.into());
+            }
             return;
         }
         let Some(cached) = self.presentation_cache().get(&item.id) else {
@@ -3825,12 +3836,12 @@ impl Runtime {
                 .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
                 .into()
         };
-        let copy = |text: &str| {
-            (!text.trim().is_empty()).then(|| {
+        let copy = |text: &str, source: QueueCopy| {
+            (!text.is_empty()).then(|| {
                 small_icon(
                     Icon::Copy,
                     "Copy queued message",
-                    Action::CopyLiteral(text.to_owned()),
+                    Action::CopyQueued(target, source),
                 )
             })
         };
@@ -3842,7 +3853,20 @@ impl Runtime {
             let entry = QueueEntry::Provider(queued.id.clone());
             let recalling = self.is_recalling(&queued.id);
             let available = available && !recalling;
-            let mut controls: Vec<Element<'_, Message>> = copy(&queued.text).into_iter().collect();
+            let preview = self
+                .provider_queue
+                .borrow_mut()
+                .get(&self.snapshot, &queued.id);
+            let mut controls: Vec<Element<'_, Message>> = preview
+                .as_ref()
+                .and_then(|preview| {
+                    copy(
+                        &queued.text,
+                        QueueCopy::Provider(Arc::downgrade(preview), queued.id.clone()),
+                    )
+                })
+                .into_iter()
+                .collect();
             if caps.queue_remove {
                 // An entry the composer cannot hold whole keeps the control,
                 // so its absence is not left to be wondered at.
@@ -3889,7 +3913,10 @@ impl Runtime {
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },
-                &queued.text,
+                preview.as_ref().map_or_else(
+                    || Cow::Borrowed("Message…"),
+                    |preview| Cow::Owned(preview.preview.to_string()),
+                ),
                 &queued.attachments,
                 controls,
             ));
@@ -3902,9 +3929,9 @@ impl Runtime {
                 } else {
                     QueueTiming::NextTurn
                 },
-                &followup.text,
+                followup.preview.as_str().into(),
                 &followup.attachments,
-                copy(&followup.text)
+                copy(&followup.text, QueueCopy::Local(followup.id))
                     .into_iter()
                     .chain([
                         control(
@@ -4048,29 +4075,53 @@ impl Runtime {
             .pending
             .as_ref()
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
+        let logical = selectable_prose::Logical {
+            identity: selection::logical_identity("queued-prompt", &[2]),
+            start: 0,
+        };
+        let body: Element<'a, Message> = if let Some(prepared) = &queued.presentation.prepared {
+            let mut settings =
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            settings.style.font = iced::Font::default();
+            if prepared.full.len() > 2048 {
+                let flow = queued.presentation.flow.markdown_entry(
+                    logical.identity,
+                    prepared.full.clone(),
+                    settings.style,
+                );
+                selectable_prose::flow_source(
+                    settings.text_size,
+                    settings.style.font,
+                    self.target,
+                    None,
+                    logical,
+                    flow,
+                )
+            } else {
+                selectable_prose::logical_text(
+                    prepared.full.spans(settings.style),
+                    settings.text_size,
+                    settings.style.font,
+                    self.target,
+                    None,
+                    logical,
+                )
+            }
+        } else {
+            widget::text(prompt::preview(queued.source.text()).0)
+                .size(design::TEXT_PROSE)
+                .into()
+        };
         let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(selectable_prose::logical_text(
-                vec![iced::widget::text::Span::new(
-                    queued.text.trim_end().to_owned(),
-                )]
+            widget::container(body)
+                .class(design::surface(
+                    Some(design::accent_wash),
+                    [design::RADIUS_M; 4],
+                    false,
+                ))
+                .padding([step::GAP_S as u16, step::GAP_M as u16])
+                .max_width(PROMPT_MEASURE)
                 .into(),
-                design::TEXT_PROSE.into(),
-                iced::Font::default(),
-                self.target,
-                None,
-                selectable_prose::Logical {
-                    identity: selection::logical_identity("queued-prompt", &[2]),
-                    start: 0,
-                },
-            ))
-            .class(design::surface(
-                Some(design::accent_wash),
-                [design::RADIUS_M; 4],
-                false,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE)
-            .into(),
         ];
         for attachment in &queued.attachments {
             rows.push(
@@ -4096,7 +4147,10 @@ impl Runtime {
                 small_icon(
                     Icon::Copy,
                     "Copy queued message",
-                    Action::CopyLiteral(queued.text.clone()),
+                    Action::CopyQueued(
+                        self.target,
+                        QueueCopy::Initial(Arc::downgrade(&queued.source)),
+                    ),
                 ),
                 crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")
                     .compact()
@@ -4126,29 +4180,25 @@ impl Runtime {
             ItemContent::Text { text, .. } => text.as_str(),
             ItemContent::Image { path, description } => Self::attachment_label(path, description),
             content => turn::step_label(content),
-        }
-        .to_owned();
-        // An attachment sits under its prompt as an outlined chip rather than
-        // another filled bubble, so a message with two images does not read as
-        // three separate things the reader said.
-        let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
-        let expanded = self.item_expanded(&item.id);
-        let text = if long && !expanded {
-            text.lines()
-                .take(12)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .chars()
-                .take(2000)
-                .collect::<String>()
-        } else {
-            text
         };
-        (text, attachment, long)
+        if attachment {
+            (text.to_owned(), true, false)
+        } else {
+            let (preview, long) = prompt::preview(text);
+            (preview, false, long)
+        }
     }
 
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
-        let (text, attachment, long) = self.prompt_text(item);
+        let prepared = self.prepared_prompt(item);
+        // Pending cold/replaced sources show only their own bounded prefix.
+        // Full literal text and catalog authority wait for the exact worker DTO.
+        let (fallback, attachment, pending_long) = if prepared.is_some() {
+            (String::new(), false, false)
+        } else {
+            self.prompt_text(item)
+        };
+        let long = prepared.map_or(pending_long, |prompt| prompt.long);
         let expanded = self.item_expanded(&item.id);
         let logical = selectable_prose::Logical {
             identity: selection::logical_identity(&item.id, &[2]),
@@ -4158,7 +4208,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
                 selectable_prose::logical_text(
-                    vec![iced::widget::text::Span::new(text)].into(),
+                    vec![iced::widget::text::Span::new(fallback)].into(),
                     design::TEXT_CAPTION.into(),
                     iced::Font::default(),
                     self.target,
@@ -4170,14 +4220,38 @@ impl Runtime {
             .align_y(Alignment::Center)
             .into()
         } else {
-            let text = selectable_prose::logical_text(
-                vec![iced::widget::text::Span::new(text)].into(),
-                design::TEXT_PROSE.into(),
-                iced::Font::default(),
-                self.target,
-                None,
-                logical,
-            );
+            let text = if let Some(prompt) = prepared {
+                let text = prompt.shown(expanded);
+                let mut settings =
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                settings.style.font = iced::Font::default();
+                if text.len() > 2048 {
+                    let flow = self.presentation_cache()[&item.id]
+                        .flow_cache
+                        .markdown_entry(logical.identity, text.clone(), settings.style);
+                    selectable_prose::flow_source(
+                        settings.text_size,
+                        settings.style.font,
+                        self.target,
+                        None,
+                        logical,
+                        flow,
+                    )
+                } else {
+                    selectable_prose::logical_text(
+                        text.spans(settings.style),
+                        settings.text_size,
+                        settings.style.font,
+                        self.target,
+                        None,
+                        logical,
+                    )
+                }
+            } else {
+                // This bounded nonselectable preview cannot certify a full
+                // source/catalog before preparation accepts the current Item.
+                widget::text(fallback).size(design::TEXT_PROSE).into()
+            };
             if long {
                 widget::column::with_children(vec![
                     text,
@@ -6796,7 +6870,15 @@ mod tests {
         let rendered = |runtime: &Runtime| {
             let mut element = runtime.prompt_view(runtime.active_item("same#opaque-id").unwrap());
             let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
+            let mut node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
+            );
+            for cached in runtime.cache.values().chain(runtime.child_cache.values()) {
+                cached.flow_cache.complete_fixture();
+            }
+            node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 8000.0)),
@@ -6825,19 +6907,35 @@ mod tests {
             text.0.join("\n")
         };
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         assert!(
             rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"),
             "a parent prompt Find match must be visible beyond its collapsed cutoff"
         );
-        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "absent".into(),
+        ));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("parent-only-suffix"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         assert!(
             rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"),
             "a child prompt Find match must be visible beyond its collapsed cutoff"
@@ -6848,12 +6946,24 @@ mod tests {
                 .expanded
                 .contains("same#opaque-id")
         );
-        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "absent".into(),
+        ));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!rendered(app.chat_runtime_mut(target).unwrap()).contains("child-only-suffix"));
-        drop(app.handle_chat_ui(Action::Find(target, "child-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
@@ -6865,7 +6975,11 @@ mod tests {
             "explicit child expansion survives search close and transcript switches"
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only-suffix".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only-suffix".into(),
+        ));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));

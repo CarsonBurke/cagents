@@ -33,6 +33,7 @@ mod monospace;
 mod pending_admission;
 mod permissions;
 mod preparation;
+mod prompt;
 mod prose;
 mod prose_document;
 mod reader_source;
@@ -248,6 +249,7 @@ pub enum Action {
     CopyMessage(Target, String, Option<chat::TextCopySource>),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
+    LocalPromptPrepared(Target, u64, preparation::Ready),
     RetryMarkdown(Target),
     OpenUrl(String),
     OpenDocument(Target, String),
@@ -264,6 +266,7 @@ pub enum Action {
     ImageExternal,
     CopyLiteral(String),
     CopySharedCode(Target, Arc<str>),
+    CopyQueued(Target, QueueCopy),
     Latest(Target),
     /// Takes a waiting message back into the composer to be revised: the one
     /// named, or the newest that can be taken back.
@@ -282,13 +285,22 @@ pub enum Action {
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
+    FindAvailable,
+    FindGroups(
+        Target,
+        u64,
+        u64,
+        Result<find_navigation::RawResult, find_navigation::RawFailure>,
+    ),
+    FindHighlight(Target, u64),
+    FindHighlighted(Target, u64, Option<find_navigation::HighlightResult>),
     FindResume(Target, find_navigation::Intent, bool),
     FindExpired(Target, find_navigation::Intent),
     FindIndexed(
         Target,
         find_navigation::Intent,
         find_navigation::DocumentEpoch,
-        Option<find_navigation::Hit>,
+        Option<find_navigation::Ready<Option<find_navigation::Hit>>>,
     ),
     FindLocated(
         Target,
@@ -360,6 +372,10 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::FindAvailable
+                | Self::FindGroups(..)
+                | Self::FindHighlight(..)
+                | Self::FindHighlighted(..)
                 | Self::FindResume(..)
                 | Self::FindExpired(..)
                 | Self::FindIndexed(..)
@@ -384,6 +400,7 @@ impl Action {
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
                 | Self::MarkdownPrepared(..)
+                | Self::LocalPromptPrepared(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -972,6 +989,7 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn contains_text(content: &ItemContent, query: &str) -> bool {
     match content {
         ItemContent::Text { text, .. } => find::contains(text, query),
@@ -1049,6 +1067,7 @@ struct CachedItem {
     source: markdown_source::Source,
     markdown: markdown::Content,
     document: Option<prose_document::Document>,
+    prompt: Option<Box<prompt::Prepared>>,
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
@@ -1082,6 +1101,7 @@ impl Drop for CachedItem {
             || self.source.retained_capacity() != 0
             || !self.blocks.is_empty()
             || self.prepared_tools.is_some()
+            || self.prompt.is_some()
         {
             preparation::retire_presentation(preparation::Presentation {
                 parsed: preparation::Parsed {
@@ -1092,6 +1112,7 @@ impl Drop for CachedItem {
                 palettes: self.palette_views.take(),
                 item: self.item.take(),
                 prepared_tools: self.prepared_tools.take(),
+                prompt: self.prompt.take(),
             });
         }
     }
@@ -1138,7 +1159,10 @@ impl CachedItem {
     /// Approximate exposed presentation storage. Opaque Markdown/parser
     /// allocations and widget/shaping trees are intentionally not estimated.
     fn retained_bytes(&self) -> usize {
-        self.flow_cache.retained_bytes()
+        self.prompt
+            .as_ref()
+            .map_or(0, |prompt| prompt.retained_bytes())
+            + self.flow_cache.retained_bytes()
             + self.source.retained_capacity()
             + self
                 .blocks
@@ -1364,6 +1388,7 @@ impl CachedItem {
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
             document: None,
+            prompt: None,
             flow_cache,
             reader_memory,
             reader_context,
@@ -1753,6 +1778,13 @@ enum Connection {
     Live(Arc<ClientHandle>),
 }
 
+#[derive(Clone)]
+pub enum QueueCopy {
+    Initial(std::sync::Weak<prompt::LocalSource>),
+    Provider(std::sync::Weak<prompt::QueuePreview>, String),
+    Local(u64),
+}
+
 /// A draft's first message, held while its conversation starts.
 ///
 /// A provider does not take commands the moment its connection opens:
@@ -1760,8 +1792,9 @@ enum Connection {
 /// and OMP once its history has loaded. The message waits here until the
 /// conversation takes it, and returns to the composer if it never does.
 struct Queued {
-    /// The reader's wording, restored if startup cannot take the message.
-    text: String,
+    /// Immutable local input; never a fabricated provider-history Item.
+    source: Arc<prompt::LocalSource>,
+    presentation: prompt::LocalPresentation,
     /// Resolve draft skill choices before the provider replaces the draft
     /// catalog; two provider skills may share a name after startup.
     resolved_text: String,
@@ -1782,8 +1815,8 @@ impl Queued {
     fn submission_text<'a>(&'a self, snapshot: &Snapshot) -> &'a str {
         // A provider command learned during startup takes precedence over a
         // draft skill with the same slash name.
-        if slash_invocation(&self.text, snapshot).is_some() {
-            &self.text
+        if slash_invocation(self.source.text(), snapshot).is_some() {
+            self.source.text()
         } else {
             &self.resolved_text
         }
@@ -1810,6 +1843,7 @@ impl Queued {
 struct Followup {
     id: u64,
     text: String,
+    preview: String,
     attachments: Vec<Attachment>,
 }
 
@@ -1872,6 +1906,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    provider_queue: RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
@@ -2472,6 +2507,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            provider_queue: RefCell::default(),
             source_clock: None,
             finished_stamp: None,
             connection,
@@ -2564,6 +2600,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.provider_queue.borrow_mut().clear();
         self.preparation.clear();
         self.cache.clear();
         self.child_cache.clear();
@@ -2621,14 +2658,15 @@ impl Runtime {
     /// of anything written since, with its attachments.
     fn unqueue(&mut self) -> Option<chat::Session> {
         let queued = self.queued.take()?;
+        self.preparation.clear_local();
         // Nothing waits on the snapshot of a hidden card any more; a
         // connection that has gone has nothing to be told.
         let _ = self.present();
         let written = self.composer.text();
         let text = if written.trim().is_empty() {
-            queued.text
+            queued.source.text().to_owned()
         } else {
-            format!("{}\n{written}", queued.text.trim_end())
+            format!("{}\n{written}", queued.source.text().trim_end())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
         let written = self.replace_attachments(queued.attachments);
@@ -2753,6 +2791,19 @@ impl Runtime {
             None => self.unfolded.contains(key),
         }
     }
+    pub(super) fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
+        self.presentation_cache()
+            .get(&item.id)
+            .filter(|cached| {
+                !cached.placeholder
+                    && cached
+                        .item
+                        .as_deref()
+                        .is_some_and(|shown| std::ptr::eq(shown, item))
+            })?
+            .prompt
+            .as_deref()
+    }
     fn presentation_cache(&self) -> &HashMap<String, CachedItem> {
         if self.selected_subagent.is_some() {
             &self.child_cache
@@ -2819,13 +2870,44 @@ impl Runtime {
                         .flat_map(|agent| &agent.items),
                 )
                 .map(|item| payload(item))
-                .sum(),
+                .sum::<usize>()
+                .saturating_add(
+                    self.queued
+                        .as_ref()
+                        .map_or(0, |queued| queued.source.allocation()),
+                )
+                .saturating_add(
+                    self.snapshot
+                        .queued_messages
+                        .iter()
+                        .map(|message| message.text.len())
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    self.followups
+                        .iter()
+                        .map(|message| message.text.capacity())
+                        .sum::<usize>(),
+                ),
             presentation_bytes: self
                 .cache
                 .values()
                 .chain(self.child_cache.values())
                 .map(CachedItem::retained_bytes)
-                .sum(),
+                .sum::<usize>()
+                .saturating_add(
+                    self.queued
+                        .as_ref()
+                        .and_then(|queued| queued.presentation.prepared.as_ref())
+                        .map_or(0, |prepared| prepared.retained_bytes()),
+                )
+                .saturating_add(self.provider_queue.borrow().retained_bytes())
+                .saturating_add(
+                    self.followups
+                        .iter()
+                        .map(|message| message.preview.capacity())
+                        .sum::<usize>(),
+                ),
             selection_bytes: self
                 .selection_document
                 .borrow()
@@ -2840,7 +2922,23 @@ impl Runtime {
         self.prepare_transcript_cache_from(snapshot, None)
     }
 
+    fn prepare_local_prompt(&mut self) {
+        if !self.visible.load(Ordering::Relaxed) {
+            self.preparation.clear_local();
+            return;
+        }
+        if let Some(queued) = &self.queued {
+            if queued.presentation.prepared.is_none() {
+                self.preparation
+                    .stage_local(self.target, &queued.source, self.syntax_theme);
+            }
+        } else {
+            self.preparation.clear_local();
+        }
+    }
+
     fn resume_preparation(&mut self) {
+        self.prepare_local_prompt();
         if !self.visible.load(Ordering::Relaxed) {
             return;
         }
@@ -3160,6 +3258,7 @@ impl Runtime {
     }
 
     fn refresh(&mut self) {
+        self.prepare_local_prompt();
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
             if let Some((snapshot, clock)) = self
@@ -3575,140 +3674,19 @@ impl Runtime {
     }
 
     fn reveal_child_find_match(&mut self, key: &str) {
-        let Some(child) = self.selected_subagent.clone() else {
-            return;
-        };
-        let Some(item) = self.active_item(key).cloned() else {
-            return;
-        };
-        let query = self.find.as_deref().unwrap_or_default();
-        let coordinated = self
-            .child_cache
-            .get(key)
-            .and_then(|cached| cached.coordination.as_deref());
-        let parts: Vec<_> = coordinated
-            .map(coordination::Coordinated::parts)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(_, text)| find::contains(text, query))
-            .map(|(part, _)| format!("{key}#{part}"))
-            .collect();
-        let raw = match coordinated {
-            Some(card) if card.is_card() => parts.is_empty(),
-            _ => {
-                item.content.is_step()
-                    || turn::slot_of(&item) == turn::Slot::Thinking
-                    || (item.role == chat::Role::User
-                        && matches!(item.content, ItemContent::Text { .. }))
-            }
-        };
-        let delivery = matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query));
-        let expand = (raw && contains_text(&item.content, query)) || delivery;
-        let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
-        for part in parts {
-            disclosure.part(&part, self.child_unfolded.entry(child.clone()).or_default());
-        }
-        if expand
-            && disclosure.item(key, self.child_expanded.entry(child).or_default())
-            && !self
-                .child_cache
-                .get(key)
-                .is_some_and(|cached| cached.preparing)
-            && (CachedItem::prose(&item.content).is_none()
-                || self
-                    .child_cache
-                    .get(key)
-                    .is_some_and(|cached| cached.coordination.is_some()))
-        {
-            let previous = self.child_cache.remove(key);
-            self.child_cache.insert(
-                key.to_owned(),
-                CachedItem::updated(
-                    &item.content,
-                    self.syntax_theme,
-                    previous,
-                    true,
-                    false,
-                    None,
-                ),
-            );
-        }
+        self.apply_find_plan(key);
     }
 
     fn refresh_find(&mut self) {
-        let previous = self.find_matches.get(self.find_index).cloned();
-        let query = self.find.as_deref().unwrap_or_default();
-        self.find_matches = if let Some(child) = self.selected_subagent.as_ref() {
-            self.snapshot
-                .subagents
-                .iter()
-                .find(|agent| &agent.id == child)
-                .into_iter()
-                .flat_map(|agent| &agent.items)
-                .filter(|item| {
-                    !query.is_empty()
-                        && (contains_text(&item.content, query)
-                            || self
-                                .child_cache
-                                .get(&item.id)
-                                .and_then(|cached| cached.coordination.as_deref())
-                                .is_some_and(|card| {
-                                    card.parts()
-                                        .iter()
-                                        .any(|(_, text)| find::contains(text, query))
-                                }))
-                })
-                .map(|item| item.id.clone())
-                .collect()
-        } else {
-            self.turns
-                .iter()
-                .filter(|turn| {
-                    !query.is_empty()
-                        && turn
-                            .prompt
-                            .iter()
-                            .copied()
-                            .chain(
-                                turn.steps
-                                    .iter()
-                                    .chain(&turn.prose)
-                                    .map(|placed| placed.index),
-                            )
-                            .filter_map(|index| self.snapshot.items.get(index))
-                            .any(|item| {
-                                contains_text(&item.content, query)
-                                // A card shows its words unquoted, as no
-                                // command line or tool input writes them.
-                                || self
-                                    .cache
-                                    .get(&item.id)
-                                    .and_then(|cached| cached.coordination.as_deref())
-                                    .is_some_and(|coordinated| {
-                                        coordinated
-                                            .parts()
-                                            .iter()
-                                            .any(|(_, text)| find::contains(text, query))
-                                    })
-                            })
-                })
-                .map(|turn| turn.key.clone())
-                .collect()
-        };
-        self.find_index = previous
-            .and_then(|key| {
-                self.find_matches
-                    .iter()
-                    .position(|candidate| candidate == &key)
-            })
-            .unwrap_or_else(|| {
-                self.find_index
-                    .min(self.find_matches.len().saturating_sub(1))
-            });
+        self.refresh_find_work();
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
-            self.find_navigation.cancel();
+            self.find_navigation.cancel_all();
+            self.preparation.clear_local();
+            if let Some(queued) = &mut self.queued {
+                queued.presentation = prompt::LocalPresentation::default();
+            }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
         images::sync(self);
@@ -3746,6 +3724,10 @@ impl Runtime {
         result
     }
     fn release_transcript_caches(&mut self) {
+        self.provider_queue.borrow_mut().clear();
+        if let Some(queued) = &mut self.queued {
+            queued.presentation = prompt::LocalPresentation::default();
+        }
         self.preparation.clear();
         self.cache = HashMap::new();
         self.child_cache = HashMap::new();
@@ -4627,15 +4609,12 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        runtime.refresh_find();
         if runtime.find_matches.is_empty() {
-            runtime.find_navigation.cancel();
-            if runtime.find.as_ref().is_some_and(|query| !query.is_empty())
-                && (runtime.presentation_evicted
-                    || runtime.snapshot.history_loading
-                    || runtime.preparation.queued_bytes() != 0)
-            {
+            if runtime.find.as_ref().is_some_and(|query| !query.is_empty()) {
                 return self.begin_find_navigation(target, None);
             }
+            runtime.find_navigation.cancel();
             return Task::none();
         }
         runtime.find_index = if forward {
@@ -4644,89 +4623,7 @@ impl Cagents {
             (runtime.find_index + runtime.find_matches.len() - 1) % runtime.find_matches.len()
         };
         let key = runtime.find_matches[runtime.find_index].clone();
-        if runtime.selected_subagent.is_some() {
-            runtime.reveal_child_find_match(&key);
-            return self.begin_find_navigation(target, Some(key));
-        }
-        if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
-            runtime.find_disclosure.turn(&key, &mut runtime.opened);
-            let query = runtime.find.as_deref().unwrap_or_default();
-            for placed in turn.steps.iter().chain(&turn.prose) {
-                let Some(item) = runtime.snapshot.items.get(placed.index) else {
-                    continue;
-                };
-                // A card's message or prompt, or a message a step read, may
-                // be folded to its opening.
-                let coordinated = runtime
-                    .cache
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref());
-                let mut unfolded = false;
-                for (part, text) in coordinated
-                    .map(coordination::Coordinated::parts)
-                    .unwrap_or_default()
-                {
-                    if find::contains(text, query) {
-                        unfolded = true;
-                        runtime
-                            .find_disclosure
-                            .part(&format!("{}#{part}", item.id), &mut runtime.unfolded);
-                    }
-                }
-                // A collapsed step hides its match, and so does a card whose
-                // match is only in the command or output it was read from.
-                let raw = match coordinated {
-                    Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
-                };
-                if raw
-                    && contains_text(&item.content, query)
-                    && runtime
-                        .find_disclosure
-                        .item(&item.id, &mut runtime.expanded)
-                    && (CachedItem::prose(&item.content).is_none()
-                        || runtime
-                            .cache
-                            .get(&item.id)
-                            .is_some_and(|cached| cached.coordination.is_some()))
-                {
-                    if runtime
-                        .cache
-                        .get(&item.id)
-                        .is_some_and(|cached| cached.preparing)
-                    {
-                        continue;
-                    }
-                    let previous = runtime.cache.remove(&item.id);
-                    runtime.cache.insert(
-                        item.id.clone(),
-                        CachedItem::updated(
-                            &item.content,
-                            runtime.syntax_theme,
-                            previous,
-                            true,
-                            false,
-                            None,
-                        ),
-                    );
-                }
-            }
-            // Both long user prompts and deliveries may hide their matching
-            // body beneath an opening. Search owns only its temporary reveal.
-            for index in &turn.prompt {
-                if let Some(item) = runtime.snapshot.items.get(*index)
-                    && match &item.content {
-                        ItemContent::Text { text, .. } => find::contains(text, query),
-                        ItemContent::Delivery { body, .. } => find::contains(body, query),
-                        _ => false,
-                    }
-                {
-                    runtime
-                        .find_disclosure
-                        .item(&item.id, &mut runtime.expanded);
-                }
-            }
-        }
+        runtime.reveal_child_find_match(&key);
         self.begin_find_navigation(target, Some(key))
     }
     fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
@@ -5796,6 +5693,7 @@ impl Cagents {
             matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed))
         }) {
             subscriptions.push(flow_layout::availability());
+            subscriptions.push(find_navigation::availability());
         }
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime) if runtime.visible.load(Ordering::Relaxed) && runtime.preparation.waiting())
@@ -6814,8 +6712,10 @@ impl Cagents {
             &runtime.snapshot.skills,
         )
         .into_owned();
+        runtime.preparation.clear_local();
         runtime.queued = Some(Queued {
-            text,
+            source: prompt::LocalSource::new(text),
+            presentation: prompt::LocalPresentation::default(),
             resolved_text,
             attachments: runtime.take_attachments(),
             model,
@@ -6999,7 +6899,10 @@ impl Cagents {
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
-        let text = runtime.queued.take().map(|queued| queued.text);
+        let text = runtime
+            .queued
+            .take()
+            .map(|queued| queued.source.text().to_owned());
         let _ = runtime.present();
         if let Some(error) = error {
             runtime.note(format!(
@@ -7397,6 +7300,23 @@ impl Cagents {
                 return self.resume_current_find(target, true);
             }
 
+            Action::LocalPromptPrepared(target, run, ready) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.refresh();
+                    if runtime.visible.load(Ordering::Relaxed)
+                        && let Some(queued) = runtime.queued.as_mut()
+                        && let Some(prepared) =
+                            runtime
+                                .preparation
+                                .accept_local(target, run, &queued.source, ready)
+                    {
+                        prepared.install_local(&mut queued.presentation);
+                        runtime.presentation_revision =
+                            runtime.presentation_revision.wrapping_add(1);
+                        runtime.find_navigation.changed_document();
+                    }
+                }
+            }
             Action::MarkdownPrepared(target, id, run, ready) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.markdown_prepared(target, &id, run, ready);
@@ -7409,6 +7329,7 @@ impl Cagents {
                 {
                     runtime.refresh();
                     runtime.preparation.retry();
+                    runtime.prepare_local_prompt();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
                     runtime.refresh_find();
@@ -7910,6 +7831,9 @@ impl Cagents {
                             && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.preparation.clear();
+                            if let Some(queued) = &mut runtime.queued {
+                                queued.presentation = prompt::LocalPresentation::default();
+                            }
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -8756,9 +8680,11 @@ impl Cagents {
                     }
                     let id = runtime.next_followup;
                     runtime.next_followup += 1;
+                    let text = runtime.composer.text().trim_end().to_owned();
                     let followup = Followup {
                         id,
-                        text: runtime.composer.text().trim_end().to_owned(),
+                        preview: prompt::queue_preview(&text),
+                        text,
                         attachments: runtime.take_attachments(),
                     };
                     runtime.followups.push(followup);
@@ -8966,7 +8892,7 @@ impl Cagents {
             }
             Action::Find(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_navigation.cancel();
+                    runtime.find_navigation.cancel_all();
                     runtime.restore_find_disclosures();
                     runtime.find = Some(query);
                     runtime.refresh_find();
@@ -8975,6 +8901,33 @@ impl Cagents {
                 return self.chat_find_next(target, true);
             }
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            Action::FindAvailable => {
+                let targets: Vec<_> = self
+                    .cards
+                    .values()
+                    .filter_map(|card| match card {
+                        CardRuntime::Chat(runtime)
+                            if runtime.visible.load(Ordering::Relaxed)
+                                && runtime.find.is_some() =>
+                        {
+                            Some(runtime.target)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                return Task::batch(
+                    targets
+                        .into_iter()
+                        .map(|target| self.resume_current_find(target, true)),
+                );
+            }
+            Action::FindGroups(target, epoch, query_epoch, result) => {
+                return self.find_groups(target, epoch, query_epoch, result);
+            }
+            Action::FindHighlight(target, id) => return self.find_highlight(target, id),
+            Action::FindHighlighted(target, id, ready) => {
+                return self.find_highlighted(target, id, ready);
+            }
             Action::FindResume(target, intent, geometry_changed) => {
                 return self.resume_find_navigation(target, intent, geometry_changed);
             }
@@ -8987,7 +8940,7 @@ impl Cagents {
             }
             Action::CloseFind(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_navigation.cancel();
+                    runtime.find_navigation.cancel_all();
                     runtime.restore_find_disclosures();
                     runtime.find = None;
                     runtime.find_focused = false;
@@ -9350,7 +9303,7 @@ impl Cagents {
             Action::SelectSubagent(target, id) => {
                 text_copy::invalidate();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_navigation.cancel();
+                    runtime.find_navigation.cancel_all();
                     let selected = id.filter(|id| {
                         runtime
                             .snapshot
@@ -9541,6 +9494,47 @@ impl Cagents {
                         Message::ExternalLinkOpened(open_system_url(url).await)
                     });
                 }
+            }
+            Action::CopyQueued(target, source) => {
+                if self
+                    .card_state(target.card)
+                    .is_none_or(|state| !state.existence.is_open())
+                {
+                    return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let text: Option<Arc<str>> = match source {
+                    QueueCopy::Initial(source) => runtime
+                        .queued
+                        .as_ref()
+                        .filter(|queued| source.as_ptr() == Arc::as_ptr(&queued.source))
+                        .map(|queued| Arc::from(queued.source.text())),
+                    QueueCopy::Provider(source, id) => {
+                        let current = runtime
+                            .provider_queue
+                            .borrow_mut()
+                            .get(&runtime.snapshot, &id);
+                        if current
+                            .as_ref()
+                            .is_none_or(|current| source.as_ptr() != Arc::as_ptr(current))
+                        {
+                            return Task::none();
+                        }
+                        current.map(|current| Arc::from(current.source.text()))
+                    }
+                    QueueCopy::Local(id) => runtime
+                        .followups
+                        .iter()
+                        .find(|message| message.id == id)
+                        .map(|message| Arc::from(message.text.as_str())),
+                };
+                let Some(text) = text else {
+                    return Task::none();
+                };
+                self.status = Some(TransientNotice::success("Copied queued message"));
+                return text_copy::write_shared_literal(text);
             }
             Action::CopySharedCode(target, text) => {
                 if self.chat_runtime_mut(target).is_none()
@@ -11271,6 +11265,7 @@ mod tests {
         Followup {
             id,
             text: text.into(),
+            preview: prompt::queue_preview(text),
             attachments: paths
                 .iter()
                 .map(|path| Attachment { path: path.into() })
@@ -11534,6 +11529,7 @@ mod tests {
         runtime.followups = vec![Followup {
             id: 0,
             text: "first".into(),
+            preview: "first".into(),
             attachments: attachments.clone(),
         }];
         runtime.replace_draft(text_editor::Content::with_text("second"));
@@ -12929,7 +12925,11 @@ mod tests {
         })];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
-        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "needle".into(),
+        ));
         assert!(chat_runtime(&app, card).expanded.contains("reasoning"));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
@@ -12977,7 +12977,11 @@ mod tests {
         for forward in [true, false] {
             // Find itself performs the first reveal; explicit Next also runs
             // the real navigation path and wraps the one matching parent turn.
-            drop(app.handle_chat_ui(Action::Find(target, "COMPLETED_THINKING_NEEDLE".into())));
+            drop(find_navigation::find_for_test(
+                &mut app,
+                target,
+                "COMPLETED_THINKING_NEEDLE".into(),
+            ));
             drop(app.handle_chat_ui(Action::FindNext(target, forward)));
             let runtime = chat_runtime(&app, card);
             assert!(runtime.expanded.contains(&source.id));
@@ -13116,7 +13120,11 @@ mod tests {
             .unwrap()
             .opened
             .insert("prompt".into(), false);
-        drop(app.handle_chat_ui(Action::Find(target, "STRASSE".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "STRASSE".into(),
+        ));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.find_matches, vec!["prompt"]);
         assert!(
@@ -13134,7 +13142,11 @@ mod tests {
         // belongs to the user and survives a new query and search closure.
         drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "changed".into())));
-        drop(app.handle_chat_ui(Action::Find(target, "absent".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "absent".into(),
+        ));
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime.expanded,
@@ -13142,7 +13154,11 @@ mod tests {
         );
         assert_eq!(runtime.opened.get("prompt"), Some(&false));
         assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 0);
-        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "needle".into(),
+        ));
         drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
         drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
@@ -13309,7 +13325,11 @@ mod tests {
                 drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
                 drop(app.handle_chat_ui(Action::ToggleTurn(target, "prompt".into())));
             }
-            drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+            drop(find_navigation::find_for_test(
+                &mut app,
+                target,
+                "needle".into(),
+            ));
             assert_eq!(chat_runtime(&app, card).opened.get("prompt"), Some(&true));
             snapshot.generation += 1;
             snapshot.items.remove(0);
@@ -13549,7 +13569,11 @@ mod tests {
             show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
             if window == 0 {
                 drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("same-child".into()))));
-                drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    "needle".into(),
+                ));
             } else {
                 drop(app.handle_chat_ui(Action::FindNext(target, true)));
             }
@@ -13601,7 +13625,11 @@ mod tests {
         ];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
-        drop(app.handle_chat_ui(Action::Find(target, "child-one-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "child-one-only".into(),
+        ));
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime.find_matches,
@@ -13612,10 +13640,18 @@ mod tests {
         assert!(!runtime.expanded.contains("same#opaque-id"));
         drop(app.handle_chat_ui(Action::FindNext(target, false)));
         assert_eq!(chat_runtime(&app, card).find_index, 0);
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only".into(),
+        ));
         assert!(chat_runtime(&app, card).find_matches.is_empty());
         assert!(!chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
-        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "needle".into(),
+        ));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
@@ -13632,7 +13668,11 @@ mod tests {
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only".into(),
+        ));
         assert!(!chat_runtime(&app, card).find_matches.is_empty());
         assert!(chat_runtime(&app, card).expanded.contains("same#opaque-id"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
@@ -13671,20 +13711,32 @@ mod tests {
         let part = "same#opaque-id#body";
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        drop(app.handle_chat_ui(Action::Find(target, "one-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "one-only".into(),
+        ));
         assert!(chat_runtime(&app, card).child_unfolded["one"].contains(part));
         assert!(!chat_runtime(&app, card).unfolded.contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         assert!(!chat_runtime(&app, card).child_unfolded["one"].contains(part));
-        drop(app.handle_chat_ui(Action::Find(target, "two-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "two-only".into(),
+        ));
         drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
         drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only".into(),
+        ));
         assert!(chat_runtime(&app, card).unfolded.contains(part));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!chat_runtime(&app, card).unfolded.contains(part));
@@ -13701,7 +13753,11 @@ mod tests {
         snapshot.subagents = vec![presentation_child("one", child_find_tool("before"))];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
-        drop(app.handle_chat_ui(Action::Find(target, "streamed-needle".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "streamed-needle".into(),
+        ));
         assert!(chat_runtime(&app, card).find_matches.is_empty());
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
@@ -13718,7 +13774,11 @@ mod tests {
         snapshot.subagents[0].items.clear();
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         assert!(chat_runtime(&app, card).find_matches.is_empty());
-        drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "parent-only".into(),
+        ));
         let mut snapshot = (*handle.snapshot()).clone();
         snapshot.generation += 1;
         snapshot.subagents.clear();
@@ -15183,6 +15243,7 @@ mod tests {
             runtime.followups.push(Followup {
                 id: 1,
                 text: "waiting follow-up".into(),
+                preview: "waiting follow-up".into(),
                 attachments: Vec::new(),
             });
             runtime
@@ -19389,14 +19450,19 @@ mod tests {
         let attempt = chat_runtime_attempt(&app, card);
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.capacity_refused);
-        assert_eq!(runtime.queued.as_ref().unwrap().text, "hello");
+        assert_eq!(runtime.queued.as_ref().unwrap().source.text(), "hello");
         assert!(runtime.composer.text().is_empty());
         // A second press while that attempt owns the card cannot enqueue or
         // create another start, even with the old rendered target.
         drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
         assert_eq!(chat_runtime_attempt(&app, card), attempt);
         assert_eq!(
-            chat_runtime(&app, card).queued.as_ref().unwrap().text,
+            chat_runtime(&app, card)
+                .queued
+                .as_ref()
+                .unwrap()
+                .source
+                .text(),
             "hello"
         );
     }
@@ -21325,6 +21391,177 @@ mod tests {
         )));
         assert_chat_copy_task_writes(task, &body);
         assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+    }
+
+    #[test]
+    fn provider_queued_copy_survives_unrelated_streaming_but_refuses_rewrite_removal_and_new_intent()
+     {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let body = format!("{}meaningful queued task λ\r\n", " ".repeat(4096));
+        let (card, target, handle) =
+            provider_queue(&mut app, vec![provider_message("queued-source", &body)]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.show(true);
+        let source = runtime
+            .provider_queue
+            .borrow_mut()
+            .get(&runtime.snapshot, "queued-source")
+            .unwrap();
+        assert_eq!(&*source.preview, "meaningful queued task λ");
+        let copied = QueueCopy::Provider(Arc::downgrade(&source), "queued-source".into());
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.busy = !snapshot.busy;
+        handle.publish_delta_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_chat_copy_task_writes(
+            app.handle_chat_ui(Action::CopyQueued(target, copied.clone())),
+            &body,
+        );
+        let task = app.handle_chat_ui(Action::CopyQueued(target, copied.clone()));
+        drop(app.handle_chat_ui(Action::CopyLiteral(
+            "newer explicit clipboard intent".into(),
+        )));
+        assert_chat_copy_task_has_no_clipboard_write(
+            task,
+            "newer intent still supersedes unchanged provider queue Copy",
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.queued_messages[0].text = "same id, changed queue body".into();
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_chat_copy_task_has_no_effects(
+            app.handle_chat_ui(Action::CopyQueued(target, copied.clone())),
+            "same queue ID cannot authorize old rendered source after rewrite",
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.queued_messages.clear();
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_chat_copy_task_has_no_effects(
+            app.handle_chat_ui(Action::CopyQueued(target, copied)),
+            "removed provider queue source cannot copy",
+        );
+        drop(source);
+        drop(app);
+        preparation::retirement_barrier();
+        let _ = card;
+    }
+
+    #[test]
+    fn queued_literal_actual_reply_copy_and_takeback_preserve_source_and_reject_late_ownership() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let body = format!(
+            "  **literal queued**\r\n{}END_QUEUED_λ\r\n",
+            "raw `code` [no link](invalid:source) ".repeat(16_384)
+        );
+        write(&mut app, card, &body);
+        submit(&mut app, card); // startup task is dropped; no provider runs
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.show(true);
+        let source = runtime.queued.as_ref().unwrap().source.clone();
+        assert_eq!(
+            source.text(),
+            body,
+            "submission moves the exact canonical local bytes"
+        );
+        assert!(
+            runtime
+                .queued
+                .as_ref()
+                .unwrap()
+                .presentation
+                .prepared
+                .is_none()
+        );
+        let materialized = markdown::materialized_bytes();
+        let cold = runtime.selection_document().0;
+        assert!(
+            cold.text(selection::logical_identity("queued-prompt", &[2]))
+                .is_none(),
+            "pending local preview is not full catalog authority"
+        );
+        assert_eq!(markdown::materialized_bytes(), materialized);
+        // Native cold layout may display only a bounded preview; it cannot
+        // clone/style/materialize the queued full source to build a widget.
+        {
+            use iced::advanced::{layout, widget::Tree};
+            let mut element = app.chat_view(card);
+            let mut tree = Tree::new(element.as_widget());
+            let _ = element.as_widget_mut().layout(
+                &mut tree,
+                &cosmic::Renderer::default(),
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(960.0, 720.0)),
+            );
+        }
+        assert_eq!(
+            markdown::materialized_bytes(),
+            materialized,
+            "cold native queue layout cannot materialize the large literal body"
+        );
+        let (run, ready) = preparation::local_reply_for_test(app.chat_runtime_mut(target).unwrap());
+        drop(app.update(Message::ChatUi(Action::LocalPromptPrepared(
+            target, run, ready,
+        ))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let prepared = runtime
+            .queued
+            .as_ref()
+            .unwrap()
+            .presentation
+            .prepared
+            .as_ref()
+            .expect("actual local action accepts exact ready source");
+        assert_eq!(&*prepared.full.plain(), body.trim_end());
+        assert_ne!(prepared.created_on, std::thread::current().id());
+        assert_eq!(
+            &*runtime
+                .selection_document()
+                .0
+                .text(selection::logical_identity("queued-prompt", &[2]))
+                .unwrap(),
+            body.trim_end()
+        );
+        let copied = QueueCopy::Initial(Arc::downgrade(&source));
+        let task = app.handle_chat_ui(Action::CopyQueued(target, copied.clone()));
+        assert_chat_copy_task_writes(task, &body);
+        let task = app.handle_chat_ui(Action::CopyQueued(target, copied.clone()));
+        drop(app.handle_chat_ui(Action::CopyLiteral("newer explicit selection".into())));
+        assert_chat_copy_task_has_no_clipboard_write(
+            task,
+            "newer clipboard intent supersedes queued full-source copy",
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.queued.as_mut().unwrap().presentation = prompt::LocalPresentation::default();
+        let (late_run, late_ready) = preparation::local_reply_for_test(runtime);
+        drop(app.update(Message::ChatUi(Action::CancelQueued(target))));
+        assert!(chat_runtime(&app, card).queued.is_none());
+        assert_eq!(
+            chat_runtime(&app, card).composer.text(),
+            body,
+            "takeback restores all raw bytes and endings"
+        );
+        drop(app.update(Message::ChatUi(Action::LocalPromptPrepared(
+            target, late_run, late_ready,
+        ))));
+        assert!(
+            chat_runtime(&app, card).queued.is_none(),
+            "late local ready cannot resurrect canceled input"
+        );
+        assert_chat_copy_task_has_no_effects(
+            app.handle_chat_ui(Action::CopyQueued(target, copied)),
+            "taken-back source is no longer queued copy authority",
+        );
+        preparation::retirement_barrier();
     }
 
     #[test]

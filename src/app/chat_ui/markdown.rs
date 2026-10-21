@@ -750,6 +750,17 @@ fn append_proven(
 }
 
 impl Text {
+    /// Plain literal source; this never interprets Markdown or creates links.
+    pub(super) fn literal(text: String) -> Self {
+        Self::new(vec![Span::Standard {
+            text,
+            strikethrough: false,
+            link: None,
+            strong: false,
+            emphasis: false,
+            code: false,
+        }])
+    }
     /// Semantic parser output, excluding materialization caches and weak
     /// append-proof lineage. Tests retain every raw span attribute and link.
     #[cfg(test)]
