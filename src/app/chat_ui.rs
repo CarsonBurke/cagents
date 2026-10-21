@@ -7141,6 +7141,11 @@ impl Cagents {
             _ => None,
         };
         if let Some(page) = page {
+            if page == view::Page::Latest {
+                runtime
+                    .scroll_memory
+                    .request_edge(None, scroll::Edge::Latest);
+            }
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
                 view::Page::Earlier => {
@@ -9231,13 +9236,13 @@ impl Cagents {
                         }
                         if pending.page == Some(view::Page::Latest)
                             && runtime.selected_subagent.is_none()
+                            && runtime.scroll_memory.edge(None) == Some(scroll::Edge::Latest)
                         {
-                            let snap = iced::widget::scrollable::snap_to(
-                                card_control_id(target.card, "chat-transcript"),
-                                iced::widget::scrollable::RelativeOffset {
-                                    x: None,
-                                    y: Some(0.0),
-                                },
+                            let snap = scroll::snap_to_edge(
+                                target,
+                                scroll::Edge::Latest,
+                                runtime.find_navigation.guard(),
+                                runtime.find_navigation.document_epoch(),
                             )
                             .map(cosmic::Action::App);
                             return Task::batch([
@@ -9249,6 +9254,9 @@ impl Cagents {
                         pending.first_prompt
                     }
                     Err(error) => {
+                        if pending.page == Some(view::Page::Latest) {
+                            runtime.scroll_memory.clear_latest();
+                        }
                         if pending.page.is_some() {
                             runtime.page_request = None;
                             runtime.earlier_asked = None;
@@ -9623,6 +9631,15 @@ impl Cagents {
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
                     if runtime.pending.is_some() {
+                        if runtime
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.page == Some(view::Page::Latest))
+                        {
+                            runtime
+                                .scroll_memory
+                                .request_edge(None, scroll::Edge::Latest);
+                        }
                         if !runtime
                             .pending
                             .as_ref()
@@ -9631,6 +9648,17 @@ impl Cagents {
                             runtime.deferred_page = Some(HistoryNavigation::Latest);
                         }
                         return Task::none();
+                    }
+                    // The ACK can settle before newest history arrives. A
+                    // repeated explicit Latest still supersedes later Home,
+                    // while reusing the already accepted provider request.
+                    if runtime
+                        .page_request
+                        .is_some_and(|(page, _)| page == view::Page::Latest)
+                    {
+                        runtime
+                            .scroll_memory
+                            .request_edge(None, scroll::Edge::Latest);
                     }
                     if runtime.snapshot.has_later
                         || runtime.snapshot.history_loading
@@ -9644,10 +9672,10 @@ impl Cagents {
                 }
                 runtime
                     .scroll_memory
-                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::End);
+                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::Latest);
                 return scroll::snap_to_edge(
                     target,
-                    scroll::Edge::End,
+                    scroll::Edge::Latest,
                     runtime.find_navigation.guard(),
                     runtime.find_navigation.document_epoch(),
                 )

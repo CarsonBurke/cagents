@@ -51,6 +51,7 @@ pub(super) struct Memory(
 pub(super) enum Edge {
     Start,
     End,
+    Latest,
 }
 
 struct ReaderState {
@@ -73,6 +74,17 @@ impl Memory {
         anchor.clock += 1;
         anchor.contexts[index].used = anchor.clock;
         anchor.contexts[index].edge = Some(edge);
+    }
+    pub(super) fn clear_latest(&self) {
+        if let Some(context) = self
+            .0
+            .borrow_mut()
+            .contexts
+            .iter_mut()
+            .find(|context| context.subagent.is_none() && context.edge == Some(Edge::Latest))
+        {
+            context.edge = None;
+        }
     }
     pub fn clear(&self) {
         *self.0.borrow_mut() = Anchor::default();
@@ -1056,7 +1068,7 @@ impl Anchor {
         let edge = context.edge;
         let top = match edge {
             Some(Edge::Start) => 0.0,
-            Some(Edge::End) => next.travel(),
+            Some(Edge::End | Edge::Latest) => next.travel(),
             None => context.position(next, rows, follow_end),
         };
         // Either explicit edge remains deliberate while a nonempty prepared

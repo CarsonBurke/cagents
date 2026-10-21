@@ -1916,19 +1916,26 @@ impl Runtime {
                     self.observed_scroll.clone(),
                     self.scroll_memory.clone(),
                     if let Some(edge) = self.scroll_memory.edge(self.selected_subagent.as_deref()) {
-                        self.presentation_evicted || {
-                            let items = selected
-                                .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
-                            match edge {
-                                scroll::Edge::Start => items.first(),
-                                scroll::Edge::End => items.last(),
+                        self.presentation_evicted
+                            || (edge == scroll::Edge::Latest
+                                && self.selected_subagent.is_none()
+                                && (snapshot.has_later
+                                    || snapshot.history_loading
+                                    || self.paging() == Some(Page::Latest)))
+                            || {
+                                let items = selected.map_or(snapshot.items.as_slice(), |agent| {
+                                    agent.items.as_slice()
+                                });
+                                match edge {
+                                    scroll::Edge::Start => items.first(),
+                                    scroll::Edge::End | scroll::Edge::Latest => items.last(),
+                                }
+                                .is_some_and(|item| {
+                                    self.presentation_cache()
+                                        .get(&item.id)
+                                        .is_none_or(|cached| cached.placeholder)
+                                })
                             }
-                            .is_some_and(|item| {
-                                self.presentation_cache()
-                                    .get(&item.id)
-                                    .is_none_or(|cached| cached.placeholder)
-                            })
-                        }
                     } else {
                         self.scroll_memory.restoration_pending(
                             self.selected_subagent.as_deref(),
@@ -7517,6 +7524,458 @@ mod tests {
     }
 
     #[test]
+    fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child_and_failure_readers()
+     {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        for case in ["success-main", "failure-main", "success-child"] {
+            struct Reader {
+                id: widget::Id,
+                move_bottom: Option<f32>,
+                top: Option<f32>,
+                travel: Option<f32>,
+                tail: bool,
+            }
+            impl Operation for Reader {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                        self.tail |= prose.plain.contains("LATEST_END_NATIVE_ATTESTATION");
+                    }
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    viewport: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    state: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.top = Some(translation.y);
+                        self.travel = Some((content.height - viewport.height).max(0.0));
+                        if let Some(bottom) = self.move_bottom.take() {
+                            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(bottom),
+                            });
+                        }
+                    }
+                }
+            }
+            fn runtime(app: &Cagents, target: Target) -> &Runtime {
+                match &app.cards[&target.card] {
+                    CardRuntime::Chat(runtime) => runtime,
+                    _ => panic!("fixture chat"),
+                }
+            }
+            fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+                runtime(app, target).view(
+                    None,
+                    false,
+                    true,
+                    &app.settings.keyboard_shortcuts,
+                    620.0,
+                    Place {
+                        name: "restore-fixture".into(),
+                        branch: None,
+                        channel: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                )
+            }
+            let source = (0..80)
+                .map(|index| {
+                    format!(
+                        "## Section {index:04}\n\nReading paragraph {index:04}: {}\n\n",
+                        "ordinary text ".repeat(12)
+                    )
+                })
+                .collect::<String>();
+            let item = chat::Item {
+                id: "cold-rich".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut initial = (*handle.snapshot()).clone();
+            initial.generation = 10;
+            initial.has_later = true;
+            let mut child = (*initial.items[0]).clone();
+            child.id = "child-rich".into();
+            initial.subagents.push(chat::Subagent {
+                id: "selected-child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child)],
+            });
+            handle.replace_snapshot_for_test(initial);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let scroll = card_control_id(target.card, "chat-transcript");
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node| {
+                let mut reader = Reader {
+                    id: scroll.clone(),
+                    move_bottom: None,
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                (
+                    reader.top.expect("actual native transcript"),
+                    reader.travel.unwrap(),
+                    reader.tail,
+                )
+            };
+            let expected;
+            {
+                let mut element = view(&app, target);
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(700.0),
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                expected = read(&mut element, &mut tree, &node).0;
+                assert!(expected > 500.0);
+                // No subsequent layout: hide immediately after actual navigation.
+            }
+            let snapshot = (*runtime(&app, target).snapshot).clone();
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(false)
+                .unwrap();
+            preparation::retirement_barrier();
+            assert!(runtime(&app, target).cache.is_empty());
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            let mut tree;
+            {
+                let mut empty_wait = view(&app, target);
+                tree = Tree::new(&empty_wait);
+                empty_wait
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            handle.replace_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+            assert!(runtime(&app, target).preparation.contains("cold-rich"));
+            drop(app.handle_chat_ui(Action::Latest(target)));
+            let pending = runtime(&app, target)
+                .pending
+                .as_ref()
+                .expect("actual Latest dispatch");
+            assert_eq!(pending.page, Some(Page::Latest));
+            let pending_id = pending.id;
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest)
+            );
+            if case == "success-child" {
+                drop(app.handle_chat_ui(Action::SelectSubagent(
+                    target,
+                    Some("selected-child".into()),
+                )));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(300.0),
+                    top: None,
+                    travel: None,
+                    tail: false,
+                };
+                child.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+            }
+            let child_before = if case == "success-child" {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                Some(read(&mut child, &mut tree, &node))
+            } else {
+                None
+            };
+            let completion = app.handle_chat_ui(Action::CommandFinished(
+                target,
+                pending_id,
+                if case == "failure-main" {
+                    Err("Fixture newest-history request failed".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if case == "success-main" {
+                assert_eq!(
+                    runtime(&app, target).snapshot.generation,
+                    10,
+                    "ACK is not newer history arrival"
+                );
+                assert!(runtime(&app, target).snapshot.has_later);
+                assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+                let mut placeholder = view(&app, target);
+                tree.diff(placeholder.as_widget_mut());
+                let node = placeholder
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut placeholder, &mut tree, &node);
+                assert_eq!((before.0, before.1), (0.0, 0.0));
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(completion)
+                        .expect("real successful PageLatest completion effects");
+                    let mut native_snap = false;
+                    while let Ok(Some(effect)) =
+                        tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+                    {
+                        if let iced::runtime::Action::Widget(mut operation) = effect {
+                            placeholder.as_widget_mut().operate(
+                                &mut tree,
+                                Layout::new(&node),
+                                &renderer,
+                                operation.as_mut(),
+                            );
+                            native_snap = true;
+                        }
+                    }
+                    assert!(
+                        native_snap,
+                        "success uses actual typed native edge operation"
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut placeholder, &mut tree, &node),
+                    before,
+                    "fitting ACK operation cannot establish source arrival"
+                );
+            } else {
+                assert!(
+                    iced::runtime::task::into_stream(completion).is_none(),
+                    "failed or child-selected ACK emits no native scroll"
+                );
+            }
+            if case == "failure-main" {
+                assert_eq!(runtime(&app, target).scroll_memory.edge(None), None);
+                assert!(runtime(&app, target).page_request.is_none());
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut ready = view(&app, target);
+                tree.diff(ready.as_widget_mut());
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let actual = read(&mut ready, &mut tree, &node);
+                assert!(
+                    (actual.0 - expected).abs() <= 1.0,
+                    "failed Latest preserves old native reading anchor"
+                );
+                assert!(!actual.2);
+                continue;
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            {
+                let mut old_ready = view(&app, target);
+                tree.diff(old_ready.as_widget_mut());
+                let node = old_ready
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let old = read(&mut old_ready, &mut tree, &node);
+                assert!(
+                    old.1 > 500.0 && !old.2,
+                    "actual old-generation Ready is large and has no newest end marker"
+                );
+                if let Some(before) = child_before {
+                    assert_eq!(
+                        old, before,
+                        "old parent ACK/Ready cannot move selected child"
+                    );
+                }
+            }
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest),
+                "old source Ready cannot fulfill explicit Latest"
+            );
+            if case == "success-main" {
+                let home = app
+                    .chat_scroll_key(&keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Home),
+                        modified_key: keyboard::Key::Named(keyboard::key::Named::Home),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                    .expect("actual Home dispatch after ACK");
+                assert_eq!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Start)
+                );
+                {
+                    let mut at_home = view(&app, target);
+                    tree.diff(at_home.as_widget_mut());
+                    let node = at_home
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    let executor = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    executor.block_on(async {
+                        let mut stream = iced::runtime::task::into_stream(home)
+                            .expect("actual Home widget operation");
+                        let effect =
+                            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                                .await
+                                .unwrap()
+                                .expect("Home effect");
+                        let iced::runtime::Action::Widget(mut operation) = effect else {
+                            panic!("Home widget operation");
+                        };
+                        at_home.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    });
+                    executor.shutdown_background();
+                    assert_eq!(read(&mut at_home, &mut tree, &node).0, 0.0);
+                }
+                let dispatched = runtime(&app, target).next_command;
+                drop(app.handle_chat_ui(Action::Latest(target)));
+                assert_eq!(
+                    runtime(&app, target).next_command,
+                    dispatched,
+                    "post-ACK repeated Latest coalesces the existing request"
+                );
+                assert!(runtime(&app, target).pending.is_none());
+                assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+                assert_eq!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Latest),
+                    "post-ACK explicit Latest supersedes actual Home even while provider request coalesces"
+                );
+            }
+
+            let mut latest = (*handle.snapshot()).clone();
+            latest.generation = 11;
+            latest.has_later = false;
+            latest.history_loading = false;
+            let ItemContent::Text { text, .. } = &mut Arc::make_mut(&mut latest.items[0]).content
+            else {
+                panic!("text fixture");
+            };
+            for index in 80..120 {
+                text.push_str(&format!(
+                    "\n\n## Newest section {index:04}\n\n{}\n\n",
+                    "new authoritative source ".repeat(12)
+                ));
+            }
+            text.push_str("\n\nLATEST_END_NATIVE_ATTESTATION\n");
+            handle.replace_snapshot_for_test(latest);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert_eq!(runtime(&app, target).snapshot.generation, 11);
+            assert!(!runtime(&app, target).snapshot.has_later);
+            assert!(runtime(&app, target).page_request.is_none());
+            if case == "success-child" {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut child, &mut tree, &node),
+                    child_before.unwrap(),
+                    "parent ACK/newest source cannot move selected child"
+                );
+                drop(child);
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            }
+            assert!(
+                runtime(&app, target).cache["cold-rich"].placeholder,
+                "newest source uses real cold preparation"
+            );
+            {
+                let mut pending = view(&app, target);
+                tree.diff(pending.as_widget_mut());
+                pending
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node);
+            assert!(
+                actual.1 > 500.0 && (actual.0 - actual.1).abs() <= 1.0 && actual.2,
+                "actual newest-generation Ready must mount its end marker at native end, got {actual:?}, old reading top {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
         use iced::advanced::{
             Layout, layout,
@@ -7835,7 +8294,11 @@ mod tests {
                 Some(if command == "Home" {
                     scroll::Edge::Start
                 } else {
-                    scroll::Edge::End
+                    if command == "Latest" {
+                        scroll::Edge::Latest
+                    } else {
+                        scroll::Edge::End
+                    }
                 })
             );
             drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
