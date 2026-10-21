@@ -14,8 +14,8 @@ pub(super) struct Data {
 }
 impl Data {
     /// Full transcript publications and rich coordination parts snapshot on
-    /// admitted parser workers. The bounded inline cache path also uses this
-    /// storage constructor; admission and input bounds belong to its caller.
+    /// admitted parser workers. The bounded inline cache route also uses this
+    /// constructor; it does not intrinsically bound the supplied graph.
     pub(super) fn snapshot(content: &markdown::Content) -> Self {
         Self::items(content.items().to_vec())
     }
@@ -70,9 +70,10 @@ impl Document {
     pub(super) fn new(data: Data) -> Self {
         Self(Rc::new(Owner(Some(data))))
     }
-    /// Snapshot CachedItem::extend's bounded inline cache input, including
-    /// empty loading placeholders, once per cache change. Row factories never
-    /// call this; full worker publications transfer Data through Self::new.
+    /// Snapshot CachedItem::extend's inline cache input once per cache change,
+    /// including empty loading placeholders. This clones the supplied graph;
+    /// Runtime routes full changed prose through admission instead. Disclosure
+    /// and row factories reuse prepared roots; full workers transfer Data via new.
     pub(super) fn snapshot(content: &markdown::Content) -> Self {
         Self::new(Data::snapshot(content))
     }

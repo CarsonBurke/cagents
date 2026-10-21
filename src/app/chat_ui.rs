@@ -4615,6 +4615,11 @@ impl Cagents {
                     && runtime
                         .find_disclosure
                         .item(&item.id, &mut runtime.expanded)
+                    && (CachedItem::prose(&item.content).is_none()
+                        || runtime
+                            .cache
+                            .get(&item.id)
+                            .is_some_and(|cached| cached.coordination.is_some()))
                 {
                     if runtime
                         .cache
@@ -12806,6 +12811,106 @@ mod tests {
         assert!(chat_runtime(&app, card).expanded.contains("reasoning"));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(!chat_runtime(&app, card).expanded.contains("reasoning"));
+    }
+
+    #[test]
+    fn parent_find_reveals_completed_large_thinking_without_reparsing_its_prepared_graph() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let body=format!("{}\n\nCOMPLETED_THINKING_NEEDLE λ\n", "> Rich **reasoning** café é.\n>\n> - nested `source` leaf\n\n| exact | table |\n| --- | --- |\n| value | λ |\n\n```text\noriginal fenced source\n```\n\n".repeat(2400));
+        assert!(body.len() > 256 * 1024);
+        let source = Arc::new(chat::Item {
+            id: "completed-thinking".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: body.clone(),
+                thinking: true,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        });
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.busy = false;
+        snapshot.items = vec![source.clone()];
+        show_chat_snapshot_for_test(&mut app, card, snapshot);
+        let runtime = chat_runtime(&app, card);
+        let cached = &runtime.cache[&source.id];
+        assert!(!cached.preparing && !cached.placeholder);
+        assert!(!runtime.expanded.contains(&source.id));
+        assert_eq!(runtime.selected_subagent, None);
+        let document = cached.document.as_ref().unwrap().clone();
+        let revision = cached.revision;
+        let canonical = cached.markdown.items().as_ptr();
+        let parsed = cached.markdown.parsed_work_bytes();
+        let mut expected = selection::Catalog::builder();
+        expected.markdown(&source.id, &[0], cached.markdown.items());
+        let expected = expected.finish();
+        let (first, last) = expected.endpoints().unwrap();
+        let expected_copy = expected.copy(first, last).unwrap();
+        let parser_work = markdown::parser_work_bytes_on_thread();
+        let materialized = markdown::materialized_bytes();
+        let clones = markdown::cloned_items();
+        for forward in [true, false] {
+            // Find itself performs the first reveal; explicit Next also runs
+            // the real navigation path and wraps the one matching parent turn.
+            drop(app.handle_chat_ui(Action::Find(target, "COMPLETED_THINKING_NEEDLE".into())));
+            drop(app.handle_chat_ui(Action::FindNext(target, forward)));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.expanded.contains(&source.id));
+            assert_eq!(runtime.find_matches.len(), 1);
+            assert!(
+                runtime.find_navigation.pending(),
+                "actual Find navigation is scheduled after disclosure"
+            );
+            assert_eq!(
+                markdown::parser_work_bytes_on_thread(),
+                parser_work,
+                "no Markdown parse work runs on the UI for Find reveal"
+            );
+            let cached = &runtime.cache[&source.id];
+            assert_eq!(
+                cached.revision, revision,
+                "disclosure must reuse prepared presentation metadata"
+            );
+            assert_eq!(cached.markdown.items().as_ptr(), canonical);
+            assert!(
+                std::ptr::eq(cached.document.as_ref().unwrap().items(), document.items()),
+                "same immutable prepared publication root"
+            );
+            assert_eq!(cached.markdown.parsed_work_bytes(), parsed);
+            assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &source));
+            assert!(
+                matches!(&cached.item.as_ref().unwrap().content,ItemContent::Text{text,..} if text==&body)
+            );
+            let catalog = runtime.selection_document().0;
+            let (first, last) = catalog.endpoints().unwrap();
+            assert_eq!(
+                catalog.copy(first, last).as_deref(),
+                Some(expected_copy.as_str()),
+                "actual revealed selection retains every original rendered source block"
+            );
+
+            assert_eq!(
+                markdown::cloned_items(),
+                clones,
+                "no replacement AST snapshot is cloned on reveal"
+            );
+            assert_eq!(
+                markdown::materialized_bytes(),
+                materialized,
+                "no styled full-source materialization is hidden in reveal"
+            );
+            drop(app.handle_chat_ui(Action::CloseFind(target)));
+            let runtime = chat_runtime(&app, card);
+            assert!(
+                !runtime.expanded.contains(&source.id),
+                "Find restores its own temporary disclosure"
+            );
+            assert!(!runtime.find_navigation.pending());
+            assert_eq!(runtime.cache[&source.id].revision, revision);
+        }
     }
 
     #[test]

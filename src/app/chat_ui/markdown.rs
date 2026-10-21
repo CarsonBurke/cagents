@@ -155,6 +155,7 @@ impl Content {
         #[cfg(test)]
         {
             self.parsed_bytes += input.len();
+            PARSER_WORK_BYTES.with(|bytes| bytes.set(bytes.get() + input.len()));
         }
         // Retain only enough prior parser state to prove a rendered styled
         // prefix after reparsing. Raw-source append alone is insufficient.
@@ -267,6 +268,8 @@ impl Content {
                     #[cfg(test)]
                     {
                         self.parsed_bytes += section.content.len();
+                        PARSER_WORK_BYTES
+                            .with(|bytes| bytes.set(bytes.get() + section.content.len()));
                     }
                     let mut state = State {
                         references: self.state.references.clone(),
@@ -585,6 +588,13 @@ pub struct Column {
 pub struct Row {
     /// The cells of the row.
     pub cells: Vec<Vec<Item>>,
+}
+
+#[cfg(test)]
+thread_local! { static PARSER_WORK_BYTES: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn parser_work_bytes_on_thread() -> usize {
+    PARSER_WORK_BYTES.with(Cell::get)
 }
 
 #[cfg(test)]
