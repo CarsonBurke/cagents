@@ -191,6 +191,8 @@ pub enum Action {
     LoadList,
     LoadMore,
     BrowserQuery(String),
+    BrowserSearch(String),
+    BrowserFocused,
     BrowserFilterIndex(usize),
     ListLoaded {
         generation: u64,
@@ -423,6 +425,8 @@ pub struct State {
     list_loading: bool,
     list_appending: bool,
     list_error: Option<String>,
+    list_last_refresh: Option<Instant>,
+    list_loaded_query: Option<String>,
     browser_query: String,
     browser_keys: BTreeMap<u64, (String, String)>,
     browser_viewport: (f32, f32),
@@ -623,6 +627,8 @@ impl State {
             list_loading: false,
             list_appending: false,
             list_error: None,
+            list_last_refresh: None,
+            list_loaded_query: None,
             browser_query: String::new(),
             browser_keys: BTreeMap::new(),
             browser_viewport: (0.0, 480.0),
@@ -670,6 +676,8 @@ impl State {
         self.list_cursor = None;
         self.list_loading = false;
         self.list_error = None;
+        self.list_last_refresh = None;
+        self.list_loaded_query = None;
         self.browser_query.clear();
         self.browser_keys.clear();
         self.browser_viewport.0 = 0.0;
@@ -683,6 +691,11 @@ impl State {
 
     pub fn source(&self) -> Option<&ReviewSource> {
         self.source.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn browser_is_refreshing(&self) -> bool {
+        self.list_loading
     }
 
     pub fn list(&self) -> &ListState {
@@ -823,15 +836,47 @@ impl State {
             }
             Action::Discussion(action) => self.update_discussion(action),
             Action::SetSource(source) => self.set_source(source),
+            Action::BrowserFocused => {
+                if self.target.is_none()
+                    && !self.list_loading
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                {
+                    self.load_list()
+                } else {
+                    ActionTask::none()
+                }
+            }
             Action::LoadList => self.load_list(),
             Action::LoadMore => self.load_list_page(true),
             Action::BrowserQuery(query) => {
-                self.browser_query = query;
+                self.browser_query = query.clone();
+                self.list_cursor = None;
                 self.browser_viewport.0 = 0.0;
-                iced::widget::operation::scroll_to(
-                    widget::Id::new("pr.browser"),
-                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
-                )
+                self.list_cancellation.cancel();
+                self.list_generation = self.list_generation.wrapping_add(1);
+                self.list_loading = false;
+                ActionTask::batch([
+                    iced::widget::operation::scroll_to(
+                        widget::Id::new("pr.browser"),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                    ),
+                    ActionTask::perform(
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            Action::BrowserSearch(query)
+                        },
+                        |action| action,
+                    ),
+                ])
+            }
+            Action::BrowserSearch(query) => {
+                if self.browser_query == query {
+                    self.load_list()
+                } else {
+                    ActionTask::none()
+                }
             }
             Action::BrowserViewport { offset, height } => {
                 self.browser_viewport = (offset, height);
@@ -854,6 +899,10 @@ impl State {
                 self.list_loading = false;
                 match result {
                     Ok(page) => {
+                        self.list_loaded_query = Some(self.browser_query.trim().to_owned());
+                        if let Some(source) = &self.source {
+                            crate::github::polling::succeeded(&source.repository.host);
+                        }
                         self.list_cursor = page.next_cursor;
                         let mut rows = if self.list_appending {
                             match std::mem::replace(&mut self.list, ListState::Idle) {
@@ -893,7 +942,10 @@ impl State {
                     Err(message) => self.list = ListState::Failed(message),
                 }
                 // A partial page cannot establish which PR refs are obsolete.
-                if self.list_cursor.is_none() && self.list_error.is_none() {
+                if self.browser_query.trim().is_empty()
+                    && self.list_cursor.is_none()
+                    && self.list_error.is_none()
+                {
                     self.prune_fetched_refs()
                 } else {
                     ActionTask::none()
@@ -943,6 +995,17 @@ impl State {
             }
             Action::Refresh => self.refresh(),
             Action::RefreshIfDue(now) => {
+                if self.target.is_none()
+                    && self.source.as_ref().is_some_and(|source| {
+                        crate::github::polling::ready(&source.repository.host, false)
+                    })
+                    && !self.list_loading
+                    && self.list_last_refresh.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= Duration::from_secs(30)
+                    })
+                {
+                    return self.load_list();
+                }
                 if !self.refreshing
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
@@ -1155,6 +1218,9 @@ impl State {
         let Some(source) = self.source.clone() else {
             return ActionTask::none();
         };
+        if !crate::github::polling::ready(&source.repository.host, true) {
+            return ActionTask::none();
+        }
         self.list_cancellation.cancel();
         self.list_cancellation = CancellationToken::new();
         let cancellation = self.list_cancellation.clone();
@@ -1166,17 +1232,53 @@ impl State {
             None
         };
         self.list_loading = true;
+        self.list_last_refresh = Some(Instant::now());
         self.list_appending = append;
         self.list_error = None;
         if !matches!(self.list, ListState::Ready(_)) {
             self.list = ListState::Loading;
         }
         let api = Arc::clone(&self.api);
+        let query = self.browser_query.trim().to_owned();
+        let page_limit = if append || self.list_loaded_query.as_deref() != Some(query.as_str()) {
+            1
+        } else {
+            match &self.list {
+                ListState::Ready(rows) => rows.len().div_ceil(50).max(1),
+                _ => 1,
+            }
+        };
         ActionTask::perform(
             async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    api.pull_request_page(&source.repository, cursor.as_deref(), &cancellation)
-                        .map_err(|error| error.to_string())
+                    let mut cursor = cursor;
+                    let mut rows = Vec::new();
+                    for _ in 0..page_limit {
+                        let page = if query.is_empty() {
+                            api.pull_request_page(
+                                &source.repository,
+                                cursor.as_deref(),
+                                &cancellation,
+                            )
+                        } else {
+                            api.search_pull_requests(
+                                &source.repository,
+                                &query,
+                                cursor.as_deref(),
+                                &cancellation,
+                            )
+                        }
+                        .map_err(|error| error.to_string())?;
+                        rows.extend(page.pull_requests);
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Ok(PullRequestPage {
+                        pull_requests: rows,
+                        next_cursor: cursor,
+                    })
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("pull request list task failed: {error}")));
@@ -2417,7 +2519,7 @@ impl State {
         .into();
         let controls = widget::column::with_children(vec![
             crate::ui_controls::field::search(
-                "Search loaded PRs by title, # or @author",
+                "Search repository PRs by title, # or @author",
                 &self.browser_query,
             )
             .on_input(Action::BrowserQuery)
@@ -2436,10 +2538,15 @@ impl State {
             .spacing(space::S)
             .into(),
             design::caption(format!(
-                "{count} matching · {} loaded",
+                "{count} matching · {} loaded{}",
                 match &self.list {
                     ListState::Ready(rows) => rows.len(),
                     _ => 0,
+                },
+                if self.browser_query.trim().is_empty() {
+                    ""
+                } else {
+                    " · repository search"
                 }
             ))
             .into(),
@@ -2914,6 +3021,8 @@ pub(crate) struct ScriptedApi {
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
     pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
+    pub search_pages: std::sync::Mutex<std::collections::VecDeque<PullRequestPage>>,
+    pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[cfg(test)]
@@ -2924,12 +3033,33 @@ impl ScriptedApi {
             viewed_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
             conversation: std::sync::Mutex::new(Default::default()),
             submitted: std::sync::Mutex::new(Vec::new()),
+            search_pages: Default::default(),
+            searches: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
 impl GitHubReviewApi for ScriptedApi {
+    fn search_pull_requests(
+        &self,
+        _repository: &GitHubRepoKey,
+        query: &str,
+        cursor: Option<&str>,
+        _: &CancellationToken,
+    ) -> Result<PullRequestPage, crate::github::GitHubError> {
+        self.searches
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), cursor.map(str::to_owned)));
+        Ok(self
+            .search_pages
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted search page"))
+    }
+
     fn pull_request(
         &self,
         _key: &PullRequestKey,
@@ -3312,6 +3442,133 @@ pub(crate) mod tests {
             load: state.load_generation,
             result: Ok(Arc::new(loaded)),
         }));
+    }
+
+    pub(crate) fn ready_due_browser(state: &mut State) {
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: Vec::new(),
+                next_cursor: None,
+            }),
+        }));
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+    }
+
+    #[test]
+    fn multi_page_search_refresh_retains_loaded_depth_query_and_viewport() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        state.source = Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        });
+        state.browser_query = "needle".into();
+        state.list_loaded_query = Some("needle".into());
+        state.list = ListState::Ready(
+            (1..=100)
+                .map(|number| Arc::new(pull_request(number)))
+                .collect(),
+        );
+        state.list_last_refresh = Some(Instant::now() - Duration::from_secs(31));
+        state.browser_viewport.0 = 800.0;
+        api.search_pages.lock().unwrap().extend([
+            PullRequestPage {
+                pull_requests: (2..=51).map(pull_request).collect(),
+                next_cursor: Some("page-2".into()),
+            },
+            PullRequestPage {
+                pull_requests: (52..=101).map(pull_request).collect(),
+                next_cursor: Some("page-3".into()),
+            },
+        ]);
+        let task = state.update(Action::RefreshIfDue(Instant::now()));
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action @ Action::ListLoaded { .. }) =
+                        action
+                    {
+                        return action;
+                    }
+                }
+                panic!("list request produced no result");
+            });
+        drop(state.update(reply));
+        assert_eq!(
+            *api.searches.lock().unwrap(),
+            vec![
+                ("needle".into(), None),
+                ("needle".into(), Some("page-2".into()))
+            ]
+        );
+        let ListState::Ready(rows) = &state.list else {
+            panic!("loaded search")
+        };
+        assert_eq!(rows.len(), 100);
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(101).is_some());
+        assert_eq!(state.browser_query, "needle");
+        assert_eq!(state.browser_viewport.0, 800.0);
+    }
+
+    #[test]
+    fn visible_browser_refreshes_on_cadence_and_drops_closed_rows() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        let before = state.list_generation;
+        drop(state.update(Action::RefreshIfDue(Instant::now())));
+        assert_eq!(state.list_generation, before);
+        let due = state.list_last_refresh.unwrap() + Duration::from_secs(31);
+        drop(state.update(Action::RefreshIfDue(due)));
+        assert!(state.list_loading);
+        assert!(state.listed_target(1).is_some());
+        drop(state.update(Action::ListLoaded {
+            generation: state.list_generation,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(2)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        assert!(state.listed_target(2).is_some());
+    }
+
+    #[test]
+    fn repository_search_ignores_obsolete_query_and_old_page() {
+        let (mut state, _) = state();
+        drop(state.set_source(Some(ReviewSource {
+            repository: target(1).repository,
+            worktree: "/repo".into(),
+        })));
+        let old = state.list_generation;
+        drop(state.update(Action::BrowserQuery("needle".into())));
+        drop(state.update(Action::BrowserSearch("old query".into())));
+        assert!(!state.list_loading);
+        drop(state.update(Action::ListLoaded {
+            generation: old,
+            result: Ok(PullRequestPage {
+                pull_requests: vec![pull_request(1)],
+                next_cursor: None,
+            }),
+        }));
+        assert!(state.listed_target(1).is_none());
+        drop(state.update(Action::BrowserSearch("needle".into())));
+        assert!(state.list_loading);
     }
 
     #[test]
