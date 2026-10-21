@@ -1101,12 +1101,12 @@ pub(super) fn code_text(
         ranges.push(start..start + line.len());
         start += line.len();
     }
-    if text.ends_with('\n') {
-        ranges.push(text.len()..text.len());
-    }
     let rows = ranges
         .into_iter()
         .map(|range| {
+            let line_height = iced::widget::text::LineHeight::default()
+                .to_absolute(size)
+                .0;
             use std::hash::{Hash, Hasher};
             let mut key = std::hash::DefaultHasher::new();
             (
@@ -1140,29 +1140,25 @@ pub(super) fn code_text(
                 logical.start += range.start;
                 logical
             });
-            let mut row = virtualized::Row::new(key, revision, size.0 * 1.3, None, move || {
-                // Newlines belong to the logical document. Each physical line
-                // contributes one visual row, including the real terminal empty
-                // line, instead of an extra empty paragraph at every chunk seam.
-                let mut display = range.clone();
-                if text[display.clone()].ends_with('\n') {
-                    display.end -= 1;
-                    if text[display.clone()].ends_with('\r') {
-                        display.end -= 1;
-                    }
-                }
-                if display.is_empty() {
+            let mut row = virtualized::Row::new(key, revision, line_height, None, move || {
+                // Keep the real LF/CRLF ending in this physical row.
+                // Rich native shaping gives it no extra visual paragraph;
+                // retaining the bytes also makes source-end carets exact.
+                let display = range.clone();
+                if matches!(&text[display.clone()], "\n" | "\r\n") {
                     // Empty physical lines still own a logical caret position,
                     // including the final newline. A Space cannot participate
                     // in pointer selection or copy across that source boundary.
-                    return leaf_text(
-                        vec![Span::new(String::new())].into(),
+                    return cosmic::widget::container(leaf_text(
+                        vec![Span::new(text[display.clone()].to_owned())].into(),
                         size,
                         font,
                         target,
                         find.as_deref(),
                         logical.clone(),
-                    );
+                    ))
+                    .height(line_height)
+                    .into();
                 }
                 code_line(
                     text.clone(),
@@ -1386,6 +1382,7 @@ mod tests {
         let weak = Arc::downgrade(&prepared[0]);
         drop(prepared);
         drop(cached);
+        preparation::retirement_barrier();
         assert!(weak.upgrade().is_none());
     }
     #[test]
@@ -1526,36 +1523,271 @@ mod tests {
                 reference
                     .as_widget_mut()
                     .layout(&mut reference_tree, &renderer, &limits);
-            let mut actual = code_text(
-                Arc::from(source.as_str()),
-                Arc::from([]),
-                size,
+            for logical in [
+                None,
+                Some(selectable_prose::Logical {
+                    identity: 0xabba,
+                    start: 0,
+                }),
+            ] {
+                let mut actual = code_text(
+                    Arc::from(source.as_str()),
+                    Arc::from([]),
+                    size,
+                    CodeBlock::FONT,
+                    target,
+                    None,
+                    logical,
+                    None,
+                    None,
+                );
+                let mut tree = Tree::new(&actual);
+                let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert!(
+                    (node.size().height - reference_node.size().height).abs() < 1.0,
+                    "physical line count changed: {:?} vs {:?}",
+                    node.size(),
+                    reference_node.size()
+                );
+                if !source.contains('\n') {
+                    assert!(
+                        node.size().width > 3000.0 * size.0,
+                        "one physical line must extend horizontally: {:?}",
+                        node.size()
+                    );
+                    assert!(
+                        (node.size().width / reference_node.size().width - 1.0).abs() < 0.03,
+                        "horizontal estimates must preserve physical extent"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn physical_terminal_newline_keeps_exact_native_extent_endpoint_copy_and_accessibility() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = selection::logical_identity("code", &[0, 0]);
+        for (ending, blank_rows, with_flow) in ["\n", "\r\n"].into_iter().flat_map(|ending| {
+            [0, 2]
+                .into_iter()
+                .flat_map(move |blanks| [false, true].map(move |flow| (ending, blanks, flow)))
+        }) {
+            let source: Arc<str> =
+                format!("{}{}", "x".repeat(4096), ending.repeat(1 + blank_rows)).into();
+            let logical = selectable_prose::Logical { identity, start: 0 };
+            let mut catalog = selection::Catalog::builder();
+            catalog.plain("code", &[0, 0], source.clone());
+            let catalog = catalog.finish();
+            let (first, last) = catalog.endpoints().unwrap();
+            assert_eq!(
+                catalog.copy(first, last).as_deref(),
+                Some(source.as_ref()),
+                "physical readers copy every original LF/CRLF source byte"
+            );
+            let limits = layout::Limits::new(
+                iced::Size::ZERO,
+                iced::Size::new(f32::INFINITY, f32::INFINITY),
+            );
+            let mut reference = leaf_text(
+                vec![Span::new(source.to_string())].into(),
+                14.0.into(),
                 CodeBlock::FONT,
                 target,
                 None,
-                None,
-                None,
-                None,
+                Some(logical.clone()),
             );
-            let mut tree = Tree::new(&actual);
-            let node = actual.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut reference_tree = Tree::new(&reference);
+            let reference_node =
+                reference
+                    .as_widget_mut()
+                    .layout(&mut reference_tree, &renderer, &limits);
+            let flow_cache = flow_layout::Cache::default();
+            let mut element = code_text(
+                source.clone(),
+                Arc::from([]),
+                14.0.into(),
+                CodeBlock::FONT,
+                target,
+                None,
+                Some(logical),
+                with_flow.then(|| flow_cache.clone()),
+                with_flow.then(|| reader_source::Source::new(&source)),
+            );
+            let mut tree = Tree::new(&element);
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            if with_flow {
+                assert!(
+                    flow_cache.complete_fixture(),
+                    "the actual code Flow source must shape"
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
             assert!(
                 (node.size().height - reference_node.size().height).abs() < 1.0,
-                "physical line count changed: {:?} vs {:?}",
-                node.size(),
-                reference_node.size()
+                "terminal source ending adds no invented visual row"
             );
-            if !source.contains('\n') {
-                assert!(
-                    node.size().width > 3000.0 * size.0,
-                    "one physical line must extend horizontally: {:?}",
-                    node.size()
-                );
-                assert!(
-                    (node.size().width / reference_node.size().width - 1.0).abs() < 0.03,
-                    "horizontal estimates must preserve physical extent"
-                );
+            struct Caret {
+                identity: u64,
+                end: usize,
+                found: bool,
+                last_plain: String,
+                ready_flow: bool,
             }
+            impl Operation for Caret {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    bounds: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                        self.ready_flow |= prose.flow_readiness() == Some(true);
+                        if let Some(caret) = prose.logical_byte_bounds(self.identity, self.end) {
+                            assert!(bounds.height > 0.0 && caret.height > 0.0);
+                            assert!(
+                                caret.y + caret.height <= bounds.height + 0.5,
+                                "terminal caret remains inside the last real native row"
+                            );
+                            self.found = true;
+                            self.last_plain = prose.plain.to_string();
+                        }
+                    }
+                }
+            }
+            let mut caret = Caret {
+                identity,
+                end: source.len(),
+                found: false,
+                last_plain: String::new(),
+                ready_flow: false,
+            };
+            element.as_widget_mut().operate(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+                &mut caret,
+            );
+            assert!(
+                caret.found,
+                "source-end caret resolves on a real mounted physical row"
+            );
+            assert_eq!(
+                caret.last_plain,
+                if blank_rows == 0 {
+                    source.as_ref()
+                } else {
+                    ending
+                },
+                "terminal physical row retains its original newline bytes"
+            );
+            assert_eq!(
+                caret.ready_flow, with_flow,
+                "the Flow variant uses actual current geometry"
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                iced::advanced::Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node.node().value() == Some(caret.last_plain.as_str())),
+                "the actual terminal physical row exposes its exact source to accessibility"
+            );
+        }
+    }
+
+    #[test]
+    fn long_carriage_return_sources_keep_actual_flow_admission_without_inline_body_copy() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        for prefix in ["", "x"] {
+            let source: Arc<str> = format!("{prefix}{}\n", "\r".repeat(65_536)).into();
+            let cache = flow_layout::Cache::default();
+            let mut element = code_text(
+                source.clone(),
+                Arc::from([]),
+                14.0.into(),
+                CodeBlock::FONT,
+                Target {
+                    card: CardId::new(),
+                    generation: 0,
+                },
+                None,
+                Some(selectable_prose::Logical {
+                    identity: 0xabba,
+                    start: 0,
+                }),
+                Some(cache),
+                Some(reader_source::Source::new(&source)),
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(
+                    iced::Size::ZERO,
+                    iced::Size::new(f32::INFINITY, f32::INFINITY),
+                ),
+            );
+            #[derive(Default)]
+            struct Probe {
+                pending: usize,
+                plain_bytes: usize,
+            }
+            impl Operation for Probe {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn custom(
+                    &mut self,
+                    _: Option<&iced::advanced::widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                        self.pending += usize::from(prose.flow_readiness() == Some(false));
+                        self.plain_bytes += prose.plain.len();
+                    }
+                }
+            }
+            let mut probe = Probe::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                iced::advanced::Layout::new(&node),
+                &renderer,
+                &mut probe,
+            );
+            assert_eq!(
+                probe.pending, 1,
+                "long carriage-return source retains actual Flow admission"
+            );
+            assert_eq!(
+                probe.plain_bytes, 0,
+                "an unprepared CR source is never materialized into inline UI spans"
+            );
         }
     }
 

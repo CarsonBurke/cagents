@@ -1224,7 +1224,18 @@ impl Prepared {
     }
     pub(super) fn byte_bounds(&self, byte: usize, length: usize) -> Option<iced::Rectangle> {
         let query = if byte == length {
-            byte.saturating_sub(1)
+            // Physical code rows retain their original source ending. Native
+            // rich shaping gives that LF/CRLF no glyph or extra visual row;
+            // resolve its end caret against the preceding real cluster.
+            let plain = self.plain.get(..length)?;
+            let end = if plain.ends_with("\r\n") {
+                length.saturating_sub(2)
+            } else if plain.ends_with('\n') {
+                length.saturating_sub(1)
+            } else {
+                length
+            };
+            end.saturating_sub(1)
         } else {
             byte
         };

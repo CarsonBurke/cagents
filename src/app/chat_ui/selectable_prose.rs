@@ -124,7 +124,9 @@ impl State {
     }
 
     pub(super) fn empty_line_caret(&self) -> bool {
-        self.logical.is_some() && self.flow.is_none() && self.plain.is_empty()
+        self.logical.is_some()
+            && self.flow.is_none()
+            && matches!(self.plain.as_ref(), "" | "\n" | "\r\n")
     }
 
     /// Only the matching mounted source may make Find wait for a real Flow
@@ -166,7 +168,11 @@ impl State {
         if self.empty_line_caret() {
             return Some(Rectangle::with_size(Size::new(
                 1.0,
-                paragraph.min_bounds().height.max(self.shape?.size.0 * 1.3),
+                paragraph.min_bounds().height.max(
+                    iced::widget::text::LineHeight::default()
+                        .to_absolute(self.shape?.size)
+                        .0,
+                ),
             )));
         }
         let mut prefixes = Vec::with_capacity(paragraph.buffer().lines.len());
@@ -677,7 +683,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         state.shape = Some(shape);
         let mut natural = state.paragraph().min_bounds();
         if state.empty_line_caret() {
-            natural.height = natural.height.max(self.size.0 * 1.3);
+            natural.height = natural.height.max(
+                iced::widget::text::LineHeight::default()
+                    .to_absolute(self.size)
+                    .0,
+            );
         }
         layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, natural))
     }
@@ -1260,7 +1270,7 @@ mod tests {
 
     #[test]
     fn prose_exposes_full_text_and_stable_accessible_identity() {
-        let element = text(
+        let mut element = text(
             vec![Span::new("α first\nβ second")].into(),
             design::TEXT_PROSE.into(),
             iced::Font::default(),
@@ -1270,8 +1280,14 @@ mod tests {
             },
             None,
         );
-        let tree = Tree::new(&element);
-        let node = layout::Node::new(Size::new(80.0, 40.0));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &crate::app::tests::headless_renderer(),
+            &layout::Limits::new(Size::ZERO, Size::new(80.0, 40.0)),
+        );
+        assert!(node.size().width > 0.0 && node.size().width <= 80.0);
+        assert!(node.size().height > 0.0 && node.size().height <= 40.0);
         let scrolled = Layout::with_offset(iced::Vector::new(12.0, 50.0), &node)
             .with_virtual_offset(iced::Vector::new(0.0, 37.0));
         let first = element
@@ -1284,7 +1300,12 @@ mod tests {
         let bounds = first.root()[0].node().bounds().unwrap();
         assert_eq!(
             (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
-            (12.0, 13.0, 92.0, 53.0)
+            (
+                12.0,
+                13.0,
+                12.0 + node.size().width as f64,
+                13.0 + node.size().height as f64
+            )
         );
         assert_eq!(first.root()[0].node().value(), Some("α first\nβ second"));
         assert_eq!(
@@ -1311,6 +1332,7 @@ mod tests {
             },
         };
         let state = State {
+            plain: selectable.plain.clone(),
             spans: Some(spans),
             shape: Some(Shape {
                 bounds: Size::new(300.0, 200.0),
