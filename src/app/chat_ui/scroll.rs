@@ -33,6 +33,7 @@ pub(super) fn transcript<'a>(
         items,
         None,
         Memory::default(),
+        false,
         None,
     )
 }
@@ -146,6 +147,33 @@ impl Memory {
             }
         }
     }
+    /// Only cold sources intersecting the saved reading window can delay its
+    /// restoration. An unrelated newly preparing tail must not hold it hostage.
+    pub(super) fn restoration_pending(
+        &self,
+        context: Option<&str>,
+        evicted: bool,
+        mut pending: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let anchor = self.0.borrow();
+        let Some(saved) = anchor
+            .contexts
+            .iter()
+            .find(|saved| saved.subagent.as_deref() == context)
+        else {
+            return false;
+        };
+        let Some((geometry, top)) = saved.geometry.zip(saved.top) else {
+            return false;
+        };
+        evicted
+            || saved.rows.iter().any(|row| {
+                row.bounds.y + row.bounds.height > top
+                    && row.bounds.y < top + geometry.viewport.height
+                    && pending(&row.id)
+            })
+    }
+
     pub fn retained_rows(&self) -> usize {
         self.0
             .borrow()
@@ -165,6 +193,7 @@ pub(super) fn transcript_observed<'a>(
     items: Vec<(Id, &'a str)>,
     observations: Observations,
     memory: Memory,
+    restoration_pending: bool,
     find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     transcript_impl(
@@ -176,6 +205,7 @@ pub(super) fn transcript_observed<'a>(
         items,
         Some(observations),
         memory,
+        restoration_pending,
         find_intent,
     )
 }
@@ -189,6 +219,7 @@ fn transcript_impl<'a>(
     items: Vec<(Id, &'a str)>,
     observations: Option<Observations>,
     memory: Memory,
+    restoration_pending: bool,
     find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
@@ -213,6 +244,7 @@ fn transcript_impl<'a>(
         items,
         observations,
         memory,
+        restoration_pending,
         find_intent,
     })
 }
@@ -230,6 +262,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         items: Vec::new(),
         observations: None,
         memory: Memory::default(),
+        restoration_pending: false,
         find_intent: None,
     })
 }
@@ -689,6 +722,7 @@ struct Anchored<'a> {
     items: Vec<(Id, &'a str)>,
     observations: Option<Observations>,
     memory: Memory,
+    restoration_pending: bool,
     find_intent: Option<find_navigation::Intent>,
 }
 
@@ -1161,6 +1195,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<ReaderState>();
+        let switching = state.memory.0.borrow().active.is_none_or(|index| {
+            state.memory.0.borrow().contexts[index].subagent.as_deref() != self.subagent
+        });
+        if (state.restore || switching) && self.restoration_pending {
+            state.restore = true;
+            // An empty hydrated-body wait or a cold source placeholder is not
+            // new reader geometry. Keep only the saved IDs/offsets until that
+            // exact selected source is prepared; never retain its old widgets.
+            return self
+                .content
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits);
+        }
         let mut restore = std::mem::take(&mut state.restore);
         let mut anchor = state.memory.0.borrow_mut();
         if restore {
@@ -1298,7 +1345,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
-        if self.target.is_some() && !correction.corrected {
+        if self.target.is_some() {
             let mut after = ReadTop::default();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1306,13 +1353,38 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 renderer,
                 &mut after,
             );
-            let mut anchor = tree
-                .state
-                .downcast_ref::<ReaderState>()
-                .memory
-                .0
-                .borrow_mut();
-            if let Some((top, geometry)) = after.0.zip(anchor.geometry()) {
+            let state = tree.state.downcast_mut::<ReaderState>();
+            let mut anchor = state.memory.0.borrow_mut();
+            if let Some(top) = after.0 {
+                let changed = before.0.is_some_and(|before| before != top);
+                if changed || correction.corrected {
+                    state.restore = false;
+                    if let Some(index) = anchor
+                        .contexts
+                        .iter()
+                        .position(|context| context.subagent.as_deref() == self.subagent)
+                    {
+                        anchor.active = Some(index);
+                        let context = &mut anchor.contexts[index];
+                        context.top = Some(top);
+                        if self.restoration_pending {
+                            context.geometry = Some(Geometry {
+                                viewport: layout.bounds().size(),
+                                content: layout
+                                    .children()
+                                    .next()
+                                    .expect("transcript content")
+                                    .bounds()
+                                    .size(),
+                            });
+                            context.rows.clear();
+                        }
+                    }
+                }
+            }
+            if !correction.corrected
+                && let Some((top, geometry)) = after.0.zip(anchor.geometry())
+            {
                 anchor.pending_input |= navigation_input(
                     before.0,
                     top,
@@ -1400,12 +1472,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .bounds()
                     .size(),
             };
-            let mut anchor = tree
-                .state
-                .downcast_ref::<ReaderState>()
-                .memory
-                .0
-                .borrow_mut();
+            let state = tree.state.downcast_mut::<ReaderState>();
+            let mut anchor = state.memory.0.borrow_mut();
+            let moved = before.0.is_some_and(|before| before != top);
+            if state.restore && self.restoration_pending && !moved {
+                return;
+            }
+            if moved {
+                state.restore = false;
+                if let Some(index) = anchor
+                    .contexts
+                    .iter()
+                    .position(|context| context.subagent.as_deref() == self.subagent)
+                {
+                    anchor.active = Some(index);
+                    let context = &mut anchor.contexts[index];
+                    context.top = Some(top);
+                    if self.restoration_pending {
+                        context.geometry = Some(geometry);
+                        context.rows.clear();
+                    }
+                }
+            }
             let changed = anchor.reported.as_ref().is_none_or(|previous| {
                 previous.subagent.as_deref() != self.subagent
                     || previous.top != top
@@ -1615,6 +1703,7 @@ mod tests {
                     .collect(),
                 observations.clone(),
                 memory.clone(),
+                false,
                 None,
             )
         };
@@ -1653,6 +1742,183 @@ mod tests {
             Some(600.0),
             "revealing a hidden transcript does not jump to its end"
         );
+    }
+
+    #[test]
+    fn cold_reader_restore_ignores_empty_and_same_item_placeholder_layouts() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let observations = Observations::default();
+        let make = |pending, height| {
+            let ids = if height == 0 {
+                vec![]
+            } else {
+                vec!["first", "middle", "last"]
+            };
+            transcript_observed(
+                widget::column::with_children(
+                    ids.iter()
+                        .map(|id| item(id, widget::Space::new().height(height).width(Length::Fill)))
+                        .collect::<Vec<_>>(),
+                ),
+                target,
+                None,
+                vec![],
+                true,
+                ids.into_iter().map(|id| (item_id(id), id)).collect(),
+                observations.clone(),
+                memory.clone(),
+                pending,
+                None,
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        {
+            let mut element = make(false, 500);
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(500.0),
+            );
+            // Deliberately drop before another layout: operations must commit
+            // actual native geometry when it changes, just as wheel input does.
+        }
+        assert_eq!(memory.0.borrow().contexts[0].top, Some(600.0));
+        let mut pending = make(true, 0);
+        let mut tree = Tree::new(&pending);
+        for height in [0, 20, 20] {
+            pending = make(true, height);
+            tree.diff(pending.as_widget_mut());
+            let node = pending
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            pending.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut vec![]),
+                &Rectangle::with_size(Size::new(720.0, 400.0)),
+            );
+            assert_eq!(memory.0.borrow().contexts[0].top, Some(600.0));
+            assert_eq!(
+                memory.0.borrow().contexts[0]
+                    .geometry
+                    .unwrap()
+                    .content
+                    .height,
+                1500.0
+            );
+            assert!(tree.state.downcast_ref::<ReaderState>().restore);
+            assert!(
+                observations.borrow().is_empty(),
+                "temporary geometry cannot replace runtime observations"
+            );
+        }
+        let mut ready = make(false, 500);
+        tree.diff(ready.as_widget_mut());
+        let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        ready
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(600.0));
+        // An authoritative empty replacement is different from hydration wait.
+        let mut empty = make(false, 0);
+        tree.diff(empty.as_widget_mut());
+        empty.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!(memory.0.borrow().contexts[0].top, Some(0.0));
+        assert!(memory.0.borrow().contexts[0].rows.is_empty());
+        let mut replacement = make(false, 500);
+        tree.diff(replacement.as_widget_mut());
+        let node = replacement
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        replacement
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(1100.0),
+            "a genuinely empty transcript resets end-follow"
+        );
+    }
+
+    #[test]
+    fn actual_native_wheel_survives_tree_drop_before_the_next_layout() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let observations = Observations::default();
+        let make = || {
+            transcript_observed(
+                item(
+                    "body",
+                    widget::Space::new().height(2000).width(Length::Fill),
+                ),
+                target,
+                None,
+                vec![],
+                true,
+                vec![(item_id("body"), "body")],
+                observations.clone(),
+                memory.clone(),
+                false,
+                None,
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        {
+            let mut element = make();
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: 5.0 },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(100.0, 100.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut vec![]),
+                &Rectangle::with_size(Size::new(720.0, 400.0)),
+            );
+        }
+        let expected = observations.borrow()[&None].from_top();
+        assert!(
+            expected < 1600.0 && expected > 0.0,
+            "the real native wheel must move the reader"
+        );
+        let mut restored = make();
+        let mut tree = Tree::new(&restored);
+        let node = restored
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        restored
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(expected));
     }
 
     fn native_logical_location(
@@ -1780,6 +2046,7 @@ mod tests {
                 vec![],
                 Observations::default(),
                 Memory::default(),
+                false,
                 Some(guard),
             ))
             .width(400)
@@ -2267,6 +2534,7 @@ mod tests {
                 vec![],
                 Observations::default(),
                 Memory::default(),
+                false,
                 Some(guard.clone()),
             );
             let mut tree = Tree::new(&element);
@@ -2573,6 +2841,7 @@ mod tests {
                 vec![],
                 observations.clone(),
                 Memory::default(),
+                false,
                 None,
             )
         };
