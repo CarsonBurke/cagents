@@ -21,7 +21,7 @@ use iced::widget::text::Span;
 
 /// How a link in an answer reaches the surface.
 fn link(target: Target, uri: markdown::Uri) -> Message {
-    action(Action::OpenDocument(target, uri.to_string()))
+    action(Action::OpenSharedDocument(target, uri))
 }
 
 /// A fenced block ready to draw: all of its lines as one paragraph of spans,
@@ -33,7 +33,7 @@ fn link(target: Target, uri: markdown::Uri) -> Message {
 /// highlighter, so the fence an answer is still writing costs a refresh the
 /// lines that arrived in it rather than every line it has.
 pub(super) struct CodeBlock {
-    spans: [Arc<[Span<'static, String>]>; 2],
+    spans: [Arc<[Span<'static, markdown::Uri>]>; 2],
     /// Where the block resumes if its text grows, for as long as it may.
     tail: Option<Tail>,
 }
@@ -56,8 +56,8 @@ impl CodeBlock {
     /// Owned span storage and logical text bytes. Plain palettes share their
     /// Arc; count that backing only once. Highlighter state is not estimated.
     pub(super) fn retained_span_bytes(&self) -> usize {
-        let bytes = |spans: &Arc<[Span<'static, String>]>| {
-            spans.len() * std::mem::size_of::<Span<'static, String>>()
+        let bytes = |spans: &Arc<[Span<'static, markdown::Uri>]>| {
+            spans.len() * std::mem::size_of::<Span<'static, markdown::Uri>>()
                 + spans
                     .iter()
                     .map(|span| {
@@ -163,7 +163,7 @@ impl CodeBlock {
             return;
         };
         let palettes = if tail.highlighter.is_some() { 2 } else { 1 };
-        let mut spans: [Vec<Span<'static, String>>; 2] = Default::default();
+        let mut spans: [Vec<Span<'static, markdown::Uri>>; 2] = Default::default();
         for (index, spans) in spans.iter_mut().enumerate().take(palettes) {
             spans.extend_from_slice(&self.spans[index][..tail.spans[index]]);
         }
@@ -200,7 +200,7 @@ impl CodeBlock {
     }
 
     /// The block's spans in the palette the current appearance uses.
-    pub(super) fn spans(&self, dark: bool) -> &Arc<[Span<'static, String>]> {
+    pub(super) fn spans(&self, dark: bool) -> &Arc<[Span<'static, markdown::Uri>]> {
         &self.spans[usize::from(dark)]
     }
 }
@@ -210,7 +210,7 @@ impl CodeBlock {
 fn line(
     source: &str,
     syntax: Option<&[crate::diff_view::SyntaxSpan]>,
-    spans: &mut Vec<Span<'static, String>>,
+    spans: &mut Vec<Span<'static, markdown::Uri>>,
 ) {
     let (line, ending) = if let Some(line) = source.strip_suffix("\r\n") {
         (line, "\r\n")
@@ -262,7 +262,7 @@ pub(super) fn fence_language(info: &str) -> Option<&str> {
         .find(|word| !word.is_empty())
 }
 
-pub(super) type PaletteMap = HashMap<u64, Arc<[Span<'static, String>]>>;
+pub(super) type PaletteMap = HashMap<u64, Arc<[Span<'static, markdown::Uri>]>>;
 pub(super) type Palettes = [Arc<PaletteMap>; 2];
 pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
     std::array::from_fn(|dark| {
@@ -319,7 +319,7 @@ pub(super) fn view(
             .into(),
         path: vec![0],
         dark: cosmic::theme::is_dark(),
-        find: find.map(|_| find_navigation::query_epoch(target)),
+        find: find.map(|_| find_navigation::render_revision(target)),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -369,7 +369,7 @@ pub(super) fn content_view(
                 .unwrap_or_default() as u32,
         ],
         dark: cosmic::theme::is_dark(),
-        find: find.map(|_| find_navigation::query_epoch(target)),
+        find: find.map(|_| find_navigation::render_revision(target)),
     }
     .items(content.items(), settings)
 }
@@ -418,7 +418,7 @@ struct Renderer {
     path: Vec<u32>,
     find: Option<u64>,
     target: Target,
-    blocks: Arc<HashMap<u64, Arc<[Span<'static, String>]>>>,
+    blocks: Arc<HashMap<u64, Arc<[Span<'static, markdown::Uri>]>>>,
     revision: u64,
     dark: bool,
 }
@@ -964,7 +964,7 @@ fn heading_style(settings: markdown::Settings, level: markdown::HeadingLevel) ->
 }
 
 fn leaf_text(
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -982,7 +982,7 @@ fn leaf_text(
 /// ranges. The logical block keeps source newlines intact for selection/copy.
 pub(super) fn code_text(
     text: Arc<str>,
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -1005,7 +1005,7 @@ pub(super) fn code_text(
         starts.push(starts.last().copied().unwrap() + span.text.len());
     }
     let starts: Arc<[usize]> = starts.into();
-    let find = find.map(|_| find_navigation::query_epoch(target));
+    let find = find.map(|_| find_navigation::render_revision(target));
     let mut ranges = Vec::new();
     let mut start = 0;
     for line in text.split_inclusive('\n') {
@@ -1095,7 +1095,7 @@ pub(super) fn code_text(
 
 fn code_line(
     text: Arc<str>,
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     starts: Arc<[usize]>,
     range: std::ops::Range<usize>,
     size: iced::Pixels,
@@ -1141,10 +1141,10 @@ fn code_line(
 }
 
 pub(super) fn sliced_spans(
-    spans: &[Span<'static, String>],
+    spans: &[Span<'static, markdown::Uri>],
     starts: &[usize],
     range: std::ops::Range<usize>,
-) -> Arc<[Span<'static, String>]> {
+) -> Arc<[Span<'static, markdown::Uri>]> {
     let first = starts
         .partition_point(|start| *start <= range.start)
         .saturating_sub(1);
@@ -1420,7 +1420,7 @@ mod tests {
                 target,
                 runtime.find.as_deref(),
             );
-            tree.diff(&element);
+            tree.diff(&mut element);
             element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
@@ -1893,11 +1893,86 @@ mod tests {
     }
 
     #[test]
+    fn long_inline_uri_shares_worker_source_through_native_hit_and_scoped_action() {
+        use iced::advanced::{layout, widget::Tree};
+        let uri = format!("https://example.test/{}#L22", "destination".repeat(100_000));
+        let expected = uri.clone();
+        let (content, data) = std::thread::spawn(move || {
+            let content = markdown::Content::parse(&format!("[x]({uri})"));
+            let data = prose_document::Data::snapshot(&content);
+            (content, data)
+        })
+        .join()
+        .unwrap();
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let markdown::Item::Paragraph(text) = &content.items()[0] else {
+            panic!("short linked paragraph")
+        };
+        assert_eq!(
+            text.len(),
+            1,
+            "a large destination must preserve the native short reader"
+        );
+        let canonical = text.spans(settings.style)[0].link.as_ref().unwrap().clone();
+        assert_eq!(canonical.as_ref(), expected);
+        let document = prose_document::Document::new(data);
+        let markdown::Item::Paragraph(snapshot) = &document.items()[0] else {
+            panic!("worker snapshot")
+        };
+        assert!(Arc::ptr_eq(
+            snapshot.spans(settings.style)[0].link.as_ref().unwrap(),
+            &canonical
+        ));
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::empty();
+        for _ in 0..3 {
+            let mut element = paragraph(settings, text, target, None, None, None);
+            tree.diff(&mut element);
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, 100.0)),
+            );
+            let state = tree.state.downcast_ref::<selectable_prose::State>();
+            assert!(
+                Arc::ptr_eq(
+                    state.spans.as_ref().unwrap()[0].link.as_ref().unwrap(),
+                    &canonical
+                ),
+                "native styled spans share the canonical URI rather than cloning its bytes"
+            );
+            let hit = (0..30)
+                .find_map(|x| state.link(iced::Point::new(x as f32, 10.0)))
+                .expect("actual native glyph link hit");
+            assert!(Arc::ptr_eq(&hit, &canonical));
+            let Message::ChatUi(Action::OpenSharedDocument(found, source)) = link(target, hit)
+            else {
+                panic!("shared reader action")
+            };
+            assert_eq!(found, target);
+            assert!(
+                Arc::ptr_eq(&source, &canonical),
+                "action retains the same complete destination through explicit activation"
+            );
+            assert_eq!(source.as_ref(), expected);
+        }
+    }
+
+    #[test]
     fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
         use iced_accessibility::accesskit::Role;
 
+        let long_uri = format!(
+            "https://example.test/{}#L22",
+            "image-destination".repeat(70_000)
+        );
+        let long_source = format!("![shared image]({long_uri})");
         for (source, uri, alt, title) in [
             (
                 "![diagram](docs/diagram.png \"Architecture\")",
@@ -1911,6 +1986,7 @@ mod tests {
                 "",
                 "",
             ),
+            (long_source.as_str(), long_uri.as_str(), "shared image", ""),
         ] {
             let target = Target {
                 card: CardId::new(),
@@ -1983,9 +2059,19 @@ mod tests {
                 );
             }
             assert!(
-                matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocument(found, path))]
-                if *found == target && path == uri),
+                matches!(messages.as_slice(), [Message::ChatUi(Action::OpenSharedDocument(found, path))]
+                if *found == target && path.as_ref() == uri),
                 "source action must retain its card/generation and exact URI"
+            );
+            let markdown::Item::Image { url, .. } = &cached.markdown.items()[0] else {
+                unreachable!()
+            };
+            let Message::ChatUi(Action::OpenSharedDocument(_, shared)) = &messages[0] else {
+                unreachable!()
+            };
+            assert!(
+                Arc::ptr_eq(url, shared),
+                "the actual image button action shares its full prepared destination"
             );
         }
     }
@@ -2145,7 +2231,7 @@ mod tests {
         language: Option<&str>,
         code: &str,
         theme: crate::settings::EditorSyntaxTheme,
-    ) -> [Vec<Span<'static, String>>; 2] {
+    ) -> [Vec<Span<'static, markdown::Uri>>; 2] {
         let syntax = language
             .filter(|_| code.len() <= CachedItem::HIGHLIGHT_LIMIT)
             .map(|language| crate::diff_view::highlight_snippet(code, language, theme));
@@ -2186,7 +2272,11 @@ mod tests {
         })
     }
 
-    fn assert_draws(block: &CodeBlock, expected: &[Vec<Span<'static, String>>; 2], case: &str) {
+    fn assert_draws(
+        block: &CodeBlock,
+        expected: &[Vec<Span<'static, markdown::Uri>>; 2],
+        case: &str,
+    ) {
         for dark in [false, true] {
             assert_eq!(
                 block.spans(dark).as_ref(),

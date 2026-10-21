@@ -24,7 +24,7 @@ pub(super) struct State {
     pub(super) target: Option<Target>,
     pub(super) managed: bool,
     pub(super) dirty: bool,
-    pub(super) spans: Option<Arc<[Span<'static, String>]>>,
+    pub(super) spans: Option<Arc<[Span<'static, markdown::Uri>]>>,
     /// How the spans were last laid out, which is what they are shaped as
     /// when something asks where a point falls among them.
     shape: Option<Shape>,
@@ -209,7 +209,7 @@ impl State {
         hit(self.paragraph(), &self.plain, position)
     }
 
-    pub(super) fn link(&self, position: Point) -> Option<String> {
+    pub(super) fn link(&self, position: Point) -> Option<markdown::Uri> {
         if self.flow.is_some() {
             let metadata = self.flow_ready.as_ref()?.link(position)?;
             return self.spans.as_ref()?.get(metadata)?.link.clone();
@@ -246,7 +246,7 @@ pub(super) struct Logical {
 }
 
 pub(super) fn logical_text(
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -257,7 +257,7 @@ pub(super) fn logical_text(
 }
 
 pub(super) fn text(
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -295,7 +295,6 @@ pub(super) fn flow_source_optional(
     } else {
         super::find_navigation::Marks::default()
     };
-    let truncated = highlights.truncated();
     let body = Element::new(Selectable {
         find_enabled: find.is_some(),
         logical,
@@ -308,22 +307,241 @@ pub(super) fn flow_source_optional(
         font,
         target,
     });
-    if truncated {
-        widget::column::with_children(vec![
-            design::caption("Find highlights limited to the first 4096 matches in this block.")
-                .into(),
+    if find.is_some() {
+        Element::new(FlowFindNotice {
             body,
-        ])
-        .width(iced::Length::Fill)
-        .into()
+            caption: design::caption(
+                "Find highlights limited to the first 4096 matches in this block.",
+            )
+            .into(),
+        })
     } else {
         body
     }
 }
 
+/// The text element is retained while asynchronous Find completes. The notice
+/// therefore follows the exact ready prefix held by its native tree too.
+struct FlowFindNotice {
+    body: Element<'static, Message>,
+    caption: Element<'static, Message>,
+}
+impl FlowFindNotice {
+    fn truncated(&self, tree: &Tree) -> bool {
+        let state = tree.children[0].state.downcast_ref::<State>();
+        state
+            .flow
+            .as_ref()
+            .zip(state.flow_ready.as_ref())
+            .is_some_and(|(flow, ready)| {
+                state.target.is_some_and(|target| {
+                    flow.borrow_mut()
+                        .find_highlights_for(target, &ready.plain)
+                        .truncated()
+                })
+            })
+    }
+}
+impl Widget<Message, cosmic::Theme, cosmic::Renderer> for FlowFindNotice {
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        let mut children = layout.children();
+        let body = self.body.as_widget().a11y_nodes(
+            children
+                .next()
+                .unwrap()
+                .with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        );
+        if *tree.state.downcast_ref::<bool>() && self.truncated(tree) {
+            iced_accessibility::A11yTree::join([
+                body,
+                self.caption.as_widget().a11y_nodes(
+                    children
+                        .next()
+                        .unwrap()
+                        .with_virtual_offset(layout.virtual_offset()),
+                    &tree.children[1],
+                    cursor,
+                ),
+            ])
+        } else {
+            body
+        }
+    }
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<bool>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(false)
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.body), Tree::new(&self.caption)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.children[0].diff(&mut self.body);
+        tree.children[1].diff(&mut self.caption);
+    }
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Shrink, Length::Shrink)
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let body = self
+            .body
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let shown = self.truncated(tree);
+        *tree.state.downcast_mut::<bool>() = shown;
+        let caption = if shown {
+            self.caption.as_widget_mut().layout(
+                &mut tree.children[1],
+                renderer,
+                &layout::Limits::new(
+                    Size::ZERO,
+                    Size::new(
+                        limits.max().width,
+                        (limits.max().height - body.size().height).max(0.0),
+                    ),
+                ),
+            )
+        } else {
+            layout::Node::new(Size::ZERO)
+        };
+        let height = caption.size().height;
+        let body_height = body.size().height;
+        let size = limits.resolve(
+            Length::Shrink,
+            Length::Shrink,
+            Size::new(
+                body.size().width.max(caption.size().width),
+                body_height + height,
+            ),
+        );
+        layout::Node::with_children(
+            size,
+            vec![body, caption.move_to(Point::new(0.0, body_height))],
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        defaults: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let mut children = layout.children();
+        self.body.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            defaults,
+            children
+                .next()
+                .unwrap()
+                .with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        );
+        if *tree.state.downcast_ref::<bool>() && self.truncated(tree) {
+            self.caption.as_widget().draw(
+                &tree.children[1],
+                renderer,
+                theme,
+                defaults,
+                children
+                    .next()
+                    .unwrap()
+                    .with_virtual_offset(layout.virtual_offset()),
+                cursor,
+                viewport,
+            );
+        }
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.body.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout
+                .children()
+                .next()
+                .unwrap()
+                .with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if self.truncated(tree) != *tree.state.downcast_ref::<bool>() {
+            shell.invalidate_layout();
+        }
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.body.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout
+                .children()
+                .next()
+                .unwrap()
+                .with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        self.body.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout
+                .children()
+                .next()
+                .unwrap()
+                .with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+}
+
 #[cfg(test)]
 pub(super) fn flow_text(
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -335,7 +553,7 @@ pub(super) fn flow_text(
 }
 
 fn build_text(
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
@@ -401,7 +619,7 @@ struct Selectable {
     flow_ready: Option<Arc<flow_layout::Prepared>>,
     logical: Option<Logical>,
     matches: super::find_navigation::Marks,
-    spans: Arc<[Span<'static, String>]>,
+    spans: Arc<[Span<'static, markdown::Uri>]>,
     plain: Arc<str>,
     size: iced::Pixels,
     font: iced::Font,
@@ -410,7 +628,7 @@ struct Selectable {
 
 impl Selectable {
     #[cfg(test)]
-    fn selected_spans(&self, state: &State) -> Arc<[Span<'static, String>]> {
+    fn selected_spans(&self, state: &State) -> Arc<[Span<'static, markdown::Uri>]> {
         let start = state.anchor.min(state.end);
         let end = state.anchor.max(state.end);
         if start == end && self.matches.is_empty() {
@@ -772,7 +990,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                         renderer,
                         projection,
                         &ready.spans,
-                        &self.matches,
+                        &if self.find_enabled {
+                            flow.borrow_mut()
+                                .find_highlights_for(self.target, &ready.plain)
+                        } else {
+                            super::find_navigation::Marks::default()
+                        },
                         state.anchor.min(state.end)..state.anchor.max(state.end),
                         self.size,
                         layout.position(),
@@ -959,7 +1182,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                     && let Some(position) = position
                     && let Some(link) = state.link(position)
                 {
-                    shell.publish(action(Action::OpenDocument(self.target, link)));
+                    shell.publish(action(Action::OpenSharedDocument(self.target, link)));
                 }
                 shell.capture_event();
                 shell.invalidate_layout();
@@ -1362,7 +1585,8 @@ mod tests {
 
     #[test]
     fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {
-        let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
+        let spans: Arc<[Span<'static, markdown::Uri>]> =
+            vec![Span::new("α first\nβ second")].into();
         let selectable = Selectable {
             find_enabled: true,
             logical: None,
@@ -1459,7 +1683,8 @@ mod tests {
     fn selection_reuses_the_paragraph_used_for_drawing_and_hit_testing() {
         let renderer = crate::app::tests::headless_renderer();
         let mut element = text(
-            vec![Span::new("linked α prose ".repeat(100)).link("source.rs".to_owned())].into(),
+            vec![Span::new("linked α prose ".repeat(100)).link(markdown::Uri::from("source.rs"))]
+                .into(),
             design::TEXT_PROSE.into(),
             iced::Font::default(),
             Target {
@@ -1505,8 +1730,8 @@ mod tests {
     fn long_tokens_wrap_with_accessible_glyphs_and_matching_hit_geometry() {
         let renderer = crate::app::tests::headless_renderer();
         let source = "w".repeat(3000);
-        let spans: Arc<[Span<'static, String>]> =
-            vec![Span::new(source.clone()).link("https://example.com".to_owned())].into();
+        let spans: Arc<[Span<'static, markdown::Uri>]> =
+            vec![Span::new(source.clone()).link(markdown::Uri::from("https://example.com"))].into();
         let mut selectable = Selectable {
             find_enabled: true,
             plain: source.clone().into(),
@@ -1567,10 +1792,10 @@ mod tests {
 
     #[test]
     fn link_hit_uses_glyph_metadata_across_wrapping_and_bidi_boundaries() {
-        let spans: Arc<[Span<'static, String>]> = vec![
-            Span::new("linked ".repeat(12)).link("first".to_owned()),
+        let spans: Arc<[Span<'static, markdown::Uri>]> = vec![
+            Span::new("linked ".repeat(12)).link(markdown::Uri::from("first")),
             Span::new(" plain "),
-            Span::new("שלום".to_owned()).link("rtl".to_owned()),
+            Span::new("שלום".to_owned()).link(markdown::Uri::from("rtl")),
         ]
         .into();
         let state = State {
@@ -1622,9 +1847,9 @@ mod tests {
 
     #[test]
     fn selection_preserves_links_fonts_and_unicode_across_span_boundaries() {
-        let spans: Arc<[Span<'static, String>]> = vec![
+        let spans: Arc<[Span<'static, markdown::Uri>]> = vec![
             Span::new("before α").font(iced::Font::MONOSPACE),
-            Span::new("β linked").link("src/app.rs:42"),
+            Span::new("β linked").link(markdown::Uri::from("src/app.rs:42")),
         ]
         .into();
         let selectable = Selectable {
@@ -1734,7 +1959,8 @@ mod flow_tests {
     #[test]
     fn huge_flow_layout_defers_shaping_and_requests_only_when_native_visible() {
         let renderer = crate::app::tests::headless_renderer();
-        let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(210_000))].into();
+        let spans: Arc<[Span<'static, markdown::Uri>]> =
+            vec![Span::new("word ".repeat(210_000))].into();
         let cache = flow_layout::Cache::default();
         let flow = cache.entry(99, spans.clone());
         let target = Target {

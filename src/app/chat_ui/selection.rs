@@ -77,7 +77,7 @@ struct State {
     end: Option<Endpoint>,
     dragging: bool,
     focused: bool,
-    link: Option<(Target, String)>,
+    link: Option<(Target, markdown::Uri)>,
     pointer: Option<Point>,
     origin: Option<Point>,
     moved: bool,
@@ -244,7 +244,7 @@ struct Block {
     bounds: Rectangle,
     visible: Option<Rectangle>,
     hit: usize,
-    link: Option<(Target, String)>,
+    link: Option<(Target, markdown::Uri)>,
     lists: Vec<ListMarker>,
     cell: Option<Cell>,
 }
@@ -1219,10 +1219,20 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                         && state.anchor == state.end
                         && let Some((target, link)) = state.link.take()
                         && read.endpoint(true).is_some_and(|block| {
-                            block.link.as_ref() == Some(&(target, link.clone()))
+                            // A worker reparse may republish the same URI in
+                            // another allocation during this gesture. Compare
+                            // destination bytes only at explicit activation.
+                            block
+                                .link
+                                .as_ref()
+                                .is_some_and(|(current_target, current)| {
+                                    *current_target == target
+                                        && (Arc::ptr_eq(current, &link)
+                                            || current.as_ref() == link.as_ref())
+                                })
                         })
                     {
-                        shell.publish(action(Action::OpenDocument(target, link)));
+                        shell.publish(action(Action::OpenSharedDocument(target, link)));
                     }
                 }
                 captured = true;
@@ -2184,6 +2194,98 @@ mod tests {
     }
 
     #[test]
+    fn native_link_release_accepts_equal_reparsed_uri_and_refuses_changed_destination_or_target() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 3,
+        };
+        let uri: markdown::Uri =
+            format!("https://example.test/{}#L22", "destination".repeat(100_000)).into();
+        let linked = |target, uri: markdown::Uri| {
+            surface(super::super::selectable_prose::text(
+                vec![iced::widget::text::Span::new("x").link(uri)].into(),
+                16.0.into(),
+                iced::Font::default(),
+                target,
+                None,
+            ))
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let viewport = Rectangle::with_size(Size::new(300.0, 100.0));
+        let cursor = mouse::Cursor::Available(Point::new(2.0, 10.0));
+        for (changed_uri, changed_target) in [(false, false), (true, false), (false, true)] {
+            let mut element = linked(target, uri.clone());
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let captured = tree
+                .state
+                .downcast_ref::<State>()
+                .link
+                .as_ref()
+                .expect("actual native glyph press captures link provenance");
+            assert_eq!(captured.0, target);
+            assert!(Arc::ptr_eq(&captured.1, &uri));
+            let next_uri: markdown::Uri = if changed_uri {
+                Arc::from("https://example.test/changed#L22")
+            } else {
+                Arc::from(uri.as_ref())
+            };
+            assert!(
+                !Arc::ptr_eq(&next_uri, &uri),
+                "a real fresh URI allocation replaces the pressed reader source"
+            );
+            let next_target = if changed_target {
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                }
+            } else {
+                target
+            };
+            let mut rebuilt = linked(next_target, next_uri);
+            tree.diff(&mut rebuilt);
+            let node = rebuilt
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            rebuilt.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            if changed_uri || changed_target {
+                assert!(
+                    messages.is_empty(),
+                    "a different destination or stale Target refuses activation across the same native gesture"
+                );
+            } else {
+                assert!(
+                    matches!(messages.as_slice(),[Message::ChatUi(Action::OpenSharedDocument(found,source))] if *found==target && Arc::ptr_eq(source,&uri)),
+                    "equal destination bytes in a reparsed allocation preserve the actual native click and original shared payload"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn click_units_shift_extension_and_returned_link_drags_use_the_shared_selection() {
         thread_local! {
             static CLICK_TIME: std::cell::Cell<iced::time::Instant> =
@@ -2204,7 +2306,7 @@ mod tests {
         let content = super::super::selectable_prose::text(
             vec![
                 iced::widget::text::Span::new("one two three")
-                    .link("https://example.com".to_owned()),
+                    .link(Arc::from("https://example.com")),
             ]
             .into(),
             16.0.into(),

@@ -1443,7 +1443,7 @@ impl Runtime {
         self.find.as_ref().map(|_| {
             (
                 self.find_navigation.search_epoch(),
-                find_navigation::query_epoch(self.target),
+                find_navigation::render_revision(self.target),
             )
         })
     }
@@ -3577,7 +3577,12 @@ impl Runtime {
         self.find
             .as_ref()
             .filter(|_| self.find_turn_matches(&turn.key))
-            .map(|_| self.find_navigation.search_epoch())
+            .map(|_| {
+                (
+                    self.find_navigation.search_epoch(),
+                    find_navigation::render_revision(self.target),
+                )
+            })
             .hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
@@ -6170,15 +6175,29 @@ mod tests {
         snapshot.subagents = vec![chat::Subagent {
             items: vec![
                 item("short", "child needle".into()),
-                item("other", "unrelated ".repeat(5000)),
+                Arc::new(chat::Item {
+                    id: "other".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "Read".into(),
+                        input: "{}".into(),
+                        output: format!("{}needle", "unrelated\n".repeat(5000)),
+                        status: chat::ToolStatus::Succeeded,
+                    },
+                    at: None,
+                    started_at: None,
+                }),
             ],
             ..native_child_fixture()
         }];
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let mut task = app.resume_current_find(target, false);
+        // The admitted raw snapshot predates reader preparation. Its first
+        // accepted Pattern cannot authorize uncapping a later ready reader.
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        let mut task = app.handle_chat_ui(Action::Find(target, "needle".into()));
         let before = app
             .chat_runtime_mut(target)
             .unwrap()
@@ -6208,7 +6227,7 @@ mod tests {
                 None,
                 vec![],
             );
-            tree.diff(&element);
+            tree.diff(&mut element);
             element.as_widget_mut().layout(
                 tree,
                 &renderer,
@@ -6244,7 +6263,7 @@ mod tests {
                 .unwrap()
             });
             task = app.handle_chat_ui(next);
-            if find_navigation::query_epoch(target) != 0 {
+            if find_navigation::render_revision(target) != 0 {
                 break;
             }
         }
@@ -6267,6 +6286,78 @@ mod tests {
         assert!(
             virtualized::constructed_rows() > built,
             "the existing native Tree rebuilds the changed child row"
+        );
+        let (reader, text, cache_revision) = {
+            let cached = &app.chat_runtime_mut(target).unwrap().child_cache["other"];
+            let output = cached.tool_output.as_ref().unwrap();
+            (output.find_identity(), output.text.clone(), cached.revision)
+        };
+        assert!(!find_navigation::tool_uncapped(target, reader, &text));
+        // A real manual navigation cancellation leaves the current query and
+        // accepted stable groups intact, allowing the coalesced raw refresh.
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .cancel();
+        let task = app.resume_current_find(target, false);
+        let raw_reply = |task| {
+            executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task)
+                    .expect("same-query current-reader raw worker");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(action @ Action::FindGroups(..)),
+                        )) = effect
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("second actual raw worker completion");
+                })
+                .await
+                .unwrap()
+            })
+        };
+        drop(app.handle_chat_ui(raw_reply(task)));
+        let current = app.chat_runtime_mut(target).unwrap();
+        let reader_phase = current.child_find_revision().unwrap();
+        assert_eq!(
+            reader_phase.0, after.0,
+            "reader readiness does not edit the query"
+        );
+        assert_ne!(
+            reader_phase.1, after.1,
+            "new exact uncapping bindings advance the accepted render phase"
+        );
+        assert_eq!(
+            current.child_cache["other"].revision, cache_revision,
+            "only accepted reader bindings changed"
+        );
+        assert!(find_navigation::tool_uncapped(target, reader, &text));
+        let built = virtualized::constructed_rows();
+        render(&mut app, &mut tree);
+        assert!(
+            virtualized::constructed_rows() > built,
+            "the same retained native Tree rebuilds for the second accepted reader plan"
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents[0]
+            .items
+            .push(item("tail", "fresh unrelated tail".into()));
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .cancel();
+        let task = app.resume_current_find(target, false);
+        drop(app.handle_chat_ui(raw_reply(task)));
+        assert_eq!(
+            find_navigation::render_revision(target),
+            reader_phase.1,
+            "an actual new raw result for unrelated tail append reuses unchanged exact reader bindings"
         );
     }
 

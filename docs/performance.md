@@ -369,6 +369,16 @@ sources are scanned on the worker, with cancellation checked inside both query
 preparation and source matching. Highlights bind the exact painted ready source;
 their existing 4,096-range limit applies to each block. Output reservations stay
 with painted range owners, including retained widget clones.
+Retained Flow widgets read current marks against the exact ready prefix they
+paint, so an asynchronous completion does not require rebuilding the element.
+A late per-block limit notice appears below the text without moving its glyph
+origin. Accepted query contexts carry a separate render revision when their
+exact tool-disclosure bindings change; unrelated publications reuse it.
+
+Link destinations share immutable storage through parser output, native spans,
+hit testing and reader actions. Rendering does not clone a long URL just because
+its displayed label is short. Resolving a clicked destination remains explicit
+UI work and preserves its complete destination.
 
 Every normal raw outcome, including failure, retains the same admission through
 message consumption or background disposal. Query and attempt epochs reject old

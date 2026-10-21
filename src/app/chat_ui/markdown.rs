@@ -37,7 +37,7 @@ use std::{
     sync::Arc,
 };
 use unicase::UniCase;
-pub type Uri = String;
+pub type Uri = Arc<str>;
 
 /// A bunch of Markdown that has been parsed.
 #[derive(Debug, Default, Clone)]
@@ -1074,7 +1074,7 @@ type ReferenceLabel = UniCase<String>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Reference {
     origin: usize,
-    destination: String,
+    destination: Uri,
     title: String,
 }
 #[derive(Debug, Default, Clone)]
@@ -1176,7 +1176,7 @@ fn parse_with<'a>(
                 RefCell::borrow_mut(&reference_labels).insert(label.clone());
                 references.get(&label).map(|reference| {
                     (
-                        pulldown_cmark::CowStr::from(reference.destination.clone()),
+                        pulldown_cmark::CowStr::from(reference.destination.to_string()),
                         pulldown_cmark::CowStr::from(reference.title.clone()),
                     )
                 })
@@ -1191,7 +1191,7 @@ fn parse_with<'a>(
                 .entry(UniCase::new(label.to_owned()))
                 .or_insert_with(|| Reference {
                     origin: origin + definition.span.start,
-                    destination: definition.dest.to_string(),
+                    destination: Arc::from(definition.dest.as_ref()),
                     title: definition.title.as_deref().unwrap_or("").to_owned(),
                 });
         }
@@ -1283,7 +1283,7 @@ fn parse_with<'a>(
                     references.get(&label)
                 };
                 link = Some(definition.map_or_else(
-                    || dest_url.into_string(),
+                    || Arc::from(dest_url.as_ref()),
                     |reference| reference.destination.clone(),
                 ));
                 None
@@ -1309,7 +1309,7 @@ fn parse_with<'a>(
                     references.get(&label)
                 };
                 image = Some(definition.map_or_else(
-                    || (dest_url.into_string(), title.into_string()),
+                    || (Arc::from(dest_url.as_ref()), title.into_string()),
                     |reference| (reference.destination.clone(), reference.title.clone()),
                 ));
                 None
@@ -1871,7 +1871,7 @@ mod tests {
         }
     }
 
-    fn reference_text(items: &[Item]) -> Vec<(char, Option<String>)> {
+    fn reference_text(items: &[Item]) -> Vec<(char, Option<Uri>)> {
         let mut output = Vec::new();
         for item in items {
             match item {

@@ -253,6 +253,7 @@ pub enum Action {
     RetryMarkdown(Target),
     OpenUrl(String),
     OpenDocument(Target, String),
+    OpenSharedDocument(Target, markdown::Uri),
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
@@ -9430,6 +9431,11 @@ impl Cagents {
                 return self.chat_changed_file_resolved(target, id, reported, result);
             }
             Action::OpenDocument(target, raw) => {
+                if self.chat_runtime_mut(target).is_some() {
+                    return self.open_document_link(Some(target.card), &raw);
+                }
+            }
+            Action::OpenSharedDocument(target, raw) => {
                 if self.chat_runtime_mut(target).is_some() {
                     return self.open_document_link(Some(target.card), &raw);
                 }
@@ -20203,7 +20209,7 @@ mod tests {
             &text("```rust\nfn main() {}\nlet x = 1;\n```\n\n```\nplain\n```\n"),
             THEME,
         );
-        let text_of = |spans: &[iced::widget::text::Span<'static, String>]| {
+        let text_of = |spans: &[iced::widget::text::Span<'static, markdown::Uri>]| {
             spans
                 .iter()
                 .map(|span| span.text.as_ref())

@@ -145,11 +145,11 @@ enum SourceData {
     Code {
         text: Arc<str>,
         range: std::ops::Range<usize>,
-        spans: Arc<[Span<'static, String>]>,
+        spans: Arc<[Span<'static, markdown::Uri>]>,
         starts: Arc<[usize]>,
         source: reader_source::Source,
     },
-    Styled(Arc<[Span<'static, String>]>),
+    Styled(Arc<[Span<'static, markdown::Uri>]>),
 }
 // Requests and Action clones share immutable backing with one final-owner
 // retirement. No unsafe Sync assertion and no UI/materialization mutex.
@@ -209,7 +209,11 @@ impl SourceData {
                         && (spans.len() != old_spans.len()
                             || !spans.iter().zip(old_spans.iter()).all(|(a, b)| {
                                 a == b
-                                    && a.link == b.link
+                                    && match (&a.link, &b.link) {
+                                        (None, None) => true,
+                                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                                        _ => false,
+                                    }
                                     && a.highlight == b.highlight
                                     && a.padding == b.padding
                                     && a.underline == b.underline
@@ -219,7 +223,7 @@ impl SourceData {
             _ => self.len() != previous.len(),
         }
     }
-    fn materialize(&self) -> (Arc<[Span<'static, String>]>, Arc<str>) {
+    fn materialize(&self) -> (Arc<[Span<'static, markdown::Uri>]>, Arc<str>) {
         match self {
             Self::Markdown { text, style } => (text.spans(*style), text.plain()),
             Self::Styled(spans) => (
@@ -251,7 +255,11 @@ impl SourceData {
 
 impl Cache {
     #[cfg(test)]
-    pub(super) fn entry(&self, identity: u64, spans: Arc<[Span<'static, String>]>) -> Handle {
+    pub(super) fn entry(
+        &self,
+        identity: u64,
+        spans: Arc<[Span<'static, markdown::Uri>]>,
+    ) -> Handle {
         self.source_entry(identity, SourceData::Styled(spans))
     }
     pub(super) fn markdown_entry(
@@ -273,7 +281,7 @@ impl Cache {
         identity: u64,
         text: Arc<str>,
         range: std::ops::Range<usize>,
-        spans: Arc<[Span<'static, String>]>,
+        spans: Arc<[Span<'static, markdown::Uri>]>,
         starts: Arc<[usize]>,
         source: reader_source::Source,
     ) -> Handle {
@@ -837,7 +845,7 @@ pub(super) struct Geometry {
     retired_on: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
     pub(super) snapshot: cosmic_text::LayoutSnapshot,
     pub(super) bounds: iced::Size,
-    pub(super) spans: Arc<[Span<'static, String>]>,
+    pub(super) spans: Arc<[Span<'static, markdown::Uri>]>,
     pub(super) plain: Arc<str>,
     unwrapped: bool,
 }
@@ -855,7 +863,7 @@ impl Prepared {
     /// changes, width, source/span changes and theme colors invalidate this.
     #[cfg(test)]
     fn new(
-        spans: &[Span<'static, String>],
+        spans: &[Span<'static, markdown::Uri>],
         size: iced::Pixels,
         font: iced::Font,
         width: f32,
@@ -882,7 +890,7 @@ impl Prepared {
     }
 
     fn with_fonts(
-        spans: Arc<[Span<'static, String>]>,
+        spans: Arc<[Span<'static, markdown::Uri>]>,
         plain: Arc<str>,
         size: iced::Pixels,
         font: iced::Font,
@@ -941,7 +949,7 @@ impl Prepared {
 
 #[cfg(test)]
 fn reference(
-    spans: &[Span<'static, String>],
+    spans: &[Span<'static, markdown::Uri>],
     size: iced::Pixels,
     font: iced::Font,
     width: f32,
@@ -1352,7 +1360,7 @@ fn visit_range_bounds(
 pub(super) fn paint(
     renderer: &mut cosmic::Renderer,
     projection: &Projection,
-    spans: &[Span<'static, String>],
+    spans: &[Span<'static, markdown::Uri>],
     matches: &[std::ops::Range<usize>],
     selection: std::ops::Range<usize>,
     size: iced::Pixels,
@@ -1440,7 +1448,7 @@ pub(super) fn paint(
 
 #[test]
 fn cache_rejects_stale_source_and_width_and_releases_owned_layout() {
-    let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(1000))].into();
+    let spans: Arc<[Span<'static, markdown::Uri>]> = vec![Span::new("word ".repeat(1000))].into();
     let cache = Cache::default();
     let entry = cache.entry(7, spans.clone());
     entry
@@ -1466,7 +1474,7 @@ fn cache_rejects_stale_source_and_width_and_releases_owned_layout() {
     );
     assert!(!entry.borrow_mut().complete(&request, None));
     let current = entry.borrow_mut().request().expect("new width request");
-    let replacement: Arc<[Span<'static, String>]> =
+    let replacement: Arc<[Span<'static, markdown::Uri>]> =
         vec![Span::new("replacement".to_owned())].into();
     let _new = cache.entry(7, replacement);
     assert!(
@@ -1484,8 +1492,8 @@ fn flow_hits_links_and_find_bounds_use_the_original_full_context_source() {
         "word ".repeat(1000),
         "suffix ".repeat(500)
     );
-    let spans: Arc<[Span<'static, String>]> =
-        vec![Span::new(text.clone()).link("https://example.com".to_owned())].into();
+    let spans: Arc<[Span<'static, markdown::Uri>]> =
+        vec![Span::new(text.clone()).link(Arc::from("https://example.com"))].into();
     let prepared = Prepared::new(
         &spans,
         iced::Pixels(16.0),
@@ -1522,7 +1530,7 @@ fn virtual_row_eviction_releases_flow_glyphs_without_hiding_the_chat() {
     let renderer = crate::app::tests::headless_renderer();
     let cache = Cache::default();
     let owners = Rc::new(RefCell::new(Vec::new()));
-    let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(800))].into();
+    let spans: Arc<[Span<'static, markdown::Uri>]> = vec![Span::new("word ".repeat(800))].into();
     let window = Rc::new(Cell::new(Some(virtualized::Viewport {
         top: 0.0,
         height: 200.0,
@@ -1809,7 +1817,7 @@ fn code_flow_preserves_full_physical_line_context_without_sync_shaping() {
 #[test]
 fn horizontal_flow_projects_sparse_glyphs_and_keeps_source_hit_and_find_coordinates() {
     let source = format!("{} ffi العربية עברית end", "office ".repeat(2000));
-    let spans = vec![Span::new(source.clone()).link("https://example.com".to_owned())];
+    let spans = vec![Span::new(source.clone()).link(Arc::from("https://example.com"))];
     let prepared = Prepared::new(
         &spans,
         iced::Pixels(16.0),
@@ -2040,7 +2048,7 @@ fn projected_decorations_stay_above_selection_and_find() {
 
 #[test]
 fn last_geometry_owner_retires_off_thread_after_widget_and_cache_release() {
-    let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(4000))].into();
+    let spans: Arc<[Span<'static, markdown::Uri>]> = vec![Span::new("word ".repeat(4000))].into();
     let mut prepared = Prepared::new(
         &spans,
         iced::Pixels(16.0),
@@ -2194,9 +2202,9 @@ fn last_flow_entry_request_and_action_retire_real_raw_spans_after_canonical_and_
 fn code_and_styled_flow_sources_share_one_final_retirement_across_request_clones() {
     for code in [false, true] {
         let text: Arc<str> = "actual original λ é\n".repeat(5000).into();
-        let spans: Arc<[Span<'static, String>]> = vec![
+        let spans: Arc<[Span<'static, markdown::Uri>]> = vec![
             Span::new(text.to_string())
-                .link("https://example.test/source".to_owned())
+                .link(Arc::from("https://example.test/source"))
                 .strikethrough(true),
         ]
         .into();
@@ -2476,7 +2484,7 @@ fn stalled_ui_delivery_holds_output_admission_until_installation_or_discard() {
             card: CardId::new(),
             generation: 0,
         };
-        let spans: Arc<[Span<'static, String>]> =
+        let spans: Arc<[Span<'static, markdown::Uri>]> =
             vec![Span::new("streamed paragraph ".repeat(2000))].into();
         let cache = Cache::default();
         let entry = cache.entry(1, spans);
@@ -2564,17 +2572,34 @@ pub(super) fn evict_find_highlights(except: u64) {
 }
 impl Entry {
     pub(super) fn find_highlights(&mut self, target: Target) -> find_navigation::Marks {
+        let Some(painted) = self.ready.as_ref().map(|ready| ready.plain.clone()) else {
+            return Default::default();
+        };
+        self.find_highlights_for(target, &painted)
+    }
+    pub(super) fn find_highlights_for(
+        &mut self,
+        target: Target,
+        painted: &Arc<str>,
+    ) -> find_navigation::Marks {
         static TOUCH: AtomicU64 = AtomicU64::new(1);
         self.find_touched = TOUCH.fetch_add(1, Ordering::Relaxed);
         if self
             .find_highlight
             .as_ref()
-            .zip(self.ready.as_ref())
-            .is_some_and(|(found, ready)| found.current(target, &ready.plain))
+            .is_some_and(|found| found.current(target, painted))
         {
             return self.find_highlight.as_ref().unwrap().marks.clone();
         }
-        self.find_highlight = None;
+        // A retained widget may still paint an older ready source. It must
+        // neither borrow nor evict marks belonging to the newer Entry source.
+        if self.find_highlight.as_ref().is_some_and(|found| {
+            self.ready
+                .as_ref()
+                .is_none_or(|ready| !found.current(target, &ready.plain))
+        }) {
+            self.find_highlight = None;
+        }
         find_navigation::Marks::default()
     }
     pub(super) fn needs_find_highlights(&mut self, target: Target) -> bool {

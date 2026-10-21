@@ -1431,6 +1431,7 @@ impl Cagents {
 struct HighlightContext {
     clock: Arc<AtomicU64>,
     epoch: u64,
+    render_revision: u64,
     plan: RawOutput,
     tools: Vec<(u64, Weak<str>)>,
 }
@@ -1443,25 +1444,47 @@ thread_local! {
     static HIGHLIGHTS: std::cell::RefCell<HashMap<Target,std::sync::Weak<HighlightContext>>> = std::cell::RefCell::new(HashMap::new());
 }
 fn register_highlights(runtime: &mut Runtime) {
+    static NEXT_RENDER_REVISION: AtomicU64 = AtomicU64::new(1);
     let raw = &runtime.find_navigation.raw;
     let context = raw
         .accepted
         .as_ref()
         .map(|result| {
+            let clock = runtime.find_navigation.search.clone();
+            let epoch = clock.load(Ordering::Acquire);
+            let tools: Vec<_> = result
+                .tools
+                .iter()
+                .filter(|(_, _, id, source)| {
+                    runtime
+                        .active_item(id)
+                        .is_some_and(|item| source.as_ptr() == Arc::as_ptr(item))
+                })
+                .map(|(id, source, _, _)| (*id, source.clone()))
+                .collect();
+            let render_revision = raw
+                .highlight_context
+                .as_ref()
+                .filter(|previous| {
+                    Arc::ptr_eq(&previous.clock, &clock)
+                        && previous.epoch == epoch
+                        && previous.tools.len() == tools.len()
+                        && previous.tools.iter().zip(&tools).all(
+                            |((id, source), (next_id, next_source))| {
+                                id == next_id && source.ptr_eq(next_source)
+                            },
+                        )
+                })
+                .map_or_else(
+                    || NEXT_RENDER_REVISION.fetch_add(1, Ordering::Relaxed),
+                    |previous| previous.render_revision,
+                );
             Arc::new(HighlightContext {
-                clock: runtime.find_navigation.search.clone(),
-                epoch: runtime.find_navigation.search.load(Ordering::Acquire),
+                clock,
+                epoch,
+                render_revision,
                 plan: result.clone(),
-                tools: result
-                    .tools
-                    .iter()
-                    .filter(|(_, _, id, source)| {
-                        runtime
-                            .active_item(id)
-                            .is_some_and(|item| source.as_ptr() == Arc::as_ptr(item))
-                    })
-                    .map(|(id, source, _, _)| (*id, source.clone()))
-                    .collect(),
+                tools,
             })
         })
         .or_else(|| {
@@ -2327,6 +2350,235 @@ mod tests {
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
     }
     #[test]
+    fn retained_flow_draw_paints_late_async_find_marks_without_element_rebuild() {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout, renderer::Renderer as _, widget::Tree,
+        };
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let cache = flow_layout::Cache::default();
+        let text = "needle ".repeat(find::HIGHLIGHT_LIMIT + 1);
+        let entries: Vec<_> = (0..2)
+            .map(|index| {
+                let entry = cache.entry(
+                    90 + index,
+                    vec![iced::widget::text::Span::new(text.clone())].into(),
+                );
+                entry.borrow_mut().bind_target(target);
+                entry
+                    .borrow_mut()
+                    .configure(600.0, iced::Pixels(14.0), iced::Font::default());
+                entry.borrow_mut().set_find_visible(true);
+                entry
+            })
+            .collect();
+        assert!(cache.complete_fixture());
+        let ready = entries[0].borrow().prepared().unwrap();
+        let other = entries[1].borrow().prepared().unwrap();
+        assert_eq!(ready.plain, other.plain);
+        assert!(!Arc::ptr_eq(&ready.plain, &other.plain));
+        let mut element = selectable_prose::flow_source_optional(
+            iced::Pixels(14.0),
+            iced::Font::default(),
+            target,
+            Some("needle"),
+            None,
+            entries[0].clone(),
+        );
+        let mut tree = Tree::new(&element);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 200.0));
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, f32::INFINITY));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(node.children()[1].size().height, 0.0);
+        let notice = "Find highlights limited to the first 4096 matches in this block.";
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::with_offset(iced::Vector::new(12.0, 50.0), &node)
+                .with_virtual_offset(iced::Vector::new(0.0, 37.0)),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let body = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().value() == Some(text.as_str()))
+            .expect("retained Flow wrapper forwards the complete native body accessibility value");
+        let body_id = body.id().clone();
+        let body_bounds = body.node().bounds().unwrap();
+        assert_eq!(
+            (body_bounds.x0, body_bounds.y0),
+            (12.0, 13.0),
+            "wrapper preserves parent virtual offset for native accessibility geometry"
+        );
+        assert!(
+            !accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| node.node().value() == Some(notice)
+                    || node.node().label() == Some(notice))
+        );
+        let theme = cosmic::theme::active();
+        let wash = iced::Background::Color(design::accent_wash(&theme));
+        let quads = |renderer: &mut cosmic::Renderer| {
+            let cosmic::Renderer::Secondary(renderer) = renderer else {
+                panic!("headless renderer must use tiny-skia")
+            };
+            renderer
+                .layers()
+                .iter()
+                .flat_map(|layer| layer.quads.iter())
+                .filter(|(_, background)| *background == wash)
+                .map(|(quad, _)| quad.bounds)
+                .collect::<Vec<_>>()
+        };
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &iced::advanced::renderer::Style::default(),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert!(
+            quads(&mut renderer).is_empty(),
+            "retained native element was constructed before async Find marks"
+        );
+        let id = entries[0].borrow_mut().find_request_id(target).unwrap();
+        finish_highlight(&mut app, target, id);
+        assert!(entries[0].borrow_mut().find_highlights(target).truncated());
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &iced::advanced::renderer::Style::default(),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let painted = quads(&mut renderer);
+        let glyph = ready.byte_bounds(0, ready.plain.len()).unwrap();
+        let point = iced::Point::new(glyph.center_x(), glyph.center_y());
+        assert!(
+            painted.iter().any(|bounds| bounds.contains(point)),
+            "the same native element/tree paints late worker marks at actual visible glyph geometry"
+        );
+        assert!(
+            entries[0]
+                .borrow_mut()
+                .find_highlights_for(target, &other.plain)
+                .is_empty(),
+            "equal bytes from another actual Ready cannot certify the painted source"
+        );
+        assert_eq!(
+            entries[0].borrow_mut().find_highlights(target).len(),
+            find::HIGHLIGHT_LIMIT,
+            "a stale retained painted source cannot evict current cached marks"
+        );
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(
+            shell.is_layout_invalid(),
+            "late truncation changes the retained notice layout"
+        );
+        let refreshed = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            refreshed.children()[0].bounds().y,
+            0.0,
+            "notice preserves the native reader origin"
+        );
+        assert!(
+            refreshed.children()[1].size().height > 0.0,
+            "late >4096 result shows its truthful notice without rebuilding Element"
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::with_offset(iced::Vector::new(12.0, 50.0), &refreshed)
+                .with_virtual_offset(iced::Vector::new(0.0, 37.0)),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let body = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.node().value() == Some(text.as_str()))
+            .expect("late notice retains the complete native body accessibility value");
+        assert_eq!(
+            body.id(),
+            &body_id,
+            "the same retained native body keeps its accessibility identity"
+        );
+        assert_eq!(
+            body.node().bounds(),
+            Some(body_bounds),
+            "late notice preserves exact body bounds and inherited virtual offset"
+        );
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| node.node().value() == Some(notice)
+                    || node.node().label() == Some(notice)),
+            "actual late truncation exposes its notice to accessibility"
+        );
+        let constrained = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 40.0)),
+        );
+        assert!(
+            constrained.size().height <= 40.0,
+            "late notice respects finite native layout height"
+        );
+        let body = &constrained.children()[0];
+        let caption = &constrained.children()[1];
+        assert_eq!(
+            body.bounds().y,
+            0.0,
+            "constrained notice preserves native reader origin"
+        );
+        assert!(
+            caption.size().height <= (40.0 - body.size().height).max(0.0),
+            "caption uses only actual remaining height"
+        );
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&constrained),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(
+            !shell.is_layout_invalid(),
+            "an unchanged truncated result does not relayout repeatedly when the caption is constrained to zero height"
+        );
+    }
+
+    #[test]
     fn two_mounted_common_match_leaves_keep_full_per_leaf_budget_and_refuse_stale_source() {
         let (mut app, target, _) = runtime("needle");
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
@@ -2821,10 +3073,10 @@ impl Runtime {
     }
 }
 
-/// Rendering transports only an enabled query epoch. Actual query text and
+/// Rendering transports only a body-free accepted-context revision. Actual query text and
 /// matching authority stay in the admitted shared Pattern context.
-pub(super) fn query_epoch(target: Target) -> u64 {
-    highlight_context(target).map_or(0, |context| context.epoch)
+pub(super) fn render_revision(target: Target) -> u64 {
+    highlight_context(target).map_or(0, |context| context.render_revision)
 }
 impl State {
     pub(super) fn search_epoch(&self) -> u64 {
