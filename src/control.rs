@@ -35,6 +35,8 @@ mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
+mod work;
+pub use work::WorkCommand;
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
@@ -138,6 +140,11 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
+    /// Show every worktree and branch in progress, newest activity first.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
     Automation {
@@ -1932,6 +1939,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
+        ServerResponse::Work(_) => "work",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -2275,6 +2283,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Project { .. }
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
+        | TopCommand::Work { .. }
         | TopCommand::Account { .. }
         | TopCommand::Chat { .. }
         | TopCommand::Whoami
@@ -2337,6 +2346,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         }
         TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Automation { command } => automations::execute(command),
+        TopCommand::Work { command } => work::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),

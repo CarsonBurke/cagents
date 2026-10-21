@@ -408,6 +408,70 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
+## Work board
+
+The Work board answers "what was I working on?" across every open project. The
+daemon keeps one card per worktree or branch in progress, and `cagents work`
+reads them:
+
+```sh
+cagents work ls                      # every open project, newest activity first
+cagents work ls --project redact     # one project, by name or path
+cagents work ls --column in-review   # one column
+cagents work ls --fresh              # rescan and poll GitHub first, up to 20 s
+cagents work ls --json               # the full board
+```
+
+Every linked worktree has a card, and so does the primary checkout while it is
+dirty, ahead of the default branch or has an agent session. A branch without a
+worktree has one while the user has an open pull request or a closed draft for
+it, and so does an open pull request of theirs whose branch exists only on
+GitHub. A branch whose pull request merged or closed is history, and a branch
+with neither a worktree nor a pull request is not work in progress; neither has
+a card.
+
+A card's last activity is the newest of its own head commit (a branch still at
+its base has none of its own), its newest changed file and the last time an
+agent worked in it; cards sort by it, newest first. Ahead and behind counts
+compare against the repository's default branch, not the branch's upstream:
+what `upstream/HEAD` (a fork's parent) or else `origin/HEAD` points at, falling
+back to `origin/main`, `origin/master` or a local `main` or `master`. Its column
+is the first of these that applies:
+
+| Column | When |
+| --- | --- |
+| **Active** | An agent there is working or waiting |
+| **Landed** | Its pull request merged and nothing local remains beyond it: its status read clean, and it is at the merged head, behind it, or already in the default branch. A candidate for removal |
+| **Active** | The last local activity was within three hours |
+| **Stale** | No activity for `work_stale_after_days` days (default 7) |
+| **In review** | An open pull request that is not a draft; the card shows its checks and review |
+| **In progress** | Everything else: commits, changes, drafts and closed drafts |
+
+`cagents work pin BRANCH in-review` overrides the derived column until
+`cagents work unpin BRANCH`; a worktree path names a card too. A branch's pin
+follows it between worktrees and is forgotten once the branch is gone or its
+pull request has merged or closed, at the next scan that Git and GitHub both
+answer; a worktree's pin is forgotten with the worktree.
+
+The daemon watches each project's Git metadata and, within its watch budget,
+the tracked directories of its worktrees. Projects beyond the budget are
+polled, every 15 seconds after recent activity and every two minutes
+otherwise; ignored trees such as `node_modules` are never walked. A commit or
+fetch re-reads only the worktrees whose head it moved.
+
+GitHub is read with `gh`: two `gh pr list` calls per repository, plus a cached
+lookup for a checked-out branch whose pull request someone else opened. While
+a board is being read, listings refresh every 30 seconds; otherwise every 10
+minutes, enough to keep merges and pins current. Failures back off, and a
+project without a GitHub remote is asked again hourly. `--fresh` reuses a scan
+or listing from the last five seconds.
+
+A worktree's `cagents linear link` names its ticket. Otherwise a Linear-style
+branch name such as `fix/main-123-title` names one once Linear confirms an
+issue with that identifier, for display only; `test/discard-1117` does not. Tickets are
+looked up with your Linear credentials, and only while a board is being read.
+Without a usable key the board says so under its cards and asks again hourly.
+
 ## Windows
 
 `cagents ui --new-window` opens another independently movable window, and

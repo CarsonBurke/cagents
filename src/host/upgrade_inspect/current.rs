@@ -176,10 +176,11 @@ impl Client {
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
 // reader never accepts Snapshot, whose layout may change independently.
-// Versions 102 (Copy sidecars) and 103 (retained Claude continuity) preserve
-// this subset, including the existing continuity enum discriminants.
+// Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
+// appended Work board request) preserve this subset, including the existing
+// continuity enum discriminants.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, ipc::PROTOCOL_VERSION].contains(&protocol)
+    [99, 100, 101, 102, 103, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
 
 fn read_response(reader: &mut impl Read) -> Result<ServerEnvelope, String> {
@@ -329,7 +330,7 @@ mod tests {
     use super::*;
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        [99, 100, 101, 102, ipc::PROTOCOL_VERSION].into()
+        [99, 100, 101, 102, 103, ipc::PROTOCOL_VERSION].into()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
@@ -533,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_inventory_subset_accepts_99_through_103_only() {
+    fn frozen_inventory_subset_accepts_99_through_104_only() {
         assert!(!supports_protocol(98));
         assert!(!supports_protocol(ipc::PROTOCOL_VERSION + 1));
         assert_eq!(postcard::to_allocvec(&ClientRequest::List).unwrap(), [1]);

@@ -493,6 +493,28 @@ pub(super) fn process_request(
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::Work(request) => {
+            // Admission was checked above. A board may wait on scans and
+            // GitHub for its bound, which must not hold the fence that
+            // shutdown and upgrades take.
+            drop(_shared);
+            let work = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .work
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "The Work board is unavailable",
+                        false,
+                    )
+                })?;
+            let response = work.process(host, request).map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            Ok((ServerResponse::Work(response), Vec::new(), false))
+        }
         ClientRequest::Automation {
             authority,
             operation,

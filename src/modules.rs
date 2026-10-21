@@ -55,7 +55,7 @@ pub mod file_icon;
 pub mod file_manager;
 mod filesystem_recovery_context;
 pub mod fs_safety;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
@@ -126,6 +126,7 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+pub mod work;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
 #[cfg(any(feature = "ui", feature = "host"))]

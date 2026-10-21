@@ -78,6 +78,15 @@ pub fn resolve_at(worktree: &Path) -> Result<LinkedIssue, Error> {
     read_link(&git_directory(worktree)?)
 }
 
+/// The ticket explicitly linked to the worktree whose Git administrative
+/// directory is `git_dir`, for a caller that already knows that directory and
+/// must not spawn Git per worktree. `None` when nothing is linked, including
+/// after an explicit unlink.
+pub fn linked_in_git_dir(git_dir: &Path) -> Result<Option<LinkedIssue>, Error> {
+    let root = Root::open(git_dir).map_err(storage)?;
+    Ok(read_stored_link(&root)?.and_then(|stored| stored.issue))
+}
+
 fn read_link(root: &Root) -> Result<LinkedIssue, Error> {
     read_stored_link(root)?
         .and_then(|stored| stored.issue)
@@ -392,6 +401,15 @@ mod tests {
         );
         assert_eq!(read_link(&git_directory(&moved).unwrap()).unwrap(), second);
         assert_eq!(read_link(&main).unwrap(), issue);
+        // The same links read by administrative directory, without Git.
+        let admin = fixture.path().join(".git");
+        assert_eq!(linked_in_git_dir(&admin).unwrap(), Some(issue));
+        assert_eq!(
+            linked_in_git_dir(&admin.join("worktrees/sibling")).unwrap(),
+            Some(second)
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(linked_in_git_dir(empty.path()).unwrap(), None);
     }
 
     #[test]
