@@ -344,7 +344,10 @@ impl Cagents {
                 return later(target, intent, false);
             };
             let ids = current.iter().map(|item| item.id.clone()).collect();
-            let (_, catalog) = document(runtime);
+            // Building a cold selection catalog can bind a new document epoch.
+            // Certify the captured catalog after that binding, under admission.
+            let (epoch, catalog) = document(runtime);
+            pending.document = Some(epoch);
             let work = Work::new(Input::Catalog(catalog.owned_search_blocks(&ids)), permit);
             let attempt = work.alive();
             pending.worker_alive = Some(attempt.clone());
@@ -2019,6 +2022,14 @@ mod tests {
             panic!("actual Catalog reply")
         };
         let (old_document, old_attempt) = (*old_document, old_attempt.clone());
+        assert_eq!(
+            old_document,
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .find_navigation
+                .document_epoch(),
+            "cold Catalog captures its epoch after lazy document binding"
+        );
         assert!(!old_attempt.load(Ordering::Acquire));
         assert!(
             admit().is_none(),
