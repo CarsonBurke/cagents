@@ -359,17 +359,20 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for FlowFindNotice {
             cursor,
         );
         if *tree.state.downcast_ref::<bool>() && self.truncated(tree) {
-            iced_accessibility::A11yTree::join([
-                body,
-                self.caption.as_widget().a11y_nodes(
-                    children
-                        .next()
-                        .unwrap()
-                        .with_virtual_offset(layout.virtual_offset()),
-                    &tree.children[1],
-                    cursor,
-                ),
-            ])
+            iced_accessibility::A11yTree::join(
+                [
+                    body,
+                    self.caption.as_widget().a11y_nodes(
+                        children
+                            .next()
+                            .unwrap()
+                            .with_virtual_offset(layout.virtual_offset()),
+                        &tree.children[1],
+                        cursor,
+                    ),
+                ]
+                .into_iter(),
+            )
         } else {
             body
         }
