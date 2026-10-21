@@ -41,7 +41,7 @@ const PROMPT_MEASURE: f32 = 560.0;
 /// short one is read in full where it lands.
 pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
-const NOTICE_LINES: usize = 3;
+pub(super) const NOTICE_LINES: usize = 3;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
@@ -422,6 +422,7 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
+#[cfg(test)]
 fn visible_notice_body(body: &str, expanded: bool) -> String {
     if !expanded && body.lines().count() > NOTICE_LINES {
         body.lines()
@@ -1354,6 +1355,13 @@ impl Runtime {
                     let text = prompt.shown(self.item_expanded(&item.id));
                     builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
                 }
+            } else if matches!(item.content, ItemContent::Image { .. }) {
+                if let Some(text) = self
+                    .prepared_literal(item)
+                    .and_then(literal_content::Content::image_prompt)
+                {
+                    builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
+                }
             } else {
                 let (text, _, _) = self.prompt_text(item);
                 builder.plain(&item.id, &[2], text.into());
@@ -1364,6 +1372,13 @@ impl Runtime {
             return;
         };
         if cached.placeholder {
+            return;
+        }
+        if let Some(literal) = self.prepared_literal(item) {
+            literal.catalog(builder, item, detail && self.item_expanded(&item.id));
+            return;
+        }
+        if literal_content::Prepared::required(&item.content) {
             return;
         }
         if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
@@ -1394,10 +1409,7 @@ impl Runtime {
                 ..
             } = &item.content
             {
-                let body = visible_notice_body(body, self.item_expanded(&item.id));
-                if !body.is_empty() {
-                    builder.plain(&item.id, &[2], body.into());
-                }
+                let _ = body; // Literal Notice is indexed only from its exact accepted DTO above.
             } else {
                 builder.markdown(&item.id, &[0], cached.markdown.items());
             }
@@ -4217,9 +4229,15 @@ impl Runtime {
 
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let prepared = self.prepared_prompt(item);
+        let attachment = matches!(item.content, ItemContent::Image { .. });
+        let image_text = self
+            .prepared_literal(item)
+            .and_then(literal_content::Content::image_prompt);
         // Pending cold/replaced sources show only their own bounded prefix.
         // Full literal text and catalog authority wait for the exact worker DTO.
-        let (fallback, attachment, pending_long) = if prepared.is_some() {
+        let (fallback, attachment, pending_long) = if attachment {
+            (String::new(), true, false)
+        } else if prepared.is_some() {
             (String::new(), false, false)
         } else {
             self.prompt_text(item)
@@ -4233,14 +4251,20 @@ impl Runtime {
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::logical_text(
-                    vec![iced::widget::text::Span::new(fallback)].into(),
-                    design::TEXT_CAPTION.into(),
-                    iced::Font::default(),
-                    self.target,
-                    None,
-                    logical,
-                ),
+                if let Some(text) = image_text {
+                    prose::paragraph(
+                        design::markdown_settings(&cosmic::theme::active(), design::TEXT_CAPTION),
+                        text,
+                        self.target,
+                        None,
+                        Some(logical),
+                        self.presentation_cache()
+                            .get(&item.id)
+                            .map(|cached| &cached.flow_cache),
+                    )
+                } else {
+                    design::caption("Loading attachment…").into()
+                },
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -4361,34 +4385,26 @@ impl Runtime {
                 .into()
         };
         if *kind == chat::DeliveryKind::Notice {
+            let Some(notice) = self
+                .prepared_literal(item)
+                .and_then(literal_content::Content::notice)
+            else {
+                return design::caption("Loading notice…").into();
+            };
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Attention),
-                    design::caption(summary.clone()).into(),
+                    literal_content::notice_summary(self, item, cached, settings),
                 ])
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .into(),
             ];
-            if !body.is_empty() {
-                let long = body.lines().count() > NOTICE_LINES;
-                let text = visible_notice_body(body, expanded);
-                rows.push(
-                    widget::container(selectable_prose::logical_text(
-                        vec![iced::widget::text::Span::new(text)].into(),
-                        design::TEXT_CAPTION.into(),
-                        iced::Font::MONOSPACE,
-                        self.target,
-                        None,
-                        selectable_prose::Logical {
-                            identity: selection::logical_identity(&item.id, &[2]),
-                            start: 0,
-                        },
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                );
-                if long {
+            if notice.body.full.len() != 0 {
+                rows.push(literal_content::notice_body(
+                    self, item, cached, settings, None,
+                ));
+                if notice.body.long {
                     rows.push(toggle("Show more"));
                 }
             }
@@ -8713,8 +8729,14 @@ mod tests {
         let key = runtime.turns[0].key.clone();
         runtime.opened.insert(key, true);
         let (catalog, bookmark) = runtime.selection_document();
+        let canonical = runtime
+            .snapshot
+            .items
+            .iter()
+            .find(|source| source.id == item.id)
+            .unwrap();
         let content = runtime.step_detail(
-            &item,
+            canonical,
             &runtime.cache[&item.id],
             design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
         );
@@ -8905,7 +8927,19 @@ mod tests {
             widget::{Operation, Tree},
         };
         let items = frame_cost::transcript(1);
-        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let mut delivery = items[0].clone();
+        delivery.id = "delivery-notice".into();
+        delivery.content = ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Provider report".into(),
+            body: "Delivered warning".into(),
+        };
+        let mut sources = items.clone();
+        sources.push(delivery);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
+        let delivery = runtime.snapshot.items.last().unwrap().clone();
         let queued = Queued {
             source: prompt::LocalSource::new("Queued message".into()),
             presentation: prompt::LocalPresentation::default(),
@@ -8925,16 +8959,7 @@ mod tests {
             .unwrap();
         let mut queued = runtime.queued.take().unwrap();
         prepared.install_local(&mut queued.presentation);
-        let mut delivery = items[0].clone();
-        delivery.id = "delivery-notice".into();
-        delivery.content = ItemContent::Delivery {
-            kind: chat::DeliveryKind::Notice,
-            from: String::new(),
-            sender: String::new(),
-            summary: "Provider report".into(),
-            body: "Delivered warning".into(),
-        };
-        let cached = CachedItem::new(&delivery.content, crate::settings::EditorSyntaxTheme::Auto);
+        let cached = &runtime.cache[&delivery.id];
         let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
         let first = notice_identity(Some("turn-a"), "Repeated failure");
         let second = notice_identity(Some("turn-b"), "Repeated failure");

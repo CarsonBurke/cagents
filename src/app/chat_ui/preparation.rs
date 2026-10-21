@@ -74,6 +74,7 @@ const _: fn() = || {
     fn send<T: Send>() {}
     send::<Parsed>();
     send::<prompt::Prepared>();
+    send::<literal_content::Prepared>();
     send::<coordination::Prepared>();
     send::<prose_document::Data>();
     send::<prose::CodeBlock>();
@@ -301,6 +302,23 @@ pub(super) fn source_bytes(content: &ItemContent) -> Option<usize> {
                 Some(changes.iter().fold(0usize, |bytes, change| {
                     bytes.saturating_add(change.diff.len())
                 }))
+            }
+            ItemContent::WebSearch { query, results } => {
+                Some(results.iter().fold(query.len(), |bytes, result| {
+                    bytes
+                        .saturating_add(result.title.len())
+                        .saturating_add(result.url.len())
+                        .saturating_add(result.snippet.len())
+                }))
+            }
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                summary,
+                body,
+                ..
+            } => Some(body.len().saturating_add(summary.len())),
+            ItemContent::Image { path, description } => {
+                Some(path.len().saturating_add(description.len()))
             }
             _ => None,
         })
@@ -964,6 +982,7 @@ pub(super) struct Prepared {
     pub(super) parsed: Parsed,
     document: prose_document::Data,
     prompt: Option<Box<prompt::Prepared>>,
+    literal: Option<literal_content::Prepared>,
     coordination: Option<coordination::Prepared>,
     blocks: HashMap<u64, prose::CodeBlock>,
     palettes: prose::Palettes,
@@ -1002,6 +1021,7 @@ impl Prepared {
             _document: Some(self.document),
             _coordination: self.coordination,
             _prompt: self.prompt,
+            _literal: self.literal,
             _blocks: self.blocks,
             _palettes: Some(self.palettes),
             _item: self.request.input.transcript().cloned(),
@@ -1019,6 +1039,7 @@ impl Prepared {
             .reader_memory
             .verified_readers(cached.reader_context.as_deref(), self.reader_verifications);
         let previous_prompt = std::mem::replace(&mut cached.prompt, self.prompt);
+        let previous_literal = cached.literal.take();
         let previous_tools = cached.prepared_tools.take();
         let previous_coordination = cached.coordination.take();
         if CachedItem::prose(
@@ -1063,6 +1084,8 @@ impl Prepared {
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         cached.document = Some(prose_document::Document::new(self.document));
+        cached.literal = self.literal.map(literal_content::Prepared::install);
+        drop(previous_literal);
         cached.coordination = self
             .coordination
             .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)));
@@ -1071,6 +1094,7 @@ impl Prepared {
             _document: None,
             _coordination: None,
             _prompt: previous_prompt,
+            _literal: None,
             _parsed: Parsed {
                 source: std::mem::replace(&mut cached.source, self.parsed.source),
                 markdown: std::mem::replace(&mut cached.markdown, self.parsed.markdown),
@@ -1114,6 +1138,7 @@ struct Retired {
     _document: Option<prose_document::Data>,
     _coordination: Option<coordination::Prepared>,
     _prompt: Option<Box<prompt::Prepared>>,
+    _literal: Option<literal_content::Prepared>,
     _blocks: HashMap<u64, prose::CodeBlock>,
     _palettes: Option<prose::Palettes>,
     _item: Option<Arc<chat::Item>>,
@@ -1139,6 +1164,7 @@ enum Retirement {
     Find(find_navigation::RetiredWork),
     LocalText(RawLocal),
     Prompt(Box<prompt::Prepared>),
+    Literal(literal_content::Prepared),
     FlowSource(flow_layout::RawSource),
     FlowOutput(flow_layout::OutputRetirement),
     Document(prose_document::Data),
@@ -1207,6 +1233,13 @@ pub(super) fn retire_prompt(prompt: Box<prompt::Prepared>) {
 }
 pub(super) fn reclaiming_find() -> bool {
     RECLAIMING_FLOW.with(std::cell::Cell::get)
+}
+pub(super) fn retire_literal(prepared: literal_content::Prepared) {
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(prepared);
+    } else {
+        enqueue_retirement(Retirement::Literal(prepared));
+    }
 }
 pub(super) fn retire_find(work: find_navigation::RetiredWork) {
     enqueue_retirement(Retirement::Find(work));
@@ -1282,6 +1315,7 @@ fn enqueue_retirement(retired: Retirement) {
                 Retirement::Find(work) => drop(work),
                 Retirement::LocalText(text) => drop(text),
                 Retirement::Prompt(prompt) => drop(prompt),
+                Retirement::Literal(prepared)=>drop(prepared),
                 Retirement::FlowSource(source) => drop(source),
                 Retirement::FlowOutput(output) => drop(output),
                 Retirement::Document(document) => drop(document),
@@ -1471,6 +1505,7 @@ fn execute(
             parsed: Parsed::default(),
             document: prose_document::Data::snapshot(&markdown::Content::default()),
             prompt: Some(prompt),
+            literal: None,
             coordination: None,
             blocks: HashMap::new(),
             palettes: prose::palettes(&HashMap::new()),
@@ -1496,7 +1531,9 @@ fn execute(
         }
         _ => None,
     };
+    let literal = literal_content::Prepared::new(&item.content, &shared.cancelled)?;
     if prompt.is_none()
+        && literal.is_none()
         && let Some(body) = CachedItem::prose(&item.content)
     {
         parse_publication(
@@ -1603,6 +1640,7 @@ fn execute(
         parsed,
         document,
         prompt,
+        literal,
         coordination: coordinated,
         blocks,
         palettes,
@@ -1722,6 +1760,303 @@ mod tests {
     }
     fn ready(prepared: Result<Prepared, String>) -> Ready {
         Ready::new(prepared)
+    }
+
+    fn literal_runtime(content: ItemContent) -> (Runtime, Arc<ClientHandle>) {
+        let (mut runtime, handle) = view::prepared_runtime_for_test(&[]);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        let mut source = (*item("")).clone();
+        source.content = content;
+        snapshot.items.push(Arc::new(source));
+        handle.publish_delta_snapshot_for_test(snapshot);
+        runtime.refresh();
+        (runtime, handle)
+    }
+
+    #[test]
+    fn literal_search_actual_worker_keeps_fields_and_refuses_same_id_rewrite_ready() {
+        let url = format!("https://example.test/{}#L22", "u".repeat(44 * 1024));
+        let content = ItemContent::WebSearch {
+            query: "**literal query**".into(),
+            results: vec![chat::SearchResult {
+                title: String::new(),
+                url: url.clone(),
+                snippet: "[literal snippet](not-a-link)".into(),
+            }],
+        };
+        let (mut runtime, handle) = literal_runtime(content);
+        let source = runtime.snapshot.items[0].clone();
+        assert!(runtime.prepared_literal(&source).is_none());
+        let (run, shared) = job(&runtime.preparation);
+        let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        assert!(output.parsed.markdown.items().is_empty());
+        let literal_content::Prepared::Search(document) = output.literal.as_ref().unwrap() else {
+            panic!("literal Search payload")
+        };
+        assert_ne!(document.created_on, std::thread::current().id());
+        runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+        let accepted = runtime.prepared_literal(&source).unwrap();
+        let literal_content::Content::Search(document) = accepted else {
+            panic!("installed Search")
+        };
+        let markdown::Item::Quote(fields) = &document.items()[1] else {
+            panic!("result fields")
+        };
+        let markdown::Item::Paragraph(title) = &fields[0] else {
+            panic!("fallback title")
+        };
+        assert_eq!(title.plain().as_ref(), url);
+        assert!(title.plain_ready());
+        let mut builder = selection::Catalog::builder();
+        accepted.catalog(&mut builder, &source, true);
+        let catalog = builder.finish();
+        let (a, b) = catalog.endpoints().unwrap();
+        assert_eq!(
+            catalog.copy(a, b).unwrap(),
+            format!("**literal query**\n\n{url}\n\n{url}\n\n[literal snippet](not-a-link)")
+        );
+        assert!(
+            runtime.prepared_literal(&(*source).clone()).is_none(),
+            "an equal item clone cannot authorize a prepared source"
+        );
+        let mut replacement = (*handle.snapshot()).clone();
+        replacement.generation += 1;
+        Arc::make_mut(&mut replacement.items[0]).content = ItemContent::WebSearch {
+            query: "replacement".into(),
+            results: Vec::new(),
+        };
+        handle.publish_snapshot_for_test(replacement);
+        runtime.refresh();
+        assert!(
+            runtime
+                .prepared_literal(&runtime.snapshot.items[0])
+                .is_none()
+        );
+        let (old_run, old_shared) = job(&runtime.preparation);
+        let old = std::thread::spawn(move || execute(old_shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        let mut rewritten = (*handle.snapshot()).clone();
+        rewritten.generation += 1;
+        Arc::make_mut(&mut rewritten.items[0]).content = ItemContent::WebSearch {
+            query: "current".into(),
+            results: Vec::new(),
+        };
+        handle.publish_snapshot_for_test(rewritten);
+        runtime.refresh();
+        runtime.markdown_prepared(runtime.target, "message", old_run, ready(Ok(old)));
+        assert!(
+            runtime
+                .prepared_literal(&runtime.snapshot.items[0])
+                .is_none(),
+            "late ready cannot publish a previous same-ID result"
+        );
+        drain_fixture(&mut runtime);
+        let literal_content::Content::Search(current) = runtime
+            .prepared_literal(&runtime.snapshot.items[0])
+            .unwrap()
+        else {
+            panic!("current Search")
+        };
+        let markdown::Item::Paragraph(query) = &current.items()[0] else {
+            panic!("query")
+        };
+        assert_eq!(query.plain().as_ref(), "current");
+        runtime.show(false);
+        retirement_barrier();
+    }
+
+    #[test]
+    fn literal_notice_preview_and_actual_ready_retire_spans_before_same_permit() {
+        for body in [
+            "one\r\ntwo\r\nthree\r\n",
+            "one\r\ntwo\r\nthree\r\nfour",
+            "single huge line",
+        ] {
+            let cancelled = AtomicBool::new(false);
+            let prepared =
+                prompt::Prepared::with_policy(body, prompt::PreviewPolicy::Notice, &cancelled)
+                    .unwrap();
+            let long = body.lines().count() > view::NOTICE_LINES;
+            let expected = if long {
+                body.lines()
+                    .take(view::NOTICE_LINES)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                body.to_owned()
+            };
+            assert_eq!(prepared.long, long);
+            assert_eq!(prepared.shown(false).plain().as_ref(), expected);
+            assert_eq!(prepared.full.plain().as_ref(), body);
+        }
+        let body = format!(
+            "{}\r\nsecond\r\nthird\r\nlast",
+            "literal **raw** λ ".repeat(65_536)
+        );
+        let (mut runtime, _handle) = literal_runtime(ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "NONSELECTABLE SUMMARY".into(),
+            body: body.clone(),
+        });
+        let (run, shared) = job(&runtime.preparation);
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let admitted = slots.clone().try_acquire_owned().unwrap();
+        let mut output = std::thread::spawn(move || execute(shared, admitted).unwrap())
+            .join()
+            .unwrap();
+        assert!(output.parsed.markdown.items().is_empty());
+        let literal_content::Prepared::Notice(notice) = output.literal.as_mut().unwrap() else {
+            panic!("notice payload")
+        };
+        assert_eq!(notice.body.full.plain().as_ref(), body);
+        let (sent, disposed) = std::sync::mpsc::channel();
+        notice.body.full.watch_raw_spans(sent);
+        let hold = hold_retirement();
+        runtime.show(false);
+        runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+        assert!(disposed.try_recv().is_err());
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "stale literal output keeps the same output permit until actual destruction"
+        );
+        drop(hold);
+        let worker = retirement_barrier();
+        assert_eq!(
+            disposed.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            worker
+        );
+        assert!(slots.try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn literal_image_worker_native_fields_keep_catalog_and_shared_remote_uri() {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let description = format!("literal **description** {}", "λ ".repeat(8_192));
+        let (mut runtime, _handle) = literal_runtime(ItemContent::Image {
+            path: "/tmp/very-long-path/image.png".into(),
+            description: description.clone(),
+        });
+        let (run, shared) = job(&runtime.preparation);
+        let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+            .join()
+            .unwrap();
+        runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+        let source = runtime.snapshot.items[0].clone();
+        let cached = &runtime.cache["message"];
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let mut element: Element<'static, Message> = widget::column::with_children(
+            (0..2)
+                .filter_map(|part| {
+                    literal_content::image_field(&runtime, &source, cached, part, settings)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100_000.0));
+        let before = markdown::materialized_bytes();
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        cached.flow_cache.complete_fixture();
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "native literal Image fields use primed stable sources"
+        );
+        #[derive(Default)]
+        struct Fields(Vec<Arc<str>>);
+        impl Operation for Fields {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(text) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push(text.plain.clone());
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut fields,
+        );
+        assert_eq!(
+            fields.0.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            [description.as_str(), "/tmp/very-long-path/image.png"]
+        );
+        let mut builder = selection::Catalog::builder();
+        runtime
+            .prepared_literal(&source)
+            .unwrap()
+            .catalog(&mut builder, &source, true);
+        let catalog = builder.finish();
+        let (a, b) = catalog.endpoints().unwrap();
+        assert_eq!(
+            catalog.copy(a, b).unwrap(),
+            format!("{description}\n\n/tmp/very-long-path/image.png")
+        );
+        assert_eq!(
+            catalog
+                .text(selection::logical_identity("message", &[8, 0]))
+                .unwrap()
+                .as_ref(),
+            description
+        );
+        let remote = format!("https://example.test/{}", "u".repeat(48 * 1024));
+        let content = ItemContent::Image {
+            path: remote.clone(),
+            description: String::new(),
+        };
+        let prepared = std::thread::spawn(move || {
+            literal_content::Prepared::new(&content, &AtomicBool::new(false))
+                .unwrap()
+                .unwrap()
+        })
+        .join()
+        .unwrap()
+        .install();
+        let literal_content::Content::Image {
+            document,
+            url: Some(url),
+        } = &prepared
+        else {
+            panic!("remote image URI")
+        };
+        let markdown::Item::Paragraph(open) = &document.items()[3] else {
+            panic!("shared URI backing")
+        };
+        assert!(Arc::ptr_eq(
+            open.spans(settings.style)[0].link.as_ref().unwrap(),
+            url
+        ));
+        let action = Action::OpenSharedUrl(runtime.target, url.clone());
+        assert!(matches!(action,Action::OpenSharedUrl(_,ref shared) if Arc::ptr_eq(shared,url)));
+        assert_eq!(url.as_ref(), remote);
+        drop(element);
+        runtime.show(false);
+        drop(prepared);
+        retirement_barrier();
     }
 
     #[test]

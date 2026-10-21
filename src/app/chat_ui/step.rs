@@ -12,7 +12,7 @@
 
 use super::coordination::Coordinated;
 use super::*;
-use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
+use crate::chat::{ChangeKind, FileChange, ToolStatus};
 
 /// The surface's spacing rhythm.
 ///
@@ -217,54 +217,6 @@ fn change_view(change: &FileChange) -> Element<'static, Message> {
     }
     widget::column::with_children(rows)
         .spacing(GAP_XS)
-        .width(Length::Fill)
-        .into()
-}
-
-fn search_result_view(result: &SearchResult, target: Target) -> Element<'static, Message> {
-    let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    let title = if result.title.is_empty() {
-        result.url.as_str()
-    } else {
-        result.title.as_str()
-    };
-    if result.url.is_empty() {
-        rows.push(selectable_prose::plain(
-            title,
-            design::TEXT_BODY,
-            iced::Font::default(),
-            target,
-        ));
-    } else {
-        rows.push(selectable_prose::text(
-            vec![
-                iced::widget::text::Span::new(title.to_owned())
-                    .link(result.url.clone())
-                    .color(design::accent_color(&cosmic::theme::active())),
-            ]
-            .into(),
-            design::TEXT_BODY.into(),
-            iced::Font::default(),
-            target,
-            None,
-        ));
-        rows.push(selectable_prose::plain(
-            result.url.as_str(),
-            design::TEXT_CAPTION,
-            iced::Font::default(),
-            target,
-        ));
-    }
-    if !result.snippet.is_empty() {
-        rows.push(selectable_prose::plain(
-            result.snippet.as_str(),
-            design::TEXT_BODY,
-            iced::Font::default(),
-            target,
-        ));
-    }
-    widget::column::with_children(rows)
-        .spacing(space::XS)
         .width(Length::Fill)
         .into()
 }
@@ -582,19 +534,14 @@ impl Runtime {
             // A notice's body is a log line or a raw result, drawn verbatim.
             ItemContent::Delivery {
                 kind: chat::DeliveryKind::Notice,
-                body,
                 ..
-            } => {
-                if !body.is_empty() {
-                    rows.push(code_surface(
-                        body,
-                        None,
-                        Some(Self::OUTPUT_HEIGHT),
-                        None,
-                        self.target,
-                    ));
-                }
-            }
+            } => rows.push(literal_content::notice_body(
+                self,
+                item,
+                cached,
+                settings,
+                Some(Self::OUTPUT_HEIGHT),
+            )),
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
                 rows.push(prose::view(
                     cached,
@@ -648,21 +595,8 @@ impl Runtime {
                     }
                 }
             }
-            ItemContent::WebSearch { query, results } => {
-                rows.push(selectable_prose::plain(
-                    query.as_str(),
-                    design::TEXT_BODY,
-                    iced::Font::default(),
-                    self.target,
-                ));
-                if results.is_empty() {
-                    rows.push(design::caption("No results were reported.").into());
-                }
-                rows.extend(
-                    results
-                        .iter()
-                        .map(|result| search_result_view(result, self.target)),
-                );
+            ItemContent::WebSearch { .. } => {
+                rows.push(literal_content::search_view(self, item, cached, settings))
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
@@ -686,7 +620,7 @@ impl Runtime {
                     ));
                 }
             }
-            ItemContent::Image { path, description } => {
+            ItemContent::Image { path, .. } => {
                 if let Some(handle) = &cached.image {
                     rows.push(
                         iced::widget::image(handle.clone())
@@ -703,27 +637,26 @@ impl Runtime {
                         .into(),
                     );
                 }
-                if !description.is_empty() {
-                    rows.push(selectable_prose::plain(
-                        description.as_str(),
-                        design::TEXT_BODY,
-                        iced::Font::default(),
-                        self.target,
-                    ));
+                if let Some(description) =
+                    literal_content::image_field(self, item, cached, 0, settings)
+                {
+                    rows.push(description);
                 }
-                if path.starts_with("http://") || path.starts_with("https://") {
+                if let Some(literal_content::Content::Image { url: Some(url), .. }) =
+                    self.prepared_literal(item)
+                {
                     rows.push(
                         widget::button::link("Open image")
-                            .on_press(action(Action::OpenUrl(path.clone())))
+                            .on_press(action(Action::OpenSharedUrl(self.target, url.clone())))
                             .into(),
                     );
-                } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(selectable_prose::plain(
-                        path.as_str(),
-                        design::TEXT_CAPTION,
-                        iced::Font::default(),
-                        self.target,
-                    ));
+                } else {
+                    let mut caption = settings;
+                    caption.text_size = design::TEXT_CAPTION.into();
+                    if let Some(path) = literal_content::image_field(self, item, cached, 1, caption)
+                    {
+                        rows.push(path);
+                    }
                 }
             }
         }

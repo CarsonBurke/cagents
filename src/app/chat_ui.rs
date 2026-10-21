@@ -27,6 +27,7 @@ mod fold;
 mod hover;
 mod images;
 mod layout;
+mod literal_content;
 mod markdown;
 mod markdown_source;
 mod monospace;
@@ -254,6 +255,7 @@ pub enum Action {
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenSharedDocument(Target, markdown::Uri),
+    OpenSharedUrl(Target, markdown::Uri),
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
@@ -1071,6 +1073,7 @@ struct CachedItem {
     markdown: markdown::Content,
     document: Option<prose_document::Document>,
     prompt: Option<Box<prompt::Prepared>>,
+    literal: Option<literal_content::Content>,
     flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
@@ -1162,9 +1165,13 @@ impl CachedItem {
     /// Approximate exposed presentation storage. Opaque Markdown/parser
     /// allocations and widget/shaping trees are intentionally not estimated.
     fn retained_bytes(&self) -> usize {
-        self.prompt
+        self.literal
             .as_ref()
-            .map_or(0, |prompt| prompt.retained_bytes())
+            .map_or(0, literal_content::Content::retained_bytes)
+            + self
+                .prompt
+                .as_ref()
+                .map_or(0, |prompt| prompt.retained_bytes())
             + self.flow_cache.retained_bytes()
             + self.source.retained_capacity()
             + self
@@ -1219,6 +1226,15 @@ impl CachedItem {
                     .clone()
                     .unwrap_or_else(|| Arc::new(tool_text::PreparedSources::retained(cached)))
             });
+        let literal = previous
+            .as_mut()
+            .filter(|cached| {
+                cached
+                    .item
+                    .as_ref()
+                    .is_some_and(|item| std::ptr::eq(&item.content, content))
+            })
+            .and_then(|cached| cached.literal.take());
         let fresh_coordination = coordination.is_some();
         let retained_coordination = previous
             .as_mut()
@@ -1392,6 +1408,7 @@ impl CachedItem {
             markdown: markdown::Content::new(),
             document: None,
             prompt: None,
+            literal,
             flow_cache,
             reader_memory,
             reader_context,
@@ -3021,7 +3038,11 @@ impl Runtime {
             let coordinated = chat::coordination::may_recognize(item, provider);
             let reader_only = !reader_proofs.is_empty()
                 && preparation::has_tool_reader_proofs(item, &reader_proofs);
-            if CachedItem::prose(&item.content).is_some() || reader_only || coordinated {
+            if CachedItem::prose(&item.content).is_some()
+                || literal_content::Prepared::required(&item.content)
+                || reader_only
+                || coordinated
+            {
                 // Only validated append lineage with equal endpoint lengths
                 // proves unchanged text without scanning a large body on UI.
                 // Shape/role/context changes and unknown full replacements
@@ -9433,6 +9454,11 @@ impl Cagents {
             Action::OpenDocument(target, raw) => {
                 if self.chat_runtime_mut(target).is_some() {
                     return self.open_document_link(Some(target.card), &raw);
+                }
+            }
+            Action::OpenSharedUrl(target, url) => {
+                if self.chat_runtime_mut(target).is_some() {
+                    return self.handle_chat_ui(Action::OpenUrl(url.to_string()));
                 }
             }
             Action::OpenSharedDocument(target, raw) => {

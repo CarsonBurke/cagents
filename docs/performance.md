@@ -360,6 +360,13 @@ sources on a changed snapshot remains UI work.
 Copy resolves the exact current record at explicit intent and preserves raw
 bytes independently of its displayed preview.
 
+Search results, Notice bodies and Image descriptions/paths use the same admitted
+literal preparation boundary. Stable logical readers preserve their displayed
+text for selection and Find without interpreting it as Markdown. Search fields
+share prepared document storage; long Notice previews preserve the existing
+three-line policy. Ready values must match the current canonical item before
+installation, and rejected or evicted payloads use the existing reclaimer.
+
 Find Next/Previous retains its existing matching-turn/item counts and temporary
 disclosure ownership. Raw group discovery, provider-aware disclosure plans,
 rendered-block lookup and lazy visible Flow highlights share one try-admitted

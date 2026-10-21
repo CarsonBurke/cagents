@@ -752,14 +752,20 @@ fn append_proven(
 impl Text {
     /// Plain literal source; this never interprets Markdown or creates links.
     pub(super) fn literal(text: String) -> Self {
+        Self::literal_linked(text, None)
+    }
+    pub(super) fn literal_linked(text: String, link: Option<Uri>) -> Self {
         Self::new(vec![Span::Standard {
             text,
             strikethrough: false,
-            link: None,
+            link,
             strong: false,
             emphasis: false,
             code: false,
         }])
+    }
+    pub(super) fn prepared_plain_proof(&self) -> Option<std::sync::Weak<str>> {
+        self.plain.get().map(Arc::downgrade)
     }
     /// Semantic parser output, excluding materialization caches and weak
     /// append-proof lineage. Tests retain every raw span attribute and link.

@@ -1216,7 +1216,7 @@ pub(super) fn chunk_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
-fn paragraph(
+pub(super) fn paragraph(
     settings: markdown::Settings,
     text: &markdown::Text,
     target: Target,

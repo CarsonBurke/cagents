@@ -287,7 +287,7 @@ impl Data {
     pub(super) fn snapshot(content: &markdown::Content) -> Self {
         Self::items(content.items().to_vec())
     }
-    fn items(items: Vec<markdown::Item>) -> Self {
+    pub(super) fn items(items: Vec<markdown::Item>) -> Self {
         let mut outline = Vec::new();
         let metadata = Metadata::items(&items, &mut Vec::new(), &mut outline, Kind::Items);
         Self {

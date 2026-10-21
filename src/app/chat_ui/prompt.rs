@@ -151,6 +151,12 @@ impl Drop for LocalPresentation {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum PreviewPolicy {
+    User,
+    Notice,
+}
+
 pub(super) struct Prepared {
     pub(super) full: markdown::Text,
     preview: markdown::Text,
@@ -160,6 +166,13 @@ pub(super) struct Prepared {
 }
 impl Prepared {
     pub(super) fn new(body: &str, cancelled: &AtomicBool) -> Result<Box<Self>, String> {
+        Self::with_policy(body, PreviewPolicy::User, cancelled)
+    }
+    pub(super) fn with_policy(
+        body: &str,
+        policy: PreviewPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<Box<Self>, String> {
         let check = || {
             if cancelled.load(Ordering::Acquire) {
                 Err("Message loading was cancelled.".to_owned())
@@ -168,7 +181,23 @@ impl Prepared {
             }
         };
         check()?;
-        let (preview, long) = preview(body);
+        let (preview, long) = match policy {
+            PreviewPolicy::User => preview(body),
+            PreviewPolicy::Notice => {
+                let long = body.lines().take(view::NOTICE_LINES + 1).count() > view::NOTICE_LINES;
+                (
+                    if long {
+                        body.lines()
+                            .take(view::NOTICE_LINES)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        String::new()
+                    },
+                    long,
+                )
+            }
+        };
         let full = markdown::Text::literal(body.to_owned());
         full.plain();
         check()?;

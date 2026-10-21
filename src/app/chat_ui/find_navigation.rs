@@ -852,6 +852,31 @@ fn tools(cached: Option<&CachedItem>) -> impl Iterator<Item = &tool_text::ToolTe
             .chain(cached.patches.iter())
     })
 }
+fn notice_reader(cached: Option<&CachedItem>) -> Option<(u64, &markdown::Text)> {
+    let cached = cached?;
+    let notice = cached.literal.as_ref()?.notice()?;
+    let item = cached.item.as_ref()?;
+    Some((
+        selection::logical_identity(&item.id, &[2]),
+        &notice.body.full,
+    ))
+}
+fn reader_proofs(cached: Option<&CachedItem>) -> Vec<(u64, SourceProof<str>)> {
+    let mut proofs: Vec<_> = tools(cached)
+        .map(|tool| {
+            (
+                tool.find_identity(),
+                SourceProof(Arc::downgrade(&tool.text)),
+            )
+        })
+        .collect();
+    if let Some((identity, text)) = notice_reader(cached)
+        .and_then(|(id, text)| text.prepared_plain_proof().map(|source| (id, source)))
+    {
+        proofs.push((identity, SourceProof(text)));
+    }
+    proofs
+}
 fn raw_stamp(runtime: &Runtime) -> RawStamp {
     let items = raw_items(runtime);
     RawStamp {
@@ -887,17 +912,7 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
                                         .as_ref()
                                         .is_some_and(|shown| Arc::ptr_eq(shown, item))
                                 });
-                            (
-                                SourceProof(Arc::downgrade(item)),
-                                tools(cached)
-                                    .map(|tool| {
-                                        (
-                                            tool.find_identity(),
-                                            SourceProof(Arc::downgrade(&tool.text)),
-                                        )
-                                    })
-                                    .collect(),
-                            )
+                            (SourceProof(Arc::downgrade(item)), reader_proofs(cached))
                         })
                         .collect(),
                 )
@@ -1724,9 +1739,14 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
                                 .as_ref()
                                 .is_some_and(|shown| Arc::ptr_eq(shown, &item))
                         });
-                        let tools = tools(cached)
+                        let mut tools: Vec<_> = tools(cached)
                             .map(|tool| (tool.find_identity(), tool.text.clone()))
                             .collect();
+                        // Strong plaintext ownership is captured only after
+                        // the same sole Find admission as every other reader.
+                        if let Some((identity, text)) = notice_reader(cached) {
+                            tools.push((identity, text.plain()));
+                        }
                         Some(RawItem {
                             item,
                             raw_disclosure,
@@ -1820,6 +1840,9 @@ fn small_raw_work(runtime: &Runtime) -> bool {
         let cached = runtime.presentation_cache().get(&item.id);
         for tool in tools(cached) {
             work = work.saturating_add(tool.text.len()).saturating_add(query);
+        }
+        if let Some((_, text)) = notice_reader(cached) {
+            work = work.saturating_add(text.len()).saturating_add(query);
         }
         work = work
             .saturating_add(item.id.len())
