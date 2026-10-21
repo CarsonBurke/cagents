@@ -5627,6 +5627,7 @@ fn compact_project_identity(
                 worktree.locked,
                 worktree.dirty.as_ref(),
                 worktree.untracked_omitted,
+                worktree.listing_truncated,
                 worktree.ahead,
                 worktree.behind
             )
