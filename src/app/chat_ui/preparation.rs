@@ -1968,7 +1968,58 @@ mod tests {
         element
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
-        cached.flow_cache.complete_fixture();
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "cold native literal Image layout cannot materialize its long field"
+        );
+        // complete_fixture intentionally materializes on its caller. Drive the
+        // actual admitted Flow task here so this oracle measures UI work only.
+        let literal_content::Content::Image { document, .. } = cached.literal.as_ref().unwrap()
+        else {
+            panic!("prepared Image document")
+        };
+        let Some(prose_document::Node::Item(markdown::Item::Paragraph(text))) = document.node(&[0])
+        else {
+            panic!("prepared Image description")
+        };
+        let mut source_style = settings.style;
+        source_style.font = iced::Font::default();
+        let entry = cached.flow_cache.markdown_entry(
+            selection::logical_identity(&source.id, &[8, 0]),
+            text.clone(),
+            source_style,
+        );
+        let request = entry
+            .borrow_mut()
+            .request()
+            .expect("mounted Image Flow request");
+        let task = flow_layout::run(runtime.target, request).expect("admitted Image Flow worker");
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (request, ready) = executor.block_on(async {
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("actual Image Flow task");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                        Action::FlowReady(target, request, ready),
+                    ))) = effect
+                    {
+                        assert_eq!(target, runtime.target);
+                        return (request, ready);
+                    }
+                }
+                panic!("actual Image Flow completion")
+            })
+            .await
+            .unwrap()
+        });
+        assert!(ready.is_some(), "actual Image Flow worker returns geometry");
+        assert!(entry.borrow_mut().complete(&request, ready));
         let node = element
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
