@@ -289,8 +289,9 @@ CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
 
 The workload compares a 16 KiB answer with ten tool rows against single 1 MiB
 paragraph, many-paragraph and fenced-code answers with 300 tool rows, at a fixed
-viewport. It warms the real pane/composer, then records refresh, view, native
-widget layout, pointer update and headless draw CPU time. The event median must
+viewport. It warms the real pane/composer, then records refresh separately from
+view, native widget layout, pointer update, headless draw and widget/cache
+disposal CPU time. The event total includes those latter stages. Its median must
 be at most 2 ms and at most twice the small workload. These are explicit test
 budgets, not claims of achieved results. The test excludes GPU submission and
 compositor presentation. Run the neighboring long-streaming workloads separately
@@ -324,7 +325,11 @@ retirement item counts for native visit/hide qualification. Actual permit releas
 also publishes one coalesced availability event; visible deferred readers retry
 without depending on unrelated input, provider output, or another redraw. Parser
 disposal checks continuation/reference allocations even when the document has no
-rendered items.
+rendered items. The selected growing source retains its Markdown parser
+continuation across verified appends. A changed fence rebuilds its syntax
+palettes on the worker; only unchanged matching fences share prepared palettes.
+Worker placement does not establish acceptable streaming CPU or input latency;
+those costs remain part of native qualification.
 
 Nested reader bookmarks retain a byte length and full source digest, alongside
 geometry and the exact logical reader identity. After hiding releases bodies,
@@ -345,10 +350,14 @@ Find Next/Previous retains its existing matching-turn/item counts and temporary
 disclosure ownership. Each selected group is resolved on a single admitted
 worker to its first matching rendered logical block and UTF-8 byte. Navigation
 then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
-geometry, including horizontal readers. At most sixteen coordinate passes and
-one thirty-second deadline belong to an intent; parser and shape completions
-wake pending geometry without a timer subscription. Matching metadata without rendered
-plaintext keeps the coarse group anchor. Loading is never an exact glyph match.
+geometry, including horizontal readers. One initial coarse realization may be
+needed while matching worker geometry is pending; it belongs to the intent's
+maximum sixteen actual coordinate corrections and absolute thirty-second
+deadline. Waiting for that geometry does not consume further corrections,
+including across verified source publications or unrelated completion wakes.
+Parser and shape completions wake pending geometry without a timer subscription.
+Matching metadata without rendered plaintext keeps the coarse group anchor.
+Loading is never an exact glyph match.
 Independent intent and rendered-document epochs guard both async replies and
 the eventual native scroll mutation. Query/context/disclosure/hide changes and
 native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
