@@ -692,10 +692,14 @@ pub(super) struct Presentation {
 
 enum Retirement {
     FlowSource(flow_layout::RawSource),
+    FlowOutput(flow_layout::OutputRetirement),
     Document(prose_document::Data),
     Coordination(coordination::Prepared),
     Styles(HashMap<u64, prose::CodeBlock>, Option<prose::Palettes>),
-    Geometry(Box<flow_layout::Geometry>, Option<flow_layout::WorkSlot>),
+    Geometry(
+        Box<flow_layout::Geometry>,
+        Option<Arc<flow_layout::OutputAdmission>>,
+    ),
     Presentation(Presentation),
     Installed(Retired),
     // Keep the existing queued-source lease until canonical parser/source
@@ -705,8 +709,25 @@ enum Retirement {
     #[cfg(test)]
     Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
 }
+thread_local! {
+    // Only the process-owned raw-payload reclaimer sets this. A final shared
+    // Flow guard can be released by a retired Geometry; destroy its source and
+    // slot inline there, before an already queued generation barrier.
+    static RECLAIMING_FLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(super) fn retire_flow_source(source: flow_layout::RawSource) {
-    enqueue_retirement(Retirement::FlowSource(source));
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(source);
+    } else {
+        enqueue_retirement(Retirement::FlowSource(source));
+    }
+}
+pub(super) fn retire_flow_output(output: flow_layout::OutputRetirement) {
+    if RECLAIMING_FLOW.with(std::cell::Cell::get) {
+        drop(output);
+    } else {
+        enqueue_retirement(Retirement::FlowOutput(output));
+    }
 }
 pub(super) fn retire_styles(
     blocks: HashMap<u64, prose::CodeBlock>,
@@ -722,7 +743,7 @@ pub(super) fn retire_document(document: prose_document::Data) {
 }
 pub(super) fn retire_geometry(
     geometry: Box<flow_layout::Geometry>,
-    admission: Option<flow_layout::WorkSlot>,
+    admission: Option<Arc<flow_layout::OutputAdmission>>,
 ) {
     enqueue_retirement(Retirement::Geometry(geometry, admission));
 }
@@ -749,7 +770,9 @@ fn enqueue_retirement(retired: Retirement) {
     let reclaimer = RETIRE.get_or_init(|| {
         let owner = Arc::new(Reclaimer { pending: Mutex::default(), wake: std::sync::Condvar::new() });
         let worker = owner.clone();
-        std::thread::Builder::new().name("chat-presentation-retire".into()).spawn(move || loop {
+        std::thread::Builder::new().name("chat-presentation-retire".into()).spawn(move || {
+          RECLAIMING_FLOW.with(|reclaiming| reclaiming.set(true));
+          loop {
             let retired = {
                 let mut pending = worker.pending.lock().unwrap_or_else(|e| e.into_inner());
                 while pending.is_empty() {
@@ -759,6 +782,7 @@ fn enqueue_retirement(retired: Retirement) {
             };
             match retired {
                 Retirement::FlowSource(source) => drop(source),
+                Retirement::FlowOutput(output) => drop(output),
                 Retirement::Document(document) => drop(document),
                 Retirement::Coordination(prepared) => drop(prepared),
                 Retirement::Styles(blocks, palettes) => { drop(blocks); drop(palettes); }
@@ -772,6 +796,7 @@ fn enqueue_retirement(retired: Retirement) {
             }
             let remaining = RETIRING.fetch_sub(1, Ordering::AcqRel) - 1;
             tracing::trace!(target: "cagents::memory", owner = "chat_retirement", pending_items = remaining);
+          }
         }).expect("start presentation retirement worker");
         owner
     });

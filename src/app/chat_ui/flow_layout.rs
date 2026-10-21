@@ -501,6 +501,9 @@ impl Entry {
             source: self.source.clone(),
             source_revision: self.source_revision,
             cancelled: self.cancelled.clone(),
+            admission: None,
+            #[cfg(test)]
+            outcome: None,
         })
     }
     pub(super) fn accepts(&self, request: &Request) -> bool {
@@ -561,6 +564,18 @@ pub(super) struct Request {
     source: Source,
     source_revision: u64,
     cancelled: Arc<AtomicBool>,
+    // Last: a final Request drops its own source before the output guard.
+    // Every admitted outcome, including None and JoinError, carries this.
+    admission: Option<Arc<OutputAdmission>>,
+    #[cfg(test)]
+    outcome: Option<WorkerOutcome>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerOutcome {
+    ReclamationError,
+    Panic,
+    CancelAfterShape,
 }
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -622,6 +637,39 @@ impl Drop for WorkSlot {
     }
 }
 
+pub(super) struct OutputAdmission {
+    owned: Option<OutputRetirement>,
+}
+impl std::fmt::Debug for OutputAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowOutputAdmission")
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for OutputAdmission {
+    fn drop(&mut self) {
+        if let Some(owned) = self.owned.take() {
+            preparation::retire_flow_output(owned);
+        }
+    }
+}
+/// Field order matters: release the final raw source before admission and its
+/// availability wake. Reclaimer-context source release destroys raw data inline.
+pub(super) struct OutputRetirement {
+    _source: Source,
+    _slot: WorkSlot,
+}
+impl OutputAdmission {
+    fn new(source: Source, slot: WorkSlot) -> Arc<Self> {
+        Arc::new(Self {
+            owned: Some(OutputRetirement {
+                _source: source,
+                _slot: slot,
+            }),
+        })
+    }
+}
+
 pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64> {
     // One shaping job, no waiting worker queue. Deferred live entries become
     // eligible when that job completes; redraw alone cannot create a busy loop.
@@ -633,11 +681,12 @@ pub(super) fn run(target: Target, request: Request) -> Result<Task<Message>, u64
 }
 fn run_with_slots(
     target: Target,
-    request: Request,
+    mut request: Request,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<Task<Message>, u64> {
     let epoch = COMPLETED.load(Ordering::Acquire);
     let permit = WorkSlot(Some(slots.try_acquire_owned().map_err(|_| epoch)?));
+    request.admission = Some(OutputAdmission::new(request.source.clone(), permit));
     // Share this font-version input snapshot. Repeated paragraph requests
     // clone one Arc on the UI; each worker's private font DB clone happens below.
     struct Fonts {
@@ -671,10 +720,21 @@ fn run_with_slots(
         let ready = tokio::task::spawn_blocking(move || {
             // Admission remains attached to the output until UI consumption;
             // a stalled event loop cannot queue full-context glyph snapshots.
-            if preparation::reclaim_before_work().is_err() || work.cancelled.load(Ordering::Acquire)
-            {
+            let reclaimed = preparation::reclaim_before_work();
+            #[cfg(test)]
+            let reclaimed = if work.outcome == Some(WorkerOutcome::ReclamationError) {
+                Err("fixture reclamation error at the real admission boundary".to_owned())
+            } else {
+                reclaimed
+            };
+            if reclaimed.is_err() || work.cancelled.load(Ordering::Acquire) {
                 return None;
             }
+            #[cfg(test)]
+            assert!(
+                work.outcome != Some(WorkerOutcome::Panic),
+                "deliberate private Flow worker panic"
+            );
             let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(
                 fonts.locale.clone(),
                 fonts.db.clone(),
@@ -693,13 +753,18 @@ fn run_with_slots(
                 },
                 &mut fonts,
             );
+            *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = work.admission.clone();
+            #[cfg(test)]
+            if work.outcome == Some(WorkerOutcome::CancelAfterShape) {
+                work.cancelled.store(true, Ordering::Release);
+            }
             if work.cancelled.load(Ordering::Acquire) {
-                // Keep the slot until this discarded geometry is reclaimed.
-                *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
+                // Geometry and the source-bearing None reply share admission.
+                // Neither worker return nor stale geometry retirement releases
+                // it before that reply is consumed/discarded.
                 drop(prepared);
                 None
             } else {
-                *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
                 Some(Arc::new(prepared))
             }
         })
@@ -715,7 +780,7 @@ fn run_with_slots(
 #[derive(Debug)]
 pub(super) struct Prepared {
     owned: Option<Box<Geometry>>,
-    admission: Mutex<Option<WorkSlot>>,
+    admission: Mutex<Option<Arc<OutputAdmission>>>,
 }
 
 // A widget or result may own the final Arc. Its last release must remain
@@ -2137,6 +2202,132 @@ fn code_and_styled_flow_sources_share_one_final_retirement_across_request_clones
 }
 
 #[test]
+fn queued_none_flow_results_hold_admission_through_cancellation_error_and_worker_panic() {
+    use iced::futures::StreamExt;
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for outcome in [
+        None,
+        Some(WorkerOutcome::ReclamationError),
+        Some(WorkerOutcome::Panic),
+        Some(WorkerOutcome::CancelAfterShape),
+    ] {
+        let (sent, disposed) = std::sync::mpsc::channel();
+        let (canonical, document, bytes) = std::thread::spawn(move || {
+            let mut canonical = markdown::Content::parse(
+                &"**owned λ** [source](https://example.test/source) é ".repeat(500),
+            );
+            canonical.discard_continuation();
+            let bytes = canonical.watch_first_raw_spans(sent);
+            let document = prose_document::Data::snapshot(&canonical);
+            (canonical, document, bytes)
+        })
+        .join()
+        .unwrap();
+        let document = prose_document::Document::new(document);
+        let [markdown::Item::Paragraph(text)] = canonical.items() else {
+            unreachable!()
+        };
+        let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+        let cache = Cache::default();
+        let entry = cache.markdown_entry(95, text.clone(), style);
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        entry.borrow_mut().bind_target(target);
+        entry
+            .borrow_mut()
+            .configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+        let mut request = entry.borrow_mut().request().unwrap();
+        request.outcome = outcome;
+        if outcome.is_none() {
+            request.cancelled.store(true, Ordering::Release);
+        }
+        preparation::retire_presentation(preparation::Presentation {
+            parsed: preparation::Parsed {
+                source: Default::default(),
+                markdown: canonical,
+            },
+            blocks: Default::default(),
+            palettes: None,
+            item: None,
+            prepared_tools: None,
+        });
+        drop(document);
+        preparation::retirement_barrier();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let task = run_with_slots(target, request, slots.clone()).expect("one actual private slot");
+        let reply = executor.block_on(async {
+            let mut effects = iced::runtime::task::into_stream(task).unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                        reply,
+                    ))) = effect
+                    {
+                        assert!(
+                            matches!(&reply,Action::FlowReady(actual,_,None) if *actual==target),
+                            "actual cancelled/error/panic worker returns its typed None reply"
+                        );
+                        return reply;
+                    }
+                }
+                panic!("actual None result must be delivered");
+            })
+            .await
+            .expect("finite real worker outcome")
+        });
+        drop(entry);
+        let reclaimer = preparation::retirement_barrier();
+        assert!(
+            disposed.try_recv().is_err(),
+            "queued None Action is the remaining actual raw source owner"
+        );
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "queued None completion retains output admission until UI consumption"
+        );
+        let mut wakes = Box::pin(availability_stream());
+        executor
+            .block_on(wakes.next())
+            .expect("initial state consumed before release");
+        let release = preparation::hold_retirement();
+        drop(reply);
+        assert!(disposed.try_recv().is_err());
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "discard keeps admission while actual raw source retirement is stalled"
+        );
+        release.send(()).unwrap();
+        let permit = executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    wakes.next().await.expect("live Flow subscription");
+                    // The global epoch may also advance for another parallel
+                    // fixture. This private semaphore is the capacity oracle.
+                    if let Ok(permit) = slots.clone().try_acquire_owned() {
+                        return permit;
+                    }
+                }
+            })
+            .await
+            .expect("actual private admission availability wake")
+        });
+        assert_eq!(
+            disposed
+                .try_recv()
+                .expect("actual raw span disposal precedes slot availability wake"),
+            (reclaimer, bytes)
+        );
+        drop(permit);
+    }
+    executor.shutdown_background();
+}
+
+#[test]
 fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_release() {
     use iced::futures::StreamExt;
     let executor = tokio::runtime::Builder::new_current_thread()
@@ -2155,8 +2346,10 @@ fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_rel
         400.0,
         iced::widget::text::Wrapping::WordOrGlyph,
     );
-    *stale.admission.lock().unwrap() =
-        Some(WorkSlot(Some(slots.clone().try_acquire_owned().unwrap())));
+    *stale.admission.lock().unwrap() = Some(OutputAdmission::new(
+        Source::new(SourceData::Styled(stale.spans.clone())),
+        WorkSlot(Some(slots.clone().try_acquire_owned().unwrap())),
+    ));
     let cache = Cache::default();
     let entry = cache.entry(91, vec![Span::new("new idle reader")].into());
     entry.borrow_mut().bind_target(target);
@@ -2286,6 +2479,8 @@ fn stalled_ui_delivery_holds_output_admission_until_installation_or_discard() {
                     .borrow_mut()
                     .complete(&completed_request, Some(output))
             );
+            drop(completed_request);
+            preparation::retirement_barrier();
             let next = slots
                 .clone()
                 .try_acquire_owned()
@@ -2294,6 +2489,7 @@ fn stalled_ui_delivery_holds_output_admission_until_installation_or_discard() {
             drop(next);
         } else {
             drop(output);
+            drop(completed_request);
             preparation::retirement_barrier();
             let next = slots
                 .clone()
