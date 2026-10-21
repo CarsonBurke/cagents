@@ -360,6 +360,40 @@ exclude opaque parser/font/renderer/image allocations and allocator retention;
 they are not RSS or a complete heap estimate. Use process measurements to verify
 residency budgets rather than inferring them from logical byte counts.
 
+Transcript row factories share one UI-local immutable AST root per parser
+publication, using index paths for quotes, lists and table cells. Ordinary
+publications clone that graph once on the parser worker; the unchanged
+inline/code text backing is shared. This removes recursive factory clones
+during view rebuilding. Final raw graph disposal runs on the persistent
+reclaimer even when retained widgets outlive the cache. Raw graphs in rejected
+output are dropped inside the existing retirement batch before its admission
+permit and FIFO barrier. Coordination recognition and all rich prompt, brief
+and result parts use the same provider-aware admitted parser worker; the UI
+detects preparation candidates from bounded item metadata. Exact-source
+disclosure changes reuse those parts and their palettes. Canonical coordination
+graphs and recognition
+metadata also retire off the UI thread. Process measurements must include the
+extra publication graph containers. Logical descendant descriptors and virtual
+column geometry/index rebuilding still visit total metadata on the UI thread;
+they are not claimed constant-time or small for arbitrary rich documents.
+Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains
+required.
+
+Parser admission retains at most 128 selected-source entries and 72 MiB of
+queued source bytes; these are source reservations, not RSS estimates.
+Temporary pressure leaves the immutable source in its authoritative snapshot
+and resumes automatically from a metadata cursor after entry or final
+source-lease release. Each resumed pump visits at most 128 positions; initial
+cache enumeration still visits the selected history. The watch sends a
+current-state event when subscribed so an idle UI cannot miss capacity released
+during subscription installation. Newest text gets first admission; historical
+inputs retain deterministic order. Sources that individually cannot fit the
+budget remain explicit errors. No shell/JSON parse runs on the UI during
+pressure; commands of at most 2,048 bytes can be excluded using the
+recognizer's existing program-name predicate. Full rich coordination parts are
+still reparsed on changed publications; off-thread ownership does not make this
+cost incremental.
+
 ## Reference results
 
 The `linux-headless-release-reference` fixture was recorded on a Ryzen 9 9900X,
@@ -392,7 +426,3 @@ Both fit the 50/100 ms input budgets. This is an upper bound to
 compositor-visible pixels, not presentation timestamps or physical scanout. The
 settled idle native terminal produced no additional terminal draws and no
 measurable UI CPU ticks in a three-second observation.
-
-Transcript row factories share one UI-local immutable AST root per parser publication, using index paths for quotes, lists and table cells. Ordinary publications clone that graph once on the parser worker; the unchanged inline/code text backing is shared. This removes recursive factory clones during view rebuilding. Final raw graph disposal runs on the persistent reclaimer even when retained widgets outlive the cache. Raw graphs in rejected output are dropped inside the existing retirement batch before its admission permit and FIFO barrier. Coordination recognition and all rich prompt, brief and result parts use the same provider-aware admitted parser worker; the UI only checks bounded item metadata. Exact-source disclosure changes reuse those parts and their palettes. Canonical coordination graphs and recognition metadata also retire off the UI thread. The extra publication graph containers remain a measured memory cost. Logical descendant descriptors and virtual column geometry/index rebuilding still visit total metadata on the UI thread; they are not claimed constant-time or small for arbitrary rich documents. Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains required.
-
-Parser admission retains at most128 selected-source entries and72MiB of queued source bytes; these are source reservations, not RSS estimates. Temporary pressure leaves the immutable source in its authoritative snapshot and resumes automatically from a metadata cursor, at most128 positions per pump, after entry or final source-lease release. The watch sends a current-state event when subscribed so an idle UI cannot miss capacity released during subscription installation. Newest text gets first admission; historical inputs retain deterministic order. Sources that individually cannot fit the budget remain explicit errors. No shell/JSON parse runs on the UI during pressure; commands of at most2048bytes can be excluded using the recognizer's existing program-name predicate. Full rich coordination parts are still reparsed on changed publications; off-thread ownership does not make this cost incremental.
