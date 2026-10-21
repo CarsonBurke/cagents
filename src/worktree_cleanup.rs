@@ -415,16 +415,6 @@ fn acquire_with_directory_pin(
     })
 }
 
-/// Real isolated lock acquisition for cross-module lifetime contracts.
-#[cfg(test)]
-pub(crate) fn fixture_protection(
-    runtime: &Path,
-    directory: &Path,
-    exclusive: bool,
-) -> io::Result<Protection> {
-    acquire(runtime, directory, exclusive)
-}
-
 static STANDALONE_EDITOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Declare the independent editor before constructing its UI. Readiness is
