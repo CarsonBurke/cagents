@@ -8,6 +8,14 @@ use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
 const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 pub(super) const MAX_INPUTS: usize = 1024;
+const MAX_METADATA_ENTRY_BYTES: usize = 1024 * 1024;
+// JSON can encode each source byte as six bytes (for example, \u0000).
+// Finished outcomes carry the public result contract in addition to fixed-size
+// run/state/usage fields. Keep metadata-only outcomes on their smaller limit.
+const MAX_FINISHED_ENTRY_BYTES: usize = 6
+    * (crate::agent_execution::MAX_RESULT_BYTES + crate::agent_execution::MAX_DIAGNOSTIC_BYTES)
+    + 4096;
+const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OutboxEntry {
@@ -248,6 +256,23 @@ impl Journal {
             }
             self.run_ids.insert(*run);
         }
+        let entry_limit = match update {
+            Update::Execution {
+                update: crate::agent_execution::Update::Finished { result, .. },
+                ..
+            } => {
+                if result.text.len() > crate::agent_execution::MAX_RESULT_BYTES
+                    || result.diagnostic.as_ref().is_some_and(|diagnostic| {
+                        diagnostic.len() > crate::agent_execution::MAX_DIAGNOSTIC_BYTES
+                    })
+                {
+                    self.record_loss(OVERFLOW_REASON)?;
+                    return Err(OVERFLOW_REASON.into());
+                }
+                MAX_FINISHED_ENTRY_BYTES
+            }
+            _ => MAX_METADATA_ENTRY_BYTES,
+        };
         let bytes = serde_json::to_vec(update).map_err(|error| error.to_string())?;
         let (count, retained): (usize, usize) = self
             .db
@@ -258,12 +283,11 @@ impl Journal {
             )
             .map_err(|error| error.to_string())?;
         if count >= MAX_ENTRIES
-            || bytes.len() > 1024 * 1024
+            || bytes.len() > entry_limit
             || retained.saturating_add(bytes.len()) > self.budget
         {
-            let reason = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
-            self.record_loss(reason)?;
-            return Err(reason.into());
+            self.record_loss(OVERFLOW_REASON)?;
+            return Err(OVERFLOW_REASON.into());
         }
         if let Update::Execution { run, .. } = update {
             self.check_run_capacity(*run)?;
@@ -888,6 +912,125 @@ mod tests {
         assert!(journal.append(&large).unwrap_err().contains("overflowed"));
         assert_eq!(journal.latest().unwrap(), 0);
         assert!(journal.continuity_loss().unwrap().is_some());
+    }
+
+    #[test]
+    fn full_size_finished_results_repeat_exactly_until_durable_ack() {
+        use crate::agent_execution::{
+            MAX_DIAGNOSTIC_BYTES, MAX_RESULT_BYTES, ResultSummary, State,
+        };
+        for text in [
+            "r".repeat(MAX_RESULT_BYTES),
+            "\0".repeat(MAX_RESULT_BYTES),
+            "😀".repeat(MAX_RESULT_BYTES / 4),
+        ] {
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::open(dir.path()).unwrap();
+            let run = crate::model::RunId::new();
+            let update = Update::Execution {
+                run,
+                update: crate::agent_execution::Update::Finished {
+                    state: State::Succeeded,
+                    result: ResultSummary {
+                        text,
+                        diagnostic: Some("\u{1}".repeat(MAX_DIAGNOSTIC_BYTES)),
+                        usage: crate::chat::Usage {
+                            input_tokens: u64::MAX,
+                            output_tokens: u64::MAX,
+                            context_tokens: u64::MAX,
+                            context_limit: u64::MAX,
+                            cost_microusd: Some(u64::MAX),
+                            cost_estimate: Some(crate::chat::pricing::CostEstimate {
+                                microusd: u64::MAX,
+                                partial: true,
+                            }),
+                        },
+                        ..Default::default()
+                    },
+                },
+            };
+            let encoded = serde_json::to_vec(&update).unwrap();
+            assert!(encoded.len() > MAX_METADATA_ENTRY_BYTES);
+            assert!(encoded.len() <= MAX_FINISHED_ENTRY_BYTES);
+            assert!(MAX_FINISHED_ENTRY_BYTES + 4096 < super::super::MAX_FRAME);
+            journal.append(&update).unwrap();
+            let following = Update::Attention(crate::notifications::Evidence {
+                key: "following-outcome".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            });
+            journal.append(&following).unwrap();
+            for _ in 0..2 {
+                let page = journal.page(0).unwrap();
+                assert_eq!(
+                    page.len(),
+                    1,
+                    "one large entry must still make page progress"
+                );
+                assert_eq!(page[0].sequence, 1);
+                assert_eq!(page[0].update, update);
+                let response: Result<serde_json::Value, String> =
+                    Ok(serde_json::to_value(&page).unwrap());
+                let wire = serde_json::to_vec(&response).unwrap();
+                assert!(wire.len() < super::super::MAX_FRAME);
+                let response: Result<serde_json::Value, String> =
+                    serde_json::from_slice(&wire).unwrap();
+                let received: Vec<OutboxEntry> = serde_json::from_value(response.unwrap()).unwrap();
+                assert_eq!(received[0].update, update);
+                assert_eq!(journal.acknowledged().unwrap(), 0);
+                assert_eq!(journal.retained_runs().unwrap(), vec![run]);
+                assert!(journal.seal_for_retirement().is_err());
+            }
+            assert!(journal.ack(3).is_err());
+            journal.ack(1).unwrap();
+            assert!(journal.retained_runs().unwrap().is_empty());
+            let page = journal.page(1).unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].sequence, 2);
+            assert_eq!(page[0].update, following);
+            journal.ack(2).unwrap();
+            assert!(journal.page(2).unwrap().is_empty());
+            assert!(journal.continuity_loss().unwrap().is_none());
+            journal.seal_for_retirement().unwrap();
+        }
+    }
+
+    #[test]
+    fn oversized_finished_fields_and_total_encoded_budget_remain_fail_closed() {
+        use crate::agent_execution::{
+            MAX_DIAGNOSTIC_BYTES, MAX_RESULT_BYTES, ResultSummary, State,
+        };
+        for (text_bytes, diagnostic_bytes, budget) in [
+            (MAX_RESULT_BYTES + 1, 0, DEFAULT_BUDGET),
+            (0, MAX_DIAGNOSTIC_BYTES + 1, DEFAULT_BUDGET),
+            (
+                MAX_RESULT_BYTES,
+                MAX_DIAGNOSTIC_BYTES,
+                MAX_METADATA_ENTRY_BYTES,
+            ),
+        ] {
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(dir.path(), budget).unwrap();
+            let run = crate::model::RunId::new();
+            let update = Update::Execution {
+                run,
+                update: crate::agent_execution::Update::Finished {
+                    state: State::Succeeded,
+                    result: ResultSummary {
+                        text: "\0".repeat(text_bytes),
+                        diagnostic: Some("\u{1}".repeat(diagnostic_bytes)),
+                        ..Default::default()
+                    },
+                },
+            };
+            assert!(journal.append(&update).unwrap_err().contains("overflowed"));
+            assert_eq!(journal.latest().unwrap(), 0);
+            assert!(journal.page(0).unwrap().is_empty());
+            let loss = journal.continuity_loss().unwrap().unwrap();
+            assert_eq!(loss.affected_runs, vec![run]);
+            journal.ack(0).unwrap();
+            assert_eq!(journal.continuity_loss().unwrap().unwrap(), loss);
+            assert!(journal.seal_for_retirement().is_err());
+        }
     }
 
     #[test]
