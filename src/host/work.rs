@@ -233,24 +233,34 @@ impl Tracked {
         };
     }
 
-    /// The pins a scan proves stale: a branch has a card while a worktree has
-    /// it checked out or its pull request is in flight, and a worktree card
-    /// while the worktree exists.
+    /// The pins a scan proves stale. A branch's pin follows it between
+    /// worktrees, so it lasts while the branch is checked out, has a pull
+    /// request in flight, or still exists without a finished one; a worktree
+    /// card's lasts while the worktree exists.
     fn live_pin(&self, item: &str) -> bool {
         let Some(local) = &self.local else {
             return true;
         };
         match crate::work::ItemKey::from_storage_key(item) {
             Some(crate::work::ItemKey::Branch(branch)) => {
-                local
-                    .worktrees
+                let pull_requests = self
+                    .snapshot
                     .iter()
-                    .any(|worktree| worktree.branch.as_ref() == Some(&branch))
-                    || self.snapshot.as_ref().is_some_and(|snapshot| {
-                        snapshot.pull_requests.iter().any(|pull_request| {
-                            pull_request.head_ref_name == branch && forge::in_flight(pull_request)
-                        })
-                    })
+                    .flat_map(|snapshot| &snapshot.pull_requests)
+                    .filter(|pull_request| pull_request.head_ref_name == branch);
+                let (in_flight, finished) = pull_requests.fold(
+                    (false, false),
+                    |(in_flight, finished), pull_request| {
+                        let live = forge::in_flight(pull_request);
+                        (in_flight || live, finished || !live)
+                    },
+                );
+                in_flight
+                    || local
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.branch.as_ref() == Some(&branch))
+                    || (local.branch_names.contains(&branch) && !finished)
             }
             Some(crate::work::ItemKey::Worktree(path)) => local
                 .worktrees
@@ -1322,7 +1332,9 @@ impl Scanner {
             if tracked.pending.is_some() && !tracked.scanning {
                 next = next.min(tracked.spacing().saturating_sub(since));
             }
-            next = next.min(shared.poll_interval(tracked).saturating_sub(since));
+            if !tracked.scanning {
+                next = next.min(shared.poll_interval(tracked).saturating_sub(since));
+            }
         }
         next.max(Duration::from_millis(100))
     }
@@ -1362,11 +1374,11 @@ mod tests {
             link: None,
             error: None,
         });
-        // A branch Git still has is not enough: its card needs a worktree
-        // or a pull request in flight.
+        // A branch between worktrees keeps its pin until its pull request
+        // finishes.
         local
             .branch_names
-            .extend(["checked-out", "open", "draft", "merged"].map(String::from));
+            .extend(["checked-out", "open", "draft", "merged", "switched-away"].map(String::from));
         tracked.local = Some(Arc::new(local));
         let pull_request = |branch: &str, state: &str, draft: bool| {
             serde_json::from_value(serde_json::json!({
@@ -1397,6 +1409,7 @@ mod tests {
         assert!(tracked.live_pin("branch:open"));
         assert!(tracked.live_pin("branch:draft"));
         assert!(!tracked.live_pin("branch:merged"));
+        assert!(tracked.live_pin("branch:switched-away"));
         assert!(!tracked.live_pin("branch:gone"));
         assert!(tracked.live_pin("worktree:/repo"));
         assert!(!tracked.live_pin("worktree:/repo/.worktrees/gone"));

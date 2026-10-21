@@ -448,9 +448,10 @@ is the first of these that applies:
 | **In progress** | Everything else: commits, changes, drafts and closed drafts |
 
 `cagents work pin BRANCH in-review` overrides the derived column until
-`cagents work unpin BRANCH`; a worktree path names a card too. The pin of a
-card that no longer exists is forgotten at the next scan that Git and GitHub
-both answer.
+`cagents work unpin BRANCH`; a worktree path names a card too. A branch's pin
+follows it between worktrees and is forgotten once the branch is gone or its
+pull request has merged or closed, at the next scan that Git and GitHub both
+answer; a worktree's pin is forgotten with the worktree.
 
 The daemon watches each project's Git metadata and, within its watch budget,
 the tracked directories of its worktrees. Projects beyond the budget are
