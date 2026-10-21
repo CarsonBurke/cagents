@@ -6287,6 +6287,19 @@ mod tests {
             virtualized::constructed_rows() > built,
             "the existing native Tree rebuilds the changed child row"
         );
+        // The first accepted raw snapshot names a closed step. Explicit
+        // disclosure creates its actual reader before the next raw scan;
+        // laying out the closed row alone does not prepare ToolText.
+        assert!(
+            app.chat_runtime_mut(target).unwrap().child_cache["other"]
+                .tool_output
+                .is_none(),
+            "the initial raw plan predates actual reader readiness"
+        );
+        drop(app.handle_chat_ui(Action::Toggle(target, "other".into())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(app.chat_runtime_mut(target).unwrap().item_expanded("other"));
+        render(&mut app, &mut tree);
         let (reader, text, cache_revision) = {
             let cached = &app.chat_runtime_mut(target).unwrap().child_cache["other"];
             let output = cached.tool_output.as_ref().unwrap();
