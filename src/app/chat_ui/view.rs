@@ -1815,7 +1815,11 @@ impl Runtime {
                             .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
-                    design::caption(if self.find_matches.is_empty() {
+                    design::caption(if let Some(error) = self.find_error() {
+                        error.to_owned()
+                    } else if self.find_searching() {
+                        "Searching…".to_owned()
+                    } else if self.find_matches.is_empty() {
                         "0 matches".to_owned()
                     } else {
                         format!(
@@ -1846,6 +1850,13 @@ impl Runtime {
                 .spacing(step::GAP_S)
                 .into(),
             );
+            if self.find_error().is_some() {
+                content.push(
+                    crate::ui_controls::button::secondary("Retry search")
+                        .on_press(action(Action::FindRetry(target)))
+                        .into(),
+                );
+            }
         }
         // The symmetric inset already exceeds the scrollbar rail. Reserving
         // the rail a second time would make transcript rows narrower than the
@@ -8421,9 +8432,10 @@ mod tests {
             widget::{Operation, Tree},
         };
         let items = frame_cost::transcript(1);
-        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
         let queued = Queued {
-            text: "Queued message".into(),
+            source: prompt::LocalSource::new("Queued message".into()),
+            presentation: prompt::LocalPresentation::default(),
             resolved_text: "Queued message".into(),
             attachments: vec![],
             model: None,
@@ -8431,6 +8443,15 @@ mod tests {
             since: None,
             rechecking: false,
         };
+        let source = queued.source.clone();
+        runtime.queued = Some(queued);
+        let (run, ready) = preparation::local_reply_for_test(&mut runtime);
+        let prepared = runtime
+            .preparation
+            .accept_local(runtime.target, run, &source, ready)
+            .unwrap();
+        let mut queued = runtime.queued.take().unwrap();
+        prepared.install_local(&mut queued.presentation);
         let mut delivery = items[0].clone();
         delivery.id = "delivery-notice".into();
         delivery.content = ItemContent::Delivery {
@@ -8841,6 +8862,7 @@ mod tests {
         runtime.followups.push(super::super::Followup {
             id: 0,
             text: "Local follow-up".into(),
+            preview: "Local follow-up".into(),
             attachments: Vec::new(),
         });
         assert!(runtime.queue_view().is_some());

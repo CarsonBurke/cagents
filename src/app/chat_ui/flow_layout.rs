@@ -2609,8 +2609,8 @@ impl Entry {
         }
         self.find_visible = visible;
     }
-    pub(super) fn defer_find_highlights(&mut self) {
-        self.find_deferred = Some(find_navigation::available_epoch());
+    pub(super) fn defer_find_highlights_at(&mut self, epoch: u64) {
+        self.find_deferred = Some(epoch);
     }
     pub(super) fn find_request_id(&mut self, target: Target) -> Option<u64> {
         self.needs_find_highlights(target).then_some(self.id)

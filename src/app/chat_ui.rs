@@ -286,12 +286,8 @@ pub enum Action {
     Find(Target, String),
     FindNext(Target, bool),
     FindAvailable,
-    FindGroups(
-        Target,
-        u64,
-        u64,
-        Result<find_navigation::RawResult, find_navigation::RawFailure>,
-    ),
+    FindRetry(Target),
+    FindGroups(Target, u64, u64, u64, Option<find_navigation::RawResult>),
     FindHighlight(Target, u64),
     FindHighlighted(Target, u64, Option<find_navigation::HighlightResult>),
     FindResume(Target, find_navigation::Intent, bool),
@@ -8901,6 +8897,7 @@ impl Cagents {
                 return self.chat_find_next(target, true);
             }
             Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            Action::FindRetry(target) => return self.retry_find(target),
             Action::FindAvailable => {
                 let targets: Vec<_> = self
                     .cards
@@ -8921,8 +8918,8 @@ impl Cagents {
                         .map(|target| self.resume_current_find(target, true)),
                 );
             }
-            Action::FindGroups(target, epoch, query_epoch, result) => {
-                return self.find_groups(target, epoch, query_epoch, result);
+            Action::FindGroups(target, epoch, query_epoch, run, result) => {
+                return self.find_groups(target, epoch, query_epoch, run, result);
             }
             Action::FindHighlight(target, id) => return self.find_highlight(target, id),
             Action::FindHighlighted(target, id, ready) => {
@@ -14931,7 +14928,8 @@ mod tests {
                 .queued
                 .as_ref()
                 .unwrap()
-                .text
+                .source
+                .text()
                 .trim(),
             "$review this change"
         );
@@ -21499,7 +21497,7 @@ mod tests {
             let mut tree = Tree::new(element.as_widget());
             let _ = element.as_widget_mut().layout(
                 &mut tree,
-                &cosmic::Renderer::default(),
+                &crate::app::tests::headless_renderer(),
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(960.0, 720.0)),
             );
         }

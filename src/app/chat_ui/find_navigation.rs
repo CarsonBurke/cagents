@@ -662,7 +662,8 @@ struct RawState {
     clock: Arc<AtomicU64>,
     stamp: Option<RawStamp>,
     in_flight: Option<Arc<AtomicBool>>,
-    failed: bool,
+    failed: Option<RawFailure>,
+    run: u64,
     complete: bool,
     deferred: Option<u64>,
     accepted: Option<RawOutput>,
@@ -672,7 +673,7 @@ impl RawState {
     fn cancel(&mut self) {
         self.clock.fetch_add(1, Ordering::AcqRel);
         self.in_flight = None;
-        self.failed = false;
+        self.failed = None;
         self.complete = false;
         self.deferred = None;
         self.stamp = None;
@@ -734,7 +735,7 @@ impl<T: Send + Sync + 'static> Ready<T> {
             .and_then(|mut ready| ready.value.take())
     }
 }
-pub(super) type RawResult = Ready<RawOutput>;
+pub(super) type RawResult = Ready<Result<RawOutput, RawFailure>>;
 #[derive(Clone)]
 pub(super) struct RawOutput(Arc<RawOwner>);
 struct RawOwner(Option<RawData>);
@@ -884,10 +885,11 @@ impl Runtime {
                 || self.find_navigation.raw.accepted.is_some()
             {
                 self.find_navigation.raw.cancel();
-                self.find_matches.clear();
-                self.find_index = 0;
                 register_highlights(self);
             }
+            self.find_matches.clear();
+            self.find_index = 0;
+            self.find_navigation.cancel();
             return;
         }
         let mut stamp = raw_stamp(self);
@@ -910,7 +912,7 @@ impl Runtime {
                 .clock
                 .fetch_add(1, Ordering::AcqRel);
             self.find_navigation.raw.complete = false;
-            self.find_navigation.raw.failed = false;
+            self.find_navigation.raw.failed = None;
             self.find_navigation.raw.deferred = None;
         } else {
             self.find_navigation.search.fetch_add(1, Ordering::AcqRel);
@@ -920,10 +922,11 @@ impl Runtime {
         self.find_navigation.raw.stamp = Some(stamp);
         self.find_matches = current_groups(self);
         self.find_index = previous
+            .as_ref()
             .and_then(|key| {
                 self.find_matches
                     .iter()
-                    .position(|candidate| candidate == &key)
+                    .position(|candidate| candidate == key)
             })
             .unwrap_or_else(|| self.find_matches.len().saturating_sub(1));
         register_highlights(self);
@@ -943,7 +946,17 @@ impl Runtime {
                     _metadata: metadata,
                 }))));
                 self.find_matches = result.groups.iter().map(|(key, _)| key.clone()).collect();
-                self.find_index = self.find_matches.len().saturating_sub(1);
+                self.find_index = previous
+                    .as_ref()
+                    .and_then(|key| {
+                        self.find_matches
+                            .iter()
+                            .position(|candidate| candidate == key)
+                    })
+                    .unwrap_or_else(|| {
+                        self.find_index
+                            .min(self.find_matches.len().saturating_sub(1))
+                    });
                 self.find_navigation.raw.accepted = Some(result);
                 self.find_navigation.raw.complete = true;
                 register_highlights(self);
@@ -1016,7 +1029,7 @@ impl Runtime {
 pub(super) enum RawFailure {
     Canceled,
     TooLarge,
-    Pressure,
+    Pressure(u64),
     Worker,
 }
 type Scan = (
@@ -1149,14 +1162,13 @@ fn raw_scan_inner(
             groups.push((key.clone(), plans.into()));
         }
     }
-    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let metadata = METADATA
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+    let attempt = metadata_epoch();
+    let metadata = metadata_capacity()
         .clone()
         .try_acquire_many_owned(cost.max(1) as u32)
         .ok()
         .or_else(|| {
-            failure.set(RawFailure::Pressure);
+            failure.set(RawFailure::Pressure(attempt));
             None
         })?;
     Some((groups, uncap, MetadataBudget(Some(metadata)), pattern))
@@ -1263,7 +1275,7 @@ impl Cagents {
         {
             return None;
         }
-        if raw.failed || raw.deferred == Some(available_epoch()) {
+        if raw.failed.is_some() || raw.deferred == Some(metadata_epoch()) {
             return Some(Task::none());
         }
         if raw
@@ -1285,28 +1297,38 @@ impl Cagents {
         let clock = runtime.find_navigation.search.clone();
         let query_epoch = clock.load(Ordering::Acquire);
         let epoch = runtime.find_navigation.raw.clock.load(Ordering::Acquire);
+        runtime.find_navigation.raw.run = runtime.find_navigation.raw.run.wrapping_add(1);
+        let run = runtime.find_navigation.raw.run;
         runtime.find_navigation.raw.in_flight = Some(work.alive());
         Some(cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let Input::Raw(input) = work.input() else {
-                    unreachable!()
-                };
-                let (groups, tools, metadata, pattern) = raw_scan(input, &input.query, &|| {
-                    clock.load(Ordering::Acquire) == query_epoch
-                })?;
-                Ok(work.finish(RawOutput(Arc::new(RawOwner(Some(RawData {
-                    epoch,
-                    query_epoch,
-                    pattern,
-                    context,
-                    groups,
-                    tools,
-                    _metadata: metadata,
-                }))))))
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Input::Raw(input) = work.input() else {
+                        unreachable!()
+                    };
+                    raw_scan(input, &input.query, &|| {
+                        clock.load(Ordering::Acquire) == query_epoch
+                    })
+                }))
+                .unwrap_or(Err(RawFailure::Worker))
+                .map(|(groups, tools, metadata, pattern)| {
+                    RawOutput(Arc::new(RawOwner(Some(RawData {
+                        epoch,
+                        query_epoch,
+                        pattern,
+                        context,
+                        groups,
+                        tools,
+                        _metadata: metadata,
+                    }))))
+                });
+                // Every outcome drops real input on this worker, then carries
+                // the SAME admission through completion consumption/rejection.
+                work.finish(outcome)
             })
             .await
-            .unwrap_or(Err(RawFailure::Worker));
-            action(Action::FindGroups(target, epoch, query_epoch, result))
+            .ok();
+            action(Action::FindGroups(target, epoch, query_epoch, run, result))
         }))
     }
     pub(super) fn find_groups(
@@ -1314,35 +1336,47 @@ impl Cagents {
         target: Target,
         epoch: u64,
         query_epoch: u64,
-        result: Result<RawResult, RawFailure>,
+        run: u64,
+        result: Option<RawResult>,
     ) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
         runtime.refresh_find_work();
-        if query_epoch != runtime.find_navigation.search.load(Ordering::Acquire) {
+        if query_epoch != runtime.find_navigation.search.load(Ordering::Acquire)
+            || run != runtime.find_navigation.raw.run
+        {
             return self.resume_current_find(target, true);
         }
         runtime.find_navigation.raw.in_flight = None;
-        let result = match result.and_then(|ready| ready.take().ok_or(RawFailure::Canceled)) {
+        let outcome = result
+            .and_then(Ready::take)
+            .unwrap_or(Err(RawFailure::Worker));
+        let result = match outcome {
             Ok(result) => result,
-            Err(RawFailure::Pressure) => {
-                runtime.find_navigation.raw.deferred = Some(available_epoch());
-                return Task::none();
+            Err(RawFailure::Pressure(attempt)) => {
+                runtime.find_navigation.raw.accepted = None;
+                runtime.find_navigation.raw.highlight_context = None;
+                runtime.find_navigation.raw.complete = false;
+                runtime.find_matches.clear();
+                runtime.find_index = 0;
+                runtime.find_navigation.raw.deferred = Some(attempt);
+                register_highlights(runtime);
+                return self.resume_current_find(target, true);
             }
-            Err(RawFailure::TooLarge | RawFailure::Worker) => {
-                runtime.find_navigation.raw.failed = true;
+            Err(failure @ (RawFailure::TooLarge | RawFailure::Worker)) => {
+                runtime.find_navigation.raw.failed = Some(failure);
+                runtime.find_navigation.raw.complete = false;
                 return Task::none();
             }
             Err(RawFailure::Canceled) => return self.resume_current_find(target, true),
         };
-        let Some(result) = Some(result).filter(|result| {
-            result.query_epoch == runtime.find_navigation.search.load(Ordering::Acquire)
-                && runtime.selected_subagent == result.context
-                && runtime.visible.load(Ordering::Relaxed)
-        }) else {
+        if result.query_epoch != runtime.find_navigation.search.load(Ordering::Acquire)
+            || runtime.selected_subagent != result.context
+            || !runtime.visible.load(Ordering::Relaxed)
+        {
             return Task::none();
-        };
+        }
         runtime.find_navigation.raw.complete =
             epoch == runtime.find_navigation.raw.clock.load(Ordering::Acquire);
         let previous = runtime.find_matches.get(runtime.find_index).cloned();
@@ -1358,6 +1392,16 @@ impl Cagents {
             .unwrap_or_else(|| runtime.find_matches.len().saturating_sub(1));
         register_highlights(runtime);
         self.resume_current_find(target, true)
+    }
+    pub(super) fn retry_find(&mut self, target: Target) -> Task<Message> {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.find_navigation.cancel_all();
+            runtime.restore_find_disclosures();
+            runtime.find_matches.clear();
+            runtime.find_index = 0;
+            runtime.refresh_find_work();
+        }
+        self.begin_find_navigation(target, None)
     }
 }
 
@@ -1471,6 +1515,7 @@ impl Cagents {
         let charge =
             (bytes.min(find::HIGHLIGHT_LIMIT) * std::mem::size_of::<std::ops::Range<usize>>() * 2
                 + 512) as u32;
+        let budget_attempt = available_epoch();
         let output = budget
             .clone()
             .try_acquire_many_owned(charge)
@@ -1480,11 +1525,12 @@ impl Cagents {
                 budget.try_acquire_many_owned(charge).ok()
             });
         let Some(output) = output else {
-            entry.borrow_mut().defer_find_highlights();
+            entry.borrow_mut().defer_find_highlights_at(budget_attempt);
             return Task::none();
         };
+        let worker_attempt = available_epoch();
         let Some(permit) = admit() else {
-            entry.borrow_mut().defer_find_highlights();
+            entry.borrow_mut().defer_find_highlights_at(worker_attempt);
             return Task::none();
         };
         // Capture the exact PAINTED ready prefix only after both admissions.
@@ -1771,6 +1817,7 @@ struct MetadataBudget(Option<tokio::sync::OwnedSemaphorePermit>);
 impl Drop for MetadataBudget {
     fn drop(&mut self) {
         drop(self.0.take());
+        METADATA_EPOCH.fetch_add(1, Ordering::AcqRel);
         available().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 }
@@ -2089,6 +2136,16 @@ mod tests {
             Some(id),
             "same slot release wakes deferred visible work"
         );
+        let held = admit().unwrap();
+        let attempt = available_epoch();
+        assert!(admit().is_none());
+        drop(held); // The actual resource releases before the UI records deferral.
+        entries[0].borrow_mut().defer_find_highlights_at(attempt);
+        assert_eq!(
+            entries[0].borrow_mut().find_request_id(target),
+            Some(id),
+            "release-before-deferral cannot lose the only idle wake"
+        );
         finish_highlight(&mut app, target, id);
         assert_eq!(entries[0].borrow_mut().find_highlights(target).len(), 80);
         assert!(
@@ -2185,6 +2242,196 @@ mod tests {
             "unknown same-ID rewrite cannot reuse old match authority"
         );
     }
+    fn raw_reply(task: Task<Message>) -> Action {
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("actual admitted raw task");
+            while let Some(effect) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    reply @ Action::FindGroups(..),
+                ))) = effect
+                {
+                    return reply;
+                }
+            }
+            panic!("raw task must return typed completion")
+        })
+    }
+    #[test]
+    fn pressure_reply_retains_same_slot_and_observes_release_before_delivery_without_stale_error_overwrite()
+     {
+        preparation::retirement_barrier();
+        let (mut app, target, handle) = runtime("initial needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let own = runtime
+            .find_navigation
+            .raw
+            .accepted
+            .as_ref()
+            .unwrap()
+            ._metadata
+            .0
+            .as_ref()
+            .unwrap()
+            .num_permits();
+        let before = metadata_capacity().available_permits();
+        let blocker = MetadataBudget(Some(
+            metadata_capacity()
+                .clone()
+                .try_acquire_many_owned(before as u32)
+                .unwrap(),
+        ));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        let old = snapshot.items[0].clone();
+        snapshot.items[0] = Arc::new(chat::Item {
+            content: ItemContent::Text {
+                text: "new needle λ ".repeat(10_000),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ..(*old).clone()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let reply = raw_reply(app.resume_current_find(target, false));
+        assert!(
+            admit().is_none(),
+            "even failed indexing keeps SAME sole admission until error consumption"
+        );
+        let old_reply = reply.clone();
+        let held = preparation::hold_retirement();
+        let epoch = metadata_epoch();
+        drop(blocker);
+        assert_ne!(
+            metadata_epoch(),
+            epoch,
+            "actual competing allocation releases BEFORE delayed completion delivery"
+        );
+        let task = app.handle_chat_ui(reply);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(
+            runtime.find_navigation.raw.accepted.is_none(),
+            "pressure retires this Runtime's own displaced reservation rather than deadlocking replacement"
+        );
+        assert!(runtime.find_navigation.raw.failed.is_none());
+        assert!(runtime.find_searching());
+        assert_eq!(
+            metadata_capacity().available_permits(),
+            before,
+            "old actual plan remains reserved behind stalled FIFO"
+        );
+        let run = runtime.find_navigation.raw.run;
+        let alive = runtime
+            .find_navigation
+            .raw
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            alive.load(Ordering::Acquire),
+            "release-before-delivery makes newest work immediately eligible"
+        );
+        drop(app.handle_chat_ui(old_reply));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.find_navigation.raw.run, run);
+        assert!(Arc::ptr_eq(
+            runtime.find_navigation.raw.in_flight.as_ref().unwrap(),
+            &alive
+        ));
+        assert!(
+            runtime.find_navigation.raw.failed.is_none(),
+            "late duplicate error cannot overwrite admitted newer run"
+        );
+        held.send(()).unwrap();
+        preparation::retirement_barrier();
+        assert_eq!(
+            metadata_capacity().available_permits(),
+            before + own,
+            "own metadata capacity returns only after real old plan destruction"
+        );
+        let reply = raw_reply(task);
+        drop(app.handle_chat_ui(reply));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .find_navigation
+                .raw
+                .complete
+        );
+    }
+    #[test]
+    fn empty_edit_clears_matches_disclosures_and_pending_without_source_capture() {
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        assert_eq!(app.chat_runtime_mut(target).unwrap().find_matches.len(), 1);
+        drop(app.handle_chat_ui(Action::Find(target, String::new())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.find_matches.is_empty());
+        assert_eq!(runtime.find_index, 0);
+        assert!(runtime.find_navigation.pending.is_none());
+        assert!(runtime.find_navigation.raw.stamp.is_none());
+        assert!(runtime.find_navigation.raw.in_flight.is_none());
+        assert!(runtime.find_disclosure.owned_count() == 0);
+    }
+    #[test]
+    fn selected_group_survives_small_metadata_publication_and_next_advances() {
+        let (mut app, target, handle) = runtime("first needle");
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "second".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "second needle".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        }));
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(find_for_test(&mut app, target, "needle".into()));
+        let first = app.chat_runtime_mut(target).unwrap().find_matches[0].clone();
+        assert_eq!(app.chat_runtime_mut(target).unwrap().find_index, 0);
+        snapshot.generation += 1;
+        snapshot.items[0] = Arc::new(chat::Item {
+            at: Some(123),
+            ..(*snapshot.items[0]).clone()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.find_matches[runtime.find_index], first);
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        assert_eq!(app.chat_runtime_mut(target).unwrap().find_index, 1);
+    }
+    #[test]
+    fn visible_failure_is_explicit_and_retry_starts_new_intent() {
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "n".repeat(700_000))));
+        let reply = raw_reply(app.resume_current_find(target, false));
+        drop(app.handle_chat_ui(reply));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let old = runtime.find_navigation.search.load(Ordering::Acquire);
+        assert!(
+            runtime.find_error().unwrap().contains("capacity"),
+            "actual admitted query overflow is a visible refusal, never 0 successful matches"
+        );
+        assert!(!runtime.find_searching());
+        drop(app.handle_chat_ui(Action::FindRetry(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.find_error().is_none());
+        assert_ne!(runtime.find_navigation.search.load(Ordering::Acquire), old);
+    }
 }
 
 #[cfg(test)]
@@ -2243,4 +2490,29 @@ pub(super) fn find_for_test(app: &mut Cagents, target: Target, query: String) ->
         task = app.handle_chat_ui(next);
     }
     panic!("Find group preparation did not settle")
+}
+
+static METADATA_EPOCH: AtomicU64 = AtomicU64::new(0);
+fn metadata_epoch() -> u64 {
+    METADATA_EPOCH.load(Ordering::Acquire)
+}
+fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
+    static METADATA: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    METADATA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
+}
+impl Runtime {
+    pub(super) fn find_error(&self) -> Option<&'static str> {
+        match self.find_navigation.raw.failed {
+            Some(RawFailure::TooLarge) => {
+                Some("Search exceeds indexing capacity. Narrow the query or transcript.")
+            }
+            Some(RawFailure::Worker) => Some("Search could not finish. Retry search."),
+            _ => None,
+        }
+    }
+    pub(super) fn find_searching(&self) -> bool {
+        self.find.as_ref().is_some_and(|query| !query.is_empty())
+            && !self.find_navigation.raw.complete
+            && self.find_error().is_none()
+    }
 }
