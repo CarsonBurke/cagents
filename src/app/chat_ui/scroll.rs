@@ -47,12 +47,33 @@ pub(super) struct Memory(
     Rc<std::cell::RefCell<Anchor>>,
     Rc<std::cell::RefCell<block::Positions>>,
 );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Edge {
+    Start,
+    End,
+}
+
 struct ReaderState {
     memory: Memory,
     restore: bool,
 }
 
 impl Memory {
+    pub(super) fn edge(&self, subagent: Option<&str>) -> Option<Edge> {
+        self.0
+            .borrow()
+            .contexts
+            .iter()
+            .find(|context| context.subagent.as_deref() == subagent)
+            .and_then(|context| context.edge)
+    }
+    pub(super) fn request_edge(&self, subagent: Option<&str>, edge: Edge) {
+        let mut anchor = self.0.borrow_mut();
+        let index = anchor.context_index(subagent);
+        anchor.clock += 1;
+        anchor.contexts[index].used = anchor.clock;
+        anchor.contexts[index].edge = Some(edge);
+    }
     pub fn clear(&self) {
         *self.0.borrow_mut() = Anchor::default();
         *self.1.borrow_mut() = block::Positions::default();
@@ -163,15 +184,17 @@ impl Memory {
         else {
             return false;
         };
+        if evicted && (saved.geometry.is_some() || saved.edge.is_some()) {
+            return true;
+        }
         let Some((geometry, top)) = saved.geometry.zip(saved.top) else {
             return false;
         };
-        evicted
-            || saved.rows.iter().any(|row| {
-                row.bounds.y + row.bounds.height > top
-                    && row.bounds.y < top + geometry.viewport.height
-                    && pending(&row.id)
-            })
+        saved.rows.iter().any(|row| {
+            row.bounds.y + row.bounds.height > top
+                && row.bounds.y < top + geometry.viewport.height
+                && pending(&row.id)
+        })
     }
 
     pub fn retained_rows(&self) -> usize {
@@ -513,12 +536,73 @@ pub(super) fn locate_logical(
     })
 }
 
-/// Marker consumed only by Find operations. Keyboard/history operations keep
-/// the existing input semantics; a Find correction cannot cancel itself.
+/// Exact-target marker for typed transcript operations. Only Find marks a
+/// correction, so ordinary keyboard/history operations keep input semantics.
 struct FindCorrection {
     target: Option<Target>,
     corrected: bool,
 }
+struct ApplyEdge {
+    target: Target,
+    scope: TranscriptScope,
+    edge: Edge,
+    intent: find_navigation::Intent,
+    document: find_navigation::DocumentEpoch,
+}
+impl ApplyEdge {
+    fn current(&self) -> bool {
+        self.intent.document_current(self.document)
+    }
+}
+impl<T: 'static> Operation<T> for ApplyEdge {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+        if self.current() {
+            let before = self.scope.begin();
+            visit(self);
+            self.scope.restore(before);
+        }
+    }
+    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+        if self.current()
+            && let Some(marker) = state.downcast_ref::<FindCorrection>()
+        {
+            self.scope.authorize(marker.target, self.target);
+        }
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        _: Rectangle,
+        _: Rectangle,
+        _: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if self.current()
+            && id == Some(&card_control_id(self.target.card, "chat-transcript"))
+            && self.scope.enter_root()
+        {
+            state.snap_to(iced::widget::scrollable::RelativeOffset {
+                x: None,
+                y: Some(if self.edge == Edge::Start { 1.0 } else { 0.0 }),
+            });
+        }
+    }
+}
+pub(super) fn snap_to_edge(
+    target: Target,
+    edge: Edge,
+    intent: find_navigation::Intent,
+    document: find_navigation::DocumentEpoch,
+) -> iced::Task<Message> {
+    iced::advanced::widget::operate(ApplyEdge {
+        target,
+        scope: TranscriptScope::default(),
+        edge,
+        intent,
+        document,
+    })
+}
+
 struct ApplyFind {
     target: Target,
     scope: TranscriptScope,
@@ -755,6 +839,7 @@ struct Context {
     top: Option<f32>,
     used: u64,
     follow_end: bool,
+    edge: Option<Edge>,
 }
 
 impl Context {
@@ -879,37 +964,8 @@ struct Anchor {
 }
 
 impl Anchor {
-    fn geometry(&self) -> Option<Geometry> {
-        self.active.and_then(|index| self.contexts[index].geometry)
-    }
-
-    #[cfg(test)]
-    fn layout(
-        &mut self,
-        subagent: Option<&str>,
-        rows: &[(&str, Rectangle)],
-        next: Geometry,
-        current_top: Option<f32>,
-    ) -> Option<f32> {
-        self.layout_following(subagent, rows, next, current_top, true)
-    }
-
-    fn layout_following(
-        &mut self,
-        subagent: Option<&str>,
-        rows: &[(&str, Rectangle)],
-        next: Geometry,
-        current_top: Option<f32>,
-        follow_end: bool,
-    ) -> Option<f32> {
-        if let Some(index) = self.active
-            && let Some(top) = current_top
-        {
-            self.contexts[index].top = Some(top);
-        }
-        let previous_active = self.active;
-        let index = self
-            .contexts
+    fn context_index(&mut self, subagent: Option<&str>) -> usize {
+        self.contexts
             .iter()
             .position(|context| context.subagent.as_deref() == subagent)
             .unwrap_or_else(|| {
@@ -942,7 +998,39 @@ impl Anchor {
                     });
                     self.contexts.len() - 1
                 }
-            });
+            })
+    }
+
+    fn geometry(&self) -> Option<Geometry> {
+        self.active.and_then(|index| self.contexts[index].geometry)
+    }
+
+    #[cfg(test)]
+    fn layout(
+        &mut self,
+        subagent: Option<&str>,
+        rows: &[(&str, Rectangle)],
+        next: Geometry,
+        current_top: Option<f32>,
+    ) -> Option<f32> {
+        self.layout_following(subagent, rows, next, current_top, true)
+    }
+
+    fn layout_following(
+        &mut self,
+        subagent: Option<&str>,
+        rows: &[(&str, Rectangle)],
+        next: Geometry,
+        current_top: Option<f32>,
+        follow_end: bool,
+    ) -> Option<f32> {
+        if let Some(index) = self.active
+            && let Some(top) = current_top
+        {
+            self.contexts[index].top = Some(top);
+        }
+        let previous_active = self.active;
+        let index = self.context_index(subagent);
         self.clock += 1;
         let seed = self.seed.take();
         let context = &mut self.contexts[index];
@@ -965,8 +1053,19 @@ impl Anchor {
         // after reflow even when the desired bottom distance is unchanged.
         let freeze_reading = old_bottom.is_some_and(|bottom| bottom > 0.5)
             && context.geometry.is_some_and(|previous| previous != next);
-        let top = context.position(next, rows, follow_end);
-        context.follow_end = follow_end;
+        let edge = context.edge;
+        let top = match edge {
+            Some(Edge::Start) => 0.0,
+            Some(Edge::End) => next.travel(),
+            None => context.position(next, rows, follow_end),
+        };
+        // Either explicit edge remains deliberate while a nonempty prepared
+        // source fits, including a child that would otherwise start on growth.
+        // A genuine empty reset consumes it.
+        if next.travel() > 0.0 || rows.is_empty() {
+            context.edge = None;
+        }
+        context.follow_end = follow_end && (rows.is_empty() || edge != Some(Edge::Start));
         let bottom = next.travel() - top;
         context.used = self.clock;
         context.remember(next, rows, top);
@@ -974,8 +1073,11 @@ impl Anchor {
         if switched {
             self.pending_input = false;
         }
-        (switched || freeze_reading || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
-            .then_some(bottom)
+        (edge.is_some()
+            || switched
+            || freeze_reading
+            || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
+        .then_some(bottom)
     }
 }
 
@@ -1195,6 +1297,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<ReaderState>();
+        if state.memory.edge(self.subagent).is_some() {
+            state.restore = true;
+        }
         let switching = state.memory.0.borrow().active.is_none_or(|index| {
             state.memory.0.borrow().contexts[index].subagent.as_deref() != self.subagent
         });
@@ -1357,7 +1462,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             let mut anchor = state.memory.0.borrow_mut();
             if let Some(top) = after.0 {
                 let changed = before.0.is_some_and(|before| before != top);
-                if changed || correction.corrected {
+                let retain_edge = self.restoration_pending
+                    && !correction.corrected
+                    && anchor.contexts.iter().any(|context| {
+                        context.subagent.as_deref() == self.subagent && context.edge.is_some()
+                    });
+                if (changed || correction.corrected) && !retain_edge {
                     state.restore = false;
                     if let Some(index) = anchor
                         .contexts
@@ -1366,6 +1476,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     {
                         anchor.active = Some(index);
                         let context = &mut anchor.contexts[index];
+                        context.edge = None;
                         context.top = Some(top);
                         if self.restoration_pending {
                             context.geometry = Some(Geometry {
@@ -1475,6 +1586,22 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             let state = tree.state.downcast_mut::<ReaderState>();
             let mut anchor = state.memory.0.borrow_mut();
             let moved = before.0.is_some_and(|before| before != top);
+            let wheel_intent = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+                && cursor.is_over(layout.bounds())
+                && cursor.is_over(*viewport)
+                && !self
+                    .captured
+                    .as_ref()
+                    .is_some_and(|captured| captured.get());
+            if moved || wheel_intent {
+                if let Some(context) = anchor
+                    .contexts
+                    .iter_mut()
+                    .find(|context| context.subagent.as_deref() == self.subagent)
+                {
+                    context.edge = None;
+                }
+            }
             if state.restore && self.restoration_pending && !moved {
                 return;
             }
@@ -2013,6 +2140,7 @@ mod tests {
             .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
         assert_eq!(actual.0, Some(600.0));
         drop(tree);
+        memory.request_edge(None, Edge::End);
         let mut pending = make(None, true, 500);
         let mut tree = Tree::new(&pending);
         let node = pending
@@ -2044,6 +2172,7 @@ mod tests {
             tree.state.downcast_ref::<ReaderState>().restore,
             "stale Find cannot replace the pending saved reader"
         );
+        assert_eq!(memory.edge(None), Some(Edge::End));
         pending.as_widget_mut().operate(
             &mut tree,
             Layout::new(&node),
@@ -2053,6 +2182,11 @@ mod tests {
         assert!(
             !tree.state.downcast_ref::<ReaderState>().restore,
             "an accepted current Find owns the new native position"
+        );
+        assert_eq!(
+            memory.edge(None),
+            None,
+            "only a current accepted Find supersedes the pending edge"
         );
         let mut ready = make(None, false, 500);
         tree.diff(ready.as_widget_mut());
@@ -2066,6 +2200,250 @@ mod tests {
             Some(900.0),
             "cold completion must not undo the accepted Find correction"
         );
+    }
+
+    #[test]
+    fn cold_fitting_native_home_end_and_wheel_keep_explicit_context_intent() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 9,
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        for context in [None, Some("child")] {
+            for (edge, wheel_cancels) in
+                [(Edge::Start, false), (Edge::End, false), (Edge::End, true)]
+            {
+                let memory = Memory::default();
+                let make = |pending, height| {
+                    transcript_observed(
+                        widget::column::with_children(
+                            ["first", "middle", "last"]
+                                .into_iter()
+                                .map(|id| {
+                                    item(
+                                        id,
+                                        widget::Space::new().height(height).width(Length::Fill),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        target,
+                        context,
+                        vec![],
+                        true,
+                        ["first", "middle", "last"]
+                            .into_iter()
+                            .map(|id| (item_id(id), id))
+                            .collect(),
+                        Observations::default(),
+                        memory.clone(),
+                        pending,
+                        None,
+                    )
+                };
+                {
+                    let mut element = make(false, 500);
+                    let mut tree = Tree::new(&element);
+                    let node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut SetBottom(500.0),
+                    );
+                }
+                memory.request_edge(context, edge);
+                let mut pending = make(true, 20);
+                let mut tree = Tree::new(&pending);
+                let node = pending
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut snap = operation::scrollable::snap_to::<()>(
+                    card_control_id(target.card, "chat-transcript"),
+                    iced::widget::scrollable::RelativeOffset {
+                        x: None,
+                        y: Some(if edge == Edge::Start { 1.0 } else { 0.0 }),
+                    },
+                );
+                let mut before = ReadTop::default();
+                pending.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut before,
+                );
+                pending.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut snap,
+                );
+                let mut after = ReadTop::default();
+                pending.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                assert_eq!(
+                    (before.0, after.0),
+                    (Some(0.0), Some(0.0)),
+                    "fitting native operation has no translation change"
+                );
+                assert_eq!(memory.edge(context), Some(edge));
+                if wheel_cancels {
+                    pending.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::WheelScrolled {
+                            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                        }),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                        &renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut Shell::new(&mut vec![]),
+                        &Rectangle::with_size(Size::new(720.0, 400.0)),
+                    );
+                    assert_eq!(
+                        memory.edge(context),
+                        None,
+                        "a later deliberate native wheel supersedes the pending edge"
+                    );
+                }
+                if !wheel_cancels {
+                    let mut fitting_ready = make(false, 20);
+                    tree.diff(fitting_ready.as_widget_mut());
+                    fitting_ready
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    assert_eq!(
+                        memory.edge(context),
+                        Some(edge),
+                        "authoritative fitting child/parent Ready keeps either explicit edge through later growth"
+                    );
+                }
+                let mut ready = make(false, 500);
+                tree.diff(ready.as_widget_mut());
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut actual = ReadTop::default();
+                ready.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut actual,
+                );
+                assert_eq!(
+                    actual.0,
+                    Some(if wheel_cancels {
+                        600.0
+                    } else if edge == Edge::Start {
+                        0.0
+                    } else {
+                        1100.0
+                    })
+                );
+                assert_eq!(memory.edge(context), None);
+                memory.request_edge(context, Edge::End);
+                let mut empty = transcript_observed(
+                    widget::Space::new().height(0).width(Length::Fill),
+                    target,
+                    context,
+                    vec![],
+                    true,
+                    vec![],
+                    Observations::default(),
+                    memory.clone(),
+                    false,
+                    None,
+                );
+                tree.diff(empty.as_widget_mut());
+                empty.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    memory.edge(context),
+                    None,
+                    "an authoritative truly empty transcript consumes the pending edge"
+                );
+                memory.request_edge(Some("child"), Edge::Start);
+                memory.request_edge(None, Edge::End);
+                assert_eq!(memory.edge(Some("child")), Some(Edge::Start));
+                memory.clear();
+                assert_eq!(memory.edge(Some("child")), None);
+                assert_eq!(memory.edge(context), None);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_edge_operation_refuses_new_generation_and_source_document() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 2,
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        for changed_generation in [false, true] {
+            let navigation = find_navigation::State::default();
+            let mut queued = ApplyEdge {
+                target,
+                scope: TranscriptScope::default(),
+                edge: Edge::Start,
+                intent: navigation.guard(),
+                document: navigation.document_epoch(),
+            };
+            let current = if changed_generation {
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                }
+            } else {
+                navigation.changed_document();
+                target
+            };
+            let mut element = transcript_observed(
+                item(
+                    "body",
+                    widget::Space::new().height(2000).width(Length::Fill),
+                ),
+                current,
+                None,
+                vec![],
+                true,
+                vec![(item_id("body"), "body")],
+                Observations::default(),
+                Memory::default(),
+                false,
+                None,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(500.0),
+            );
+            let mut before = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut queued);
+            let mut after = ReadTop::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+            assert_eq!(before.0, Some(1100.0));
+            assert_eq!(
+                after.0, before.0,
+                "a held typed edge task cannot scroll a newer target or source document"
+            );
+        }
     }
 
     fn native_logical_location(

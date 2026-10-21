@@ -1915,17 +1915,33 @@ impl Runtime {
                         .collect(),
                     self.observed_scroll.clone(),
                     self.scroll_memory.clone(),
-                    self.scroll_memory.restoration_pending(
-                        self.selected_subagent.as_deref(),
-                        self.presentation_evicted,
-                        |id| {
-                            self.active_item(id).is_some()
-                                && self
-                                    .presentation_cache()
-                                    .get(id)
+                    if let Some(edge) = self.scroll_memory.edge(self.selected_subagent.as_deref()) {
+                        self.presentation_evicted || {
+                            let items = selected
+                                .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice());
+                            match edge {
+                                scroll::Edge::Start => items.first(),
+                                scroll::Edge::End => items.last(),
+                            }
+                            .is_some_and(|item| {
+                                self.presentation_cache()
+                                    .get(&item.id)
                                     .is_none_or(|cached| cached.placeholder)
-                        },
-                    ),
+                            })
+                        }
+                    } else {
+                        self.scroll_memory.restoration_pending(
+                            self.selected_subagent.as_deref(),
+                            self.presentation_evicted,
+                            |id| {
+                                self.active_item(id).is_some()
+                                    && self
+                                        .presentation_cache()
+                                        .get(id)
+                                        .is_none_or(|cached| cached.placeholder)
+                            },
+                        )
+                    },
                     Some(self.find_navigation.guard()),
                 ),
                 target,
@@ -7498,6 +7514,342 @@ mod tests {
             (actual - expected).abs() <= 1.0,
             "actual App/native Tree restored {actual} instead of {expected}"
         );
+    }
+
+    #[test]
+    fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        for command in ["Home", "End", "Latest"] {
+            struct Reader {
+                id: widget::Id,
+                move_bottom: Option<f32>,
+                top: Option<f32>,
+                travel: Option<f32>,
+            }
+            impl Operation for Reader {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    viewport: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    state: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&self.id) {
+                        self.top = Some(translation.y);
+                        self.travel = Some((content.height - viewport.height).max(0.0));
+                        if let Some(bottom) = self.move_bottom.take() {
+                            state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(bottom),
+                            });
+                        }
+                    }
+                }
+            }
+            fn runtime(app: &Cagents, target: Target) -> &Runtime {
+                match &app.cards[&target.card] {
+                    CardRuntime::Chat(runtime) => runtime,
+                    _ => panic!("fixture chat"),
+                }
+            }
+            fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+                runtime(app, target).view(
+                    None,
+                    false,
+                    true,
+                    &app.settings.keyboard_shortcuts,
+                    620.0,
+                    Place {
+                        name: "restore-fixture".into(),
+                        branch: None,
+                        channel: None,
+                    },
+                    true,
+                    None,
+                    vec![],
+                )
+            }
+            fn dispatch(app: &mut Cagents, target: Target, command: &str) -> Task<Message> {
+                if command == "Latest" {
+                    app.handle_chat_ui(Action::Latest(target))
+                } else {
+                    let key = if command == "Home" {
+                        keyboard::key::Named::Home
+                    } else {
+                        keyboard::key::Named::End
+                    };
+                    app.chat_scroll_key(&keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key.clone()),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    })
+                    .expect("actual chat keyboard dispatch")
+                }
+            }
+            let source = (0..80)
+                .map(|index| {
+                    format!(
+                        "## Section {index:04}\n\nReading paragraph {index:04}: {}\n\n",
+                        "ordinary text ".repeat(12)
+                    )
+                })
+                .collect::<String>();
+            let item = chat::Item {
+                id: "cold-rich".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: source,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut seeded = (*handle.snapshot()).clone();
+            let mut child_item = (*seeded.items[0]).clone();
+            child_item.id = "child-rich".into();
+            seeded.subagents.push(chat::Subagent {
+                id: "selected-child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child_item)],
+            });
+            handle.replace_snapshot_for_test(seeded);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let scroll = card_control_id(target.card, "chat-transcript");
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node| {
+                let mut reader = Reader {
+                    id: scroll.clone(),
+                    move_bottom: None,
+                    top: None,
+                    travel: None,
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                (
+                    reader.top.expect("actual native transcript"),
+                    reader.travel.unwrap(),
+                )
+            };
+            let expected;
+            {
+                let mut element = view(&app, target);
+                let mut tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(700.0),
+                    top: None,
+                    travel: None,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                expected = read(&mut element, &mut tree, &node).0;
+                assert!(expected > 500.0);
+                // No subsequent layout: hide immediately after actual navigation.
+            }
+            let snapshot = (*runtime(&app, target).snapshot).clone();
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(false)
+                .unwrap();
+            preparation::retirement_barrier();
+            assert!(runtime(&app, target).cache.is_empty());
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .set_visible(true)
+                .unwrap();
+            let mut tree;
+            {
+                let mut empty_wait = view(&app, target);
+                tree = Tree::new(&empty_wait);
+                empty_wait
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            handle.replace_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).cache["cold-rich"].placeholder);
+            assert!(runtime(&app, target).preparation.contains("cold-rich"));
+            let stale = Target {
+                generation: target.generation + 1,
+                ..target
+            };
+            assert!(
+                iced::runtime::task::into_stream(app.handle_chat_ui(Action::Latest(stale)))
+                    .is_none(),
+                "stale generation cannot emit a card-ID-only scroll operation"
+            );
+            assert_eq!(runtime(&app, target).scroll_memory.edge(None), None);
+            let task = dispatch(&mut app, target, command);
+            {
+                let mut placeholder = view(&app, target);
+                tree.diff(placeholder.as_widget_mut());
+                let node = placeholder
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut placeholder, &mut tree, &node);
+                assert_eq!(before, (0.0, 0.0), "actual cold App placeholder fits");
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(task)
+                        .expect("actual keyboard/Latest native operation");
+                    let action = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .expect("native operation effect");
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("expected actual widget operation");
+                    };
+                    placeholder.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut placeholder, &mut tree, &node),
+                    before,
+                    "actual fitting snap has unchanged native translation"
+                );
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            assert!(!runtime(&app, target).cache["cold-rich"].placeholder);
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node);
+            assert!(
+                actual.1 > 500.0,
+                "actual authoritative Ready remains the large transcript"
+            );
+            assert!(
+                (actual.0 - if command == "Home" { 0.0 } else { actual.1 }).abs() <= 1.0,
+                "actual App/native Tree {command} produced {actual:?} instead of the explicit edge (old reading top {expected})"
+            );
+            drop(ready);
+            let held = dispatch(&mut app, target, command);
+            drop(app.handle_chat_ui(Action::SelectSubagent(
+                target,
+                Some("selected-child".into()),
+            )));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            {
+                let mut child = view(&app, target);
+                tree.diff(child.as_widget_mut());
+                let node = child.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut movement = Reader {
+                    id: scroll.clone(),
+                    move_bottom: Some(300.0),
+                    top: None,
+                    travel: None,
+                };
+                child.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut movement,
+                );
+                let before = read(&mut child, &mut tree, &node);
+                assert!(before.0 > 500.0 && before.0 < before.1);
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(held)
+                        .expect("held actual App edge dispatch");
+                    let action = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .expect("held widget effect");
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("widget operation");
+                    };
+                    child.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                });
+                executor.shutdown_background();
+                assert_eq!(
+                    read(&mut child, &mut tree, &node),
+                    before,
+                    "held parent Home/End/Latest cannot affect selected child"
+                );
+            }
+            assert_eq!(
+                runtime(&app, target)
+                    .scroll_memory
+                    .edge(Some("selected-child")),
+                None
+            );
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(if command == "Home" {
+                    scroll::Edge::Start
+                } else {
+                    scroll::Edge::End
+                })
+            );
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let mut parent = view(&app, target);
+            tree.diff(parent.as_widget_mut());
+            let node = parent.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut parent, &mut tree, &node);
+            assert!(actual.1 > 500.0);
+            assert!(
+                (actual.0 - if command == "Home" { 0.0 } else { actual.1 }).abs() <= 1.0,
+                "original selected context retains its own explicit edge"
+            );
+        }
     }
 
     #[test]

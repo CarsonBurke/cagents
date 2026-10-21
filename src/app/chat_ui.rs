@@ -5163,13 +5163,26 @@ impl Cagents {
                     },
                 )
             }
-            Named::Home | Named::End => iced::widget::scrollable::snap_to(
-                id,
-                iced::widget::scrollable::RelativeOffset {
-                    x: None,
-                    y: Some(if *key == Named::Home { 1.0 } else { 0.0 }),
-                },
-            ),
+            Named::Home | Named::End => {
+                let edge = if *key == Named::Home {
+                    scroll::Edge::Start
+                } else {
+                    scroll::Edge::End
+                };
+                runtime.find_navigation.cancel();
+                runtime
+                    .scroll_memory
+                    .request_edge(runtime.selected_subagent.as_deref(), edge);
+                return Some(
+                    scroll::snap_to_edge(
+                        runtime.target,
+                        edge,
+                        runtime.find_navigation.guard(),
+                        runtime.find_navigation.document_epoch(),
+                    )
+                    .map(cosmic::Action::App),
+                );
+            }
             _ => return None,
         };
         runtime.find_navigation.cancel();
@@ -9604,36 +9617,39 @@ impl Cagents {
                 }
             }
             Action::Latest(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_navigation.cancel();
-                    if runtime.selected_subagent.is_none() {
-                        if runtime.pending.is_some() {
-                            if !runtime
-                                .pending
-                                .as_ref()
-                                .is_some_and(|pending| pending.page == Some(view::Page::Latest))
-                            {
-                                runtime.deferred_page = Some(HistoryNavigation::Latest);
-                            }
-                            return Task::none();
-                        }
-                        if runtime.snapshot.has_later
-                            || runtime.snapshot.history_loading
-                            || runtime
-                                .page_request
-                                .is_some_and(|(page, _)| page == view::Page::Earlier)
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                runtime.find_navigation.cancel();
+                if runtime.selected_subagent.is_none() {
+                    if runtime.pending.is_some() {
+                        if !runtime
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.page == Some(view::Page::Latest))
                         {
-                            return self.chat_send(target, Command::Refresh, false);
+                            runtime.deferred_page = Some(HistoryNavigation::Latest);
                         }
-                        runtime.unseen_activity = false;
+                        return Task::none();
                     }
+                    if runtime.snapshot.has_later
+                        || runtime.snapshot.history_loading
+                        || runtime
+                            .page_request
+                            .is_some_and(|(page, _)| page == view::Page::Earlier)
+                    {
+                        return self.chat_send(target, Command::Refresh, false);
+                    }
+                    runtime.unseen_activity = false;
                 }
-                return iced::widget::scrollable::snap_to(
-                    card_control_id(target.card, "chat-transcript"),
-                    iced::widget::scrollable::RelativeOffset {
-                        x: None,
-                        y: Some(0.0),
-                    },
+                runtime
+                    .scroll_memory
+                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::End);
+                return scroll::snap_to_edge(
+                    target,
+                    scroll::Edge::End,
+                    runtime.find_navigation.guard(),
+                    runtime.find_navigation.document_epoch(),
                 )
                 .map(cosmic::Action::App);
             }
