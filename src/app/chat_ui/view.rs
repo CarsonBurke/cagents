@@ -7364,7 +7364,7 @@ mod tests {
                 if id == Some(&self.id) {
                     self.top = Some(translation.y);
                     if let Some(bottom) = self.move_bottom.take() {
-                        state.scroll_to(widget::scrollable::AbsoluteOffset {
+                        state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
                             x: None,
                             y: Some(bottom),
                         });
