@@ -95,30 +95,45 @@ impl Default for Stream {
 
 #[cfg(any(feature = "host", test))]
 impl Stream {
+    /// Continue decoding after an authoritative whole-output snapshot. The
+    /// snapshot owns its partial escape/CR grammar, not a superseded stream.
+    /// No visible output or control payload is allocated by this pass.
+    pub(super) fn from_snapshot(raw: &str) -> Self {
+        let mut stream = Self::default();
+        for character in raw.chars() {
+            stream.consume(character, |_| {});
+        }
+        stream
+    }
+
     /// What `delta` adds to the output shown so far.
     pub(super) fn push(&mut self, delta: &str) -> String {
         let mut shown = String::new();
         for character in delta.chars() {
-            if !self.visible(character) {
-                continue;
-            }
-            match character {
-                '\r' => self.returned = true,
-                '\n' => {
-                    shown.push('\n');
-                    self.returned = false;
-                    self.fresh = true;
-                }
-                character => {
-                    if std::mem::take(&mut self.returned) && !self.fresh {
-                        shown.push('\n');
-                    }
-                    shown.push(character);
-                    self.fresh = false;
-                }
-            }
+            self.consume(character, |character| shown.push(character));
         }
         shown
+    }
+
+    fn consume(&mut self, character: char, mut emit: impl FnMut(char)) {
+        if !self.visible(character) {
+            return;
+        }
+        match character {
+            '\r' => self.returned = true,
+            '\n' => {
+                emit('\n');
+                self.returned = false;
+                self.fresh = true;
+            }
+            character => {
+                if std::mem::take(&mut self.returned) && !self.fresh {
+                    emit('\n');
+                }
+                emit(character);
+                self.fresh = false;
+            }
+        }
     }
 
     fn visible(&mut self, character: char) -> bool {

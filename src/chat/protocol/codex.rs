@@ -61,6 +61,9 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
+// Reserve for every possible byte count, leaving the rest for real output.
+const OUTPUT_MARKER_BYTES: usize =
+    "\n[...  bytes omitted ...]\n".len() + usize::MAX.ilog10() as usize + 1;
 /// Output keeps its first quarter and a rolling tail, with accounting kept
 /// separately from provider text so marker-like output cannot forge omission.
 #[derive(Default)]
@@ -78,7 +81,7 @@ fn append_display_output(
     if delta.is_empty() {
         return false;
     }
-    if limit < 64 {
+    if limit < OUTPUT_MARKER_BYTES + 4 {
         // Large command identity fields can leave very little output budget.
         // Preserve the newest UTF-8-safe suffix even when no marker fits.
         if delta.len() >= limit {
@@ -98,7 +101,7 @@ fn append_display_output(
         return true;
     }
     // Reserve enough space for the largest usize count and marker punctuation.
-    let budget = limit.saturating_sub(64);
+    let budget = limit.saturating_sub(OUTPUT_MARKER_BYTES);
     let (head, tail) = if window.omitted == 0 {
         let mut whole = std::mem::take(output);
         whole.push_str(delta);
@@ -1134,6 +1137,13 @@ impl Codex {
             if replace || !self.active_items.contains_key(&item.id) {
                 self.output_streams.remove(&item.id);
                 self.output_windows.remove(&item.id);
+                if value["type"] == "commandExecution" {
+                    let raw = value["aggregatedOutput"].as_str().unwrap_or_default();
+                    self.output_streams.insert(
+                        item.id.clone(),
+                        super::terminal_output::Stream::from_snapshot(raw),
+                    );
+                }
                 if let Some(window) = window {
                     self.output_windows.insert(item.id.clone(), window);
                 }
@@ -4059,7 +4069,11 @@ mod tests {
         for snapshot in ["item", "turn", "history"] {
             for (raw, suffix, expected) in [
                 ("before🦀\u{1b}[", "31m-tail", "before🦀-tail"),
-                ("before🦀\u{1b}]8;;https://example.test/", "\u{7}tail", "before🦀tail"),
+                (
+                    "before🦀\u{1b}]8;;https://example.test/",
+                    "\u{7}tail",
+                    "before🦀tail",
+                ),
                 ("before🦀\u{1b}Ppayload\u{1b}", "\\tail", "before🦀tail"),
                 ("before🦀\r", "after", "before🦀\nafter"),
             ] {
@@ -4068,8 +4082,12 @@ mod tests {
                 adapter.receive(output_window_started("")).unwrap();
                 adapter.receive(output_window_delta("old\u{1b}[")).unwrap();
                 match snapshot {
-                    "item" => { adapter.receive(output_window_started(raw)).unwrap(); }
-                    "turn" => { adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}}})).unwrap(); }
+                    "item" => {
+                        adapter.receive(output_window_started(raw)).unwrap();
+                    }
+                    "turn" => {
+                        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}}})).unwrap();
+                    }
                     "history" => {
                         let key = item_key("window-turn", "window-cmd");
                         adapter.active_items.remove(&key);
@@ -4081,8 +4099,14 @@ mod tests {
                 }
                 adapter.receive(output_window_delta(suffix)).unwrap();
                 let key = item_key("window-turn", "window-cmd");
-                let ItemContent::Command { output, .. } = &adapter.active_items[&key].content else { panic!("command output"); };
-                assert_eq!(output, expected, "{snapshot} snapshot must seed its own terminal continuation, not the old stream or default grammar");
+                let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                else {
+                    panic!("command output");
+                };
+                assert_eq!(
+                    output, expected,
+                    "{snapshot} snapshot must seed its own terminal continuation, not the old stream or default grammar"
+                );
             }
         }
     }
@@ -4095,7 +4119,10 @@ mod tests {
             let mut window = OutputWindow::default();
             append_display_output(&mut output, &source, limit, &mut window);
             assert!(output.len() <= limit);
-            assert!(output.ends_with("LAST🦀\n"), "a {limit}-byte window has room for its marker and newest line");
+            assert!(
+                output.ends_with("LAST🦀\n"),
+                "a {limit}-byte window has room for its marker and newest line"
+            );
             let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
             assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
         }
@@ -4120,7 +4147,6 @@ mod tests {
                 output_window_started(replacement)
             };
             adapter.receive(frame).unwrap();
-            assert!(!adapter.output_streams.contains_key(&key));
             let window = adapter.output_windows.get(&key).unwrap();
             assert_eq!((window.omitted, window.head), (0, 0));
             let delta = "31m-tail🦀";
