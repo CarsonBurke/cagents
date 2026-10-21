@@ -1439,6 +1439,15 @@ impl Runtime {
         }
     }
 
+    fn child_find_revision(&self) -> Option<(u64, u64)> {
+        self.find.as_ref().map(|_| {
+            (
+                self.find_navigation.search_epoch(),
+                find_navigation::query_epoch(self.target),
+            )
+        })
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -1574,7 +1583,7 @@ impl Runtime {
                 (
                     cached.revision,
                     self.item_expanded(&item.id),
-                    &self.find,
+                    self.child_find_revision(),
                     dark,
                 )
                     .hash(&mut revision);
@@ -3568,6 +3577,7 @@ impl Runtime {
         self.find
             .as_ref()
             .filter(|_| self.find_turn_matches(&turn.key))
+            .map(|_| self.find_navigation.search_epoch())
             .hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
@@ -6131,6 +6141,133 @@ mod tests {
         assert!(known.contains("Waiting for your approval"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
+    }
+
+    #[test]
+    fn cold_child_find_acceptance_changes_retained_revision_without_another_query_edit() {
+        use iced::advanced::{layout, widget::Tree};
+        use iced::futures::StreamExt;
+        let item = |id: &str, text: String| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text,
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let (runtime, handle) = frame_cost::live_runtime(&[]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![chat::Subagent {
+            items: vec![
+                item("short", "child needle".into()),
+                item("other", "unrelated ".repeat(5000)),
+            ],
+            ..native_child_fixture()
+        }];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let mut task = app.handle_chat_ui(Action::Find(target, "needle".into()));
+        let before = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .child_find_revision()
+            .unwrap();
+        assert_eq!(
+            before.1, 0,
+            "raw worker has not published the shared Pattern"
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let mut tree = Tree::empty();
+        let render = |app: &mut Cagents, tree: &mut Tree| {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let mut element = runtime.view(
+                None,
+                false,
+                true,
+                &shortcuts,
+                600.0,
+                Place {
+                    name: "project".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            );
+            tree.diff(&element);
+            element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+            );
+        };
+        render(&mut app, &mut tree);
+        let built = virtualized::constructed_rows();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for _ in 0..8 {
+            let next = executor.block_on(async {
+                let mut stream =
+                    iced::runtime::task::into_stream(task).expect("real pending raw Find task");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(effect) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(
+                                action @ (Action::FindGroups(..)
+                                | Action::FindResume(..)
+                                | Action::FindAvailable),
+                            ),
+                        )) = effect
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("raw Find completion");
+                })
+                .await
+                .unwrap()
+            });
+            task = app.handle_chat_ui(next);
+            if find_navigation::query_epoch(target) != 0 {
+                break;
+            }
+        }
+        drop(task);
+        let after = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .child_find_revision()
+            .unwrap();
+        assert_eq!(
+            before.0, after.0,
+            "completion must not invent another user query edit"
+        );
+        assert_ne!(
+            before, after,
+            "accepted Pattern invalidates retained short native child rows"
+        );
+        assert!(after.1 != 0);
+        render(&mut app, &mut tree);
+        assert!(
+            virtualized::constructed_rows() > built,
+            "the existing native Tree rebuilds the changed child row"
+        );
     }
 
     #[test]

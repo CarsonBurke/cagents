@@ -346,9 +346,41 @@ rehashing/copying the full body during UI installation. Hiding evicts these
 body owners with the rest of the cache. A rewrite cannot overwrite a valid
 bookmark before verification.
 
+Literal user messages use the same admitted preparation engine without Markdown
+interpretation. The worker prepares their full text, legacy collapsed preview
+and selection checkpoints. Cold views show a bounded preview until the exact
+current source is ready. A queued first message moves its canonical string into
+an immutable local source and retains the same source reservation through its
+final raw destruction, including cancellation before a subscription starts.
+Compact local follow-ups prepare their preview at explicit submission. Provider
+queue previews reuse immutable records across unrelated publications; changed
+records are copied only within the existing 128-message, 16 KiB source-preview
+limits, with the existing truncation marker appended. Comparing those bounded
+sources on a changed snapshot remains UI work.
+Copy resolves the exact current record at explicit intent and preserves raw
+bytes independently of its displayed preview.
+
 Find Next/Previous retains its existing matching-turn/item counts and temporary
-disclosure ownership. Each selected group is resolved on a single admitted
-worker to its first matching rendered logical block and UTF-8 byte. Navigation
+disclosure ownership. Raw group discovery, provider-aware disclosure plans,
+rendered-block lookup and lazy visible Flow highlights share one try-admitted
+worker. A fixed aggregate small-input path handles tiny searches synchronously.
+Unicode query folding and its matcher table are shared across phases. Large
+sources are scanned on the worker, with cancellation checked inside both query
+preparation and source matching. Highlights bind the exact painted ready source;
+their existing 4,096-range limit applies to each block. Output reservations stay
+with painted range owners, including retained widget clones.
+
+Every normal raw outcome, including failure, retains the same admission through
+message consumption or background disposal. Query and attempt epochs reject old
+errors before they can change a newer search. Metadata pressure retires displaced
+plans and waits for actual metadata capacity release, independently of worker-slot
+wakes. Pending searches and failed searches have distinct visible states; failure
+does not masquerade as a successful zero-match result. Exact unchanged groups can
+remain available during unrelated streamed publications while changed groups
+await current indexing.
+
+Each selected group is resolved to its first matching rendered logical block and
+UTF-8 byte. Navigation
 then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
 geometry, including horizontal readers. One initial coarse realization may be
 needed while matching worker geometry is pending; it belongs to the intent's
@@ -362,6 +394,14 @@ Independent intent and rendered-document epochs guard both async replies and
 the eventual native scroll mutation. Query/context/disclosure/hide changes and
 native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
 queued corrections. A Find scroll does not masquerade as new user input.
+
+The final owners of parser requests, canonical continuations and logical
+selection catalogs transfer their raw allocations to the same reclaimer. This
+also covers subscriptions and retained widgets that outlive cache eviction.
+Canceled and discarded work releases reservations after its actual owned payloads.
+Independent native widget/read clones still contribute to measured event and
+cache-disposal costs; this is not a guarantee that every UI allocation frees on
+the reclaimer.
 
 The pane inspector's diagnostics disclose known source, prepared-presentation
 and logical-selection payload owners for the selected chat. These counters
@@ -382,9 +422,14 @@ detects preparation candidates from bounded item metadata. Exact-source
 disclosure changes reuse those parts and their palettes. Canonical coordination
 graphs and recognition
 metadata also retire off the UI thread. Process measurements must include the
-extra publication graph containers. Logical descendant descriptors and virtual
-column geometry/index rebuilding still visit total metadata on the UI thread;
-they are not claimed constant-time or small for arbitrary rich documents.
+extra publication graph containers. The worker also prepares aggregate subtree
+sizes, code line counts and row estimates. A recursive tree of short quote/list
+children cannot opt into a dense column merely because each immediate list is
+small. Rows share slices of one flat logical outline. Binding that outline to
+an item/root namespace first visits logical metadata on the UI thread; later
+views reuse the binding. Virtual column geometry/index rebuilding still visits
+its aliases on a revision change. These costs are not claimed constant-time or
+small for arbitrary rich documents.
 Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains
 required.
 

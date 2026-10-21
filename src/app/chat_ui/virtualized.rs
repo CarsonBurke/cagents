@@ -41,6 +41,39 @@ pub(super) struct LogicalRange {
     pub chunk: bool,
 }
 
+/// An immutable prepared outline can back many nested row descriptors. The
+/// range/chunk view is body-free and avoids cloning every descendant per view.
+#[derive(Clone, Default)]
+pub(super) struct LogicalRanges {
+    source: Option<std::sync::Arc<[LogicalRange]>>,
+    range: std::ops::Range<usize>,
+    chunk: bool,
+}
+impl LogicalRanges {
+    pub(super) fn shared(
+        source: std::sync::Arc<[LogicalRange]>,
+        range: std::ops::Range<usize>,
+        chunk: bool,
+    ) -> Self {
+        if range.start > range.end || range.end > source.len() {
+            return Self::default();
+        }
+        Self {
+            source: Some(source),
+            range,
+            chunk,
+        }
+    }
+    pub(super) fn iter(&self) -> impl Iterator<Item = LogicalRange> + '_ {
+        self.source.as_deref().unwrap_or(&[])[self.range.clone()]
+            .iter()
+            .cloned()
+            .map(|mut logical| {
+                logical.chunk |= self.chunk;
+                logical
+            })
+    }
+}
 pub(super) struct Row<'a> {
     pub key: u64,
     pub revision: u64,
@@ -48,7 +81,7 @@ pub(super) struct Row<'a> {
     pub aliases: Vec<Id>,
     pub anchor: bool,
     pub logical: Option<LogicalRange>,
-    pub descendants: Vec<LogicalRange>,
+    pub descendants: LogicalRanges,
     rebuild: Option<Box<dyn Fn() -> Element<'a, Message> + 'a>>,
     build: Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>,
     content: Option<Element<'a, Message>>,
@@ -68,7 +101,7 @@ impl<'a> Row<'a> {
             aliases: id.into_iter().collect(),
             anchor: false,
             logical: None,
-            descendants: vec![],
+            descendants: LogicalRanges::default(),
             rebuild: None,
             build: Some(Box::new(build)),
             content: None,
@@ -88,7 +121,7 @@ impl<'a> Row<'a> {
             aliases: id.into_iter().collect(),
             anchor: false,
             logical: None,
-            descendants: vec![],
+            descendants: LogicalRanges::default(),
             rebuild: Some(Box::new(build)),
             build: None,
             content: None,
@@ -337,7 +370,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 .collect();
             state.logical.clear();
             for (index, row) in self.rows.iter().enumerate() {
-                for logical in row.logical.iter().chain(&row.descendants) {
+                for logical in row.logical.iter().cloned().chain(row.descendants.iter()) {
                     state.logical.entry(logical.identity).or_default().push((
                         logical.bytes.clone(),
                         index,

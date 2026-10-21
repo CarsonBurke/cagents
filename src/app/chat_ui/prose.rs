@@ -319,7 +319,7 @@ pub(super) fn view(
             .into(),
         path: vec![0],
         dark: cosmic::theme::is_dark(),
-        find: find.map(Arc::from),
+        find: find.map(|_| find_navigation::query_epoch(target)),
     }
     .items(cached.markdown.items(), settings)
 }
@@ -369,7 +369,7 @@ pub(super) fn content_view(
                 .unwrap_or_default() as u32,
         ],
         dark: cosmic::theme::is_dark(),
-        find: find.map(Arc::from),
+        find: find.map(|_| find_navigation::query_epoch(target)),
     }
     .items(content.items(), settings)
 }
@@ -416,7 +416,7 @@ struct Renderer {
     reader_context: Option<String>,
     item: Arc<str>,
     path: Vec<u32>,
-    find: Option<Arc<str>>,
+    find: Option<u64>,
     target: Target,
     blocks: Arc<HashMap<u64, Arc<[Span<'static, String>]>>>,
     revision: u64,
@@ -424,75 +424,19 @@ struct Renderer {
 }
 
 impl Renderer {
-    /// Describe logical leaves without plain-text extraction, styling, widget
-    /// creation or shaping. Composite ancestors expose these aliases so Find
-    /// can realize the correct nested row before measuring its exact glyph.
-    fn logical_descendants(&self, items: &[markdown::Item]) -> Vec<virtualized::LogicalRange> {
-        let mut leaves = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            self.child(index as u32).describe(item, &mut leaves);
-        }
-        leaves
+    fn logical_descendants(&self, _items: &[markdown::Item]) -> virtualized::LogicalRanges {
+        self.descendants(false)
     }
-    fn describe(&self, item: &markdown::Item, leaves: &mut Vec<virtualized::LogicalRange>) {
-        let length = match item {
-            markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => Some(text.len()),
-            markdown::Item::CodeBlock { code, .. } => Some(code.len()),
-            _ => None,
-        };
-        if let Some(length) = length {
-            leaves.push(virtualized::LogicalRange {
-                identity: selection::logical_identity(&self.item, &self.path),
-                bytes: 0..length,
-                chunk: false,
-            });
-            return;
-        }
-        match item {
-            markdown::Item::Quote(items) => leaves.extend(self.logical_descendants(items)),
-            markdown::Item::List { bullets, .. } => {
-                for (index, bullet) in bullets.iter().enumerate() {
-                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
-                        bullet;
-                    leaves.extend(self.child(index as u32).logical_descendants(items));
-                }
-            }
-            markdown::Item::Table { columns, rows } => {
-                for (column, header) in columns.iter().enumerate() {
-                    leaves.extend(
-                        self.child(0)
-                            .child(column as u32)
-                            .logical_descendants(&header.header),
-                    );
-                }
-                for (row, cells) in rows.iter().enumerate() {
-                    for (column, cells) in cells.cells.iter().enumerate() {
-                        leaves.extend(
-                            self.child(row as u32 + 1)
-                                .child(column as u32)
-                                .logical_descendants(cells),
-                        );
-                    }
-                }
-            }
-            markdown::Item::Image { alt, title, .. } => {
-                if alt.len() > 0 {
-                    leaves.push(virtualized::LogicalRange {
-                        identity: selection::logical_identity(&self.item, &self.child(0).path),
-                        bytes: 0..alt.len(),
-                        chunk: false,
-                    });
-                }
-                if !title.is_empty() {
-                    leaves.push(virtualized::LogicalRange {
-                        identity: selection::logical_identity(&self.item, &self.child(1).path),
-                        bytes: 0..title.len(),
-                        chunk: false,
-                    });
-                }
-            }
-            _ => {}
-        }
+    fn descendants(&self, chunk: bool) -> virtualized::LogicalRanges {
+        self.document.logical_ranges(
+            &self.item,
+            &self.path[..self.root_path],
+            &self.path[self.root_path..],
+            chunk,
+        )
+    }
+    fn stats(&self) -> prose_document::Stats {
+        self.document.stats(&self.path[self.root_path..])
     }
     fn child(&self, index: u32) -> Self {
         let mut path = self.path.clone();
@@ -543,7 +487,7 @@ impl Renderer {
         items: &[markdown::Item],
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        if items.len() <= 4 {
+        if items.len() <= 4 && self.stats().inline() {
             return widget::column::with_children(
                 items
                     .iter()
@@ -571,22 +515,8 @@ impl Renderer {
                 )
                     .hash(&mut revision);
                 let revision = revision.finish();
-                let estimate = match item {
-                    markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
-                        (text.len() as f32 * settings.text_size.0 * 0.5 / design::READABLE_MEASURE)
-                            .ceil()
-                            .max(1.0)
-                            * settings.text_size.0
-                            * 1.3
-                    }
-                    markdown::Item::CodeBlock { code, .. } => {
-                        (code.bytes().filter(|byte| *byte == b'\n').count().max(1) as f32)
-                            * settings.code_size.0
-                            * 1.3
-                            + 48.0
-                    }
-                    _ => 80.0,
-                } + if index == 0 { 0.0 } else { settings.spacing.0 };
+                let estimate = renderer.stats().estimate(settings)
+                    + if index == 0 { 0.0 } else { settings.spacing.0 };
                 let logical_len = match item {
                     markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
                         Some(text.len())
@@ -595,11 +525,9 @@ impl Renderer {
                     _ => None,
                 };
                 let descendants = if logical_len.is_none() {
-                    let mut leaves = Vec::new();
-                    renderer.describe(item, &mut leaves);
-                    leaves
+                    renderer.descendants(false)
                 } else {
-                    vec![]
+                    Default::default()
                 };
                 let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
                     let renderer = renderer.clone();
@@ -640,7 +568,7 @@ impl Renderer {
                 text,
                 index,
                 self.target,
-                self.find.as_deref(),
+                self.find.map(|_| ""),
                 Some(self.logical_identity(0)),
                 Some(&self.flow_cache),
             ),
@@ -648,7 +576,7 @@ impl Renderer {
                 settings,
                 text,
                 self.target,
-                self.find.as_deref(),
+                self.find.map(|_| ""),
                 Some(self.logical_identity(0)),
                 Some(&self.flow_cache),
             ),
@@ -687,7 +615,7 @@ impl Renderer {
                         image_settings,
                         alt,
                         self.target,
-                        self.find.as_deref(),
+                        self.find.map(|_| ""),
                         Some(self.child(0).logical_identity(0)),
                         Some(&self.flow_cache),
                     ));
@@ -700,7 +628,7 @@ impl Renderer {
                         },
                         title_text,
                         self.target,
-                        self.find.as_deref(),
+                        self.find.map(|_| ""),
                         Some(self.child(1).logical_identity(0)),
                         Some(&self.flow_cache),
                     ));
@@ -749,7 +677,7 @@ impl Renderer {
                 let mut descriptor = virtualized::Row::new(
                     key,
                     self.revision,
-                    64.0 + settings.spacing.0 * 0.75,
+                    renderer.stats().estimate(nested) + settings.spacing.0 * 0.75,
                     None,
                     move || {
                         let prose_document::Node::Bullet(bullet) = renderer.node() else {
@@ -836,24 +764,11 @@ impl Renderer {
             .map(|row| {
                 let renderer = self.child(row as u32);
                 let key = selection::logical_identity(&self.item, &renderer.path);
-                let descendants = columns
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(column, _)| {
-                        let cell = renderer.child(column as u32);
-                        let prose_document::Node::Items(items) = cell.node() else {
-                            unreachable!("cell path")
-                        };
-                        cell.logical_descendants(items)
-                    })
-                    .collect();
+                let descendants = renderer.descendants(false);
+                let estimate = renderer.stats().estimate(settings) + settings.spacing.0;
                 let alignments = alignments.clone();
-                let mut descriptor = virtualized::Row::new(
-                    key,
-                    self.revision,
-                    48.0 + settings.spacing.0,
-                    None,
-                    move || {
+                let mut descriptor =
+                    virtualized::Row::new(key, self.revision, estimate, None, move || {
                         let descriptors = alignments
                             .iter()
                             .enumerate()
@@ -862,13 +777,10 @@ impl Renderer {
                                 let key =
                                     selection::logical_identity(&renderer.item, &renderer.path);
                                 let alignment = *alignment;
-                                let prose_document::Node::Items(items) = renderer.node() else {
+                                let prose_document::Node::Items(_items) = renderer.node() else {
                                     unreachable!("cell path")
                                 };
-                                let mut descendants = renderer.logical_descendants(items);
-                                for logical in &mut descendants {
-                                    logical.chunk = true;
-                                }
+                                let descendants = renderer.descendants(true);
                                 let mut descriptor = virtualized::Row::new(
                                     key,
                                     renderer.revision,
@@ -889,9 +801,8 @@ impl Renderer {
                                 descriptor
                             })
                             .collect();
-                        virtualized::row(descriptors, 48.0 + settings.spacing.0, Default::default())
-                    },
-                );
+                        virtualized::row(descriptors, estimate, Default::default())
+                    });
                 descriptor.descendants = descendants;
                 descriptor.anchor = true;
                 descriptor
@@ -954,7 +865,7 @@ impl Renderer {
             settings.code_size,
             CodeBlock::FONT,
             self.target,
-            self.find.as_deref(),
+            self.find.map(|_| ""),
             Some(self.logical(Arc::from(""), 0)),
             Some(self.flow_cache.clone()),
             Some(reader_source.clone()),
@@ -1094,7 +1005,7 @@ pub(super) fn code_text(
         starts.push(starts.last().copied().unwrap() + span.text.len());
     }
     let starts: Arc<[usize]> = starts.into();
-    let find: Option<Arc<str>> = find.map(Arc::from);
+    let find = find.map(|_| find_navigation::query_epoch(target));
     let mut ranges = Vec::new();
     let mut start = 0;
     for line in text.split_inclusive('\n') {
@@ -1128,7 +1039,7 @@ pub(super) fn code_text(
             let text = text.clone();
             let spans = spans.clone();
             let starts = starts.clone();
-            let find = find.clone();
+            let find = find;
             let flow_cache = flow_cache.clone();
             let reader_source = reader_source.clone();
             let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
@@ -1154,7 +1065,7 @@ pub(super) fn code_text(
                         size,
                         font,
                         target,
-                        find.as_deref(),
+                        find.map(|_| ""),
                         logical.clone(),
                     ))
                     .height(line_height)
@@ -1190,7 +1101,7 @@ fn code_line(
     size: iced::Pixels,
     font: iced::Font,
     target: Target,
-    find: Option<Arc<str>>,
+    find: Option<u64>,
     logical: Option<selectable_prose::Logical>,
     flow_cache: Option<flow_layout::Cache>,
     reader_source: Option<reader_source::Source>,
@@ -1216,7 +1127,7 @@ fn code_line(
             size,
             font,
             target,
-            find.as_deref(),
+            find.map(|_| ""),
             logical,
             flow,
         );
@@ -1226,7 +1137,7 @@ fn code_line(
     } else {
         sliced_spans(&spans, &starts, range)
     };
-    leaf_text(styled, size, font, target, find.as_deref(), logical)
+    leaf_text(styled, size, font, target, find.map(|_| ""), logical)
 }
 
 pub(super) fn sliced_spans(
@@ -1420,6 +1331,128 @@ mod tests {
             markdown::materialized_bytes(),
             before,
             "UI realization must not copy full plain text or style thousands of inline spans"
+        );
+    }
+
+    #[test]
+    fn admitted_recursive_small_quotes_mount_only_native_viewport_leaves_with_find() {
+        use iced::advanced::{layout, widget::Tree};
+        use iced::futures::StreamExt;
+        fn residents(tree: &Tree) -> (usize, usize) {
+            let own = usize::from(
+                tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>(),
+            );
+            tree.children
+                .iter()
+                .fold((1, own), |(widgets, leaves), child| {
+                    let (nested, prose) = residents(child);
+                    (widgets + nested, leaves + prose)
+                })
+        }
+        let source = prose_document::recursive_quote_fixture(8);
+        let source_bytes = source.len();
+        let (mut runtime, handle) = view::prepared_runtime_for_test(&[]);
+        let target = runtime.target;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "recursive-small-quotes".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: source,
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        }));
+        handle.publish_delta_snapshot_for_test(snapshot);
+        let parsed_on_ui = markdown::parser_work_bytes_on_thread();
+        let copied_on_ui = markdown::cloned_items();
+        runtime.refresh();
+        assert!(runtime.cache["recursive-small-quotes"].placeholder);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let subscriptions = runtime.preparation.subscriptions(target);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut completed = 0;
+        for subscription in subscriptions {
+            for recipe in iced::advanced::subscription::into_recipes(subscription) {
+                let message = executor.block_on(async {
+                    let mut stream = recipe.stream(iced::futures::stream::empty().boxed());
+                    tokio::time::timeout(Duration::from_secs(10), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                });
+                assert!(
+                    matches!(message, Message::ChatUi(Action::MarkdownPrepared(..))),
+                    "actual admitted parser subscription completion"
+                );
+                if let Message::ChatUi(action) = message {
+                    drop(app.handle_chat_ui(action));
+                }
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1);
+        assert!(!app.chat_runtime_mut(target).unwrap().cache["recursive-small-quotes"].placeholder);
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "FW16_RECURSIVE_NEEDLE".into(),
+        ));
+        assert_eq!(app.chat_runtime_mut(target).unwrap().find_matches.len(), 1);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::empty();
+        let materialized = markdown::materialized_bytes();
+        let rows = virtualized::constructed_rows();
+        for _ in 0..2 {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let cached = &runtime.cache["recursive-small-quotes"];
+            let mut element = view(
+                cached,
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                target,
+                runtime.find.as_deref(),
+            );
+            tree.diff(&element);
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+            );
+            let (widgets, leaves) = residents(&tree);
+            assert!(
+                leaves > 0 && leaves < 64,
+                "native short-leaf aggregate escaped the viewport: {leaves}"
+            );
+            assert!(
+                widgets < 1500,
+                "recursive native widget construction escaped viewport: {widgets}"
+            );
+        }
+        assert!(
+            virtualized::constructed_rows() - rows < 100,
+            "recursive row factories remain bounded across a rebuild"
+        );
+        assert!(
+            markdown::materialized_bytes() - materialized < source_bytes / 4,
+            "only mounted native short leaves may materialize spans"
+        );
+        assert_eq!(
+            markdown::parser_work_bytes_on_thread(),
+            parsed_on_ui,
+            "real parser subscriptions do not parse on the UI thread"
+        );
+        assert_eq!(
+            markdown::cloned_items(),
+            copied_on_ui,
+            "native factories retain the admitted immutable graph"
         );
     }
 
