@@ -2736,7 +2736,7 @@ impl PartialEq for CommitComposer {
 impl Eq for CommitComposer {}
 
 /// The complete composer travels with its canonical worktree, including
-/// cursor and editor history. Revisions distinguish later edits from a commit
+/// cursor and selection. Revisions distinguish later edits from a commit
 /// that was submitted before navigation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct CommitDraft {
@@ -2748,6 +2748,8 @@ struct CommitDraft {
     amend_stash: Option<Box<CommitDraft>>,
     amend_loaded_message: Option<String>,
     amend_loading: bool,
+    amend_read_dispatched: bool,
+    amend_error: Option<String>,
     amend_edited: bool,
     amend_head: Option<Oid>,
     revision: u64,
@@ -3177,6 +3179,21 @@ impl SidebarState {
             .then_some(self.commit_draft.revision)
     }
 
+    pub fn take_amend_request(&mut self, key: &ActiveWorktreeKey) -> Option<u64> {
+        if self.active_worktree.as_ref() != Some(key)
+            || !self.commit_draft.amend_loading
+            || self.commit_draft.amend_read_dispatched
+        {
+            return None;
+        }
+        self.commit_draft.amend_read_dispatched = true;
+        Some(self.commit_draft.revision)
+    }
+
+    pub fn amend_error(&self) -> Option<&str> {
+        self.commit_draft.amend_error.as_deref()
+    }
+
     /// A delayed read must never overwrite typing, a later toggle, or another tree.
     pub fn load_amend_message(
         &mut self,
@@ -3189,16 +3206,32 @@ impl SidebarState {
         } else {
             self.parked_commit_drafts.get_mut(&key.canonical_path)
         };
-        let Some(draft) = draft.filter(|draft| draft.amend && draft.revision == revision) else {
+        let Some(draft) =
+            draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
+        else {
             return false;
         };
         draft.set_message(message);
         draft.amend_loaded_message = Some(message.to_owned());
         draft.amend_loading = false;
+        draft.amend_error = None;
         true
     }
 
     pub fn finish_amend_read(&mut self, key: &ActiveWorktreeKey, revision: u64) -> bool {
+        self.fail_amend_read(
+            key,
+            revision,
+            "Could not load HEAD’s message. Toggle Amend to retry, or type a message.".into(),
+        )
+    }
+
+    pub fn fail_amend_read(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        revision: u64,
+        error: String,
+    ) -> bool {
         let draft = if self.active_worktree.as_ref() == Some(key) {
             Some(&mut self.commit_draft)
         } else {
@@ -3208,6 +3241,7 @@ impl SidebarState {
             draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
         {
             draft.amend_loading = false;
+            draft.amend_error = Some(error);
             return true;
         }
         false
@@ -3394,6 +3428,7 @@ impl SidebarState {
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
                 self.commit_draft.amend_loading = false;
+                self.commit_draft.amend_error = None;
                 self.commit_draft.amend_edited = true;
                 self.commit_draft.set_message(message);
             }
@@ -3407,6 +3442,7 @@ impl SidebarState {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_error = None;
                     self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     let text = self.commit_draft.subject_composer.0.text();
@@ -3428,6 +3464,7 @@ impl SidebarState {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_error = None;
                     self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
                     self.commit_draft.message = compose_commit_message(
@@ -3444,6 +3481,8 @@ impl SidebarState {
                         self.commit_draft.amend_stash = Some(Box::new(stash));
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = true;
+                        self.commit_draft.amend_read_dispatched = false;
+                        self.commit_draft.amend_error = None;
                         self.commit_draft.amend_edited = false;
                     } else {
                         let unchanged = self.commit_draft.amend_loaded_message.as_deref()
@@ -3456,6 +3495,8 @@ impl SidebarState {
                         }
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = false;
+                        self.commit_draft.amend_read_dispatched = false;
+                        self.commit_draft.amend_error = None;
                         self.commit_draft.amend_edited = false;
                         self.commit_draft.amend_head = None;
                     }
@@ -8949,6 +8990,9 @@ fn changes_footer<'a>(
     }
     if state.commit_draft.amend_loading {
         column = column.push(design::caption("Loading HEAD’s commit message…"));
+    }
+    if let Some(error) = state.amend_error() {
+        column = column.push(design::caption(error));
     }
     if state.commit_draft.amend && head_is_pushed(&source.tracking) {
         column = column.push(design::caption(
@@ -16880,6 +16924,85 @@ pub(crate) mod tests {
         assert!(state.sync_active_worktree(&emptied, &SidebarFocus::None));
         assert_eq!(state.active_worktree(), None);
         assert!(bound_source_control(&emptied, &state).is_none());
+    }
+
+    #[test]
+    fn amend_read_settles_once_and_preserves_actual_cursor_and_selection() {
+        use cosmic::iced::widget::text_editor::{Cursor, Position};
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Draft subject\n\nDraft body".into(),
+        });
+        let cursor = Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 1 }),
+        };
+        state.commit_draft.subject_composer.0.move_to(cursor);
+        state.commit_draft.composer.0.move_to(cursor);
+        let subject_selection = state.commit_draft.subject_composer.0.selection();
+        let body_selection = state.commit_draft.composer.0.selection();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.take_amend_request(&key).unwrap();
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        assert!(
+            state.take_amend_request(&key).is_none(),
+            "one read is dispatched per pending amend revision"
+        );
+        assert!(state.load_amend_message(&key, revision, "HEAD subject\n\nHEAD body"));
+        state.commit_draft.composer.0.move_to(cursor);
+        let loaded_selection = state.commit_draft.composer.0.selection();
+        assert!(
+            !state.load_amend_message(&key, revision, "Duplicate HEAD body"),
+            "a settled success cannot replace the editor again"
+        );
+        assert_eq!(state.commit_draft.composer.0.cursor(), cursor);
+        assert_eq!(state.commit_draft.composer.0.selection(), loaded_selection);
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        assert_eq!(state.commit_message(), "Draft subject\n\nDraft body");
+        assert_eq!(state.commit_draft.subject_composer.0.cursor(), cursor);
+        assert_eq!(state.commit_draft.composer.0.cursor(), cursor);
+        assert_eq!(
+            state.commit_draft.subject_composer.0.selection(),
+            subject_selection
+        );
+        assert_eq!(state.commit_draft.composer.0.selection(), body_selection);
+        state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = state.take_amend_request(&key).unwrap();
+        assert!(state.fail_amend_read(
+            &key,
+            revision,
+            "Read failed. Toggle Amend to retry.".into()
+        ));
+        assert!(
+            !state.load_amend_message(&key, revision, "Late success after failure"),
+            "failed attempt is settled before a duplicate success"
+        );
+        assert_eq!(
+            state.amend_error(),
+            Some("Read failed. Toggle Amend to retry.")
+        );
+        assert!(!state.commit_draft.ready());
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key,
+            message: "Explicit replacement".into(),
+        });
+        assert!(state.amend_error().is_none());
+        assert!(state.commit_draft.ready());
     }
 
     #[test]

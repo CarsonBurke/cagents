@@ -14875,7 +14875,7 @@ impl Application for Cagents {
                     // dialog it was driving is gone with it.
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::AmendChanged { key, amend } => {
-                        let Some(revision) = self.sidebar_state.amend_request_revision().filter(|_| amend) else {
+                        let Some(revision) = self.sidebar_state.take_amend_request(&key).filter(|_| amend) else {
                             return Task::none();
                         };
                         let Some(head) = self.sidebar_model.source_control.as_ref()
@@ -16896,22 +16896,14 @@ impl Application for Cagents {
                                 .load_amend_message(&key, revision, &message);
                         }
                         Err(error) => {
-                            if self.sidebar_state.finish_amend_read(&key, revision)
-                                && let Some(source) =
-                                    self.sidebar_model.source_control.as_mut().filter(|_| bound)
-                            {
-                                source.set_error(Some(format!(
-                                    "Could not load HEAD’s message: {error}"
-                                )));
-                            }
+                            self.sidebar_state.fail_amend_read(&key, revision, format!(
+                                "Could not load HEAD’s message: {error}. Toggle Amend to retry, or type a message."
+                            ));
                         }
                     }
                 } else {
-                    if self.sidebar_state.finish_amend_read(&key, revision)
-                        && let Some(source) = self.sidebar_model.source_control.as_mut()
-                    {
-                        source.set_error(Some("HEAD changed while loading its message. Toggle Amend again to load the new commit.".into()));
-                    }
+                    self.sidebar_state.fail_amend_read(&key, revision,
+                        "HEAD changed while loading its message. Toggle Amend again to load the new commit.".into());
                 }
                 Task::none()
             }
@@ -25407,6 +25399,62 @@ mod tests {
     }
 
     #[test]
+    fn amend_parked_read_failure_returns_with_its_own_visible_retry_hint() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let head = crate::repository::Oid::parse_object("11".repeat(20)).unwrap();
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = app.sidebar_state.take_amend_request(&key).unwrap();
+        app.sidebar_state
+            .pin_amend_head(&key, revision, head.clone());
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: "/repo/fix-sidebar".into()
+            }
+        ));
+        let source = app.sidebar_model.source_control.take();
+        drop(app.update(Message::SourceControlAmendMessage {
+            key: key.clone(),
+            revision,
+            head,
+            result: Err("private fixture read failed".into()),
+        }));
+        assert!(
+            app.sidebar_state.amend_error().is_none(),
+            "a parked error cannot leak into the current worktree"
+        );
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: key.canonical_path.clone()
+            }
+        ));
+        app.sidebar_model.source_control = source;
+        let error = app.sidebar_state.amend_error().unwrap();
+        assert!(
+            error.contains("private fixture read failed") && error.contains("Toggle Amend"),
+            "returning to the failed owning draft explains how to recover"
+        );
+        assert!(
+            app.sidebar_state
+                .submitted_commit_revision(&key, app.sidebar_state.commit_message(), true)
+                .is_none()
+        );
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key,
+                message: "Typed replacement".into(),
+            });
+        assert!(app.sidebar_state.amend_error().is_none());
+    }
+
+    #[test]
     fn amend_stale_read_errors_cannot_replace_later_feedback() {
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();
@@ -25467,14 +25515,19 @@ mod tests {
             result: Err("Current reader failed".into()),
         }));
         assert!(
+            app.sidebar_state
+                .amend_error()
+                .unwrap()
+                .contains("Current reader failed")
+        );
+        assert_eq!(
             app.sidebar_model
                 .source_control
                 .as_ref()
                 .unwrap()
                 .error
-                .as_deref()
-                .unwrap()
-                .contains("Current reader failed")
+                .as_deref(),
+            Some("Newer operation feedback")
         );
     }
 
