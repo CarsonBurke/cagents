@@ -277,10 +277,44 @@ pub(super) struct LogicalLocation {
     pub offset: f32,
     pub exact: bool,
     pub stage: u8,
+    pub shape_pending: Option<flow_layout::PendingGeometry>,
     horizontal: Vec<(Id, f32)>,
 }
 
+/// Widget operations visit every mounted card. Only descendants of the
+/// requested transcript may supply geometry or receive reader corrections.
+#[derive(Default)]
+struct TranscriptScope {
+    active: bool,
+    enter: bool,
+    authorized: bool,
+}
+impl TranscriptScope {
+    fn authorize(&mut self, owner: Option<Target>, target: Target) {
+        if !self.active {
+            self.authorized = owner == Some(target);
+        }
+    }
+    fn enter_root(&mut self) -> bool {
+        if std::mem::take(&mut self.authorized) {
+            self.enter = true;
+            true
+        } else {
+            false
+        }
+    }
+    fn begin(&mut self) -> bool {
+        let before = self.active;
+        self.active |= std::mem::take(&mut self.enter);
+        before
+    }
+    fn restore(&mut self, before: bool) {
+        self.active = before;
+    }
+}
+
 struct LocateLogical {
+    target: Target,
     scroll: Id,
     item: Id,
     identity: u64,
@@ -291,6 +325,8 @@ struct LocateLogical {
     frames: Vec<(Id, Rectangle, Rectangle)>,
     pending: Option<(Id, Rectangle, Rectangle)>,
     horizontal: Vec<(Id, f32)>,
+    shape_pending: Option<flow_layout::PendingGeometry>,
+    scope: TranscriptScope,
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
@@ -321,6 +357,7 @@ impl LocateLogical {
 }
 impl Operation<Option<LogicalLocation>> for LocateLogical {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) {
+        let before = self.scope.begin();
         let pushed = if let Some(frame) = self.pending.take() {
             self.frames.push(frame);
             true
@@ -331,6 +368,7 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         if pushed {
             self.frames.pop();
         }
+        self.scope.restore(before);
     }
     fn scrollable(
         &mut self,
@@ -340,35 +378,47 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         _: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
-        if id == Some(&self.scroll) {
+        if id == Some(&self.scroll) && self.scope.enter_root() {
             self.content = Some(content);
             self.viewport = Some(viewport);
-        } else if let Some(id) = id {
+        } else if self.scope.active
+            && let Some(id) = id
+        {
             self.pending = Some((id.clone(), viewport, content));
         }
     }
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&self.item) {
+        if self.scope.active && id == Some(&self.item) {
             self.candidate(bounds, 0);
         }
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(marker) = state.downcast_ref::<FindCorrection>() {
+            self.scope.authorize(marker.target, self.target);
+            return;
+        }
+        if !self.scope.active {
+            return;
+        }
         if let Some((bounds, stage)) =
             virtualized::logical_bounds(state, bounds, self.identity, self.byte)
         {
             self.candidate(bounds, stage);
         }
-        if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
-            && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte)
-        {
-            self.candidate(
-                Rectangle {
-                    x: bounds.x + local.x,
-                    y: bounds.y + local.y,
-                    ..local
-                },
-                3,
-            );
+        if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+            self.shape_pending = prose
+                .logical_geometry_pending(self.target, self.identity, self.byte)
+                .or(self.shape_pending);
+            if let Some(local) = prose.logical_byte_bounds(self.identity, self.byte) {
+                self.candidate(
+                    Rectangle {
+                        x: bounds.x + local.x,
+                        y: bounds.y + local.y,
+                        ..local
+                    },
+                    3,
+                );
+            }
         }
     }
     fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
@@ -379,8 +429,9 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
                     .clamp(0.0, travel);
                 LogicalLocation {
                     offset: travel - from_top,
-                    exact: stage == 3,
+                    exact: stage == 3 && self.shape_pending.is_none(),
                     stage,
+                    shape_pending: self.shape_pending,
                     horizontal: self.horizontal.clone(),
                 }
             },
@@ -395,6 +446,7 @@ pub(super) fn locate_logical(
     byte: usize,
 ) -> iced::Task<Option<LogicalLocation>> {
     iced::advanced::widget::operate(LocateLogical {
+        target,
         scroll: card_control_id(target.card, "chat-transcript"),
         item: item_id(&item),
         identity,
@@ -405,13 +457,20 @@ pub(super) fn locate_logical(
         frames: Vec::new(),
         pending: None,
         horizontal: Vec::new(),
+        shape_pending: None,
+        scope: TranscriptScope::default(),
     })
 }
 
 /// Marker consumed only by Find operations. Keyboard/history operations keep
 /// the existing input semantics; a Find correction cannot cancel itself.
-struct FindCorrection(bool);
+struct FindCorrection {
+    target: Option<Target>,
+    corrected: bool,
+}
 struct ApplyFind {
+    target: Target,
+    scope: TranscriptScope,
     scroll: Id,
     location: LogicalLocation,
     intent: find_navigation::Intent,
@@ -428,14 +487,19 @@ impl ApplyFind {
 impl<T: 'static> Operation<T> for ApplyFind {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
         if self.current() {
+            let before = self.scope.begin();
             visit(self);
+            self.scope.restore(before);
         }
     }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
         if self.current()
             && let Some(marker) = state.downcast_mut::<FindCorrection>()
         {
-            marker.0 = true;
+            self.scope.authorize(marker.target, self.target);
+            if marker.target == Some(self.target) {
+                marker.corrected = true;
+            }
         }
     }
     fn scrollable(
@@ -449,16 +513,17 @@ impl<T: 'static> Operation<T> for ApplyFind {
         if !self.current() {
             return;
         }
-        if id == Some(&self.scroll) {
+        if id == Some(&self.scroll) && self.scope.enter_root() {
             state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
                 x: None,
                 y: Some(self.location.offset),
             });
-        } else if let Some((_, x)) = self
-            .location
-            .horizontal
-            .iter()
-            .find(|(wanted, _)| Some(wanted) == id)
+        } else if self.scope.active
+            && let Some((_, x)) = self
+                .location
+                .horizontal
+                .iter()
+                .find(|(wanted, _)| Some(wanted) == id)
         {
             state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
                 x: Some(*x),
@@ -474,6 +539,8 @@ pub(super) fn apply_find_location(
     document: Option<find_navigation::DocumentEpoch>,
 ) -> iced::Task<Message> {
     iced::advanced::widget::operate(ApplyFind {
+        target,
+        scope: TranscriptScope::default(),
         scroll: card_control_id(target.card, "chat-transcript"),
         location,
         intent,
@@ -486,6 +553,8 @@ pub(super) fn find_anchor(
     intent: find_navigation::Intent,
 ) -> iced::Task<Message> {
     struct Anchor {
+        target: Target,
+        scope: TranscriptScope,
         scroll: Id,
         anchor: Id,
         intent: find_navigation::Intent,
@@ -496,7 +565,9 @@ pub(super) fn find_anchor(
     impl<T: 'static> Operation<T> for Anchor {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
             if self.intent.current() {
+                let before = self.scope.begin();
                 visit(self);
+                self.scope.restore(before);
             }
         }
         fn scrollable(
@@ -507,13 +578,18 @@ pub(super) fn find_anchor(
             _: Vector,
             _: &mut dyn operation::Scrollable,
         ) {
-            if id == Some(&self.scroll) {
+            if id == Some(&self.scroll) && self.scope.enter_root() {
                 self.content = Some(content);
                 self.viewport = Some(viewport);
             }
         }
+        fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some(marker) = state.downcast_ref::<FindCorrection>() {
+                self.scope.authorize(marker.target, self.target);
+            }
+        }
         fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-            if id == Some(&self.anchor) {
+            if self.scope.active && id == Some(&self.anchor) {
                 self.found = Some(bounds);
             }
         }
@@ -528,6 +604,8 @@ pub(super) fn find_anchor(
             };
             let travel = (content.height - viewport.height).max(0.0);
             operation::Outcome::Chain(Box::new(ApplyFind {
+                target: self.target,
+                scope: TranscriptScope::default(),
                 scroll: self.scroll.clone(),
                 intent: self.intent.clone(),
                 document: None,
@@ -535,12 +613,15 @@ pub(super) fn find_anchor(
                     offset: travel - (found.y - content.y).clamp(0.0, travel),
                     exact: false,
                     stage: 0,
+                    shape_pending: None,
                     horizontal: Vec::new(),
                 },
             }))
         }
     }
     iced::advanced::widget::operate(Anchor {
+        target,
+        scope: TranscriptScope::default(),
         scroll: card_control_id(target.card, "chat-transcript"),
         anchor,
         intent,
@@ -1187,12 +1268,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut before,
             );
         }
-        let mut correction = FindCorrection(false);
+        let mut correction = FindCorrection {
+            target: self.target,
+            corrected: false,
+        };
         operation.custom(None, layout.bounds(), &mut correction);
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
-        if self.target.is_some() && !correction.0 {
+        if self.target.is_some() && !correction.corrected {
             let mut after = ReadTop::default();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1549,6 +1633,428 @@ mod tests {
         );
     }
 
+    fn native_logical_location(
+        element: &mut Element<'_, Message>,
+        tree: &mut Tree,
+        node: &layout::Node,
+        renderer: &cosmic::Renderer,
+        target: Target,
+        identity: u64,
+        byte: usize,
+    ) -> Option<LogicalLocation> {
+        let result = Arc::new(Mutex::new(None));
+        let sink = result.clone();
+        let mut locate = operation::map(
+            LocateLogical {
+                target,
+                scroll: card_control_id(target.card, "chat-transcript"),
+                item: item_id("opaque-item"),
+                identity,
+                byte,
+                content: None,
+                viewport: None,
+                found: None,
+                frames: Vec::new(),
+                pending: None,
+                horizontal: Vec::new(),
+                shape_pending: None,
+                scope: TranscriptScope::default(),
+            },
+            move |location| {
+                *sink.lock().unwrap() = location;
+            },
+        );
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(node), renderer, &mut locate);
+        let _ = locate.finish();
+        result.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn find_geometry_and_corrections_stay_in_the_exact_mounted_transcript() {
+        #[derive(Default)]
+        struct Offsets(HashMap<Id, Vector>);
+        impl Operation for Offsets {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), translation);
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let wanted = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let neighbor = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let identity = selection::logical_identity("opaque-item", &[0, 0]);
+        let byte = "wanted line\n".len() * 1500;
+        let wanted_state = find_navigation::State::default();
+        let neighbor_state = find_navigation::State::default();
+        let neighbor_guard = neighbor_state.guard();
+        let horizontal_id = block_id(neighbor, None, identity);
+        let wanted_body = prose::code_text(
+            Arc::from("wanted line\n".repeat(5000)),
+            Arc::from([]),
+            iced::Pixels(14.0),
+            iced::Font::MONOSPACE,
+            wanted,
+            None,
+            Some(selectable_prose::Logical { identity, start: 0 }),
+            None,
+            None,
+        );
+        let neighbor_body = widget::scrollable(widget::row::with_children(vec![
+            widget::Space::new().width(3000).into(),
+            selectable_prose::logical_text(
+                vec![iced::widget::text::Span::new("neighbor glyph".to_owned())].into(),
+                iced::Pixels(14.0),
+                iced::Font::MONOSPACE,
+                neighbor,
+                None,
+                selectable_prose::Logical {
+                    identity,
+                    start: byte,
+                },
+            ),
+        ]))
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            design::scrollbar(),
+        ))
+        .id(horizontal_id.clone());
+        let pane = |body, target, guard| {
+            widget::container(transcript_observed(
+                item("opaque-item", body),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+                Observations::default(),
+                Memory::default(),
+                Some(guard),
+            ))
+            .width(400)
+            .height(400)
+            .into()
+        };
+        let mut element: Element<'_, Message> = widget::row::with_children(vec![
+            pane(wanted_body, wanted, wanted_state.guard()),
+            pane(neighbor_body.into(), neighbor, neighbor_guard.clone()),
+        ])
+        .into();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(800.0, 400.0));
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let location = native_logical_location(
+            &mut element,
+            &mut tree,
+            &node,
+            &renderer,
+            wanted,
+            identity,
+            byte,
+        )
+        .expect("wanted actual transcript geometry");
+        assert!(
+            !location.exact && location.stage == 1,
+            "an unrelated mounted exact glyph cannot replace the wanted virtual descriptor"
+        );
+        assert!(
+            location.horizontal.is_empty(),
+            "neighbor reader IDs never enter the wanted result"
+        );
+        let mut before = Offsets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        let mut defense = location.clone();
+        defense.horizontal.push((horizontal_id.clone(), 1500.0));
+        let mut apply = ApplyFind {
+            target: wanted,
+            scope: TranscriptScope::default(),
+            scroll: card_control_id(wanted.card, "chat-transcript"),
+            location: defense,
+            intent: wanted_state.guard(),
+            document: Some(wanted_state.document_epoch()),
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut apply);
+        let mut after = Offsets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_ne!(
+            before.0[&card_control_id(wanted.card, "chat-transcript")].y,
+            after.0[&card_control_id(wanted.card, "chat-transcript")].y,
+            "positive control changes the wanted native reader"
+        );
+        assert_eq!(
+            before.0[&horizontal_id], after.0[&horizontal_id],
+            "even a captured foreign reader ID cannot scroll a neighboring card"
+        );
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(800.0, 400.0)),
+        );
+        assert!(
+            neighbor_guard.current(),
+            "neighboring Find intent is unchanged"
+        );
+        assert!(
+            !messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::Scrolled(target, _, _, true)) if *target == neighbor)),
+            "a correction cannot mark neighboring navigation as user input"
+        );
+        let mut own_marker = FindCorrection {
+            target: Some(wanted),
+            corrected: false,
+        };
+        let mut foreign_marker = FindCorrection {
+            target: Some(neighbor),
+            corrected: false,
+        };
+        <ApplyFind as Operation<()>>::custom(
+            &mut apply,
+            None,
+            Rectangle::default(),
+            &mut own_marker,
+        );
+        <ApplyFind as Operation<()>>::custom(
+            &mut apply,
+            None,
+            Rectangle::default(),
+            &mut foreign_marker,
+        );
+        assert!(
+            own_marker.corrected && !foreign_marker.corrected,
+            "the pre-transcript correction marker is bound to its exact Target"
+        );
+        let stale_target = Target {
+            generation: wanted.generation + 1,
+            ..wanted
+        };
+        assert!(
+            native_logical_location(
+                &mut element,
+                &mut tree,
+                &node,
+                &renderer,
+                stale_target,
+                identity,
+                byte
+            )
+            .is_none(),
+            "a stale-generation tree supplies no coarse, virtual or exact Find geometry"
+        );
+        let mut stale = ApplyFind {
+            target: stale_target,
+            scope: TranscriptScope::default(),
+            scroll: card_control_id(wanted.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 0.0,
+                ..location
+            },
+            intent: wanted_state.guard(),
+            document: Some(wanted_state.document_epoch()),
+        };
+        let mut before = Offsets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut stale);
+        let mut after = Offsets::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert_eq!(
+            before.0, after.0,
+            "a stale-generation operation cannot mutate native readers"
+        );
+        let mut marker = FindCorrection {
+            target: Some(wanted),
+            corrected: false,
+        };
+        <ApplyFind as Operation<()>>::custom(&mut stale, None, Rectangle::default(), &mut marker);
+        assert!(
+            !marker.corrected,
+            "a stale-generation operation cannot mark a correction"
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        use iced::futures::StreamExt;
+        let mut task = iced::runtime::task::into_stream(find_anchor(
+            stale_target,
+            item_id("opaque-item"),
+            wanted_state.guard(),
+        ))
+        .unwrap();
+        let effect = executor.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), task.next())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let iced::runtime::Action::Widget(mut coarse) = effect else {
+            panic!("native anchor operation");
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, coarse.as_mut());
+        assert!(
+            matches!(coarse.finish(), operation::Outcome::None),
+            "a stale-generation coarse anchor cannot queue a scroll correction"
+        );
+        executor.shutdown_background();
+    }
+
+    #[test]
+    fn appended_flow_prefix_is_not_exact_find_geometry_before_redraw_requests_current_source() {
+        fn paragraph(content: &markdown::Content) -> markdown::Text {
+            let markdown::Item::Paragraph(text) = &content.items()[0] else {
+                panic!("paragraph");
+            };
+            text.clone()
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let identity = selection::logical_identity("opaque-item", &[0, 0]);
+        let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+        let mut content = markdown::Content::parse(&"prefix needle words ".repeat(300));
+        let cache = flow_layout::Cache::default();
+        let entry = cache.markdown_entry(identity, paragraph(&content), style);
+        let make = |entry| {
+            transcript(
+                item(
+                    "opaque-item",
+                    selectable_prose::flow_source(
+                        iced::Pixels(14.0),
+                        iced::Font::default(),
+                        target,
+                        None,
+                        selectable_prose::Logical { identity, start: 0 },
+                        entry,
+                    ),
+                ),
+                target,
+                None,
+                vec![],
+                true,
+                vec![],
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        let mut element = make(entry.clone());
+        let mut tree = Tree::new(&element);
+        let _ = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            cache.complete_fixture(),
+            "initial real geometry fixture completed"
+        );
+        element = make(entry.clone());
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let ready = native_logical_location(
+            &mut element,
+            &mut tree,
+            &node,
+            &renderer,
+            target,
+            identity,
+            7,
+        )
+        .expect("actual transcript geometry");
+        assert!(ready.exact && ready.shape_pending.is_none());
+        content.push_str(" appended words reflow the current source");
+        let current = cache.markdown_entry(identity, paragraph(&content), style);
+        assert!(Rc::ptr_eq(&entry, &current));
+        element = make(current.clone());
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        // No Redraw/update has requested the new revision. The old prefix glyph
+        // is genuinely mounted, but it cannot finish the current Find intent.
+        let pending = native_logical_location(
+            &mut element,
+            &mut tree,
+            &node,
+            &renderer,
+            target,
+            identity,
+            7,
+        )
+        .expect("actual transcript geometry");
+        assert_eq!(
+            pending.stage, 3,
+            "old prefix glyph remains available for display"
+        );
+        assert!(
+            pending.shape_pending.is_some() && !pending.exact,
+            "pre-redraw old prefix geometry cannot certify the current source"
+        );
+        assert!(
+            cache.complete_fixture(),
+            "the current revision still needs a real request"
+        );
+        element = make(current);
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let exact = native_logical_location(
+            &mut element,
+            &mut tree,
+            &node,
+            &renderer,
+            target,
+            identity,
+            7,
+        )
+        .expect("actual transcript geometry");
+        assert!(exact.exact && exact.shape_pending.is_none());
+    }
+
     #[test]
     fn queued_find_operations_check_live_intent_and_document_before_native_scroll() {
         let renderer = crate::app::tests::headless_renderer();
@@ -1563,6 +2069,7 @@ mod tests {
             offset: 600.0,
             exact: true,
             stage: 3,
+            shape_pending: None,
             horizontal: Vec::new(),
         };
         let mut element = transcript(
@@ -1579,6 +2086,8 @@ mod tests {
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
         let mut apply = ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
             scroll: card_control_id(target.card, "chat-transcript"),
             location: location.clone(),
             intent: guard.clone(),
@@ -1597,6 +2106,8 @@ mod tests {
         );
         state.changed_document();
         let mut stale = ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
             scroll: card_control_id(target.card, "chat-transcript"),
             location: LogicalLocation {
                 offset: 0.0,
@@ -1618,6 +2129,8 @@ mod tests {
         );
         guard.cancel();
         let mut canceled = ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
             scroll: card_control_id(target.card, "chat-transcript"),
             location: LogicalLocation {
                 offset: 0.0,
@@ -1674,11 +2187,14 @@ mod tests {
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
             let mut apply = ApplyFind {
+                target,
+                scope: TranscriptScope::default(),
                 scroll: card_control_id(target.card, "chat-transcript"),
                 location: LogicalLocation {
                     offset: 600.0,
                     exact: true,
                     stage: 3,
+                    shape_pending: None,
                     horizontal: Vec::new(),
                 },
                 intent: guard.clone(),
@@ -1827,6 +2343,7 @@ mod tests {
                 let sink = found.clone();
                 let mut locate = operation::map(
                     LocateLogical {
+                        target,
                         scroll: card_control_id(target.card, "chat-transcript"),
                         item: item_id("answer"),
                         identity,
@@ -1837,6 +2354,8 @@ mod tests {
                         frames: Vec::new(),
                         pending: None,
                         horizontal: Vec::new(),
+                        shape_pending: None,
+                        scope: TranscriptScope::default(),
                     },
                     move |location| {
                         *sink.lock().unwrap() = location;

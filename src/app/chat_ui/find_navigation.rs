@@ -40,14 +40,32 @@ impl State {
         self.pending.is_some()
     }
     #[cfg(test)]
+    pub(super) fn correction_count(&self) -> Option<u8> {
+        self.pending.as_ref().map(|pending| pending.passes)
+    }
+    #[cfg(test)]
+    pub(super) fn current_hit(&self) -> Option<(&str, u64, usize)> {
+        let pending = self.pending.as_ref()?;
+        if pending.document != Some(self.document_epoch()) {
+            return None;
+        }
+        pending
+            .hit
+            .as_ref()
+            .map(|hit| (hit.item.as_str(), hit.identity, hit.byte))
+    }
+    #[cfg(test)]
     pub(super) fn diagnostic(&self) -> String {
         self.pending.as_ref().map_or_else(
             || "complete".into(),
             |pending| {
                 format!(
-                    "key={:?}, indexed={}, in_flight={}, wait_for_shape={}, passes={}, previous={:?}",
+                    "key={:?}, hit={:?}, in_flight={}, wait_for_shape={}, passes={}, previous={:?}",
                     pending.key,
-                    pending.hit.is_some(),
+                    pending
+                        .hit
+                        .as_ref()
+                        .map(|hit| (&hit.item, hit.identity, hit.byte)),
                     pending.in_flight,
                     pending.wait_for_shape,
                     pending.passes,
@@ -91,9 +109,10 @@ struct Pending {
     wait_for_shape: bool,
     passes: u8,
     previous: Option<(u8, f32)>,
+    realized_pending: Option<(flow_layout::PendingGeometry, Hit)>,
     _deadline: iced::task::Handle,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Hit {
     item: String,
     identity: u64,
@@ -167,6 +186,7 @@ impl Cagents {
             wait_for_shape: false,
             passes: 0,
             previous: None,
+            realized_pending: None,
             _deadline: handle.abort_on_drop(),
         });
         Task::batch([
@@ -258,11 +278,6 @@ impl Cagents {
         }
         pending.wait_for_shape = false;
         let task = if let Some(hit) = &pending.hit {
-            if pending.passes >= 16 {
-                runtime.find_navigation.cancel();
-                return Task::none();
-            }
-            pending.passes += 1;
             pending.in_flight = true;
             let intent = intent.clone();
             scroll::locate_logical(target, hit.item.clone(), hit.identity, hit.byte).map(
@@ -419,13 +434,38 @@ impl Cagents {
             stage == location.stage && (offset - location.offset).abs() <= 1.0
         });
         pending.previous = Some((location.stage, location.offset));
+        // A single large paragraph has no logical row estimate until its
+        // admitted full-context geometry arrives. Repeating that unchanged
+        // coarse correction must not exhaust Find while the real source is
+        // still shaping, even if unrelated/stale completions wake this card.
+        if let Some(geometry) = location.shape_pending
+            && pending
+                .realized_pending
+                .as_ref()
+                .is_some_and(|(owner, hit)| *owner == geometry && Some(hit) == pending.hit.as_ref())
+        {
+            pending.wait_for_shape = true;
+            runtime.find_navigation.pending = Some(pending);
+            return Task::none();
+        }
+        if pending.passes >= 16 {
+            runtime.find_navigation.cancel();
+            return Task::none();
+        }
+        pending.passes += 1;
+        if let Some(geometry) = location.shape_pending {
+            // Verified appends retain the body-free geometry owner. Its one
+            // initial realization survives document publications while current
+            // shaping is pending; rewritten sources get another owner.
+            pending.realized_pending = pending.hit.clone().map(|hit| (geometry, hit));
+        }
         let scroll =
             scroll::apply_find_location(target, location.clone(), intent.clone(), Some(epoch))
                 .map(cosmic::Action::App);
         if location.exact {
             return scroll;
         } // Guard remains valid until any user navigation.
-        pending.wait_for_shape = location.stage >= 2 && same;
+        pending.wait_for_shape = location.shape_pending.is_some() || (location.stage >= 2 && same);
         let retry = if pending.wait_for_shape {
             Task::none()
         } else {

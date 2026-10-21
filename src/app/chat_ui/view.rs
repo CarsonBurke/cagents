@@ -6157,6 +6157,13 @@ mod tests {
 
     #[test]
     fn actual_find_actions_mount_deep_logical_matches_and_reject_late_navigation() {
+        drive_deep_find(false);
+    }
+    #[test]
+    fn actual_find_current_target_appends_keep_pending_geometry_through_parser_publications() {
+        drive_deep_find(true);
+    }
+    fn drive_deep_find(append_target: bool) {
         use iced::advanced::{
             Layout, Shell, layout, mouse,
             widget::{Operation, Tree, operation},
@@ -6317,7 +6324,10 @@ mod tests {
                 vec![5],
                 output.find(needle).unwrap(),
             ),
-        ] {
+        ]
+        .into_iter()
+        .take(if append_target { 1 } else { 4 })
+        {
             let item = chat::Item {
                 id: "deep-answer".into(),
                 role: chat::Role::Assistant,
@@ -6353,6 +6363,16 @@ mod tests {
                 drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("deep-child".into()))));
                 preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
             }
+            let delayed = !append_target && !child && path == [0, 0];
+            if append_target {
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.busy = true;
+                snapshot.items[0] = Arc::new(item.clone());
+                handle.publish_snapshot_for_test(snapshot);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            }
             let mut streams = Vec::new();
             let mut availability = Box::pin(flow_layout::availability_stream());
             push(
@@ -6368,6 +6388,23 @@ mod tests {
                 .expect("actual prepared source catalog includes the deep needle");
             assert_eq!(actual.1, identity, "fixture logical path {path:?}");
             assert_eq!(actual.2.find(needle), Some(byte), "fixture logical byte");
+            // Stall the actual worker boundary for the single large paragraph.
+            // Dropping the sender on panic releases the reclaimer immediately.
+            let mut release = delayed.then(preparation::hold_retirement);
+            let stale_request = delayed.then(|| {
+                let cache = flow_layout::Cache::default();
+                let entry = cache.entry(
+                    u64::MAX,
+                    vec![iced::widget::text::Span::new("old leaf".to_owned())].into(),
+                );
+                let mut state = entry.borrow_mut();
+                state.bind_target(target);
+                state.configure(600.0, iced::Pixels(14.0), iced::Font::default());
+                state
+                    .request()
+                    .expect("real request from an evicted unrelated leaf")
+            });
+            let mut stalled_locations = 0;
             let mut tree = Tree::empty();
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
             let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
@@ -6376,8 +6413,35 @@ mod tests {
             let mut passes = 0;
             let mut last_geometry = None;
             let mut locations = std::collections::VecDeque::new();
+            let mut preparation_jobs = HashSet::new();
+            let mut buffered_reply = None;
+            let mut target_publications = 0;
+            let mut accepted_publications = 0;
             while Instant::now() < deadline {
                 passes += 1;
+                // Materialize the actual admitted parser subscriptions once per
+                // recipe, including their real spawn_blocking worker/results.
+                for subscription in app
+                    .chat_runtime_mut(target)
+                    .unwrap()
+                    .preparation
+                    .subscriptions(target)
+                {
+                    for recipe in iced::advanced::subscription::into_recipes(subscription) {
+                        let mut hash = iced::advanced::subscription::Hasher::default();
+                        recipe.hash(&mut hash);
+                        if preparation_jobs.insert(std::hash::Hasher::finish(&hash)) {
+                            streams.push(
+                                recipe
+                                    .stream(iced::futures::stream::empty().boxed())
+                                    .map(|message| {
+                                        iced::runtime::Action::Output(cosmic::Action::App(message))
+                                    })
+                                    .boxed(),
+                            );
+                        }
+                    }
+                }
                 let mut effects = Vec::new();
                 executor.block_on(async {
                     let mut index = 0;
@@ -6481,7 +6545,24 @@ mod tests {
                 }
                 drop(element);
                 for message in messages {
+                    if append_target
+                        && target_publications == 0
+                        && buffered_reply.is_none()
+                        && matches!(&message, Message::ChatUi(Action::FlowReady(_, _, Some(_))))
+                    {
+                        // Hold an actual produced reply, including its source
+                        // and output admission, without blocking parser workers.
+                        buffered_reply = Some(message);
+                        continue;
+                    }
                     if let Message::ChatUi(Action::FindLocated(_, _, _, location)) = &message {
+                        if release.is_some()
+                            && location
+                                .as_ref()
+                                .is_some_and(|location| location.shape_pending.is_some())
+                        {
+                            stalled_locations += 1;
+                        }
                         if locations.len() == 16 {
                             locations.pop_front();
                         }
@@ -6489,11 +6570,124 @@ mod tests {
                     }
                     push(&mut streams, app.update(message));
                 }
-                if !pending && visible.found {
+                if release.is_some() {
+                    assert!(
+                        app.chat_runtime_mut(target)
+                            .unwrap()
+                            .find_navigation
+                            .correction_count()
+                            .is_some_and(|count| count < 16),
+                        "delayed current geometry keeps Find pending without spending its correction budget"
+                    );
+                    if stalled_locations >= 24 {
+                        release.take().unwrap().send(()).unwrap();
+                    } else {
+                        // This exact stale same-card completion is rejected by
+                        // source ownership, but still delivers the real handler's
+                        // geometry wake. It cannot burn the current Find budget.
+                        push(
+                            &mut streams,
+                            app.handle_chat_ui(Action::FlowReady(
+                                target,
+                                stale_request.as_ref().unwrap().clone(),
+                                None,
+                            )),
+                        );
+                    }
+                }
+                if buffered_reply.is_some() {
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    assert!(
+                        runtime
+                            .find_navigation
+                            .correction_count()
+                            .is_some_and(|count| count < 16),
+                        "current target publications preserve the pending Find correction budget"
+                    );
+                    let current = runtime.active_item(&item.id).unwrap().clone();
+                    let accepted = runtime.cache.get(&item.id).is_some_and(|cached| {
+                        !cached.placeholder
+                            && cached
+                                .item
+                                .as_ref()
+                                .is_some_and(|shown| Arc::ptr_eq(shown, &current))
+                    });
+                    if accepted
+                        && runtime.find_navigation.current_hit()
+                            == Some((item.id.as_str(), identity, byte))
+                    {
+                        let (catalog, _) = runtime.selection_document();
+                        let actual = catalog
+                            .owned_search_blocks(&HashSet::from([item.id.clone()]))
+                            .into_iter()
+                            .find(|(_, _, text)| text.contains(needle))
+                            .unwrap();
+                        assert_eq!((actual.1, actual.2.find(needle)), (identity, Some(byte)));
+                        accepted_publications = target_publications;
+                        if target_publications == 24 {
+                            assert!(
+                                actual.2.ends_with(" verified append 24"),
+                                "the exact current accepted catalog contains the final source publication"
+                            );
+                            push(&mut streams, app.update(buffered_reply.take().unwrap()));
+                        } else {
+                            target_publications += 1;
+                            use chat::presentation::{ItemChange, Presentation};
+                            let previous = handle.snapshot();
+                            let old = previous
+                                .items
+                                .iter()
+                                .find(|source| source.id == item.id)
+                                .unwrap();
+                            let mut next = (**old).clone();
+                            let ItemContent::Text { text, .. } = &mut next.content else {
+                                unreachable!();
+                            };
+                            text.push_str(&format!(" verified append {target_publications}"));
+                            let change = ItemChange::between(Some(old), &next);
+                            assert!(
+                                matches!(change, ItemChange::Append { .. }),
+                                "the real presentation validator receives an append delta"
+                            );
+                            let mut metadata = (*previous).clone();
+                            metadata.generation += 1;
+                            metadata.items.clear();
+                            handle.publish_presentation_for_test(Presentation {
+                                base_generation: previous.generation,
+                                file_changes_unchanged: false,
+                                metadata,
+                                order: vec![item.id.clone()],
+                                changes: vec![change],
+                                children: vec![],
+                            });
+                            let next = handle.snapshot().items[0].clone();
+                            assert!(
+                                handle.known_append(old, &next),
+                                "actual client lineage authenticates each current-target publication"
+                            );
+                            push(
+                                &mut streams,
+                                app.handle_chat_ui(Action::Wake(target, Wake::Changed)),
+                            );
+                        }
+                    }
+                }
+                if !pending && visible.found && (!append_target || accepted_publications == 24) {
                     seen = true;
                     break;
                 }
             }
+            assert!(
+                !append_target
+                    || (target_publications == 24
+                        && accepted_publications == 24
+                        && buffered_reply.is_none()),
+                "more than sixteen real target appends were accepted and reindexed before releasing Flow"
+            );
+            assert!(
+                !delayed || stalled_locations >= 24,
+                "actual current geometry survived more than sixteen unrelated completion wakes"
+            );
             assert!(
                 seen,
                 "actual Find action must expose the deep mounted glyph; child={child}, path={path:?}, byte={byte}, passes={passes}, streams={}, navigation={}, last_geometry={last_geometry:?}, locations={locations:?}",

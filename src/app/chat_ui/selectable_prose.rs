@@ -127,6 +127,24 @@ impl State {
         self.logical.is_some() && self.flow.is_none() && self.plain.is_empty()
     }
 
+    /// Only the matching mounted source may make Find wait for a real Flow
+    /// completion; unrelated paragraphs and offscreen estimates cannot do so.
+    pub(super) fn logical_geometry_pending(
+        &self,
+        target: Target,
+        identity: u64,
+        byte: usize,
+    ) -> Option<flow_layout::PendingGeometry> {
+        let logical = self.logical.as_ref()?;
+        if self.target != Some(target) || logical.identity != identity || byte < logical.start {
+            return None;
+        }
+        self.flow
+            .as_ref()?
+            .borrow()
+            .geometry_pending(byte - logical.start)
+    }
+
     /// A mounted glyph cluster containing a logical byte. This inspects the
     /// existing bounded paragraph and never shapes an offscreen source.
     pub(super) fn logical_byte_bounds(&self, identity: u64, byte: usize) -> Option<Rectangle> {

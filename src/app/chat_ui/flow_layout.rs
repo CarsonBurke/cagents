@@ -402,6 +402,11 @@ impl Cache {
     }
 }
 
+/// Body-free identity of mounted geometry work. Verified appends retain it;
+/// source replacement creates another Entry and needs its own realization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingGeometry(u64);
+
 impl Entry {
     pub(super) fn bind_target(&mut self, target: Target) {
         if self.target.is_some_and(|previous| previous != target) {
@@ -460,6 +465,12 @@ impl Entry {
     }
     pub(super) fn failed(&self) -> bool {
         self.failed
+    }
+    pub(super) fn geometry_pending(&self, byte: usize) -> Option<PendingGeometry> {
+        (byte <= self.source_len
+            && self.ready_revision != Some(self.source_revision)
+            && !self.failed)
+            .then_some(PendingGeometry(self.id))
     }
     pub(super) fn prepared(&self) -> Option<Arc<Prepared>> {
         self.ready.clone()
@@ -1618,16 +1629,22 @@ fn continuous_append_publishes_versioned_progress_and_eventually_exact_final_geo
             );
             assert!(shown.plain.len() < text(&content).len());
             published += 1;
+            assert!(
+                entry.borrow().geometry_pending(0).is_some(),
+                "visible prefix geometry cannot certify the current revision before redraw requests it"
+            );
             pending = entry
                 .borrow_mut()
                 .request()
                 .expect("newest source still needs exact layout");
+            assert!(entry.borrow().geometry_pending(0).is_some());
         }
     }
     assert_eq!(published, 12);
     let final_ready = finish(&pending);
     assert!(entry.borrow_mut().complete(&pending, Some(final_ready)));
     assert!(entry.borrow_mut().request().is_none());
+    assert!(entry.borrow().geometry_pending(0).is_none());
     let ready = entry.borrow().prepared().unwrap();
     assert_eq!(ready.plain.as_ref(), text(&content).plain().as_ref());
     let reference = reference(
