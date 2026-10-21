@@ -8183,6 +8183,13 @@ mod tests {
             let mut find_guard = None;
             let expected;
             if case == "find" {
+                // Accept a real Find query before certifying its navigation
+                // guard; refresh correctly cancels navigation without a query.
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    "Old 50".into(),
+                ));
                 let (catalog, _) = runtime(&app, target).selection_document();
                 let (_, identity, _) = catalog
                     .owned_search_blocks(&HashSet::from(["old-window-only".into()]))
