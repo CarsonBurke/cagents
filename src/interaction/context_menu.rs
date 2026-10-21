@@ -61,6 +61,7 @@ struct MenuItems {
     count: usize,
     width: u16,
     anchor: Point,
+    open: bool,
 }
 
 struct MenuSurface<'a, Message> {
@@ -115,6 +116,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             count: self.items,
             width: self.width,
             anchor: Point::ORIGIN,
+            open: false,
         })
     }
 
@@ -147,6 +149,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         measured.count = self.items;
         measured.width = self.width;
         if remeasured || tree.children.is_empty() {
+            measured.open = false;
             tree.children = vec![self.native_tree()];
         }
         let native: &mut dyn Widget<Message, Theme, Renderer> = &mut self.native;
@@ -182,7 +185,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // frame's viewport is smaller. Dismiss that geometry; a fresh opening
         // measures and clamps against the new window instead of moving an
         // already open action under the pointer.
-        if matches!(event, Event::Window(window::Event::Resized(_))) {
+        if matches!(event, Event::Window(window::Event::Resized(_)))
+            && tree.state.downcast_ref::<MenuItems>().open
+        {
+            tree.state.downcast_mut::<MenuItems>().open = false;
             tree.children = vec![self.native_tree()];
             shell.invalidate_layout();
             shell.request_redraw();
@@ -247,6 +253,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             viewport,
         );
         if opening {
+            tree.state.downcast_mut::<MenuItems>().open = true;
             shell.invalidate_layout();
             shell.request_redraw();
         }
@@ -316,9 +323,13 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             viewport,
             Vector::ZERO,
         );
-        if native.is_none() && self.builder.is_some() {
-            tree.state.downcast_mut::<MenuItems>().count = 0;
-            self.items = 0;
+        if native.is_none() {
+            let measured = tree.state.downcast_mut::<MenuItems>();
+            measured.open = false;
+            if self.builder.is_some() {
+                measured.count = 0;
+                self.items = 0;
+            }
         }
         native.map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner, anchor })))
     }
