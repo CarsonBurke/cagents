@@ -1,5 +1,6 @@
-//! Bounded filesystem invalidation for sidebar Git state. The watcher never
-//! runs Git or GitHub; its coalesced edges ask the UI's cancellable reader to do so.
+//! Bounded filesystem invalidation for Git state. The watcher never runs Git or
+//! GitHub; its coalesced edges ask the owner's cancellable reader to do so. The
+//! window's sidebar and the daemon's Work board each own one.
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::MetadataExt,
@@ -173,9 +174,7 @@ impl Project {
                     || relative == Path::new("packed-refs")
                     || relative.starts_with("refs")
             }) {
-                change
-                    .worktrees
-                    .extend(self.worktrees.iter().map(|worktree| worktree.id));
+                change.references = true;
                 change.membership |= common == Some(Path::new("refs"));
                 continue;
             }
@@ -216,13 +215,18 @@ impl Project {
                 }
             }
         }
-        (change.topology || !change.worktrees.is_empty()).then_some(change)
+        (change.topology || change.references || !change.worktrees.is_empty()).then_some(change)
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Change {
+    /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
+    /// Shared refs or configuration changed: a commit, fetch or branch
+    /// update. Any worktree's comparison may have moved, but its status only
+    /// where its own `HEAD` did, which a consumer can tell from the refs.
+    pub references: bool,
     pub topology: bool,
     pub membership: bool,
     pub error: Option<String>,
@@ -232,6 +236,7 @@ pub(crate) struct Change {
 impl Change {
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
+        self.references |= other.references;
         self.topology |= other.topology;
         self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
@@ -363,22 +368,25 @@ impl Registrations {
     }
 }
 
-/// One native watcher for the window, with at most one pending wake regardless
-/// of event rate. Registration happens on its coordinator, never the UI thread.
+/// One native watcher for its owner, with at most one pending change set
+/// regardless of event rate. Registration happens on its coordinator, never on
+/// the owner's thread.
 pub(crate) struct Monitor {
     commands: mpsc::SyncSender<()>,
     configuration: Arc<Mutex<Configuration>>,
     pending: Arc<Mutex<Pending>>,
-    pub receiver: async_channel::Receiver<()>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Monitor {
-    pub fn start() -> std::io::Result<Self> {
+    /// `wake` runs on the watcher's threads whenever changes are pending to
+    /// [`drain`](Self::drain). It may run for every event, so it must only
+    /// signal (a bounded `try_send`, a condvar notify) and never block.
+    pub fn start(wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
         let (commands, requests) = mpsc::sync_channel(1);
         let configuration = Arc::new(Mutex::new(Configuration::default()));
         let desired_configuration = configuration.clone();
-        let (wake, receiver) = async_channel::bounded(1);
+        let wake = Arc::new(wake);
         let pending = Arc::new(Mutex::new(Pending::default()));
         let state = pending.clone();
         let thread = thread::Builder::new()
@@ -391,7 +399,7 @@ impl Monitor {
                         let mut pending = events.lock().unwrap_or_else(|p| p.into_inner());
                         pending.event(event);
                         if !pending.changes.is_empty() {
-                            let _ = signal.try_send(());
+                            signal();
                         }
                     })
                 };
@@ -502,7 +510,7 @@ impl Monitor {
                         });
                     }
                     if !pending.changes.is_empty() {
-                        let _ = wake.try_send(());
+                        wake();
                     }
                 }
             })?;
@@ -510,7 +518,6 @@ impl Monitor {
             commands,
             configuration,
             pending,
-            receiver,
             thread: Some(thread),
         })
     }
@@ -672,7 +679,8 @@ mod tests {
         let change = project
             .change(&modified(project.common_dir.join("refs/heads/main")))
             .unwrap();
-        assert_eq!(change.worktrees, BTreeSet::from([first.id, linked.id]));
+        assert!(change.references);
+        assert!(change.worktrees.is_empty(), "no worktree's own files changed");
         assert!(!change.topology);
         assert!(
             project
@@ -765,10 +773,14 @@ mod tests {
         );
     }
 
-    fn wait_for(monitor: &Monitor, project: ProjectId, predicate: impl Fn(&Change) -> bool) {
+    fn wait_for(
+        (monitor, woken): &(Monitor, mpsc::Receiver<()>),
+        project: ProjectId,
+        predicate: impl Fn(&Change) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if monitor.receiver.try_recv().is_ok()
+            if woken.try_recv().is_ok()
                 && monitor.drain().get(&project).is_some_and(&predicate)
             {
                 return;
@@ -789,8 +801,15 @@ mod tests {
         std::fs::create_dir_all(&worktree.git_dir).unwrap();
         let file = source.join("main.rs");
         std::fs::write(&file, "first").unwrap();
-        let monitor = Monitor::start().unwrap();
-        monitor.configure(vec![Arc::new(project.clone())]);
+        let (wake, woken) = mpsc::sync_channel(1);
+        let monitor = (
+            Monitor::start(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap(),
+            woken,
+        );
+        monitor.0.configure(vec![Arc::new(project.clone())]);
         wait_for(&monitor, project.id, |change| change.error.is_none());
         let replacement = source.join(".save");
         std::fs::write(&replacement, "second").unwrap();
@@ -804,7 +823,7 @@ mod tests {
         wait_for(&monitor, project.id, |change| change.membership);
         // The path set is unchanged, but the directory inode changed. Rearm
         // it instead of trusting a stale native registration for that path.
-        monitor.configure(vec![Arc::new(project.clone())]);
+        monitor.0.configure(vec![Arc::new(project.clone())]);
         // Configure completion must be acknowledged even when paths compare
         // equal, so edits cannot race the re-registration barrier.
         wait_for(&monitor, project.id, |change| {

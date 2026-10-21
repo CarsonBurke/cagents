@@ -19,6 +19,7 @@ use std::{
 
 mod account_info;
 mod directory;
+pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod terminals;

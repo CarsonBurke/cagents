@@ -24,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod branch_census;
+pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
@@ -1764,7 +1766,11 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
             } else if let Some(value) = header.strip_prefix(b"branch.upstream ") {
                 upstream = Some(String::from_utf8_lossy(value).into_owned());
             } else if let Some(value) = header.strip_prefix(b"branch.ab ") {
-                ahead_behind = Some(parse_ahead_behind(value, index)?);
+                // `--no-ahead-behind` says only that the branch and its
+                // upstream differ, which leaves the counts unknown.
+                if value != b"+? -?" {
+                    ahead_behind = Some(parse_ahead_behind(value, index)?);
+                }
             }
             index += 1;
             continue;
@@ -6844,6 +6850,14 @@ mod tests {
     fn rejects_missing_rename_source_and_malformed_ab() {
         assert!(parse_status(b"2 R. N... 100644 100644 100644 a b R100 path\0").is_err());
         assert!(parse_status(b"# branch.ab +x -2\0").is_err());
+        assert_eq!(
+            parse_status(b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head feature\0# branch.upstream origin/feature\0# branch.ab +? -?\0")
+                .unwrap()
+                .tracking,
+            TrackingState::Unknown {
+                upstream: Some("origin/feature".into())
+            }
+        );
         assert!(matches!(
             parse_status(b"? path"),
             Err(GitParseError::Truncated { .. })

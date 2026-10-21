@@ -165,7 +165,9 @@ use crate::{
 /// do not preserve binary compatibility.
 /// Version 103 adds retained Claude actor continuity to native descriptors and
 /// snapshots. Private actor protocol 2 has a separate authenticated namespace.
-pub const PROTOCOL_VERSION: u16 = 103;
+/// Version 104 preserves version 103 and appends the Work board request and
+/// its response.
+pub const PROTOCOL_VERSION: u16 = 104;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -509,6 +511,8 @@ pub enum ClientRequest {
         proof: ChatReleaseProof,
         dry_run: bool,
     },
+    /// Reads the Work board or pins one of its cards.
+    Work(crate::work::Request),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -831,6 +835,7 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::TextCopyPage,
     },
+    Work(crate::work::Response),
 }
 
 /// Maximum compact inventory rows in one capacity response.
