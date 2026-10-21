@@ -177,6 +177,16 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // Native MenuBounds remembers its opening window. After a resize its
+        // cached position can be outside the new window even though this
+        // frame's viewport is smaller. Dismiss that geometry; a fresh opening
+        // measures and clamps against the new window instead of moving an
+        // already open action under the pointer.
+        if matches!(event, Event::Window(window::Event::Resized(_))) {
+            tree.children = vec![self.native_tree()];
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
         // A freshly mounted row may be right-clicked before a view diff. The
         // native widget initializes its *real* menu item tree only in diff(),
         // not in state()/children(); opening first otherwise leaves an empty
@@ -335,6 +345,120 @@ mod tests {
         fn message(&self) -> usize {
             self.0
         }
+    }
+
+    #[test]
+    fn resized_window_dismisses_old_geometry_and_reopens_a_reachable_action() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element = surface(widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![widget::menu::Item::Button(
+                "New worktree from this branch…".to_owned(),
+                None,
+                RowAction(7),
+            )],
+        ));
+        let mut tree = Tree::new(&element);
+        let mut messages = Vec::new();
+        let old_size = Size::new(1200.0, 900.0);
+        let new_size = Size::new(800.0, 650.0);
+        // Keep the actual widget/Tree through native resize and reopening.
+        for (index, size) in [old_size, new_size].into_iter().enumerate() {
+            let viewport = Rectangle::with_size(size);
+            let row = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(size, size),
+            );
+            let anchor =
+                mouse::Cursor::Available(Point::new(size.width - 20.0, size.height - 20.0));
+            if index == 1 {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Window(window::Event::Resized(size)),
+                    Layout::new(&row),
+                    anchor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert!(
+                    element
+                        .as_widget_mut()
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .is_none(),
+                    "an old right-edge popup cannot keep geometry outside the resized window",
+                );
+                assert!(
+                    messages.is_empty(),
+                    "resize must not activate an old action"
+                );
+            }
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&row),
+                anchor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let mut popup = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&row),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("native menu can open after resize");
+            let first = popup.as_overlay_mut().layout(&renderer, size);
+            popup.as_overlay_mut().update(
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&first),
+                anchor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
+            let measured = popup.as_overlay_mut().layout(&renderer, size);
+            let bounds = measured.children().first().expect("visible popup").bounds();
+            assert!(bounds.is_within(&viewport));
+            if index == 1 {
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    popup.as_overlay_mut().update(
+                        &Event::Mouse(event),
+                        Layout::new(&measured),
+                        mouse::Cursor::Available(bounds.center()),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
+                }
+            }
+        }
+        assert_eq!(messages, [7], "the new visible action remains clickable");
     }
 
     #[test]
