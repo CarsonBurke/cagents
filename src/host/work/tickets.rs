@@ -53,20 +53,49 @@ impl Reference {
 pub(super) struct Memory {
     /// References Linear answered without an issue.
     missing: HashMap<String, Instant>,
-    /// Workspaces whose credentials or connection failed.
-    unavailable: HashMap<Option<String>, Instant>,
+    /// Workspaces whose credentials or connection failed, and why.
+    unavailable: HashMap<Option<String>, (Instant, String)>,
 }
 
 impl Memory {
     /// Whether looking `reference` up now could tell anything new.
     pub(super) fn askable(&self, reference: &Reference) -> bool {
-        !self.missing.contains_key(&reference.id)
-            && !self.unavailable.contains_key(&reference.workspace)
+        self.missing
+            .get(&reference.id)
+            .is_none_or(|at| at.elapsed() >= MISSING_FOR)
+            && self
+                .unavailable
+                .get(&reference.workspace)
+                .is_none_or(|(at, _)| at.elapsed() >= RETRY)
+    }
+
+    /// Why the workspaces some of `wanted` need cannot be asked, until a
+    /// retry reaches them.
+    pub(super) fn unavailable_for(&self, wanted: &BTreeSet<Reference>) -> Option<String> {
+        let reasons = wanted
+            .iter()
+            .map(|reference| &reference.workspace)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|workspace| {
+                let (_, reason) = self.unavailable.get(workspace)?;
+                Some(match workspace {
+                    Some(workspace) => format!("workspace {workspace}: {reason}"),
+                    None => reason.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 
     fn forget_expired(&mut self) {
         self.missing.retain(|_, at| at.elapsed() < MISSING_FOR);
-        self.unavailable.retain(|_, at| at.elapsed() < RETRY);
+        self.unavailable.retain(|_, (at, _)| at.elapsed() < RETRY);
+    }
+
+    fn set_aside(&mut self, workspace: &Option<String>, error: &crate::linear::Error) {
+        self.unavailable
+            .insert(workspace.clone(), (Instant::now(), error.to_string()));
     }
 }
 
@@ -101,9 +130,7 @@ pub(super) fn resolve(
                 Ok(client) => entry.insert(client),
                 Err(error) => {
                     tracing::debug!(%error, "Linear credentials for the Work board are unavailable");
-                    memory
-                        .unavailable
-                        .insert(reference.workspace.clone(), Instant::now());
+                    memory.set_aside(&reference.workspace, &error);
                     continue;
                 }
             },
@@ -122,9 +149,7 @@ pub(super) fn resolve(
             }
             Err(error) => {
                 tracing::debug!(%error, "a Linear ticket could not be resolved");
-                memory
-                    .unavailable
-                    .insert(reference.workspace.clone(), Instant::now());
+                memory.set_aside(&reference.workspace, &error);
             }
         }
     }
@@ -166,15 +191,29 @@ mod tests {
         };
         assert!(memory.askable(&guess) && memory.askable(&linked));
         memory.missing.insert(guess.id.clone(), Instant::now());
-        memory
-            .unavailable
-            .insert(Some("WORK".into()), Instant::now());
+        memory.set_aside(
+            &Some("WORK".into()),
+            &crate::linear::Error::new("linear_auth_missing", "no key"),
+        );
         assert!(!memory.askable(&guess));
         assert!(!memory.askable(&linked));
-        assert!(memory.askable(&Reference {
+        let other = Reference {
             id: "other".into(),
             workspace: None,
-        }));
+        };
+        assert!(memory.askable(&other));
+        // Only the workspaces still wanted explain missing tickets.
+        assert_eq!(
+            memory.unavailable_for(&BTreeSet::from([other.clone(), linked.clone()])),
+            Some("workspace WORK: no key".into())
+        );
+        assert_eq!(memory.unavailable_for(&BTreeSet::from([other])), None);
+        // Expired entries are asked again without waiting for a pruning
+        // round, which runs only once something is due.
+        let long_ago = Instant::now() - MISSING_FOR;
+        memory.missing.insert(guess.id.clone(), long_ago);
+        memory.unavailable.get_mut(&Some("WORK".into())).unwrap().0 = long_ago;
+        assert!(memory.askable(&guess) && memory.askable(&linked));
         assert!(answered_without_issue(&crate::linear::Error::new(
             "linear_graphql",
             "Entity not found"

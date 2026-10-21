@@ -260,6 +260,8 @@ struct Shared {
     /// Resolved Linear tickets by reference: a linked issue's id or a branch
     /// name's identifier.
     tickets: BTreeMap<String, store::Ticket>,
+    /// Why Linear cannot be asked about tickets cards still want.
+    linear_unavailable: Option<String>,
     stale_after_days: u16,
     read_at: Option<Instant>,
     /// Forge listings read from the store for projects not yet tracked.
@@ -367,6 +369,7 @@ impl Service {
             pins: BTreeMap::new(),
             session_activity: HashMap::new(),
             tickets: BTreeMap::new(),
+            linear_unavailable: None,
             stale_after_days: stale_after_days(),
             read_at: None,
             restored: BTreeMap::new(),
@@ -639,6 +642,7 @@ impl Handle {
         let pins = shared.pins.clone();
         let session_activity = shared.session_activity.clone();
         let tickets = shared.tickets.clone();
+        let linear_unavailable = shared.linear_unavailable.clone();
         let stale_after_days = shared.stale_after_days;
         drop(shared);
         let sessions = live_sessions(host);
@@ -664,6 +668,7 @@ impl Handle {
                 session_activity: &session_activity,
                 sessions: &sessions,
                 tickets: &tickets,
+                linear_unavailable: linear_unavailable.as_deref(),
             },
         ))
     }
@@ -982,19 +987,22 @@ impl Handle {
                 shared
                     .wanted_tickets()
                     .into_iter()
-                    .filter(|reference| {
-                        !shared.tickets.contains_key(&reference.id) && tickets.askable(reference)
-                    })
+                    .filter(|reference| !shared.tickets.contains_key(&reference.id))
                     .collect::<BTreeSet<_>>()
             })
         };
-        if let Some(wanted) = wanted.filter(|wanted| !wanted.is_empty()) {
+        if let Some(wanted) = wanted {
             let resolved = tickets::resolve(&wanted, tickets, &self.0.cancellation);
-            if !resolved.is_empty() {
-                for (reference, ticket) in &resolved {
-                    self.store(|store| store.save_ticket(reference, ticket));
-                }
-                self.shared().tickets.extend(resolved);
+            for (reference, ticket) in &resolved {
+                self.store(|store| store.save_ticket(reference, ticket));
+            }
+            let unavailable = tickets.unavailable_for(&wanted);
+            let mut shared = self.shared();
+            let changed = !resolved.is_empty() || shared.linear_unavailable != unavailable;
+            shared.tickets.extend(resolved);
+            shared.linear_unavailable = unavailable;
+            drop(shared);
+            if changed {
                 self.0.updated.notify_all();
             }
         }

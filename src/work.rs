@@ -162,6 +162,9 @@ pub struct Board {
     pub projects: Vec<Project>,
     /// Newest activity first; see [`sort`].
     pub items: Vec<Item>,
+    /// Why Linear could not be asked about some cards' tickets, which those
+    /// cards then lack.
+    pub linear_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

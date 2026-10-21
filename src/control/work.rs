@@ -114,7 +114,11 @@ fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {
     if let Some(column) = arguments.column {
         board.items.retain(|item| item.column == column);
     }
-    let human = board_human(&board, crate::chat::now_ms().unwrap_or_default());
+    let human = board_human(
+        &board,
+        arguments.column,
+        crate::chat::now_ms().unwrap_or_default(),
+    );
     Ok(CommandOutput {
         command: "work.list",
         data: json!({ "board": board }),
@@ -147,8 +151,9 @@ fn pin(item: String, column: Option<Column>, project: Option<PathBuf>) -> Result
 }
 
 /// One table per column, in board order, then what kept any project from
-/// being read in full.
-fn board_human(board: &Board, now_ms: u64) -> String {
+/// being read in full. `filtered_to` names the column the cards were
+/// filtered to.
+fn board_human(board: &Board, filtered_to: Option<Column>, now_ms: u64) -> String {
     let mut sections = Vec::new();
     for column in Column::ALL {
         let items = board
@@ -175,7 +180,10 @@ fn board_human(board: &Board, now_ms: u64) -> String {
         ));
     }
     if sections.is_empty() {
-        sections.push("Nothing in progress".into());
+        sections.push(match filtered_to {
+            Some(column) => format!("No cards in {}", column.label()),
+            None => "No cards".into(),
+        });
     }
     let notes = board
         .projects
@@ -210,6 +218,12 @@ fn board_human(board: &Board, now_ms: u64) -> String {
                 super::format::plain(&item.label()),
                 super::format::plain(error)
             ))
+        }))
+        .chain(board.linear_unavailable.as_deref().map(|reason| {
+            format!(
+                "Linear tickets could not be looked up: {}",
+                super::format::plain(reason)
+            )
         }))
         .collect::<Vec<_>>();
     if !notes.is_empty() {
@@ -439,22 +453,26 @@ mod tests {
                 },
             }],
             items: vec![item(), stale],
+            linear_unavailable: Some("Add a Linear key".into()),
         };
-        let human = board_human(&board, NOW);
+        let human = board_human(&board, None, NOW);
         let active = human.find("ACTIVE (1)").unwrap();
         let stale = human.find("STALE (1)").unwrap();
         assert!(active < stale);
-        assert!(human.ends_with("repo: GitHub is unavailable: gh is not installed"));
+        assert!(human.ends_with(
+            "repo: GitHub is unavailable: gh is not installed\n\
+             Linear tickets could not be looked up: Add a Linear key"
+        ));
+        let empty = Board {
+            items: Vec::new(),
+            projects: Vec::new(),
+            linear_unavailable: None,
+            ..board
+        };
+        assert_eq!(board_human(&empty, None, NOW), "No cards");
         assert_eq!(
-            board_human(
-                &Board {
-                    items: Vec::new(),
-                    projects: Vec::new(),
-                    ..board
-                },
-                NOW
-            ),
-            "Nothing in progress"
+            board_human(&empty, Some(Column::Landed), NOW),
+            "No cards in Landed"
         );
     }
 }

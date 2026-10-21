@@ -41,6 +41,7 @@ pub(super) struct Context<'a> {
     pub session_activity: &'a HashMap<PathBuf, u64>,
     pub sessions: &'a [LiveSession],
     pub tickets: &'a BTreeMap<String, Ticket>,
+    pub linear_unavailable: Option<&'a str>,
 }
 
 pub(super) fn assemble(projects: &[ProjectView<'_>], context: &Context<'_>) -> Board {
@@ -74,6 +75,7 @@ pub(super) fn assemble(projects: &[ProjectView<'_>], context: &Context<'_>) -> B
             })
             .collect(),
         items,
+        linear_unavailable: context.linear_unavailable.map(str::to_owned),
     }
 }
 
@@ -359,9 +361,15 @@ fn linked_ticket(issue_id: &str, tickets: &BTreeMap<String, Ticket>) -> LinearTi
 }
 
 /// The ticket a Linear-style branch name names, once Linear confirmed it:
-/// `fix/discard-1117-x` looks like one and is not.
+/// `fix/discard-1117-x` looks like one and is not. Linear also answers a
+/// former team key with the issue's current identifier, so `fix/issue-1403`
+/// about GitHub issue 1403 could come back as `MAIN-1403`; only an answer
+/// under the same identifier confirms a guess.
 fn branch_ticket(branch: &str, tickets: &BTreeMap<String, Ticket>) -> Option<LinearTicket> {
-    let ticket = tickets.get(&crate::work::ticket_from_branch(branch)?)?;
+    let identifier = crate::work::ticket_from_branch(branch)?;
+    let ticket = tickets
+        .get(&identifier)
+        .filter(|ticket| ticket.identifier.eq_ignore_ascii_case(&identifier))?;
     Some(LinearTicket {
         identifier: Some(ticket.identifier.clone()),
         title: Some(ticket.title.clone()),
@@ -381,6 +389,24 @@ fn short_ref(refname: &str) -> &str {
 mod tests {
     use super::*;
     use crate::{github::GitHubRepoKey, work::Comparison};
+
+    #[test]
+    fn branch_tickets_need_linear_to_answer_under_the_same_identifier() {
+        let ticket = |identifier: &str| Ticket {
+            identifier: identifier.into(),
+            title: "Title".into(),
+            url: format!("https://linear.app/team/issue/{identifier}"),
+        };
+        let tickets = BTreeMap::from([
+            ("MAIN-7552".to_owned(), ticket("MAIN-7552")),
+            ("ISSUE-1403".to_owned(), ticket("MAIN-1403")),
+        ]);
+        let confirmed = branch_ticket("fix/main-7552-vimeo", &tickets).unwrap();
+        assert_eq!(confirmed.identifier.as_deref(), Some("MAIN-7552"));
+        assert_eq!(confirmed.source, TicketSource::BranchName);
+        assert_eq!(branch_ticket("fix/issue-1403-compact", &tickets), None);
+        assert_eq!(branch_ticket("fix/main-1-unasked", &tickets), None);
+    }
 
     const NOW: u64 = 1_800_000_000_000;
     const HOUR: u64 = 60 * 60 * 1000;
@@ -465,6 +491,7 @@ mod tests {
                     session_activity: &self.activity,
                     sessions: &self.sessions,
                     tickets: &BTreeMap::new(),
+                    linear_unavailable: None,
                 },
             )
         }

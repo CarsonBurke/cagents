@@ -466,9 +466,10 @@ project without a GitHub remote is asked again hourly. `--fresh` reuses a scan
 or listing from the last five seconds.
 
 A worktree's `cagents linear link` names its ticket. Otherwise a Linear-style
-branch name such as `fix/main-123-title` names one once Linear confirms the
-issue exists, for display only; `test/discard-1117` does not. Tickets are
+branch name such as `fix/main-123-title` names one once Linear confirms an
+issue with that identifier, for display only; `test/discard-1117` does not. Tickets are
 looked up with your Linear credentials, and only while a board is being read.
+Without a usable key the board says so under its cards and asks again hourly.
 
 ## Windows
 
