@@ -255,6 +255,16 @@ fn merge(authored: Vec<PullRequest>, open: Vec<PullRequest>) -> Vec<PullRequest>
     merged
 }
 
+/// Whether a pull request keeps its branch in flight: open, or a draft
+/// closed without merging.
+pub(super) fn in_flight(pull_request: &PullRequest) -> bool {
+    match pull_request.state.0.as_str() {
+        "OPEN" => true,
+        "CLOSED" => pull_request.is_draft,
+        _ => false,
+    }
+}
+
 /// How stale a listing may be while someone reads the board.
 pub(super) const WATCHED_INTERVAL: Duration = Duration::from_secs(30);
 /// Unread, a listing only keeps merge state and pins current.

@@ -36,6 +36,9 @@ use crate::{
 /// The shortest gap between two event-driven scans of one project; edits in
 /// between coalesce into the next.
 const SCAN_SPACING: Duration = Duration::from_secs(2);
+/// A failed scan is retried this long after, or as soon as someone reads the
+/// board; its changes wait for the retry.
+const SCAN_RETRY: Duration = Duration::from_secs(30);
 /// Polling for projects beyond the watch budget: soon after recent activity,
 /// rarely otherwise.
 const ACTIVE_POLL: Duration = Duration::from_secs(15);
@@ -212,6 +215,15 @@ impl Tracked {
         }
     }
 
+    /// The shortest gap before this project's next scan.
+    fn spacing(&self) -> Duration {
+        if self.scan_error.is_some() {
+            SCAN_RETRY
+        } else {
+            SCAN_SPACING
+        }
+    }
+
     fn restore_snapshot(&mut self, synced_at_unix_ms: u64, snapshot: forge::Snapshot) {
         self.hints = Arc::new(snapshot.hints());
         self.snapshot = Some(Arc::new(snapshot));
@@ -221,20 +233,23 @@ impl Tracked {
         };
     }
 
-    /// The pins a scan proves stale: a card exists only for a branch Git or
-    /// the forge still names, or a detached worktree that still exists.
+    /// The pins a scan proves stale: a branch has a card while a worktree has
+    /// it checked out or its pull request is in flight, and a worktree card
+    /// while the worktree exists.
     fn live_pin(&self, item: &str) -> bool {
         let Some(local) = &self.local else {
             return true;
         };
         match crate::work::ItemKey::from_storage_key(item) {
             Some(crate::work::ItemKey::Branch(branch)) => {
-                local.branch_names.contains(&branch)
+                local
+                    .worktrees
+                    .iter()
+                    .any(|worktree| worktree.branch.as_ref() == Some(&branch))
                     || self.snapshot.as_ref().is_some_and(|snapshot| {
-                        snapshot
-                            .pull_requests
-                            .iter()
-                            .any(|pull_request| pull_request.head_ref_name == branch)
+                        snapshot.pull_requests.iter().any(|pull_request| {
+                            pull_request.head_ref_name == branch && forge::in_flight(pull_request)
+                        })
                     })
             }
             Some(crate::work::ItemKey::Worktree(path)) => local
@@ -290,11 +305,7 @@ impl Shared {
                 .snapshot
                 .iter()
                 .flat_map(|snapshot| snapshot.pull_requests.iter())
-                .filter(|pull_request| match pull_request.state.0.as_str() {
-                    "OPEN" => true,
-                    "CLOSED" => pull_request.is_draft,
-                    _ => false,
-                })
+                .filter(|pull_request| forge::in_flight(pull_request))
             {
                 wanted.extend(tickets::Reference::from_branch(&pull_request.head_ref_name));
             }
@@ -305,6 +316,37 @@ impl Shared {
     fn being_read(&self) -> bool {
         self.read_at
             .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    }
+
+    /// How long a project goes without a re-read when no watcher event asks
+    /// for one.
+    fn poll_interval(&self, tracked: &Tracked) -> Duration {
+        if tracked.covered {
+            WATCHED_POLL
+        } else if self.active(tracked) {
+            ACTIVE_POLL
+        } else {
+            IDLE_POLL
+        }
+    }
+
+    /// Whether a project's files or agents changed within the active window.
+    fn active(&self, tracked: &Tracked) -> bool {
+        let recent = |at: u64| now_unix_ms().saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS;
+        tracked.local.as_ref().is_some_and(|local| {
+            local.worktrees.iter().any(|worktree| {
+                worktree
+                    .dirty
+                    .as_ref()
+                    .and_then(|dirty| dirty.newest_modified_at_unix_ms)
+                    .is_some_and(recent)
+                    || self
+                        .session_activity
+                        .get(&worktree.path)
+                        .copied()
+                        .is_some_and(recent)
+            })
+        })
     }
 
     fn track(&mut self, repository: &Path, name: &str) -> &mut Tracked {
@@ -568,8 +610,11 @@ impl Handle {
                 // running may have read the worktrees before the change the
                 // caller wants to see.
                 let rescan = fresh && !recent(tracked.last_scan);
-                let scan = (rescan || tracked.local.is_none()).then(|| {
-                    if rescan {
+                // A first scan that just failed answers with its failure.
+                let first = tracked.local.is_none()
+                    && !(tracked.scan_error.is_some() && recent(tracked.last_scan));
+                let scan = (rescan || first).then(|| {
+                    if rescan || !tracked.scanning {
                         tracked
                             .pending
                             .get_or_insert_with(Default::default)
@@ -615,8 +660,12 @@ impl Handle {
                     targets.iter().any(|(repository, scan, poll)| {
                         shared.projects.get(repository).is_some_and(|tracked| {
                             scan.is_some_and(|scan| tracked.scans < scan)
+                                // The forge reads a project only once it has
+                                // scanned it.
                                 || poll.is_some_and(|poll| {
-                                    tracked.polls < poll && tracked.forge != Forge::NotGitHub
+                                    tracked.polls < poll
+                                        && tracked.forge != Forge::NotGitHub
+                                        && (tracked.local.is_some() || tracked.scan_error.is_none())
                                 })
                         })
                     })
@@ -778,6 +827,10 @@ impl Handle {
             Err(error) => {
                 tracing::debug!(%error, project = %tracked.name, "Work board scan failed");
                 tracked.scan_error = Some(error);
+                tracked
+                    .pending
+                    .get_or_insert_with(Default::default)
+                    .merge(job.change);
             }
         }
         let settled = tracked.scan_error.is_none()
@@ -896,6 +949,7 @@ impl Handle {
                     tracked.poll_requested = false;
                     tracked.polls_started += 1;
                     Some((
+                        tracked.id,
                         target,
                         std::mem::take(&mut tracked.memory),
                         tracked.polls_started,
@@ -903,7 +957,7 @@ impl Handle {
                 })
                 .collect::<Vec<_>>()
         };
-        for (target, mut memory, sequence) in due {
+        for (id, target, mut memory, sequence) in due {
             if self.0.cancellation.is_cancelled() {
                 break;
             }
@@ -928,7 +982,12 @@ impl Handle {
             }
             let mut shared = self.shared();
             let watched = shared.being_read();
-            let Some(tracked) = shared.projects.get_mut(&target.repository) else {
+            // A project closed, or closed and reopened, while it was polled.
+            let Some(tracked) = shared
+                .projects
+                .get_mut(&target.repository)
+                .filter(|tracked| tracked.id == id)
+            else {
                 continue;
             };
             tracked.memory = memory;
@@ -1164,34 +1223,13 @@ impl Scanner {
     fn dispatch(&mut self, handle: &Handle) {
         let jobs = {
             let mut shared = handle.shared();
-            let session_activity = &shared.session_activity;
-            let active = |tracked: &Tracked| {
-                let recent = |at: u64| now_unix_ms().saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS;
-                tracked.local.as_ref().is_some_and(|local| {
-                    local.worktrees.iter().any(|worktree| {
-                        worktree
-                            .dirty
-                            .as_ref()
-                            .and_then(|dirty| dirty.newest_modified_at_unix_ms)
-                            .is_some_and(recent)
-                            || session_activity.get(&worktree.path).copied().is_some_and(recent)
-                    })
-                })
-            };
             let polls = shared
                 .projects
                 .iter()
                 .filter(|(_, tracked)| {
-                    let interval = if tracked.covered {
-                        WATCHED_POLL
-                    } else if active(tracked) {
-                        ACTIVE_POLL
-                    } else {
-                        IDLE_POLL
-                    };
                     tracked
                         .last_scan
-                        .is_some_and(|last| last.elapsed() >= interval)
+                        .is_some_and(|last| last.elapsed() >= shared.poll_interval(tracked))
                 })
                 .map(|(repository, _)| repository.clone())
                 .collect::<Vec<_>>();
@@ -1219,7 +1257,7 @@ impl Scanner {
                         && (tracked.urgent
                             || tracked
                                 .last_scan
-                                .is_none_or(|last| last.elapsed() >= SCAN_SPACING))
+                                .is_none_or(|last| last.elapsed() >= tracked.spacing()))
                 })
                 .map(|(repository, tracked)| {
                     tracked.scanning = true;
@@ -1282,14 +1320,9 @@ impl Scanner {
                 .map_or(Duration::MAX, |last| last.elapsed());
             // A scanning project's worker wakes this thread when it is done.
             if tracked.pending.is_some() && !tracked.scanning {
-                next = next.min(SCAN_SPACING.saturating_sub(since));
+                next = next.min(tracked.spacing().saturating_sub(since));
             }
-            let poll = if tracked.covered {
-                WATCHED_POLL
-            } else {
-                ACTIVE_POLL
-            };
-            next = next.min(poll.saturating_sub(since));
+            next = next.min(shared.poll_interval(tracked).saturating_sub(since));
         }
         next.max(Duration::from_millis(100))
     }
@@ -1316,10 +1349,56 @@ mod tests {
         let mut tracked = Tracked::new("repo".into());
         assert!(tracked.live_pin("branch:gone"), "nothing is known yet");
         let mut local = scan::Local::default();
-        local.branch_names.insert("kept".into());
+        local.worktrees.push(scan::Worktree {
+            id: crate::model::WorktreeId::new(),
+            path: "/repo".into(),
+            primary: true,
+            locked: false,
+            created_at_unix_ms: None,
+            branch: Some("checked-out".into()),
+            head: None,
+            comparison: None,
+            dirty: None,
+            link: None,
+            error: None,
+        });
+        // A branch Git still has is not enough: its card needs a worktree
+        // or a pull request in flight.
+        local
+            .branch_names
+            .extend(["checked-out", "open", "draft", "merged"].map(String::from));
         tracked.local = Some(Arc::new(local));
-        assert!(tracked.live_pin("branch:kept"));
+        let pull_request = |branch: &str, state: &str, draft: bool| {
+            serde_json::from_value(serde_json::json!({
+                "number": 1,
+                "title": branch,
+                "state": state,
+                "isDraft": draft,
+                "headRefName": branch,
+                "headRefOid": "oid",
+                "baseRefName": "main",
+                "updatedAt": "2026-10-01T00:00:00Z",
+                "url": "https://github.com/me/repo/pull/1",
+            }))
+            .unwrap()
+        };
+        tracked.snapshot = Some(Arc::new(forge::Snapshot {
+            repository: crate::github::GitHubRepoKey::new("github.com", None, "me", "repo")
+                .unwrap(),
+            remotes: Vec::new(),
+            pull_requests: vec![
+                pull_request("open", "OPEN", false),
+                pull_request("draft", "CLOSED", true),
+                pull_request("merged", "MERGED", false),
+            ],
+            others: BTreeMap::new(),
+        }));
+        assert!(tracked.live_pin("branch:checked-out"));
+        assert!(tracked.live_pin("branch:open"));
+        assert!(tracked.live_pin("branch:draft"));
+        assert!(!tracked.live_pin("branch:merged"));
         assert!(!tracked.live_pin("branch:gone"));
+        assert!(tracked.live_pin("worktree:/repo"));
         assert!(!tracked.live_pin("worktree:/repo/.worktrees/gone"));
         assert!(tracked.live_pin("unknown-layout"));
     }
