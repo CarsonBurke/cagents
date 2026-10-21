@@ -457,8 +457,7 @@ impl Cagents {
                     return self.resume_current_find(target, true);
                 }
                 Err(_) => {
-                    runtime.find_navigation.raw.failed = Some(RawFailure::Worker);
-                    runtime.find_navigation.cancel_navigation();
+                    runtime.fail_find(RawFailure::Worker);
                     return Task::none();
                 }
             }
@@ -1390,8 +1389,7 @@ impl Cagents {
                 return self.resume_current_find(target, true);
             }
             Err(failure @ (RawFailure::TooLarge | RawFailure::Worker)) => {
-                runtime.find_navigation.raw.failed = Some(failure);
-                runtime.find_navigation.raw.complete = false;
+                runtime.fail_find(failure);
                 return Task::none();
             }
             Err(RawFailure::Canceled) => return self.resume_current_find(target, true),
@@ -1516,7 +1514,8 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        if !runtime.visible.load(Ordering::Relaxed) {
+        if !runtime.visible.load(Ordering::Relaxed) || runtime.find_navigation.raw.failed.is_some()
+        {
             return Task::none();
         }
         let Some(context) = highlight_context(target) else {
@@ -1638,8 +1637,7 @@ impl Cagents {
                 entry
                     .borrow_mut()
                     .complete_find_highlights(target, &attempt, None);
-                runtime.find_navigation.raw.failed = Some(RawFailure::Worker);
-                runtime.find_navigation.cancel_navigation();
+                runtime.fail_find(RawFailure::Worker);
                 return Task::none();
             }
         };
@@ -2148,6 +2146,49 @@ mod tests {
         drop(app.handle_chat_ui(reply));
         assert_eq!(entry.borrow_mut().find_highlights(target).len(), 80);
         assert!(entry.borrow_mut().find_request_id(target).is_none());
+        drop(app);
+        drop(entry);
+        drop(cache);
+        preparation::retirement_barrier();
+    }
+    #[test]
+    fn current_highlight_failure_suppresses_redraw_demand_until_explicit_retry() {
+        preparation::retirement_barrier();
+        let (mut app, target, _) = runtime("needle");
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let cache = flow_layout::Cache::default();
+        let entry = cache.entry(
+            992,
+            vec![iced::widget::text::Span::new("needle ".repeat(80))].into(),
+        );
+        entry.borrow_mut().bind_target(target);
+        entry
+            .borrow_mut()
+            .configure(600.0, iced::Pixels(14.0), iced::Font::default());
+        entry.borrow_mut().set_find_visible(true);
+        assert!(cache.complete_fixture());
+        let id = entry.borrow_mut().find_request_id(target).unwrap();
+        let task = app.find_highlight(target, id);
+        let attempt = entry.borrow().find_attempt_for_test().unwrap();
+        drop(task); // actual unpolled cancellation releases input through FIFO
+        preparation::retirement_barrier();
+        // Inject the body-free outer JoinError representation at the consumer;
+        // no worker panic is claimed from this normal cancellation.
+        drop(app.handle_chat_ui(Action::FindHighlighted(target, id, attempt, None)));
+        assert!(app.chat_runtime_mut(target).unwrap().find_error().is_some());
+        assert!(!has_highlight_context(target));
+        for _ in 0..4 {
+            assert!(
+                entry.borrow_mut().find_request_id(target).is_none(),
+                "a failed current search cannot enqueue highlight work on each Redraw"
+            );
+            assert!(iced::runtime::task::into_stream(app.find_highlight(target, id)).is_none());
+        }
+        drop(app.handle_chat_ui(Action::FindRetry(target)));
+        assert!(app.chat_runtime_mut(target).unwrap().find_error().is_none());
+        assert!(entry.borrow_mut().find_request_id(target).is_some());
+        finish_highlight(&mut app, target, id);
+        assert_eq!(entry.borrow_mut().find_highlights(target).len(), 80);
         drop(app);
         drop(entry);
         drop(cache);
@@ -2754,6 +2795,16 @@ fn metadata_capacity() -> &'static Arc<tokio::sync::Semaphore> {
     METADATA.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32 * 1024 * 1024)))
 }
 impl Runtime {
+    fn fail_find(&mut self, failure: RawFailure) {
+        self.find_navigation.raw.failed = Some(failure);
+        self.find_navigation.raw.complete = false;
+        self.find_navigation.raw.accepted = None;
+        self.find_navigation.raw.highlight_context = None;
+        HIGHLIGHTS.with(|contexts| {
+            contexts.borrow_mut().remove(&self.target);
+        });
+        self.find_navigation.cancel_navigation();
+    }
     pub(super) fn find_error(&self) -> Option<&'static str> {
         match self.find_navigation.raw.failed {
             Some(RawFailure::TooLarge) => Some(
