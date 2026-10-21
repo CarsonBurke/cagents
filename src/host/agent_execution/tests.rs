@@ -870,7 +870,22 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     {
         return;
     }
-    let (host, request, _) = fixture();
+    let (host, request, path) = fixture();
+    // Observe consumption of the actual refresh response, not just command
+    // admission: pending transport must still refuse an idle close.
+    let provider = path.parent().unwrap().join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let refreshed = r#"      case "$frame" in
+        *'"subtype":"get_context_usage"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":424242,"maxTokens":1000000}}}\n' "$id"
+          ;;
+        *)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+          ;;
+      esac"#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(provider, script.replace(original, refreshed)).unwrap();
     let automation = automation_fixture(&host, &request);
     let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
@@ -886,7 +901,19 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
         .id();
     let handle = host.lock().unwrap().chats[&session_id].handle.clone();
     let stale = handle.snapshot(None).unwrap().generation;
+    assert_ne!(handle.usage().context_tokens, 424242);
     handle.command(Command::Refresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if handle.usage().context_tokens == 424242
+            && handle.check_update_readiness().unwrap()
+                == crate::chat::runtime::UpdateReadiness::Idle
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture refresh did not settle");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         !handle.try_close_if_idle(stale).unwrap(),
         "idle metadata drift must defer without stopping the actor"
