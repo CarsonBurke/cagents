@@ -2835,9 +2835,9 @@ impl Runtime {
         }
     }
 
-    fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
+    fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) -> preparation::MetadataRetirement {
         self.preparation.take_deferred();
-        self.prepare_transcript_cache_from(snapshot, None);
+        self.prepare_transcript_cache_from(snapshot, None)
     }
 
     fn resume_preparation(&mut self) {
@@ -2850,7 +2850,12 @@ impl Runtime {
         }
     }
 
-    fn prepare_transcript_cache_from(&mut self, snapshot: &Snapshot, resume: Option<usize>) {
+    fn prepare_transcript_cache_from(
+        &mut self,
+        snapshot: &Snapshot,
+        resume: Option<usize>,
+    ) -> preparation::MetadataRetirement {
+        let mut retired_metadata = preparation::MetadataRetirement::default();
         let _stage = chat_stage::scope(Stage::PrepareChild);
         let mut presentation_changed = false;
         let context = self.selected_subagent.clone();
@@ -2916,6 +2921,49 @@ impl Runtime {
             let reader_only = !reader_proofs.is_empty()
                 && preparation::has_tool_reader_proofs(item, &reader_proofs);
             if CachedItem::prose(&item.content).is_some() || reader_only || coordinated {
+                // Only validated append lineage with equal endpoint lengths
+                // proves unchanged text without scanning a large body on UI.
+                // Shape/role/context changes and unknown full replacements
+                // retain ordinary admitted worker preparation.
+                let previous = cache
+                    .get(&item.id)
+                    .filter(|cached| {
+                        !cached.placeholder
+                            && cached.coordination.is_none()
+                            && cached.reader_context == context
+                    })
+                    .and_then(|cached| cached.item.as_ref())
+                    .cloned();
+                let metadata_proven = previous.as_ref().is_some_and(|previous| {
+                    !Arc::ptr_eq(previous, item)
+                        && previous.role == item.role
+                        && matches!((&previous.content, &item.content),
+                            (ItemContent::Text { text: old, thinking: a, phase: x },
+                             ItemContent::Text { text: next, thinking: b, phase: y })
+                            if old.len() == next.len() && a == b && x == y)
+                        && handle
+                            .as_ref()
+                            .is_some_and(|handle| handle.known_append(previous, item))
+                });
+                let metadata_reused = metadata_proven
+                    && self.preparation.retarget_metadata(
+                        previous.as_ref().unwrap(),
+                        item,
+                        growing,
+                        theme,
+                        cache[&item.id].preparing,
+                        cache[&item.id].source.provisional(),
+                        &mut retired_metadata,
+                    );
+                if metadata_reused {
+                    let old = cache
+                        .get_mut(&item.id)
+                        .unwrap()
+                        .item
+                        .replace(item.clone())
+                        .unwrap();
+                    retired_metadata.push(old);
+                }
                 let current = cache.get(&item.id);
                 let exact = current
                     .and_then(|cached| cached.item.as_ref())
@@ -2935,7 +2983,7 @@ impl Runtime {
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
-                if pending || !exact {
+                if !metadata_reused && (pending || !exact) {
                     let replaced = self.preparation.stage(
                         item,
                         growing && (!reader_only || coordinated),
@@ -3062,6 +3110,7 @@ impl Runtime {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             self.find_navigation.changed_document();
         }
+        retired_metadata
     }
 
     pub(super) fn preparation_metrics(&self) -> (usize, usize) {
@@ -3258,6 +3307,10 @@ impl Runtime {
         {
             self.restore_find_disclosures();
             self.selected_subagent = None;
+            // The selected identity disappeared even when parent IDs did not
+            // change. Its separate prepared owners cannot survive fallback.
+            self.child_cache.clear();
+            self.child_cache_context = None;
             self.find_matches.clear();
             self.find_index = 0;
         }
@@ -3359,7 +3412,22 @@ impl Runtime {
             self.expanded.retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
-        self.prepare_transcript_cache(&snapshot);
+        let retired_metadata = self.prepare_transcript_cache(&snapshot);
+        if self.selected_subagent.is_some() {
+            // Parent payload preparation stays lazy while a child is selected,
+            // but accepted recorded-time metadata also belongs to retained
+            // parent footers. Updating a stamp never examines the body.
+            let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
+            for item in &snapshot.items {
+                if let Some(cached) = self.cache.get_mut(&item.id)
+                    && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
+                {
+                    cached.stamp = item
+                        .at
+                        .and_then(|at| recorded_message_stamp(at, today.as_ref()));
+                }
+            }
+        }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
         for request in &snapshot.requests {
@@ -3466,6 +3534,7 @@ impl Runtime {
             .last()
             .map(|item| (item.id.clone(), ChangeToken::of(&item.content)));
         self.snapshot = snapshot;
+        drop(retired_metadata);
         self.presentation_evicted = false;
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id, resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
         images::sync(self);
@@ -10560,12 +10629,27 @@ mod tests {
         assert_eq!(runtime.thumbnails.subscriptions(runtime.target).len(), 1);
         let target = runtime.target;
         runtime.visible.store(true, Ordering::Relaxed);
-        let visible = app.chat_subscription().units();
+        let fingerprints = |subscription: Subscription<Message>| {
+            cosmic::iced::advanced::subscription::into_recipes(subscription)
+                .into_iter()
+                .map(|recipe| {
+                    let mut hash = cosmic::iced::advanced::subscription::Hasher::default();
+                    recipe.hash(&mut hash);
+                    std::hash::Hasher::finish(&hash)
+                })
+                .collect::<HashSet<_>>()
+        };
+        let thumbnails = fingerprints(Subscription::batch(
+            runtime.thumbnails.subscriptions(target),
+        ));
+        assert!(!thumbnails.is_empty());
+        let visible = fingerprints(app.chat_subscription());
+        assert!(thumbnails.is_subset(&visible));
         app.chat_runtime_mut(target)
             .unwrap()
             .visible
             .store(false, Ordering::Relaxed);
-        assert_eq!(app.chat_subscription().units() + 1, visible);
+        assert!(thumbnails.is_disjoint(&fingerprints(app.chat_subscription())));
         app.chat_runtime_mut(target)
             .unwrap()
             .visible
@@ -10710,6 +10794,7 @@ mod tests {
             ChangeToken::of(&changed.content)
         );
         let publish = |app: &mut Cagents, item: Arc<chat::Item>, generation| {
+            app.chat_runtime_mut(target).unwrap().show(true);
             handle.replace_snapshot_for_test(Snapshot {
                 items: vec![item],
                 generation,
@@ -11363,6 +11448,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("followup"));
         let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().show(true);
         let runtime = app.chat_runtime_mut(target).unwrap();
         Arc::make_mut(&mut runtime.snapshot).busy = true;
         Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
@@ -11764,23 +11850,28 @@ mod tests {
             "only parent source is prepared before child selection"
         );
         assert!(runtime.cache["body-2"].markdown.items().len() > 0);
-        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-2".into()))));
-        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
-        assert!(chat_runtime(&app, card).cache.contains_key("body-2"));
-        assert!(
-            matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
-            ItemContent::Text { text, .. } if text.len() > 10000),
-            "identical parent/child provider IDs cannot reuse the wrong scope"
-        );
-        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-3".into()))));
-        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
-        assert!(chat_runtime(&app, card).cache.contains_key("body-3"));
-        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
-        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
-        assert!(
-            matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
-            ItemContent::Text { text, .. } if text == "Parent source")
-        );
+        for selected in [Some("child-2"), Some("child-3"), None] {
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, selected.map(str::to_owned))));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(runtime);
+            assert_eq!(runtime.cache.len(), 1);
+            assert!(
+                matches!(&runtime.cache["body-2"].item.as_ref().unwrap().content,
+                ItemContent::Text { text, .. } if text == "Parent source"),
+                "colliding child IDs never replace the parent's source"
+            );
+            if let Some(selected) = selected {
+                let id = selected.replace("child", "body");
+                assert_eq!(runtime.child_cache.len(), 1);
+                assert!(
+                    matches!(&runtime.child_cache[&id].item.as_ref().unwrap().content,
+                    ItemContent::Text { text, .. } if text.len() > 10000)
+                );
+                assert!(!runtime.child_cache[&id].placeholder);
+            } else {
+                assert!(runtime.child_cache.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -11798,9 +11889,16 @@ mod tests {
                 at: None,
             })
         };
+        let live = |runtime: &Runtime, id: &str| {
+            runtime
+                .preparation
+                .growing_canonical_for_test(runtime.active_item(id).unwrap())
+                .is_some()
+        };
         let body = "```rust\nfn first() {}\n";
         let mut snapshot = Snapshot {
             generation: 10,
+            session_id: Some("streaming-children".into()),
             ready: true,
             busy: false,
             items: vec![item("parent", body)],
@@ -11831,44 +11929,54 @@ mod tests {
             ..Snapshot::default()
         };
         let publish = |app: &mut Cagents, snapshot: &Snapshot| {
-            handle.publish_snapshot_for_test(snapshot.clone());
             let runtime = app.chat_runtime_mut(target).unwrap();
-            runtime.visible.store(true, Ordering::Relaxed);
+            runtime.show(true);
+            handle.publish_delta_snapshot_for_test(snapshot.clone());
             runtime.refresh();
+            preparation::drain_fixture(runtime);
         };
-        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("running-child".into());
         publish(&mut app, &snapshot);
         assert!(chat_runtime(&app, card).child_cache.is_empty());
         drop(app.handle_chat_ui(Action::SelectSubagent(
             target,
             Some("finished-child".into()),
         )));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         assert!(
             chat_runtime(&app, card).child_cache["finished"]
                 .open
                 .is_none()
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("running-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let runtime = chat_runtime(&app, card);
         assert!(
-            runtime.child_cache["child-first"].open.is_some(),
+            live(runtime, "child-first"),
             "an idle parent must not retire its running child's fence"
         );
+        let parser_work = runtime
+            .preparation
+            .growing_canonical_for_test(runtime.active_item("child-first").unwrap())
+            .unwrap();
         assert!(runtime.cache["parent"].open.is_none());
         assert!(!runtime.child_cache.contains_key("finished"));
         // An unchanged snapshot must also preserve the child's continuation.
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
-        assert!(
-            chat_runtime(&app, card).child_cache["child-first"]
-                .open
-                .is_some()
-        );
+        assert!(live(chat_runtime(&app, card), "child-first"));
         let longer = format!("{body}fn second() {{}}\n");
         snapshot.subagents[0].items[0] = item("child-first", &longer);
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
-        let expected = CachedItem::new(&text(&longer), chat_runtime(&app, card).syntax_theme);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime
+                .preparation
+                .growing_canonical_for_test(runtime.active_item("child-first").unwrap()),
+            Some(parser_work),
+            "verified child append continues the actual retained Markdown fence without reparsing it"
+        );
+        let expected = CachedItem::new(&text(&longer), runtime.syntax_theme);
         let cached = &chat_runtime(&app, card).child_cache["child-first"];
         assert_eq!(parsed_codes(cached), parsed_codes(&expected));
         for (key, block) in &expected.blocks {
@@ -11888,9 +11996,14 @@ mod tests {
         publish(&mut app, &snapshot);
         let runtime = chat_runtime(&app, card);
         assert!(runtime.child_cache["child-first"].open.is_none());
-        assert!(runtime.child_cache["child-new"].open.is_some());
+        assert!(!runtime.preparation.contains("child-first"));
+        assert!(live(runtime, "child-new"));
         assert!(runtime.cache["parent"].open.is_none());
-        assert!(runtime.cache["parent-new"].open.is_some());
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        assert!(live(chat_runtime(&app, card), "parent-new"));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("running-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         // Each terminal status retires an unchanged item. A resumed child
         // with the same item ID can subsequently append without losing text.
         for (index, status) in [
@@ -11906,13 +12019,17 @@ mod tests {
             snapshot.subagents[0].items.push(item(&id, body));
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
-            assert!(chat_runtime(&app, card).child_cache[&id].open.is_some());
+            assert!(live(chat_runtime(&app, card), &id));
             snapshot.subagents[0].status = status;
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
             let runtime = chat_runtime(&app, card);
             assert!(runtime.child_cache[&id].open.is_none());
-            assert!(runtime.cache["parent-new"].open.is_some());
+            assert!(!runtime.preparation.contains(&id));
+            assert!(
+                !runtime.preparation.contains("parent-new"),
+                "inactive parent continuation does not own the selected child's parser"
+            );
             snapshot.subagents[0].status = chat::ToolStatus::Running;
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
@@ -11920,7 +12037,7 @@ mod tests {
             snapshot.generation += 1;
             publish(&mut app, &snapshot);
             let cached = &chat_runtime(&app, card).child_cache[&id];
-            assert!(cached.open.is_some());
+            assert!(live(chat_runtime(&app, card), &id));
             assert_eq!(parsed_codes(cached), parsed_codes(&expected));
             for (key, block) in &expected.blocks {
                 for dark in [false, true] {
@@ -11947,11 +12064,9 @@ mod tests {
         }));
         snapshot.generation += 1;
         publish(&mut app, &snapshot);
-        assert!(
-            chat_runtime(&app, card).child_cache["child-ending-2"]
-                .open
-                .is_none()
-        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.child_cache["child-ending-2"].open.is_none());
+        assert!(!runtime.preparation.contains("child-ending-2"));
     }
 
     #[test]
@@ -11985,10 +12100,11 @@ mod tests {
                 ..Snapshot::default()
             };
             let publish = |app: &mut Cagents, snapshot: &Snapshot| {
-                handle.publish_snapshot_for_test(snapshot.clone());
                 let runtime = app.chat_runtime_mut(target).unwrap();
-                runtime.visible.store(true, Ordering::Relaxed);
+                runtime.show(true);
+                handle.publish_snapshot_for_test(snapshot.clone());
                 runtime.refresh();
+                preparation::drain_fixture(runtime);
             };
             app.chat_runtime_mut(target).unwrap().selected_subagent = Some("child".into());
             publish(&mut app, &snapshot);
@@ -12031,7 +12147,13 @@ mod tests {
     }
 
     fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
-        let card = live_chat(app, Some(KNOWN_THREAD));
+        history_fixture_for_provider(app, Provider::Codex)
+    }
+    fn history_fixture_for_provider(
+        app: &mut Cagents,
+        provider: Provider,
+    ) -> (CardId, Target, Arc<ClientHandle>) {
+        let card = live_chat_for_provider(app, provider, Some(KNOWN_THREAD));
         let runtime = app
             .chat_runtime_mut(chat_runtime(app, card).target)
             .unwrap();
@@ -13332,7 +13454,10 @@ mod tests {
     /// sent. Tasks are dropped throughout: nothing here starts a provider or
     /// reaches a daemon.
     fn draft_chat(app: &mut Cagents) -> CardId {
-        let _ = app.new_native_chat(Provider::Codex, Some(PathBuf::from(FIXTURE_DIRECTORY)));
+        draft_chat_for_provider(app, Provider::Codex)
+    }
+    fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
+        let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();
         assert!(
             matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft()),
@@ -13524,12 +13649,7 @@ mod tests {
     #[test]
     fn selected_child_find_restores_coordination_parts_only_in_their_original_scope() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target, handle) = history_fixture(&mut app);
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .session
-            .launch
-            .provider = Provider::Claude;
+        let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
         let card_item = |scope: &str| {
             Arc::new(chat::Item {
             id: "same#opaque-id".into(), role: chat::Role::Assistant,
@@ -13550,10 +13670,12 @@ mod tests {
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         let part = "same#opaque-id#body";
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("one".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::Find(target, "one-only".into())));
         assert!(chat_runtime(&app, card).child_unfolded["one"].contains(part));
         assert!(!chat_runtime(&app, card).unfolded.contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         assert!(!chat_runtime(&app, card).child_unfolded["one"].contains(part));
         drop(app.handle_chat_ui(Action::Find(target, "two-only".into())));
         drop(app.handle_chat_ui(Action::Unfold(target, part.into())));
@@ -13561,6 +13683,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         assert!(chat_runtime(&app, card).child_unfolded["two"].contains(part));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::Find(target, "parent-only".into())));
         assert!(chat_runtime(&app, card).unfolded.contains(part));
         drop(app.handle_chat_ui(Action::CloseFind(target)));
@@ -13776,12 +13899,7 @@ mod tests {
     #[test]
     fn selected_presentation_bounds_child_disclosure_history_without_crossing_transcripts() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (card, target, handle) = history_fixture(&mut app);
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .session
-            .launch
-            .provider = Provider::Claude;
+        let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
         let item = Arc::new(chat::Item {
             id: "same#opaque-id".into(),
             role: chat::Role::Assistant,
@@ -13807,6 +13925,7 @@ mod tests {
         ];
         handle.publish_snapshot_for_test(snapshot.clone());
         app.chat_runtime_mut(target).unwrap().refresh();
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         assert!(
             chat_runtime(&app, card).cache[&item.id]
                 .coordination
@@ -13821,6 +13940,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
         for child in ["long-running-child", "other-child"] {
             drop(app.handle_chat_ui(Action::SelectSubagent(target, Some(child.into()))));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
             drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
             drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
         }
@@ -13857,55 +13977,73 @@ mod tests {
     }
 
     #[test]
-    fn selected_presentation_hide_retains_raw_history_and_ready_cache() {
+    fn selected_presentation_hide_releases_bodies_and_rehydrates_history_draft_and_selection() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = history_fixture(&mut app);
-        let prompt = Arc::new(chat::Item {
-            id: "prompt".into(),
-            role: chat::Role::User,
-            content: ItemContent::Text {
-                text: "Saved prompt".into(),
-                thinking: false,
-                phase: chat::Phase::Final,
-            },
-            at: None,
-            started_at: None,
-        });
-        let mut snapshot = (*handle.snapshot()).clone();
-        snapshot.generation += 1;
-        snapshot.items = vec![prompt];
-        snapshot.subagents = vec![presentation_child(
-            "child",
-            presentation_text("answer", "Selected **answer**"),
-        )];
-        handle.publish_snapshot_for_test(snapshot);
-        app.chat_runtime_mut(target).unwrap().refresh();
+        let snapshot = || Snapshot {
+            generation: 17,
+            ready: true,
+            session_id: Some(KNOWN_THREAD.into()),
+            items: vec![Arc::new(chat::Item {
+                id: "prompt".into(),
+                role: chat::Role::User,
+                content: text("Saved prompt"),
+                at: None,
+                started_at: None,
+            })],
+            subagents: vec![presentation_child(
+                "child",
+                presentation_text("answer", "Selected **answer**"),
+            )],
+            ..Snapshot::default()
+        };
+        show_chat_snapshot_for_test(&mut app, card, snapshot());
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
         let runtime = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(runtime);
         runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
-        let raw = runtime.snapshot.clone();
-        let client_raw = handle.snapshot();
-        let history = runtime.history.clone();
-        let revision = runtime.child_cache["answer"].revision;
+        assert_eq!(runtime.history, ["Saved prompt"]);
+        assert!(!runtime.child_cache["answer"].placeholder);
+        let old_answer = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
-        assert!(Arc::ptr_eq(&raw, &runtime.snapshot));
-        assert!(Arc::ptr_eq(&client_raw, &handle.snapshot()));
-        assert_eq!(runtime.child_cache["answer"].revision, revision);
-        runtime.set_visible(true).unwrap();
-        runtime.refresh();
-        assert!(Arc::ptr_eq(&raw, &runtime.snapshot));
-        assert_eq!(runtime.history, history);
+        preparation::retirement_barrier();
+        assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(old_answer.upgrade().is_none());
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
         assert_eq!(runtime.composer.text(), "Unsent draft");
-        assert_eq!(runtime.child_cache["answer"].revision, revision);
+        runtime.set_visible(true).unwrap();
+        assert!(
+            runtime.child_cache.is_empty(),
+            "reveal awaits the authoritative body"
+        );
+        // Rehydration can legitimately answer at the same daemon generation.
+        handle.replace_snapshot_for_test(snapshot());
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        assert_eq!(runtime.history, ["Saved prompt"]);
+        assert_eq!(runtime.composer.text(), "Unsent draft");
+        assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
+        assert!(!runtime.child_cache["answer"].placeholder);
+        assert_eq!(
+            runtime.child_cache["answer"].item.as_ref().unwrap().content,
+            text("Selected **answer**")
+        );
         // An actual new publication removing the selected child reverts to parent.
-        let mut removed = (*handle.snapshot()).clone();
+        let mut removed = snapshot();
         removed.generation += 1;
         removed.subagents.clear();
-        handle.publish_snapshot_for_test(removed);
+        handle.publish_delta_snapshot_for_test(removed);
         runtime.refresh();
+        preparation::drain_fixture(runtime);
         assert!(runtime.selected_subagent.is_none() && runtime.child_cache.is_empty());
-        assert!(runtime.cache.contains_key("prompt"));
+        assert!(!runtime.cache["prompt"].placeholder);
+        assert_eq!(
+            runtime.cache["prompt"].item.as_ref().unwrap().content,
+            text("Saved prompt")
+        );
     }
 
     #[test]
@@ -14308,11 +14446,13 @@ mod tests {
     fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_ways() {
         use crate::workspace_widget::GlobalShortcut;
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, Some("permissions"));
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some("permissions"));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.session.launch.provider = Provider::Claude;
-        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        runtime.show(true);
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
         snapshot.permission_mode = Some("default".into());
         snapshot.capabilities.permission_modes = vec!["default".into(), "plan".into()];
         snapshot.requests = vec![chat::Request {
@@ -14340,6 +14480,8 @@ mod tests {
                 agent_id: None,
             })
             .collect();
+        handle.publish_delta_snapshot_for_test(snapshot);
+        runtime.refresh();
         drop(app.open_chat_control(GlobalShortcut::ChatPermissions));
         settle(&mut app, card, Ok(()));
         let describe = |messages: Vec<Message>| {
@@ -15352,7 +15494,10 @@ mod tests {
     /// A new conversation whose start, for its first message, is still in
     /// flight.
     fn starting_chat(app: &mut Cagents) -> (CardId, Target) {
-        let card = draft_chat(app);
+        starting_chat_for_provider(app, Provider::Codex)
+    }
+    fn starting_chat_for_provider(app: &mut Cagents, provider: Provider) -> (CardId, Target) {
+        let card = draft_chat_for_provider(app, provider);
         write(app, card, "hello");
         submit(app, card);
         let target = app
@@ -15513,7 +15658,9 @@ mod tests {
             boot_id: "fixture-boot".into(),
             host_incarnation: "fixture-incarnation".into(),
         };
-        session.claim_owned_codex_listener(std::path::Path::new("/daemon-temp-root"), &proof);
+        if session.launch.provider == Provider::Codex {
+            session.claim_owned_codex_listener(std::path::Path::new("/daemon-temp-root"), &proof);
+        }
         session.proof = Some(proof);
         Arc::new(ClientHandle::fixture(
             session,
@@ -15527,7 +15674,14 @@ mod tests {
 
     /// A conversation that started, optionally with a provider-confirmed id.
     fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
-        let (card, target) = starting_chat(app);
+        live_chat_for_provider(app, Provider::Codex, session_id)
+    }
+    fn live_chat_for_provider(
+        app: &mut Cagents,
+        provider: Provider,
+        session_id: Option<&str>,
+    ) -> CardId {
+        let (card, target) = starting_chat_for_provider(app, provider);
         let handle = fixture_handle(app, card, session_id);
         answer_start(app, target, Ok(handle));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
@@ -15655,6 +15809,7 @@ mod tests {
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().show(true);
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         let mut snapshot = Snapshot {
             ready: true,
@@ -19812,32 +19967,64 @@ mod tests {
     }
 
     #[test]
-    fn hidden_prose_releases_only_continuation_scratch_and_preserves_reader_state() {
+    fn hidden_prose_releases_graph_and_scratch_and_rehydrates_reader_state() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = draft_chat(&mut app);
-        let target = chat_runtime(&app, card).target;
+        let (card, target, handle) = history_fixture(&mut app);
+        let snapshot = || Snapshot {
+            generation: 17,
+            ready: true,
+            session_id: Some(KNOWN_THREAD.into()),
+            subagents: vec![presentation_child(
+                "selected child",
+                presentation_text("scratch-owner", &"x".repeat(512 * 1024)),
+            )],
+            ..Snapshot::default()
+        };
+        show_chat_snapshot_for_test(&mut app, card, snapshot());
+        drop(app.handle_chat_ui(Action::SelectSubagent(
+            target,
+            Some("selected child".into()),
+        )));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        let content = text(&"x".repeat(512 * 1024));
-        let cached = CachedItem::updated(&content, runtime.syntax_theme, None, false, true, None);
-        assert!(cached.source.retained_tail_capacity() >= 512 * 1024);
-        let revision = cached.revision;
-        runtime.cache.insert("scratch-owner".into(), cached);
-        runtime.composer = text_editor::Content::with_text("unsent reader draft");
+        preparation::drain_fixture(runtime);
+        assert!(
+            runtime.child_cache["scratch-owner"]
+                .source
+                .retained_tail_capacity()
+                >= 512 * 1024
+        );
+        let old_item = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
+        runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
         runtime.find = Some("kept query".into());
-        runtime.selected_subagent = Some("selected child".into());
         runtime.expanded.insert("scratch-owner".into());
         runtime.opened.insert("kept turn".into(), true);
-        let snapshot = runtime.snapshot.clone();
         runtime.set_visible(false).unwrap();
         runtime.set_visible(false).unwrap();
-        let cached = &runtime.cache["scratch-owner"];
-        assert_eq!(cached.source.retained_tail_capacity(), 0);
-        assert_eq!(cached.revision, revision);
-        assert_eq!(cached.markdown.items().len(), 1);
-        assert!(Arc::ptr_eq(&snapshot, &runtime.snapshot));
+        preparation::retirement_barrier();
+        // A live hidden presentation releases the graph and its parser scratch;
+        // a draft has no provider transcript to suspend.
+        assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
+        assert!(old_item.upgrade().is_none());
+        assert_eq!(runtime.snapshot.transcript_bytes(), 0);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
         assert_eq!(runtime.unsent_text(), "unsent reader draft");
         assert_eq!(runtime.find.as_deref(), Some("kept query"));
         assert_eq!(runtime.selected_subagent.as_deref(), Some("selected child"));
+        assert!(runtime.expanded.contains("scratch-owner"));
+        assert_eq!(runtime.opened.get("kept turn"), Some(&true));
+        runtime.set_visible(true).unwrap();
+        handle.replace_snapshot_for_test(snapshot());
+        runtime.refresh();
+        preparation::drain_fixture(runtime);
+        let cached = &runtime.child_cache["scratch-owner"];
+        assert!(!cached.placeholder);
+        assert_eq!(cached.markdown.items().len(), 1);
+        assert_eq!(
+            cached.item.as_ref().unwrap().content,
+            text(&"x".repeat(512 * 1024))
+        );
+        assert_eq!(runtime.unsent_text(), "unsent reader draft");
+        assert_eq!(runtime.find.as_deref(), Some("kept query"));
         assert!(runtime.expanded.contains("scratch-owner"));
         assert_eq!(runtime.opened.get("kept turn"), Some(&true));
     }
@@ -20043,7 +20230,37 @@ mod tests {
                     format!("List({start:?}, {bullets:?})")
                 }
                 markdown::Item::Quote(items) => format!("Quote({})", outline(items)),
-                item => format!("{item:?}"),
+                markdown::Item::Paragraph(text) => {
+                    format!("Paragraph({:?})", text.semantic_spans())
+                }
+                markdown::Item::Heading(level, text) => {
+                    format!("Heading({level:?}, {:?})", text.semantic_spans())
+                }
+                markdown::Item::Image {
+                    url,
+                    title,
+                    title_text,
+                    alt,
+                } => format!(
+                    "Image({url:?}, {title:?}, {:?}, {:?})",
+                    title_text.semantic_spans(),
+                    alt.semantic_spans()
+                ),
+                markdown::Item::Rule => "Rule".into(),
+                markdown::Item::Table { columns, rows } => format!(
+                    "Table({:?}, {:?})",
+                    columns
+                        .iter()
+                        .map(|column| (column.alignment, outline(&column.header)))
+                        .collect::<Vec<_>>(),
+                    rows.iter()
+                        .map(|row| row
+                            .cells
+                            .iter()
+                            .map(|cell| outline(cell))
+                            .collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
+                ),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -23007,8 +23224,10 @@ mod tests {
         // The daemon answers the unconditional read at the same generation.
         handle.replace_snapshot_for_test(snapshot());
         runtime.refresh();
+        preparation::drain_fixture(runtime);
         assert!(runtime.snapshot.transcript_bytes() > 0);
-        assert!(!runtime.cache.is_empty());
+        assert!(!runtime.presentation_cache().is_empty());
+        assert!(!runtime.child_cache["child-item"].placeholder);
         assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
         assert_eq!(runtime.scroll, scroll);
         assert_eq!(runtime.subagent_scroll, child_scroll);

@@ -5186,6 +5186,11 @@ fn model_list<'a>(
 mod frame_cost;
 
 #[cfg(test)]
+pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
+    frame_cost::live_runtime(items)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5277,8 +5282,9 @@ mod tests {
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
             Arc::make_mut(&mut snapshot.items[0]).at = recorded;
-            handle.publish_snapshot_for_test(snapshot);
+            handle.publish_delta_snapshot_for_test(snapshot);
             runtime.refresh();
+            preparation::drain_fixture(&mut runtime);
             assert_eq!(
                 runtime.cache["dated-retained-answer"].revision, revision,
                 "unchanged message body keeps prepared cache"
@@ -5355,14 +5361,18 @@ mod tests {
             ..parent.clone()
         };
         let mut snapshot = (*handle.snapshot()).clone();
+        // Publish the permission metadata already accepted by this Runtime;
+        // otherwise its no-thread draft fallback must clone each fresh Arc.
+        snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
         snapshot.generation += 1;
         let child_id = native_child_fixture().id;
         snapshot.subagents.push(chat::Subagent {
             items: vec![Arc::new(child.clone())],
             ..native_child_fixture()
         });
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         runtime.refresh();
+        preparation::drain_fixture(&mut runtime);
         let renderer = crate::app::tests::headless_renderer();
         let target = runtime.target;
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -5373,6 +5383,7 @@ mod tests {
             let before_selection = app.chat_runtime_mut(target).unwrap().snapshot.clone();
             drop(app.handle_chat_ui(Action::SelectSubagent(target, selected)));
             let runtime = app.chat_runtime_mut(target).unwrap();
+            preparation::drain_fixture(runtime);
             assert!(Arc::ptr_eq(&before_selection, &runtime.snapshot));
             assert_eq!(runtime.cache[&parent.id].stamp.as_ref().unwrap().0, at);
             let expected = runtime.presentation_cache()[&item.id]
@@ -5458,9 +5469,10 @@ mod tests {
                     let mut snapshot = (*handle.snapshot()).clone();
                     snapshot.generation += 1;
                     Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = recorded;
-                    handle.publish_snapshot_for_test(snapshot);
+                    handle.publish_delta_snapshot_for_test(snapshot);
                     let runtime = app.chat_runtime_mut(target).unwrap();
                     runtime.refresh();
+                    preparation::drain_fixture(runtime);
                     assert_eq!(
                         runtime.child_cache[&item.id].revision, revision,
                         "clock-only publication retains prepared child body"
@@ -5507,7 +5519,7 @@ mod tests {
         snapshot.generation += 1;
         Arc::make_mut(&mut snapshot.items[0]).at = None;
         Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = None;
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.refresh();
         assert!(runtime.cache[&parent.id].stamp.is_none());
@@ -5564,14 +5576,18 @@ mod tests {
         };
         let (mut runtime, handle) = frame_cost::live_runtime(&[parent]);
         let mut snapshot = (*handle.snapshot()).clone();
+        // Publish the permission metadata already accepted by this Runtime;
+        // otherwise its no-thread draft fallback must clone each fresh Arc.
+        snapshot.permission_mode = runtime.snapshot.permission_mode.clone();
         snapshot.generation += 1;
         snapshot.subagents.push(chat::Subagent {
             status: chat::ToolStatus::Succeeded,
             items: vec![Arc::new(child)],
             ..native_child_fixture()
         });
-        handle.publish_snapshot_for_test(snapshot);
+        handle.publish_delta_snapshot_for_test(snapshot);
         runtime.refresh();
+        preparation::drain_fixture(&mut runtime);
         let target = runtime.target;
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
@@ -5606,12 +5622,14 @@ mod tests {
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
         drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
         assert!(
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct child reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         drop(app.handle_chat_ui(Action::CloseFind(target)));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(!runtime.item_expanded("shared-thought"));
@@ -5623,6 +5641,7 @@ mod tests {
             inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.item_expanded("shared-thought"));
         assert!(runtime.part_unfolded("shared-thought#output"));
@@ -5630,6 +5649,7 @@ mod tests {
         drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
         drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.item_expanded("shared-thought"));
         assert!(runtime.part_unfolded("shared-thought#output"));
@@ -6072,6 +6092,7 @@ mod tests {
         let mut previous_anchor = None;
         for (child, item, framed) in [("a", "bc", "1:abc"), ("ab", "c", "2:abc")] {
             drop(app.handle_chat_ui(Action::SelectSubagent(target, Some(child.into()))));
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
             let task = app.handle_chat_ui(Action::Find(target, "needle".into()));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert_eq!(runtime.find_matches, vec![item]);
@@ -6111,6 +6132,16 @@ mod tests {
                 count: usize,
             }
             impl Operation for Anchors {
+                fn custom(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn std::any::Any,
+                ) {
+                    if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                        policy.visit = false;
+                    }
+                }
                 fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                     visit(self);
                 }
@@ -7172,8 +7203,10 @@ mod tests {
                     text.push_str(" streamed detail");
                 }
                 snapshot.items[0] = Arc::new(item);
-                handle.publish_snapshot_for_test(snapshot);
+                snapshot.generation += 1;
+                handle.publish_delta_snapshot_for_test(snapshot);
                 runtime.refresh();
+                preparation::drain_fixture(runtime);
                 assert!(runtime.expanded.contains("live-thought"));
                 continue;
             }
@@ -8899,23 +8932,12 @@ mod tests {
             "reasoning"
         ));
 
-        // Even reasoning already followed by an answer keeps its busy
-        // dependency; this change does not localize cross-item completion.
+        // Completed historical reasoning keeps its retained presentation when
+        // another turn changes the conversation's busy state.
         let (mut history, _handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
         let idle = fingerprints(&history, true);
         Arc::make_mut(&mut history.snapshot).busy = true;
-        for (turn, (idle, busy)) in history
-            .turns
-            .iter()
-            .zip(idle.iter().zip(fingerprints(&history, true)))
-        {
-            assert_eq!(
-                *idle != busy,
-                turn.prose
-                    .iter()
-                    .any(|placed| placed.slot == turn::Slot::Thinking)
-            );
-        }
+        assert_eq!(idle, fingerprints(&history, true));
     }
 
     #[test]
@@ -8979,13 +9001,14 @@ mod tests {
         items: &[chat::Item],
         generation: u64,
     ) {
-        handle.publish_snapshot_for_test(Snapshot {
+        handle.publish_delta_snapshot_for_test(Snapshot {
             generation,
             ready: true,
             items: items.iter().cloned().map(Arc::new).collect(),
             ..Snapshot::default()
         });
         runtime.refresh();
+        preparation::drain_fixture(runtime);
     }
 
     #[test]

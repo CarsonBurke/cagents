@@ -108,6 +108,106 @@ impl Drop for Lease {
     }
 }
 
+/// Bounded raw immutable owners displaced by authenticated metadata-only
+/// publications. Hold this guard until the Runtime commits its new Snapshot,
+/// then retire actual Items before releasing their source-byte reservation.
+#[derive(Default)]
+pub(super) struct MetadataRetirement(Option<MetadataItems>);
+struct MetadataItems {
+    items: Vec<Arc<chat::Item>>,
+    #[cfg(test)]
+    watchers: Vec<(
+        std::sync::Weak<chat::Item>,
+        std::sync::mpsc::Sender<(std::thread::ThreadId, bool)>,
+    )>,
+    // Actual Items and their String allocations drop before capacity returns.
+    lease: Lease,
+}
+impl Drop for MetadataItems {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.items));
+        #[cfg(test)]
+        for (item, sender) in self.watchers.drain(..) {
+            let _ = sender.send((std::thread::current().id(), item.upgrade().is_none()));
+        }
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static METADATA_WATCH: std::cell::RefCell<HashMap<usize, std::sync::mpsc::Sender<(std::thread::ThreadId, bool)>>> = std::cell::RefCell::default();
+}
+#[cfg(test)]
+fn watch_metadata_retirement(
+    item: &Arc<chat::Item>,
+) -> std::sync::mpsc::Receiver<(std::thread::ThreadId, bool)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    METADATA_WATCH.with(|watch| {
+        watch
+            .borrow_mut()
+            .insert(Arc::as_ptr(item) as usize, sender)
+    });
+    receiver
+}
+impl MetadataRetirement {
+    fn reserve(&mut self, item: &Arc<chat::Item>) -> bool {
+        let owned = self.0.get_or_insert_with(|| MetadataItems {
+            items: Vec::new(),
+            #[cfg(test)]
+            watchers: Vec::new(),
+            lease: Lease::default(),
+        });
+        // Include bounded item/vector bookkeeping even for an empty body.
+        let payload = match &item.content {
+            ItemContent::Text { text, .. } => text.capacity(),
+            _ => unreachable!("metadata retirement only admits proven Text"),
+        };
+        let bytes = payload
+            .saturating_add(item.id.capacity())
+            .saturating_add(std::mem::size_of::<chat::Item>())
+            .saturating_add(2 * std::mem::size_of::<Arc<chat::Item>>())
+            .saturating_add(64);
+        if !owned
+            .lease
+            .resize(owned.lease.0.load(Ordering::Relaxed).saturating_add(bytes))
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(sender) =
+            METADATA_WATCH.with(|watch| watch.borrow_mut().remove(&(Arc::as_ptr(item) as usize)))
+        {
+            owned.watchers.push((Arc::downgrade(item), sender));
+        }
+        true
+    }
+    pub(super) fn push(&mut self, item: Arc<chat::Item>) {
+        self.0
+            .as_mut()
+            .expect("reserved metadata retirement")
+            .items
+            .push(item);
+    }
+}
+impl Drop for MetadataRetirement {
+    fn drop(&mut self) {
+        if let Some(owned) = self.0.take() {
+            if owned.items.is_empty() {
+                drop(owned);
+            } else {
+                #[cfg(test)]
+                let observed = !owned.watchers.is_empty();
+                enqueue_retirement(Retirement::Metadata(owned));
+                // Deterministically expose premature guard release: a wrong
+                // pre-Snapshot enqueue must observe that obsolete owner live.
+                #[cfg(test)]
+                if observed {
+                    retirement_barrier();
+                }
+            }
+        }
+    }
+}
+
 struct Shared {
     latest: Mutex<Request>,
     canonical: Mutex<Option<Canonical>>,
@@ -381,6 +481,30 @@ impl State {
     pub(super) fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
     }
+    #[cfg(test)]
+    pub(super) fn growing_canonical_for_test(&self, item: &Arc<chat::Item>) -> Option<usize> {
+        let Some(entry) = self.entries.get(&item.id) else {
+            return None;
+        };
+        let latest = entry.shared.latest.lock().unwrap();
+        if entry.running
+            || !latest.growing
+            || !Arc::ptr_eq(&latest.item, item)
+            || entry.shared.cancelled.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        entry
+            .shared
+            .canonical
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|canonical| {
+                canonical.parsed.markdown.has_open_fence_for_test() && !canonical.blocks.is_empty()
+            })
+            .map(|canonical| canonical.parsed.markdown.parsed_work_bytes())
+    }
     pub(super) fn queued_bytes(&self) -> usize {
         self.entries
             .values()
@@ -495,6 +619,43 @@ impl State {
             },
         );
         true
+    }
+
+    /// The caller already proved an authenticated equal-body Text publication
+    /// in this exact selected context. A running/finalizing parser cannot be
+    /// relabeled; only its accepted idle canonical input may follow metadata.
+    pub(super) fn retarget_metadata(
+        &mut self,
+        previous: &Arc<chat::Item>,
+        current: &Arc<chat::Item>,
+        growing: bool,
+        theme: crate::settings::EditorSyntaxTheme,
+        preparing: bool,
+        provisional: bool,
+        retired: &mut MetadataRetirement,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(&current.id) {
+            if entry.running || entry.shared.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut latest = entry
+                .shared
+                .latest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !Arc::ptr_eq(&latest.item, previous)
+                || latest.growing != growing
+                || latest.theme != theme
+                || self.provider != Some(latest.provider)
+                || !retired.reserve(previous)
+            {
+                return false;
+            }
+            retired.push(std::mem::replace(&mut latest.item, current.clone()));
+            true
+        } else {
+            !preparing && !growing && !provisional && retired.reserve(previous)
+        }
     }
 
     pub(super) fn subscriptions(&self, target: Target) -> Vec<Subscription<Message>> {
@@ -691,6 +852,7 @@ pub(super) struct Presentation {
 }
 
 enum Retirement {
+    Metadata(MetadataItems),
     FlowSource(flow_layout::RawSource),
     FlowOutput(flow_layout::OutputRetirement),
     Document(prose_document::Data),
@@ -781,6 +943,7 @@ fn enqueue_retirement(retired: Retirement) {
                 pending.pop_front().expect("queued retirement")
             };
             match retired {
+                Retirement::Metadata(owned) => drop(owned),
                 Retirement::FlowSource(source) => drop(source),
                 Retirement::FlowOutput(output) => drop(output),
                 Retirement::Document(document) => drop(document),
@@ -1175,6 +1338,298 @@ mod tests {
     }
     fn ready(prepared: Result<Prepared, String>) -> Ready {
         Ready::new(prepared)
+    }
+
+    #[test]
+    fn authenticated_metadata_retains_exact_graph_and_retires_old_snapshot_items_after_commit() {
+        for growing in [false, true] {
+            let source = item(&format!(
+                "# Stable rich source\n\n{}",
+                "large unchanged body ".repeat(50_000)
+            ));
+            let (mut runtime, handle) = view::prepared_runtime_for_test(&[(*source).clone()]);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.busy = growing;
+            if growing {
+                let ItemContent::Text { text, .. } =
+                    &mut Arc::make_mut(&mut snapshot.items[0]).content
+                else {
+                    unreachable!()
+                };
+                text.push_str("\n\nActual growing tail");
+            }
+            handle.publish_delta_snapshot_for_test(snapshot);
+            runtime.refresh();
+            drain_fixture(&mut runtime);
+            retirement_barrier();
+            assert_eq!(
+                runtime.preparation.entries.contains_key("message"),
+                growing,
+                "the growing case must own an actually accepted managed canonical"
+            );
+            let cached = &runtime.cache["message"];
+            let revision = cached.revision;
+            let document = cached.document.as_ref().unwrap().clone();
+            let graph = document.items().as_ptr();
+            let old = cached.item.as_ref().unwrap().clone();
+            let old_snapshot = Arc::downgrade(&runtime.snapshot);
+            let old_item = Arc::downgrade(&old);
+            let disposed = watch_metadata_retirement(&old);
+            let version = runtime.preparation.entries.get("message").map(|entry| {
+                assert!(!entry.running);
+                entry.shared.latest.lock().unwrap().version
+            });
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            Arc::make_mut(&mut snapshot.items[0]).at = Some(1_700_000_000_000);
+            handle.publish_delta_snapshot_for_test(snapshot);
+            assert!(handle.known_append(&old, &handle.snapshot().items[0]));
+            drop(old);
+            let parser_before = markdown::parser_work_bytes_on_thread();
+            runtime.refresh();
+            assert_eq!(
+                markdown::parser_work_bytes_on_thread(),
+                parser_before,
+                "metadata-only refresh performs no UI body parse"
+            );
+            let cached = &runtime.cache["message"];
+            assert_eq!(
+                cached.revision, revision,
+                "authenticated equal-body metadata preserves the prepared revision"
+            );
+            assert_eq!(
+                cached.document.as_ref().unwrap().items().as_ptr(),
+                graph,
+                "authenticated equal-body metadata preserves the actual rich graph"
+            );
+            assert!(
+                Arc::ptr_eq(cached.item.as_ref().unwrap(), &runtime.snapshot.items[0]),
+                "authenticated equal-body metadata advances only exact current item authority"
+            );
+            assert_eq!(cached.stamp.as_ref().unwrap().0, 1_700_000_000_000);
+            assert!(runtime.preparation.subscriptions(runtime.target).is_empty());
+            assert!(old_snapshot.upgrade().is_none());
+            let (thread, raw_gone) = disposed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                raw_gone && old_item.upgrade().is_none(),
+                "actual old Snapshot and raw item owners are gone before metadata capacity returns"
+            );
+            assert_eq!(
+                thread,
+                retirement_barrier(),
+                "actual old raw item retirement belongs to the reclaimer"
+            );
+            if let Some(version) = version {
+                let entry = &runtime.preparation.entries["message"];
+                assert!(!entry.running);
+                let latest = entry.shared.latest.lock().unwrap();
+                assert_eq!(latest.version, version);
+                assert!(Arc::ptr_eq(&latest.item, &runtime.snapshot.items[0]));
+            }
+            // The managed canonical cursor must accept a later real append.
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            let ItemContent::Text { text, .. } = &mut Arc::make_mut(&mut snapshot.items[0]).content
+            else {
+                unreachable!()
+            };
+            text.push_str("\n\nFollowing actual provider append.");
+            handle.publish_delta_snapshot_for_test(snapshot);
+            runtime.refresh();
+            drain_fixture(&mut runtime);
+            let cached = &runtime.cache["message"];
+            assert!(!cached.placeholder);
+            assert!(Arc::ptr_eq(
+                cached.item.as_ref().unwrap(),
+                &runtime.snapshot.items[0]
+            ));
+            assert!(cached.document.as_ref().unwrap().items().len() >= 3);
+            runtime.show(false);
+            retirement_barrier();
+        }
+    }
+
+    #[test]
+    fn metadata_reuse_refuses_full_resets_rewrites_shape_changes_and_inflight_work() {
+        for case in [
+            "full reset",
+            "same-length rewrite",
+            "thinking",
+            "phase",
+            "role",
+            "inflight palette",
+            "finalization",
+        ] {
+            let source = item(&format!(
+                "{}{}",
+                "a".repeat(16_384),
+                "same tail ".repeat(32)
+            ));
+            let (mut runtime, handle) = view::prepared_runtime_for_test(&[(*source).clone()]);
+            if case == "finalization" {
+                let mut snapshot = (*handle.snapshot()).clone();
+                snapshot.generation += 1;
+                snapshot.busy = true;
+                let ItemContent::Text { text, .. } =
+                    &mut Arc::make_mut(&mut snapshot.items[0]).content
+                else {
+                    unreachable!()
+                };
+                text.push_str(" actual unfinished tail");
+                handle.publish_delta_snapshot_for_test(snapshot);
+                runtime.refresh();
+                drain_fixture(&mut runtime);
+                assert!(runtime.preparation.entries.contains_key("message"));
+            }
+            retirement_barrier();
+            let cached = &runtime.cache["message"];
+            let revision = cached.revision;
+            let document = cached.document.as_ref().unwrap().clone();
+            let previous = cached.item.as_ref().unwrap().clone();
+            if case == "inflight palette" {
+                runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::SolarizedDark);
+                assert!(runtime.preparation.entries["message"].running);
+            }
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            if case == "finalization" {
+                snapshot.busy = false;
+            }
+            let next = Arc::make_mut(&mut snapshot.items[0]);
+            next.at = Some(1_700_000_000_000);
+            match (&mut next.content, case) {
+                (ItemContent::Text { text, .. }, "same-length rewrite") => {
+                    text.replace_range(0..1, "b");
+                }
+                (ItemContent::Text { thinking, .. }, "thinking") => *thinking = true,
+                (ItemContent::Text { phase, .. }, "phase") => *phase = chat::Phase::Commentary,
+                (_, "role") => next.role = chat::Role::User,
+                _ => {}
+            }
+            if case == "same-length rewrite" {
+                assert_eq!(
+                    ChangeToken::of(&previous.content),
+                    ChangeToken::of(&next.content)
+                );
+            }
+            if case == "full reset" {
+                handle.publish_snapshot_for_test(snapshot);
+            } else {
+                handle.publish_delta_snapshot_for_test(snapshot);
+            }
+            let parser_before = markdown::parser_work_bytes_on_thread();
+            runtime.refresh();
+            assert_eq!(
+                markdown::parser_work_bytes_on_thread(),
+                parser_before,
+                "metadata and finalization never parse a large body on UI"
+            );
+            let cached = &runtime.cache["message"];
+            assert!(
+                cached.preparing,
+                "{case}: a new current preparation is required"
+            );
+            if matches!(case, "inflight palette" | "finalization") {
+                assert!(
+                    Arc::ptr_eq(cached.item.as_ref().unwrap(), &previous),
+                    "a metadata publication cannot relabel an in-flight old graph as current"
+                );
+            } else {
+                assert!(
+                    cached.placeholder,
+                    "{case}: unproved source cannot expose the old graph"
+                );
+            }
+            drain_fixture(&mut runtime);
+            let cached = &runtime.cache["message"];
+            assert!(!cached.placeholder);
+            assert!(Arc::ptr_eq(
+                cached.item.as_ref().unwrap(),
+                &runtime.snapshot.items[0]
+            ));
+            assert_ne!(cached.revision, revision);
+            assert_ne!(
+                cached.document.as_ref().unwrap().items().as_ptr(),
+                document.items().as_ptr()
+            );
+            runtime.show(false);
+            retirement_barrier();
+        }
+    }
+
+    #[test]
+    fn metadata_retirement_pressure_uses_normal_admission_and_idle_release_without_retry() {
+        use iced::futures::StreamExt;
+        for (growing, large_id) in [(false, false), (true, false), (false, true)] {
+            let mut source = item(&if large_id {
+                "x".into()
+            } else {
+                "source ".repeat(4096)
+            });
+            if large_id {
+                Arc::make_mut(&mut source).id = "opaque".repeat(16_384);
+            }
+            let id = source.id.clone();
+            let (mut runtime, handle) = view::prepared_runtime_for_test(&[(*source).clone()]);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            snapshot.busy = growing;
+            if growing {
+                let ItemContent::Text { text, .. } =
+                    &mut Arc::make_mut(&mut snapshot.items[0]).content
+                else {
+                    unreachable!()
+                };
+                text.push_str(" actual growing tail");
+            }
+            handle.publish_delta_snapshot_for_test(snapshot);
+            runtime.refresh();
+            drain_fixture(&mut runtime);
+            retirement_barrier();
+            let previous = runtime.cache[&id].item.as_ref().unwrap().clone();
+            let pressure = Lease::default();
+            let spare = if large_id { 4096 } else { 0 };
+            assert!(pressure.resize(QUEUED_BYTES - RESERVED.load(Ordering::Relaxed) - spare));
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.generation += 1;
+            Arc::make_mut(&mut snapshot.items[0]).at = Some(1_700_000_000_000);
+            handle.publish_delta_snapshot_for_test(snapshot);
+            runtime.refresh();
+            assert!(
+                Arc::ptr_eq(runtime.cache[&id].item.as_ref().unwrap(), &previous),
+                "retirement pressure retains the proven old owner rather than promoting it"
+            );
+            assert!(runtime.cache[&id].preparing);
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut events = Box::pin(availability_stream());
+            executor.block_on(events.next()).unwrap();
+            drop(pressure);
+            let message = executor
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), events.next()).await
+                })
+                .unwrap()
+                .unwrap();
+            let target = runtime.target;
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+            drop(app.update(message));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            drain_fixture(runtime);
+            assert!(!runtime.cache[&id].placeholder && !runtime.preparation.waiting());
+            assert!(Arc::ptr_eq(
+                runtime.cache[&id].item.as_ref().unwrap(),
+                &runtime.snapshot.items[0]
+            ));
+            runtime.show(false);
+            retirement_barrier();
+            executor.shutdown_background();
+        }
     }
 
     #[test]

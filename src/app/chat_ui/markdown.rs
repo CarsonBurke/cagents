@@ -78,6 +78,11 @@ struct Section {
 
 impl Content {
     #[cfg(test)]
+    pub(super) fn has_open_fence_for_test(&self) -> bool {
+        self.open_fence.is_some()
+    }
+
+    #[cfg(test)]
     pub(super) fn parsed_work_bytes(&self) -> usize {
         self.parsed_bytes
     }
@@ -745,6 +750,12 @@ fn append_proven(
 }
 
 impl Text {
+    /// Semantic parser output, excluding materialization caches and weak
+    /// append-proof lineage. Tests retain every raw span attribute and link.
+    #[cfg(test)]
+    pub(super) fn semantic_spans(&self) -> impl std::fmt::Debug + '_ {
+        &self.spans.values
+    }
     fn new(spans: Vec<Span>) -> Self {
         let mut starts = Vec::with_capacity(spans.len() + 1);
         starts.push(0);

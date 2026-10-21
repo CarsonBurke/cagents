@@ -834,6 +834,57 @@ impl ClientHandle {
             .store(true, Ordering::Release);
     }
 
+    /// Build normal daemon-style deltas while retaining the production
+    /// transaction validator and weak append authority. Full reset fixtures
+    /// deliberately keep using publish_snapshot_for_test instead.
+    #[cfg(test)]
+    pub(crate) fn publish_delta_snapshot_for_test(&self, mut next: Snapshot) {
+        use super::presentation::{ChildUpdate, ItemChange, Presentation};
+        let previous = self.snapshot();
+        let changes = |old: &[Arc<super::Item>], items: &[Arc<super::Item>]| {
+            let old: std::collections::HashMap<_, _> = old
+                .iter()
+                .map(|item| (item.id.as_str(), item.as_ref()))
+                .collect();
+            items
+                .iter()
+                .filter_map(|item| {
+                    let before = old.get(item.id.as_str()).copied();
+                    (before != Some(item.as_ref())).then(|| ItemChange::between(before, item))
+                })
+                .collect()
+        };
+        let order = next.items.iter().map(|item| item.id.clone()).collect();
+        let parent = changes(&previous.items, &next.items);
+        next.items.clear();
+        let children = next
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let old = previous
+                    .subagents
+                    .iter()
+                    .find(|old| old.id == child.id)
+                    .map_or(&[][..], |old| old.items.as_slice());
+                let update = ChildUpdate {
+                    id: child.id.clone(),
+                    order: child.items.iter().map(|item| item.id.clone()).collect(),
+                    changes: changes(old, &child.items),
+                };
+                child.items.clear();
+                update
+            })
+            .collect();
+        self.publish_presentation_for_test(Presentation {
+            base_generation: previous.generation,
+            file_changes_unchanged: false,
+            metadata: next,
+            order,
+            changes: parent,
+            children,
+        });
+    }
+
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
     #[cfg(test)]
