@@ -7541,6 +7541,27 @@ mod tests {
         );
     }
 
+    // Task::batch wraps even zero effects in Some(empty stream). Observe the
+    // real native task protocol instead of its optional stream representation.
+    fn native_task_emits_nothing(task: Task<Message>) -> bool {
+        use iced::futures::StreamExt;
+        let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+            return true;
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let empty = executor.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("empty native effect stream must settle")
+                .is_none()
+        });
+        executor.shutdown_background();
+        empty
+    }
+
     #[test]
     fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child_and_failure_readers()
      {
@@ -7829,7 +7850,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    iced::runtime::task::into_stream(completion).is_none(),
+                    native_task_emits_nothing(completion),
                     "failed or child-selected ACK emits no native scroll"
                 );
             }
@@ -8391,7 +8412,7 @@ mod tests {
             }
             if expected.is_some() {
                 assert!(
-                    iced::runtime::task::into_stream(ack).is_none(),
+                    native_task_emits_nothing(ack),
                     "resumed fetch cannot issue a new reader snap"
                 );
             }
@@ -8693,8 +8714,7 @@ mod tests {
                 ..target
             };
             assert!(
-                iced::runtime::task::into_stream(app.handle_chat_ui(Action::Latest(stale)))
-                    .is_none(),
+                native_task_emits_nothing(app.handle_chat_ui(Action::Latest(stale))),
                 "stale generation cannot emit a card-ID-only scroll operation"
             );
             assert_eq!(runtime(&app, target).scroll_memory.edge(None), None);
