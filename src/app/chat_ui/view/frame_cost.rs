@@ -278,6 +278,7 @@ struct Pane {
     cache: Cache,
     theme: cosmic::Theme,
     shortcuts: crate::settings::KeyboardShortcuts,
+    last_event_phases: [Duration; 3],
 }
 
 impl Pane {
@@ -296,6 +297,7 @@ impl Pane {
             cache: Cache::new(),
             theme: cosmic::Theme::dark(),
             shortcuts: crate::settings::KeyboardShortcuts::default(),
+            last_event_phases: [Duration::ZERO; 3],
         }
     }
 
@@ -354,7 +356,7 @@ impl Pane {
                 &mut self.renderer,
             );
             let mut changed = Vec::new();
-            for (id, cached) in &self.runtime.cache {
+            for (id, cached) in self.runtime.presentation_cache() {
                 let mut completed = cached.flow_cache.complete_fixture();
                 for tool in cached
                     .tool_input
@@ -383,7 +385,11 @@ impl Pane {
                 return probe.ready_bytes;
             }
             for id in changed {
-                self.runtime.cache.get_mut(&id).unwrap().revision = CachedItem::next_revision();
+                self.runtime
+                    .presentation_cache_mut()
+                    .get_mut(&id)
+                    .unwrap()
+                    .revision = CachedItem::next_revision();
             }
         }
         panic!("visible geometry preparation did not quiesce");
@@ -537,14 +543,20 @@ impl Pane {
                 &mut Vec::new(),
             );
         }
+        let pointer = clock.elapsed();
+        let paint_clock = Instant::now();
         ui.draw(
             &mut self.renderer,
             &self.theme,
             &cosmic::iced::advanced::renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
-        let drawn = clock.elapsed();
+        let painted = paint_clock.elapsed();
+        let disposal_clock = Instant::now();
         self.cache = ui.into_cache();
+        self.last_event_phases = [pointer, painted, disposal_clock.elapsed()];
+        // The rebuilt view and retired payload owners are part of the event.
+        let drawn = clock.elapsed();
         [refreshed, viewed, laid_out, drawn]
     }
 
@@ -557,7 +569,7 @@ impl Pane {
         let expected = self.items.last().expect("streamed item");
         let cached = self
             .runtime
-            .cache
+            .presentation_cache()
             .get(&expected.id)
             .expect("active streamed cache");
         // `preparing` also keeps a running source's canonical parser alive;
@@ -1089,13 +1101,52 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
         !cfg!(debug_assertions),
         "use optimized dev-runtime with opt-level2"
     );
-    let mut medians = Vec::new();
-    for (name, bytes, tools, form) in [
+    let medians = viewport_workloads(&[
         ("small", 16_usize * 1024, 10, 0),
         ("giant paragraph", 1024 * 1024, 300, 0),
         ("many paragraphs", 1024 * 1024, 300, 1),
         ("giant fence", 1024 * 1024, 300, 2),
-    ] {
+    ]);
+    let small = medians[0].1;
+    for (name, median) in medians {
+        println!(
+            "{name}: event median {:.3}ms, ratio {:.3}",
+            median.as_secs_f64() * 1000.0,
+            median.as_secs_f64() / small.as_secs_f64()
+        );
+        assert!(
+            median <= Duration::from_millis(2),
+            "{name} exceeded2ms viewport budget: {median:?}"
+        );
+        assert!(
+            median <= small * 2,
+            "{name} exceeded2x fixed-viewport scaling budget"
+        );
+    }
+}
+
+/// Diagnostic factorial: separate the tool-count and body-size variables.
+/// The required combined four-case acceptance above remains unchanged.
+#[test]
+#[ignore = "optimized attribution measurement; not a substitute for the combined viewport budget"]
+fn viewport_cost_factorial_attribution() {
+    assert!(
+        !cfg!(debug_assertions),
+        "use optimized dev-runtime with opt-level2"
+    );
+    viewport_workloads(&[
+        ("small", 16 * 1024, 10, 0),
+        ("many tools only", 16 * 1024, 300, 0),
+        ("giant paragraph only", 1024 * 1024, 10, 0),
+        ("many paragraphs only", 1024 * 1024, 10, 1),
+    ]);
+}
+
+fn viewport_workloads(
+    workloads: &[(&'static str, usize, usize, usize)],
+) -> Vec<(&'static str, Duration)> {
+    let mut medians = Vec::new();
+    for &(name, bytes, tools, form) in workloads {
         let mut items = vec![item(
             "viewport-prompt".into(),
             chat::Role::User,
@@ -1149,32 +1200,24 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
         }
         let mut totals = Stage::default();
         let mut stages = Stages::default();
+        let mut phases = [Stage::default(), Stage::default(), Stage::default()];
         for _ in 0..SAMPLES {
             let sample = pane.frame_with_pointer(true);
             totals.0.push(sample[1] + sample[2] + sample[3]);
             stages.record(sample);
+            for (phase, elapsed) in phases.iter_mut().zip(pane.last_event_phases) {
+                phase.0.push(elapsed);
+            }
         }
         println!("viewport workload {name}: bytes={bytes}, tools={tools}");
         stages.report();
+        for (phase, name) in phases.iter_mut().zip(["pointer", "paint", "dispose"]) {
+            phase.report(name);
+        }
         let median = totals.report("event");
         medians.push((name, median));
     }
-    let small = medians[0].1;
-    for (name, median) in medians {
-        println!(
-            "{name}: event median {:.3}ms, ratio {:.3}",
-            median.as_secs_f64() * 1000.0,
-            median.as_secs_f64() / small.as_secs_f64()
-        );
-        assert!(
-            median <= Duration::from_millis(2),
-            "{name} exceeded2ms viewport budget: {median:?}"
-        );
-        assert!(
-            median <= small * 2,
-            "{name} exceeded2x fixed-viewport scaling budget"
-        );
-    }
+    medians
 }
 
 #[test]

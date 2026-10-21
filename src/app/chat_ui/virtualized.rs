@@ -192,6 +192,8 @@ struct State {
     heights: HashMap<u64, Height>,
     cross_extents: std::collections::BTreeMap<u32, usize>,
     mounted: Vec<(usize, u64)>,
+    // The exact last layout window, including an empty insertion point.
+    realized: std::ops::Range<usize>,
     offsets: PrefixSums,
     descriptors: u64,
     observed: Option<Viewport>,
@@ -381,6 +383,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 viewport.top
             };
             let range = visible(&state.offsets, top, viewport.height);
+            state.realized = range.clone();
             let mut previous: HashMap<_, _> = state
                 .mounted
                 .drain(..)
@@ -859,9 +862,7 @@ impl Operation for UpdateViewport {
                 ),
             };
             let wanted = visible(&state.offsets, top, height);
-            let mounted = state.mounted.first().map_or(0, |(index, _)| *index)
-                ..state.mounted.last().map_or(0, |(index, _)| *index + 1);
-            if wanted != mounted {
+            if wanted != state.realized {
                 self.changed = true;
                 self.touches += 1;
             }
@@ -878,6 +879,158 @@ impl Operation for UpdateViewport {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn empty_virtual_windows_settle_and_reenter_after_native_scroll() {
+        fn reader(axis: Axis, count: usize, reverse: bool, id: Id) -> Element<'static, Message> {
+            let rows = (0..count)
+                .map(|at| {
+                    let index = if reverse { count - at - 1 } else { at };
+                    Row::new(index as u64 + 1, 1, 20.0, None, move || {
+                        widget::Space::new().width(20.0).height(20.0).into()
+                    })
+                })
+                .collect();
+            let (body, direction): (Element<'static, Message>, _) = match axis {
+                Axis::Vertical => (
+                    widget::column::with_children(vec![
+                        column(rows, Default::default()),
+                        widget::Space::new().height(100_000.0).into(),
+                    ])
+                    .into(),
+                    iced::widget::scrollable::Direction::Vertical(Default::default()),
+                ),
+                Axis::Horizontal => (
+                    widget::row::with_children(vec![
+                        row(rows, 20.0, Default::default()),
+                        widget::Space::new().width(100_000.0).into(),
+                    ])
+                    .into(),
+                    iced::widget::scrollable::Direction::Horizontal(Default::default()),
+                ),
+            };
+            widget::scrollable(body)
+                .id(id)
+                .direction(direction)
+                .anchor_bottom()
+                .anchor_right()
+                .width(600.0)
+                .height(400.0)
+                .into()
+        }
+        #[derive(Default)]
+        struct Probe(Option<(std::ops::Range<usize>, usize, usize, Option<usize>)>);
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, value: &mut dyn std::any::Any) {
+                if let Some(policy) = value.downcast_mut::<PlaceholderPolicy>() {
+                    policy.visit = false;
+                }
+                if let Some(state) = value.downcast_ref::<State>() {
+                    self.0 = Some((
+                        state.realized.clone(),
+                        state.mounted.len(),
+                        state.positions.len(),
+                        state
+                            .positions
+                            .get(&(state.positions.len() as u64))
+                            .copied(),
+                    ));
+                }
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        for axis in [Axis::Vertical, Axis::Horizontal] {
+            let id = Id::unique();
+            let mut element = reader(axis, 300, false, id.clone());
+            let mut tree = Tree::new(&element);
+            let mut limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 400.0));
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut initial = UpdateViewport::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
+            assert!(
+                initial.changed,
+                "the actual native end viewport first evicts the old mounted rows"
+            );
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            for _ in 0..8 {
+                let mut observation = UpdateViewport::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut observation,
+                );
+                assert!(
+                    !observation.changed && observation.touches == 0,
+                    "an empty realized window does not request another layout"
+                );
+                let mut probe = Probe::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut probe,
+                );
+                assert_eq!(probe.0, Some((300..300, 0, 300, Some(299))));
+            }
+            // Native reentry must still request and mount the newly visible rows.
+            let mut home = operation::scrollable::scroll_to::<()>(
+                id.clone(),
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(f32::MAX),
+                    y: Some(f32::MAX),
+                },
+            );
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut home);
+            let mut reenter = UpdateViewport::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut reenter);
+            assert!(
+                reenter.changed,
+                "native reentry realizes a different row window"
+            );
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut probe = Probe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            assert!(
+                probe
+                    .0
+                    .is_some_and(|(range, mounted, count, _)| range.start == 0
+                        && mounted > 0
+                        && count == 300)
+            );
+            // A new descriptor count/order and width must invalidate the old indices.
+            element = reader(axis, 301, true, id);
+            tree.diff(element.as_widget_mut());
+            limits = layout::Limits::new(Size::ZERO, Size::new(500.0, 400.0));
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut probe = Probe::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            assert!(probe.0.is_some_and(|(_, mounted, count, last)| mounted > 0
+                && count == 301
+                && last == Some(0)));
+        }
+    }
 
     #[test]
     fn measured_height_index_matches_flat_offsets_after_sparse_corrections() {
