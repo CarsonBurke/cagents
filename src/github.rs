@@ -24,6 +24,7 @@ use crate::repository::{
 
 #[cfg(feature = "ui")]
 pub mod avatar;
+pub mod checkout;
 pub mod review_requests;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";

@@ -391,9 +391,12 @@ Agents should read them as context and follow only the user's authorized scope.
 When creating a worktree, enter a branch name, a Linear issue ID such as
 `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
 the issue ID and title slug without fetching Linear metadata. New worktrees go
-under `worktrees/` in the repository by default; Settings accepts an absolute
+under `.worktrees/` in the repository by default; Settings accepts an absolute
 or repository-relative parent, and the creation dialog accepts an explicit
-destination.
+destination. Creation adds a clone-local Git exclude rule when needed, leaving
+tracked `.gitignore` unchanged. Existing worktrees under `worktrees/` stay in
+place and are excluded on the next creation. An explicitly configured parent
+keeps its location.
 
 Worktree creation is journaled: a versioned request and an exclusive mutation
 identity are recorded before any directory or Git effects, and progress stays
@@ -454,7 +457,12 @@ active precheck, with at most four prechecks at once.
 
 A fresh conversation closes the automation's idle provider after its result is
 durable. **Reuse this automation’s idle agent** keeps its own verified idle conversation for the
-next occurrence. If you take over the conversation, automatic cleanup and reuse
+next occurrence. A ready provider still finishing ordinary work retains the run’s
+slot until verified idle. The schedule stays enabled, overlapping occurrences
+are skipped, and the finished prompt is never resent. History shows “session
+release pending” during cleanup. Explicitly pausing the schedule stays effective
+after cleanup. Permission requests and uncertain ownership still require attention.
+If you take over the conversation, automatic cleanup and reuse
 stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
@@ -576,10 +584,15 @@ account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify while focused** is enabled. They name the provider and
-folder, without copying prompts or output. **Send test notification** reports
+unless **Notify while focused** is enabled. By default, they name the provider and
+folder without copying prompts or output. **Show message previews** optionally
+adds bounded message context. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
+
+Clicking an alert selects its conversation or request. Your desktop decides
+whether to bring the window to the front. If it remains behind another window,
+select cagents with your desktop's window switcher.
 
 If the daemon stops replying, a persistent banner shows when the interruption
 began and how long the reply was allowed to take. Repeated transport notices

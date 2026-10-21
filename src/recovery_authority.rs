@@ -57,7 +57,9 @@ impl Drop for ContextInner {
     }
 }
 /// Pre-effect ownership of an exact cleanup lease. No path-based reacquisition
-/// occurs on failure. Callers supply the actual retained native FD count.
+/// occurs on failure. Static guards charge their actual retained FD count;
+/// an effectful bootstrap reserves a documented upper bound before creating
+/// handles and keeps that capacity charged through all pending cleanup.
 #[derive(Clone)]
 pub(crate) struct RecoveryContext(Arc<ContextInner>);
 impl RecoveryContext {

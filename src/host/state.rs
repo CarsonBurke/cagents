@@ -1,3 +1,5 @@
+#[cfg(all(test, target_os = "linux"))]
+mod paired_upgrade_tests;
 mod presentation;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
@@ -5,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -60,6 +62,8 @@ pub(crate) struct TerminalRecord {
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    /// The actual validated worker command, independent of its issued pane.
+    execution_recipe: Option<crate::model::LaunchRecipe>,
     options: TerminalSpawnOptions,
     upgrade_sources: Vec<TerminalSession>,
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
@@ -70,10 +74,18 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    /// Actual OSC/display title, separate from provider conversation metadata.
+    display_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
 }
 
 impl TerminalRecord {
+    pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
+        self.execution_recipe
+            .as_ref()
+            .unwrap_or(&self.session.launch)
+    }
+
     /// The title the provider last set, for the session directory.
     pub(super) fn conversation_title(&self) -> Option<&str> {
         self.conversation_title
@@ -285,11 +297,14 @@ pub(crate) struct HostState {
     shutdown_requested: bool,
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
+    pub(super) native_chat_capacity: usize,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
+    pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
+    pub(super) native_actor_startups: BTreeMap<TerminalId, super::chat::retained_actor::Startup>,
     pub(super) native_adoption_failures: super::chat::AdoptionFailures,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
@@ -298,9 +313,10 @@ pub(crate) struct HostState {
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
+    pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
     /// retained conversations a restore could not reattach.
-    upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
+    pub(super) upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
 }
 
 /// A checkpoint saved and awaiting this daemon's exit.
@@ -351,17 +367,21 @@ impl HostState {
             shutdown_requested: false,
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
+            native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
+            native_actor_outcomes: None,
+            native_actor_startups: BTreeMap::new(),
             native_adoption_failures: Default::default(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
+            chat_resolutions: BTreeMap::new(),
             upgrade_evidence: None,
         }
     }
@@ -399,6 +419,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -629,6 +650,65 @@ impl HostState {
                 }
             }
         }
+        if let ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        } = &edit
+        {
+            let expected = self
+                .registry()?
+                .title_conversation(*id, *card, *expected_revision)
+                .map_err(model_unavailable)?;
+            let invalid = || {
+                ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "The conversation's current name or source changed; refresh before suggesting a title",
+                    false,
+                )
+            };
+            let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+            if expected.proof.as_ref() != Some(self.proof())
+                || actual.session.launch.provider != expected.launch.provider
+                || actual.session.launch.recipe != expected.launch.recipe
+            {
+                return Err(invalid());
+            }
+            // Model mutations serialize under this HostLock. Read only resident
+            // metadata, not Store, snapshot/history or files. A later B edit
+            // cannot overtake this A admission; a delayed A sees B's current name.
+            let (session, current_title) =
+                actual.handle.conversation_title().map_err(|reason| {
+                    let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
+                    ProtocolError::new(
+                        if busy {
+                            ProtocolErrorCode::QueueFull
+                        } else {
+                            ProtocolErrorCode::Internal
+                        },
+                        if busy {
+                            "Conversation metadata is busy; retry the original title suggestion"
+                        } else {
+                            "Conversation metadata is unavailable"
+                        },
+                        busy,
+                    )
+                })?;
+            if session.is_none() || session != expected.launch.session_id {
+                return Err(invalid());
+            }
+            let current_title = current_title
+                .as_deref()
+                .and_then(crate::workspace_model::channel_title);
+            match source {
+                crate::model::ChannelTitleSource::Provider
+                    if current_title.as_ref() == Some(title) => {}
+                crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
+                _ => return Err(invalid()),
+            }
+        }
         let registry = self.registry()?;
         let applied = registry.apply(&edit).map_err(|error| {
             if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
@@ -713,6 +793,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
         {
@@ -950,6 +1031,33 @@ impl HostState {
         )
     }
 
+    /// Typed recovery projects this already authenticated paired worker before
+    /// installing the native-console association. Subscription state does not
+    /// grant or remove the worker's current daemon ownership.
+    pub(super) fn native_terminal_projection(
+        &self,
+        id: TerminalId,
+    ) -> Result<TerminalSession, String> {
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
+        if terminal.handle.is_completed() || !self.proof().is_complete() {
+            return Err(
+                "The native console worker completed or its current ownership is unavailable"
+                    .into(),
+            );
+        }
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        Ok(current)
+    }
+
     /// The descriptor an observer with attachment state `attached` is owed.
     ///
     /// Attachment is the only per-client input, so a broadcast to observers
@@ -1002,6 +1110,7 @@ impl HostState {
             ),
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
+            title: record.display_title.clone(),
         })
     }
 
@@ -1055,6 +1164,26 @@ impl HostState {
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
+        self.reserve_spawn_for_view_reserved(terminal_id, paired, None)
+    }
+
+    fn reserve_spawn_for_view_reserved(
+        &mut self,
+        terminal_id: TerminalId,
+        paired: Option<&TerminalSession>,
+        transition: Option<&super::chat::TerminalViewReservation<'_>>,
+    ) -> Result<(), ProtocolError> {
+        let owns_transition = transition.is_some_and(|transition| {
+            paired.is_some_and(|source| source.id == terminal_id)
+                && transition.authorizes(self, terminal_id)
+        });
+        if transition.is_some() && !owns_transition {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "The reserved native attachment changed before opening its CLI view",
+                true,
+            ));
+        }
         if self.shutting_down {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -1062,7 +1191,7 @@ impl HostState {
                 true,
             ));
         }
-        if self.chat_spawning.contains_key(&terminal_id)
+        if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
                     && !paired.is_some_and(|terminal| {
@@ -1170,9 +1299,21 @@ impl HostState {
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
+        session: TerminalSession,
+        handle: TerminalHandle,
+        initially_visible: bool,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.finish_spawn_with_execution(client_id, session, handle, initially_visible, None, None)
+    }
+
+    fn finish_spawn_with_execution(
+        &mut self,
+        client_id: ClientId,
         mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
+        execution_recipe: Option<crate::model::LaunchRecipe>,
+        execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     ) -> Result<TerminalDescriptor, ProtocolError> {
         let terminal_id = session.id;
         self.cancel_spawn(terminal_id);
@@ -1194,7 +1335,8 @@ impl HostState {
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
-                execution_environment: None,
+                execution_environment,
+                execution_recipe,
                 upgrade_sources: Vec::new(),
                 upgrade_relaunches: Vec::new(),
                 running: true,
@@ -1203,6 +1345,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                display_title: None,
                 working_directory: None,
             },
         );
@@ -1439,6 +1582,9 @@ impl HostState {
         if self.shutting_down
             || self.upgrade.is_some()
             || self.inventory_count() != 0
+            // An original Child can remain ours after its hosted record is
+            // detached or removed, including before holder discovery exists.
+            || crate::daemon::child_reaper::has_outstanding_ownership()
             || !self.browser_logins_spawning.is_empty()
             || !self.execution_startups.is_empty()
             || !self.chat_bindings.is_empty()
@@ -1920,12 +2066,11 @@ fn prepare_upgrade_with_carry_policy(
         // A durable native holder also keeps its paired terminal alive. Its
         // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            (state.chats.get(id).is_some_and(|chat| {
-                matches!(
-                    chat.handle.native_continuity(),
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
-            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
+            (state
+                .chats
+                .get(id)
+                .is_some_and(|chat| chat.handle.native_continuity().retains_provider())
+                || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some()
         };
         let carried = state
@@ -1980,13 +2125,11 @@ fn prepare_upgrade_with_carry_policy(
             }
             let mut source = record.session.clone();
             source.native_continuity = record.handle.native_continuity();
-            if matches!(
-                source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if source.native_continuity.retains_provider() {
                 source.launch.session_id = record.handle.confirmed_session_id();
-                crate::chat::protocol::align_resume_identity(&mut source.launch)
-                    .map_err(upgrade_error)?;
+                // This is an issued descriptor, including after a provider
+                // changed its thread. Only the separate effective launch below
+                // may normalize resume argv for that confirmed identity.
             }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
@@ -1997,12 +2140,21 @@ fn prepare_upgrade_with_carry_policy(
             // final conversation.
             super::super::chat::protocol::align_resume_identity(&mut launch)
                 .map_err(upgrade_error)?;
-            if launch.terminal_recipe().is_none() {
+            if launch.terminal_recipe().is_none()
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                )
+            {
                 return Err(upgrade_error(format!(
                     "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
                     source.id
                 )));
             }
+            crate::upgrade::handoff::validate_chat_source(&source, &launch)
+                .map_err(|reason| upgrade_error(format!(
+                    "Native chat {} cannot migrate: {reason}. Its existing provider remains active.", source.id
+                )))?;
             // The successor restarts this conversation from its terminal only
             // if that terminal is checkpointed, which a completed one is not,
             // and is restored first, which it is not for a conversation that
@@ -2015,11 +2167,9 @@ fn prepare_upgrade_with_carry_policy(
             super::chat::validate_upgrade_environment(&launch, hosted_source, &record.handle)
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
-                && state.terminals.contains_key(&source.id)
-                && !matches!(
-                    source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && state.terminals.get(&source.id).is_some_and(|terminal| {
+                    !terminal.handle.is_completed() && !carries(&source.id, terminal)
+                })
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -2078,6 +2228,7 @@ fn prepare_upgrade_with_carry_policy(
             store.path.display()
         )));
     }
+    store.preflight_recovered(&chats).map_err(upgrade_error)?;
     let mut frozen = Vec::with_capacity(terminals.len());
     let mut saved = Vec::with_capacity(terminals.len());
     // Every terminal that would refuse the upgrade is reported at once, so the
@@ -2095,10 +2246,9 @@ fn prepare_upgrade_with_carry_policy(
     ) in terminals
     {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
-        source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
-            // The worker's argv hint can be fresh or name an older TUI thread.
-            // Only the still-confirmed attachment may supersede it, and only
-            // after freezing and revalidating its exact process/account.
+        let recipe = if let Some((selected, native)) = paired_codex.get(&source.id) {
+            // Only the still-confirmed attachment can supply execution for
+            // the exact terminal descriptor already issued to its chat pane.
             let current = handle.observe_agent_process().ok_or_else(|| {
                 upgrade_error("The paired Codex source disappeared before upgrade")
             })?;
@@ -2121,25 +2271,27 @@ fn prepare_upgrade_with_carry_policy(
                 native.confirmed_session_id().as_deref(),
             )
             .map_err(upgrade_error)?;
-            Some(
-                crate::model::agent_recovery::hint_from_launch(&recipe).ok_or_else(|| {
-                    upgrade_error("The paired Codex exact recipe cannot be saved")
-                })?,
+            source = super::chat::restored_terminal_source(
+                chat.source.terminal.as_ref().expect("validated pair"),
+                &source,
             )
+            .map_err(upgrade_error)?;
+            recipe
         } else {
-            snapshot.hint.clone()
-        };
-        let Some(recipe) = upgrade_recipe(
-            &source,
-            &handle,
-            &snapshot,
-            &mut relaunches,
-            relaunch_agents,
-        )
-        .map_err(upgrade_error)?
-        else {
-            blockers.push(describe_upgrade_blocker(&source));
-            continue;
+            source.resume_hint = snapshot.hint.clone();
+            let Some(recipe) = upgrade_recipe(
+                &source,
+                &handle,
+                &snapshot,
+                &mut relaunches,
+                relaunch_agents,
+            )
+            .map_err(upgrade_error)?
+            else {
+                blockers.push(describe_upgrade_blocker(&source));
+                continue;
+            };
+            recipe
         };
         if !relaunches.iter().any(|accepted| accepted.source == source) {
             tracing::info!(
@@ -2329,10 +2481,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-            let durable = matches!(
-                handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let durable = handle.native_continuity().retains_provider();
             if durable {
                 handle.preserve_for_restart()?;
             } else {
@@ -2467,11 +2616,15 @@ fn carry_terminals(
         // Completion can race the carry, or VT serialization can fail while
         // its process still runs. A registered holder can keep either result
         // without converting ownership into permission to execute a recipe.
-        if crate::terminal::holder::evidence(&holder_socket(holders, id))
-            .ok()
-            .flatten()
-            .is_some_and(|record| record.holder.is_current())
-            && handle.preserve_for_restart().is_ok()
+        if crate::daemon::holder_registry::recovery_candidate(
+            &holder_socket(holders, id),
+            crate::daemon::holder_registry::Kind::Terminal,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            handle.holder_identity() == Some(&record) && record.holder.is_current()
+        }) && handle.preserve_for_restart().is_ok()
         {
             tracing::warn!(terminal = %id, %error,
                 "upgrade preserves the registered holder without a new parser snapshot");
@@ -2609,7 +2762,11 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let records = crate::terminal::holder::discover(&directory, &proof.boot_id)?;
+    let records = crate::daemon::holder_registry::recovery_candidates(
+        &directory,
+        &proof.boot_id,
+        crate::daemon::holder_registry::Kind::Terminal,
+    )?;
     for record in records {
         if crate::daemon::termination_requested() {
             break;
@@ -2707,12 +2864,11 @@ fn restore_upgrade_from(
         return Ok(Vec::new());
     };
     checkpoint.validate()?;
-    if checkpoint.chats.iter().any(|chat| {
-        !matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        )
-    }) {
+    if checkpoint
+        .chats
+        .iter()
+        .any(|chat| !chat.source.native_continuity.retains_provider())
+    {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -2724,10 +2880,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.source.native_continuity.retains_provider() {
             continue;
         }
         let terminal = TerminalSession {
@@ -2767,10 +2920,7 @@ fn restore_upgrade_from(
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if super::chat::owns_codex_listener(&chat.source)
-                && !matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && !chat.source.native_continuity.retains_provider()
             {
                 super::chat::restore_upgrade(host, chat)?;
             }
@@ -2803,11 +2953,7 @@ fn restore_upgrade_from(
         // checkpoint, but their authenticated holders retain the final screen.
         // Restore those receipts before requiring a native pair to match.
         if checkpoint.chats.iter().any(|chat| {
-            chat.source.terminal.is_some()
-                && matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+            chat.source.terminal.is_some() && chat.source.native_continuity.retains_provider()
         }) {
             restore_orphaned_holders(host)?;
         }
@@ -2817,10 +2963,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !matches!(
-                chat.source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if !chat.source.native_continuity.retains_provider() {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -2861,8 +3004,23 @@ fn restore_upgrade_from(
                 chat.terminal = Some(terminal.clone());
                 continue;
             }
-            let mut session = terminal.source.clone();
-            session.launch = terminal.recipe.clone();
+            let pair = checkpoint.chats.iter().find(|chat| {
+                chat.launch.provider == crate::agent::Provider::Codex
+                    && chat.source.id == terminal.source.id
+                    && chat
+                        .source
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal.source.id)
+            });
+            let mut session = if let Some(chat) = pair {
+                crate::upgrade::handoff::paired_terminal_source(chat, terminal)?
+            } else {
+                terminal.source.clone()
+            };
+            if pair.is_none() {
+                session.launch = terminal.recipe.clone();
+            }
             session.continuity = TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
                 last_exit: None,
@@ -2877,9 +3035,24 @@ fn restore_upgrade_from(
                     true
                 })
             };
-            let descriptor =
+            let descriptor = if pair.is_some() {
+                start_terminal_view_owned(
+                    host,
+                    0,
+                    session,
+                    terminal.options.clone(),
+                    None,
+                    paired,
+                    None,
+                    None,
+                    None,
+                    Some(terminal.recipe.clone()),
+                )
+                .map(|(descriptor, _)| descriptor)
+            } else {
                 spawn_terminal_view(host, 0, session, terminal.options.clone(), None, paired)
-                    .map_err(|error| error.message)?;
+            }
+            .map_err(|error| error.message)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
@@ -2902,6 +3075,31 @@ fn restore_upgrade_from(
             }
             super::chat::restore_upgrade(host, chat)?;
         }
+        let recovered = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            checkpoint
+                .chats
+                .iter()
+                .filter_map(|chat| {
+                    if unattached
+                        .iter()
+                        .any(|entry| entry.summary.id == chat.source.id)
+                    {
+                        return None;
+                    }
+                    let record = state.chats.get(&chat.source.id)?;
+                    let mut replacement = record.session.clone();
+                    replacement.launch.session_id = record.handle.session_id();
+                    replacement.native_continuity = record.handle.native_continuity();
+                    Some(crate::upgrade::handoff::RecoveredChat {
+                        evidence: chat.clone(),
+                        replacement,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        store.record_recovered(&recovered)?;
         // Until this is durable, the checkpoint is the only record of what
         // was left unattached, so it must be written before that is consumed.
         store.record_unattached(&unattached, &reattached)?;
@@ -3002,6 +3200,20 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     }
 }
 
+/// Explicit conversation closure ends the need to retain its issued pane aliases.
+pub(super) fn retire_recovered_upgrade_chat(host: &SharedHost, id: TerminalId) {
+    let store = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone();
+    if let Some(store) = store
+        && let Err(error) = store.retire_recovered(id)
+    {
+        tracing::warn!(session = %id, %error, "could not retire closed conversation recovery evidence");
+    }
+}
+
 /// Forgets that a retained native conversation was left unattached by an
 /// upgrade, once it has been reattached or explicitly closed.
 pub(super) fn retire_unattached_upgrade_chat(host: &SharedHost, id: TerminalId) {
@@ -3048,7 +3260,10 @@ fn adopt_carried_terminal(
         let socket = holder_socket(holders, id);
         for attempt in 1..=ADOPTION_ATTEMPTS {
             let previous = (|| {
-                if let Some(record) = crate::terminal::holder::evidence(&socket)? {
+                if let Some(record) = crate::daemon::holder_registry::recovery_candidate(
+                    &socket,
+                    crate::daemon::holder_registry::Kind::Terminal,
+                )? {
                     let proof = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3078,6 +3293,7 @@ fn adopt_carried_terminal(
                         relaunches: terminal.relaunches.clone(),
                         options: terminal.options.clone(),
                         execution_environment: None,
+                        execution_recipe: None,
                     },
                     false,
                 ))
@@ -3263,10 +3479,7 @@ fn close_failed_restore(
         )
     };
     for chat in chats {
-        if matches!(
-            chat.native_continuity(),
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()?;
         } else {
             chat.close()?;
@@ -3395,6 +3608,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3456,6 +3670,7 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3471,6 +3686,9 @@ fn start_terminal_view(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    let execution_recipe = previous
+        .as_ref()
+        .and_then(|previous| previous.execution_recipe.clone());
     start_terminal_view_owned(
         shared,
         client_id,
@@ -3481,6 +3699,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        execution_recipe,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3492,16 +3711,89 @@ fn start_terminal_view_owned(
     client_id: ClientId,
     session: TerminalSession,
     options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+    pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_reserved(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+        pending_pane,
+        execution_recipe,
+        None,
+    )
+}
+
+pub(super) fn spawn_codex_view_reserved(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    transition: &super::chat::TerminalViewReservation<'_>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_reserved(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        true,
+        None,
+        None,
+        None,
+        None,
+        Some(transition),
+    )
+}
+
+fn start_terminal_view_owned_reserved(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
     mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
+    transition: Option<&super::chat::TerminalViewReservation<'_>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    if let Some(recipe) = &execution_recipe {
+        if crate::upgrade::exact_conversation(recipe).is_none()
+            || (adoption.is_some()
+                && previous
+                    .as_ref()
+                    .and_then(|previous| previous.execution_recipe.as_ref())
+                    != Some(recipe))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Terminal restart execution does not match its authenticated source",
+                false,
+            ));
+        }
+        let mut effective = session.clone();
+        effective.launch = recipe.clone();
+        validate_launch(&effective)?;
+    }
     if let Some(environment) = &mut execution_environment {
-        session.launch.remove_unset_environment(&mut environment.0);
+        execution_recipe
+            .as_ref()
+            .unwrap_or(&session.launch)
+            .remove_unset_environment(&mut environment.0);
     }
     if adoption.is_some() {
         super::account_lifecycle::ensure_terminal_adoption(
@@ -3520,6 +3812,29 @@ fn start_terminal_view_owned(
         &crate::account::launch_credential_overrides(&session.launch),
         execution_environment.is_none(),
     )?;
+    if let Some(recipe) = &execution_recipe {
+        // The pane retains its issued recipe, while the validated restart can
+        // use another credential directory. Admit the command actually passed
+        // to Worker as well as the immutable source retained above.
+        let removals = crate::account::launch_credential_overrides(recipe);
+        if adoption.is_some() {
+            super::account_lifecycle::ensure_terminal_adoption(
+                shared,
+                execution_environment.as_ref().map(|value| &value.0),
+                &removals,
+            )?;
+        }
+        super::account_lifecycle::ensure_launch(
+            shared,
+            &recipe.working_directory,
+            execution_environment
+                .as_ref()
+                .map(|value| &value.0)
+                .unwrap_or(&recipe.environment),
+            &removals,
+            execution_environment.is_none(),
+        )?;
+    }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
@@ -3551,7 +3866,11 @@ fn start_terminal_view_owned(
                 false,
             ));
         }
-        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
+        state.reserve_spawn_for_view_reserved(
+            terminal_id,
+            paired.then_some(&session),
+            transition,
+        )?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.
@@ -3587,6 +3906,7 @@ fn start_terminal_view_owned(
                 relaunches,
                 options: options.clone(),
                 execution_environment: retained_environment.clone(),
+                execution_recipe: execution_recipe.clone(),
             }
         })
     };
@@ -3664,7 +3984,11 @@ fn start_terminal_view_owned(
     } else {
         Default::default()
     };
-    let weak = Arc::downgrade(shared);
+    let redraw = Arc::new(TerminalRedraw {
+        host: Arc::downgrade(shared),
+        terminal_id,
+        worker: OnceLock::new(),
+    });
     let config = TerminalConfig {
         agent_authority,
         columns: options.columns,
@@ -3679,9 +4003,15 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
-    let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
-        broadcast_redraw(&weak, terminal_id, wake.generation);
-    }) {
+    let wake_redraw = Arc::clone(&redraw);
+    let handle = match TerminalHandle::spawn_with_execution(
+        session.clone(),
+        config,
+        execution_recipe.clone(),
+        move |wake| {
+            wake_redraw.publish(wake.generation);
+        },
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             shared
@@ -3695,6 +4025,9 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    // Bind before publishing the Host record. Pre-binding captures are covered
+    // by the initial Spawn snapshot and acknowledge below, never by an ID lookup.
+    let _ = redraw.worker.set(handle.downgrade());
     let output_host = Arc::downgrade(shared);
     handle
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
@@ -3724,16 +4057,30 @@ fn start_terminal_view_owned(
                 return Err(error);
             }
         }
-        let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
-        if descriptor.is_ok() && pending_pane.is_some() {
-            finish_pending_terminal(&mut state, terminal_id);
-        }
-        if descriptor.is_ok() {
+        let issued_hint = execution_recipe
+            .as_ref()
+            .map(|_| session.resume_hint.clone());
+        let mut descriptor = state.finish_spawn_with_execution(
+            client_id,
+            session,
+            handle,
+            options.initially_visible,
+            execution_recipe.clone(),
+            retained_environment,
+        );
+        if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
             state
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("finished spawn")
-                .execution_environment = retained_environment;
+                .session
+                .resume_hint = hint.clone();
+            descriptor.session.resume_hint = hint;
+        }
+        if descriptor.is_ok() && pending_pane.is_some() {
+            finish_pending_terminal(&mut state, terminal_id);
+        }
+        if descriptor.is_ok() {
             state
                 .terminals
                 .get_mut(&terminal_id)
@@ -3772,7 +4119,7 @@ fn start_terminal_view_owned(
         if completed {
             // Completed is emitted only after the final grid and parser
             // teardown. Notify visible subscribers from that exact worker.
-            broadcast_redraw(&event_host, terminal_id, handle.generation());
+            broadcast_redraw(&event_host, terminal_id, handle.generation(), handle);
         }
     });
     Ok((descriptor, redraw_handle))
@@ -3897,7 +4244,22 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
     }
 }
 
-/// Publishes a repaint to every visible subscriber of `terminal_id`.
+/// Binds redraw wakes before Host publication without a strong callback cycle.
+struct TerminalRedraw {
+    host: Weak<HostLock>,
+    terminal_id: TerminalId,
+    worker: OnceLock<crate::terminal::WeakTerminalHandle>,
+}
+
+impl TerminalRedraw {
+    fn publish(&self, generation: u64) {
+        if let Some(worker) = self.worker.get().and_then(|worker| worker.upgrade()) {
+            broadcast_redraw(&self.host, self.terminal_id, generation, &worker);
+        }
+    }
+}
+
+/// Publishes a repaint to every visible subscriber of this exact worker.
 ///
 /// A subscriber for which the daemon already recorded the exact capture it last
 /// delivered receives the repaint itself, diff-encoded against that capture,
@@ -3914,13 +4276,28 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
-fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
+fn broadcast_redraw(
+    host: &Weak<HostLock>,
+    terminal_id: TerminalId,
+    generation: u64,
+    worker: &TerminalHandle,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
     let mut pending = Vec::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retirement does not drain queued callbacks. Validate the original
+        // worker under the same lock as visibility, viewport and capture work;
+        // an earlier identity check could race a same-ID replacement.
+        if !state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_worker(worker))
+        {
+            return;
+        }
         let visible = state
             .subscriptions
             .by_terminal
@@ -4029,6 +4406,14 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
+        if let WireTerminalEvent::TitleChanged { title } = &wire_event {
+            record.display_title = Some(
+                title
+                    .chars()
+                    .take(crate::terminal_ipc::MAX_TERMINAL_TITLE_CHARACTERS)
+                    .collect(),
+            );
+        }
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }
@@ -4120,6 +4505,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 #[cfg(test)]
 mod native_upgrade_tests;
 #[cfg(test)]
+mod redraw_identity_tests;
+#[cfg(test)]
 mod strict_upgrade_tests;
 
 #[cfg(test)]
@@ -4137,6 +4524,192 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn channel_title_admission_rejects_delayed_names_from_the_same_resident_actor() {
+        use crate::{
+            chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+            chat::{self, Command, Event},
+            model::{CardId, CardKind, ChannelId, ChannelTitleSource, LaunchRecipe},
+            workspace_model::views::{Pane, Scope},
+        };
+        const SESSION: &str = "12345678-1234-4234-8234-123456789abc";
+        struct Names(usize);
+        impl Adapter for Names {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Session {
+                            id: SESSION.into(),
+                            title: Some("Initial bundle audit".into()),
+                        },
+                        Event::Ready(true),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: SESSION.into(),
+                        title: Some(
+                            if self.0 == 1 {
+                                "Encryption performance review"
+                            } else {
+                                "Final encryption audit"
+                            }
+                            .into(),
+                        ),
+                    }],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_host();
+        state.install_model(
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        );
+        let recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.transport = TransportSpec::History;
+        let mut adapter = Names(0);
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle =
+            chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .conversation_title()
+            .ok()
+            .and_then(|(session, _)| session)
+            .as_deref()
+            != Some(SESSION)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "history worker did not publish its exact session"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let session = chat::Session {
+            id: TerminalId::new(),
+            proof: Some(state.proof().clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: Some(SESSION.into()),
+            },
+        };
+        state.chats.insert(
+            session.id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                session: session.clone(),
+                handle: handle.clone(),
+                console_recipe: None,
+                paired_terminal: None,
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let id = ChannelId::new();
+        let card = CardId::new();
+        state
+            .edit_model(
+                1,
+                ModelEdit::OpenProject {
+                    repository: directory.path().into(),
+                    name: "project".into(),
+                    kind: Default::default(),
+                },
+            )
+            .unwrap();
+        state
+            .edit_model(
+                1,
+                ModelEdit::CreateChannel {
+                    id,
+                    repository: directory.path().into(),
+                    title: String::new(),
+                    title_source: Default::default(),
+                },
+            )
+            .unwrap();
+        let model = state
+            .edit_model(
+                1,
+                ModelEdit::SeedView {
+                    scope: Scope::Channel(id),
+                    closed: Vec::new(),
+                    panes: vec![Pane {
+                        id: card,
+                        title: "Chat".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 1.,
+                        scope: Some(directory.path().into()),
+                        kind: CardKind::Chat(session),
+                    }],
+                },
+            )
+            .unwrap();
+        let revision = model.views[0].revision;
+        let suggest = |name: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision: revision,
+            title: name.into(),
+            source: ChannelTitleSource::Provider,
+        };
+        let apply = |state: &mut HostState, origin, edit: ModelEdit| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match state.edit_model(origin, edit.clone()) {
+                    Err(error) if error.retryable && error.code == ProtocolErrorCode::QueueFull => {
+                        assert!(Instant::now() < deadline, "resident metadata remained busy");
+                        std::thread::yield_now();
+                    }
+                    result => break result,
+                }
+            }
+        };
+        apply(&mut state, 1, suggest("Initial bundle audit")).unwrap();
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 2, suggest("Encryption performance review")).unwrap();
+        assert!(
+            apply(&mut state, 1, suggest("Initial bundle audit")).is_err(),
+            "delayed A must not replace accepted B at the same view revision"
+        );
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Encryption performance review"
+        );
+        handle.command(Command::Compact).unwrap();
+        apply(&mut state, 1, suggest("Final encryption audit")).unwrap();
+        assert_eq!(
+            state.read_model().unwrap().channels[0].title,
+            "Final encryption audit"
+        );
+        handle.close().unwrap();
     }
 
     #[test]
@@ -5015,9 +5588,9 @@ for line in sys.stdin:
         assert_ne!(restored.proof, source.proof);
         let mut hidden = source.clone();
         hidden.launch.session_id = None;
-        assert_eq!(
-            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
-            restored
+        assert!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).is_err(),
+            "a known issued source cannot manufacture an unissued pre-ID alias"
         );
         let mut changed = source.clone();
         changed.launch.recipe.arguments = vec!["--resume".into(), B.into()];
@@ -5086,9 +5659,9 @@ for line in sys.stdin:
         let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(third.launch.session_id.as_deref(), Some(B));
         assert_ne!(third.proof, restored.proof);
-        assert_eq!(
-            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
-            third
+        assert!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).is_err(),
+            "another daemon generation cannot legitimize an unissued pre-ID alias"
         );
         assert_eq!(
             super::super::chat::resolve_upgrade(&replacement, &restored).unwrap(),
@@ -5292,7 +5865,14 @@ for line in sys.stdin:
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
         use crate::upgrade::handoff::Store;
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        // Preserve the exact detached socket/checkpoint namespace on success
+        // and panic until the outer original-family guardian has settled it.
+        directory.disable_cleanup(true);
+        eprintln!(
+            "Retained terminal carry fixture: {}",
+            directory.path().display()
+        );
         let holders = directory.path().join("holders");
         let empty_proc = directory.path().join("proc");
         fs::create_dir(&empty_proc).unwrap();
@@ -5800,9 +6380,10 @@ for line in sys.stdin:
     fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
         let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
         let terminal_id = TerminalId::new();
+        let stream = crate::terminal::RenderStreamFixture::new(|_| {});
         let deliveries = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
-            [
+            let deliveries = [
                 TerminalVisibility::Visible,
                 TerminalVisibility::Hidden,
                 TerminalVisibility::Hibernated,
@@ -5817,16 +6398,26 @@ for line in sys.stdin:
                     .attach(client_id, terminal_id, visibility);
                 delivery
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+            state.reserve_spawn(terminal_id).unwrap();
+            state
+                .finish_spawn(
+                    1,
+                    redraw_identity_tests::session(terminal_id),
+                    stream.handle.clone(),
+                    true,
+                )
+                .unwrap();
+            deliveries
         };
 
-        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7);
+        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7, &stream.handle);
         for delivery in &deliveries {
             delivery.close_after_drain();
         }
         assert!(matches!(
             deliveries[0].pop().unwrap().message,
-            ServerMessage::Redraw { generation: 7, .. }
+            ServerMessage::Snapshot { snapshot, .. } if snapshot.generation == 7
         ));
         assert!(deliveries[1].pop().is_none());
         assert!(deliveries[2].pop().is_none());
@@ -5885,7 +6476,7 @@ for line in sys.stdin:
             thread::sleep(Duration::from_millis(10));
         }
 
-        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation());
+        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation(), &handle);
         delivery.close_after_drain();
         let mut pushed = None;
         while let Some(message) = delivery.pop() {
@@ -6119,6 +6710,149 @@ for line in sys.stdin:
             assert_eq!(count, expected);
         }
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_descriptor_retains_only_native_display_title_after_event_eviction() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let id = TerminalId::new();
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .finish_spawn(1, session, handle.clone(), false)
+            .unwrap();
+        let weak = Arc::downgrade(&shared);
+        let observations = (|| -> Result<_, ProtocolError> {
+            let initial = shared.lock().unwrap().descriptor(1, id)?.title;
+            record_event(
+                &weak,
+                id,
+                TerminalEvent::ConversationTitleChanged("Provider conversation".into()),
+            );
+            let provider_only = shared.lock().unwrap().descriptor(1, id)?.title;
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged("界".repeat(300)),
+                Some(&handle),
+            );
+            for _ in 0..EVENT_REPLAY_CAPACITY {
+                record_event(&weak, id, TerminalEvent::Bell);
+            }
+            let (retained, evicted) = {
+                let state = shared.lock().unwrap();
+                (
+                    state
+                        .list(1)
+                        .into_iter()
+                        .find(|row| row.session.id == id)
+                        .unwrap()
+                        .title,
+                    state
+                        .replay_events(id, 0)?
+                        .iter()
+                        .all(|(_, event)| !matches!(event, WireTerminalEvent::TitleChanged { .. })),
+                )
+            };
+            record_event_from(
+                &weak,
+                id,
+                TerminalEvent::TitleChanged(String::new()),
+                Some(&handle),
+            );
+            let cleared = shared.lock().unwrap().descriptor(1, id)?.title;
+            Ok((initial, provider_only, retained, evicted, cleared))
+        })();
+        handle.shutdown().unwrap();
+        let (initial, provider_only, retained, evicted, cleared) = observations.unwrap();
+        assert_eq!(initial, None);
+        assert_eq!(
+            provider_only, None,
+            "provider conversation titles are a different observation"
+        );
+        assert_eq!(retained, Some("界".repeat(256)));
+        assert!(evicted, "the title must survive actual transition eviction");
+        assert_eq!(cleared, Some(String::new()));
+    }
+
+    #[test]
+    fn terminal_descriptor_title_comes_from_an_actual_pty_osc_event() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf '\\033]2;Native terminal title\\007'; exec /bin/cat".into(),
+            ],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let id = TerminalId::new();
+        let session = TerminalSession {
+            id,
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (_, handle) = spawn_terminal_view_owned(
+            &shared,
+            1,
+            session,
+            TerminalSpawnOptions::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observation = (|| -> Result<_, String> {
+            loop {
+                let title = shared
+                    .lock()
+                    .unwrap()
+                    .descriptor(1, id)
+                    .map_err(|error| error.message)?
+                    .title;
+                if title.as_deref() == Some("Native terminal title") {
+                    return Ok(title);
+                }
+                if Instant::now() >= deadline {
+                    return Err("production event observer did not publish the PTY title".into());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })();
+        handle.shutdown().unwrap();
+        assert_eq!(observation.unwrap(), Some("Native terminal title".into()));
     }
 
     #[test]

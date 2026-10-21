@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use crate::model::{ChannelId, ProjectId, WorktreeId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Row {
     Project(ProjectId),
     Worktree(ProjectId, WorktreeId),

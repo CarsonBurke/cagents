@@ -799,6 +799,8 @@ impl Adapter for Omp {
             Command::Compact => step.writes.push(self.request("compact")),
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
+            Command::ReadTextCopy { .. } =>
+                return Err("Text copies are served by the transcript cache".into()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
@@ -2541,6 +2543,64 @@ mod tests {
         let request = adapter.request("get_state");
         assert!(adapter.receive(json!({"type":"response","id":request["id"],"command":"get_state","success":true,"data":{"sessionId":"other"}})).is_err());
         assert!(!adapter.ready);
+    }
+
+    #[test]
+    fn notification_questions_preserve_omp_messages_without_prefill_values() {
+        for method in ["select", "input", "editor", "confirm"] {
+            let question = |message: &str, prefill: &str| {
+                json!({
+                    "type":"extension_ui_request", "id":"migration", "method":method,
+                    "title":"Migration strategy", "message":message,
+                    "placeholder":"Choose a strategy", "prefill":prefill,
+                    "options":["Keep", "Replace"]
+                })
+            };
+            let receipts = crate::chat::runtime::notification_frames_for_test(
+                Box::new(Omp {
+                    ready: true,
+                    ..Default::default()
+                }),
+                vec![
+                    question(
+                        "Which migration strategy should be used?",
+                        "PRIVATE_PREFILL",
+                    ),
+                    question("Updated question: keep config_file.rs?", "PRIVATE_PREFILL"),
+                    question(
+                        "Updated question: keep config_file.rs?",
+                        "EDITED_PRIVATE_PREFILL",
+                    ),
+                ],
+                false,
+            );
+            assert_eq!(
+                receipts.len(),
+                2,
+                "prefill changes must not notify: {method}"
+            );
+            for (index, expected) in [
+                "Which migration strategy should be used?",
+                "Updated question: keep config_file.rs?",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (evidence, content) = &receipts[index];
+                assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+                assert_eq!(
+                    content.request,
+                    Some(crate::notifications::RequestType::Question)
+                );
+                assert!(
+                    content.preview.starts_with(expected),
+                    "{method}: {}",
+                    content.preview
+                );
+                assert!(!content.preview.contains("PRIVATE_PREFILL"));
+            }
+            assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        }
     }
 
     #[test]

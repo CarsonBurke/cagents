@@ -124,20 +124,11 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
-        }
-        widget::Id::new(
-            if self
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.blocker.is_some())
-            {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        widget::Id::new(if self.remove_dialog.is_some() {
+            "dialog.project.remove.cancel"
+        } else {
+            "dialog.project.close"
+        })
     }
 }
 
@@ -215,6 +206,8 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn sync_worktree_protections(&mut self) {
+        #[cfg(test)]
+        super::terminal_output_tests::record_protection();
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
@@ -389,6 +382,7 @@ impl Cagents {
         }
         self.project_has_unsaved_editors(project)
             .then(|| "Save or close this project's unsaved editor buffers first.".into())
+            .or_else(|| self.project_review_checkout_blocker(project))
     }
 
     pub(super) fn selected_worktree_deletion_blocker(
@@ -506,6 +500,7 @@ impl Cagents {
             .copied()
             .filter(|project| {
                 !self.project_has_unsaved_editors(*project)
+                    && self.project_review_checkout_blocker(*project).is_none()
                     && !self.project_ui.close_failed.contains(project)
                     && !self.project_ui.close_in_flight.contains(project)
                     && !self
@@ -560,6 +555,18 @@ impl Cagents {
                 Message::ProjectUi(Action::ProjectSessionsClosed(project, generation, result))
             })
         }))
+    }
+
+    fn project_review_checkout_blocker(&self, project: ProjectId) -> Option<String> {
+        let scope = self.project_session_scope(project);
+        self.cards.iter().find_map(|(id, runtime)| {
+            let belongs = matches!(runtime, CardRuntime::PullRequests(pane)
+                if pane.project(&self.sidebar_model) == Some(project))
+                || self
+                    .card_state(*id)
+                    .is_some_and(|card| self.project_owns_card(project, card, &scope));
+            belongs.then(|| self.review_checkout_blocker(*id)).flatten()
+        })
     }
 
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
@@ -666,6 +673,12 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
+        // An accepted checkout can begin after session census but before this
+        // callback. Keep its owner and the committed close pending until it settles.
+        if let Some(reason) = self.project_review_checkout_blocker(id) {
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
         let Some(repository) = self.project_ui.closing.remove(&id) else {
             return Task::none();
         };
@@ -1006,6 +1019,7 @@ impl Cagents {
                 }
                 match command {
                     ProjectCommand::CopyPath => {
+                        chat_ui::invalidate_copy_intent();
                         return iced::clipboard::write(target.path.display().to_string());
                     }
                     ProjectCommand::CopyBranch
@@ -1032,6 +1046,7 @@ impl Cagents {
                             return Task::none();
                         };
                         if matches!(command, ProjectCommand::CopyBranch) {
+                            chat_ui::invalidate_copy_intent();
                             return iced::clipboard::write(branch);
                         }
                         return self.open_worktree_dialog(
@@ -1135,6 +1150,19 @@ impl Cagents {
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
+                        if target.worktree.is_some() {
+                            let (selected, scope) =
+                                self.select_worktree_checked(target.path, false);
+                            if !selected {
+                                return scope;
+                            }
+                            // Selection commits synchronously, including aliases;
+                            // do not reconstruct the target from a later callback.
+                            let directory =
+                                self.active_workspace.clone().expect("selected worktree");
+                            let thread = self.new_native_thread_at(directory);
+                            return Task::batch([scope, thread]);
+                        }
                         return cosmic::task::message(Message::Sidebar(
                             SidebarAction::NewChannel { project_id },
                         ));
@@ -1201,6 +1229,10 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(
                         "The project changed. Try removing it again.",
                     ));
+                    return self.project_dialog_closed();
+                }
+                if let Some(reason) = self.project_review_checkout_blocker(removal.project) {
+                    self.status = Some(TransientNotice::warning(reason));
                     return self.project_dialog_closed();
                 }
                 if self.project_has_unsaved_editors(removal.project) {
@@ -1741,6 +1773,7 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
                             .on_press(Message::ProjectUi(Action::Dismiss)),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
@@ -2341,6 +2374,195 @@ mod tests {
     }
 
     #[test]
+    fn project_and_worktree_deletion_start_on_cancel_and_enter_keeps_them() {
+        for remove in [false, true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.join("worktrees/topic"),
+                Some("topic".into()),
+            );
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            let opening = app.handle_project_action(Action::Command {
+                project_id: project,
+                worktree_id: (!remove).then_some(linked.id),
+                command: if remove {
+                    ProjectCommand::Remove
+                } else {
+                    ProjectCommand::Delete
+                },
+            });
+            let cancel = widget::Id::new(if remove {
+                "dialog.project.remove.cancel"
+            } else {
+                "dialog.project.close"
+            });
+            assert_eq!(
+                super::super::tests::focused_element(app.project_dialog_view().unwrap(), opening),
+                Some(cancel.clone())
+            );
+            let message = super::super::dialog_ui::tests::enter_control(
+                app.project_dialog_view().unwrap(),
+                cancel,
+            );
+            assert!(matches!(message, Message::ProjectUi(Action::Dismiss)));
+            drop(app.update(message));
+            assert!(!app.project_ui.modal_open());
+            assert!(app.sidebar_model.project(project).is_some());
+            assert!(row(&app, linked.id).is_some());
+            assert!(app.project_ui.removing.is_empty());
+            assert!(app.project_ui.deletions.is_empty());
+        }
+    }
+
+    #[test]
+    fn worktree_row_thread_uses_successful_selected_scope_and_refuses_before_draft() {
+        for blocked in [true, false] {
+            let repository = tempfile::tempdir().unwrap();
+            let linked_directory = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.path().into(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                linked_directory.path().into(),
+                Some("feature/login".into()),
+            );
+            let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
+            app.worktree_protections
+                .use_fixture_runtime(runtime.path().into());
+            drop(app.select_worktree(repository.path().into(), false));
+            let old_scope = app.active_workspace.clone();
+            let old_order = app.workspace.order().collect::<Vec<_>>();
+            let old_cards = app.durable.cards.clone();
+            let old_scopes = app.durable.card_scopes.clone();
+            let _exclusive = blocked.then(|| {
+                crate::worktree_cleanup::fixture_protection(
+                    runtime.path(),
+                    linked_directory.path(),
+                    true,
+                )
+                .unwrap()
+            });
+            let action = || Action::Command {
+                project_id: project,
+                worktree_id: Some(linked.id),
+                command: ProjectCommand::NewChannel,
+            };
+            drop(app.handle_project_action(action()));
+            if blocked {
+                assert_eq!(app.active_workspace, old_scope);
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), old_order);
+                assert_eq!(
+                    app.durable.cards, old_cards,
+                    "refused physical protection cannot expose a draft"
+                );
+                assert_eq!(app.durable.card_scopes, old_scopes);
+                assert!(
+                    app.status
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("Cannot open this worktree")
+                );
+            } else {
+                assert_eq!(
+                    app.active_workspace.as_deref(),
+                    Some(linked_directory.path())
+                );
+                assert!(app.durable.active_channel.is_none());
+                assert!(
+                    app.durable.channels.is_empty(),
+                    "worktree row opens a thread, not a project channel"
+                );
+                let added = app
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| !old_cards.iter().any(|old| old.id == card.id))
+                    .collect::<Vec<_>>();
+                assert_eq!(added.len(), 1);
+                assert!(
+                    matches!(&added[0].kind, CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())
+                );
+                assert_eq!(
+                    crate::worktree_cleanup::fixture_protection(
+                        runtime.path(),
+                        linked_directory.path(),
+                        true
+                    )
+                    .unwrap_err()
+                    .kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                // A successful same-scope no-op still authorizes another thread.
+                let count = app.durable.cards.len();
+                drop(app.handle_project_action(action()));
+                assert_eq!(app.durable.cards.len(), count + 1);
+                let CardKind::Chat(session) = &app.durable.cards.last().unwrap().kind else {
+                    panic!("native thread")
+                };
+                assert_eq!(
+                    session.launch.recipe.working_directory,
+                    linked_directory.path()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_row_channel_uses_primary_scope_and_branch_label_without_saving_a_fake_name() {
+        let repository = tempfile::tempdir().unwrap();
+        let linked_directory = tempfile::tempdir().unwrap();
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.path().into(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            linked_directory.path().into(),
+            Some("feature/login".into()),
+        );
+        let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
+        app.settings.default_channel_pane = settings::DefaultPane::NativeChat;
+        drop(app.select_worktree(linked_directory.path().into(), false));
+        let task = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: None,
+            command: ProjectCommand::NewChannel,
+        });
+        let message = super::super::tests::task_app_message(task);
+        assert!(
+            matches!(&message, Message::Sidebar(SidebarAction::NewChannel {project_id}) if *project_id == project)
+        );
+        drop(app.update(message));
+        assert_eq!(app.active_workspace.as_deref(), Some(repository.path()));
+        let channel = app.durable.channels.last().unwrap();
+        assert!(
+            channel.title.is_empty(),
+            "the first actual conversation remains free to name it"
+        );
+        assert_eq!(
+            channel_ui::channel_display_title(channel, app.sidebar_model.project(project)),
+            "New channel · main"
+        );
+        assert_eq!(
+            app.sidebar_model.project(project).unwrap().channels[0].title,
+            "New channel · main"
+        );
+        assert!(channel.cards.iter().any(|id| matches!(&app.card_state(*id).unwrap().kind, CardKind::Chat(session) if session.launch.recipe.working_directory == repository.path())));
+    }
+
+    #[test]
     fn shared_project_close_removes_local_row_and_records_tombstones() {
         let repository = PathBuf::from("/repo");
         let primary = SidebarWorktree::from_durable(
@@ -2384,6 +2606,86 @@ mod tests {
                     .existence
                     .is_open()
             );
+        }
+    }
+
+    #[test]
+    fn pending_pr_checkout_survives_local_and_inflight_shared_project_removal() {
+        for scoped in [false, true] {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.clone(),
+                Some("main".into()),
+            );
+            let linked = SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                repository.join("linked"),
+                Some("feature".into()),
+            );
+            let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+            app.active_workspace = Some(if scoped {
+                linked.path.clone()
+            } else {
+                repository.clone()
+            });
+            let (card, task) = app.add_pull_requests_card(if scoped {
+                linked.path.clone()
+            } else {
+                repository.clone()
+            });
+            drop(task);
+            // Session closure may already have started before checkout acceptance.
+            drop(app.close_shared_project(&repository));
+            let generation = app.project_ui.close_generation[&project];
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                panic!("review");
+            };
+            let ticket = pane.review.fixture_existing_checkout_pending();
+            let review_generation = pane.review.selection_generation();
+            app.project_ui.remove_dialog = Some(ProjectRemoval {
+                project,
+                repository: repository.clone(),
+                kind: Default::default(),
+                name: "repo".into(),
+                worktrees: vec![repository.clone(), linked.path.clone()],
+                channels: 0,
+                project_sessions: ProjectSessionOwnership::default(),
+            });
+            drop(app.handle_project_action(Action::ConfirmRemove));
+            assert!(!app.project_ui.removing.contains_key(&repository));
+            assert!(app.cards.contains_key(&card));
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+            )));
+            assert!(app.sidebar_model.project(project).is_some());
+            assert!(app.project_ui.closing.contains_key(&project));
+            assert!(app.cards.contains_key(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.window_update_blocker().is_some());
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: pull_request_review::Action::ExistingCheckout(
+                    pull_request_review::checkout_ui::Action::Finished {
+                        generation: review_generation,
+                        ticket,
+                        result: Err("refused; no effect".into()),
+                    },
+                ),
+            }));
+            assert!(
+                app.project_ui.close_in_flight.contains(&project),
+                "settlement resumes the committed project close"
+            );
+            drop(app.handle_project_action(Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(ProjectSessionClosure::for_roots(vec![repository.clone()])),
+            )));
+            assert!(app.sidebar_model.project(project).is_none());
+            assert!(!app.cards.contains_key(&card));
         }
     }
 

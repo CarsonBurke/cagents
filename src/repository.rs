@@ -12,6 +12,9 @@ pub use authority::{WorktreeAuthority, WorktreeExecutor};
 use recovery::TrashReceipt;
 pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
 
+mod managed_worktrees;
+#[cfg(test)]
+pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
@@ -28,7 +31,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod complete_inventory;
+mod pr_checkout;
+mod pr_creation;
 mod status_limit;
+pub use pr_checkout::{
+    ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
+    PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
+};
+pub use pr_creation::PrWorktreeCreationConsent;
 
 use crate::fs_safety;
 use crate::model::{OperationId, WorktreeId};
@@ -3815,6 +3826,11 @@ impl BaseRevision {
 pub struct CreateWorktreeRequest {
     pub repository: PathBuf,
     pub managed_root: PathBuf,
+    /// Directory selected by the resolver for clone-local ignore policy.
+    /// Explicit destination overrides exclude only that checkout; old requests
+    /// without this hint also use the exact destination, never its shared parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_ignore_root: Option<PathBuf>,
     pub destination: PathBuf,
     pub branch: ValidatedBranchName,
     pub base: BaseRevision,
@@ -7530,7 +7546,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let configured = input.managed_directory.trim();
         let configured = Path::new(if configured.is_empty() {
-            "worktrees/"
+            crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY
         } else {
             configured
         });
@@ -7569,6 +7585,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
+            managed_ignore_root: Some(if input.destination.trim().is_empty() {
+                managed_root.clone()
+            } else {
+                destination.clone()
+            }),
             managed_root,
             destination,
             branch,
@@ -9510,14 +9531,29 @@ mod tests {
         }
 
         fn isolated_large_pathspec_test(name: &str) -> bool {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let name = name
                 .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
                 .unwrap_or(name);
             if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
                 return false;
             }
+            // Keep the namespace on every outcome until the outer owner has
+            // established full-family settlement; a child result is not that proof.
+            let directory = tempfile::Builder::new()
+                .prefix("cagents-pathspec-contract-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/var/tmp")
+                .unwrap()
+                .keep();
             let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--test-threads=1"])
+                .args([
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
                 .timeout(Duration::from_secs(240))
                 .output_limits(1024 * 1024, 1024 * 1024);
             for (key, _) in std::env::vars_os() {
@@ -9527,6 +9563,7 @@ mod tests {
             }
             command = command
                 .env("CAGENTS_LARGE_PATHSPEC_CONTRACT", name)
+                .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -9539,18 +9576,62 @@ mod tests {
                 .env("GIT_CONFIG_VALUE_2", "false")
                 .env("GIT_CONFIG_KEY_3", "init.templateDir")
                 .env("GIT_CONFIG_VALUE_3", "");
-            let output = SystemProcessExecutor
-                .execute(&command, &CancellationToken::new())
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let (success, stdout, stderr, status) =
+                match SystemProcessExecutor.execute(&command, &CancellationToken::new()) {
+                    Ok(output) => (
+                        output.success,
+                        output.stdout,
+                        output.stderr,
+                        format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
+                    ),
+                    Err(failure) => (
+                        false,
+                        failure.stdout,
+                        failure.stderr,
+                        format!("{:?}: {}", failure.kind, failure.message),
+                    ),
+                };
+            for (name, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(name))
+                    .unwrap()
+                    .write_all(bytes)
+                    .unwrap();
+            }
+            eprintln!("Retained pathspec contract root: {}", directory.display());
+            let stdout = String::from_utf8_lossy(&stdout);
+            let stderr = String::from_utf8_lossy(&stderr);
+            assert!(success, "{status}\n{stdout}\n{stderr}");
             assert!(
-                output.success,
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
+                stdout
+                    .lines()
+                    .any(|line| line.contains(&format!("test {name} ... ok"))),
+                "{stdout}"
             );
-            assert!(stdout.contains(&format!("test {name} ... ok")), "{stdout}");
-            assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "{stdout}"
+            );
+            print!("{stdout}");
+            eprint!("{stderr}");
             true
+        }
+
+        fn retained_large_pathspec_directory() -> tempfile::TempDir {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
+                .expect("owning private contract namespace");
+            let mut directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent)
+                .unwrap();
+            directory.disable_cleanup(true);
+            directory
         }
 
         #[test]
@@ -9561,7 +9642,7 @@ mod tests {
             )) {
                 return;
             }
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = retained_large_pathspec_directory();
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
             fs::write(root.join("selected.txt"), "base").unwrap();
@@ -9629,7 +9710,7 @@ mod tests {
             )) {
                 return;
             }
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = retained_large_pathspec_directory();
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
             let names = [
@@ -11322,6 +11403,7 @@ mod tests {
             fs::write(root.join("ignored #1.log"), "ignored").unwrap();
             fs::write(root.join("keep.log"), "included").unwrap();
             fs::write(root.join("private.txt"), "local ignore").unwrap();
+            fs::create_dir_all(root.join(".git/info")).unwrap();
             fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
             let files = service()
                 .ignored_files(
@@ -11406,6 +11488,7 @@ mod tests {
             fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
             fs::create_dir(root.join("ignored-dir")).unwrap();
             fs::write(root.join("ignored-dir/nested.txt"), "ignored\n").unwrap();
+            fs::create_dir_all(root.join(".git/info")).unwrap();
             fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
             fs::write(root.join("private.txt"), "ignored\n").unwrap();
             let cancel = CancellationToken::new();
@@ -11560,6 +11643,7 @@ mod tests {
             git(root, &["add", "-A"]);
             fs::write(root.join("new.txt"), b"working rename\n").unwrap();
             fs::write(root.join(unusual.as_os_str()), b"working unusual\n").unwrap();
+            fs::create_dir_all(root.join(".git/hooks")).unwrap();
             let hook = root.join(".git/hooks/post-checkout");
             fs::write(&hook, b"#!/bin/sh\nprintf invoked > hook-ran\nexit 1\n").unwrap();
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
@@ -11926,6 +12010,7 @@ mod tests {
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
+            managed_ignore_root: None,
             destination: destination.clone(),
             branch: ValidatedBranchName::parse("feature/safe").unwrap(),
             base: BaseRevision::object_id("a".repeat(40)).unwrap(),
@@ -11957,6 +12042,7 @@ mod tests {
             setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
+            managed_ignore_root: None,
             destination: root.path().join("feature"),
             branch: ValidatedBranchName::parse("feature").unwrap(),
             base: BaseRevision::remote_ref("refs/remotes/origin/main").unwrap(),
@@ -13717,6 +13803,7 @@ mod tests {
                 setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
+                managed_ignore_root: None,
                 destination: managed.path().join("feature"),
                 branch: ValidatedBranchName::parse("feature").unwrap(),
                 base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
@@ -15138,6 +15225,9 @@ struct WorktreeJournal {
     base_oid: Option<String>,
     #[serde(default)]
     existing_branch_oid: Option<String>,
+    /// Exact PR consent is durable before fetching. Ordinary payloads stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_checkout: Option<PrWorktreeCreationConsent>,
     /// The administrative directory Git keeps for the created worktree,
     /// `<common dir>/worktrees/<name>`. Unlike its path, it stays with the
     /// worktree when the worktree is moved, and no two live worktrees share
@@ -15512,6 +15602,48 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_pr_consent(
+            store,
+            request,
+            None,
+            generation,
+            cancellation,
+            progress,
+        )
+    }
+
+    /// Create the reviewed PR commit and source through the ordinary durable
+    /// creation, tracking, setup and settlement pipeline.
+    #[cfg(feature = "ui")]
+    pub fn create_worktree_journaled_for_pr(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        consent: &PrWorktreeCreationConsent,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: &async_channel::Sender<WorktreeProgressEvent>,
+    ) -> WorktreeOperationReport {
+        self.create_worktree_journaled_with_pr_consent(
+            store,
+            request,
+            Some(consent),
+            generation,
+            cancellation,
+            progress,
+        )
+    }
+
+    #[cfg(feature = "ui")]
+    fn create_worktree_journaled_with_pr_consent(
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        consent: Option<&PrWorktreeCreationConsent>,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: &async_channel::Sender<WorktreeProgressEvent>,
+    ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
             let _ = progress.try_send(WorktreeProgressEvent {
@@ -15551,6 +15683,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return failure_report(WorktreeOperationState::MalformedPayload, error.to_string());
             }
         };
+        if let Some(consent) = consent {
+            if let Err(error) = consent.validate_request(&journal.request) {
+                emit(WorktreeProgressStage::Finished);
+                let detail =
+                    format!("PR checkout consent changed: {error}; prepare checkout again");
+                let failure = process_failure(
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Io,
+                    &detail,
+                    false,
+                );
+                let mut report = failure_report(WorktreeOperationState::NotCreated, detail);
+                report.outcome = Some(WorktreeCreationOutcome::NotCreated { failure });
+                return report;
+            }
+            journal.pr_checkout = Some(consent.clone());
+        }
         let mut payload = match serde_json::to_value(&journal) {
             Ok(payload) => payload,
             Err(error) => {
@@ -15616,12 +15765,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            if let Some(consent) = &journal.pr_checkout {
+                if journal
+                    .existing_branch_oid
+                    .as_deref()
+                    .is_some_and(|oid| oid != consent.expected_head().as_str())
+                {
+                    return Err(ValidationError::InvalidBranch(
+                        "The existing local branch is not at the reviewed PR commit. Its history was preserved; choose another branch or explicitly open the local work instead".into(),
+                    ).into());
+                }
+            }
             // The durable identity lease must win over changed repository state:
             // a replay is still a conflict after an earlier attempt made a branch.
             if journal.existing_branch_oid.is_some()
                 && !(matches!(&journal.request.base, BaseRevision::LocalBranch(branch) if branch == &journal.request.branch)
                     || (journal.request.track
-                        && matches!(&journal.request.base, BaseRevision::RemoteRef(_))))
+                        && matches!(&journal.request.base, BaseRevision::RemoteRef(_)))
+                    || journal.pr_checkout.as_ref().is_some_and(|consent| {
+                        !consent.tracks_remote()
+                            && journal.existing_branch_oid.as_deref() == Some(consent.expected_head().as_str())
+                            && matches!(&journal.request.base, BaseRevision::ObjectId(oid) if oid == consent.expected_head().as_str())
+                    }))
             {
                 return Err(ValidationError::InvalidBranch(
                     "Branch already exists; resolve it as an existing branch instead of overriding its base".into()
@@ -15650,7 +15815,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     journal_write_failed = true;
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
-            if let BaseRevision::RemoteRef(reference) = &journal.request.base {
+            if let Some(consent) = &journal.pr_checkout {
+                self.fetch_reviewed_pr_creation_head(
+                    &journal.request,
+                    consent,
+                    &lease,
+                    cancellation,
+                )?;
+            } else if let BaseRevision::RemoteRef(reference) = &journal.request.base {
                 let remotes = self.remotes(&journal.request.repository, cancellation)?;
                 let (remote, branch) = remotes
                     .iter()
@@ -15731,6 +15903,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     }
                 }
             }
+            if journal
+                .pr_checkout
+                .as_ref()
+                .is_some_and(|consent| oid != consent.expected_head().as_str())
+            {
+                return Err(ValidationError::InvalidBase(
+                    "The PR branch no longer serves the reviewed commit; refresh the review. No worktree was created".into(),
+                ).into());
+            }
             journal.base_oid = Some(oid.clone());
             // Persist intention before the first managed-directory or Git effect.
             journal.effects_started = true;
@@ -15758,6 +15939,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            self.ensure_creation_destination_ignored(&journal.request, cancellation)?;
+            self.ignore_legacy_managed_worktrees(&journal.request.repository, cancellation)?;
             fs::create_dir_all(&journal.request.managed_root)
                 .map_err(|e| ValidationError::Io(e.to_string()))?;
             let plan = self.plan_worktree_creation(&journal.request)?;
@@ -15816,6 +15999,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
             if journal.request.track && !cancellation.is_cancelled() {
+                if let Some(consent) = &journal.pr_checkout {
+                    // Preserve an upstream selected by a post-checkout hook or
+                    // another admitted product action instead of overwriting it.
+                    self.reviewed_pr_creation_endpoint_at(
+                        &journal.request,
+                        consent,
+                        &journal.request.destination,
+                        cancellation,
+                    )?;
+                    self.validate_pr_creation_tracking_at(
+                        &journal.request,
+                        consent,
+                        &journal.request.destination,
+                        false,
+                        cancellation,
+                    )?;
+                }
                 let mut upstream = self.set_upstream_command(&journal.request)?;
                 upstream.inherited_lease = Some(lease.as_raw_fd());
                 self.run_checked(&upstream, cancellation)?;
@@ -15860,7 +16060,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             self.unlock_created_worktree(&mut journal);
         }
-        finish_worktree_journal(store, &journal, &payload, created_at, &emit)
+        let report = finish_worktree_journal(store, &journal, &payload, created_at, &emit);
+        self.guard_created_pr_checkout_report(&journal, report)
     }
 
     fn prepare_worktree_journal(
@@ -15880,6 +16081,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|e| ValidationError::Io(e.to_string()))?;
         request.destination = canonical_future_path(&request.destination)
             .map_err(|e| ValidationError::Io(e.to_string()))?;
+        if let Some(ignore_root) = &mut request.managed_ignore_root {
+            *ignore_root = canonical_future_path(ignore_root)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            if *ignore_root != request.managed_root && *ignore_root != request.destination {
+                return Err(ValidationError::DestinationOutsideRoot.into());
+            }
+        }
         if !destination_within_managed_root(&request.destination, &request.managed_root) {
             return Err(ValidationError::DestinationOutsideRoot.into());
         }
@@ -15904,6 +16112,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             checkout_completed: false,
             base_oid: None,
             existing_branch_oid,
+            pr_checkout: None,
             admin_dir: None,
             outcome: None,
             warnings: Vec::new(),
@@ -16013,6 +16222,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         let admin_dir = self.created_admin_dir(journal);
         if residual.branch_exists && owned && admin_dir.is_some() {
+            if let Some(consent) = &journal.pr_checkout {
+                let token = CancellationToken::new();
+                let source = self
+                    .reviewed_pr_creation_endpoint(&journal.request, consent, &token)
+                    .and_then(|_| {
+                        self.reviewed_pr_creation_endpoint_at(
+                            &journal.request,
+                            consent,
+                            &journal.request.destination,
+                            &token,
+                        )
+                    })
+                    .and_then(|_| {
+                        self.validate_pr_creation_tracking(&journal.request, consent, true, &token)
+                    });
+                if let Err(error) = source {
+                    journal.state = WorktreeOperationState::OutcomeUnknown;
+                    journal.detail = format!(
+                        "PR checkout source changed before settlement: {error}; inspect the retained worktree"
+                    );
+                    journal.outcome =
+                        Some(WorktreeCreationOutcome::OutcomeUnknown { failure, residual });
+                    return;
+                }
+            }
             journal.admin_dir = admin_dir;
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
@@ -16217,7 +16451,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                         && (!journal.checkout_completed
                             || (journal.effects_started && journal.base_oid.is_some()))
                         && ValidatedBranchName::parse(journal.request.branch.as_str()).is_ok()
-                        && journal.request.base.validate().is_ok() =>
+                        && journal.request.base.validate().is_ok()
+                        && journal.valid_pr_checkout_evidence() =>
                 {
                     journal
                 }
@@ -16251,7 +16486,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &|_| {},
                 ));
             } else {
-                reports.push(journal.report(operation.created_at_unix_ms));
+                reports.push(self.guard_created_pr_checkout_report(
+                    &journal,
+                    journal.report(operation.created_at_unix_ms),
+                ));
             }
         }
         Ok(reports)
@@ -16332,6 +16570,7 @@ mod worktree_journal_tests {
                 setup_intent: None,
                 repository,
                 managed_root: root.clone(),
+                managed_ignore_root: None,
                 destination: root.join("feature"),
                 branch: ValidatedBranchName::parse("feature").unwrap(),
                 base: BaseRevision::LocalBranch(ValidatedBranchName::parse("main").unwrap()),
@@ -17327,6 +17566,7 @@ mod worktree_journal_tests {
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&marker)
             .unwrap();
+        fs::create_dir_all(fixture.request.repository.join(".git/hooks")).unwrap();
         let hook = fixture.request.repository.join(".git/hooks/post-checkout");
         fs::write(
             &hook,

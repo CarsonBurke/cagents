@@ -173,11 +173,6 @@ impl Root {
         ))
     }
 
-    /// Enumerates the held inode, including after its public name moves.
-    pub fn read_dir(&self) -> io::Result<std::fs::ReadDir> {
-        std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
-    }
-
     pub(crate) fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }
@@ -452,6 +447,9 @@ pub use directory_creation::{
     DirectoryPublication, DirectoryRecovery, DirectoryStage, create_directory_beneath,
     create_directory_in_namespace, stage_directory_in_namespace,
 };
+pub(crate) use directory_creation::{
+    OwnedPrivateSibling, PrivateSiblingCreateError, SaveSiblingDurability, StickyParent,
+};
 
 /// Changes permissions through the exact retained directory descriptor.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
@@ -516,15 +514,18 @@ pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), Res
 #[path = "fs_safety/recovery_placement.rs"]
 mod recovery_placement;
 pub(crate) use recovery_placement::{
-    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp,
+    RecoveryDirectoryStamp, RecoveryPlacement, recovery_directory_stamp, validate_recovery_parent,
 };
 
 #[path = "fs_safety/recovery_cache.rs"]
 mod recovery_cache;
+#[cfg(test)]
+pub(crate) use recovery_cache::fixture_fail_next_save_preparation_sync;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 pub(crate) use recovery_cache::{
-    RecoveryDirectoryError, RecoveryParentCandidates, prepare_recovery_directory_with_owner,
+    RecoveryDirectoryError, RecoveryParentCandidates, SavePreparationDurability,
+    prepare_recovery_directory_with_owner, prepare_save_recovery_directory_with_owner,
     verify_recovery_directory_private,
 };
 
@@ -948,6 +949,40 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
     lost
 }
 
+/// Captures the content metadata used to fence a retained editor Save.
+/// Unlike best-effort copying, an incomplete snapshot refuses publication.
+/// Bound both allocation and syscall work even when a file carries many
+/// attributes. Other filesystem callers retain their existing copy policy.
+pub fn content_attributes(
+    file: &File,
+) -> io::Result<std::collections::BTreeMap<OsString, Vec<u8>>> {
+    const LIST_BYTES: usize = 64 * 1024;
+    const MAX_ATTRIBUTES: usize = 1024;
+    const SNAPSHOT_BYTES: usize = 1024 * 1024;
+    let names = attribute_names_with_limit(file, LIST_BYTES)?;
+    if names.len() > MAX_ATTRIBUTES {
+        return Err(io::Error::other(
+            "file attribute count exceeds the Save metadata budget",
+        ));
+    }
+    let mut remaining = SNAPSHOT_BYTES;
+    let mut attributes = std::collections::BTreeMap::new();
+    for name in names {
+        if !is_content_attribute(&name) {
+            continue;
+        }
+        let value = read_attribute_with_limit(file, &name, remaining.min(LIST_BYTES))?
+            .ok_or_else(|| io::Error::other("file attributes changed while they were read"))?;
+        // Discard spare capacity from a concurrent shrink, so the retained
+        // snapshot obeys the aggregate allocation budget as well as its
+        // logical byte budget. At most one bounded value is transient.
+        let value = value.into_boxed_slice().into_vec();
+        remaining -= value.len();
+        attributes.insert(OsString::from_vec(name.to_bytes().to_vec()), value);
+    }
+    Ok(attributes)
+}
+
 /// Preserves an existing file's owner and group on its temporary replacement.
 /// Apply this before access ACLs or content: the owner/group entries in those
 /// permissions must retain their original meaning. Every failure prevents
@@ -1109,6 +1144,10 @@ fn is_content_attribute(name: &CStr) -> bool {
 
 /// Every extended-attribute name an open file carries.
 fn attribute_names(file: &File) -> io::Result<Vec<CString>> {
+    attribute_names_with_limit(file, usize::MAX)
+}
+
+fn attribute_names_with_limit(file: &File, limit: usize) -> io::Result<Vec<CString>> {
     let mut buffer = Vec::new();
     for _ in 0..ATTRIBUTE_SIZE_ATTEMPTS {
         // SAFETY: a null buffer with a zero length asks `flistxattr` only for
@@ -1126,6 +1165,11 @@ fn attribute_names(file: &File) -> io::Result<Vec<CString>> {
         }
         if size == 0 {
             return Ok(Vec::new());
+        }
+        if size as usize > limit {
+            return Err(io::Error::other(
+                "file attribute list exceeds the Save metadata budget",
+            ));
         }
         buffer.resize(size as usize, 0);
         // SAFETY: the write is bounded by the buffer's own length.
@@ -1160,6 +1204,14 @@ fn attribute_name_list(buffer: &[u8]) -> Vec<CString> {
 
 /// One attribute's value, or `None` when it was removed after being listed.
 fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
+    read_attribute_with_limit(file, name, usize::MAX)
+}
+
+fn read_attribute_with_limit(
+    file: &File,
+    name: &CStr,
+    limit: usize,
+) -> io::Result<Option<Vec<u8>>> {
     let mut value = Vec::new();
     for _ in 0..ATTRIBUTE_SIZE_ATTEMPTS {
         // SAFETY: `name` outlives the call, and a null buffer with a zero
@@ -1171,6 +1223,11 @@ fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
                 return Ok(None);
             }
             return Err(error);
+        }
+        if size as usize > limit {
+            return Err(io::Error::other(
+                "file attributes exceed the Save metadata budget",
+            ));
         }
         value.resize(size as usize, 0);
         // SAFETY: `name` outlives the call and the write is bounded by the
@@ -1185,6 +1242,9 @@ fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
             )
         };
         if read >= 0 {
+            if read as usize > value.len() {
+                continue;
+            }
             value.truncate(read as usize);
             return Ok(Some(value));
         }
@@ -1873,6 +1933,29 @@ pub(crate) mod tests {
                 "{name:?} belongs to the kernel or the filesystem",
             );
         }
+    }
+
+    #[test]
+    fn retained_save_attribute_snapshot_reads_values_and_enforces_budget() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, b"one\n").expect("write");
+        if !tag(&path) {
+            return;
+        }
+        let file = File::open(&path).expect("open");
+        let attributes = content_attributes(&file).expect("snapshot");
+        assert_eq!(
+            attributes.get(OsStr::new("user.note")),
+            Some(&b"keepme".to_vec())
+        );
+        assert!(read_attribute_with_limit(&file, c"user.note", 5).is_err());
+        assert!(attribute_names_with_limit(&file, 1).is_err());
+        write_attribute(&file, c"user.note", b"new").expect("change attribute");
+        assert_ne!(
+            content_attributes(&file).expect("changed snapshot"),
+            attributes
+        );
     }
 
     #[test]

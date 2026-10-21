@@ -9,6 +9,8 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub(crate) mod native_chat_capacity;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
@@ -81,6 +83,8 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;

@@ -291,6 +291,36 @@ impl Protection {
         Ok(false)
     }
 
+    /// Independent open descriptions retain shared protection in exec children.
+    /// OwnedLock explicitly unlocks on drop, so duplicating its descriptor would
+    /// let the parent's retirement unlock the child's shared open description.
+    pub(crate) fn retained_child_files(&self) -> io::Result<Vec<std::sync::Arc<std::fs::File>>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let mut files = Vec::new();
+        for lock in &self._locks {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+            let old = lock.metadata()?;
+            let new = file.metadata()?;
+            if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
+                return Err(io::Error::other("directory protection inode changed"));
+            }
+            // SAFETY: file owns this independent open description. It only
+            // closes on drop; an inherited child keeps its SH lock alive.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            files.push(std::sync::Arc::new(file));
+        }
+        for directory in &self._directories {
+            files.push(std::sync::Arc::new(directory.try_clone()?));
+        }
+        Ok(files)
+    }
+
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
@@ -307,7 +337,21 @@ fn lock_path(runtime: &Path, directory: &Path) -> io::Result<PathBuf> {
 }
 
 fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
-    use std::os::unix::{fs::MetadataExt, fs::OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    acquire_with_directory_pin(runtime, directory, exclusive, |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+fn acquire_with_directory_pin(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+    pin: impl Fn(&Path) -> io::Result<std::fs::File>,
+) -> io::Result<Protection> {
+    use std::os::unix::fs::MetadataExt;
     crate::secure_file::reject_symlink_components(directory)?;
     let directory = directory.canonicalize()?;
     // A nested folder or submodule editor also protects containing Git worktrees.
@@ -325,10 +369,7 @@ fn acquire(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Prot
     let mut locks = Vec::with_capacity(roots.len() * 2);
     let mut directories = Vec::with_capacity(roots.len());
     for root in roots {
-        let held_directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&root)?;
+        let held_directory = pin(&root)?;
         let identity = held_directory.metadata()?;
         let path = lock_path(runtime, &root)?;
         let inode_path = path.with_file_name(format!(
@@ -446,14 +487,18 @@ fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<V
 /// original root against cooperating automatic cleanup; it grants no global
 /// root-adoption, placement or publication authority. It never returns an
 /// unprotected compatibility fallback.
-pub fn protect_operation(root: &crate::fs_safety::Root) -> io::Result<Protection> {
-    protect_operation_in_runtime(&crate::instance::runtime_directory()?, root)
+pub fn protect_root_operation(root: &crate::fs_safety::Root) -> io::Result<Protection> {
+    protect_root_operation_in_runtime(&crate::instance::runtime_directory()?, root)
 }
-fn protect_operation_in_runtime(
+fn protect_root_operation_in_runtime(
     runtime: &Path,
     root: &crate::fs_safety::Root,
 ) -> io::Result<Protection> {
-    let protection = acquire(runtime, root.path(), false)?;
+    // An operation needs a physical directory pin, not enumeration rights.
+    // Keep the ordinary path/host protection API's read-capable pins intact.
+    let protection = acquire_with_directory_pin(runtime, root.path(), false, |path| {
+        crate::fs_safety::Root::open(path)?.retained_directory()
+    })?;
     if !protection.protects_root(root)? {
         return Err(io::Error::other(
             "The operation source root changed while acquiring cleanup protection; no file was changed.",
@@ -475,6 +520,21 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+/// Local mutations need directory protection even outside an initialized UI.
+/// Callers retain this guard until every inherited operation lease has retired.
+pub(crate) fn protect_operation(directory: &Path) -> io::Result<Protection> {
+    acquire(&crate::instance::runtime_directory()?, directory, false)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_protection(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+) -> io::Result<Protection> {
+    acquire(runtime, directory, exclusive)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
@@ -486,6 +546,8 @@ pub(crate) struct WindowProtections {
     retry_after: Option<std::time::Instant>,
     last_failure: Option<String>,
     missing: std::collections::BTreeSet<PathBuf>,
+    #[cfg(test)]
+    fixture_runtime: Option<PathBuf>,
 }
 
 impl WindowProtections {
@@ -496,8 +558,21 @@ impl WindowProtections {
         self.last_failure = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_fixture_runtime(&mut self, runtime: PathBuf) {
+        assert!(self.directories.is_empty());
+        self.fixture_runtime = Some(runtime);
+    }
+
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
-        if let Some(protection) = protect(directory)? {
+        #[cfg(test)]
+        let protection = match &self.fixture_runtime {
+            Some(runtime) => Some(acquire(runtime, directory, false)?),
+            None => protect(directory)?,
+        };
+        #[cfg(not(test))]
+        let protection = protect(directory)?;
+        if let Some(protection) = protection {
             self.resolved
                 .insert(directory.to_owned(), protection.directory.clone());
             self.directories
@@ -867,6 +942,55 @@ mod tests {
     }
 
     #[test]
+    fn root_operation_protection_uses_path_pins_for_write_search_only_parents() {
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("parent");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        let protection = protect_root_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        for pin in &protection._directories {
+            let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::O_PATH, 0);
+        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn root_operation_protection_holds_the_original_directory() {
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        let protection = protect_root_operation_in_runtime(runtime.path(), &root).unwrap();
+        assert!(protection.protects_root(&root).unwrap());
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        drop(protection);
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+    }
+
+    #[test]
+    fn root_operation_protection_rejects_replacement_at_the_original_path() {
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        let moved = tree.path().join("moved");
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::fs_safety::Root::open(&directory).unwrap();
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(protect_root_operation_in_runtime(runtime.path(), &root).is_err());
+        // Rejection must release the replacement's temporary acquisition.
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+        assert!(acquire(runtime.path(), &moved, true).is_ok());
+    }
+
+    #[test]
     fn directory_identity_protection_survives_git_worktree_moves_and_path_replacement() {
         let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
         let runtime = fixture.path().join("runtime");
@@ -973,6 +1097,60 @@ mod tests {
         )
         .unwrap();
         acquire(runtime.path(), &moved, true).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(feature = "ui", feature = "host"))]
+    fn inherited_shared_protection_outlives_parent_guard_and_directory_replacement() {
+        use std::io::{BufRead, Write};
+        let runtime = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let directory = tree.path().join("checkout");
+        std::fs::create_dir(&directory).unwrap();
+        let parent = acquire(runtime.path(), &directory, false).unwrap();
+        let mut spec = crate::process::CommandSpec::new("/bin/sh")
+            .args(["-c", "printf 'ready\\n'; read -r retired"]);
+        for file in parent.retained_child_files().unwrap() {
+            spec = spec.inherit_file(file).unwrap();
+        }
+        let mut command = spec.to_command();
+        drop(spec);
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(command);
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(parent); // OwnedLock's explicit unlock must not retire child locks.
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        let moved = tree.path().join("moved");
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(acquire(runtime.path(), &directory, true).is_err());
+        assert!(acquire(runtime.path(), &moved, true).is_err());
+        child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(acquire(runtime.path(), &directory, true).is_ok());
+        assert!(acquire(runtime.path(), &moved, true).is_ok());
+    }
+
+    #[test]
+    fn child_shared_protection_never_downgrades_an_exclusive_guard() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let exclusive = acquire(runtime.path(), directory.path(), true).unwrap();
+        assert_eq!(
+            exclusive.retained_child_files().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(acquire(runtime.path(), directory.path(), false).is_err());
+        drop(exclusive);
+        assert!(acquire(runtime.path(), directory.path(), false).is_ok());
     }
 
     #[test]
