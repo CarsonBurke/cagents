@@ -1921,6 +1921,153 @@ mod tests {
         assert_eq!(actual.0, Some(expected));
     }
 
+    #[test]
+    fn pending_child_switch_and_current_find_preserve_their_own_native_reader_context() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 3,
+        };
+        let memory = Memory::default();
+        let navigation = find_navigation::State::default();
+        let make = |context: Option<&'static str>, pending, height| {
+            transcript_observed(
+                widget::column::with_children(
+                    ["first", "middle", "last"]
+                        .into_iter()
+                        .map(|id| item(id, widget::Space::new().height(height).width(Length::Fill)))
+                        .collect::<Vec<_>>(),
+                ),
+                target,
+                context,
+                vec![],
+                true,
+                ["first", "middle", "last"]
+                    .into_iter()
+                    .map(|id| (item_id(id), id))
+                    .collect(),
+                Observations::default(),
+                memory.clone(),
+                pending,
+                Some(navigation.guard()),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        let mut element = make(None, false, 500);
+        let mut tree = Tree::new(&element);
+        for (context, bottom) in [(None, 500.0), (Some("child"), 300.0)] {
+            element = make(context, false, 500);
+            tree.diff(element.as_widget_mut());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(bottom),
+            );
+        }
+        assert!(
+            !memory.restoration_pending(None, false, |id| id == "last"),
+            "an unrelated cold tail cannot block the saved window"
+        );
+        assert!(memory.restoration_pending(None, false, |id| id == "middle"));
+        // This is a context switch within a retained native Tree, not merely
+        // restoration after creating a fresh Tree.
+        element = make(None, true, 20);
+        tree.diff(element.as_widget_mut());
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(
+            memory
+                .0
+                .borrow()
+                .contexts
+                .iter()
+                .find(|c| c.subagent.is_none())
+                .unwrap()
+                .top,
+            Some(600.0)
+        );
+        assert_eq!(
+            memory
+                .0
+                .borrow()
+                .contexts
+                .iter()
+                .find(|c| c.subagent.as_deref() == Some("child"))
+                .unwrap()
+                .top,
+            Some(800.0)
+        );
+        element = make(None, false, 500);
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(600.0));
+        drop(tree);
+        let mut pending = make(None, true, 500);
+        let mut tree = Tree::new(&pending);
+        let node = pending
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let stale = navigation.document_epoch();
+        navigation.changed_document();
+        let apply = |document| ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 200.0,
+                exact: true,
+                stage: 0,
+                shape_pending: None,
+                horizontal: vec![],
+            },
+            intent: navigation.guard(),
+            document: Some(document),
+        };
+        pending.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut apply(stale),
+        );
+        assert!(
+            tree.state.downcast_ref::<ReaderState>().restore,
+            "stale Find cannot replace the pending saved reader"
+        );
+        pending.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut apply(navigation.document_epoch()),
+        );
+        assert!(
+            !tree.state.downcast_ref::<ReaderState>().restore,
+            "an accepted current Find owns the new native position"
+        );
+        let mut ready = make(None, false, 500);
+        tree.diff(ready.as_widget_mut());
+        let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        ready
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(900.0),
+            "cold completion must not undo the accepted Find correction"
+        );
+    }
+
     fn native_logical_location(
         element: &mut Element<'_, Message>,
         tree: &mut Tree,
