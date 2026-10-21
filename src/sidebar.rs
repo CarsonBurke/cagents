@@ -13920,6 +13920,64 @@ pub(crate) mod tests {
             );
         }
 
+        /// Measure the actual native popup, including its current clipped
+        /// slice, instead of assuming an entry sits below the click anchor.
+        fn menu_entry(&mut self, label: &str) -> (Rectangle, Rectangle) {
+            use cosmic::iced::advanced::widget::Operation;
+            struct Entry<'a> {
+                label: &'a str,
+                pending: Option<Rectangle>,
+                containers: Vec<Rectangle>,
+                matches: Vec<(Rectangle, Rectangle)>,
+            }
+            impl Operation for Entry<'_> {
+                fn container(&mut self, _: Option<&Id>, bounds: Rectangle) {
+                    self.pending = Some(bounds);
+                }
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    let container = self.pending.take();
+                    if let Some(bounds) = container {
+                        self.containers.push(bounds);
+                    }
+                    visit(self);
+                    if container.is_some() {
+                        self.containers.pop();
+                    }
+                }
+                fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                    if text == self.label {
+                        // The runtime operates overlays separately from the
+                        // base tree. Menu::operate's outer container is the
+                        // native popup, not the sidebar behind it.
+                        let popup = *self.containers.first().expect("native popup container");
+                        self.matches.push((bounds, popup));
+                    }
+                }
+            }
+            let mut entry = Entry {
+                label,
+                pending: None,
+                containers: Vec::new(),
+                matches: Vec::new(),
+            };
+            let mut interface = interface(
+                &self.model,
+                &self.state,
+                &self.navigation,
+                self.bounds,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            interface.operate(&self.renderer, &mut entry);
+            self.cache = interface.into_cache();
+            assert_eq!(
+                entry.matches.len(),
+                1,
+                "one visible native menu entry {label}"
+            );
+            entry.matches[0]
+        }
+
         /// The window rows an open row menu paints on, measured against the
         /// same frame with the menu closed and the pointer absent from both,
         /// so that neither the list's scroll position nor hover feedback can
@@ -13999,10 +14057,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_row_menu_in_a_scrolled_list_runs_the_entry_for_its_row() {
-        use cosmic::iced::{Point, advanced::mouse};
-        // The anchor is above the window's center, so the native popup picks
-        // the larger space below it. A short reach selects its first entry.
-        let entry_cursor = Point::new(86.0, MENU_ROW.y + 8.0);
+        use cosmic::iced::advanced::mouse;
         let mut outcomes = Vec::new();
         for scroll in [0.0, MENU_SCROLL] {
             let mut sidebar = Sidebar::scrolling();
@@ -14022,8 +14077,28 @@ pub(crate) mod tests {
                 )],
                 MENU_ROW,
             );
+            let (entry, popup) = sidebar.menu_entry("New terminal");
+            let viewport = Rectangle::with_size(sidebar.bounds);
+            assert!(viewport.contains(entry.center()));
+            assert_eq!(
+                popup.position(),
+                cosmic::iced::Point::ORIGIN,
+                "this tall, full-width popup clamps to the short window's origin"
+            );
+            assert!(popup.height > viewport.height);
+            assert!(popup.width <= viewport.width);
+            let entry_cursor = entry.center();
             sidebar.move_to(entry_cursor);
             let chosen = sidebar.click(mouse::Button::Left, entry_cursor);
+            assert_eq!(
+                chosen,
+                vec![SidebarAction::ProjectCommand {
+                    project_id: sidebar.model.projects[0].id,
+                    worktree_id: Some(under_pointer),
+                    command: ProjectCommand::NewTerminal,
+                }],
+                "the measured New terminal row must activate only its original worktree"
+            );
             let (worktree, command) = match chosen.first() {
                 Some(SidebarAction::ProjectCommand {
                     worktree_id,
@@ -14148,15 +14223,23 @@ pub(crate) mod tests {
     #[test]
     fn clicking_beside_an_open_row_menu_only_dismisses_it() {
         use cosmic::iced::{Point, advanced::mouse};
-        // A header control above the scrolled list, inside the band a menu
-        // anchored in window space leaves behind if it stops covering the
-        // whole window.
+        // Leave genuine space outside the popup. In a window shorter than
+        // this tall menu, clamping deliberately covers this header point.
         let beside = Point::new(24.0, 20.0);
         for scroll in [0.0, MENU_SCROLL] {
-            let mut sidebar = Sidebar::scrolling();
+            let mut closed = Sidebar::roomy();
+            closed.scroll(scroll, MENU_ROW);
+            let header_action = closed.click(mouse::Button::Left, beside);
+            assert!(!header_action.is_empty(), "the underlying header is active");
+            let mut sidebar = Sidebar::roomy();
             sidebar.scroll(scroll, MENU_ROW);
             sidebar.click(mouse::Button::Right, MENU_ROW);
             sidebar.move_to(MENU_ROW);
+            let (_, popup) = sidebar.menu_entry("New terminal");
+            assert!(
+                !popup.contains(beside),
+                "the dismissal point must be outside the actual native popup: {popup:?}"
+            );
             let dismissing = sidebar.click(mouse::Button::Left, beside);
             assert_eq!(
                 dismissing,
@@ -14165,8 +14248,8 @@ pub(crate) mod tests {
                  covers (scroll={scroll})"
             );
             let reachable = sidebar.click(mouse::Button::Left, beside);
-            assert!(
-                !reachable.is_empty(),
+            assert_eq!(
+                reachable, header_action,
                 "the dismissed menu leaves that control usable again (scroll={scroll})"
             );
         }
