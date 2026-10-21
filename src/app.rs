@@ -25533,6 +25533,7 @@ mod tests {
         // A parked callback must settle its owning draft without touching this one.
         let source = app.sidebar_model.source_control.take();
         let sibling = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(sibling.canonical_path.clone());
         app.sidebar_state
             .apply(&SidebarAction::CommitMessageChanged {
                 key: sibling,
