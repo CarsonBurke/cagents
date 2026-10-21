@@ -34,6 +34,7 @@ pub(super) fn transcript<'a>(
         None,
         Memory::default(),
         false,
+        HashSet::new(),
         None,
     )
 }
@@ -52,6 +53,17 @@ pub(super) enum Edge {
     Start,
     End,
     Latest,
+}
+
+// One accepted main-history fetch may outlive the reader intent that asked
+// for it. Keep its source epoch, never its old source or native widgets.
+#[derive(Clone, Copy)]
+struct PreserveRefresh {
+    request: u64,
+    generation: u64,
+    source: u64,
+    arrived: bool,
+    latest: bool,
 }
 
 struct ReaderState {
@@ -85,6 +97,61 @@ impl Memory {
         {
             context.edge = None;
         }
+    }
+    pub(super) fn preserve_refresh(&self, request: u64, generation: u64) {
+        let mut anchor = self.0.borrow_mut();
+        let index = anchor.context_index(None);
+        anchor.contexts[index].preserve = Some(PreserveRefresh {
+            request,
+            generation,
+            source: generation,
+            arrived: false,
+            latest: false,
+        });
+    }
+    pub(super) fn latest_source(
+        &self,
+        expected: Option<u64>,
+        generation: u64,
+        has_later: bool,
+        loading: bool,
+    ) {
+        if let Some(context) = self
+            .0
+            .borrow_mut()
+            .contexts
+            .iter_mut()
+            .find(|context| context.subagent.is_none())
+            && let Some(preserve) = &mut context.preserve
+            && expected.is_none_or(|expected| expected == preserve.generation)
+            && generation > preserve.source
+        {
+            preserve.source = generation;
+            preserve.arrived = true;
+            preserve.latest = !has_later && !loading;
+        }
+    }
+    pub(super) fn cancel_preserve(&self, request: u64) {
+        if let Some(context) = self
+            .0
+            .borrow_mut()
+            .contexts
+            .iter_mut()
+            .find(|context| context.subagent.is_none())
+            && context
+                .preserve
+                .is_some_and(|preserve| preserve.request == request)
+        {
+            context.preserve = None;
+        }
+    }
+    pub(super) fn preserve_arrived(&self, subagent: Option<&str>) -> bool {
+        self.0
+            .borrow()
+            .contexts
+            .iter()
+            .find(|context| context.subagent.as_deref() == subagent)
+            .is_some_and(|context| context.preserve.is_some_and(|preserve| preserve.arrived))
     }
     pub fn clear(&self) {
         *self.0.borrow_mut() = Anchor::default();
@@ -229,6 +296,7 @@ pub(super) fn transcript_observed<'a>(
     observations: Observations,
     memory: Memory,
     restoration_pending: bool,
+    preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     transcript_impl(
@@ -241,6 +309,7 @@ pub(super) fn transcript_observed<'a>(
         Some(observations),
         memory,
         restoration_pending,
+        preparing,
         find_intent,
     )
 }
@@ -255,6 +324,7 @@ fn transcript_impl<'a>(
     observations: Option<Observations>,
     memory: Memory,
     restoration_pending: bool,
+    preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
@@ -280,6 +350,7 @@ fn transcript_impl<'a>(
         observations,
         memory,
         restoration_pending,
+        preparing,
         find_intent,
     })
 }
@@ -298,6 +369,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         observations: None,
         memory: Memory::default(),
         restoration_pending: false,
+        preparing: HashSet::new(),
         find_intent: None,
     })
 }
@@ -819,6 +891,7 @@ struct Anchored<'a> {
     observations: Option<Observations>,
     memory: Memory,
     restoration_pending: bool,
+    preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
 }
 
@@ -852,6 +925,7 @@ struct Context {
     used: u64,
     follow_end: bool,
     edge: Option<Edge>,
+    preserve: Option<PreserveRefresh>,
 }
 
 impl Context {
@@ -872,6 +946,7 @@ impl Context {
         });
         if !prepended
             && self.follow_end
+            && !self.preserve.is_some_and(|preserve| preserve.arrived)
             && follow_end
             && previous.travel() - top <= 0.5
             && (previous.travel() > 0.0 || self.subagent.is_none())
@@ -924,7 +999,12 @@ impl Context {
                             .total_cmp(&(b.bounds.y - top).abs())
                     })
             });
-        overlap.map_or(next.travel(), |(old, new)| {
+        let fallback = if self.preserve.is_some_and(|preserve| preserve.arrived) {
+            top.clamp(0.0, next.travel())
+        } else {
+            next.travel()
+        };
+        overlap.map_or(fallback, |(old, new)| {
             let within = top - old.bounds.y;
             // A disclosure or reflow may shorten the anchored exchange itself.
             // Do not carry an offset past its new end into an unrelated turn.
@@ -1081,6 +1161,15 @@ impl Anchor {
         let bottom = next.travel() - top;
         context.used = self.clock;
         context.remember(next, rows, top);
+        if let Some(preserve) = &mut context.preserve
+            && preserve.arrived
+        {
+            if preserve.latest {
+                context.preserve = None;
+            } else {
+                preserve.arrived = false;
+            }
+        }
         self.active = Some(index);
         if switched {
             self.pending_input = false;
@@ -1309,7 +1398,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<ReaderState>();
-        if state.memory.edge(self.subagent).is_some() {
+        if state.memory.edge(self.subagent).is_some()
+            || state.memory.preserve_arrived(self.subagent)
+        {
             state.restore = true;
         }
         let switching = state.memory.0.borrow().active.is_none_or(|index| {
@@ -1402,6 +1493,49 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .map(|(key, bounds)| (key.as_str(), *bounds)),
             );
             rows.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            // A superseded Latest fetch may replace every old row. Wait for
+            // only cold aliases touching the desired replacement viewport;
+            // unrelated history preparation cannot hold the reader here.
+            let pending_window_top = anchor
+                .contexts
+                .iter()
+                .find(|context| context.subagent.as_deref() == self.subagent)
+                .filter(|context| {
+                    context.edge.is_none()
+                        && context.preserve.is_some_and(|preserve| preserve.arrived)
+                })
+                .map(|context| context.position(next, &rows, self.follow_end))
+                .filter(|top| {
+                    rows.iter().any(|(id, bounds)| {
+                        self.preparing.contains(id)
+                            && bounds.y + bounds.height > *top
+                            && bounds.y < *top + next.viewport.height
+                    })
+                });
+            if let Some(top) = pending_window_top {
+                self.restoration_pending = true;
+                state.restore = true;
+                self.content.as_widget_mut().operate(
+                    child,
+                    Layout::new(&node),
+                    renderer,
+                    &mut SetBottom(next.travel() - top),
+                );
+                let mut viewport = virtualized::UpdateViewport::default();
+                self.content.as_widget_mut().operate(
+                    child,
+                    Layout::new(&node),
+                    renderer,
+                    &mut viewport,
+                );
+                if !viewport.changed {
+                    break;
+                }
+                node = self.content.as_widget_mut().layout(child, renderer, limits);
+                continue;
+            }
+            self.restoration_pending = false;
+            state.restore = false;
             let offset = anchor
                 .layout_following(self.subagent, &rows, next, top.0, self.follow_end)
                 .or_else(|| {
@@ -1843,6 +1977,7 @@ mod tests {
                 observations.clone(),
                 memory.clone(),
                 false,
+                HashSet::new(),
                 None,
             )
         };
@@ -1912,6 +2047,7 @@ mod tests {
                 observations.clone(),
                 memory.clone(),
                 pending,
+                HashSet::new(),
                 None,
             )
         };
@@ -2020,6 +2156,7 @@ mod tests {
                 observations.clone(),
                 memory.clone(),
                 false,
+                HashSet::new(),
                 None,
             )
         };
@@ -2088,6 +2225,7 @@ mod tests {
                 Observations::default(),
                 memory.clone(),
                 pending,
+                HashSet::new(),
                 Some(navigation.guard()),
             )
         };
@@ -2215,6 +2353,201 @@ mod tests {
     }
 
     #[test]
+    fn superseded_latest_refresh_keeps_native_find_and_overlap_without_waiting_for_unrelated_cold_rows()
+     {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 3,
+        };
+        let navigation = find_navigation::State::default();
+        let memory = Memory::default();
+        let make = |context, ids: Vec<&'static str>, height, preparing| {
+            transcript_observed(
+                widget::column::with_children(
+                    ids.iter()
+                        .map(|id| item(id, widget::Space::new().height(height).width(Length::Fill)))
+                        .collect::<Vec<_>>(),
+                ),
+                target,
+                context,
+                vec![],
+                true,
+                ids.into_iter().map(|id| (item_id(id), id)).collect(),
+                Observations::default(),
+                memory.clone(),
+                false,
+                preparing,
+                Some(navigation.guard()),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+        let old = vec!["first", "middle", "last"];
+        let mut element = make(None, old.clone(), 500, HashSet::new());
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(500.0),
+        );
+        memory.preserve_refresh(42, 10);
+        let document = navigation.document_epoch();
+        navigation.changed_document();
+        let apply = |document| ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 200.0,
+                exact: true,
+                stage: 0,
+                shape_pending: None,
+                horizontal: vec![],
+            },
+            intent: navigation.guard(),
+            document: Some(document),
+        };
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut apply(document),
+        );
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(600.0), "stale Find cannot change reader");
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut apply(navigation.document_epoch()),
+        );
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(actual.0, Some(900.0), "current accepted native Find wins");
+        memory.latest_source(Some(9), 11, false, false);
+        assert!(
+            !memory.preserve_arrived(None),
+            "wrong refresh epoch cannot authorize replacement fallback"
+        );
+        memory.cancel_preserve(41);
+        memory.latest_source(Some(10), 11, true, false);
+        assert!(
+            memory.preserve_arrived(None),
+            "intermediate replacement also preserves reader"
+        );
+        memory.latest_source(None, 12, false, false);
+        assert!(memory.preserve_arrived(None));
+        assert!(!memory.preserve_arrived(Some("child")));
+        element = make(Some("child"), old.clone(), 500, HashSet::new());
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(300.0),
+        );
+        let replacement = vec![
+            "replacement-first",
+            "replacement-middle",
+            "replacement-last",
+        ];
+        element = make(
+            None,
+            replacement.clone(),
+            20,
+            replacement.iter().copied().collect(),
+        );
+        tree.diff(element.as_widget_mut());
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(memory.preserve_arrived(None));
+        assert_eq!(
+            memory
+                .0
+                .borrow()
+                .contexts
+                .iter()
+                .find(|context| context.subagent.is_none())
+                .unwrap()
+                .top,
+            Some(900.0),
+            "cold replacement cannot overwrite the accepted Find geometry"
+        );
+        element = make(None, replacement, 500, HashSet::from(["replacement-first"]));
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(900.0),
+            "unrelated cold first row cannot block Ready replacement viewport"
+        );
+        assert!(
+            !memory.preserve_arrived(None),
+            "one arrived replacement consumes the bounded marker"
+        );
+        // With overlapping IDs, row anchoring takes precedence over numeric fallback.
+        memory.clear();
+        element = make(None, old.clone(), 500, HashSet::new());
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut SetBottom(500.0),
+        );
+        memory.preserve_refresh(43, 11);
+        memory.latest_source(Some(11), 12, false, false);
+        element = make(
+            None,
+            vec!["prefix", "first", "middle", "last"],
+            500,
+            HashSet::new(),
+        );
+        tree.diff(element.as_widget_mut());
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut actual = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
+        assert_eq!(
+            actual.0,
+            Some(1100.0),
+            "surviving row moves by prepend delta, not saved numeric top"
+        );
+        memory.preserve_refresh(44, 12);
+        memory.cancel_preserve(44);
+        memory.latest_source(Some(12), 13, false, false);
+        assert!(
+            !memory.preserve_arrived(None),
+            "failed exact refresh cannot authorize later unrelated source"
+        );
+    }
+
+    #[test]
     fn cold_fitting_native_home_end_and_wheel_keep_explicit_context_intent() {
         let renderer = crate::app::tests::headless_renderer();
         let target = Target {
@@ -2251,6 +2584,7 @@ mod tests {
                         Observations::default(),
                         memory.clone(),
                         pending,
+                        HashSet::new(),
                         None,
                     )
                 };
@@ -2369,6 +2703,7 @@ mod tests {
                     Observations::default(),
                     memory.clone(),
                     false,
+                    HashSet::new(),
                     None,
                 );
                 tree.diff(empty.as_widget_mut());
@@ -2427,6 +2762,7 @@ mod tests {
                 Observations::default(),
                 Memory::default(),
                 false,
+                HashSet::new(),
                 None,
             );
             let mut tree = Tree::new(&element);
@@ -2584,6 +2920,7 @@ mod tests {
                 Observations::default(),
                 Memory::default(),
                 false,
+                HashSet::new(),
                 Some(guard),
             ))
             .width(400)
@@ -3072,6 +3409,7 @@ mod tests {
                 Observations::default(),
                 Memory::default(),
                 false,
+                HashSet::new(),
                 Some(guard.clone()),
             );
             let mut tree = Tree::new(&element);
@@ -3379,6 +3717,7 @@ mod tests {
                 observations.clone(),
                 Memory::default(),
                 false,
+                HashSet::new(),
                 None,
             )
         };

@@ -1921,7 +1921,8 @@ impl Runtime {
                                 && self.selected_subagent.is_none()
                                 && (snapshot.has_later
                                     || snapshot.history_loading
-                                    || self.paging() == Some(Page::Latest)))
+                                    || self.paging() == Some(Page::Latest)
+                                    || self.deferred_page == Some(HistoryNavigation::Latest)))
                             || {
                                 let items = selected.map_or(snapshot.items.as_slice(), |agent| {
                                     agent.items.as_slice()
@@ -1948,6 +1949,23 @@ impl Runtime {
                                         .is_none_or(|cached| cached.placeholder)
                             },
                         )
+                    },
+                    if self
+                        .scroll_memory
+                        .preserve_arrived(self.selected_subagent.as_deref())
+                    {
+                        selected
+                            .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                            .iter()
+                            .filter(|item| {
+                                self.presentation_cache()
+                                    .get(&item.id)
+                                    .is_none_or(|cached| cached.placeholder)
+                            })
+                            .map(|item| item.id.as_str())
+                            .collect()
+                    } else {
+                        Default::default()
                     },
                     Some(self.find_navigation.guard()),
                 ),
@@ -7972,6 +7990,507 @@ mod tests {
                 actual.1 > 500.0 && (actual.0 - actual.1).abs() <= 1.0 && actual.2,
                 "actual newest-generation Ready must mount its end marker at native end, got {actual:?}, old reading top {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacement_source() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        struct Reader {
+            id: widget::Id,
+            bottom: Option<f32>,
+            top: f32,
+            travel: f32,
+            bounds: iced::Rectangle,
+        }
+        impl Operation for Reader {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                viewport: iced::Rectangle,
+                content: iced::Rectangle,
+                translation: iced::Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.top = translation.y;
+                    self.travel = (content.height - viewport.height).max(0.0);
+                    self.bounds = viewport;
+                    if let Some(bottom) = self.bottom.take() {
+                        state.scroll_to(iced::widget::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(bottom),
+                        });
+                    }
+                }
+            }
+        }
+        fn runtime(app: &Cagents, target: Target) -> &Runtime {
+            match &app.cards[&target.card] {
+                CardRuntime::Chat(runtime) => runtime,
+                _ => panic!("fixture chat"),
+            }
+        }
+        fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+            runtime(app, target).view(
+                None,
+                false,
+                true,
+                &app.settings.keyboard_shortcuts,
+                620.0,
+                Place {
+                    name: "restore-fixture".into(),
+                    branch: None,
+                    channel: None,
+                },
+                true,
+                None,
+                vec![],
+            )
+        }
+        for case in [
+            "home",
+            "wheel",
+            "child",
+            "failure",
+            "follow",
+            "ordinary",
+            "coalesced",
+            "intermediate",
+            "find",
+        ] {
+            let item = chat::Item {
+                id: "old-window-only".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: (0..100)
+                        .map(|index| {
+                            format!("## Old {index}\n\n{}\n\n", "reader source ".repeat(12))
+                        })
+                        .collect(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[item]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let mut initial = (*handle.snapshot()).clone();
+            initial.generation = 10;
+            initial.has_later = true;
+            let mut child = (*initial.items[0]).clone();
+            child.id = "unrelated-child".into();
+            initial.subagents.push(chat::Subagent {
+                id: "child".into(),
+                kind: "fixture".into(),
+                description: "Child".into(),
+                status: chat::ToolStatus::Succeeded,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: false,
+                items: vec![Arc::new(child)],
+            });
+            handle.replace_snapshot_for_test(initial);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let renderer = crate::app::tests::headless_renderer();
+            let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(620.0, 720.0));
+            let read = |element: &mut Element<'_, Message>,
+                        tree: &mut Tree,
+                        node: &layout::Node,
+                        bottom| {
+                let mut reader = Reader {
+                    id: card_control_id(target.card, "chat-transcript"),
+                    bottom,
+                    top: -1.0,
+                    travel: -1.0,
+                    bounds: iced::Rectangle::default(),
+                };
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(node), &renderer, &mut reader);
+                reader
+            };
+            let mut tree;
+            {
+                let mut element = view(&app, target);
+                tree = Tree::new(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                read(&mut element, &mut tree, &node, Some(700.0));
+                assert!(read(&mut element, &mut tree, &node, None).top > 500.0);
+            }
+            let unrelated = if matches!(case, "ordinary" | "coalesced") {
+                None
+            } else {
+                drop(app.chat_send(
+                    target,
+                    Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                    false,
+                ));
+                Some(runtime(&app, target).pending.as_ref().unwrap().id)
+            };
+            drop(app.handle_chat_ui(Action::Latest(target)));
+            if unrelated.is_some() {
+                assert_eq!(
+                    runtime(&app, target).deferred_page,
+                    Some(HistoryNavigation::Latest)
+                );
+            }
+            assert_eq!(
+                runtime(&app, target).scroll_memory.edge(None),
+                Some(scroll::Edge::Latest)
+            );
+            let mut find_guard = None;
+            let expected;
+            if case == "find" {
+                let (catalog, _) = runtime(&app, target).selection_document();
+                let (_, identity, _) = catalog
+                    .owned_search_blocks(&HashSet::from(["old-window-only".into()]))
+                    .into_iter()
+                    .find(|(_, _, text)| text.as_ref() == "Old 50")
+                    .expect("actual prepared Find heading");
+                let intent = runtime(&app, target).find_navigation.guard();
+                let epoch = runtime(&app, target).find_navigation.document_epoch();
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let location = executor.block_on(async {
+                    let mut stream = iced::runtime::task::into_stream(scroll::locate_logical(
+                        target,
+                        "old-window-only".into(),
+                        identity,
+                        0,
+                    ))
+                    .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while let Some(effect) = stream.next().await {
+                            match effect {
+                                iced::runtime::Action::Widget(mut operation) => {
+                                    element.as_widget_mut().operate(
+                                        &mut tree,
+                                        Layout::new(&node),
+                                        &renderer,
+                                        operation.as_mut(),
+                                    );
+                                    let _ = operation.finish();
+                                }
+                                iced::runtime::Action::Output(location) => {
+                                    return location.expect("actual native Find location");
+                                }
+                                _ => {}
+                            }
+                        }
+                        panic!("actual locator completion");
+                    })
+                    .await
+                    .unwrap()
+                });
+                executor.block_on(async {
+                    let task =
+                        scroll::apply_find_location(target, location, intent.clone(), Some(epoch));
+                    let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                    let effect = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let iced::runtime::Action::Widget(mut operation) = effect else {
+                        panic!("actual Find widget operation")
+                    };
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                    let _ = operation.finish();
+                });
+                executor.shutdown_background();
+                let after = read(&mut element, &mut tree, &node, None);
+                assert!(
+                    after.top > 500.0 && after.top < after.travel,
+                    "actual accepted Find owns an interior reader"
+                );
+                assert!(intent.document_current(epoch));
+                find_guard = Some((intent, epoch));
+                expected = Some(after.top);
+            } else if case == "follow" {
+                expected = None;
+            } else if case == "wheel" {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let before = read(&mut element, &mut tree, &node, None);
+                let mut messages = vec![];
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 },
+                    }),
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Available(before.bounds.center()),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut iced::advanced::Shell::new(&mut messages),
+                    &before.bounds,
+                );
+                let after = read(&mut element, &mut tree, &node, None);
+                assert!(
+                    after.top > 0.0 && after.top < before.top,
+                    "actual wheel moved native reader"
+                );
+                expected = Some(after.top);
+            } else {
+                for repetition in 0..if case == "coalesced" { 2 } else { 1 } {
+                    if repetition == 1 {
+                        let count = runtime(&app, target).next_command;
+                        drop(app.handle_chat_ui(Action::Latest(target)));
+                        assert_eq!(
+                            runtime(&app, target).next_command,
+                            count,
+                            "explicit Latest coalesces accepted fetch"
+                        );
+                        assert_eq!(
+                            runtime(&app, target).scroll_memory.edge(None),
+                            Some(scroll::Edge::Latest)
+                        );
+                    }
+                    let home = app
+                        .chat_scroll_key(&keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(keyboard::key::Named::Home),
+                            modified_key: keyboard::Key::Named(keyboard::key::Named::Home),
+                            physical_key: keyboard::key::Physical::Unidentified(
+                                keyboard::key::NativeCode::Unidentified,
+                            ),
+                            location: keyboard::Location::Standard,
+                            modifiers: keyboard::Modifiers::empty(),
+                            text: None,
+                            repeat: false,
+                        })
+                        .expect("actual later Home dispatch");
+                    let mut element = view(&app, target);
+                    tree.diff(element.as_widget_mut());
+                    let node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    let executor = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    executor.block_on(async {
+                        let mut stream = iced::runtime::task::into_stream(home).unwrap();
+                        let effect =
+                            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        let iced::runtime::Action::Widget(mut operation) = effect else {
+                            panic!("Home widget operation")
+                        };
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                    });
+                    executor.shutdown_background();
+                    assert_eq!(read(&mut element, &mut tree, &node, None).top, 0.0);
+                }
+                expected = Some(0.0);
+            }
+            if let Some(unrelated) = unrelated {
+                assert_eq!(
+                    runtime(&app, target).deferred_page,
+                    Some(HistoryNavigation::Latest),
+                    "reader intent cannot cancel the fetch"
+                );
+                drop(app.handle_chat_ui(Action::CommandFinished(target, unrelated, Ok(()))));
+            }
+            if let Some((intent, epoch)) = &find_guard {
+                assert!(
+                    intent.document_current(*epoch),
+                    "resuming the deferred FETCH cannot cancel current Find intent/document"
+                );
+            }
+            let fetch = runtime(&app, target)
+                .pending
+                .as_ref()
+                .expect("deferred FETCH resumed despite later reader intent");
+            assert_eq!(fetch.page, Some(Page::Latest));
+            let fetch_id = fetch.id;
+            assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
+            if expected.is_some() {
+                assert_ne!(
+                    runtime(&app, target).scroll_memory.edge(None),
+                    Some(scroll::Edge::Latest)
+                );
+            }
+            let mut child_before = None;
+            if case == "child" {
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                read(&mut element, &mut tree, &node, Some(300.0));
+                child_before = Some(read(&mut element, &mut tree, &node, None).top);
+            }
+            drop(app.handle_chat_ui(Action::CommandFinished(
+                target,
+                fetch_id.wrapping_add(1),
+                Ok(()),
+            )));
+            assert_eq!(
+                runtime(&app, target).pending.as_ref().unwrap().id,
+                fetch_id,
+                "stale ACK cannot consume the actual fetch"
+            );
+            let ack = app.handle_chat_ui(Action::CommandFinished(
+                target,
+                fetch_id,
+                if case == "failure" {
+                    Err("fixture latest failed".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if let Some((intent, epoch)) = &find_guard {
+                assert!(
+                    intent.document_current(*epoch),
+                    "PageLatest ACK cannot invalidate current accepted Find"
+                );
+            }
+            if expected.is_some() {
+                assert!(
+                    iced::runtime::task::into_stream(ack).is_none(),
+                    "resumed fetch cannot issue a new reader snap"
+                );
+            }
+            if case == "failure" {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut element, &mut tree, &node, None).top,
+                    expected.unwrap()
+                );
+                continue;
+            }
+            if case == "intermediate" {
+                let mut intermediate = (*handle.snapshot()).clone();
+                intermediate.generation = 11;
+                intermediate.has_later = true;
+                intermediate.history_loading = false;
+                Arc::make_mut(&mut intermediate.items[0]).id = "intermediate-no-old-ids".into();
+                handle.replace_snapshot_for_test(intermediate);
+                app.chat_runtime_mut(target).unwrap().refresh();
+                assert!(
+                    runtime(&app, target).page_request.is_none(),
+                    "existing Runtime clears page metadata on intermediate source"
+                );
+                {
+                    let mut pending = view(&app, target);
+                    tree.diff(pending.as_widget_mut());
+                    pending
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+                preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+                let mut ready = view(&app, target);
+                tree.diff(ready.as_widget_mut());
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut ready, &mut tree, &node, None).top,
+                    expected.unwrap(),
+                    "intermediate replacement also preserves Home"
+                );
+            }
+            let mut latest = (*handle.snapshot()).clone();
+            latest.generation = if case == "intermediate" { 12 } else { 11 };
+            latest.has_later = false;
+            latest.history_loading = false;
+            let replacement = Arc::make_mut(&mut latest.items[0]);
+            replacement.id = "replacement-with-no-old-ids".into();
+            let ItemContent::Text { text, .. } = &mut replacement.content else {
+                panic!("text fixture")
+            };
+            *text = (0..120)
+                .map(|index| format!("## New {index}\n\n{}\n\n", "replacement source ".repeat(12)))
+                .collect();
+            handle.replace_snapshot_for_test(latest);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            assert!(runtime(&app, target).page_request.is_none());
+            if let Some(before) = child_before {
+                let mut element = view(&app, target);
+                tree.diff(element.as_widget_mut());
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                assert_eq!(
+                    read(&mut element, &mut tree, &node, None).top,
+                    before,
+                    "main replacement token cannot move selected child"
+                );
+                drop(element);
+                drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+            }
+            assert!(runtime(&app, target).cache["replacement-with-no-old-ids"].placeholder);
+            {
+                let mut pending = view(&app, target);
+                tree.diff(pending.as_widget_mut());
+                pending
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+            let mut ready = view(&app, target);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let actual = read(&mut ready, &mut tree, &node, None);
+            assert!(actual.travel > 500.0);
+            if let Some(expected) = expected {
+                assert!(
+                    (actual.top - expected).abs() <= 1.0,
+                    "{case}: replacement top {} must preserve later reader {expected}",
+                    actual.top
+                );
+            } else {
+                assert!(
+                    (actual.top - actual.travel).abs() <= 1.0,
+                    "unsuperseded Latest still follows newest source"
+                );
+            }
         }
     }
 

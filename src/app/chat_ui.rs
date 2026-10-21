@@ -1760,6 +1760,13 @@ enum HistoryNavigation {
     Latest,
 }
 
+#[derive(Clone, Copy)]
+// Deferring the history fetch must not resurrect a superseded reader snap.
+enum LatestReader {
+    Follow,
+    Preserve,
+}
+
 struct PendingCommand {
     followup: bool,
     /// The provider's queued message this command asks back, which stops
@@ -3316,6 +3323,14 @@ impl Runtime {
             self.source_clock = source_clock;
             return;
         }
+        self.scroll_memory.latest_source(
+            self.page_request
+                .filter(|(page, _)| *page == view::Page::Latest)
+                .map(|(_, generation)| generation),
+            snapshot.generation,
+            snapshot.has_later,
+            snapshot.history_loading,
+        );
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
         }) && self
@@ -6849,6 +6864,7 @@ impl Cagents {
                     Command::SetModel { model, reasoning },
                     false,
                     Some(QueuedStep::Model),
+                    LatestReader::Follow,
                 );
             } else if !snapshot.models.is_empty() || waited >= MODEL_PATIENCE {
                 queued.model = None;
@@ -6874,7 +6890,13 @@ impl Cagents {
             &queued.attachments,
             PromptMode::Send,
         ) {
-            Ok(command) => self.chat_send_step(target, command, false, Some(QueuedStep::Prompt)),
+            Ok(command) => self.chat_send_step(
+                target,
+                command,
+                false,
+                Some(QueuedStep::Prompt),
+                LatestReader::Follow,
+            ),
             Err(refusal) => self.revert_chat_draft(target, Some(refusal.into())),
         }
     }
@@ -7042,7 +7064,28 @@ impl Cagents {
             return Task::none();
         };
         match page {
-            HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
+            HistoryNavigation::Latest
+                if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Latest) =>
+            {
+                self.handle_chat_action(Action::Latest(target))
+            }
+            // The fetch survives Home, Find, or a wheel; its original snap does not.
+            HistoryNavigation::Latest
+                if runtime.snapshot.has_later
+                    || runtime.snapshot.history_loading
+                    || runtime
+                        .page_request
+                        .is_some_and(|(page, _)| page == view::Page::Earlier) =>
+            {
+                self.chat_send_step(
+                    target,
+                    Command::Refresh,
+                    false,
+                    None,
+                    LatestReader::Preserve,
+                )
+            }
+            HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
                 if runtime.parent_scroll().at_bottom()
                     && !runtime.parent_scroll().at_top()
@@ -7065,7 +7108,7 @@ impl Cagents {
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
-        self.chat_send_step(target, command, clear_draft, None)
+        self.chat_send_step(target, command, clear_draft, None, LatestReader::Follow)
     }
     /// Sends `command`, which is `step` of a queued first message where that
     /// is given.
@@ -7075,6 +7118,7 @@ impl Cagents {
         command: Command,
         clear_draft: bool,
         step: Option<QueuedStep>,
+        latest_reader: LatestReader,
     ) -> Task<Message> {
         if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
             return Task::none();
@@ -7142,9 +7186,15 @@ impl Cagents {
         };
         if let Some(page) = page {
             if page == view::Page::Latest {
+                match latest_reader {
+                    LatestReader::Follow => runtime
+                        .scroll_memory
+                        .request_edge(None, scroll::Edge::Latest),
+                    LatestReader::Preserve => {}
+                }
                 runtime
                     .scroll_memory
-                    .request_edge(None, scroll::Edge::Latest);
+                    .preserve_refresh(id, runtime.snapshot.generation);
             }
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
@@ -9256,6 +9306,7 @@ impl Cagents {
                     Err(error) => {
                         if pending.page == Some(view::Page::Latest) {
                             runtime.scroll_memory.clear_latest();
+                            runtime.scroll_memory.cancel_preserve(pending.id);
                         }
                         if pending.page.is_some() {
                             runtime.page_request = None;
@@ -9631,15 +9682,9 @@ impl Cagents {
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
                     if runtime.pending.is_some() {
-                        if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page == Some(view::Page::Latest))
-                        {
-                            runtime
-                                .scroll_memory
-                                .request_edge(None, scroll::Edge::Latest);
-                        }
+                        runtime
+                            .scroll_memory
+                            .request_edge(None, scroll::Edge::Latest);
                         if !runtime
                             .pending
                             .as_ref()
