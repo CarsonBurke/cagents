@@ -1957,9 +1957,7 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            "The provider reported an error without a readable message".into()
-                        })
+                        .unwrap_or_else(|| error.to_string())
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -3098,7 +3096,7 @@ impl Adapter for Codex {
                 let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| "Codex reported an error without a readable message".into());
+                    .unwrap_or_else(|| params["error"].to_string());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
@@ -3115,10 +3113,9 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
-                    "Codex reported a configuration warning; check the provider log for details"
-                        .into()
-                });
+                let mut message = summary
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| params.to_string());
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
@@ -4057,6 +4054,53 @@ mod tests {
         assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
         assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
     }
+    #[test]
+    fn snapshot_output_preserves_its_partial_terminal_state_for_the_next_delta() {
+        for snapshot in ["item", "turn", "history"] {
+            for (raw, suffix, expected) in [
+                ("before🦀\u{1b}[", "31m-tail", "before🦀-tail"),
+                ("before🦀\u{1b}]8;;https://example.test/", "\u{7}tail", "before🦀tail"),
+                ("before🦀\u{1b}Ppayload\u{1b}", "\\tail", "before🦀tail"),
+                ("before🦀\r", "after", "before🦀\nafter"),
+            ] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                adapter.receive(output_window_started("")).unwrap();
+                adapter.receive(output_window_delta("old\u{1b}[")).unwrap();
+                match snapshot {
+                    "item" => { adapter.receive(output_window_started(raw)).unwrap(); }
+                    "turn" => { adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}}})).unwrap(); }
+                    "history" => {
+                        let key = item_key("window-turn", "window-cmd");
+                        adapter.active_items.remove(&key);
+                        adapter.output_streams.remove(&key);
+                        adapter.output_windows.remove(&key);
+                        adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}],"nextCursor":null}), &mut Step::default(), false).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                adapter.receive(output_window_delta(suffix)).unwrap();
+                let key = item_key("window-turn", "window-cmd");
+                let ItemContent::Command { output, .. } = &adapter.active_items[&key].content else { panic!("command output"); };
+                assert_eq!(output, expected, "{snapshot} snapshot must seed its own terminal continuation, not the old stream or default grammar");
+            }
+        }
+    }
+
+    #[test]
+    fn small_marker_budgets_still_retain_the_latest_complete_utf8_tail() {
+        let source = format!("first🦀\n{}LAST🦀\n", "numbered🦀\n".repeat(100));
+        for limit in 64..=96 {
+            let mut output = String::new();
+            let mut window = OutputWindow::default();
+            append_display_output(&mut output, &source, limit, &mut window);
+            assert!(output.len() <= limit);
+            assert!(output.ends_with("LAST🦀\n"), "a {limit}-byte window has room for its marker and newest line");
+            let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+            assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        }
+    }
+
     #[test]
     fn repeated_native_started_replaces_clipped_window_and_partial_decoder_together() {
         for whole_turn in [false, true] {
