@@ -8666,6 +8666,238 @@ mod tests {
         assert_eq!(blocks.last().unwrap().1.as_ref(), "Current failure");
     }
 
+    fn web_search_selection_fixture() -> (Runtime, Arc<ClientHandle>, chat::Item, String) {
+        let query = "search query";
+        let title = "Search title";
+        let url = "https://example.test/source#L22";
+        let snippet = format!(
+            "{}WEB_SEARCH_FIND_NEEDLE",
+            "literal α é excerpt ".repeat(2000)
+        );
+        assert!(
+            query.len() + title.len() + url.len() + snippet.len() < 64 * 1024,
+            "public stored metadata fixture remains below the Store shrink threshold"
+        );
+        let item = chat::Item {
+            id: "web-search".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::WebSearch {
+                query: query.into(),
+                results: vec![chat::SearchResult {
+                    title: title.into(),
+                    url: url.into(),
+                    snippet: snippet.clone(),
+                }],
+            },
+            at: None,
+            started_at: None,
+        };
+        let expected = [query, title, url, snippet.as_str()].join("\n\n");
+        let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+        (runtime, handle, item, expected)
+    }
+
+    fn copy_web_search_native(select_all: bool) {
+        use iced::advanced::{
+            layout,
+            widget::{Operation, Tree},
+        };
+        let (runtime, _handle, item, expected) = web_search_selection_fixture();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let key = runtime.turns[0].key.clone();
+        runtime.opened.insert(key, true);
+        let (catalog, bookmark) = runtime.selection_document();
+        let content = runtime.step_detail(
+            &item,
+            &runtime.cache[&item.id],
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        );
+        let mut element =
+            selection::transcript_virtualized(content, target, None, catalog, bookmark);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100_000.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        runtime.cache[&item.id].flow_cache.complete_fixture();
+        node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        #[derive(Default)]
+        struct TextBounds(Vec<(Arc<str>, iced::Rectangle)>);
+        impl Operation for TextBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                    self.0.push((prose.plain.clone(), bounds));
+                }
+            }
+        }
+        let mut bounds = TextBounds::default();
+        element.as_widget_mut().operate(
+            &mut tree,
+            iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut bounds,
+        );
+        assert_eq!(bounds.0.first().unwrap().0.as_ref(), "search query");
+        assert!(
+            bounds
+                .0
+                .last()
+                .unwrap()
+                .0
+                .ends_with("WEB_SEARCH_FIND_NEEDLE")
+        );
+        #[derive(Default)]
+        struct ClipboardText(String);
+        impl iced::advanced::Clipboard for ClipboardText {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, text: String) {
+                self.0 = text;
+            }
+        }
+        let first = bounds.0.first().unwrap().1;
+        let last = bounds.0.last().unwrap().1;
+        let start = iced::Point::new(first.x, first.y + 3.0);
+        let end = if select_all {
+            start
+        } else {
+            iced::Point::new(last.x + last.width + 5.0, last.y + last.height + 1.0)
+        };
+        let mut events = vec![(
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            start,
+        )];
+        if !select_all {
+            events.push((
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: end }),
+                end,
+            ));
+        }
+        events.push((
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            end,
+        ));
+        for key in if select_all {
+            vec!["a", "c"]
+        } else {
+            vec!["c"]
+        } {
+            events.push((
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(key.into()),
+                    modified_key: keyboard::Key::Character(key.into()),
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                }),
+                end,
+            ));
+        }
+        let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 100_000.0));
+        let mut clipboard = ClipboardText::default();
+        for (event, point) in events {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert_eq!(
+            clipboard.0, expected,
+            "actual native WebSearch selection copies query/title/URL/snippet in visible source order through the Runtime Catalog"
+        );
+    }
+
+    #[test]
+    fn native_web_search_ctrl_a_copy_keeps_all_visible_literal_fields() {
+        copy_web_search_native(true);
+    }
+
+    #[test]
+    fn native_web_search_drag_copy_keeps_visible_field_boundaries() {
+        copy_web_search_native(false);
+    }
+
+    #[test]
+    fn actual_web_search_find_indexes_visible_result_snippet() {
+        use iced::futures::StreamExt;
+        let (runtime, _handle, item, _) = web_search_selection_fixture();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "WEB_SEARCH_FIND_NEEDLE".into(),
+        ));
+        drop(app.handle_chat_ui(Action::FindNext(target, true)));
+        let task = app.resume_current_find(target, false);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = executor.block_on(async {
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("actual prepared Catalog Find task");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                        action @ Action::FindIndexed(..),
+                    ))) = effect
+                    {
+                        return action;
+                    }
+                }
+                panic!("actual Catalog worker reply");
+            })
+            .await
+            .unwrap()
+        });
+        drop(app.handle_chat_ui(reply));
+        let hit = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .find_navigation
+            .current_hit();
+        assert!(
+            hit.is_some_and(|(id, _, _)| id == item.id),
+            "actual admitted WebSearch Find locates the visible snippet through its prepared Runtime Catalog"
+        );
+    }
+
     #[test]
     fn queued_and_notice_widgets_copy_through_logical_catalog() {
         use iced::advanced::{
