@@ -25399,6 +25399,183 @@ mod tests {
     }
 
     #[test]
+    fn amend_actual_read_task_pins_head_and_preserves_later_parked_editor_selection() {
+        use cosmic::iced::widget::text_editor::{Action, Cursor, Edit, Position};
+
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "Pinned subject\n\nPinned body",
+        ]);
+        let pinned =
+            crate::repository::Oid::parse_object(git(&["rev-parse", "HEAD"]).trim()).unwrap();
+        let original_message = git(&[
+            "show",
+            "--no-patch",
+            "--format=format:%B",
+            pinned.as_str(),
+            "--",
+        ]);
+        let root = directory.path().canonicalize().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_model.projects[0].worktrees[0].path = root.clone();
+        let key = app.sidebar_model.source_control.as_mut().unwrap();
+        key.key.canonical_path = root.clone();
+        key.head_oid = Some(pinned.as_str().into());
+        let key = key.key.clone();
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: root.clone()
+            },
+        ));
+        app.active_workspace = Some(root);
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Draft subject\n\nDraft body".into(),
+            })),
+        );
+
+        // Keep the real action's task unpolled until HEAD and the draft change.
+        // The worker must still read the captured object, not the new HEAD.
+        let read = app.update(Message::Sidebar(SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        }));
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        assert_eq!(app.sidebar_state.amend_target(), Some(pinned.clone()));
+        assert!(app.sidebar_state.take_amend_request(&key).is_none());
+        git(&[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "New HEAD must not be read",
+        ]);
+        assert_ne!(git(&["rev-parse", "HEAD"]).trim(), pinned.as_str());
+        let start = Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        };
+        for action in [
+            SidebarAction::CommitSubjectEditorCursor {
+                key: key.clone(),
+                cursor: start,
+            },
+            SidebarAction::CommitEditorCursor {
+                key: key.clone(),
+                cursor: start,
+            },
+        ] {
+            drop(app.update(Message::Sidebar(action)));
+        }
+        for action in [
+            SidebarAction::CommitSubjectEditorAction {
+                key: key.clone(),
+                action: Action::Edit(Edit::Paste(Arc::new("Later ".into()))),
+            },
+            SidebarAction::CommitEditorAction {
+                key: key.clone(),
+                action: Action::Edit(Edit::Paste(Arc::new("Later ".into()))),
+            },
+        ] {
+            drop(app.update(Message::Sidebar(action)));
+        }
+        let cursor = Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 1 }),
+        };
+        for action in [
+            SidebarAction::CommitSubjectEditorCursor {
+                key: key.clone(),
+                cursor,
+            },
+            SidebarAction::CommitEditorCursor {
+                key: key.clone(),
+                cursor,
+            },
+        ] {
+            drop(app.update(Message::Sidebar(action)));
+        }
+        let later_message = app.sidebar_state.commit_message().to_owned();
+        assert!(later_message.starts_with("Later Draft subject\n\nLater Draft body"));
+        sidebar::tests::assert_commit_editor_selection(
+            &app.sidebar_state,
+            cursor,
+            "Later Draft subject",
+            "Later Draft body",
+        );
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: "/repo/fix-sidebar".into()
+            },
+        ));
+        // A parked callback must settle its owning draft without touching this one.
+        let source = app.sidebar_model.source_control.take();
+        let sibling = app.sidebar_state.active_worktree().unwrap().clone();
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key: sibling,
+                message: "Sibling draft".into(),
+            });
+        let completed = task_app_message(read);
+        match &completed {
+            Message::SourceControlAmendMessage {
+                key: actual_key,
+                revision: actual_revision,
+                head,
+                result: Ok(message),
+            } => {
+                assert_eq!(actual_key, &key);
+                assert_eq!(*actual_revision, revision);
+                assert_eq!(head, &pinned);
+                assert_eq!(
+                    message, &original_message,
+                    "actual worker reads the pinned Git object"
+                );
+            }
+            _ => panic!("actual Amend action must return a successful worker read"),
+        }
+        drop(app.update(completed));
+        assert_eq!(app.sidebar_state.commit_message(), "Sibling draft");
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: key.canonical_path.clone()
+            },
+        ));
+        app.sidebar_model.source_control = source;
+        assert_eq!(app.sidebar_state.commit_message(), later_message);
+        assert_eq!(app.sidebar_state.amend_target(), Some(pinned));
+        sidebar::tests::assert_commit_editor_selection(
+            &app.sidebar_state,
+            cursor,
+            "Later Draft subject",
+            "Later Draft body",
+        );
+    }
+
+    #[test]
     fn amend_parked_read_failure_returns_with_its_own_visible_retry_hint() {
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();

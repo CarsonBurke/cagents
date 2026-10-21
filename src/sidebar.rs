@@ -16771,6 +16771,26 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn assert_commit_editor_selection(
+        state: &SidebarState,
+        cursor: cosmic::iced::widget::text_editor::Cursor,
+        subject: &str,
+        body: &str,
+    ) {
+        for (actual, text) in [
+            (&state.commit_draft.subject_composer.0, subject),
+            (&state.commit_draft.composer.0, body),
+        ] {
+            let mut expected =
+                cosmic::iced::widget::text_editor::Content::<cosmic::Renderer>::with_text(text);
+            expected.move_to(cursor);
+            assert_eq!(actual.text().trim_end_matches('\n'), text);
+            assert_eq!(actual.cursor(), cursor);
+            assert!(actual.selection().is_some());
+            assert_eq!(actual.selection(), expected.selection());
+        }
+    }
+
     /// A pane bound to `main` with every panel section open.
     pub(crate) fn panel_state(model: &SidebarModel) -> SidebarState {
         let mut state = SidebarState::default();
