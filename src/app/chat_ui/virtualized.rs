@@ -406,7 +406,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 let mut node = element.as_widget_mut().layout(
                     &mut child,
                     renderer,
-                    &layout::Limits::new(Size::ZERO, child_max),
+                    // Match an intrinsic iced Column/Row: fluid descendants
+                    // shrink on unbounded axes. Activity rails inherit Fill
+                    // height, so discarding this compression makes them grow
+                    // to infinity when a Find-expanded tool has no height cap.
+                    &layout::Limits::with_compression(
+                        Size::ZERO,
+                        child_max,
+                        Size::new(
+                            limits.compression().width || !child_max.width.is_finite(),
+                            true,
+                        ),
+                    ),
                 );
                 let height = self.axis.main(node.size());
                 changed |= (height - state.offsets.values[index]).abs() > 0.5;
@@ -893,6 +904,52 @@ mod tests {
                 offsets.partition_point(|offset| *offset <= top)
             );
         }
+    }
+
+    #[test]
+    fn intrinsic_rows_keep_fill_height_activity_rails_finite_in_an_unbounded_parent() {
+        fn activity() -> Element<'static, Message> {
+            widget::row::with_children(vec![
+                widget::container(widget::Space::new().height(Length::Fill))
+                    .width(1)
+                    .height(Length::Fill)
+                    .into(),
+                widget::column::with_children(vec![
+                    widget::Space::new().height(25).width(100).into(),
+                    widget::Space::new().height(40).width(100).into(),
+                ])
+                .into(),
+            ])
+            .into()
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut ordinary: Element<'_, Message> = widget::column::with_children(vec![activity()])
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .into();
+        let mut tree = Tree::new(&ordinary);
+        let expected = ordinary
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(expected.size().height.is_finite());
+        let mut virtualized = column(
+            vec![Row::new(1, 1, 65.0, None, activity)],
+            Default::default(),
+        );
+        let mut tree = Tree::new(&virtualized);
+        let actual = virtualized
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            actual.size().height.is_finite(),
+            "intrinsic virtual rows must not expand activity rails to infinite height"
+        );
+        assert_eq!(
+            actual.size(),
+            expected.size(),
+            "same finite native intrinsic layout"
+        );
     }
 
     #[test]

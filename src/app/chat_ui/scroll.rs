@@ -281,6 +281,17 @@ pub(super) struct LogicalLocation {
     horizontal: Vec<(Id, f32)>,
 }
 
+impl LogicalLocation {
+    fn finite(&self) -> bool {
+        self.offset.is_finite() && self.horizontal.iter().all(|(_, offset)| offset.is_finite())
+    }
+}
+fn finite_bounds(bounds: Rectangle) -> bool {
+    [bounds.x, bounds.y, bounds.width, bounds.height]
+        .into_iter()
+        .all(f32::is_finite)
+}
+
 /// Widget operations visit every mounted card. Only descendants of the
 /// requested transcript may supply geometry or receive reader corrections.
 #[derive(Default)]
@@ -330,6 +341,9 @@ struct LocateLogical {
 }
 impl LocateLogical {
     fn candidate(&mut self, bounds: Rectangle, stage: u8) {
+        if !finite_bounds(bounds) {
+            return;
+        }
         if self
             .found
             .as_ref()
@@ -422,18 +436,22 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         }
     }
     fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
-        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).map(
+        operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).and_then(
             |((content, viewport), (found, stage))| {
+                if !finite_bounds(content) || !finite_bounds(viewport) {
+                    return None;
+                }
                 let travel = (content.height - viewport.height).max(0.0);
                 let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0)
                     .clamp(0.0, travel);
-                LogicalLocation {
+                let location = LogicalLocation {
                     offset: travel - from_top,
                     exact: stage == 3 && self.shape_pending.is_none(),
                     stage,
                     shape_pending: self.shape_pending,
                     horizontal: self.horizontal.clone(),
-                }
+                };
+                location.finite().then_some(location)
             },
         ))
     }
@@ -478,10 +496,11 @@ struct ApplyFind {
 }
 impl ApplyFind {
     fn current(&self) -> bool {
-        self.document.map_or_else(
-            || self.intent.current(),
-            |epoch| self.intent.document_current(epoch),
-        )
+        self.location.finite()
+            && self.document.map_or_else(
+                || self.intent.current(),
+                |epoch| self.intent.document_current(epoch),
+            )
     }
 }
 impl<T: 'static> Operation<T> for ApplyFind {
@@ -602,6 +621,9 @@ pub(super) fn find_anchor(
             else {
                 return operation::Outcome::None;
             };
+            if !finite_bounds(content) || !finite_bounds(viewport) || !finite_bounds(found) {
+                return operation::Outcome::None;
+            }
             let travel = (content.height - viewport.height).max(0.0);
             operation::Outcome::Chain(Box::new(ApplyFind {
                 target: self.target,
@@ -1718,6 +1740,18 @@ mod tests {
             None,
             None,
         );
+        let owned_horizontal_id = block_id(wanted, None, identity);
+        let wanted_body: Element<'_, Message> =
+            widget::scrollable(widget::row::with_children(vec![
+                widget::Space::new().width(1500).into(),
+                wanted_body,
+            ]))
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .id(owned_horizontal_id.clone())
+            .width(Length::Fill)
+            .into();
         let neighbor_body = widget::scrollable(widget::row::with_children(vec![
             widget::Space::new().width(3000).into(),
             selectable_prose::logical_text(
@@ -1777,7 +1811,10 @@ mod tests {
             "an unrelated mounted exact glyph cannot replace the wanted virtual descriptor"
         );
         assert!(
-            location.horizontal.is_empty(),
+            location
+                .horizontal
+                .iter()
+                .all(|(id, _)| *id != horizontal_id),
             "neighbor reader IDs never enter the wanted result"
         );
         let mut before = Offsets::default();
@@ -1939,6 +1976,56 @@ mod tests {
             "a stale-generation coarse anchor cannot queue a scroll correction"
         );
         executor.shutdown_background();
+        for (offset, horizontal) in [
+            (f32::INFINITY, None),
+            (f32::NEG_INFINITY, None),
+            (f32::NAN, None),
+            (0.0, Some(f32::INFINITY)),
+            (0.0, Some(f32::NEG_INFINITY)),
+            (0.0, Some(f32::NAN)),
+        ] {
+            let mut invalid = ApplyFind {
+                target: wanted,
+                scope: TranscriptScope::default(),
+                scroll: card_control_id(wanted.card, "chat-transcript"),
+                location: LogicalLocation {
+                    offset,
+                    exact: false,
+                    stage: 0,
+                    shape_pending: None,
+                    horizontal: horizontal
+                        .map(|x| vec![(owned_horizontal_id.clone(), x)])
+                        .unwrap_or_default(),
+                },
+                intent: wanted_state.guard(),
+                document: Some(wanted_state.document_epoch()),
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut invalid);
+            let mut rejected = Offsets::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut rejected,
+            );
+            assert_eq!(
+                after.0, rejected.0,
+                "nonfinite Find offsets cannot mutate a native reader"
+            );
+            let mut marker = FindCorrection {
+                target: Some(wanted),
+                corrected: false,
+            };
+            <ApplyFind as Operation<()>>::custom(
+                &mut invalid,
+                None,
+                Rectangle::default(),
+                &mut marker,
+            );
+            assert!(!marker.corrected);
+        }
     }
 
     #[test]
@@ -2537,11 +2624,31 @@ mod tests {
             &bounds,
         );
         assert!(
+            messages.is_empty(),
+            "leaving the end updates direct observations without paging"
+        );
+        assert!(
+            !observations.borrow()[&None].at_bottom(),
+            "the real wheel moved away from the end"
+        );
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
             messages.iter().any(|message| matches!(
                 message,
                 Message::ChatUi(Action::Scrolled(_, None, _, true))
             )),
-            "user navigation still drives paging"
+            "wheel navigation toward the history edge still drives paging"
         );
     }
 
