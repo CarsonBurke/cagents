@@ -39,6 +39,23 @@ impl State {
     pub(super) fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    #[cfg(test)]
+    pub(super) fn diagnostic(&self) -> String {
+        self.pending.as_ref().map_or_else(
+            || "complete".into(),
+            |pending| {
+                format!(
+                    "key={:?}, indexed={}, in_flight={}, wait_for_shape={}, passes={}, previous={:?}",
+                    pending.key,
+                    pending.hit.is_some(),
+                    pending.in_flight,
+                    pending.wait_for_shape,
+                    pending.passes,
+                    pending.previous,
+                )
+            },
+        )
+    }
     pub(super) fn cancel(&mut self) {
         self.clock.fetch_add(1, Ordering::AcqRel);
         self.pending = None;

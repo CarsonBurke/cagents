@@ -598,7 +598,7 @@ fn available() -> &'static tokio::sync::watch::Sender<u64> {
 pub(super) fn availability() -> Subscription<Message> {
     Subscription::run(availability_stream)
 }
-fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
+pub(super) fn availability_stream() -> impl iced::futures::Stream<Item = Message> + Send {
     iced::futures::stream::unfold(
         (available().subscribe(), true),
         |(mut receiver, initial)| async move {

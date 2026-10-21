@@ -6161,7 +6161,7 @@ mod tests {
             Layout, Shell, layout, mouse,
             widget::{Operation, Tree, operation},
         };
-        use iced::futures::{StreamExt, stream::BoxStream};
+        use iced::futures::{FutureExt, StreamExt, stream::BoxStream};
         type Effect = iced::runtime::Action<cosmic::Action<Message>>;
         struct Visible {
             identity: u64,
@@ -6170,6 +6170,7 @@ mod tests {
             pending: Option<(iced::Vector, iced::Rectangle)>,
             clips: Vec<iced::Rectangle>,
             found: bool,
+            sample: Option<(iced::Rectangle, Vec<iced::Rectangle>)>,
         }
         impl Operation for Visible {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -6216,6 +6217,7 @@ mod tests {
                         y: bounds.y + local.y - self.translation.y,
                         ..local
                     };
+                    self.sample = Some((glyph, self.clips.clone()));
                     self.found |= !self.clips.is_empty()
                         && self
                             .clips
@@ -6326,6 +6328,16 @@ mod tests {
             let (runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
             let target = runtime.target;
             let mut app = crate::app::tests::context_inspector_test_app(false);
+            // Native navigation mutations require an authoritative open card,
+            // in addition to its live runtime. Exercise that admission guard.
+            let mut card = crate::app::tests::terminal_card_state();
+            card.id = target.card;
+            card.generation = target.generation;
+            card.kind = CardKind::Chat(runtime.session.clone());
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.push(card);
+            durable.focused = Some(target.card);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
             app.cards
                 .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
             if child {
@@ -6342,35 +6354,71 @@ mod tests {
                 preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
             }
             let mut streams = Vec::new();
+            let mut availability = Box::pin(flow_layout::availability_stream());
             push(
                 &mut streams,
                 app.handle_chat_ui(Action::Find(target, needle.into())),
             );
             let identity = selection::logical_identity(&item.id, &path);
+            let (catalog, _) = app.chat_runtime_mut(target).unwrap().selection_document();
+            let actual = catalog
+                .owned_search_blocks(&HashSet::from([item.id.clone()]))
+                .into_iter()
+                .find(|(_, _, text)| text.contains(needle))
+                .expect("actual prepared source catalog includes the deep needle");
+            assert_eq!(actual.1, identity, "fixture logical path {path:?}");
+            assert_eq!(actual.2.find(needle), Some(byte), "fixture logical byte");
             let mut tree = Tree::empty();
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
             let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut seen = false;
             let mut passes = 0;
-            while Instant::now() < deadline && passes < 1_000 {
+            let mut last_geometry = None;
+            let mut locations = std::collections::VecDeque::new();
+            while Instant::now() < deadline {
                 passes += 1;
                 let mut effects = Vec::new();
                 executor.block_on(async {
-                    for stream in &mut streams {
+                    let mut index = 0;
+                    while index < streams.len() {
+                        let mut finished = false;
                         for _ in 0..8 {
-                            match tokio::time::timeout(Duration::from_millis(1), stream.next())
-                                .await
+                            match tokio::time::timeout(
+                                Duration::from_millis(1),
+                                streams[index].next(),
+                            )
+                            .await
                             {
                                 Ok(Some(effect)) => effects.push(effect),
-                                _ => break,
+                                Ok(None) => {
+                                    finished = true;
+                                    break;
+                                }
+                                Err(_) => break,
                             }
                         }
+                        if finished {
+                            drop(streams.remove(index));
+                        } else {
+                            index += 1;
+                        }
                     }
+                    // Drive the same coalesced current-state/change stream as
+                    // the native subscription, after actual permit release.
+                    if let Some(Some(message)) = availability.next().now_or_never() {
+                        effects.push(iced::runtime::Action::Output(cosmic::Action::App(message)));
+                    }
+                    // A native redraw is paced by the event loop. Keep this
+                    // fixture from exhausting a synthetic iteration cap while
+                    // real full-context shaping is still running off-thread.
+                    tokio::time::sleep(Duration::from_millis(16)).await;
                 });
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 let mut element = view(runtime, &shortcuts);
-                element.as_widget_mut().diff(&mut tree);
+                // Match the native runtime: initialize/reconcile the root tag
+                // and state before diffing its children or delivering events.
+                tree.diff(element.as_widget_mut());
                 let mut node = element
                     .as_widget_mut()
                     .layout(&mut tree, &renderer, &limits);
@@ -6419,6 +6467,7 @@ mod tests {
                     pending: None,
                     clips: Vec::new(),
                     found: false,
+                    sample: None,
                 };
                 element.as_widget_mut().operate(
                     &mut tree,
@@ -6427,15 +6476,18 @@ mod tests {
                     &mut visible,
                 );
                 let pending = runtime.find_navigation.pending();
+                if visible.sample.is_some() {
+                    last_geometry = visible.sample;
+                }
                 drop(element);
                 for message in messages {
-                    let completed = matches!(&message, Message::ChatUi(Action::FlowReady(..)));
-                    push(&mut streams, app.update(message));
-                    // Deliver the production availability event after a real
-                    // FlowReady releases its actual output admission.
-                    if completed {
-                        push(&mut streams, app.handle_chat_ui(Action::FlowAvailable));
+                    if let Message::ChatUi(Action::FindLocated(_, _, _, location)) = &message {
+                        if locations.len() == 16 {
+                            locations.pop_front();
+                        }
+                        locations.push_back(location.clone());
                     }
+                    push(&mut streams, app.update(message));
                 }
                 if !pending && visible.found {
                     seen = true;
@@ -6444,7 +6496,12 @@ mod tests {
             }
             assert!(
                 seen,
-                "actual Find action must expose the deep mounted glyph; child={child}, passes={passes}"
+                "actual Find action must expose the deep mounted glyph; child={child}, path={path:?}, byte={byte}, passes={passes}, streams={}, navigation={}, last_geometry={last_geometry:?}, locations={locations:?}",
+                streams.len(),
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .diagnostic(),
             );
             assert_eq!(
                 app.chat_runtime_mut(target).unwrap().find_matches.len(),
