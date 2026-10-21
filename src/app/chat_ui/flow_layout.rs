@@ -71,9 +71,70 @@ struct Key {
 }
 
 #[derive(Clone)]
-enum Source {
+struct Source(Arc<SourceOwner>);
+struct SourceOwner(Option<RawSource>);
+impl Drop for SourceOwner {
+    fn drop(&mut self) {
+        if let Some(source) = self.0.take() {
+            preparation::retire_flow_source(source);
+        }
+    }
+}
+impl std::ops::Deref for Source {
+    type Target = SourceData;
+    fn deref(&self) -> &SourceData {
+        self.0
+            .0
+            .as_ref()
+            .expect("live Flow owner")
+            .data
+            .as_ref()
+            .expect("live Flow source")
+    }
+}
+impl Source {
+    fn new(data: SourceData) -> Self {
+        Self(Arc::new(SourceOwner(Some(RawSource {
+            data: Some(data),
+            #[cfg(test)]
+            disposed: None,
+        }))))
+    }
+    #[cfg(test)]
+    fn watch_disposal(
+        &mut self,
+        disposed: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+    ) {
+        Arc::get_mut(&mut self.0)
+            .expect("observe before cloning source")
+            .0
+            .as_mut()
+            .unwrap()
+            .disposed = Some(disposed);
+    }
+}
+/// Raw Send payload, destroyed inline by the reclaimer. In particular, it
+/// never queues a second retirement behind an already waiting FIFO barrier.
+pub(super) struct RawSource {
+    data: Option<SourceData>,
+    #[cfg(test)]
+    disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
+}
+impl Drop for RawSource {
+    fn drop(&mut self) {
+        let source = self.data.take().expect("owned Flow source");
+        #[cfg(test)]
+        let bytes = source.len();
+        drop(source);
+        #[cfg(test)]
+        if let Some(disposed) = self.disposed.take() {
+            let _ = disposed.send((std::thread::current().id(), bytes));
+        }
+    }
+}
+enum SourceData {
     Markdown {
-        text: markdown::Text,
+        text: markdown::FlowText,
         style: markdown::Style,
     },
     Code {
@@ -85,7 +146,14 @@ enum Source {
     },
     Styled(Arc<[Span<'static, String>]>),
 }
-impl Source {
+// Requests and Action clones share immutable backing with one final-owner
+// retirement. No unsafe Sync assertion and no UI/materialization mutex.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Source>();
+    send_sync::<Request>();
+};
+impl SourceData {
     fn len(&self) -> usize {
         match self {
             Self::Markdown { text, .. } => text.len(),
@@ -179,7 +247,7 @@ impl Source {
 impl Cache {
     #[cfg(test)]
     pub(super) fn entry(&self, identity: u64, spans: Arc<[Span<'static, String>]>) -> Handle {
-        self.source_entry(identity, Source::Styled(spans))
+        self.source_entry(identity, SourceData::Styled(spans))
     }
     pub(super) fn markdown_entry(
         &self,
@@ -187,7 +255,13 @@ impl Cache {
         text: markdown::Text,
         style: markdown::Style,
     ) -> Handle {
-        self.source_entry(identity, Source::Markdown { text, style })
+        self.source_entry(
+            identity,
+            SourceData::Markdown {
+                text: text.flow_source(),
+                style,
+            },
+        )
     }
     pub(super) fn code_entry(
         &self,
@@ -200,7 +274,7 @@ impl Cache {
     ) -> Handle {
         self.source_entry(
             identity,
-            Source::Code {
+            SourceData::Code {
                 text,
                 range,
                 spans,
@@ -209,7 +283,7 @@ impl Cache {
             },
         )
     }
-    fn source_entry(&self, identity: u64, source: Source) -> Handle {
+    fn source_entry(&self, identity: u64, source: SourceData) -> Handle {
         let mut entries = self.0.borrow_mut();
         if let Some(entry) = entries
             .logical
@@ -225,7 +299,7 @@ impl Cache {
                     current.source_len = length;
                     current.failed = false;
                 }
-                current.source = source;
+                current.source = Source::new(source);
                 drop(current);
                 return entry;
             }
@@ -235,7 +309,7 @@ impl Cache {
         let entry = Rc::new(RefCell::new(Entry {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             target: None,
-            source,
+            source: Source::new(source),
             source_len,
             source_revision: 0,
             ready_revision: None,
@@ -1891,6 +1965,175 @@ fn last_geometry_owner_retires_off_thread_after_widget_and_cache_release() {
         weak_plain.upgrade().is_none(),
         "retirement releases the actual source owner"
     );
+}
+
+#[test]
+fn last_flow_entry_request_and_action_retire_real_raw_spans_after_canonical_and_document_owners() {
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    for final_owner in 0..3 {
+        let (sent, disposed) = std::sync::mpsc::channel();
+        let (canonical, document, bytes, expected, styled) = std::thread::spawn(move || {
+            let mut canonical = markdown::Content::parse(
+                &"**bold λ** [linked](https://example.test/source) é ".repeat(5000),
+            );
+            canonical.discard_continuation();
+            let bytes = canonical.watch_first_raw_spans(sent);
+            let [markdown::Item::Paragraph(text)] = canonical.items() else {
+                panic!("one actual rich paragraph")
+            };
+            let expected = text.plain();
+            text.plain_prefixes();
+            let styled = text.spans(style);
+            let document = prose_document::Data::snapshot(&canonical);
+            (canonical, document, bytes, expected, styled)
+        })
+        .join()
+        .unwrap();
+        assert!(bytes > 64 * 1024);
+        let document = prose_document::Document::new(document);
+        let [markdown::Item::Paragraph(text)] = canonical.items() else {
+            unreachable!()
+        };
+        let before = markdown::materialized_bytes();
+        let cache = Cache::default();
+        let entry = cache.markdown_entry(91, text.clone(), style);
+        assert_eq!(
+            markdown::materialized_bytes(),
+            before,
+            "Flow capture never materializes full source on UI"
+        );
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        entry.borrow_mut().bind_target(target);
+        entry
+            .borrow_mut()
+            .configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+        let request = entry.borrow_mut().request().unwrap();
+        let shared = request.source.clone();
+        let (actual_styled, actual_plain) = std::thread::spawn(move || shared.materialize())
+            .join()
+            .unwrap();
+        assert_eq!(actual_plain.as_ref(), expected.as_ref());
+        assert!(
+            Arc::ptr_eq(&actual_styled, &styled),
+            "exact primed rich style and source metadata are shared"
+        );
+        let weak_plain = Arc::downgrade(&actual_plain);
+        let weak_styled = Arc::downgrade(&actual_styled);
+        drop((expected, styled, actual_styled, actual_plain));
+        let mut entry = Some(entry);
+        let mut request = Some(request);
+        let mut action = Some(Action::FlowReady(
+            target,
+            request.as_ref().unwrap().clone(),
+            None,
+        ));
+        preparation::retire_presentation(preparation::Presentation {
+            parsed: preparation::Parsed {
+                source: Default::default(),
+                markdown: canonical,
+            },
+            blocks: Default::default(),
+            palettes: None,
+            item: None,
+            prepared_tools: None,
+        });
+        drop(document);
+        preparation::retirement_barrier();
+        assert!(
+            disposed.try_recv().is_err(),
+            "the real raw span Vec outlives canonical and document batches"
+        );
+        match final_owner {
+            0 => {
+                drop(request.take());
+                drop(action.take());
+            }
+            1 => {
+                drop(entry.take());
+                drop(action.take());
+            }
+            _ => {
+                drop(entry.take());
+                drop(request.take());
+            }
+        }
+        preparation::retirement_barrier();
+        assert!(
+            disposed.try_recv().is_err(),
+            "the remaining actual Entry, Request or queued Action owns the raw spans"
+        );
+        let release = preparation::hold_retirement();
+        drop((entry, request, action));
+        assert!(
+            disposed.try_recv().is_err(),
+            "final Flow source release transfers actual raw spans instead of destructing them on UI"
+        );
+        release.send(()).unwrap();
+        let reclaimer = preparation::retirement_barrier();
+        let (thread, actual_bytes) = disposed
+            .try_recv()
+            .expect("raw span Vec and owned Strings destroyed before barrier");
+        assert_eq!(actual_bytes, bytes);
+        assert_eq!(thread, reclaimer);
+        assert_ne!(thread, std::thread::current().id());
+        assert!(
+            weak_plain.upgrade().is_none() && weak_styled.upgrade().is_none(),
+            "all primed source/style backing is released with the same raw owner"
+        );
+    }
+}
+
+#[test]
+fn code_and_styled_flow_sources_share_one_final_retirement_across_request_clones() {
+    for code in [false, true] {
+        let text: Arc<str> = "actual original λ é\n".repeat(5000).into();
+        let spans: Arc<[Span<'static, String>]> = vec![
+            Span::new(text.to_string())
+                .link("https://example.test/source".to_owned())
+                .strikethrough(true),
+        ]
+        .into();
+        let weak_text = Arc::downgrade(&text);
+        let weak_spans = Arc::downgrade(&spans);
+        let source = if code {
+            SourceData::Code {
+                text: text.clone(),
+                range: 0..text.len(),
+                spans: spans.clone(),
+                starts: Arc::from([0]),
+                source: reader_source::Source::new(&text),
+            }
+        } else {
+            SourceData::Styled(spans.clone())
+        };
+        let cache = Cache::default();
+        let entry = cache.source_entry(71, source);
+        let (sent, disposed) = std::sync::mpsc::channel();
+        entry.borrow_mut().source.watch_disposal(sent);
+        entry
+            .borrow_mut()
+            .configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+        let request = entry.borrow_mut().request().unwrap();
+        let last = request.clone();
+        assert!(Arc::ptr_eq(&request.source.0, &last.source.0));
+        let bytes = request.source.len();
+        drop((text, spans, entry, request));
+        preparation::retirement_barrier();
+        assert!(disposed.try_recv().is_err());
+        let release = preparation::hold_retirement();
+        drop(last);
+        assert!(
+            disposed.try_recv().is_err(),
+            "Code and Styled last clones transfer their actual variable-size source backing"
+        );
+        release.send(()).unwrap();
+        let reclaimer = preparation::retirement_barrier();
+        assert_eq!(disposed.try_recv().unwrap(), (reclaimer, bytes));
+        assert!(weak_text.upgrade().is_none() && weak_spans.upgrade().is_none());
+    }
 }
 
 #[test]

@@ -691,6 +691,7 @@ pub(super) struct Presentation {
 }
 
 enum Retirement {
+    FlowSource(flow_layout::RawSource),
     Document(prose_document::Data),
     Coordination(coordination::Prepared),
     Styles(HashMap<u64, prose::CodeBlock>, Option<prose::Palettes>),
@@ -703,6 +704,9 @@ enum Retirement {
     Barrier(std::sync::mpsc::Sender<std::thread::ThreadId>),
     #[cfg(test)]
     Hold(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>),
+}
+pub(super) fn retire_flow_source(source: flow_layout::RawSource) {
+    enqueue_retirement(Retirement::FlowSource(source));
 }
 pub(super) fn retire_styles(
     blocks: HashMap<u64, prose::CodeBlock>,
@@ -754,6 +758,7 @@ fn enqueue_retirement(retired: Retirement) {
                 pending.pop_front().expect("queued retirement")
             };
             match retired {
+                Retirement::FlowSource(source) => drop(source),
                 Retirement::Document(document) => drop(document),
                 Retirement::Coordination(prepared) => drop(prepared),
                 Retirement::Styles(blocks, palettes) => { drop(blocks); drop(palettes); }

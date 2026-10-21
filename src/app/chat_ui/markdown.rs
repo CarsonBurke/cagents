@@ -365,6 +365,18 @@ impl Content {
     ) {
         self.disposal = Some(Arc::new(Disposal(sender)));
     }
+
+    #[cfg(test)]
+    pub(super) fn watch_first_raw_spans(
+        &mut self,
+        disposed: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+    ) -> usize {
+        let Some(Item::Paragraph(text)) = self.items.first_mut() else {
+            panic!("a real paragraph owns the observed raw spans")
+        };
+        text.watch_raw_spans(disposed);
+        text.len()
+    }
     #[cfg(test)]
     pub(super) fn reference_count(&self) -> usize {
         self.state.references.len()
@@ -607,7 +619,7 @@ pub(super) fn materialized_bytes() -> usize {
 /// A bunch of parsed Markdown text.
 #[derive(Debug, Clone)]
 pub struct Text {
-    spans: Arc<Vec<Span>>,
+    spans: Arc<Spans>,
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
     plain_source: std::cell::OnceCell<super::reader_source::Source>,
@@ -617,7 +629,119 @@ pub struct Text {
 }
 #[derive(Debug, Default)]
 struct StyledLineage {
-    edges: std::collections::VecDeque<(std::sync::Weak<Vec<Span>>, std::sync::Weak<Vec<Span>>)>,
+    edges: std::collections::VecDeque<(std::sync::Weak<Spans>, std::sync::Weak<Spans>)>,
+}
+
+#[derive(Debug)]
+struct Spans {
+    values: Vec<Span>,
+    #[cfg(test)]
+    disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
+}
+impl Clone for Spans {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            #[cfg(test)]
+            disposed: None,
+        }
+    }
+}
+impl std::ops::Deref for Spans {
+    type Target = Vec<Span>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl std::ops::DerefMut for Spans {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+#[cfg(test)]
+impl Drop for Spans {
+    fn drop(&mut self) {
+        let values = std::mem::take(&mut self.values);
+        let bytes = values.iter().map(|span| span.text().len()).sum();
+        // Observe the real raw span Vec and its owned Strings after disposal,
+        // not an unrelated token whose lifetime might end before the source.
+        drop(values);
+        if let Some(disposed) = self.disposed.take() {
+            let _ = disposed.send((std::thread::current().id(), bytes));
+        }
+    }
+}
+
+/// Immutable input for a shared Flow owner. UI-local Text cells never cross
+/// this boundary. Capture only existing backing, without plain/style work.
+pub(super) struct FlowText {
+    spans: Arc<Spans>,
+    starts: Arc<[usize]>,
+    plain: std::sync::OnceLock<Arc<str>>,
+    // Retain every source/cache owner until raw Flow retirement, including
+    // already-primed proof state and a cached style captured from the Text.
+    _plain_source: Option<super::reader_source::Source>,
+    style: Option<Style>,
+    styled: Arc<[text::Span<'static, Uri>]>,
+    lineage: Arc<std::sync::Mutex<StyledLineage>>,
+}
+impl FlowText {
+    pub(super) fn len(&self) -> usize {
+        self.starts.last().copied().unwrap_or_default()
+    }
+    pub(super) fn append_proven(&self, previous: &Self) -> bool {
+        append_proven(
+            &self.spans,
+            &previous.spans,
+            &self.lineage,
+            &previous.lineage,
+        )
+    }
+    pub(super) fn plain(&self) -> Arc<str> {
+        self.plain
+            .get_or_init(|| {
+                #[cfg(test)]
+                MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+                self.spans.iter().map(Span::text).collect::<String>().into()
+            })
+            .clone()
+    }
+    pub(super) fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
+        if self.style == Some(style) {
+            self.styled.clone()
+        } else {
+            #[cfg(test)]
+            MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
+            self.spans.iter().map(|span| span.view(&style)).collect()
+        }
+    }
+}
+
+fn append_proven(
+    spans: &Arc<Spans>,
+    previous: &Arc<Spans>,
+    lineage: &Arc<std::sync::Mutex<StyledLineage>>,
+    old_lineage: &Arc<std::sync::Mutex<StyledLineage>>,
+) -> bool {
+    if Arc::ptr_eq(spans, previous) {
+        return true;
+    }
+    if !Arc::ptr_eq(lineage, old_lineage) {
+        return false;
+    }
+    let mut cursor = Arc::downgrade(previous);
+    let target = Arc::downgrade(spans);
+    let lineage = lineage.lock().unwrap_or_else(|poison| poison.into_inner());
+    for (old, next) in &lineage.edges {
+        if !old.ptr_eq(&cursor) {
+            continue;
+        }
+        if next.ptr_eq(&target) {
+            return true;
+        }
+        cursor = next.clone();
+    }
+    false
 }
 
 impl Text {
@@ -628,7 +752,11 @@ impl Text {
             starts.push(starts.last().copied().unwrap() + span.text().len());
         }
         Self {
-            spans: spans.into(),
+            spans: Arc::new(Spans {
+                values: spans,
+                #[cfg(test)]
+                disposed: None,
+            }),
             starts: starts.into(),
             plain: std::cell::OnceCell::new(),
             plain_source: std::cell::OnceCell::new(),
@@ -664,7 +792,7 @@ impl Text {
         self.record_edge(previous);
     }
 
-    fn record_edge(&mut self, previous: std::sync::Weak<Vec<Span>>) {
+    fn record_edge(&mut self, previous: std::sync::Weak<Spans>) {
         let mut lineage = self
             .lineage
             .lock()
@@ -697,28 +825,36 @@ impl Text {
     /// records exact conservative proofs before publication; rewrites and
     /// Markdown reinterpretation establish a new lineage instead.
     pub fn append_proven(&self, previous: &Text) -> bool {
-        if Arc::ptr_eq(&self.spans, &previous.spans) {
-            return true;
+        append_proven(
+            &self.spans,
+            &previous.spans,
+            &self.lineage,
+            &previous.lineage,
+        )
+    }
+
+    pub(super) fn flow_source(&self) -> FlowText {
+        let plain = std::sync::OnceLock::new();
+        if let Some(ready) = self.plain.get() {
+            let _ = plain.set(ready.clone());
         }
-        if !Arc::ptr_eq(&self.lineage, &previous.lineage) {
-            return false;
+        FlowText {
+            spans: self.spans.clone(),
+            starts: self.starts.clone(),
+            plain,
+            _plain_source: self.plain_source.get().cloned(),
+            style: self.last_style.get(),
+            styled: self.last_styled_spans.borrow().clone(),
+            lineage: self.lineage.clone(),
         }
-        let mut cursor = Arc::downgrade(&previous.spans);
-        let target = Arc::downgrade(&self.spans);
-        let lineage = self
-            .lineage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        for (old, next) in &lineage.edges {
-            if !old.ptr_eq(&cursor) {
-                continue;
-            }
-            if next.ptr_eq(&target) {
-                return true;
-            }
-            cursor = next.clone();
-        }
-        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn watch_raw_spans(
+        &mut self,
+        disposed: std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>,
+    ) {
+        Arc::make_mut(&mut self.spans).disposed = Some(disposed);
     }
 
     /// Logical text without constructing styled presentation spans. Shared by
