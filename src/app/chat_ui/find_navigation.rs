@@ -828,7 +828,7 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
     let items = raw_items(runtime);
     RawStamp {
         context: runtime.selected_subagent.clone(),
-        provider: runtime.session.provider,
+        provider: runtime.session.launch.provider,
         handle: runtime
             .handle()
             .map(|handle| SourceProof(Arc::downgrade(handle))),
@@ -1609,7 +1609,7 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
     RawInput {
         query: runtime.find.clone().unwrap_or_default(),
         groups,
-        provider: runtime.session.provider,
+        provider: runtime.session.launch.provider,
     }
 }
 /// Aggregate source AND repeated query work, decided from lengths and bounded
@@ -2111,7 +2111,7 @@ mod tests {
             .unwrap()
             .clone();
         let old_epoch = old.query_epoch;
-        runtime.session.provider = Provider::Codex;
+        runtime.session.launch.provider = Provider::Codex;
         runtime.refresh_find_work();
         assert!(Arc::ptr_eq(&source, &runtime.snapshot.items[0]));
         assert_ne!(
