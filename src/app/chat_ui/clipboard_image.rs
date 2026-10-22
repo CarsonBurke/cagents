@@ -14,8 +14,9 @@ use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 /// extension; `save` checks the actual bytes before making an attachment.
 #[derive(Debug, Clone)]
 pub(super) struct Image {
-    bytes: Vec<u8>,
+    bytes: std::sync::Arc<[u8]>,
     mime: String,
+    oversized: bool,
 }
 
 impl AllowedMimeTypes for Image {
@@ -36,7 +37,16 @@ impl TryFrom<(Vec<u8>, String)> for Image {
         if !Self::allowed().iter().any(|allowed| allowed == &mime) {
             return Err("Unsupported clipboard image type");
         }
-        Ok(Self { bytes, mime })
+        let oversized = bytes.len() as u64 > MAX_CLIPBOARD_IMAGE_BYTES;
+        Ok(Self {
+            bytes: if oversized {
+                Vec::new().into()
+            } else {
+                bytes.into()
+            },
+            mime,
+            oversized,
+        })
     }
 }
 
@@ -44,7 +54,26 @@ impl TryFrom<(Vec<u8>, String)> for Image {
 /// provider without its own limit would otherwise keep any size offered.
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[cfg(test)]
 pub(super) fn save(image: Image, max_bytes: u64) -> Result<crate::chat::Attachment, String> {
+    save_checked(image, max_bytes, || Ok(()))
+}
+pub(super) fn save_active(
+    image: Image,
+    max_bytes: u64,
+    ticket: &super::attachment_draft::Ticket,
+) -> Result<crate::chat::Attachment, String> {
+    save_checked(image, max_bytes, || ticket.check())
+}
+fn save_checked(
+    image: Image,
+    max_bytes: u64,
+    active: impl Fn() -> Result<(), String>,
+) -> Result<crate::chat::Attachment, String> {
+    active()?;
+    if image.oversized {
+        return Err("Clipboard image exceeds the 32 MiB size limit.".into());
+    }
     let max_bytes = max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES);
     let expected = match image.mime.as_str() {
         "image/png" => image::ImageFormat::Png,
@@ -58,6 +87,7 @@ pub(super) fn save(image: Image, max_bytes: u64) -> Result<crate::chat::Attachme
         return Err("Clipboard image data does not match its image type.".into());
     }
     let extension = extension(actual)?;
+    active()?;
     crate::chat::attachment_assets::stage_validated(
         &image.bytes,
         "Pasted image",
@@ -78,7 +108,12 @@ fn extension(format: image::ImageFormat) -> Result<&'static str, String> {
 
 /// A user-selected local image is read once, bounded, then validated and
 /// copied to immutable device-owned data. Non-image files stay provider files.
-pub(super) fn stage_file(path: PathBuf, max_bytes: u64) -> Result<crate::chat::Attachment, String> {
+pub(super) fn stage_file_active(
+    path: PathBuf,
+    max_bytes: u64,
+    ticket: &super::attachment_draft::Ticket,
+) -> Result<crate::chat::Attachment, String> {
+    ticket.check()?;
     if crate::device::is_remote() {
         return Err(
             "Attach the image on the conversation's device; local image transfer is unavailable."
@@ -104,6 +139,7 @@ pub(super) fn stage_file(path: PathBuf, max_bytes: u64) -> Result<crate::chat::A
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
+    ticket.check()?;
     crate::chat::attachment_assets::stage_validated(&bytes, &name, extension(actual)?, max_bytes)
 }
 
@@ -174,6 +210,43 @@ fn prune_old_images(directory: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_staging_does_not_read_a_selected_file_or_allocate_a_receipt() {
+        let (ticket, lease) = super::super::attachment_draft::admit().unwrap();
+        drop(lease);
+        let error = stage_file_active(
+            PathBuf::from("/must-not-read-after-cancellation.png"),
+            u64::MAX,
+            &ticket,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+    }
+
+    #[test]
+    fn cancellation_after_decode_prevents_durable_publication() {
+        crate::chat::attachment_assets::with_test_image(|existing| {
+            let bytes = std::fs::read(&existing.path).unwrap();
+            let image = Image::try_from((bytes, "image/png".into())).unwrap();
+            let checks = std::cell::Cell::new(0);
+            let error = save_checked(image, u64::MAX, || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    Ok(())
+                } else {
+                    Err("cancelled before publication".into())
+                }
+            })
+            .unwrap_err();
+            assert!(error.contains("cancelled before publication"));
+            assert_eq!(checks.get(), 2);
+            assert_eq!(
+                crate::chat::attachment_assets::list().unwrap().images.len(),
+                1
+            );
+        });
+    }
 
     #[test]
     fn rejects_invalid_and_oversized_clipboard_images() {

@@ -16,15 +16,16 @@ impl Cache {
             .iter()
             .rev()
             .filter(|attachment| {
-                attachment
-                    .path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        chat::IMAGE_EXTENSIONS
-                            .iter()
-                            .any(|known| extension.eq_ignore_ascii_case(known))
-                    })
+                attachment.reference.is_some()
+                    || attachment
+                        .path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            chat::IMAGE_EXTENSIONS
+                                .iter()
+                                .any(|known| extension.eq_ignore_ascii_case(known))
+                        })
             })
             .take(RECENT)
             .collect();
@@ -128,6 +129,9 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
         let path = source.path.clone();
         let attachment = source.attachment;
         let loaded = images::worker(move || {
+            if let Some(reference) = &attachment.reference {
+                return images::managed_thumbnail(reference);
+            }
             if crate::device::is_remote() {
                 return images::Loaded::Failed(
                     "Image belongs to another device; local transfer is unavailable.".into(),

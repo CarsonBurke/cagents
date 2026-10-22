@@ -279,9 +279,15 @@ fn load_with_request(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
 ) -> Loaded {
-    let ItemContent::Image { path, .. } = &item.content else {
+    let ItemContent::Image {
+        path, reference, ..
+    } = &item.content
+    else {
         return Loaded::Unavailable;
     };
+    if let Some(reference) = reference {
+        return managed_with_request(reference, origin.device.is_some(), None, request);
+    }
     if path.starts_with("data:image/") {
         let bytes = (path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES)
             .then(|| path.split_once(";base64,"))
@@ -398,6 +404,51 @@ pub(in crate::app) async fn file_preview(
         )),
     }
 }
+/// Managed image identity is resolved by its owning backend. UI path hints
+/// never authorize a read, including after history restoration across roots.
+fn managed_with_request(
+    reference: &chat::ImageReference,
+    remote: bool,
+    edge: Option<u32>,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Loaded {
+    if let Err(error) = reference.validate() {
+        return Loaded::Failed(error);
+    }
+    let bytes = if remote {
+        request(crate::device_service::Operation::ReadImageAsset { reference: reference.clone() })
+            .and_then(|reply| match reply {
+                crate::device_service::Reply::Image(bytes) if bytes.len() <= crate::device_service::MAX_DEVICE_IMAGE_BYTES => Ok(bytes),
+                _ => Err("The selected device did not return a supported image preview; use matching cagents executables.".into()),
+            })
+    } else {
+        chat::attachment_assets::read(reference, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
+    };
+    match bytes {
+        Ok(bytes) => match bounded_handle_size(bytes, budget(), edge) {
+            Loaded::Unavailable => Loaded::Failed(format!(
+                "Cannot preview {}: unsupported, damaged, or larger than the 16 MiB preview limit.",
+                reference.label()
+            )),
+            loaded => loaded,
+        },
+        Err(error) => Loaded::Failed(format!(
+            "Cannot preview {} on its originating device: {error}",
+            reference.label()
+        )),
+    }
+}
+pub(super) fn managed_thumbnail(reference: &chat::ImageReference) -> Loaded {
+    managed_with_request(
+        reference,
+        crate::device::is_remote(),
+        Some(128),
+        crate::device_service::request,
+    )
+}
+
 #[cfg(test)]
 fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
     match bounded_handle(bytes, budget()) {
@@ -1035,6 +1086,81 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn managed_remote_preview_uses_backend_receipt_across_different_roots_and_never_local_hint() {
+        chat::attachment_assets::with_test_image(|backend_image| {
+            let ui_root = tempfile::tempdir().unwrap();
+            let ui_hint = ui_root.path().join("coincident-image.png");
+            let ui_pixels = png();
+            std::fs::write(&ui_hint, &ui_pixels).unwrap();
+            assert_ne!(backend_image.path.parent(), Some(ui_root.path()));
+            let backend_bytes = std::fs::read(&backend_image.path).unwrap();
+            let expected = image::load_from_memory(&backend_bytes)
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            assert_ne!(
+                expected,
+                image::load_from_memory(&ui_pixels)
+                    .unwrap()
+                    .into_rgba8()
+                    .into_raw()
+            );
+            let reference = backend_image.reference.as_ref().unwrap();
+            let mut item = image_item(ui_hint.to_string_lossy().into_owned());
+            if let ItemContent::Image {
+                reference: slot, ..
+            } = &mut item.content
+            {
+                *slot = Some(reference.clone());
+            }
+            let origin = Origin {
+                root: ui_root.path().into(),
+                child: false,
+                device: Some("backend-with-another-home".into()),
+            };
+            let loaded = load_with_request(&item, &origin, |operation| {
+                let crate::device_service::Operation::ReadImageAsset { reference: sent } =
+                    operation
+                else {
+                    panic!("managed preview must not send any caller path");
+                };
+                assert_eq!(&sent, reference);
+                chat::attachment_assets::read(&sent, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
+                    .map(crate::device_service::Reply::Image)
+            });
+            let Loaded::Ready(iced::widget::image::Handle::Rgba { pixels, .. }) = loaded else {
+                panic!("valid backend receipt bytes must decode");
+            };
+            assert_eq!(pixels.as_ref(), expected.as_slice());
+            let mut foreign = reference.clone();
+            foreign.device = uuid::Uuid::new_v4();
+            if let ItemContent::Image {
+                reference: slot, ..
+            } = &mut item.content
+            {
+                *slot = Some(foreign);
+            }
+            let loaded = load_with_request(&item, &origin, |operation| {
+                let crate::device_service::Operation::ReadImageAsset { reference } = operation
+                else {
+                    panic!("no path fallback");
+                };
+                chat::attachment_assets::read(
+                    &reference,
+                    crate::device_service::MAX_DEVICE_IMAGE_BYTES,
+                )
+                .map(crate::device_service::Reply::Image)
+            });
+            assert!(matches!(loaded, Loaded::Failed(error) if error.contains("device")));
+            assert_eq!(
+                std::fs::read(ui_hint).unwrap(),
+                ui_pixels,
+                "foreign receipt never opens or mutates coincident UI pixels"
+            );
+        });
+    }
+
     #[test]
     fn remote_preview_never_reads_same_named_local_pixels_or_falls_back_after_failure() {
         let directory = tempfile::tempdir().unwrap();
