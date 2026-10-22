@@ -525,6 +525,9 @@ pub(crate) mod tests {
     }
     pub(crate) fn assert_separate(holder: u32, root: u32) {
         if !manager_available() {
+            eprintln!(
+                "scope isolation unqualified: OS user manager unavailable; existing launch fallback"
+            );
             return;
         }
         let _proof = match ManagerNamespace::connect() {
