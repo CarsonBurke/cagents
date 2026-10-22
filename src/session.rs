@@ -4613,6 +4613,7 @@ mod tests {
                 source,
                 copy: state.cards[0].clone(),
                 draft: "Keep exact retry bytes".into(),
+                attachments: Vec::new(),
                 scope: None,
                 channel: None,
             };
@@ -4783,6 +4784,7 @@ mod tests {
             source: source.clone(),
             copy: card,
             draft: "Retry exact bytes  \nUnicode 🦀".into(),
+            attachments: Vec::new(),
             scope: Some(scope.clone()),
             channel: None,
         };
@@ -4966,6 +4968,7 @@ mod tests {
                 source: source.clone(),
                 copy: card,
                 draft: "Saved draft  \nUnicode 🦀".into(),
+                attachments: Vec::new(),
                 scope: None,
                 channel: None,
             };
