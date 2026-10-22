@@ -170,6 +170,8 @@ use crate::{
 /// `work::Response::Watching` and `ServerMessage::WorkBoard` - deliberately
 /// does not move it, for the reasons terminal-inventory observation did not:
 /// each is appended, and none reaches a peer that cannot issue the request.
+/// Worktree removal - `work::Request::{RemovalPlan, Remove, Snapshots}` and
+/// their responses - is appended under the same policy.
 pub const PROTOCOL_VERSION: u16 = 104;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

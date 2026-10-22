@@ -2,14 +2,21 @@
 //! progress, newest activity first.
 use super::*;
 use crate::work::{
-    ActivitySource, Board, CheckOutcome, Column, Forge, Item, PullRequestState, Request, Response,
-    Review, Scope,
+    ActivitySource, Board, CheckOutcome, Column, Forge, Item, Keep, PullRequestState, Removal,
+    RemovalPlan, Removed, Request, Response, Review, SavedSnapshot, Scope,
 };
 
 /// How long a board may wait on its first scan or a fresh rescan, on top of
 /// the daemon's own bound for each.
 const BOARD_TIMEOUT: Duration = Duration::from_secs(15);
 const FRESH_BOARD_TIMEOUT: Duration = Duration::from_secs(30);
+/// An inspection reads every file of a large worktree; a fetch may add the
+/// daemon's own minute.
+const PLAN_TIMEOUT: Duration = Duration::from_secs(90);
+const FETCHED_PLAN_TIMEOUT: Duration = Duration::from_secs(150);
+/// Removal inspects twice, or inspects and snapshots, then gives Git up to
+/// ten minutes to delete the files.
+const REMOVE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
@@ -34,6 +41,50 @@ pub enum WorkCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Remove a card's worktree, keeping its branch. Removal is refused while
+    /// a session or process uses the worktree, and unless nothing unsaved
+    /// would be lost or --snapshot or --discard says what happens to it.
+    #[command(visible_alias = "remove")]
+    Rm(RemoveArgs),
+    /// List the snapshots worktree removals kept, newest first. Restore one
+    /// with `git stash apply --index REF` in any worktree of its project.
+    Snapshots {
+        /// Only the open project with this name, or containing this path.
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RemoveArgs {
+    /// The card's branch, or its worktree's path.
+    item: String,
+    /// The open project the card belongs to, by name or path.
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// Keep unsaved changes as a snapshot before removing the worktree.
+    #[arg(long, conflicts_with = "discard")]
+    snapshot: bool,
+    /// Delete unsaved changes with the worktree.
+    #[arg(long)]
+    discard: bool,
+    /// Delete the branch too; allowed only when its work landed.
+    #[arg(long)]
+    delete_branch: bool,
+    /// Show what removal would keep and lose, and remove nothing.
+    #[arg(long, conflicts_with = "yes")]
+    dry_run: bool,
+    /// Fetch the project's remotes first, so work that landed upstream
+    /// counts as landed.
+    #[arg(long)]
+    fetch: bool,
+    /// Remove only if the worktree is still as the plan with this token,
+    /// from `--dry-run --json`, found it.
+    #[arg(long)]
+    token: Option<String>,
+    /// Confirm the removal.
+    #[arg(long, short)]
+    yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -160,10 +211,24 @@ fn item_argument(item: String) -> String {
 }
 
 fn send(request: Request, timeout: Duration) -> Result<Response, AppError> {
+    send_with(request, timeout, protocol_error)
+}
+
+fn send_with(
+    request: Request,
+    timeout: Duration,
+    failed: impl FnOnce(ControlError) -> AppError,
+) -> Result<Response, AppError> {
     let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    client.work(request, timeout).map_err(protocol_error)
+    // Inside a hosted session the daemon lets this read the board but never
+    // change it, as it can tell once the connection names its authority.
+    let authority = Authority::from_environment();
+    if authority.token().is_some() && matches!(request, Request::Pin { .. } | Request::Remove(_)) {
+        client.authenticate(authority).map_err(protocol_error)?;
+    }
+    client.work(request, timeout).map_err(failed)
 }
 
 pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
@@ -175,7 +240,225 @@ pub(super) fn execute(command: WorkCommand) -> Result<CommandOutput, AppError> {
             project,
         } => pin(item, Some(column), project),
         WorkCommand::Unpin { item, project } => pin(item, None, project),
+        WorkCommand::Rm(arguments) => remove(arguments),
+        WorkCommand::Snapshots { project } => snapshots(project),
     }
+}
+
+fn remove(arguments: RemoveArgs) -> Result<CommandOutput, AppError> {
+    let scope = scope(arguments.project)?;
+    let item = item_argument(arguments.item);
+    let request = Request::RemovalPlan {
+        scope: scope.clone(),
+        item: item.clone(),
+        fetch: arguments.fetch,
+    };
+    let timeout = if arguments.fetch {
+        FETCHED_PLAN_TIMEOUT
+    } else {
+        PLAN_TIMEOUT
+    };
+    let Response::RemovalPlan(plan) = send(request, timeout)? else {
+        return Err(AppError::new("work", "Unexpected Work board response"));
+    };
+    let described = plan_human(&plan);
+    if arguments.dry_run {
+        return Ok(CommandOutput {
+            command: "work.rm",
+            data: json!({ "plan": plan, "removed": null }),
+            human: described,
+        });
+    }
+    let keep = if arguments.snapshot {
+        Keep::Snapshot
+    } else if arguments.discard {
+        Keep::Discard
+    } else {
+        Keep::Nothing
+    };
+    plan.permits(keep, arguments.delete_branch)
+        .map_err(|reason| AppError::new("work_removal_refused", format!("{described}\n\n{reason}")))?;
+    let token = match (arguments.token, plan.inspection.token.clone()) {
+        (Some(expected), Some(current)) if expected != current => {
+            return Err(AppError::new(
+                "work_removal_changed",
+                format!("{described}\n\nThe worktree changed since the plan with that token; review this plan and retry"),
+            ));
+        }
+        (_, Some(current)) => current,
+        (_, None) => return Err(AppError::new("work_removal_refused", described)),
+    };
+    // This command's own working directory would refuse the removal.
+    if std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .is_ok_and(|directory| directory.starts_with(&plan.inspection.path))
+    {
+        return Err(AppError::new(
+            "work_removal_refused",
+            format!("{described}\n\nThis shell is inside the worktree; leave it and retry"),
+        ));
+    }
+    if !arguments.yes {
+        return Err(AppError::new(
+            "work_removal_unconfirmed",
+            format!("{described}\n\nPass --yes to remove it, or --dry-run to only see this plan"),
+        ));
+    }
+    let request = Request::Remove(Box::new(Removal {
+        scope,
+        item,
+        token,
+        keep,
+        delete_branch: arguments.delete_branch,
+    }));
+    let unanswered = |error: ControlError| match error {
+        ControlError::ReplyTimeout { .. } | ControlError::ConnectionClosed => AppError::new(
+            "work_removal_unanswered",
+            format!(
+                "{error}. The removal may still finish: see `cagents work list`, and `cagents work snapshots` for unsaved work it kept"
+            ),
+        ),
+        error => protocol_error(error),
+    };
+    let Response::Removed(removed) = send_with(request, REMOVE_TIMEOUT, unanswered)? else {
+        return Err(AppError::new("work", "Unexpected Work board response"));
+    };
+    Ok(CommandOutput {
+        command: "work.rm",
+        human: removed_human(&removed),
+        data: json!({ "plan": plan, "removed": removed }),
+    })
+}
+
+fn snapshots(project: Option<PathBuf>) -> Result<CommandOutput, AppError> {
+    let request = Request::Snapshots {
+        scope: scope(project)?,
+    };
+    let Response::Snapshots(snapshots) = send(request, BOARD_TIMEOUT)? else {
+        return Err(AppError::new("work", "Unexpected Work board response"));
+    };
+    let human = snapshots_human(&snapshots, crate::chat::now_ms().unwrap_or_default());
+    Ok(CommandOutput {
+        command: "work.snapshots",
+        data: json!({ "snapshots": snapshots }),
+        human,
+    })
+}
+
+/// The plan's verdict, then what it counted and what removal deletes.
+fn plan_human(plan: &RemovalPlan) -> String {
+    let inspection = &plan.inspection;
+    let mut lines = vec![
+        format!(
+            "{} in {}: {}",
+            super::format::plain(&plan.item),
+            super::format::plain(&plan.project_name),
+            inspection.path.display()
+        ),
+        plan.summary(),
+    ];
+    if let Some(number) = plan.merged_pull_request {
+        lines.push(format!("Pull request #{number} merged at this commit."));
+    }
+    if inspection.staged + inspection.modified + inspection.untracked > 0 {
+        lines.push(format!(
+            "Changes: {} staged, {} modified, {} untracked ({})",
+            inspection.staged,
+            inspection.modified,
+            inspection.untracked,
+            super::format::size(inspection.untracked_bytes)
+        ));
+    }
+    let listed = |title: &str, paths: &[String]| {
+        (!paths.is_empty()).then(|| {
+            format!(
+                "{title}:\n{}",
+                paths
+                    .iter()
+                    .map(|path| format!("  {}", super::format::plain(path)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+    };
+    lines.extend(listed(
+        "Changed on their way into Git, so no snapshot keeps them",
+        &inspection.filtered,
+    ));
+    lines.extend(listed("Repositories inside it, deleted whole", &inspection.nested));
+    if inspection.ignored_total > 0 {
+        let shown = inspection
+            .ignored
+            .iter()
+            .map(|entry| {
+                if entry.directory {
+                    format!("{}/", entry.path.trim_end_matches('/'))
+                } else {
+                    entry.path.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut section = listed(
+            &format!("Ignored, deleted with it ({})", inspection.ignored_total),
+            &shown,
+        )
+        .unwrap_or_default();
+        let hidden = (inspection.ignored_total as usize).saturating_sub(shown.len());
+        if hidden > 0 {
+            section.push_str(&format!("\n  and {hidden} more"));
+        }
+        lines.push(section);
+    }
+    lines.join("\n")
+}
+
+fn removed_human(removed: &Removed) -> String {
+    let mut lines = vec![format!("Removed {}", removed.path.display())];
+    if let Some(snapshot) = &removed.snapshot {
+        lines.push(format!(
+            "Unsaved work is in {}; restore it with `git stash apply --index {}`",
+            snapshot.refname, snapshot.refname
+        ));
+    }
+    if let Some(branch) = &removed.deleted_branch {
+        lines.push(format!("Deleted branch {}", super::format::plain(branch)));
+    }
+    if let Some(error) = &removed.branch_error {
+        lines.push(format!(
+            "The branch was kept: {}",
+            super::format::plain(error)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn snapshots_human(snapshots: &[SavedSnapshot], now_ms: u64) -> String {
+    super::format::table(
+        ["SNAPSHOT", "PROJECT", "TAKEN", "OF", "WORKTREE"],
+        snapshots
+            .iter()
+            .map(|snapshot| {
+                [
+                    snapshot.refname.clone(),
+                    snapshot.project_name.clone(),
+                    snapshot.created_at_unix_ms.map_or_else(
+                        || "-".to_owned(),
+                        |at| super::format::relative_time(at, now_ms),
+                    ),
+                    snapshot
+                        .subject
+                        .strip_prefix("WIP on ")
+                        .unwrap_or(&snapshot.subject)
+                        .to_owned(),
+                    snapshot
+                        .worktree
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
+                ]
+            })
+            .collect(),
+        "No snapshots",
+    )
 }
 
 fn list(arguments: ListArgs) -> Result<CommandOutput, AppError> {

@@ -467,6 +467,9 @@ struct Walk {
 
 fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentError> {
     let mut walk = Walk::default();
+    // A mount below the root is emptied by a recursive removal, though no
+    // file in it belongs to the worktree.
+    let own = filesystem(root)?.ok_or_else(|| ContentError::Path(root.to_owned()))?;
     let mut pending = vec![PathBuf::new()];
     let mut visited = 0u64;
     let mut reported = Vec::<PathBuf>::new();
@@ -511,7 +514,15 @@ fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentEr
                 _ => {}
             }
             if is_directory && !(name == ".git" && relative.as_os_str().is_empty()) {
-                directories.push(relative.join(name));
+                let child = relative.join(name);
+                match filesystem(&root.join(&child))? {
+                    None => continue,
+                    Some(other) if other != own => {
+                        walk.blocker = Some(Blocker::MountPoint(format!("{}/", child.display())));
+                        return Ok(walk);
+                    }
+                    Some(_) => directories.push(child),
+                }
             }
         }
         // A nested repository is reported once, not again for its own git
@@ -525,6 +536,44 @@ fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentEr
     }
     walk.nested.sort();
     Ok(walk)
+}
+
+/// The device and mount a directory is on, or `None` once it is gone or is
+/// no longer a directory. The
+/// mount tells apart a bind mount of the same file system; the device, a
+/// Btrfs subvolume, which is no mount. Kernels before 5.8 report no mount.
+pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Option<u64>)>> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut metadata = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_MNT_ID,
+            metadata.as_mut_ptr(),
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => Ok(None),
+            // A sandbox may filter statx; the device still finds most mounts.
+            Some(libc::ENOSYS | libc::EPERM) => {
+                let metadata = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path.as_bytes()))?;
+                Ok(Some((libc::major(metadata.dev()).into(), libc::minor(metadata.dev()).into(), None)))
+            }
+            _ => Err(error),
+        };
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    let mount = (metadata.stx_mask & libc::STATX_MNT_ID != 0).then_some(metadata.stx_mnt_id);
+    Ok(Some((
+        u64::from(metadata.stx_dev_major),
+        u64::from(metadata.stx_dev_minor),
+        mount,
+    )))
 }
 
 /// Whether two files hold the same bytes, read in chunks.

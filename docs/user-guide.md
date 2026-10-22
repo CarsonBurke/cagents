@@ -465,6 +465,52 @@ follows it between worktrees and is forgotten once the branch is gone or its
 pull request has merged or closed, at the next scan that Git and GitHub both
 answer; a worktree's pin is forgotten with the worktree.
 
+### Removing a worktree
+
+`cagents work rm` removes a card's worktree and keeps its branch. It first
+judges what removal would lose:
+
+- **Landed**: the commits and any uncommitted changes are already in the
+  default branch, or the branch's merged pull request is at this exact commit.
+  Squash and rebase merges count. The branch may be deleted too.
+- **Commits kept**: nothing uncommitted would be lost, and a branch or tag
+  still holds the commits.
+- **Unsaved**: changes that are in no landing target, or commits that no
+  branch or tag holds. Removal needs `--snapshot` or `--discard`.
+- **Refused**: for example, the primary or a locked worktree, a merge or
+  rebase in progress, a submodule with untracked files, another file system
+  mounted inside it, or more than 1 GiB of untracked files.
+
+Ignored files, such as `node_modules` and `.env`, are always deleted with the
+worktree; the plan lists them. A snapshot cannot keep files that a clean
+filter changes on their way into Git, nor repositories nested inside the
+worktree. When those are present, only `--discard` removes it. `--discard`
+deletes everything the worktree alone holds, including commits that no branch
+or tag holds. `--snapshot` makes no snapshot when nothing is unsaved.
+
+```sh
+cagents work rm fix/login --dry-run          # the plan; removes nothing
+cagents work rm fix/login --yes              # remove when nothing would be lost
+cagents work rm fix/login --snapshot --yes   # keep unsaved changes first
+cagents work rm fix/login --discard --yes    # delete unsaved changes
+cagents work rm fix/login --delete-branch --yes  # landed work only
+cagents work rm fix/login --fetch --dry-run  # fetch remotes before judging
+cagents work snapshots                       # what earlier removals kept
+```
+
+A snapshot is a stash-shaped commit under `refs/cagents/snapshots/`. Restore
+one with `git stash apply --index REF` in any worktree of the project. The
+plan is bound to the content it judged. `--dry-run --json` returns its token,
+and `--token` makes the removal refuse if anything changed since that plan.
+
+While a removal runs, no session can start inside the worktree. It is refused
+when a terminal, chat or agent works there, an automation run is in progress
+there, or any process of yours has its working directory or an open file
+inside it, the shell running `cagents work rm` included. Processes in
+containers are not seen; stop them first. Sessions in other worktrees keep
+running, and the daemon refuses to upgrade or shut down until the removal
+finishes. Agents may read plans, but only you can remove a worktree.
+
 The daemon watches each project's Git metadata and, within its watch budget,
 the tracked directories of its worktrees. Projects beyond the budget are
 polled, every 15 seconds after recent activity and every two minutes

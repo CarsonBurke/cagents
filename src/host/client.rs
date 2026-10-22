@@ -449,6 +449,7 @@ pub(super) fn process_request(
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
+    super::worktree_removal::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {

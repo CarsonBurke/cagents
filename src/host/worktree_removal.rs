@@ -5,7 +5,9 @@
 //! admitted before it has already published its hosted record; launches after
 //! it see the reservation in `ensure_outside`. Unlike automatic cleanup, which
 //! waits for global quiescence, this lets the user remove one worktree while
-//! sessions elsewhere keep running.
+//! sessions elsewhere keep running. The removal itself runs outside control
+//! admission, so a daemon upgrade or shutdown is refused until it finishes,
+//! as for an account operation.
 use super::state::SharedHost;
 use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 use std::{
@@ -22,6 +24,15 @@ pub(super) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<Scope>>>>;
 /// Removals reserved at once, which also bounds the work every launch does to
 /// check them.
 const MAX_RESERVATIONS: usize = 16;
+
+/// How long installation retries the control writer while other requests
+/// briefly hold the gate. It never waits on the writer itself, which would
+/// stall every new request behind it.
+const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a process found in the worktree gets to leave before it refuses
+/// the removal.
+const OCCUPANT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub(super) struct Scope {
     path: PathBuf,
@@ -94,13 +105,32 @@ impl Drop for Reservation {
 impl Reservation {
     /// Caller holds no control admission: this takes the short writer itself.
     pub(super) fn install(host: &SharedHost, path: &Path) -> Result<Self, ProtocolError> {
+        Self::install_within(host, path, INSTALL_PATIENCE)
+    }
+
+    fn install_within(
+        host: &SharedHost,
+        path: &Path,
+        patience: std::time::Duration,
+    ) -> Result<Self, ProtocolError> {
         super::client::ensure_control_open(host)?;
         let scope = Arc::new(Scope::capture(path).map_err(refusal)?);
         let (gate, map) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             (state.control_gate.clone(), state.worktree_removals.clone())
         };
-        let writer = super::client::try_scoped_control_write(&gate)?;
+        let deadline = std::time::Instant::now() + patience;
+        let mut pause = std::time::Duration::from_millis(5);
+        let writer = loop {
+            match super::client::try_scoped_control_write(&gate) {
+                Ok(writer) => break writer,
+                Err(error) if std::time::Instant::now() + pause > deadline => return Err(error),
+                Err(_) => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(200));
+                }
+            }
+        };
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.values().any(|other| other.overlaps(&scope)) {
@@ -193,7 +223,7 @@ impl Reservation {
                     .map(|directory| ("An automation", directory)),
             );
         for (owner, directory) in hosted.into_iter().chain(durable) {
-            if self.contains(&directory)? {
+            if self.contains(&directory) {
                 return Err(format!("{owner} is running in this worktree"));
             }
         }
@@ -205,7 +235,15 @@ impl Reservation {
     /// directory, root, executable or an open file inside the worktree. This
     /// sees what the daemon does not host: shells, editors, build watchers.
     pub(crate) fn ensure_no_processes(&self) -> Result<(), String> {
-        match occupant(Path::new("/proc"), &self.scope.path, std::process::id()) {
+        let scan = || occupant(Path::new("/proc"), &self.scope.path, std::process::id());
+        let mut found = scan();
+        // A short-lived Git child of the board's own scan is gone moments
+        // later; what still uses the worktree after a pause is no passerby.
+        if matches!(found, Ok(Some(_))) {
+            std::thread::sleep(OCCUPANT_GRACE);
+            found = scan();
+        }
+        match found {
             Ok(None) => Ok(()),
             Ok(Some((pid, name))) => Err(format!(
                 "{name} (process {pid}) is using this worktree; close it and retry"
@@ -214,14 +252,15 @@ impl Reservation {
         }
     }
 
-    /// A relative directory names nothing the daemon can resolve; the process
-    /// scan still finds whatever actually runs there.
-    fn contains(&self, directory: &Path) -> Result<bool, String> {
+    /// A relative directory names nothing the daemon can resolve, and one it
+    /// cannot open is judged by its path alone, so neither blocks every
+    /// removal; the process scan still finds whatever actually runs there.
+    fn contains(&self, directory: &Path) -> bool {
         if !directory.is_absolute() {
-            return Ok(false);
+            return false;
         }
-        let ancestors = existing_ancestors(directory)?;
-        Ok(self.scope.contains(directory, &ancestors))
+        let ancestors = existing_ancestors(directory).unwrap_or_default();
+        self.scope.contains(directory, &ancestors)
     }
 }
 
@@ -261,6 +300,28 @@ fn scopes(host: &SharedHost) -> Vec<Arc<Scope>> {
         .values()
         .cloned()
         .collect()
+}
+
+/// Refuses a daemon upgrade or shutdown while a removal runs: either would end
+/// Git's deletion partway through.
+pub(super) fn admit(
+    host: &SharedHost,
+    request: &crate::terminal_ipc::ClientRequest,
+) -> Result<(), ProtocolError> {
+    use crate::terminal_ipc::ClientRequest;
+    if matches!(
+        request,
+        ClientRequest::PrepareUpgrade { .. }
+            | ClientRequest::PrepareConfirmedUpgrade { .. }
+            | ClientRequest::Shutdown
+            | ClientRequest::ShutdownV1 { .. }
+    ) && !scopes(host).is_empty()
+    {
+        return Err(refusal(
+            "A worktree removal is still finishing. Wait for it before shutting down or upgrading this daemon.",
+        ));
+    }
+    Ok(())
 }
 
 const STARTING_INSIDE: &str =

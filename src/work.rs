@@ -147,6 +147,19 @@ pub enum Request {
         item: String,
         column: Option<Column>,
     },
+    /// What removing the worktree of the card named by `item` would lose,
+    /// without removing it. With `fetch`, the project's remotes are fetched
+    /// first, so work that landed upstream counts as landed.
+    RemovalPlan {
+        scope: Scope,
+        item: String,
+        fetch: bool,
+    },
+    /// Removes a card's worktree, provided its content is still what the
+    /// plan with the same token judged.
+    Remove(Box<Removal>),
+    /// The snapshots earlier removals kept, newest first.
+    Snapshots { scope: Scope },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +168,135 @@ pub enum Response {
     Pinned(Box<Item>),
     /// The answer to a subscription: the board as of `revision`.
     Watching { revision: u64, board: Box<Board> },
+    RemovalPlan(Box<RemovalPlan>),
+    Removed(Box<Removed>),
+    Snapshots(Vec<SavedSnapshot>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    pub scope: Scope,
+    pub item: String,
+    /// The [`crate::worktree_content::Inspection::token`] of the plan the
+    /// user accepted.
+    pub token: String,
+    pub keep: Keep,
+    /// Also delete the branch; allowed only when its work landed.
+    pub delete_branch: bool,
+}
+
+/// What happens to work only the worktree holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Keep {
+    /// Nothing needs keeping: refused when the plan found unsaved work.
+    Nothing,
+    /// Store the uncommitted work as a snapshot first.
+    Snapshot,
+    /// Delete it, as the user explicitly chose.
+    Discard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalPlan {
+    pub project: PathBuf,
+    pub project_name: String,
+    /// The card's text form, as the command line names it.
+    pub item: String,
+    pub inspection: crate::worktree_content::Inspection,
+    /// The merged pull request whose head counted as landed.
+    pub merged_pull_request: Option<u64>,
+}
+
+impl RemovalPlan {
+    /// What removal keeps and loses, in a sentence.
+    pub fn summary(&self) -> String {
+        use crate::worktree_content::Verdict;
+        match &self.inspection.verdict {
+            Verdict::Landed => format!(
+                "Everything landed in {}: removing the worktree loses nothing, and its branch may go too.",
+                self.inspection.landed_in.as_deref().unwrap_or("the default branch")
+            ),
+            Verdict::CommitsKept => {
+                "Nothing uncommitted would be lost, and the branch keeps its commits.".into()
+            }
+            Verdict::Unsaved {
+                uncommitted,
+                unreachable,
+                beyond_snapshot,
+            } => {
+                let mut losses = Vec::new();
+                if *uncommitted {
+                    losses.push("changes that are in no landing target");
+                }
+                if *unreachable {
+                    losses.push("commits no branch or tag holds");
+                }
+                let mut summary = format!("Removal would lose {}.", losses.join(" and "));
+                if *beyond_snapshot {
+                    summary.push_str(" A snapshot cannot keep all of it.");
+                }
+                summary
+            }
+            Verdict::Blocked(blocker) => format!("Removal is refused: {blocker}."),
+        }
+    }
+
+    /// Whether removing with `keep` and `delete_branch` is allowed, and why
+    /// not. The daemon checks again against the content it removes.
+    pub fn permits(&self, keep: Keep, delete_branch: bool) -> Result<(), String> {
+        use crate::worktree_content::Verdict;
+        match &self.inspection.verdict {
+            Verdict::Blocked(blocker) => return Err(format!("Removal is refused: {blocker}")),
+            Verdict::Unsaved {
+                beyond_snapshot: true,
+                ..
+            } if keep != Keep::Discard => {
+                return Err(
+                    "Removal would lose work a snapshot cannot keep, such as filtered files or nested repositories; only an explicit discard removes it"
+                        .into(),
+                );
+            }
+            Verdict::Unsaved { .. } if keep == Keep::Nothing => {
+                return Err("Removal would lose unsaved work; snapshot or discard it".into());
+            }
+            Verdict::Landed | Verdict::CommitsKept | Verdict::Unsaved { .. } => {}
+        }
+        if delete_branch {
+            if self.inspection.branch.is_none() {
+                return Err("The worktree is detached, so it has no branch to delete".into());
+            }
+            if self.inspection.verdict != Verdict::Landed {
+                return Err("Only a branch whose work landed is deleted with its worktree".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removed {
+    pub project: PathBuf,
+    pub path: PathBuf,
+    pub snapshot: Option<crate::worktree_content::Snapshot>,
+    /// The branch deleted with the worktree.
+    pub deleted_branch: Option<String>,
+    /// Why the branch was kept although its deletion was asked for. The
+    /// worktree is removed regardless.
+    pub branch_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSnapshot {
+    pub project: PathBuf,
+    pub project_name: String,
+    pub refname: String,
+    pub oid: String,
+    pub created_at_unix_ms: Option<u64>,
+    /// Such as `WIP on fix/login: 0123456789ab`.
+    pub subject: String,
+    /// The worktree it was taken from.
+    pub worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

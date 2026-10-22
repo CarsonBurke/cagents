@@ -580,7 +580,7 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
             .open(&lease_path)
             .map_err(|_| {
                 io::Error::other(
-                    "close older or unready independent editors before automatic cleanup",
+                    "close older or unready independent editors before removing worktrees",
                 )
             })?;
         let expected = lease.metadata()?;

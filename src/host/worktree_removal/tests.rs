@@ -84,9 +84,14 @@ fn installation_waits_for_launches_already_admitted() {
     let host = host();
     let gate = host.lock().unwrap().control_gate.clone();
     let admitted = gate.read().unwrap();
-    assert!(Reservation::install(&host, &worktree).is_err());
-    drop(admitted);
-    Reservation::install(&host, &worktree).unwrap();
+    assert!(Reservation::install_within(&host, &worktree, std::time::Duration::ZERO).is_err());
+    // Installation retries while the request already admitted finishes.
+    std::thread::scope(|scope| {
+        let installing = scope.spawn(|| Reservation::install(&host, &worktree).map(drop));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(admitted);
+        installing.join().unwrap().unwrap();
+    });
 }
 
 #[test]
