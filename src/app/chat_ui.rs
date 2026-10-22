@@ -2080,7 +2080,7 @@ impl Runtime {
             return false;
         }
         let current = current.cursor;
-        self.composer.move_to(bookmark.cursor);
+        attachment_draft::move_to(&mut self.composer, bookmark.cursor);
         let mut insertion = text.to_owned();
         if !attachments.is_empty()
             && self
@@ -2124,7 +2124,7 @@ impl Runtime {
                 self.cancel_invalid_attachment_jobs();
                 if current != bookmark.cursor {
                     if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                        self.composer.move_to(mapped);
+                        attachment_draft::move_to(&mut self.composer, mapped);
                     }
                 }
             }
@@ -2169,10 +2169,13 @@ impl Runtime {
             .rev()
         {
             let current = attachment_draft::Bookmark::capture(&self.composer).cursor;
-            self.composer.move_to(text_editor::Cursor {
-                position: excerpt.position(offset + token.len()),
-                selection: Some(excerpt.position(offset)),
-            });
+            attachment_draft::move_to(
+                &mut self.composer,
+                text_editor::Cursor {
+                    position: excerpt.position(offset + token.len()),
+                    selection: Some(excerpt.position(offset)),
+                },
+            );
             if let Ok(Some(change)) = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(String::new())),
@@ -2181,7 +2184,7 @@ impl Runtime {
                     bookmark.changed(&change);
                 }
                 if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                    self.composer.move_to(mapped);
+                    attachment_draft::move_to(&mut self.composer, mapped);
                 }
             }
         }
@@ -15521,13 +15524,21 @@ mod tests {
                 selection: Some(text_editor::Position { line: 0, column: 6 }),
             });
             let id = runtime.begin_attachment_insert();
+            assert_eq!(runtime.composer.selection().as_deref(), Some("beta"));
+            // Moving the raw native caret alone retains its old anchor. Model
+            // the user's explicit deselection before typing inside that span.
+            runtime.composer_action(text_editor::Action::ClearSelection);
             runtime.composer.move_to(text_editor::Cursor {
                 position: text_editor::Position { line: 0, column: 8 },
                 selection: None,
             });
+            assert_eq!(runtime.composer.selection(), None);
             runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+            assert_eq!(runtime.composer.text(), "alpha be!ta gamma");
+            let before_callback = runtime.composer.text();
             assert!(!runtime.finish_attachment_insert(id.id, "", vec![image]));
             assert_eq!(runtime.composer.text(), "alpha be!ta gamma");
+            assert_eq!(runtime.composer.text(), before_callback);
             assert!(runtime.attachments.is_empty());
             assert!(
                 runtime

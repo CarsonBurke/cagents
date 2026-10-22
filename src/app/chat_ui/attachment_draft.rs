@@ -32,6 +32,14 @@ pub(super) fn excerpt(
     result
 }
 
+/// Replace the native selection as well as its caret. `Content::move_to` only
+/// installs a supplied anchor; `None` leaves an existing word/line selection
+/// intact. An async insertion must not inherit that unrelated selection.
+pub(super) fn move_to(content: &mut Content, cursor: Cursor) {
+    content.perform(text_editor::Action::ClearSelection);
+    content.move_to(cursor);
+}
+
 fn selected_span(content: &Content<cosmic::Renderer>, view: &Excerpt) -> Option<Cursor> {
     let cursor = content.cursor();
     let Some(anchor) = cursor.selection else {
