@@ -2073,6 +2073,11 @@ impl Runtime {
             self.submit_after_paste = None;
             return false;
         }
+        // An empty clipboard completes the job without editing the draft.
+        // Its caller may still resume an explicitly deferred Submit.
+        if text.is_empty() && attachments.is_empty() {
+            return true;
+        }
         let current = attachment_draft::Bookmark::capture(&self.composer);
         if !current.valid {
             self.error = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
@@ -15356,6 +15361,228 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), "replacement draft");
         assert_eq!(runtime.pastes_pending, 0);
+    }
+
+    #[test]
+    fn valid_empty_paste_preserves_later_native_selection_and_caret() {
+        let _admission = attachment_draft::test_admission();
+        let thumbnail_key = |runtime: &Runtime| {
+            let mut subscriptions = runtime.thumbnails.subscriptions(runtime.target);
+            assert_eq!(subscriptions.len(), 1);
+            let mut recipes =
+                iced::advanced::subscription::into_recipes(subscriptions.pop().unwrap());
+            assert_eq!(recipes.len(), 1);
+            let mut hasher = iced::advanced::subscription::Hasher::default();
+            recipes.pop().unwrap().hash(&mut hasher);
+            std::hash::Hasher::finish(&hasher)
+        };
+        for empty in [None, Some(String::new())] {
+            for selection in 0..3 {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = draft_chat(&mut app);
+                let target = chat_runtime(&app, card).target;
+                write(&mut app, card, "start middle end\nsecond line");
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.attach([PathBuf::from("/fixture/existing.png")]);
+                runtime.composer.move_to(text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 0 },
+                    selection: None,
+                });
+                let ticket = runtime.begin_attachment_insert();
+                drop(app.handle_chat_ui(Action::ComposerCursor(
+                    target,
+                    text_editor::Cursor {
+                        position: text_editor::Position { line: 0, column: 8 },
+                        selection: None,
+                    },
+                )));
+                let action = match selection {
+                    0 => text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+                    1 => text_editor::Action::SelectWord,
+                    _ => text_editor::Action::SelectLine,
+                };
+                drop(app.handle_chat_ui(Action::Composer(target, action)));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                match selection {
+                    0 => assert!(runtime.composer.selection().is_none()),
+                    1 => assert_eq!(runtime.composer.selection().as_deref(), Some("middle")),
+                    _ => assert!(
+                        runtime
+                            .composer
+                            .selection()
+                            .unwrap()
+                            .contains("start middle end")
+                    ),
+                }
+                runtime.completion.dismissed = Some((0, 0));
+                let before_text = runtime.composer.text();
+                let before_cursor = runtime.composer.cursor();
+                let before_selection = runtime.composer.selection();
+                let before_attachments = runtime.attachments.clone();
+                let before_revision = runtime.revision;
+                let before_thumbnail = thumbnail_key(runtime);
+                assert!(runtime.attachment_bookmarks[&ticket.id].valid);
+
+                drop(app.handle_chat_ui(Action::PastedText(target, ticket, empty.clone())));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.composer.text(), before_text);
+                assert_eq!(runtime.composer.cursor(), before_cursor);
+                assert_eq!(runtime.composer.selection(), before_selection);
+                assert_eq!(runtime.attachments, before_attachments);
+                assert_eq!(thumbnail_key(runtime), before_thumbnail);
+                assert_eq!(runtime.revision, before_revision);
+                assert_eq!(runtime.completion.dismissed, Some((0, 0)));
+                assert_eq!(runtime.pastes_pending, 0);
+                assert!(runtime.attachment_jobs.is_empty());
+                assert!(runtime.attachment_bookmarks.is_empty());
+                assert!(runtime.attachment_order.is_empty());
+                assert!(runtime.submit_after_paste.is_none());
+                assert!(runtime.pending.is_none());
+                assert!(runtime.error.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn valid_empty_paste_keeps_recalled_history_and_down_restores_the_image_draft() {
+        let _admission = attachment_draft::test_admission();
+        chat::attachment_assets::with_test_image(|sent| {
+            let draft = chat::attachment_assets::test_image("unsent-stash.png");
+            let sent_text = format!("Sent {}", sent.reference.as_ref().unwrap().token());
+            let draft_text = format!(
+                "draft words {}\nsecond line",
+                draft.reference.as_ref().unwrap().token()
+            );
+            for empty in [None, Some(String::new())] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = draft_chat(&mut app);
+                let target = chat_runtime(&app, card).target;
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.remember_with_attachments(sent_text.clone(), vec![sent.clone()]);
+                runtime.replace_draft(text_editor::Content::with_text(&draft_text));
+                runtime.replace_attachments(vec![draft.clone()]);
+                runtime.composer.move_to(text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 8 },
+                    selection: None,
+                });
+                runtime.composer.perform(text_editor::Action::SelectWord);
+                assert_eq!(runtime.composer.selection().as_deref(), Some("words"));
+                let draft_cursor = runtime.composer.cursor();
+                let draft_selection = runtime.composer.selection();
+                drop(app.handle_chat_ui(Action::HistoryOlder(target)));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                assert_eq!(runtime.history_cursor, Some(0));
+                assert_eq!(runtime.composer.text(), sent_text);
+                assert_eq!(runtime.attachments, [sent.clone()]);
+                let recalled_cursor = runtime.composer.cursor();
+                let recalled_selection = runtime.composer.selection();
+                let ticket = runtime.begin_attachment_insert();
+                let before_revision = runtime.revision;
+
+                drop(app.handle_chat_ui(Action::PastedText(target, ticket, empty)));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.history_cursor, Some(0));
+                assert_eq!(runtime.history, [sent_text.clone()]);
+                assert_eq!(runtime.history_images, [vec![sent.clone()]]);
+                assert_eq!(runtime.composer.text(), sent_text);
+                assert_eq!(runtime.composer.cursor(), recalled_cursor);
+                assert_eq!(runtime.composer.selection(), recalled_selection);
+                let stash = runtime
+                    .history_stash
+                    .as_ref()
+                    .expect("unsent editor retained");
+                assert_eq!(stash.text(), draft_text);
+                assert_eq!(stash.cursor(), draft_cursor);
+                assert_eq!(stash.selection(), draft_selection);
+                assert_eq!(
+                    runtime.history_attachment_stash.as_deref(),
+                    Some([draft.clone()].as_slice())
+                );
+                assert_eq!(runtime.unsent_text(), draft_text);
+                assert_eq!(runtime.unsent_attachments(), [draft.clone()]);
+                assert_eq!(runtime.attachments, [sent.clone()]);
+                assert_eq!(runtime.revision, before_revision);
+                assert_eq!(runtime.pastes_pending, 0);
+                assert!(runtime.attachment_jobs.is_empty());
+                assert!(runtime.attachment_bookmarks.is_empty());
+                assert!(runtime.attachment_order.is_empty());
+
+                // HistoryNewer is the composer's normal Down action while recalling.
+                drop(app.handle_chat_ui(Action::HistoryNewer(target)));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.composer.text(), draft_text);
+                assert_eq!(runtime.composer.cursor(), draft_cursor);
+                assert_eq!(runtime.composer.selection(), draft_selection);
+                assert_eq!(runtime.attachments, [draft.clone()]);
+                assert!(runtime.history_cursor.is_none());
+                assert!(runtime.history_stash.is_none());
+                assert!(runtime.history_attachment_stash.is_none());
+                assert!(runtime.pending.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
+        let _admission = attachment_draft::test_admission();
+        for text in ["send after both empty callbacks", ""] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("empty-paste-submit"));
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, text);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let first = runtime.begin_attachment_insert();
+            let second = runtime.begin_attachment_insert();
+            let replay = second.clone();
+            submit(&mut app, card);
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.pending.is_none());
+            assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
+
+            drop(app.handle_chat_ui(Action::PastedText(target, first, None)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.pastes_pending, 1);
+            assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
+            assert!(runtime.pending.is_none());
+            assert_eq!(runtime.composer.text(), text);
+
+            drop(app.handle_chat_ui(Action::PastedText(target, second, Some(String::new()))));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.pastes_pending, 0);
+            assert!(runtime.attachment_jobs.is_empty());
+            assert!(runtime.attachment_bookmarks.is_empty());
+            assert!(runtime.attachment_order.is_empty());
+            assert!(runtime.submit_after_paste.is_none());
+            if text.is_empty() {
+                assert!(
+                    runtime.pending.is_none(),
+                    "empty clipboard cannot invent a prompt"
+                );
+            } else {
+                assert_eq!(
+                    runtime
+                        .pending
+                        .as_ref()
+                        .unwrap()
+                        .sent
+                        .as_deref()
+                        .map(str::trim_end),
+                    Some(text)
+                );
+            }
+            let pending_id = runtime.pending.as_ref().map(|pending| pending.id);
+            drop(app.handle_chat_ui(Action::PastedText(target, replay, None)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.pending.as_ref().map(|pending| pending.id),
+                pending_id
+            );
+            assert!(
+                runtime.followups.is_empty(),
+                "replayed completion must not submit twice"
+            );
+            assert!(runtime.attachments.is_empty());
+        }
     }
 
     #[test]
