@@ -332,6 +332,11 @@ struct LoggedNotice {
 struct NoticeLog {
     entries: VecDeque<LoggedNotice>,
     next_id: u64,
+    /// Since when confirmations have stopped counting down, because nobody
+    /// could be reading them: the window is in the background, or the reader
+    /// has the notices open. A confirmation gets its whole lifetime in front
+    /// of someone who can see it.
+    paused_at: Option<Instant>,
 }
 
 impl NoticeLog {
@@ -340,8 +345,11 @@ impl NoticeLog {
     }
 
     fn record_at(&mut self, notice: TransientNotice, now: Instant) {
-        let expires_at =
-            (notice.severity == NoticeSeverity::Success).then(|| now + NOTICE_SUCCESS_LIFETIME);
+        // Recorded while paused, a confirmation's countdown starts with the
+        // resume: `resume` moves every deadline on by the pause's length.
+        let counted_from = self.paused_at.unwrap_or(now);
+        let expires_at = (notice.severity == NoticeSeverity::Success)
+            .then(|| counted_from + NOTICE_SUCCESS_LIFETIME);
         // A keyed notice takes over its key's entry, whatever either says, so
         // a key never holds more than one. An unkeyed one only collapses onto
         // an identical message. Scanning the whole log rather than only its
@@ -372,18 +380,50 @@ impl NoticeLog {
             expires_at,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            // The oldest entry of the lowest severity present goes first, so a
-            // run of confirmations or warnings cannot push out a failure that
-            // nothing has resolved.
+            // The notice just recorded always stays: it is what the reader is
+            // being told now. Among the rest the oldest entry of the lowest
+            // severity goes first, so a run of confirmations or warnings
+            // cannot push out a failure that nothing has resolved.
+            let earlier = self.entries.len() - 1;
             let index = self
                 .entries
                 .iter()
+                .take(earlier)
                 .enumerate()
                 .min_by_key(|(_, entry)| entry.notice.severity)
                 .map(|(index, _)| index)
-                .expect("an overflowing log is not empty");
+                .expect("an overflowing log holds more than the new entry");
             self.entries.remove(index);
         }
+    }
+
+    /// Stops confirmations counting down from `now`; see `paused_at`.
+    fn pause(&mut self, now: Instant) {
+        self.paused_at.get_or_insert(now);
+    }
+
+    /// Lets confirmations count down again from where they stopped.
+    fn resume(&mut self, now: Instant) {
+        let Some(since) = self.paused_at.take() else {
+            return;
+        };
+        let paused = now.saturating_duration_since(since);
+        for expiry in self
+            .entries
+            .iter_mut()
+            .filter_map(|entry| entry.expires_at.as_mut())
+        {
+            *expiry += paused;
+        }
+    }
+
+    /// Whether retiring what is due by `now` would empty the log.
+    fn all_due(&self, now: Instant) -> bool {
+        self.paused_at.is_none()
+            && self
+                .entries
+                .iter()
+                .all(|entry| entry.expires_at.is_some_and(|expiry| expiry <= now))
     }
 
     /// Withdraws whatever `key` last reported, because its condition no
@@ -392,15 +432,26 @@ impl NoticeLog {
         self.entries.retain(|entry| entry.notice.key != Some(key));
     }
 
-    /// Retires every confirmation due by `now`.
+    /// Retires every confirmation due by `now`. Nothing is due while paused,
+    /// which also discards a timer that fired just before the pause began.
     fn expire(&mut self, now: Instant) {
+        if self.paused_at.is_some() {
+            return;
+        }
         self.entries
             .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
     }
 
-    /// When the next confirmation is due to retire, if any is waiting to.
+    /// When the next confirmation is due to retire: never while paused, and
+    /// never with no confirmation waiting, so neither arms a timer.
     fn next_expiry(&self) -> Option<Instant> {
-        self.entries.iter().filter_map(|entry| entry.expires_at).min()
+        if self.paused_at.is_some() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.expires_at)
+            .min()
     }
 
     fn dismiss(&mut self, id: u64) {
@@ -545,7 +596,7 @@ impl TransientNotice {
     }
 
     /// Ties the notice to the operation that raised it; see [`NoticeKey`].
-    fn keyed(mut self, key: NoticeKey) -> Self {
+    fn with_key(mut self, key: NoticeKey) -> Self {
         self.key = Some(key);
         self
     }
@@ -682,12 +733,34 @@ fn notice_surface_detail<'a>(
     severity: NoticeSeverity,
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> Element<'a, Message> {
+    notice_detail_text(severity, text).into()
+}
+
+/// A notice's underlying reason, kept to a few lines so one long error chain
+/// cannot crowd the rest of the notices out of the popup. The whole of it is
+/// in the log, which records every warning and error with its details.
+fn notice_surface_details<'a>(
+    severity: NoticeSeverity,
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> Element<'a, Message> {
+    notice_detail_text(severity, text)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            EllipsizeHeightLimit::Lines(NOTICE_DETAIL_LINES),
+        ))
+        .into()
+}
+
+const NOTICE_DETAIL_LINES: usize = 4;
+
+fn notice_detail_text<'a>(
+    severity: NoticeSeverity,
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> widget::SelectableText<'a> {
     widget::selectable_text(text)
         .size(design::TEXT_CAPTION)
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))
-        .into()
 }
 
 /// Button styling for a control inside a `notice_surface`.
@@ -4519,6 +4592,11 @@ pub enum Message {
     DismissAllNotices,
     /// The earliest confirmation in the notice log is due to retire.
     ExpireNotices,
+    /// Retires what is due, once it is known whether the notices control,
+    /// which goes away with the last notice, held keyboard focus.
+    RetireNotices {
+        control_focused: bool,
+    },
 }
 
 /// An application exit in progress.
@@ -11544,11 +11622,38 @@ impl Cagents {
         })
     }
 
-    /// How a notice names a pane: quoted, as its tab shows it. The notice log
-    /// is shared by every pane, so "this conversation" would not say which.
+    /// How a notice names a pane: quoted, by the title its tab shows, so a
+    /// terminal reads as its numbered tab rather than a name several tabs
+    /// share. The notice log is shared by every pane, so "this conversation"
+    /// would not say which.
     fn notice_pane_name(&self, card: CardId) -> Option<String> {
         self.card_state(card)
-            .map(|state| format!("“{}”", self.card_display_title(state)))
+            .map(|state| format!("“{}”", self.repository_chrome(state).0))
+    }
+
+    /// Withdraws reports about cards that are gone. A card leaves by many
+    /// paths - a close, a deleted worktree or channel, a sign-in's terminal
+    /// retiring, another client removing a shared pane - so this holds for
+    /// all of them in one place, after every update, rather than in each.
+    fn resolve_notices_for_closed_cards(&mut self) {
+        let closed = self
+            .notices
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.notice.key {
+                Some(key @ NoticeKey::ChatAttach(card))
+                    if self
+                        .card_state(card)
+                        .is_none_or(|state| !state.existence.is_open()) =>
+                {
+                    Some(key)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in closed {
+            self.notices.resolve(key);
+        }
     }
 
     /// Withdraws whatever `key` reported, because its condition no longer
@@ -11573,16 +11678,22 @@ impl Cagents {
             .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
             .map(|card| card.id)
             .collect::<HashSet<_>>();
-        let mut failure = None;
+        let mut failures = Vec::new();
         for (id, runtime) in &mut self.cards {
             let visible = workspace_visible && visible_cards.contains(id);
             let result = match runtime {
-                CardRuntime::Terminal(surface) => if visible {
+                // A terminal whose daemon connection has ended for good
+                // already says so in its pane, and the next attachment
+                // applies visibility as it starts, so there is nothing for
+                // this pass to report; that matches a disconnected chat.
+                CardRuntime::Terminal(surface) => match if visible {
                     surface.reveal()
                 } else {
                     surface.hide()
-                }
-                .map_err(|error| error.to_string()),
+                } {
+                    Ok(()) | Err(crate::terminal::TerminalSendError::Closed) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                },
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
@@ -11599,28 +11710,49 @@ impl Cagents {
                 | CardRuntime::Automations
                 | CardRuntime::Work => Ok(()),
             };
-            if failure.is_none() {
-                failure = result.err().map(|error| (*id, visible, error));
+            if let Err(error) = result {
+                failures.push((*id, visible, error));
             }
         }
-        // Visibility is reapplied on every pass, so a pass that reaches every
-        // pane is what resolves an earlier failure.
-        let Some((card, visible, error)) = failure else {
+        self.report_surface_visibility(failures);
+    }
+
+    /// Reports the panes one visibility pass could not reach, each as
+    /// `(card, whether it was being shown, why)`. Visibility is reapplied on
+    /// every pass, so a pass that reaches every pane is what resolves an
+    /// earlier failure.
+    fn report_surface_visibility(&mut self, mut failures: Vec<(CardId, bool, String)>) {
+        if failures.is_empty() {
             self.resolve_notice(NoticeKey::SurfaceVisibility);
             return;
+        }
+        // A pane left showing stale content is the failure the reader can
+        // see, so it is the one reported when both kinds happen together.
+        let showing = failures.iter().any(|(_, visible, _)| *visible);
+        failures.retain(|(_, visible, _)| *visible == showing);
+        // Named in saved card order, so which pane a notice leads with does
+        // not depend on how a hash map iterates; panes no longer saved come
+        // last, and ids break the tie.
+        failures.sort_by_cached_key(|(id, _, _)| (self.card_index(*id).unwrap_or(usize::MAX), *id));
+        let others = failures.len() - 1;
+        let (card, _, error) = failures.swap_remove(0);
+        let pane = self.notice_pane_name(card);
+        let subject = match (pane, others) {
+            (Some(pane), 0) => pane,
+            (None, 0) => "A pane".to_owned(),
+            (Some(pane), 1) => format!("{pane} and 1 other pane"),
+            (Some(pane), others) => format!("{pane} and {others} other panes"),
+            (None, others) => format!("{} panes", others + 1),
         };
-        let pane = self
-            .notice_pane_name(card)
-            .unwrap_or_else(|| "A pane".to_owned());
-        let message = if visible {
-            format!("{pane} may not show its latest content.")
-        } else {
-            format!("{pane} may keep updating while hidden.")
+        let message = match (showing, others) {
+            (true, 0) => format!("{subject} may not show its latest content."),
+            (true, _) => format!("{subject} may not show their latest content."),
+            (false, _) => format!("{subject} may keep updating while hidden."),
         };
         self.status = Some(
             TransientNotice::warning(message)
                 .with_details(error)
-                .keyed(NoticeKey::SurfaceVisibility),
+                .with_key(NoticeKey::SurfaceVisibility),
         );
     }
 
@@ -16899,10 +17031,8 @@ impl Application for Cagents {
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
             }
-            Message::ExpireNotices => {
-                self.notices.expire(Instant::now());
-                self.reconcile_notice_popup()
-            }
+            Message::ExpireNotices => self.expire_notices(),
+            Message::RetireNotices { control_focused } => self.retire_notices(control_focused),
             Message::DirectoryFilesLoaded {
                 key,
                 request,
@@ -17076,25 +17206,34 @@ impl Application for Cagents {
         self.sync_popup_keyboard_nav();
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
-        if let Some(notice) = self.status.take()
-            && !crate::daemon_health::replaces_notice(&notice.message)
-            && !notice
-                .details
-                .as_deref()
-                .is_some_and(crate::daemon_health::replaces_notice)
-        {
-            let details = notice.details.as_deref();
-            match notice.severity {
-                NoticeSeverity::Error => {
-                    tracing::error!(message = %notice.message, details, "application notice")
+        if let Some(notice) = self.status.take() {
+            if crate::daemon_health::replaces_notice(&notice.message)
+                || notice
+                    .details
+                    .as_deref()
+                    .is_some_and(crate::daemon_health::replaces_notice)
+            {
+                // The banner speaks for this outcome now, so an earlier report
+                // under the same key would only be giving an outdated reason.
+                if let Some(key) = notice.key {
+                    self.notices.resolve(key);
                 }
-                NoticeSeverity::Warning => {
-                    tracing::warn!(message = %notice.message, details, "application notice")
+            } else {
+                let details = notice.details.as_deref();
+                match notice.severity {
+                    NoticeSeverity::Error => {
+                        tracing::error!(message = %notice.message, details, "application notice")
+                    }
+                    NoticeSeverity::Warning => {
+                        tracing::warn!(message = %notice.message, details, "application notice")
+                    }
+                    NoticeSeverity::Success => {}
                 }
-                NoticeSeverity::Success => {}
+                self.notices.record(notice);
             }
-            self.notices.record(notice);
         }
+        self.resolve_notices_for_closed_cards();
+        self.sync_notice_countdown();
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
@@ -20726,13 +20865,13 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("Exact native chat not found")
-                .keyed(key),
+                .with_key(key),
         );
         let first = log.recent().next().unwrap().id;
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .keyed(key),
+                .with_key(key),
         );
         assert_eq!(log.len(), 2, "re-raising a key replaces its report");
         let replaced = log.recent().next().unwrap();
@@ -20742,16 +20881,16 @@ mod tests {
         log.record(
             TransientNotice::error("Could not reopen “Fix parser”.")
                 .with_details("daemon refused")
-                .keyed(key),
+                .with_key(key),
         );
         assert_eq!(log.recent().next().unwrap().repeats, 2);
 
         // Another object's report under the same operation is its own.
         let other = NoticeKey::ChatAttach(CardId::new());
-        log.record(TransientNotice::error("Could not reopen “Other”.").keyed(other));
+        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other));
         assert_eq!(log.len(), 3);
 
-        log.record(TransientNotice::success("Reopened.").keyed(key));
+        log.record(TransientNotice::success("Reopened.").with_key(key));
         assert_eq!(log.len(), 3, "the success takes the failure's place");
         assert!(
             log.recent()
@@ -20790,7 +20929,10 @@ mod tests {
         assert_eq!(log.next_expiry(), Some(later + NOTICE_SUCCESS_LIFETIME));
 
         // A repeat of a confirmation is a fresh one, and waits afresh.
-        log.record_at(TransientNotice::success("Copied."), later + Duration::from_secs(5));
+        log.record_at(
+            TransientNotice::success("Copied."),
+            later + Duration::from_secs(5),
+        );
         log.expire(later + NOTICE_SUCCESS_LIFETIME);
         assert_eq!(log.len(), 3);
 
@@ -20818,6 +20960,66 @@ mod tests {
             .map(|entry| entry.notice.message.as_str())
             .collect::<Vec<_>>();
         assert_eq!(remaining, ["May be stale", "Still disconnected"]);
+    }
+
+    /// Overflow never takes the notice that caused it: that is what the
+    /// reader is being told now, whatever is already waiting.
+    #[test]
+    fn the_newest_notice_survives_a_full_log_of_worse_ones() {
+        let mut log = NoticeLog::default();
+        for index in 0..NOTICE_LOG_CAPACITY {
+            log.record(TransientNotice::error(format!("error {index}")));
+        }
+        log.record(TransientNotice::warning("May be stale"));
+        assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[0], "May be stale");
+        assert!(!messages.contains(&"error 0"), "the oldest error made room");
+        assert!(messages.contains(&"error 1"));
+
+        log.record(TransientNotice::success("Copied."));
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[0], "Copied.");
+        // Once no longer newest, the warning is the lowest severity left.
+        assert!(!messages.contains(&"May be stale"));
+        assert!(messages.contains(&"error 1"));
+    }
+
+    /// A paused countdown neither retires anything nor arms a timer, and
+    /// resumes where it stopped: a confirmation gets its whole lifetime of
+    /// unpaused time, including one raised during the pause.
+    #[test]
+    fn a_paused_countdown_resumes_where_it_stopped() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut log = NoticeLog::default();
+        log.record_at(TransientNotice::success("Account added."), start);
+        assert_eq!(log.next_expiry(), Some(at(6)));
+
+        log.pause(at(2));
+        log.pause(at(3));
+        assert_eq!(log.next_expiry(), None, "no timer runs while paused");
+        assert!(!log.all_due(at(100)));
+        log.record_at(TransientNotice::success("Copied."), at(4));
+        log.expire(at(100));
+        assert_eq!(log.len(), 2, "nothing retires while paused");
+
+        // Paused from 2 s to 10 s: the first had 4 s left, the second all 6.
+        log.resume(at(10));
+        assert_eq!(log.next_expiry(), Some(at(14)));
+        log.expire(at(14));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.next_expiry(), Some(at(16)));
+        assert!(!log.all_due(at(15)));
+        assert!(log.all_due(at(16)));
+        log.resume(at(20));
+        assert_eq!(log.next_expiry(), Some(at(16)), "resuming twice is a no-op");
     }
 
     /// The log is what keeps a report from being overwritten by the next one,
@@ -20867,7 +21069,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(messages.contains(&"first failure"));
         assert!(!messages.contains(&"failure 0"));
-        assert_eq!(messages[0], format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1));
+        assert_eq!(
+            messages[0],
+            format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1)
+        );
 
         log.clear();
         assert!(log.is_empty());
@@ -22783,6 +22988,102 @@ mod tests {
         (app, id, directory)
     }
 
+    /// A terminal whose daemon connection has ended for good - its client
+    /// gives up once a killed daemon stays gone - says so in its own pane,
+    /// and the attachment that replaces it applies visibility as it starts,
+    /// so telling it whether it is on screen cannot fail in a way worth a
+    /// notice.
+    #[test]
+    fn a_terminal_whose_connection_ended_raises_no_visibility_notice() {
+        let (mut app, card, _directory) = live_agent_app("sh");
+        let Some(CardRuntime::Terminal(surface)) = app.cards.get(&card) else {
+            unreachable!();
+        };
+        surface.stop_for_test();
+        assert!(matches!(
+            surface.hide(),
+            Err(crate::terminal::TerminalSendError::Closed)
+        ));
+        app.set_workspace_surfaces_visible(false);
+        app.set_workspace_surfaces_visible(true);
+        assert!(
+            app.status.is_none(),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+    }
+
+    /// A visibility failure names the same pane however the runtimes happen
+    /// to be stored, says how many others failed with it, and reports the
+    /// panes left showing stale content ahead of those left updating.
+    #[test]
+    fn a_visibility_notice_names_panes_in_card_order() {
+        let mut app = context_inspector_test_app(false);
+        let cards = ["Build", "Logs", "Shell"].map(|title| {
+            let mut card = terminal_card_state();
+            card.title = title.into();
+            card
+        });
+        let [a, b, c] = cards.each_ref().map(|card| card.id);
+        app.durable = Arc::new(WorkspaceState {
+            cards: cards.into(),
+            ..WorkspaceState::default()
+        });
+        let name = |app: &Cagents, card| app.notice_pane_name(card).unwrap();
+        let reported = |app: &Cagents| {
+            let notice = app.status.as_ref().expect("a visibility notice");
+            assert_eq!(notice.key, Some(NoticeKey::SurfaceVisibility));
+            (notice.message.clone(), notice.details.clone().unwrap())
+        };
+
+        for failures in [
+            vec![(c, true, "c"), (a, false, "a"), (b, true, "b")],
+            vec![(b, true, "b"), (c, true, "c"), (a, false, "a")],
+        ] {
+            app.report_surface_visibility(
+                failures
+                    .into_iter()
+                    .map(|(card, visible, error)| (card, visible, error.to_owned()))
+                    .collect(),
+            );
+            assert_eq!(
+                reported(&app),
+                (
+                    format!(
+                        "{} and 1 other pane may not show their latest content.",
+                        name(&app, b)
+                    ),
+                    "b".to_owned()
+                )
+            );
+        }
+
+        app.report_surface_visibility(vec![
+            (c, true, "c".into()),
+            (b, true, "b".into()),
+            (a, true, "a".into()),
+        ]);
+        assert_eq!(
+            reported(&app).0,
+            format!(
+                "{} and 2 other panes may not show their latest content.",
+                name(&app, a)
+            )
+        );
+        app.report_surface_visibility(vec![(c, true, "c".into())]);
+        assert_eq!(
+            reported(&app).0,
+            format!("{} may not show its latest content.", name(&app, c))
+        );
+        app.report_surface_visibility(vec![(a, false, "a".into())]);
+        assert_eq!(
+            reported(&app).0,
+            format!("{} may keep updating while hidden.", name(&app, a))
+        );
+        app.report_surface_visibility(Vec::new());
+        assert!(app.status.is_none(), "a clean pass withdraws the notice");
+    }
+
     #[test]
     fn terminal_review_revision_acknowledges_same_card_cancellation_and_focus_switch() {
         let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
@@ -23059,14 +23360,11 @@ mod tests {
             "the terminal surface is still what the card draws"
         );
         assert!(
-            app.notices
-                .entries
-                .iter()
-                .any(|entry| entry
-                    .notice
-                    .details
-                    .as_deref()
-                    .is_some_and(|details| details.contains("refused the handoff"))),
+            app.notices.entries.iter().any(|entry| entry
+                .notice
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("refused the handoff"))),
             "the refusal is recorded as a notice, not a process abort: {:?}",
             app.notices.entries
         );

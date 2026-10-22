@@ -2545,6 +2545,8 @@ impl Cagents {
             Action::LinkCancel => {
                 if !self.account_ui.table.linking {
                     self.account_ui.table.link = None;
+                    // Giving up on the link is an answer to why it failed.
+                    self.resolve_notice(NoticeKey::AccountLink);
                 }
                 Task::none()
             }
@@ -2556,7 +2558,7 @@ impl Cagents {
                         self.account_ui.table.link = None;
                         self.status = Some(
                             TransientNotice::success("Existing account home added.")
-                                .keyed(NoticeKey::AccountLink),
+                                .with_key(NoticeKey::AccountLink),
                         );
                         let id = self
                             .account_ui
@@ -2571,7 +2573,7 @@ impl Cagents {
                         self.status = Some(
                             TransientNotice::error("Could not use that account home.")
                                 .with_details(error)
-                                .keyed(NoticeKey::AccountLink),
+                                .with_key(NoticeKey::AccountLink),
                         );
                         Task::none()
                     }
@@ -3795,7 +3797,7 @@ impl Cagents {
                             "{} could not say which account signed in. cagents will check again the next time it starts.",
                             probe::cli_name(login.provider)
                         ))
-                        .keyed(NoticeKey::SignIn(key)),
+                        .with_key(NoticeKey::SignIn(key)),
                     );
                 }
                 return Task::none();
@@ -3812,6 +3814,8 @@ impl Cagents {
                     < crate::account::home::ORPHAN_AGE.as_millis() as Millis
             {
                 self.account_ui.logins.remove(index);
+                // No longer this window's sign-in, so not its to report on.
+                self.resolve_notice(NoticeKey::SignIn(key));
                 return Task::none();
             }
             login.phase = LoginPhase::Settling;
@@ -3914,7 +3918,7 @@ impl Cagents {
                         login.provider.label()
                     ))
                     .with_details(error.clone())
-                    .keyed(NoticeKey::SignIn(key)),
+                    .with_key(NoticeKey::SignIn(key)),
                 );
                 return Task::none();
             }
@@ -3944,7 +3948,7 @@ impl Cagents {
                 }
                 self.status = Some(
                     TransientNotice::success(format!("{name} was added."))
-                        .keyed(NoticeKey::SignIn(key)),
+                        .with_key(NoticeKey::SignIn(key)),
                 );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
@@ -3959,7 +3963,7 @@ impl Cagents {
                     .unwrap_or_else(|| "an account you already have".into());
                 self.status = Some(
                     TransientNotice::warning(format!("That login is already added as {name}."))
-                        .keyed(NoticeKey::SignIn(key)),
+                        .with_key(NoticeKey::SignIn(key)),
                 );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
@@ -3978,7 +3982,7 @@ impl Cagents {
                         login.provider.label()
                     ))
                     .with_details(error)
-                    .keyed(NoticeKey::SignIn(key)),
+                    .with_key(NoticeKey::SignIn(key)),
                 );
                 Task::none()
             }
@@ -7889,11 +7893,33 @@ mod app_tests {
         assert_eq!(app.account_ui.display_name(state), "new@example.com");
     }
 
+    /// A failed link says why, and stops saying it once the reader gives up
+    /// on the link.
+    #[test]
+    fn cancelling_a_failed_link_withdraws_its_error() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::AccountUi(Action::LinkStart(Provider::Claude)));
+        let _ = app.update(Message::AccountUi(Action::LinkReady {
+            key: uuid::Uuid::new_v4(),
+            result: Err("no credentials in that directory".into()),
+        }));
+        let notices = app
+            .notices
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(notices, ["Could not use that account home."]);
+        let _ = app.update(Message::AccountUi(Action::LinkCancel));
+        assert!(app.notices.is_empty());
+    }
+
     /// Each retry of a sign-in's save replaces the warning before it, and the
     /// save that lands replaces the warning with a confirmation.
     #[test]
     fn a_saved_sign_in_replaces_its_retry_warning() {
         let mut app = context_inspector_test_app(false);
+        // Confirmations count down only in the foreground window.
+        app.refresh_ui.focused = true;
         let key = pending_login(&mut app, 14);
         for (attempt, error) in [(1, "auth terminal is still closing"), (2, "reply lost")] {
             app.account_ui.logins[0].phase = LoginPhase::Settling;
@@ -7903,7 +7929,11 @@ mod app_tests {
                 result: Err(error.into()),
             }));
         }
-        assert_eq!(app.notices.len(), 1, "a retry replaces the warning before it");
+        assert_eq!(
+            app.notices.len(),
+            1,
+            "a retry replaces the warning before it"
+        );
         let mut registry = app.account_ui.registry.clone();
         registry
             .register(

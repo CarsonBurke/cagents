@@ -588,25 +588,59 @@ mod tests {
         assert!(app.context_inspector_overlay_active);
     }
 
+    fn focus_main_window(app: &mut Cagents, focused: bool) {
+        app.core
+            .set_main_window_id(Some(cosmic::iced::window::Id::RESERVED));
+        let _ = app.update(Message::RefreshUi(
+            super::super::refresh_ui::Action::Focused(cosmic::iced::window::Id::RESERVED, focused),
+        ));
+        assert_eq!(app.refresh_ui.focused, focused);
+    }
+
     /// The expiry timer runs only while a confirmation is waiting to retire
-    /// and the reader is not looking at the notices; it fires as a message
-    /// that retires what is due.
+    /// and someone could be reading it: the window in the foreground and the
+    /// notices closed. It fires as a message that retires what is due.
     #[test]
-    fn confirmations_retire_only_while_the_notices_are_closed() {
+    fn confirmations_retire_only_while_someone_could_read_them() {
         let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
         app.notices.record(TransientNotice::error("Still failing."));
-        assert_eq!(app.notice_expiry_deadline(), None, "an idle window arms no timer");
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "an idle window arms no timer"
+        );
         let recorded = Instant::now();
         app.notices
             .record_at(TransientNotice::success("Account added."), recorded);
         let due = recorded + NOTICE_SUCCESS_LIFETIME;
-        assert_eq!(app.notice_expiry_deadline(), Some(due));
+        assert_eq!(app.notices.next_expiry(), Some(due));
 
-        let _ = app.update_chrome(Action::ToggleNotices);
+        let _ = app.update(Message::ChromeUi(Action::ToggleNotices));
         assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
-        assert_eq!(app.notice_expiry_deadline(), None, "nothing retires while read");
-        let _ = app.update_chrome(Action::Close);
-        assert_eq!(app.notice_expiry_deadline(), Some(due));
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "nothing retires while read"
+        );
+        // A timer that fired just before the popup opened changes nothing.
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        let _ = app.update(Message::ChromeUi(Action::Close));
+        let resumed = app.notices.next_expiry().expect("the countdown resumes");
+        assert!(resumed >= due, "the time spent reading is not counted");
+
+        focus_main_window(&mut app, false);
+        assert_eq!(app.notices.next_expiry(), None, "nothing retires unseen");
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        focus_main_window(&mut app, true);
+        assert!(
+            app.notices
+                .next_expiry()
+                .is_some_and(|next| next >= resumed)
+        );
 
         // Backdated, so the repeat is already due when the timer fires.
         app.notices.record_at(
@@ -616,7 +650,137 @@ mod tests {
         let _ = app.update(Message::ExpireNotices);
         assert_eq!(app.notices.len(), 1);
         assert_eq!(app.notices.severity(), Some(NoticeSeverity::Error));
-        assert_eq!(app.notice_expiry_deadline(), None);
+        assert_eq!(app.notices.next_expiry(), None);
+    }
+
+    /// Runs `task`'s widget operations against the notices control, holding
+    /// the keyboard or not, and the inspector toggle. Returns the messages it
+    /// produced and whether it moved the keyboard to the toggle.
+    fn run_notice_task(task: Task<Message>, control_focused: bool) -> (Vec<Message>, bool) {
+        use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
+        use cosmic::iced::futures::StreamExt;
+
+        struct Control(bool);
+        impl Focusable for Control {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        let control_id = widget::Id::new(NOTICES_CONTROL_ID);
+        let toggle_id = context_inspector_toggle_id();
+        let mut control = Control(control_focused);
+        let mut toggle = Control(false);
+        let mut messages = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                match action {
+                    cosmic::iced::runtime::Action::Widget(operation) => {
+                        let mut next = Some(operation);
+                        while let Some(mut operation) = next.take() {
+                            let bounds = cosmic::iced::Rectangle::default();
+                            operation.focusable(Some(&control_id), bounds, &mut control);
+                            operation.focusable(Some(&toggle_id), bounds, &mut toggle);
+                            if let Outcome::Chain(chained) = operation.finish() {
+                                next = Some(chained);
+                            }
+                        }
+                    }
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        runtime.shutdown_background();
+        (messages, toggle.0)
+    }
+
+    /// The notices control goes away with the last notice. When a
+    /// confirmation retiring on its own takes it while it holds the keyboard,
+    /// the keyboard moves to the inspector toggle beside it rather than to
+    /// nowhere; otherwise it stays where it is.
+    #[test]
+    fn retiring_the_last_notice_moves_the_keyboard_off_its_control() {
+        for control_focused in [true, false] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            focus_main_window(&mut app, true);
+            app.notices.record_at(
+                TransientNotice::success("Copied."),
+                Instant::now() - NOTICE_SUCCESS_LIFETIME,
+            );
+            let query = app.update(Message::ExpireNotices);
+            assert_eq!(app.notices.len(), 1, "it asks about focus before retiring");
+            let (mut messages, moved) = run_notice_task(query, control_focused);
+            assert!(!moved);
+            assert!(
+                matches!(
+                    messages.as_slice(),
+                    [Message::RetireNotices { control_focused: answer }]
+                        if *answer == control_focused
+                ),
+                "{messages:?}"
+            );
+            let retire = app.update(messages.pop().unwrap());
+            assert!(app.notices.is_empty());
+            let (_, moved) = run_notice_task(retire, true);
+            assert_eq!(moved, control_focused);
+        }
+
+        // A tree without the control answers nothing; the retirement still
+        // happens.
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let query = app.update(Message::ExpireNotices);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let messages = runtime.block_on(async {
+            use cosmic::iced::futures::StreamExt;
+            let mut messages = Vec::new();
+            let mut stream = cosmic::iced::runtime::task::into_stream(query).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    // Nothing in this tree answers the query.
+                    cosmic::iced::runtime::Action::Widget(operation) => drop(operation),
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+            messages
+        });
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::RetireNotices {
+                    control_focused: false
+                }]
+            ),
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -1117,6 +1281,7 @@ mod tab_style_tests {
     }
 }
 
+const NOTICES_CONTROL_ID: &str = "chrome.notices";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
 
@@ -1508,7 +1673,7 @@ impl Cagents {
                 popup.map_or_else(Task::none, |popup| {
                     iced::widget::operation::focus(widget::Id::new(match popup {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
-                        Popup::Notices => "chrome.notices",
+                        Popup::Notices => NOTICES_CONTROL_ID,
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -1610,23 +1775,65 @@ impl Cagents {
     }
 
     /// Wakes the shell when the earliest confirmation is due to retire, and
-    /// never otherwise: with nothing waiting to retire there is no timer.
-    ///
-    /// Nothing retires while the reader has the notices open, so an entry
-    /// does not vanish from under the pointer or the keyboard; whatever came
-    /// due meanwhile goes as soon as the popup closes.
+    /// never otherwise: with nothing waiting to retire, or the countdown
+    /// paused, there is no timer.
     pub(super) fn notice_expiry_subscription(&self) -> Subscription<Message> {
-        self.notice_expiry_deadline()
+        self.notices
+            .next_expiry()
             .map_or_else(Subscription::none, |deadline| {
                 Subscription::run_with(NoticeExpiry(deadline), notice_expiry_stream)
             })
     }
 
-    fn notice_expiry_deadline(&self) -> Option<Instant> {
-        if self.chrome_ui.popup == Some(Popup::Notices) {
-            return None;
+    /// Confirmations count down only while someone could be reading them as
+    /// they appear: with the main window in the foreground and the notices
+    /// closed. While the notices are open nothing retires, so an entry does
+    /// not vanish from under the pointer or the keyboard; and a confirmation
+    /// raised behind another window is still there when the user returns.
+    /// Either way the countdown carries on from where it stopped.
+    pub(super) fn sync_notice_countdown(&mut self) {
+        let now = Instant::now();
+        if self.refresh_ui.focused && self.chrome_ui.popup != Some(Popup::Notices) {
+            self.notices.resume(now);
+        } else {
+            self.notices.pause(now);
         }
-        self.notices.next_expiry()
+    }
+
+    /// Retires the confirmations that are due. When that would take the last
+    /// notice, and with it the notices control, it first asks whether the
+    /// control holds keyboard focus so focus can move somewhere that stays.
+    pub(super) fn expire_notices(&mut self) -> Task<Message> {
+        let now = Instant::now();
+        let removes_control = !self.notices.is_empty()
+            && self.notices.all_due(now)
+            && !self
+                .save_health
+                .as_ref()
+                .is_some_and(SaveHealthState::is_visible);
+        if removes_control {
+            // Collected, because a tree without the control answers nothing
+            // at all, and the confirmations must retire regardless.
+            return iced::widget::operation::is_focused(widget::Id::new(NOTICES_CONTROL_ID))
+                .collect()
+                .map(|answers| {
+                    cosmic::Action::App(Message::RetireNotices {
+                        control_focused: answers.contains(&true),
+                    })
+                });
+        }
+        self.retire_notices(false)
+    }
+
+    pub(super) fn retire_notices(&mut self, control_focused: bool) -> Task<Message> {
+        // A pause that began since the focus query (the popup opened, the
+        // window lost focus) makes this a no-op; the countdown resumes later.
+        self.notices.expire(Instant::now());
+        if control_focused && !self.has_chrome_notices() {
+            return iced::widget::operation::focus(context_inspector_toggle_id())
+                .map(cosmic::Action::App);
+        }
+        self.reconcile_notice_popup()
     }
 
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
@@ -1668,7 +1875,7 @@ impl Cagents {
         )
         .selected(self.chrome_ui.popup == Some(Popup::Notices))
         .on_press_maybe((!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)))
-        .id(widget::Id::new("chrome.notices"))
+        .id(widget::Id::new(NOTICES_CONTROL_ID))
         .tone(design::Tone::Themed(match severity {
             NoticeSeverity::Success => design::success_color,
             NoticeSeverity::Warning => design::warning_color,
@@ -1681,7 +1888,7 @@ impl Cagents {
                     let severity = entry.notice.severity;
                     let mut lines = vec![super::notice_body(&entry.notice.message)];
                     if let Some(details) = &entry.notice.details {
-                        lines.push(super::notice_surface_detail(severity, details));
+                        lines.push(super::notice_surface_details(severity, details));
                     }
                     if entry.repeats > 1 {
                         lines.push(super::notice_surface_detail(
