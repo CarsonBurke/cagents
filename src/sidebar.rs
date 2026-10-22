@@ -11741,7 +11741,7 @@ pub(crate) mod tests {
         },
     };
     use cosmic::iced::{
-        Size,
+        Rectangle, Size,
         advanced::{Layout, layout, widget::Tree},
     };
     use uuid::Uuid;
