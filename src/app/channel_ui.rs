@@ -856,8 +856,7 @@ impl Cagents {
                 continue;
             }
             self.retire_lsp_card(card);
-            self.sidebar_state.clear_agent_activity(card);
-            self.sidebar_state.acknowledge_agent_update(card);
+            self.sidebar_state.forget_card_attention(card);
             if passive {
                 self.shared_chat_detach(card);
             } else {
