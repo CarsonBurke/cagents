@@ -310,6 +310,7 @@ impl RenderedEnd {
             && travel > 0.0
             && self.offset.x.is_finite()
             && self.offset.y.is_finite()
+            && self.offset.y > 0.0
             && self.offset.y == travel.round()
             && translation.x.is_finite()
             && translation.y.is_finite()
@@ -1665,6 +1666,19 @@ mod tests {
         let clip = native.viewport;
         assert!(!enclosed_caret_row(row, clip, native.offset));
         assert!(native.contains_caret(row, clip, native.offset));
+        let tiny = RenderedEnd {
+            viewport: Rectangle {
+                height: 400.0_f32.next_down().next_down(),
+                ..native.viewport
+            },
+            content: native.viewport,
+            offset: Vector::ZERO,
+        };
+        let tiny_row = Rectangle::new(Point::new(0.0, 380.0), Size::new(0.0, 20.0));
+        assert!(tiny.content.height - tiny.viewport.height > 0.0);
+        assert_eq!((tiny.content.height - tiny.viewport.height).round(), 0.0);
+        assert!(!enclosed_caret_row(tiny_row, tiny.viewport, Vector::ZERO));
+        assert!(!tiny.contains_caret(tiny_row, tiny.viewport, Vector::ZERO));
         for trim in [1.0, 2.0, 40.0] {
             let offset = Vector::new(0.0, native.offset.y - trim);
             assert!(!RenderedEnd { offset, ..native }.contains_caret(row, clip, offset));
