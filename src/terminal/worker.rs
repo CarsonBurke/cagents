@@ -2867,7 +2867,7 @@ impl Worker {
                 }
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
-                    let path = working_directory_path(raw, local_host_name());
+                    let path = working_directory_path(raw, crate::file_url::host_name().as_deref());
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
                         self.publish_fallback_title();
@@ -4099,39 +4099,12 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
     }
 }
 
-fn local_host_name() -> Option<&'static str> {
-    static NAME: OnceLock<Option<String>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let mut buffer = [0u8; 256];
-        // SAFETY: gethostname receives a valid writable buffer and its size.
-        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-            return None;
-        }
-        // An unterminated truncated hostname must not match a different host.
-        std::ffi::CStr::from_bytes_until_nul(&buffer)
-            .ok()?
-            .to_str()
-            .ok()
-            .map(str::to_owned)
-    })
-    .as_deref()
-}
-
 fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf> {
-    if let Ok(uri) = url::Url::parse(raw) {
+    if let Ok(mut uri) = url::Url::parse(raw) {
         if uri.scheme() != "file" {
             return None;
         }
-        if uri
-            .host_str()
-            .zip(local_host)
-            .is_some_and(|(host, local)| host.eq_ignore_ascii_case(local))
-        {
-            return url::Url::parse(&format!("file://{}", uri.path()))
-                .ok()?
-                .to_file_path()
-                .ok();
-        }
+        crate::file_url::localize(&mut uri, local_host);
         uri.to_file_path().ok()
     } else {
         let path = PathBuf::from(raw);
