@@ -282,3 +282,7 @@ harfrust = { path = "vendor/harfrust" }
 [patch."https://github.com/wash2/accesskit"]
 accesskit_unix = { path = "vendor/accesskit-unix" }
 accesskit_atspi_common = { path = "vendor/accesskit-atspi-common" }
+
+# Keep the clipboard worker alive when an input device is removed (#1464).
+[patch."https://github.com/pop-os/smithay-clipboard"]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }

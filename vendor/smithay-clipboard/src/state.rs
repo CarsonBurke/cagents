@@ -19,7 +19,7 @@ use sctk::primary_selection::PrimarySelectionManagerState;
 use sctk::reexports::client::protocol::wl_output::WlOutput;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::registry::{ProvidesRegistryState, RegistryState};
-use sctk::seat::pointer::{PointerData, PointerEvent, PointerEventKind, PointerHandler};
+use sctk::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use sctk::seat::{Capability, SeatHandler, SeatState};
 use sctk::shm::multi::MultiPool;
 use sctk::shm::{Shm, ShmHandler};
@@ -150,20 +150,23 @@ impl<T: 'static + Clone> State<T> {
         match ty {
             Target::Clipboard => {
                 let mgr = self.data_device_manager_state.as_ref()?;
+                // Selection devices are gone while the seat has no keyboard.
+                let device = seat.data_device.as_ref()?;
                 let mime_types = contents.available();
                 self.data_selection_content = contents;
                 let source = mgr.create_copy_paste_source(&self.queue_handle, mime_types.iter());
                 self.data_selection_mime_types = Rc::new(mime_types);
-                source.set_selection(seat.data_device.as_ref().unwrap(), seat.latest_serial);
+                source.set_selection(device, seat.latest_serial);
                 self.data_sources.push(source);
             },
             Target::Primary => {
                 let mgr = self.primary_selection_manager_state.as_ref()?;
+                let device = seat.primary_device.as_ref()?;
                 let mime_types = contents.available();
                 self.primary_selection_content = contents;
                 let source = mgr.create_selection_source(&self.queue_handle, mime_types.iter());
                 self.primary_selection_mime_types = Rc::new(mime_types);
-                source.set_selection(seat.primary_device.as_ref().unwrap(), seat.latest_serial);
+                source.set_selection(device, seat.latest_serial);
                 self.primary_sources.push(source);
             },
         }
@@ -317,7 +320,10 @@ impl<T: 'static + Clone> SeatHandler for State<T> {
         seat: WlSeat,
         capability: Capability,
     ) {
-        let seat_state = self.seats.get_mut(&seat.id()).unwrap();
+        // Capability events can still be queued for a seat that was removed.
+        let Some(seat_state) = self.seats.get_mut(&seat.id()) else {
+            return;
+        };
 
         match capability {
             Capability::Keyboard => {
@@ -356,11 +362,16 @@ impl<T: 'static + Clone> SeatHandler for State<T> {
         seat: WlSeat,
         capability: Capability,
     ) {
-        let seat_state = self.seats.get_mut(&seat.id()).unwrap();
+        let Some(seat_state) = self.seats.get_mut(&seat.id()) else {
+            return;
+        };
         match capability {
             Capability::Keyboard => {
                 seat_state.data_device = None;
                 seat_state.primary_device = None;
+                // Without a keyboard there is no keyboard focus, as after a leave.
+                seat_state.latest_serial = 0;
+                seat_state.has_focus = false;
 
                 if let Some(keyboard) = seat_state.keyboard.take() {
                     if keyboard.version() >= 3 {
@@ -392,11 +403,15 @@ impl<T: 'static + Clone> PointerHandler for State<T> {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        let seat = pointer.data::<PointerData>().unwrap().seat();
-        let seat_id = seat.id();
-        let seat_state = match self.seats.get_mut(&seat_id) {
-            Some(seat_state) => seat_state,
-            None => return,
+        // Events can still be queued for a pointer that `remove_capability`
+        // released. It belongs to no seat, and the proxy rebuilt for its events
+        // has no user data.
+        let Some((seat_id, seat_state)) = self
+            .seats
+            .iter_mut()
+            .find(|(_, seat_state)| seat_state.pointer.as_ref() == Some(pointer))
+        else {
+            return;
         };
 
         let mut updated_serial = false;
@@ -413,7 +428,7 @@ impl<T: 'static + Clone> PointerHandler for State<T> {
 
         // Only update the seat we're using when the serial got updated.
         if updated_serial {
-            self.latest_seat = Some(seat_id);
+            self.latest_seat = Some(seat_id.clone());
         }
     }
 }
@@ -612,7 +627,7 @@ impl<T: 'static + Clone> PrimarySelectionSourceHandler for State<T> {
 impl<T: 'static + Clone> Dispatch<WlKeyboard, ObjectId, State<T>> for State<T> {
     fn event(
         state: &mut State<T>,
-        _: &WlKeyboard,
+        keyboard: &WlKeyboard,
         event: <WlKeyboard as sctk::reexports::client::Proxy>::Event,
         data: &ObjectId,
         _: &Connection,
@@ -620,8 +635,9 @@ impl<T: 'static + Clone> Dispatch<WlKeyboard, ObjectId, State<T>> for State<T> {
     ) {
         use sctk::reexports::client::protocol::wl_keyboard::Event as WlKeyboardEvent;
         let seat_state = match state.seats.get_mut(data) {
-            Some(seat_state) => seat_state,
-            None => return,
+            // Ignore events still queued for a keyboard that was released.
+            Some(seat_state) if seat_state.keyboard.as_ref() == Some(keyboard) => seat_state,
+            _ => return,
         };
         match event {
             WlKeyboardEvent::Key { serial, .. } | WlKeyboardEvent::Modifiers { serial, .. } => {

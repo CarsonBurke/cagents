@@ -4,6 +4,10 @@
 //! should have surface around.
 
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
+
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::io::Result;
