@@ -707,6 +707,8 @@ mod tests {
                 "ALTER TABLE native_actor_cursors RENAME COLUMN digest TO changed_digest;",
             ),
             (15, "DROP TABLE native_actor_retirements;"),
+            (16, "DROP TABLE automation_lifecycle;"),
+            (16, "DROP INDEX automation_lifecycle_scoped;"),
             (
                 15,
                 "ALTER TABLE native_actor_ownerships ADD COLUMN foreign_payload TEXT;",
@@ -747,7 +749,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15] {
+        for version in [13, 14, 15, 16] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -960,7 +962,7 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15] {
+        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
