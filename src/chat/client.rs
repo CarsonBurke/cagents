@@ -4601,6 +4601,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+        let mut metadata_clock = None;
         if visibility.is_some() {
             let state = handle.inner.publication.current.load_full();
             assert!(
@@ -4613,6 +4614,7 @@ mod tests {
                 "hidden metadata cannot authorize an append across eviction"
             );
             assert_eq!(state.clock.unwrap().sampled_at, 50_000);
+            metadata_clock = state.clock;
             if visibility == Some(true) {
                 resync_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 assert!(handle.resident_snapshot_with_clock().is_none());
@@ -4632,7 +4634,15 @@ mod tests {
                 visibility.is_none()
             );
         }
-        assert_eq!(clock.unwrap().sampled_at, 50_000);
+        assert_eq!(published.sampled_at, Some(50_000));
+        let clock = clock.unwrap();
+        if visibility == Some(true) {
+            let metadata_clock = metadata_clock.unwrap();
+            assert!(clock.received_at >= metadata_clock.received_at);
+            assert!(clock.at(clock.received_at) >= metadata_clock.at(clock.received_at));
+        } else {
+            assert_eq!(clock.sampled_at, 50_000);
+        }
         done_tx.send(()).unwrap();
         worker.join().unwrap();
     }
