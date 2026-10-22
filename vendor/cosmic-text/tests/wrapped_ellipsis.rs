@@ -136,3 +136,48 @@ fn authored_leading_spaces_are_preserved() {
         assert_eq!(glyph(&limited[0]), glyph(&ordinary[0]));
     }
 }
+
+#[test]
+fn an_overflowing_separator_stays_out_of_the_last_ellipsized_line() {
+    let mut fonts = font_system();
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    // A word wider than the line is retained whole under Word wrapping. Its
+    // following separator then overflows alone, rather than with the next
+    // word. Repeated blanks exercise the same boundary at ordinary widths.
+    for text in [
+        "Supercalifragilisticexpialidocious and then more words that wrap across several lines",
+        "Pack my box   with five dozen   liquor jugs. Sphinx of black quartz, judge my vow.",
+    ] {
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        for wrap in [Wrap::Word, Wrap::WordOrGlyph] {
+            for width in [60.0, 88.0, 110.0, 180.0] {
+                let ordinary = layout(&shaped, width, wrap, Ellipsize::None);
+                for count in [2, 3] {
+                    if ordinary.len() <= count {
+                        continue;
+                    }
+                    let limited = layout(
+                        &shaped,
+                        width,
+                        wrap,
+                        Ellipsize::End(EllipsizeHeightLimit::Lines(count)),
+                    );
+                    assert_eq!(limited.len(), count);
+                    let start = |line: &LayoutLine| {
+                        line.glyphs
+                            .iter()
+                            .filter(|glyph| glyph.start != glyph.end)
+                            .map(|glyph| glyph.start)
+                            .min()
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        start(&limited[count - 1]),
+                        start(&ordinary[count - 1]),
+                        "overflowing separator: {wrap:?}, width {width}, count {count}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}

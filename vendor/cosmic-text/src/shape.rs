@@ -2718,7 +2718,7 @@ impl ShapeLine {
                                         font_size,
                                         Some(SpanWordGlyphPos::with_wordglyph(
                                             span_index,
-                                            WordGlyphPos::new(i, 0),
+                                            WordGlyphPos::new(if word.blank { i + 1 } else { i }, 0),
                                         )),
                                         width_opt,
                                         ellipsize,
