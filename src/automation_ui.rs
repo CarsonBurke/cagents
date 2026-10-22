@@ -21,6 +21,15 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const PAGE: usize = 50;
+/// Narrower than this, the header stacks its view switcher under the title.
+const SINGLE_ROW_HEADER_WIDTH: f32 = 560.0;
+/// From this width the automation list sits beside the selection.
+const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
+const LIST_WIDTH: f32 = 240.0;
+/// The most of a narrow pane's height the stacked list takes from the
+/// selection below it, and the least it is given on a short pane.
+const STACKED_LIST_SHARE: f32 = 0.4;
+const STACKED_LIST_MIN_HEIGHT: f32 = 160.0;
 const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
@@ -74,6 +83,8 @@ pub enum Field {
 #[derive(Debug, Clone)]
 pub enum Action {
     Browse,
+    /// Leaves the open run for the automation or history it was opened from.
+    CloseRun,
     Tick,
     Refresh,
     More,
@@ -570,6 +581,40 @@ enum HistoryStatus {
     Loading,
     Loaded,
     Failed,
+}
+
+/// The pane's two peer views. A run opened from one stays inside it, so
+/// leaving the run returns there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Automations,
+    RunHistory,
+}
+
+impl Section {
+    const ALL: [Self; 2] = [Self::Automations, Self::RunHistory];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automations => "Automations",
+            Self::RunHistory => "Run history",
+        }
+    }
+
+    /// The tab's accessible name and tooltip.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Automations => "Automations and their schedules",
+            Self::RunHistory => "Runs of every automation, including removed ones",
+        }
+    }
+
+    fn enter(self) -> Action {
+        match self {
+            Self::Automations => Action::Browse,
+            Self::RunHistory => Action::AllHistory,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1311,6 +1356,7 @@ impl State {
                 }
             }
             Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
+            Action::CloseRun => self.run = None,
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(
@@ -1334,43 +1380,152 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        crate::ui_controls::responsive(move |size| self.view_layout(size.width)).into()
+        crate::ui_controls::responsive(move |size| self.view_layout(size)).into()
     }
 
-    fn view_layout(&self, width: f32) -> Element<'_, Action> {
+    /// Which of the pane's two views is on screen. A run keeps the view it
+    /// was opened from.
+    fn section(&self) -> Section {
+        if self.all_history {
+            Section::RunHistory
+        } else {
+            Section::Automations
+        }
+    }
+
+    /// The view switcher's tabs. The view on screen is selected and publishes
+    /// nothing; while a command is in flight neither tab does.
+    fn view_tabs(&self, busy: bool) -> Vec<crate::ui_controls::ViewTab<'static, Action>> {
+        let current = self.section();
+        Section::ALL
+            .into_iter()
+            .map(|section| crate::ui_controls::ViewTab {
+                label: section.label().into(),
+                description: section.description().into(),
+                count: None,
+                selected: section == current,
+                id: None,
+                on_press: (!busy && section != current).then(|| section.enter()),
+            })
+            .collect()
+    }
+
+    /// The levels above the open run, each a way back to it: the view it was
+    /// opened from, then its automation. A level that is still loaded behind
+    /// the run is returned to as it was rather than read again.
+    fn run_trail<'a>(&self, run: &'a RunDetail) -> [(&'a str, Action); 2] {
+        let section = self.section();
+        let automation = run.firing.automation;
+        [
+            (
+                section.label(),
+                match section {
+                    Section::RunHistory => Action::CloseRun,
+                    Section::Automations => Action::Browse,
+                },
+            ),
+            (
+                run.definition.name.as_str(),
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.id == automation)
+                {
+                    Action::CloseRun
+                } else {
+                    Action::Select(automation)
+                },
+            ),
+        ]
+    }
+
+    /// The pane's name and its view-level commands, above every layout so
+    /// they keep one place at every width. A draft or a confirmation keeps
+    /// only the name and progress: each carries its own way out and its own
+    /// primary action.
+    fn header(&self, busy: bool, width: f32) -> Element<'_, Action> {
+        let browsing = self.draft.is_none() && self.confirmation.is_none();
+        let mut identity = widget::row::with_capacity(4)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE))
+            .push(
+                crate::design::title("Automations")
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None),
+            );
+        let tabs = browsing.then(|| crate::ui_controls::view_tabs(self.view_tabs(busy), false));
+        // Side by side, the tab row's fill is the gap that pushes the
+        // commands to the trailing edge; stacked, a spacer does that.
+        let stacked = width < SINGLE_ROW_HEADER_WIDTH;
+        let tabs = match tabs {
+            Some(tabs) if !stacked => {
+                identity = identity.push(tabs);
+                None
+            }
+            tabs => {
+                identity = identity.push(widget::Space::new().width(Length::Fill));
+                tabs
+            }
+        };
+        if busy {
+            identity = identity.push(crate::interaction::tooltip(
+                widget::container(crate::ui_controls::activity_spinner(
+                    14.0,
+                    crate::design::muted_color,
+                ))
+                .center(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE)),
+                if self.history_status == HistoryStatus::Loading {
+                    "Loading run history…"
+                } else {
+                    "Updating automations…"
+                },
+            ));
+        } else if browsing {
+            identity = identity.push(
+                crate::ui_controls::icon_button(
+                    crate::ui_controls::Icon::Refresh,
+                    if self.run.is_some() {
+                        "Refresh run"
+                    } else if self.all_history {
+                        "Refresh run history"
+                    } else {
+                        "Refresh automations"
+                    },
+                )
+                .on_press(Action::Refresh),
+            );
+        }
+        if browsing {
+            identity = identity.push(
+                crate::ui_controls::button::primary("New automation")
+                    .on_press_maybe((!busy).then_some(Action::New)),
+            );
+        }
+        let mut header = widget::column::with_capacity(2)
+            .spacing(space::S)
+            .push(identity);
+        if let Some(tabs) = tabs {
+            header = header.push(tabs);
+        }
+        widget::container(header)
+            .padding([space::S, space::L])
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_layout(&self, size: cosmic::iced::Size) -> Element<'_, Action> {
+        let width = size.width;
         let busy = self
             .pending
             .is_some_and(|(_, pending)| !pending.background_read());
         let mut listing: Vec<Element<'_, Action>> = Vec::new();
-        let mut content = widget::column::with_children(vec![
-            widget::row::with_children(vec![
-                crate::design::title("Automations")
-                    .width(Length::Fill)
-                    .into(),
-                crate::interaction::tooltip(
-                    widget::container(if self.pending.is_some() {
-                        crate::ui_controls::activity_spinner(14.0, crate::design::warning_color)
-                    } else {
-                        widget::Space::new().into()
-                    })
-                    .center(Length::Fixed(f32::from(crate::design::ROW_ICON_SIZE))),
-                    if self.pending.is_none() {
-                        "Automations"
-                    } else if self.history_status == HistoryStatus::Loading {
-                        "Loading run history…"
-                    } else {
-                        "Updating automations…"
-                    },
-                ),
-            ])
-            .align_y(Alignment::Center)
-            .into(),
-            crate::design::body("Recurring agent work continues while this window is closed.")
-                .into(),
-        ])
-        .spacing(space::M)
-        .padding(space::L)
-        .width(Length::Fill);
+        // A pane that only states it is empty centers that statement rather
+        // than scrolling it.
+        let mut scrolls = true;
+        let mut content = widget::column::with_capacity(8)
+            .spacing(space::M)
+            .padding(space::L)
+            .width(Length::Fill);
         if let Some(error) = &self.error
             && self.draft.is_none()
         {
@@ -1418,30 +1573,8 @@ impl State {
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
-            content = content.push(
-                widget::row::with_children(vec![
-                    button("New automation", Action::New, !busy),
-                    button(
-                        "Automations",
-                        Action::Browse,
-                        !busy && (self.run.is_some() || self.all_history),
-                    ),
-                    button("Refresh", Action::Refresh, !busy),
-                    button("All run history", Action::AllHistory, !busy),
-                ])
-                .spacing(space::S)
-                .wrap(),
-            );
             if self.run.is_none() {
                 if !self.all_history {
-                    listing.push(
-                        crate::ui_controls::field::search(
-                            "Search loaded automations",
-                            &self.search,
-                        )
-                        .on_input(Action::Search)
-                        .into(),
-                    );
                     let query = self.search.to_lowercase();
                     for row in self.rows.iter().filter(|row| {
                         row.name.to_lowercase().contains(&query)
@@ -1494,14 +1627,40 @@ impl State {
                             listing.push(crate::design::caption(blocked).into());
                         }
                     }
-                    if self.rows.is_empty() {
-                        content = content.push(crate::design::body(
-                            "Create an automation to schedule work in an open project.",
-                        ));
+                    if listing.is_empty() && !self.rows.is_empty() {
+                        listing.push(
+                            crate::design::caption(if self.more {
+                                "No loaded automations match."
+                            } else {
+                                "No automations match."
+                            })
+                            .into(),
+                        );
                     }
                     if self.more {
-                        content =
-                            content.push(button("Load more automations", Action::More, !busy));
+                        listing.push(button("Load more automations", Action::More, !busy));
+                    }
+                    // A read in flight is announced by the header's progress,
+                    // so neither statement anticipates the list or selection
+                    // it is about to replace.
+                    let empty = match self.pending {
+                        _ if self.selected.is_some() => None,
+                        Some((_, Pending::List { append: false } | Pending::Show)) => None,
+                        _ if self.rows.is_empty() => Some(
+                            crate::ui_controls::placeholder("No automations yet")
+                                .icon(crate::ui_controls::Icon::Alarm.handle())
+                                .detail(
+                                    "Run an agent on a schedule in an open project. Automations keep running while this window is closed.",
+                                ),
+                        ),
+                        _ => Some(
+                            crate::ui_controls::placeholder("Select an automation")
+                                .detail("Its schedule, launch settings and runs appear here."),
+                        ),
+                    };
+                    if let Some(empty) = empty {
+                        scrolls = false;
+                        content = content.push(empty);
                     }
                     if let Some(selected) = &self.selected {
                         content = content
@@ -1619,6 +1778,11 @@ impl State {
                 }
             }
             if let Some(run) = &self.run {
+                content = content.push(breadcrumb(
+                    self.run_trail(run)
+                        .map(|(label, action)| (label, (!busy).then_some(action))),
+                    "Run",
+                ));
                 content = content
                     .push(crate::design::title(format!(
                         "{} · {}",
@@ -1678,35 +1842,78 @@ impl State {
                 );
             }
         }
-        let content: Element<'_, Action> = widget::scrollable(content)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into();
-        if listing.is_empty() {
-            return content;
-        }
-        let list = widget::scrollable(
-            widget::column::with_children(listing)
-                .spacing(space::XS)
-                .padding(space::S),
-        );
-        if width >= 700.0 {
-            widget::row::with_children(vec![
-                list.width(240).height(Length::Fill).into(),
-                crate::design::vertical_rule(),
-                content,
-            ])
-            .height(Length::Fill)
-            .into()
+        let content: Element<'_, Action> = if scrolls {
+            widget::scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into()
         } else {
-            widget::column::with_children(vec![
-                list.width(Length::Fill).height(200).into(),
-                crate::design::horizontal_rule(),
-                content,
+            content.height(Length::Fill).into()
+        };
+        let body = if listing.is_empty() {
+            content
+        } else {
+            let mut search = crate::ui_controls::field::search("Filter automations", &self.search)
+                .on_input(Action::Search)
+                .width(Length::Fill);
+            if !self.search.is_empty() {
+                search = search.trailing_icon(crate::ui_controls::field::clear(Action::Search(
+                    String::new(),
+                )));
+            }
+            let side_by_side = width >= SIDE_BY_SIDE_WIDTH;
+            // The field stays put while its rows scroll beneath it.
+            let list = widget::column::with_children(vec![
+                widget::container(search)
+                    .padding([space::S, space::S, 0.0, space::S])
+                    .into(),
+                widget::scrollable(
+                    widget::column::with_children(listing)
+                        .spacing(space::XS)
+                        .padding([0.0, space::S, space::S, space::S]),
+                )
+                .height(if side_by_side {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                })
+                .into(),
             ])
-            .height(Length::Fill)
-            .into()
-        }
+            .spacing(space::XS);
+            if side_by_side {
+                widget::row::with_children(vec![
+                    widget::container(list)
+                        .width(LIST_WIDTH)
+                        .height(Length::Fill)
+                        .into(),
+                    crate::design::vertical_rule(),
+                    content,
+                ])
+                .height(Length::Fill)
+                .into()
+            } else {
+                // Stacked, the list takes the height of its rows up to a
+                // share of the pane, leaving the rest to the selection.
+                widget::column::with_children(vec![
+                    widget::container(list)
+                        .width(Length::Fill)
+                        .max_height((size.height * STACKED_LIST_SHARE).max(STACKED_LIST_MIN_HEIGHT))
+                        .into(),
+                    crate::design::horizontal_rule(),
+                    content,
+                ])
+                .height(Length::Fill)
+                .into()
+            }
+        };
+        widget::column::with_children(vec![
+            self.header(busy, width),
+            crate::design::horizontal_rule(),
+            body,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 }
 
@@ -2124,6 +2331,42 @@ fn launch_description<'a>(
         )));
     }
     column.into()
+}
+/// The levels above the current page, each a way back to it, ending at the
+/// page itself.
+fn breadcrumb<'a>(
+    parents: impl IntoIterator<Item = (&'a str, Option<Action>)>,
+    current: &'a str,
+) -> Element<'a, Action> {
+    let mut trail = widget::row::with_capacity(5)
+        .spacing(space::XXS)
+        .align_y(Alignment::Center);
+    for (label, action) in parents {
+        let enabled = action.is_some();
+        let crumb = widget::button::custom(
+            crate::design::body(label)
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .class(cosmic::theme::Text::Custom(crate::design::muted_text)),
+        )
+        .name(label)
+        .class(crate::ui_controls::control_style(false, None))
+        .padding([space::XXS, space::XS])
+        .on_press_maybe(action);
+        trail = trail
+            .push(if enabled {
+                crate::interaction::hover(crumb)
+            } else {
+                crumb.into()
+            })
+            .push(crate::ui_controls::passive_icon(
+                crate::ui_controls::Icon::ChevronRight.handle(),
+                crate::design::COMPACT_ICON_SIZE,
+            ));
+    }
+    trail
+        .push(crate::design::body(current).wrapping(cosmic::iced::widget::text::Wrapping::None))
+        .wrap()
+        .into()
 }
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
     let mut button = crate::ui_controls::button::secondary(label);
@@ -2683,6 +2926,193 @@ mod tests {
         });
         assert!(state.run.is_none());
         assert_eq!(state.pending.unwrap().0, browse);
+    }
+
+    /// Where the pane's text, its one text field and its scrolling regions
+    /// land, in the order the view builds them.
+    #[derive(Default)]
+    struct Outline {
+        texts: Vec<(String, cosmic::iced::Rectangle)>,
+        field: Option<cosmic::iced::Rectangle>,
+        /// Each scrolling region's viewport and the content it scrolls.
+        scrollables: Vec<(cosmic::iced::Rectangle, cosmic::iced::Rectangle)>,
+    }
+
+    impl cosmic::iced::advanced::widget::Operation for Outline {
+        fn traverse(
+            &mut self,
+            visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+        ) {
+            visit(self);
+        }
+        fn text(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: cosmic::iced::Rectangle,
+            text: &str,
+        ) {
+            self.texts.push((text.to_owned(), bounds));
+        }
+        fn text_input(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: cosmic::iced::Rectangle,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::TextInput,
+        ) {
+            self.field.get_or_insert(bounds);
+        }
+        fn scrollable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: cosmic::iced::Rectangle,
+            content: cosmic::iced::Rectangle,
+            _: cosmic::iced::Vector,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+        ) {
+            self.scrollables.push((bounds, content));
+        }
+    }
+
+    impl Outline {
+        fn of(state: &State, width: f32, height: f32) -> Self {
+            use cosmic::iced::Size;
+            use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut element = state.view();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, height)),
+            );
+            let mut outline = Self::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut outline);
+            outline
+        }
+
+        /// The first text that reads `label`.
+        fn text(&self, label: &str) -> cosmic::iced::Rectangle {
+            self.texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label:?} is drawn"))
+                .1
+        }
+    }
+
+    #[test]
+    fn automation_list_reads_title_then_search_then_rows_at_every_width() {
+        let state = State {
+            rows: vec![automation().summary(None)],
+            ..Default::default()
+        };
+        // Either side of the split between stacked and side-by-side lists.
+        for width in [480.0, 900.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            let title = outline.text("Automations");
+            let search = outline.field.expect("the list offers its search field");
+            let row = outline.text("Daily review");
+            assert!(
+                title.y + title.height <= search.y,
+                "at {width} px the pane's title precedes the search field: {title:?} {search:?}"
+            );
+            assert!(
+                search.y + search.height <= row.y,
+                "at {width} px the search field sits above the rows it filters"
+            );
+            let views = outline.text("Run history");
+            assert!(
+                views.y + views.height <= search.y,
+                "at {width} px the view switcher belongs to the header, above the list"
+            );
+            if width < 700.0 {
+                // The stacked list takes the height of its rows, not a fixed
+                // band that leaves empty space between search and header.
+                let (list, rows) = outline.scrollables[0];
+                assert!(
+                    list.height <= rows.height + 0.5,
+                    "the stacked list is no taller than its rows: {list:?} {rows:?}"
+                );
+            }
+        }
+        // With nothing to filter, the pane offers no field and says so.
+        let empty = Outline::of(&State::default(), 480.0, 700.0);
+        assert!(empty.field.is_none());
+        assert!(empty.text("Automations").y < empty.text("No automations yet").y);
+    }
+
+    #[test]
+    fn automation_switcher_selects_the_view_on_screen_and_a_run_keeps_its_origin() {
+        use crate::automations::FiringState;
+        fn selected(state: &State, busy: bool) -> Section {
+            let tabs = state.view_tabs(busy);
+            let chosen = tabs.iter().filter(|tab| tab.selected).collect::<Vec<_>>();
+            assert_eq!(chosen.len(), 1, "exactly one view is current");
+            assert!(chosen[0].on_press.is_none(), "the current view publishes nothing");
+            for tab in tabs.iter().filter(|tab| !tab.selected) {
+                assert_eq!(tab.on_press.is_some(), !busy, "{} is a way out", tab.label);
+            }
+            *Section::ALL
+                .iter()
+                .find(|section| section.label() == chosen[0].label)
+                .unwrap()
+        }
+        let mut state = State::default();
+        assert_eq!(selected(&state, false), Section::Automations);
+        assert_eq!(selected(&state, true), Section::Automations);
+        assert!(matches!(
+            state.update(Section::RunHistory.enter()),
+            Some(Effect::Request {
+                request: Request::History { id: None, .. },
+                ..
+            })
+        ));
+        state.pending = None;
+        assert_eq!(selected(&state, false), Section::RunHistory);
+
+        // A run opened from history stays inside it; its trail leads back to
+        // the loaded page rather than reading it again.
+        let firing = history_firing(100, FiringState::Succeeded);
+        state.history = vec![firing.clone()];
+        state.history_status = HistoryStatus::Loaded;
+        let detail = RunDetail {
+            definition: automation().definition,
+            firing: firing.clone(),
+            agent: None,
+            run: None,
+        };
+        state.run = Some(detail.clone());
+        assert_eq!(selected(&state, false), Section::RunHistory);
+        let [(root, back), (name, automation_link)] = state.run_trail(&detail);
+        assert_eq!((root, name), ("Run history", "Daily review"));
+        assert!(matches!(automation_link, Action::Select(id) if id == firing.automation));
+        assert!(matches!(back, Action::CloseRun));
+        assert!(state.update(back).is_none(), "closing a run reads nothing");
+        assert!(state.run.is_none());
+        assert_eq!(selected(&state, false), Section::RunHistory);
+        assert_eq!(state.history.len(), 1, "the history page is kept");
+
+        // From an automation's own history, its name leads back to it and
+        // the root leaves for the list.
+        let mut owner = automation();
+        owner.id = firing.automation;
+        state.all_history = false;
+        state.selected = Some(owner);
+        state.run = Some(detail.clone());
+        assert_eq!(selected(&state, false), Section::Automations);
+        let [(root, list), (_, back)] = state.run_trail(&detail);
+        assert_eq!(root, "Automations");
+        assert!(matches!(list, Action::Browse));
+        assert!(matches!(back, Action::CloseRun));
+        state.update(back);
+        assert!(state.run.is_none() && state.selected.is_some());
+        assert!(matches!(
+            state.update(Section::RunHistory.enter()),
+            Some(Effect::Request { .. })
+        ));
+        assert!(state.selected.is_none() && state.all_history);
     }
 
     #[test]
