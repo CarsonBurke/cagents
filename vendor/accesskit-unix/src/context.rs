@@ -6,26 +6,23 @@
 use accesskit::{ActivationHandler, DeactivationHandler};
 use accesskit_atspi_common::{Adapter as AdapterImpl, AppContext, Event};
 #[cfg(not(feature = "tokio"))]
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use atspi::proxy::bus::StatusProxy;
 #[cfg(not(feature = "tokio"))]
-use futures_util::{pin_mut as pin, select, StreamExt};
+use futures_util::{pin_mut as pin, select, FutureExt, StreamExt};
 use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
 };
 #[cfg(feature = "tokio")]
-use tokio::{
-    pin, select,
-    sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender},
-};
+use tokio::{pin, select, sync::mpsc::UnboundedSender as Sender};
 #[cfg(feature = "tokio")]
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use zbus::{connection::Builder, Connection};
 
 use crate::{
     adapter::{AdapterState, Callback, Message},
-    atspi::{map_or_ignoring_broken_pipe, Bus},
+    atspi::Bus,
     executor::Executor,
     util::block_on,
 };
@@ -52,21 +49,65 @@ pub(crate) fn get_or_init_messages() -> Sender<Message> {
             #[cfg(feature = "tokio")]
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            thread::spawn(|| {
-                let executor = Executor::new();
-                block_on(executor.run(async {
-                    if let Ok(session_bus) = Builder::session() {
-                        if let Ok(session_bus) = session_bus.internal_executor(false).build().await
-                        {
-                            run_event_loop(&executor, session_bus, rx).await.unwrap();
-                        }
-                    }
-                }))
-            });
+            thread::Builder::new()
+                .name("accesskit-unix".into())
+                .spawn(|| {
+                    let executor = Executor::new();
+                    block_on(executor.run(async {
+                        #[cfg(not(feature = "tokio"))]
+                        let mut messages = std::pin::pin!(rx.fuse());
+                        #[cfg(feature = "tokio")]
+                        let mut messages = UnboundedReceiverStream::new(rx).fuse();
+                        drive_context(
+                            &executor,
+                            &mut messages,
+                            || async { Builder::session()?.internal_executor(false).build().await },
+                            |_| {},
+                        )
+                        .await;
+                    }))
+                })
+                .expect("launch accessibility adapter thread");
 
             tx
         })
         .clone()
+}
+
+/// Keep lifecycle receivers and adapters alive through failed connection attempts.
+/// The connector and retry observation are injected by the refused-bus regression.
+async fn drive_context<F, Connect>(
+    executor: &Executor<'_>,
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    mut connect: Connect,
+    mut retry_scheduled: impl FnMut(std::time::Duration),
+) where
+    Connect: FnMut() -> F,
+    F: std::future::Future<Output = zbus::Result<Connection>>,
+{
+    let mut adapters = Vec::new();
+    let mut retry = Retry::default();
+    loop {
+        let result = async {
+            let session_bus = connect().await?;
+            run_event_loop(executor, session_bus, messages, &mut adapters, &mut retry).await
+        }
+        .await;
+        let Err(error) = result else {
+            break;
+        };
+        if retry.attempts == 0 {
+            tracing::warn!(%error, "Accessibility bus unavailable; retrying in background");
+        }
+        for entry in &mut adapters {
+            deactivate_adapter(entry);
+        }
+        let delay = retry.next_delay();
+        retry_scheduled(delay);
+        if !wait_for_retry(messages, &mut adapters, delay).await {
+            break;
+        }
+    }
 }
 
 struct AdapterEntry {
@@ -135,10 +176,66 @@ fn deactivate_adapter(entry: &mut AdapterEntry) {
     }
 }
 
+/// Capped exponential retry; one warning is emitted for an outage, never a panic.
+#[derive(Default)]
+struct Retry {
+    attempts: u32,
+}
+
+impl Retry {
+    fn next_delay(&mut self) -> std::time::Duration {
+        let seconds = (1u64 << self.attempts.min(5)).min(30);
+        self.attempts = self.attempts.saturating_add(1);
+        std::time::Duration::from_secs(seconds)
+    }
+}
+
+async fn retry_sleep_until(deadline: std::time::Instant) {
+    #[cfg(feature = "tokio")]
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    #[cfg(not(feature = "tokio"))]
+    async_io::Timer::at(deadline).await;
+}
+
+async fn wait_for_retry(
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    adapters: &mut Vec<AdapterEntry>,
+    delay: std::time::Duration,
+) -> bool {
+    wait_for_retry_until(messages, adapters, std::time::Instant::now() + delay).await
+}
+
+async fn wait_for_retry_until(
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    adapters: &mut Vec<AdapterEntry>,
+    deadline: std::time::Instant,
+) -> bool {
+    loop {
+        let next = futures_lite::future::race(
+            async {
+                retry_sleep_until(deadline).await;
+                None
+            },
+            async { Some(messages.next().await) },
+        )
+        .await;
+        match next {
+            None => return true,
+            Some(None) => return false,
+            Some(Some(message)) => {
+                // With no bus, only lifecycle messages have work to do.
+                let _ = process_adapter_message(&None, adapters, message).await;
+            }
+        }
+    }
+}
+
 async fn run_event_loop(
     executor: &Executor<'_>,
     session_bus: Connection,
-    rx: Receiver<Message>,
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    adapters: &mut Vec<AdapterEntry>,
+    retry: &mut Retry,
 ) -> zbus::Result<()> {
     let session_bus_copy = session_bus.clone();
     let _session_bus_task = executor.spawn(
@@ -150,29 +247,75 @@ async fn run_event_loop(
         "accesskit_session_bus_task",
     );
 
-    let status = StatusProxy::new(&session_bus).await?;
+    // Probe without a property cache first: a missing service must fail here,
+    // rather than stranding zbus's lazy cache updater and property stream.
+    // This also avoids a cache-population warning on every retry while absent.
+    let status_probe = StatusProxy::builder(&session_bus)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    status_probe.screen_reader_enabled().await?;
+    let dbus = zbus::fdo::DBusProxy::new(&session_bus).await?;
+    let status_name = zbus::names::BusName::try_from("org.a11y.Bus")?;
+    let status_owner = dbus.get_name_owner(status_name.clone()).await?;
+    let status = StatusProxy::builder(&session_bus)
+        .cache_properties(zbus::proxy::CacheProperties::Yes)
+        .build()
+        .await?;
+    if dbus.get_name_owner(status_name.clone()).await? != status_owner {
+        return Err(zbus::Error::Failure(
+            "Accessibility status owner changed during connection".into(),
+        ));
+    }
     let changes = status.receive_screen_reader_enabled_changed().await.fuse();
     pin!(changes);
 
-    #[cfg(not(feature = "tokio"))]
-    let messages = rx.fuse();
-    #[cfg(feature = "tokio")]
-    let messages = UnboundedReceiverStream::new(rx).fuse();
-    pin!(messages);
-
-    let mut atspi_bus = None;
-    let mut adapters: Vec<AdapterEntry> = Vec::new();
-
+    let mut atspi_bus: Option<Bus> = None;
+    let health_interval = std::time::Duration::from_secs(5);
+    let mut health_deadline = std::time::Instant::now() + health_interval;
     loop {
+        let next_message = messages.next();
+        #[cfg(not(feature = "tokio"))]
+        let next_message = next_message.fuse();
+        pin!(next_message);
+        // Adapter traffic must not postpone the status/transport probe.
+        let heartbeat = retry_sleep_until(health_deadline);
+        #[cfg(not(feature = "tokio"))]
+        let heartbeat = heartbeat.fuse();
+        pin!(heartbeat);
         select! {
+            _ = heartbeat => {
+                // A restarted bus may leave the property stream pending without
+                // another adapter message. Check both transports independently.
+                // A healthy session bus alone cannot establish status-service
+                // health. Its owner can disappear/restart while that bus lives.
+                if dbus.get_name_owner(status_name.clone()).await? != status_owner {
+                    return Err(zbus::Error::Failure(
+                        "Accessibility status owner changed".into(),
+                    ));
+                }
+                status_probe.screen_reader_enabled().await?;
+                if let Some(bus) = &atspi_bus {
+                    bus.check_connection().await?;
+                }
+                health_deadline = std::time::Instant::now() + health_interval;
+            }
             change = changes.next() => {
+                for entry in adapters.iter_mut() {
+                    deactivate_adapter(entry);
+                }
                 atspi_bus = None;
                 if let Some(change) = change {
                     if change.get().await? {
-                        atspi_bus = map_or_ignoring_broken_pipe(Bus::new(&session_bus, executor).await, None, Some)?;
+                        atspi_bus = Some(Bus::new(&session_bus, executor).await?);
                     }
+                    // Disabled accessibility is a healthy connection too;
+                    // a later outage must start a fresh warning/backoff cycle.
+                    retry.attempts = 0;
+                } else {
+                    return Err(zbus::Error::Failure("Accessibility status stream closed".into()));
                 }
-                for entry in &mut adapters {
+                for entry in adapters.iter_mut() {
                     if atspi_bus.is_some() {
                         activate_adapter(entry);
                     } else {
@@ -180,9 +323,11 @@ async fn run_event_loop(
                     }
                 }
             }
-            message = messages.next() => {
+            message = next_message => {
                 if let Some(message) = message {
-                    process_adapter_message(&atspi_bus, &mut adapters, message).await?;
+                    process_adapter_message(&atspi_bus, adapters, message).await?;
+                } else {
+                    return Ok(());
                 }
             }
         }
@@ -257,4 +402,81 @@ async fn process_adapter_message(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn refused_connection_schedules_bounded_retries() {
+        let mut retry = Retry::default();
+        let delays = (0..10)
+            .map(|_| retry.next_delay().as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30, 30, 30]);
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn expired_retry_deadline_cannot_be_reset_by_continuous_adapter_messages() {
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let mut messages =
+                futures_lite::stream::repeat_with(|| Message::RemoveAdapter { id: usize::MAX })
+                    .take(10_000);
+            let mut adapters = Vec::new();
+            let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            assert!(wait_for_retry_until(&mut messages, &mut adapters, expired).await);
+            assert!(
+                messages.next().await.is_some(),
+                "traffic was drained instead of retrying"
+            );
+        }));
+    }
+
+    #[test]
+    fn refused_bus_connection_returns_an_error_and_schedules_retry() {
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            #[cfg(not(feature = "tokio"))]
+            let (tx, rx) = async_channel::unbounded::<Message>();
+            #[cfg(feature = "tokio")]
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            #[cfg(not(feature = "tokio"))]
+            let mut messages = std::pin::pin!(rx.fuse());
+            #[cfg(feature = "tokio")]
+            let mut messages = UnboundedReceiverStream::new(rx).fuse();
+            let mut sender = Some(tx);
+            let attempts = std::cell::Cell::new(0);
+            let mut scheduled = Vec::new();
+            drive_context(
+                &executor,
+                &mut messages,
+                || {
+                    attempts.set(attempts.get() + 1);
+                    async {
+                        Builder::address("unix:path=/nonexistent/cagents-atspi-test-bus")
+                            .unwrap()
+                            .internal_executor(false)
+                            .build()
+                            .await
+                    }
+                },
+                |delay| {
+                    scheduled.push(delay);
+                    // Once the real failed attempt schedules its retry, retire
+                    // the final sender: the driver's disconnected wait must exit.
+                    drop(sender.take());
+                },
+            )
+            .await;
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(scheduled, [std::time::Duration::from_secs(1)]);
+        }));
+    }
 }

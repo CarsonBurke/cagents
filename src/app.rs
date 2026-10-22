@@ -4232,6 +4232,14 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowSizeObserved {
+        window: window::Id,
+        size: iced::Size,
+    },
+    WindowOccluded {
+        window: window::Id,
+        occluded: bool,
+    },
     ActivateUi {
         token: Option<String>,
     },
@@ -5005,6 +5013,8 @@ pub struct Cagents {
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
+    #[cfg(test)]
+    resumed_focus_refreshes: u32,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
     account_ui: account_ui::State,
@@ -13319,6 +13329,8 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            #[cfg(test)]
+            resumed_focus_refreshes: 0,
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
@@ -13507,6 +13519,7 @@ impl Application for Cagents {
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
+            app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -15694,6 +15707,21 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowOccluded { window, occluded } => {
+                if self.core.main_window_id() == Some(window) {
+                    crate::ui_controls::observe_activity_window_event(&window::Event::Occluded(
+                        occluded,
+                    ));
+                }
+                return Task::none();
+            }
+            Message::WindowSizeObserved { window, size } => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                crate::ui_controls::observe_activity_window_event(&window::Event::Resized(size));
+                return self.update(Message::WindowResized(size.width, size.height));
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -16639,6 +16667,11 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(id, focused)
                         if self.core.main_window_id() == Some(id) =>
                     {
+                        crate::ui_controls::observe_activity_window_event(&if focused {
+                            window::Event::Focused
+                        } else {
+                            window::Event::Unfocused
+                        });
                         Some((focused, focused && !self.refresh_ui.focused))
                     }
                     _ => None,
@@ -16654,7 +16687,25 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                let resumed = if account_focus.is_some_and(|(_, regained)| regained) {
+                    #[cfg(test)]
+                    {
+                        self.resumed_focus_refreshes += 1;
+                    }
+                    Task::batch([
+                        self.update_update_ui(update_ui::Action::InspectInstallation),
+                        self.update_review_requests(review_request_ui::Action::FocusGained),
+                    ])
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    resumed,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -17079,6 +17130,18 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Closed) => {
                     Some(Message::WindowClosed(event_window))
                 }
+                iced::Event::Window(window::Event::Occluded(occluded)) => {
+                    Some(Message::WindowOccluded {
+                        window: event_window,
+                        occluded,
+                    })
+                }
+                iced::Event::Window(
+                    window::Event::Opened { size, .. } | window::Event::Resized(size),
+                ) => Some(Message::WindowSizeObserved {
+                    window: event_window,
+                    size,
+                }),
                 iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, true),
                 )),
@@ -22779,6 +22842,171 @@ mod tests {
     }
 
     #[test]
+    fn expanded_chat_survives_failed_worktree_then_new_scope_and_remount_frames() {
+        use crate::model::WorktreeId;
+        use crate::repository::{WorktreeLock, WorktreeRecord};
+        let (mut app, chat, _socket) = live_agent_app("codex");
+        app.settings.default_worktree_pane = settings::DefaultPane::NativeChat;
+        drop(app.update(Message::ChatUi(chat_ui::Action::Switch(chat))));
+        let ready = chat_ui::ready_message_for_pending_switch(&app, chat, busy_chat_snapshot());
+        drop(app.update(ready));
+        let target = match app.cards.get(&chat).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.target,
+            _ => panic!("fixture must mount a native chat"),
+        };
+        drop(app.update(Message::ChatUi(chat_ui::Action::Toggle(
+            target,
+            "tool-1".into(),
+        ))));
+        assert!(chat_ui::chat_step_is_expanded_for_test(
+            &app, chat, "tool-1"
+        ));
+        let old_scope = match app.cards.get_mut(&chat).unwrap() {
+            CardRuntime::Chat(runtime) => {
+                runtime.tool_groups_expanded = true;
+                runtime.session.launch.recipe.working_directory.clone()
+            }
+            _ => panic!("fixture must mount a native chat"),
+        };
+        app.known_worktree_roots.insert(old_scope.clone());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(chat, old_scope.clone());
+        drop(app.select_worktree(old_scope.clone(), false));
+        let mut editor = terminal_card_state();
+        let mut editor_runtime = RepositoryRuntime::dirty_fixture(editor.id);
+        editor_runtime.descriptor.worktree = old_scope.clone();
+        let editor_id = editor.id;
+        let editor_text = editor_runtime.editor_text();
+        assert!(editor_runtime.is_dirty());
+        editor.title = "Fixture editor".into();
+        editor.kind = CardKind::Repository(editor_runtime.descriptor.clone());
+        editor.residency = Residency::Hot;
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(editor.id, old_scope.clone());
+        app.cards
+            .insert(editor.id, CardRuntime::Repository(Box::new(editor_runtime)));
+        Arc::make_mut(&mut app.durable).cards.push(editor);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        assert_eq!(app.workspace.cards().len(), 3);
+        let settings_id = open_settings_panes(&app)[0];
+        app.settings_search = "retained fixture settings filter".into();
+
+        let first = ProjectId::new();
+        let second = ProjectId::new();
+        let new_repository = PathBuf::from("/cagents-fixture-second-project");
+        for (id, path) in [(first, old_scope.clone()), (second, new_repository.clone())] {
+            app.sidebar_model
+                .projects
+                .push(sidebar::SidebarProject::new(
+                    id,
+                    RepositoryId::new(),
+                    "Fixture project".into(),
+                    path.join(".git"),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+        }
+        app.known_worktree_roots.insert(new_repository.clone());
+        let mut renderer = headless_renderer();
+        let mut tree = cosmic::iced::advanced::widget::Tree::empty();
+        let mut frames = |app: &Cagents, count| {
+            for _ in 0..count {
+                present(app, &mut renderer, &mut tree);
+            }
+        };
+        // Carry the full libcosmic window tree, including modal membership.
+        // The original Retained ID forwarding is expected to expose the
+        // duplicate-name collision on the second expanded-chat frame.
+        frames(&app, 2);
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id: first,
+            repository: old_scope.join(".git"),
+        })));
+        frames(&app, 2);
+        // Only completed backend messages are injected; this fixture performs
+        // no remote authentication, Git mutation, or provider execution.
+        drop(app.update(Message::WorktreeCreated {
+            project_id: first,
+            repository: old_scope.join(".git"),
+            result: Err("Fixture remote authentication refused".into()),
+        }));
+        frames(&app, 2);
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(app.worktree_dialog.is_none());
+        frames(&app, 2);
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id: second,
+            repository: new_repository.join(".git"),
+        })));
+        drop(app.update(Message::WorktreeBranchChanged("feat-y".into())));
+        frames(&app, 2);
+        // Submission closes the dialog before the completion selects scope.
+        app.worktree_dialog = None;
+        let new_scope = new_repository.join("feat-y");
+        drop(app.update(Message::WorktreeCreated {
+            project_id: second,
+            repository: new_repository.join(".git"),
+            result: Ok(WorktreeCreationOutcome::Created {
+                worktree: WorktreeRecord {
+                    id: WorktreeId::new(),
+                    path: new_scope.clone(),
+                    created_at_unix_ms: None,
+                    head_oid: None,
+                    branch: Some("refs/heads/feat-y".into()),
+                    detached: false,
+                    bare: false,
+                    lock: WorktreeLock::default(),
+                    prunable_reason: None,
+                },
+                warnings: Vec::new(),
+            }),
+        }));
+        assert_eq!(app.active_workspace.as_ref(), Some(&new_scope));
+        assert!(app.workspace.order().any(|card| {
+            matches!(
+                app.card_state(card).map(|state| &state.kind),
+                Some(CardKind::Chat(_))
+            )
+        }));
+        frames(&app, 3);
+        drop(app.select_worktree(old_scope.clone(), false));
+        assert_eq!(app.active_workspace.as_ref(), Some(&old_scope));
+        assert!(app.workspace.order().any(|card| card == chat));
+        assert!(
+            matches!(app.cards.get(&chat), Some(CardRuntime::Chat(runtime))
+            if runtime.tool_groups_expanded)
+        );
+        assert!(chat_ui::chat_step_is_expanded_for_test(
+            &app, chat, "tool-1"
+        ));
+        let Some(CardRuntime::Repository(editor)) = app.cards.get(&editor_id) else {
+            panic!("the unsaved editor must remain mounted or parked");
+        };
+        assert!(editor.is_dirty());
+        assert_eq!(editor.editor_text(), editor_text);
+        assert!(app.workspace.order().any(|card| card == editor_id));
+        assert!(app.workspace.order().any(|card| card == settings_id));
+        assert_eq!(open_settings_panes(&app), vec![settings_id]);
+        assert_eq!(app.settings_search, "retained fixture settings filter");
+        frames(&app, 3);
+    }
+
+    #[test]
     fn a_refused_switch_keeps_the_terminal_on_screen() {
         let (mut app, card, _socket) = live_agent_app("claude");
         draw_frames(&mut app, 2, |app, frame| {
@@ -26219,6 +26447,8 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            #[cfg(test)]
+            resumed_focus_refreshes: 0,
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
@@ -27222,6 +27452,173 @@ mod tests {
         match action {
             iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
             _ => panic!("task did not produce an application message"),
+        }
+    }
+
+    #[test]
+    fn retained_background_spinner_reconciles_visibility_after_a_modal() {
+        use crate::ui_controls::activity_spinner;
+        use cosmic::Application as _;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, window};
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let mut modal: Element<'_, ()> = crate::inspector::ModalOverlay::new(
+            activity_spinner(24.0, crate::design::accent_color),
+            iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .into();
+        let mut tree = Tree::new(modal.as_widget());
+        let node = modal.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        for event in [window::Event::Unfocused, window::Event::Occluded(true)] {
+            match event {
+                window::Event::Unfocused => {
+                    drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))))
+                }
+                window::Event::Occluded(occluded) => drop(app.update(Message::WindowOccluded {
+                    window: main,
+                    occluded,
+                })),
+                _ => unreachable!(),
+            }
+            // The real modal wrapper forwards these only to its foreground.
+            modal.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(event),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        let mut retained = tree.children.remove(0);
+        let mut exposed: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
+        let node = layout::Node::new(Size::new(24.0, 24.0));
+        let mut redraw = || {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            exposed.as_widget_mut().update(
+                &mut retained,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            shell.redraw_request()
+        };
+        assert_eq!(redraw(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_eq!(redraw(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        assert_ne!(redraw(), window::RedrawRequest::Wait);
+    }
+
+    #[test]
+    fn a_spinner_mounted_after_main_window_visibility_changes_stays_paused() {
+        use crate::ui_controls::activity_spinner;
+        use cosmic::Application as _;
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, window};
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        let requested_by_new_widget = || {
+            let mut element: Element<'_, ()> = activity_spinner(24.0, crate::design::accent_color);
+            let mut tree = Tree::new(element.as_widget());
+            let node = layout::Node::new(Size::new(24.0, 24.0));
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            // No visibility event is replayed to this newly mounted widget.
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            shell.redraw_request()
+        };
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: true,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, false))));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: true,
+        }));
+        drop(app.update(Message::WindowOccluded {
+            window: main,
+            occluded: false,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        drop(app.update(Message::WindowSizeObserved {
+            window: main,
+            size: Size::ZERO,
+        }));
+        assert_eq!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowSizeObserved {
+            window: main,
+            size: Size::new(800.0, 600.0),
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
+        drop(app.update(Message::WindowOccluded {
+            window: window::Id::unique(),
+            occluded: true,
+        }));
+        assert_ne!(requested_by_new_widget(), window::RedrawRequest::Wait);
+    }
+
+    #[test]
+    fn focus_gain_requests_one_installation_and_review_refresh_bundle() {
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        app.refresh_ui.focused = false;
+        for (window, focused, expected) in [
+            (window::Id::unique(), true, 0),
+            (main, true, 1),
+            (main, true, 1),
+            (main, false, 1),
+            (main, false, 1),
+            (main, true, 2),
+        ] {
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                window, focused,
+            ))));
+            assert_eq!(app.resumed_focus_refreshes, expected);
         }
     }
 

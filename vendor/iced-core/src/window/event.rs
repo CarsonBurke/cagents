@@ -28,6 +28,9 @@ pub enum Event {
     /// A window was resized.
     Resized(Size),
 
+    /// A window became fully occluded or visible again.
+    Occluded(bool),
+
     /// A window changed its scale factor.
     Rescaled(f32),
 
@@ -44,6 +47,9 @@ pub enum Event {
 
     /// A window was unfocused.
     Unfocused,
+
+    /// Assistive technology activated or deactivated this window's tree.
+    AccessibilityEnabled(bool),
 
     /// A file is being hovered over the window.
     ///

@@ -81,6 +81,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
+ "tracing",
  "zbus 5.19.0",
 ]
 

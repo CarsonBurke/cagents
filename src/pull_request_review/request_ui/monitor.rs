@@ -25,6 +25,8 @@ const BURST: u32 = 10;
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
+    /// A resumed visible shell should not wait for its healthy cache deadline.
+    FocusGained,
     Loaded {
         repository: GitHubRepoKey,
         generation: u64,
@@ -151,6 +153,16 @@ impl Monitor {
                 );
             }
         }
+        if matches!(&action, Action::FocusGained) {
+            let now = Instant::now();
+            for entry in state
+                .entries
+                .values_mut()
+                .filter(|entry| entry.failures == 0)
+            {
+                entry.due = entry.due.min(now);
+            }
+        }
         let failing = state.failing;
         if let Action::Loaded {
             repository,
@@ -220,11 +232,17 @@ impl Monitor {
                 if applied.is_err() {
                     entry.scan.failed_history(&work);
                 }
-                entry.snapshot = Arc::new(Snapshot {
-                    viewer: entry.scan.viewer.clone(),
-                    requested: entry.scan.requested.clone(),
-                    error: applied.err(),
-                });
+                let error = applied.err();
+                if entry.snapshot.viewer != entry.scan.viewer
+                    || entry.snapshot.requested != entry.scan.requested
+                    || entry.snapshot.error != error
+                {
+                    entry.snapshot = Arc::new(Snapshot {
+                        viewer: entry.scan.viewer.clone(),
+                        requested: entry.scan.requested.clone(),
+                        error,
+                    });
+                }
                 // A pass that met a failure keeps backing off until it
                 // settles, so one timeline that always fails cannot reset the
                 // backoff through the pages read between its attempts.
@@ -329,6 +347,106 @@ mod tests {
             next_cursor: None,
         })
     }
+    #[test]
+    fn identical_completed_reads_preserve_the_shared_snapshot() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let load = |monitor: &mut Monitor, reply: Reply| {
+            let (_, generation) = monitor.busy.clone().expect("read admitted");
+            drop(monitor.update(
+                Action::Loaded {
+                    repository: repository.clone(),
+                    generation,
+                    work: Work::Page { cursor: None },
+                    result: Ok(reply),
+                },
+                [repository.clone()],
+            ));
+        };
+        load(&mut monitor, reply("viewer", None));
+        let original = Arc::clone(&monitor.entries[&repository].snapshot);
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        monitor.paced = None;
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        load(&mut monitor, reply("viewer", None));
+        assert!(Arc::ptr_eq(
+            &original,
+            &monitor.entries[&repository].snapshot
+        ));
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        monitor.paced = None;
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        load(&mut monitor, reply("new-viewer", None));
+        assert!(!Arc::ptr_eq(
+            &original,
+            &monitor.entries[&repository].snapshot
+        ));
+        assert_eq!(
+            monitor.entries[&repository]
+                .snapshot
+                .viewer
+                .as_ref()
+                .unwrap()
+                .id,
+            "new-viewer"
+        );
+    }
+
+    #[test]
+    fn focus_refreshes_healthy_cache_without_bypassing_backoff_or_pace() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let (_, generation) = monitor.busy.clone().expect("initial read admitted");
+        drop(monitor.update(
+            Action::Loaded {
+                repository: repository.clone(),
+                generation,
+                work: Work::Page { cursor: None },
+                result: Ok(reply("viewer", None)),
+            },
+            [repository.clone()],
+        ));
+        let later = monitor.entries[&repository].due;
+        assert!(
+            later > Instant::now(),
+            "completed healthy read sets a future cache deadline"
+        );
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        assert!(
+            monitor.busy.is_none(),
+            "ordinary tick preserves a healthy cache deadline"
+        );
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert!(
+            monitor.busy.is_some(),
+            "real focus gain admits a fresh healthy read"
+        );
+        let busy = monitor.busy.clone();
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert_eq!(
+            monitor.busy, busy,
+            "another focus does not replace an in-flight read"
+        );
+        monitor.busy = None;
+        monitor.entries.get_mut(&repository).unwrap().due = later;
+        monitor.entries.get_mut(&repository).unwrap().failures = 1;
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert!(
+            monitor.busy.is_none(),
+            "focus cannot bypass an API failure cooldown"
+        );
+        assert_eq!(monitor.entries[&repository].due, later);
+        monitor.entries.get_mut(&repository).unwrap().failures = 0;
+        monitor.paced = Some(Instant::now() + PACE * BURST);
+        drop(monitor.update(Action::FocusGained, [repository]));
+        assert!(
+            monitor.busy.is_none(),
+            "focus cannot bypass the global request budget"
+        );
+    }
+
     #[test]
     fn reads_spend_a_burst_then_one_per_pace() {
         let mut monitor = Monitor::default();
