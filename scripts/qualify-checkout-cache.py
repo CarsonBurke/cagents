@@ -7,6 +7,8 @@ It needs only Cargo, Git, and Python; no native UI dependencies or downloads.
 """
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -252,10 +254,11 @@ pub fn generated() -> &'static str { GENERATED }
     return {"owned": outcomes, "patched": patch_outcomes}
 
 
-def qualify_manifest_paths(directory, fixed, *, body_identity=None):
+def qualify_manifest_paths(directory, fixed, *, body_identity=None, historical=False):
     """Distinguish current script inputs from an executable's baked-in paths."""
-    lane = directory / (("body-anchored" if body_identity else "body-watch-only") if body_identity is not None
-                        else ("metadata-fixed" if fixed else "metadata-control"))
+    lane = directory / ("body-historical-bootstrap" if historical else
+                        (("body-anchored" if body_identity else "body-watch-only") if body_identity is not None
+                         else ("metadata-fixed" if fixed else "metadata-control")))
     checkout_a = lane / "a"
     checkout_b = lane / "b"
     target = lane / "target"
@@ -269,7 +272,10 @@ version="0.1.0"
 edition="2021"
 [dependencies]
 qualification-path-source={path="vendor/path-source"}
+qualification-independent={path="../independent"}
 ''')
+    write(lane / "independent/Cargo.toml", '[package]\nname="qualification-independent"\nversion="0.1.0"\nedition="2021"\n')
+    write(lane / "independent/src/lib.rs", 'pub fn independent() {}\n')
     write(checkout_a / "build.rs", '''fn main() {
     println!("cargo:rerun-if-env-changed=QUALIFICATION_PROBE_CHECKOUT");
     println!("cargo:rustc-env=QUALIFICATION_OBSERVER_CHECKOUT={}",
@@ -320,7 +326,12 @@ links="qualification_paths"
     write(checkout_b / "vendor/path-source/input.txt", "input-B")
     if body_identity is not None:
         script = checkout_b / "vendor/path-source/build.rs"
-        write(script, script.read_text().replace("body-A", "body-B"))
+        body = script.read_text().replace("body-A", "body-B")
+        if historical:
+            # Historical checkout B predates the compiler anchor. A runtime
+            # watch alone cannot force this executable to recompile on return.
+            body = body.replace(ANCHOR, "")
+        write(script, body)
     for checkout in (checkout_a, checkout_b):
         tracked, _ = run("git", "ls-files", cwd=checkout)
         for relative in tracked.splitlines():
@@ -328,10 +339,33 @@ links="qualification_paths"
     env = os.environ.copy()
     env.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(lane / "build"),
                CARGO_BUILD_JOBS="2", CAGENTS_CHECKOUT_ROOT="deliberately-stale-inherited-value")
-    for step, checkout in enumerate((checkout_a, checkout_b, checkout_a)):
+    independent_artifacts = None
+    bootstrap_observations = []
+    script_compilations = []
+    compiler_anchors = []
+    checkouts = (checkout_a, checkout_b, checkout_a) + ((checkout_a,) if historical else ())
+    for step, checkout in enumerate(checkouts):
+        if step == 3:
+            # This explicit package selection models the admitted maintenance
+            # operation; never clean the whole shared cache or alter timestamps.
+            _, clean_log = run("cargo", "clean", "--offline", "--package",
+                               "qualification-path-source", cwd=checkout, env=env)
+            write(lane / "bootstrap-clean.log", clean_log)
         env["QUALIFICATION_PROBE_CHECKOUT"] = str(checkout)
         _, log = run("cargo", "build", "--offline", "--workspace", "--verbose", cwd=checkout, env=env)
         write(lane / f"build-{step}.log", log)
+        if historical:
+            compilations = sum("--crate-name build_script_build" in line
+                               and "vendor/path-source/build.rs" in line
+                               for line in log.splitlines() if "Running `" in line)
+            script_compilations.append(compilations)
+            dep_infos = [path for base in (target, lane / "build")
+                         for path in base.rglob("build_script_build*.d")
+                         if "vendor/path-source/build.rs" in path.read_text()]
+            assert len(dep_infos) == 1, ("ambiguous build-script dep-info", dep_infos)
+            dep_info = dep_infos[0].read_text()
+            write(lane / f"build-{step}.dep-info", dep_info)
+            compiler_anchors.append(f"# env-dep:{IDENTITY}=" in dep_info)
         observed, _ = run(str(target / "debug/qualification-path-observer"), cwd=checkout)
         observer, input_value, include = observed.split("|")
         assert observer == str(checkout), ("metadata observer was stale", checkout, observer)
@@ -341,12 +375,35 @@ links="qualification_paths"
         if body_identity is not None:
             # Watch-only control deliberately observes stale executable BODY
             # while relative input and runtime manifest path follow checkout B.
-            expected_body = "body-B" if body_identity and step == 1 else "body-A"
+            expected_body = "body-B" if body_identity and (step == 1 or historical and step == 2) else "body-A"
             expected_include = expected_include / expected_body
         assert include == str(expected_include), (checkout, include)
         if not fixed and step == 1:
             assert include != str(checkout / "vendor/path-source"), "control did not leak its compiled manifest path"
+        artifacts = {
+            str(p.relative_to(lane)): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+            for base in (target, lane / "build")
+            for p in base.rglob("libqualification_independent-*.rlib")
+        }
+        assert artifacts, "missing independent dependency artifact"
+        if independent_artifacts is not None:
+            assert artifacts == independent_artifacts, "package bootstrap invalidated unrelated dependency"
+            assert "Fresh qualification-independent" in log, log
+        independent_artifacts = artifacts
+        bootstrap_observations.append(observed)
         print(f"{lane.name}: {observed}")
+    if historical:
+        assert script_compilations == [1, 1, 0, 1], script_compilations
+        assert compiler_anchors == [True, False, False, True], compiler_anchors
+        # Preserve all four results rather than calling stale return a pass.
+        write(lane / "bootstrap-observations.json", json.dumps({
+            "sequence": ["anchored-A", "unanchored-B", "stale-return-A", "package-bootstrap-A"],
+            "observations": bootstrap_observations,
+            "package": "qualification-path-source",
+            "script_compilations": script_compilations,
+            "compiler_checkout_anchors": compiler_anchors,
+            "unrelated_artifacts": independent_artifacts,
+        }, indent=2) + "\n")
 
 
 def main():
@@ -372,6 +429,7 @@ def main():
         qualify_manifest_paths(directory, True)
         qualify_manifest_paths(directory, True, body_identity=False)
         qualify_manifest_paths(directory, True, body_identity=True)
+        qualify_manifest_paths(directory, True, body_identity=True, historical=True)
     else:
         with tempfile.TemporaryDirectory(prefix="cagents-cache-qualification-", dir="/var/tmp") as temporary:
             qualify(Path(temporary), False)
@@ -380,7 +438,8 @@ def main():
             qualify_manifest_paths(Path(temporary), True)
             qualify_manifest_paths(Path(temporary), True, body_identity=False)
             qualify_manifest_paths(Path(temporary), True, body_identity=True)
-    print("PASS: stale reuse reproduced; owned sources, stamps, patches and build-script path metadata follow A → B → A; same-checkout generated input stays live; external dependency remains fresh; watch-only stale script BODY reproduced and compile-anchor BODY follows A → B → A")
+            qualify_manifest_paths(Path(temporary), True, body_identity=True, historical=True)
+    print("PASS: stale reuse reproduced; owned sources, stamps, patches and build-script path metadata follow A → B → A; same-checkout generated input stays live; external dependency remains fresh; watch-only stale script BODY reproduced and compile-anchor BODY follows A → B → A; historical unanchored producer is reproduced and package bootstrap restores A without cleaning unrelated dependencies")
 
 
 if __name__ == "__main__":
