@@ -63,6 +63,11 @@ impl Bus {
         Ok(bus)
     }
 
+    /// Resolves once the connection to the AT-SPI bus is closed.
+    pub(crate) async fn closed(&self) {
+        self.conn.closed().await
+    }
+
     fn unique_name(&self) -> &OwnedUniqueName {
         self.conn.unique_name().unwrap()
     }
