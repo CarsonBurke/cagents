@@ -23667,4 +23667,58 @@ mod tests {
             "new tail content still signals unread activity"
         );
     }
+
+    #[test]
+    fn late_connection_callbacks_cannot_change_a_reconnected_card() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let old = chat_runtime(&app, card).target;
+        // This is exactly the closure shape installed by start_chat: a late
+        // worker callback carries the connection Target, never the current card.
+        let sender = app.chat_ui.sender.clone();
+        let late_callback = move |wake| sender.try_send((old, wake)).unwrap();
+        drop(app.handle_chat_ui(Action::Reconnect(old)));
+        let attempt = app.chat_ui.attempt(card).unwrap().target;
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, attempt, Ok(handle.clone()));
+        let target = chat_runtime(&app, card).target;
+        assert_ne!(old, target);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("new connection draft"));
+        let snapshot = chat_runtime(&app, card).snapshot.clone();
+        let session = chat_runtime(&app, card).session.clone();
+        let account_report = crate::account::LiveReport::CodexLimits(
+            crate::account::codex::parse_update(&serde_json::json!({"rateLimits": {
+                "primary": {"usedPercent": 31, "windowDurationMins": 300},
+            }}))
+            .unwrap(),
+        );
+        assert!(handle.push_account_usage_for_test(account_report, crate::chat::now_ms().unwrap()));
+        assert!(app.chat_ui.receiver.is_empty());
+        for wake in [
+            Wake::Changed,
+            Wake::Observed,
+            Wake::Activity,
+            Wake::AccountUsage,
+            Wake::Disconnected("old connection retired".into()),
+        ] {
+            late_callback(wake);
+            let (tag, wake) = app.chat_ui.receiver.try_recv().unwrap();
+            assert_eq!(tag, old);
+            drop(app.handle_chat_ui(Action::Wake(tag, wake)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.target, target);
+            assert!(!runtime.disconnected);
+            assert!(runtime.error.is_none());
+            assert_eq!(runtime.snapshot, snapshot);
+            assert_eq!(runtime.session, session);
+            assert_eq!(runtime.composer.text().trim(), "new connection draft");
+        }
+        assert_eq!(
+            handle.take_account_usage().len(),
+            1,
+            "an old account wake must not drain the replacement connection's report queue"
+        );
+    }
 }

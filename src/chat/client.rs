@@ -274,6 +274,15 @@ impl UpgradeRecovery {
 /// One immutable, coherent presentation. Append evidence owns only bounded
 /// Weak item edges; neither hidden state nor lineage keeps transcript bodies.
 struct Publication {
+    owned: Option<Box<RetiredPublication>>,
+    retirement: Arc<ClientRetirement>,
+    // One exact connection reader, registered inside its owned thread. This
+    // preserves producer-side destruction backpressure without labeling callers
+    // or trusting the thread which happened to construct the attach snapshot.
+    source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+}
+
+struct PublicationPayload {
     snapshot: Arc<Snapshot>,
     clock: Option<SourceClock>,
     resident: bool,
@@ -281,35 +290,125 @@ struct Publication {
     // Ready before installation: hide performs no body/metadata derivation.
     // Metadata nodes have no pair and own no body or append authority.
     hidden: Option<Arc<Publication>>,
+    #[cfg(test)]
+    retirement_complete: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
+}
+
+impl std::ops::Deref for Publication {
+    type Target = PublicationPayload;
+
+    fn deref(&self) -> &Self::Target {
+        &self
+            .owned
+            .as_ref()
+            .expect("held until Publication::drop")
+            .payload
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if let Some(retired) = self.owned.take() {
+            // ArcSwap guards can become last owners on a presentation reader.
+            // Retire on EVERY final Publication path, not only hide/swap paths.
+            if self
+                .source_thread
+                .get()
+                .is_some_and(|id| *id == thread::current().id())
+            {
+                // Ordinary producer swaps keep their existing disposal cost;
+                // only a different final owner hands this work to the reaper.
+                retired.finish();
+            } else {
+                self.retirement.enqueue(RetirementJob::Publication(retired));
+            }
+        }
+    }
+}
+
+struct RetiredPublication {
+    payload: PublicationPayload,
+    next: Option<RetirementJob>,
+}
+
+impl RetiredPublication {
+    fn finish(self: Box<Self>) {
+        debug_assert!(self.next.is_none());
+        #[cfg(test)]
+        let complete = self
+            .payload
+            .retirement_complete
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        // Snapshot/control vectors, weak lineage and ready metadata ownership
+        // all belong to this same node, regardless of the last Arc's thread.
+        drop(self);
+        #[cfg(test)]
+        if let Some(complete) = complete {
+            let _ = complete.send(thread::current().id());
+        }
+    }
 }
 
 impl Publication {
+    fn owned(
+        snapshot: Snapshot,
+        clock: Option<SourceClock>,
+        resident: bool,
+        lineage: append::Lineage,
+        hidden: Option<Arc<Publication>>,
+        source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+    ) -> Arc<Self> {
+        // The connection starts this owner before any handshake/body admission.
+        // Direct test constructors use the same fallible process initialization.
+        let retirement = ClientRetirement::shared()
+            .expect("client retirement must prestart before body admission");
+        Arc::new(Self {
+            owned: Some(Box::new(RetiredPublication {
+                payload: PublicationPayload {
+                    snapshot: Arc::new(snapshot),
+                    clock,
+                    resident,
+                    lineage,
+                    hidden,
+                    #[cfg(test)]
+                    retirement_complete: Mutex::new(None),
+                },
+                next: None,
+            })),
+            retirement,
+            source_thread,
+        })
+    }
+
     fn initial(snapshot: Snapshot) -> Arc<Self> {
         let clock = SourceClock::from_sample(snapshot.sampled_at, Instant::now());
-        Self::resident(snapshot, clock, append::Lineage::default())
+        Self::resident(
+            snapshot,
+            clock,
+            append::Lineage::default(),
+            Arc::new(std::sync::OnceLock::new()),
+        )
     }
 
     fn resident(
         snapshot: Snapshot,
         clock: Option<SourceClock>,
         lineage: append::Lineage,
+        source_thread: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
     ) -> Arc<Self> {
         let mut metadata = snapshot.clone();
         metadata.evict_transcript();
-        let hidden = Arc::new(Self {
-            snapshot: Arc::new(metadata),
+        let hidden = Self::owned(
+            metadata,
             clock,
-            resident: false,
-            lineage: append::Lineage::default(),
-            hidden: None,
-        });
-        Arc::new(Self {
-            snapshot: Arc::new(snapshot),
-            clock,
-            resident: true,
-            lineage,
-            hidden: Some(hidden),
-        })
+            false,
+            append::Lineage::default(),
+            None,
+            source_thread.clone(),
+        );
+        Self::owned(snapshot, clock, true, lineage, Some(hidden), source_thread)
     }
 
     fn next(
@@ -321,15 +420,16 @@ impl Publication {
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         if resident {
-            Self::resident(snapshot, clock, lineage)
+            Self::resident(snapshot, clock, lineage, base.source_thread.clone())
         } else {
-            Arc::new(Self {
-                snapshot: Arc::new(snapshot),
+            Self::owned(
+                snapshot,
                 clock,
-                resident: false,
-                lineage: append::Lineage::default(),
-                hidden: None,
-            })
+                false,
+                append::Lineage::default(),
+                None,
+                base.source_thread.clone(),
+            )
         }
     }
 }
@@ -347,6 +447,14 @@ impl Publications {
             current: ArcSwap::from(Publication::initial(snapshot)),
             commit: Mutex::new(0),
         }
+    }
+
+    fn bind_source_thread(&self) {
+        self.current
+            .load()
+            .source_thread
+            .set(thread::current().id())
+            .expect("one owned reader per publication lineage");
     }
 
     /// Pair the installed identity with body-policy revision before deriving
@@ -369,7 +477,12 @@ impl Publications {
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         }
-        let full = Publication::resident(snapshot, clock, append::Lineage::default());
+        let full = Publication::resident(
+            snapshot,
+            clock,
+            append::Lineage::default(),
+            base.source_thread.clone(),
+        );
         let metadata = full
             .hidden
             .as_ref()
@@ -421,7 +534,14 @@ impl Publications {
     }
 }
 
+// Keep the public ClientHandle/Arc API unchanged. The private payload can move
+// as one owner, including its installed body, even after both threads settled.
 struct Inner {
+    owned: Option<Box<RetiredClient>>,
+    retirement: Arc<ClientRetirement>,
+}
+
+struct InnerPayload {
     id: TerminalId,
     session: Session,
     upgrade_recovery: Option<UpgradeRecovery>,
@@ -447,6 +567,262 @@ struct Inner {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+
+impl Inner {
+    fn new(payload: InnerPayload, retirement: Arc<ClientRetirement>) -> Self {
+        Self {
+            owned: Some(Box::new(RetiredClient {
+                payload,
+                next: None,
+            })),
+            retirement,
+        }
+    }
+}
+
+impl std::ops::Deref for Inner {
+    type Target = InnerPayload;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owned.as_ref().expect("held until Inner::drop").payload
+    }
+}
+
+impl std::ops::DerefMut for Inner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.owned.as_mut().expect("held until Inner::drop").payload
+    }
+}
+
+struct RetiredClient {
+    payload: InnerPayload,
+    next: Option<RetirementJob>,
+}
+
+impl RetiredClient {
+    fn ready(&mut self) -> bool {
+        self.payload
+            .reader
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+            && self
+                .payload
+                .visibility_worker
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished)
+    }
+
+    fn finish(mut self: Box<Self>) {
+        debug_assert!(self.next.is_none());
+        debug_assert!(self.ready());
+        if let Some(reader) = self
+            .payload
+            .reader
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = reader.join();
+        }
+        if let Some(worker) = self
+            .payload
+            .visibility_worker
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
+        let id = self.payload.id;
+        #[cfg(test)]
+        let completed = self.payload.retirement_complete.take();
+        // Actual publication, codec scratch, pending replies, session metadata
+        // and callback ownership all leave the event thread together.
+        drop(self);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+            released = true, resident_bytes = 0usize);
+        #[cfg(test)]
+        if let Some(completed) = completed {
+            let _ = completed.send(std::thread::current().id());
+        }
+    }
+}
+
+enum RetirementJob {
+    Client(Box<RetiredClient>),
+    Publication(Box<RetiredPublication>),
+}
+
+impl RetirementJob {
+    fn next_mut(&mut self) -> &mut Option<Self> {
+        match self {
+            Self::Client(client) => &mut client.next,
+            Self::Publication(publication) => &mut publication.next,
+        }
+    }
+
+    fn ready(&mut self) -> bool {
+        match self {
+            Self::Client(client) => client.ready(),
+            Self::Publication(_) => true,
+        }
+    }
+
+    fn finish(self) {
+        match self {
+            Self::Client(client) => client.finish(),
+            Self::Publication(publication) => publication.finish(),
+        }
+    }
+}
+
+/// One process-owned worker, separate from the parser/presentation FIFO. Each
+/// admitted client and constructed publication already owns its intrusive node;
+/// Drop allocates no queue node and never starts a thread. Outstanding client
+/// and publication retirements have no fixed global byte cap. Never join an
+/// unfinished client here.
+struct ClientRetirement {
+    incoming: Mutex<Option<RetirementJob>>,
+    wake: std::sync::Condvar,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Only a successful process owner is cached. An OS thread-spawn error must
+/// refuse this admission without permanently poisoning later chat attempts.
+struct ClientRetirementInitializer {
+    owner: std::sync::OnceLock<Arc<ClientRetirement>>,
+    initialize: Mutex<()>,
+}
+
+impl ClientRetirementInitializer {
+    const fn new() -> Self {
+        Self {
+            owner: std::sync::OnceLock::new(),
+            initialize: Mutex::new(()),
+        }
+    }
+
+    fn get_or_start(
+        &self,
+        start: impl FnOnce() -> Result<Arc<ClientRetirement>, String>,
+    ) -> Result<Arc<ClientRetirement>, String> {
+        if let Some(owner) = self.owner.get() {
+            return Ok(owner.clone());
+        }
+        let _initializing = self.initialize.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(owner) = self.owner.get() {
+            return Ok(owner.clone());
+        }
+        let owner = start()?;
+        // This is the sole setter, serialized by initialize. Failure leaves
+        // OnceLock empty; concurrent admissions can never start duplicate owners.
+        assert!(
+            self.owner.set(owner.clone()).is_ok(),
+            "serialized retirement initialization"
+        );
+        Ok(owner)
+    }
+}
+
+impl ClientRetirement {
+    fn shared() -> Result<Arc<Self>, String> {
+        static OWNER: ClientRetirementInitializer = ClientRetirementInitializer::new();
+        OWNER.get_or_start(|| {
+            Self::start_with(|worker| {
+                thread::Builder::new()
+                    .name("chat-client-retire".into())
+                    .spawn(worker)
+            })
+        })
+    }
+
+    fn for_client(id: TerminalId) -> Result<Arc<Self>, String> {
+        #[cfg(test)]
+        if tests::fail_retirement_start(id) {
+            return Self::start_with(|_| {
+                Err(io::Error::other("fixture retirement worker startup failed"))
+            });
+        }
+        #[cfg(not(test))]
+        let _ = id;
+        Self::shared()
+    }
+
+    fn start_with(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+    ) -> Result<Arc<Self>, String> {
+        let owner = Arc::new(Self {
+            incoming: Mutex::new(None),
+            wake: std::sync::Condvar::new(),
+            worker: Mutex::new(None),
+        });
+        let running = owner.clone();
+        // No client payload or connection thread has been admitted yet. A spawn
+        // failure drops only this empty startup state and returns a real error.
+        let worker = spawn(Box::new(move || running.run())).map_err(|error| error.to_string())?;
+        *owner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
+        Ok(owner)
+    }
+
+    fn enqueue(&self, mut retired: RetirementJob) {
+        let mut incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+        *retired.next_mut() = incoming.take();
+        *incoming = Some(retired);
+        drop(incoming);
+        self.wake.notify_one();
+    }
+
+    fn run(&self) {
+        let mut waiting = None;
+        loop {
+            let incoming = {
+                let mut incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+                while incoming.is_none() && waiting.is_none() {
+                    incoming = self.wake.wait(incoming).unwrap_or_else(|p| p.into_inner());
+                }
+                incoming.take()
+            };
+            // Both lists are owned only by this worker. No scan, join, trace or
+            // payload destruction holds the short UI handoff mutex.
+            for mut list in [incoming, waiting.take()] {
+                while let Some(mut retired) = list {
+                    list = retired.next_mut().take();
+                    if retired.ready() {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            retired.finish()
+                        }))
+                        .is_err()
+                        {
+                            // Each node is unlinked first: an ordinary payload
+                            // destructor panic cannot drop or strand later jobs.
+                            // Rust abort/double-panic behavior is unchanged.
+                            tracing::error!("chat client retirement payload panicked");
+                        }
+                    } else {
+                        *retired.next_mut() = waiting.take();
+                        waiting = Some(retired);
+                    }
+                }
+            }
+            if waiting.is_some() {
+                let incoming = self.incoming.lock().unwrap_or_else(|p| p.into_inner());
+                if incoming.is_none() {
+                    drop(
+                        self.wake
+                            .wait_timeout(incoming, Duration::from_millis(10))
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -857,6 +1233,7 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let retirement = ClientRetirement::shared().expect("start fixture client retirement");
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
             .items
@@ -874,39 +1251,43 @@ impl ClientHandle {
             host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
         };
         Self {
-            inner: Arc::new(Inner {
-                id: session.id,
-                session,
-                upgrade_recovery: None,
-                proof,
-                wire: Arc::new(Mutex::new(Wire {
-                    stream,
-                    codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
-                    body_requested: body_requested.clone(),
-                })),
-                cancel,
-                publication: Arc::new(Publications::new(snapshot)),
-                body_requested,
-                user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
-                activity: Arc::new(Mutex::new(ActivityObservation {
-                    generation: 0,
-                    state: ActivityState::Idle,
-                    pending: false,
-                })),
-                observed: Arc::new(Mutex::new(OutputObservation::default())),
-                account_usage: Arc::default(),
-                next: Arc::new(AtomicU64::new(1)),
-                alive: Arc::new(AtomicBool::new(true)),
-                visible: Arc::new(AtomicBool::new(true)),
-                wake: Arc::new(|_| {}),
-                reader: Mutex::new(None),
-                pending: Arc::new(Mutex::new(BTreeMap::new())),
-                file_pending: Arc::new(Mutex::new(BTreeMap::new())),
-                text_copy_pending: Arc::new(Mutex::new(BTreeMap::new())),
-                text_copies: AtomicUsize::new(0),
-                visibility_tx,
-                visibility_worker: Mutex::new(None),
-            }),
+            inner: Arc::new(Inner::new(
+                InnerPayload {
+                    id: session.id,
+                    session,
+                    upgrade_recovery: None,
+                    proof,
+                    wire: Arc::new(Mutex::new(Wire {
+                        stream,
+                        codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                        body_requested: body_requested.clone(),
+                    })),
+                    cancel,
+                    publication: Arc::new(Publications::new(snapshot)),
+                    body_requested,
+                    user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
+                    activity: Arc::new(Mutex::new(ActivityObservation {
+                        generation: 0,
+                        state: ActivityState::Idle,
+                        pending: false,
+                    })),
+                    observed: Arc::new(Mutex::new(OutputObservation::default())),
+                    account_usage: Arc::default(),
+                    next: Arc::new(AtomicU64::new(1)),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    visible: Arc::new(AtomicBool::new(true)),
+                    wake: Arc::new(|_| {}),
+                    reader: Mutex::new(None),
+                    pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    file_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    text_copy_pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    text_copies: AtomicUsize::new(0),
+                    visibility_tx,
+                    visibility_worker: Mutex::new(None),
+                    retirement_complete: None,
+                },
+                retirement,
+            )),
         }
     }
 
@@ -1294,6 +1675,7 @@ impl ClientHandle {
         upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
+        let retirement = ClientRetirement::for_client(session.id)?;
         if let Some(expected) = &upgrade_expected
             && (intent != Intent::Restore
                 || source.is_some()
@@ -1532,31 +1914,36 @@ impl ClientHandle {
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
-        let inner = Arc::new(Inner {
-            id,
-            session,
-            upgrade_recovery,
-            proof: proof.clone(),
-            wire: wire.clone(),
-            cancel,
-            publication: publication.clone(),
-            body_requested: body_requested.clone(),
-            user_item_seen: user_item_seen.clone(),
-            activity: activity.clone(),
-            observed: observed.clone(),
-            account_usage: account_usage.clone(),
-            next: next.clone(),
-            alive: alive.clone(),
-            wake: wake.clone(),
-            visible: visible.clone(),
-            reader: Mutex::new(None),
-            pending: pending.clone(),
-            file_pending: file_pending.clone(),
-            text_copy_pending: text_copy_pending.clone(),
-            text_copies: AtomicUsize::new(0),
-            visibility_tx,
-            visibility_worker: Mutex::new(None),
-        });
+        let inner = Arc::new(Inner::new(
+            InnerPayload {
+                id,
+                session,
+                upgrade_recovery,
+                proof: proof.clone(),
+                wire: wire.clone(),
+                cancel,
+                publication: publication.clone(),
+                body_requested: body_requested.clone(),
+                user_item_seen: user_item_seen.clone(),
+                activity: activity.clone(),
+                observed: observed.clone(),
+                account_usage: account_usage.clone(),
+                next: next.clone(),
+                alive: alive.clone(),
+                wake: wake.clone(),
+                visible: visible.clone(),
+                reader: Mutex::new(None),
+                pending: pending.clone(),
+                file_pending: file_pending.clone(),
+                text_copy_pending: text_copy_pending.clone(),
+                text_copies: AtomicUsize::new(0),
+                visibility_tx,
+                visibility_worker: Mutex::new(None),
+                #[cfg(test)]
+                retirement_complete: None,
+            },
+            retirement,
+        ));
         let visibility_wire = wire.clone();
         let visibility_alive = alive.clone();
         let visibility_value = visible.clone();
@@ -1601,6 +1988,7 @@ impl ClientHandle {
         // before the UI has installed the matching runtime generation.
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
             trace_worker_stack("chat_reader");
+            publication.bind_source_thread();
             let mut read_pending = false;
             let mut read_again = false;
             let mut resync = false;
@@ -1769,10 +2157,9 @@ impl ClientHandle {
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
                             let mut proposed = Some(if base.resident {
-                                Publication::resident(snapshot, base.clock, base.lineage.clone())
+                                Publication::resident(snapshot, base.clock, base.lineage.clone(), base.source_thread.clone())
                             } else {
-                                Arc::new(Publication { snapshot: Arc::new(snapshot), clock: base.clock, resident: false,
-                                    lineage: append::Lineage::default(), hidden: None })
+                                Publication::owned(snapshot, base.clock, false, append::Lineage::default(), None, base.source_thread.clone())
                             });
                             let (old, current) = {
                                 let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
@@ -2312,30 +2699,14 @@ pub fn inventory() -> Result<Vec<Session>, String> {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        let Some(retired) = self.owned.take() else {
+            return;
+        };
         // Socket EOF unregisters the subscription, never stops the daemon's actor.
-        self.alive.store(false, Ordering::Release);
-        let _ = self.visibility_tx.try_send(());
-        let _ = self.cancel.shutdown(Shutdown::Both);
-        if let Some(reader) = self
-            .reader
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            && reader.thread().id() != thread::current().id()
-        {
-            let _ = reader.join();
-        }
-        if let Some(worker) = self
-            .visibility_worker
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
-        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %self.id,
-            released = true, resident_bytes = 0usize);
+        retired.payload.alive.store(false, Ordering::Release);
+        let _ = retired.payload.visibility_tx.try_send(());
+        let _ = retired.payload.cancel.shutdown(Shutdown::Both);
+        self.retirement.enqueue(RetirementJob::Client(retired));
     }
 }
 
@@ -3993,8 +4364,16 @@ mod tests {
         )
         .unwrap();
         let body = Arc::downgrade(&handle.snapshot().items[0]);
+        let installed = handle.inner.publication.current.load_full();
+        let (released, retirement) = std::sync::mpsc::channel();
+        *installed.retirement_complete.lock().unwrap() = Some(released);
+        drop(installed);
         handle.set_visible(false).unwrap();
         hidden_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The actual wire hide edge no longer implies that the independent
+        // local disposal owner has completed. Wait for that exact payload,
+        // then retain the same real Weak-body release/residency oracles.
+        retirement.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(handle.snapshot().generation, 41);
         assert_eq!(
             handle.snapshot().session_id.as_deref(),
@@ -5997,5 +6376,521 @@ mod tests {
         assert!(handle.inner.alive.load(Ordering::Acquire));
         released.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    // Test-only injected thread-factory failure, scoped to an exact fresh client.
+    // It exercises the real fallible empty-owner startup path before handshake.
+    static FAIL_RETIREMENT_START: Mutex<std::collections::BTreeSet<TerminalId>> =
+        Mutex::new(std::collections::BTreeSet::new());
+
+    pub(super) fn fail_retirement_start(id: TerminalId) -> bool {
+        FAIL_RETIREMENT_START
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id)
+    }
+
+    fn retirement_text(body: String) -> Arc<super::super::Item> {
+        Arc::new(super::super::Item {
+            id: "retirement-source".into(),
+            role: super::super::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: super::super::ItemContent::Text {
+                text: body,
+                thinking: false,
+                phase: Default::default(),
+            },
+        })
+    }
+
+    /// An actual existing FrameCodec/UnixStream connection; no provider fixture,
+    /// substitute JoinHandle, fabricated lifecycle or synthetic body ownership.
+    fn retirement_wire(
+        session: Session,
+        initial: Snapshot,
+        update: Option<super::super::presentation::Presentation>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> (ClientHandle, JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (eof, observed_eof) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = request.request else {
+                panic!("expected actual ChatStart handshake")
+            };
+            let chat_id = session.id;
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(request.request_id),
+                &handoff_proof(),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                },
+            );
+            if let Some(update) = update {
+                let visible: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(
+                    visible.request,
+                    ClientRequest::ChatVisibility { visible: true, .. }
+                ));
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    None,
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatUpdate { chat_id, update },
+                    },
+                );
+                let end: Option<ClientEnvelope> = codec.read(&mut server).unwrap();
+                assert!(
+                    end.is_none(),
+                    "Drop shutdown must close the real connection while its reader is paused"
+                );
+                eof.send(()).unwrap();
+            }
+        });
+        let client = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
+        .unwrap();
+        (client, worker, observed_eof)
+    }
+
+    #[test]
+    fn dropping_a_paused_client_hands_off_both_joins_without_blocking_other_retirements() {
+        use super::super::presentation::{ItemChange, Presentation};
+        let session = omp_card(None, None);
+        let (paused, observed_pause) = std::sync::mpsc::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        PUBLICATION_GATES
+            .lock()
+            .unwrap()
+            .insert(session.id, (paused, released));
+        let before = retirement_text("before".into());
+        let after = retirement_text("before tail".into());
+        let update = Presentation {
+            base_generation: 1,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec![after.id.clone()],
+            changes: vec![ItemChange::between(Some(&before), &after)],
+            children: vec![],
+            file_changes_unchanged: false,
+        };
+        let (callback, callbacks) = std::sync::mpsc::channel();
+        let (mut client, server, eof) = retirement_wire(
+            session,
+            Snapshot {
+                generation: 1,
+                items: vec![before],
+                ..Default::default()
+            },
+            Some(update),
+            move |wake| {
+                let _ = callback.send(wake);
+            },
+        );
+        let (finished, observed_finish) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut client.inner).unwrap().retirement_complete = Some(finished);
+        let alive = client.inner.alive.clone();
+        client.set_visible(true).unwrap();
+        observed_pause.recv_timeout(Duration::from_secs(5)).unwrap();
+        while callbacks.try_recv().is_ok() {}
+        let (dropped, observed_drop) = std::sync::mpsc::channel();
+        let dropping = thread::spawn(move || {
+            drop(client);
+            dropped.send(thread::current().id()).unwrap();
+        });
+        let returned_while_paused = observed_drop.recv_timeout(Duration::from_secs(1));
+        let cancelled_while_paused = eof.recv_timeout(Duration::from_secs(1));
+        let unfinished_was_retained = observed_finish.try_recv().is_err();
+        let cancelled_before_resume = !alive.load(Ordering::Acquire);
+        let no_callback_before_resume = callbacks.try_recv().is_err();
+        // A second real owned payload has no connection threads to wait on.
+        // It must retire while the first real connection remains gated.
+        let mut independent = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (other_finished, other_observed) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut independent.inner)
+            .unwrap()
+            .retirement_complete = Some(other_finished);
+        drop(independent);
+        let other_retired_while_paused = other_observed.recv_timeout(Duration::from_secs(1));
+        // Always release/retire the real held reader before judging results.
+        resume.send(()).unwrap();
+        dropping.join().unwrap();
+        server.join().unwrap();
+        let released_on = observed_finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let late: Vec<_> = callbacks.try_iter().collect();
+        assert!(
+            cancelled_before_resume,
+            "alive must be fenced inline before the held reader resumes"
+        );
+        assert!(no_callback_before_resume);
+        assert!(late.iter().any(|wake| matches!(wake, Wake::Changed)));
+        assert!(
+            late.iter()
+                .any(|wake| matches!(wake, Wake::Disconnected(_))),
+            "real queued callbacks may arrive after Drop returns; their UI Target must remain fenced"
+        );
+        let dropped_on = returned_while_paused
+            .expect("dropping the last UI owner must not join its gated reader");
+        assert!(
+            cancelled_while_paused.is_ok(),
+            "actual socket shutdown must remain inline"
+        );
+        assert!(
+            unfinished_was_retained,
+            "never claim destruction/join completion while the reader is gated"
+        );
+        assert_ne!(released_on, dropped_on);
+        assert_eq!(
+            other_retired_while_paused.unwrap(),
+            released_on,
+            "one unfinished reader must not head-of-line block another ready payload"
+        );
+    }
+
+    #[test]
+    fn settled_reader_and_failed_join_release_the_actual_large_publication_off_the_dropping_thread()
+    {
+        let body = "large retained client body\n".repeat(200_000);
+        let bytes = body.len();
+        let (mut client, server, _) = retirement_wire(
+            omp_card(None, None),
+            Snapshot {
+                generation: 1,
+                items: vec![retirement_text(body)],
+                ..Default::default()
+            },
+            None,
+            |wake| {
+                if matches!(wake, Wake::Disconnected(_)) {
+                    panic!("fixture settled reader failure");
+                }
+            },
+        );
+        server.join().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reader_done = client
+                .inner
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished();
+            let visibility_done = client
+                .inner
+                .visibility_worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished();
+            if reader_done && visibility_done {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "actual connection threads must settle before the final-owner test"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let publication = Arc::downgrade(&client.inner.publication);
+        let state = client.inner.publication.current.load_full();
+        assert_eq!(state.snapshot.transcript_bytes(), bytes);
+        let snapshot = Arc::downgrade(&state.snapshot);
+        let (body_released, body_completion) = std::sync::mpsc::channel();
+        *state.retirement_complete.lock().unwrap() = Some(body_released);
+        drop(state);
+        let (finished, observed_finish) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut client.inner).unwrap().retirement_complete = Some(finished);
+        let dropping_thread = thread::current().id();
+        drop(client);
+        let released_on = observed_finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(
+            released_on, dropping_thread,
+            "even a settled connection's large last publication belongs off UI"
+        );
+        assert!(
+            publication.upgrade().is_none(),
+            "retirement must release the actual publication owner"
+        );
+        assert_eq!(
+            body_completion
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            released_on
+        );
+        assert!(
+            snapshot.upgrade().is_none(),
+            "retirement must destroy the final actual snapshot body, not only its handles"
+        );
+    }
+
+    #[test]
+    fn a_panicking_payload_does_not_strand_later_clients() {
+        struct CallbackOwner(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for CallbackOwner {
+            fn drop(&mut self) {
+                let _ = self.0.send(thread::current().id());
+                panic!("fixture callback owner destructor");
+            }
+        }
+        let (destroyed, destruction) = std::sync::mpsc::channel();
+        let owned = CallbackOwner(destroyed);
+        let mut first = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        Arc::get_mut(&mut first.inner).unwrap().wake = Arc::new(move |_| {
+            let _ = &owned;
+        });
+        let dropping_thread = thread::current().id();
+        drop(first);
+        let failed_on = destruction.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut next = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (finished, completion) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut next.inner).unwrap().retirement_complete = Some(finished);
+        drop(next);
+        assert_ne!(failed_on, dropping_thread);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            failed_on,
+            "the same process-owned worker must survive an ordinary payload destructor unwind"
+        );
+    }
+
+    #[test]
+    fn retirement_worker_start_failure_refuses_before_handshake_or_payload_admission() {
+        use std::io::Read;
+        let session = omp_card(None, None);
+        FAIL_RETIREMENT_START.lock().unwrap().insert(session.id);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        );
+        let Err(error) = result else {
+            panic!("thread factory failure must refuse the client");
+        };
+        assert!(error.message.contains("retirement worker startup failed"));
+        let mut byte = [0];
+        assert_eq!(
+            server.read(&mut byte).unwrap(),
+            0,
+            "no Connect/ChatStart or body ownership may precede retirement admission"
+        );
+    }
+
+    fn observed_large_publication() -> (
+        Arc<Publication>,
+        std::sync::Weak<Snapshot>,
+        std::sync::mpsc::Receiver<std::thread::ThreadId>,
+    ) {
+        let body = "large publication last owner\n".repeat(400_000);
+        let publication = Publication::initial(Snapshot {
+            generation: 1,
+            items: vec![retirement_text(body)],
+            ..Default::default()
+        });
+        let snapshot = Arc::downgrade(&publication.snapshot);
+        let (completed, completion) = std::sync::mpsc::channel();
+        *publication.retirement_complete.lock().unwrap() = Some(completed);
+        (publication, snapshot, completion)
+    }
+
+    #[test]
+    fn hiding_retires_the_actual_last_publication_body_off_the_caller() {
+        let client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (publication, body, completion) = observed_large_publication();
+        let identity = Arc::downgrade(&publication);
+        drop(client.inner.publication.current.swap(publication));
+        let caller = thread::current().id();
+        client.set_interest(false, false).unwrap();
+        assert!(!client.inner.publication.current.load().resident);
+        let destroyed_on = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(destroyed_on, caller);
+        assert!(identity.upgrade().is_none());
+        assert!(
+            body.upgrade().is_none(),
+            "the actual large Snapshot must be released, not only a spare wrapper"
+        );
+    }
+
+    #[test]
+    fn a_final_arc_swap_reader_guard_retires_its_body_off_the_reader() {
+        let client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let (publication, body, completion) = observed_large_publication();
+        drop(client.inner.publication.current.swap(publication));
+        let guard = client.inner.publication.current.load();
+        let original = Arc::as_ptr(&guard);
+        let publications = client.inner.publication.clone();
+        let writer = thread::spawn(move || {
+            assert_eq!(
+                publications.replace(
+                    Snapshot {
+                        generation: 2,
+                        ..Default::default()
+                    },
+                    &AtomicBool::new(true),
+                    false,
+                    false
+                ),
+                Some(true)
+            );
+        });
+        writer.join().unwrap();
+        assert_ne!(
+            Arc::as_ptr(&client.inner.publication.current.load()),
+            original
+        );
+        assert_eq!(
+            guard.snapshot.generation, 1,
+            "the real ArcSwap guard still owns the superseded publication"
+        );
+        assert!(body.upgrade().is_some());
+        assert!(completion.try_recv().is_err());
+        let reader = thread::current().id();
+        drop(guard);
+        assert_ne!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            reader
+        );
+        assert!(body.upgrade().is_none());
+    }
+
+    #[test]
+    fn ordinary_reader_replacement_disposes_its_previous_body_on_that_reader() {
+        use super::super::presentation::{ItemChange, Presentation};
+        let body = "source reader disposal\n".repeat(200_000);
+        let before = retirement_text(body.clone());
+        let after = retirement_text(body + "tail");
+        let update = Presentation {
+            base_generation: 1,
+            metadata: Snapshot {
+                generation: 2,
+                ..Default::default()
+            },
+            order: vec![after.id.clone()],
+            changes: vec![ItemChange::between(Some(&before), &after)],
+            children: vec![],
+            file_changes_unchanged: false,
+        };
+        let (client, server, eof) = retirement_wire(
+            omp_card(None, None),
+            Snapshot {
+                generation: 1,
+                items: vec![before],
+                ..Default::default()
+            },
+            Some(update),
+            |_| {},
+        );
+        let reader = client
+            .inner
+            .reader
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+        let current = client.inner.publication.current.load_full();
+        let previous_body = Arc::downgrade(&current.snapshot);
+        let (completed, completion) = std::sync::mpsc::channel();
+        *current.retirement_complete.lock().unwrap() = Some(completed);
+        drop(current);
+        client.set_visible(true).unwrap();
+        let disposal = completion.recv_timeout(Duration::from_secs(5));
+        // Release/finish the real wire before judging the thread oracle.
+        drop(client);
+        eof.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            disposal.unwrap(),
+            reader,
+            "ordinary source updates must keep actual prior-body disposal on their producer, preserving backpressure"
+        );
+        assert!(previous_body.upgrade().is_none());
+    }
+
+    #[test]
+    fn retirement_initialization_retries_after_a_thread_factory_error() {
+        let initializer = ClientRetirementInitializer::new();
+        let starts = AtomicUsize::new(0);
+        let failure = initializer.get_or_start(|| {
+            starts.fetch_add(1, Ordering::Relaxed);
+            ClientRetirement::start_with(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+        });
+        assert!(failure.is_err());
+        assert!(
+            initializer.owner.get().is_none(),
+            "failed startup must not poison later admission"
+        );
+        let owner = initializer
+            .get_or_start(|| {
+                starts.fetch_add(1, Ordering::Relaxed);
+                ClientRetirement::start_with(|worker| {
+                    thread::Builder::new()
+                        .name("chat-retire-initializer-fixture".into())
+                        .spawn(worker)
+                })
+            })
+            .unwrap();
+        let same = initializer
+            .get_or_start(|| {
+                panic!("a successful owner must be reused without another worker spawn")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&owner, &same));
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "one failed attempt and one actual successful worker"
+        );
+        let worker = owner.worker.lock().unwrap().as_ref().unwrap().thread().id();
+        // Exercise real payload admission after successful retry, not merely a
+        // stored flag. The isolated worker is process-owned, just like shared().
+        let mut client = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let inner = Arc::get_mut(&mut client.inner).unwrap();
+        inner.retirement = owner;
+        let (finished, completion) = std::sync::mpsc::channel();
+        inner.retirement_complete = Some(finished);
+        drop(client);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(5)).unwrap(),
+            worker
+        );
     }
 }
