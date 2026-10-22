@@ -551,20 +551,39 @@ fn load_regular_file(
         return Ok(decode_svg(&bytes)
             .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
     }
-    let format = image::guess_format(&bytes)
-        .ok()
-        .or_else(|| image::ImageFormat::from_path(relative_path).ok());
-    if let Some(format) = format {
+    // A name that says image is the reader's own claim, so a file that fails
+    // to decode is presented with the decoder's reason. The content picks the
+    // decoder, because a misnamed image is still an image.
+    if let Ok(named) = image::ImageFormat::from_path(relative_path) {
+        let format = image::guess_format(&bytes).unwrap_or(named);
         return Ok(decode_raster(&bytes, format)
             .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
     }
-    if bytes.contains(&0) {
-        return Ok(FileContent::ReadOnly(ReadOnlyReason::Binary));
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return Ok(FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)),
+    // Otherwise text is decided first. Several signatures are printable ASCII
+    // ("BM", "P1" to "P7", "DDS ", "qoif", "GIF89a"), so they also begin
+    // ordinary prose, and a file that reads as text is text. Real images
+    // carrying those signatures are not valid text and still reach the
+    // decoder below, as does every image whose signature is binary.
+    let (bytes, reason) = if bytes.contains(&0) {
+        (bytes, ReadOnlyReason::Binary)
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(text) => return Ok(editable_text(relative_path, text)),
+            Err(error) => (error.into_bytes(), ReadOnlyReason::InvalidUtf8),
+        }
     };
+    // A signature without a name to back it up is a guess, so one that does
+    // not decode leaves the file classified by its bytes.
+    if let Ok(format) = image::guess_format(&bytes)
+        && let Ok(image) = decode_raster(&bytes, format)
+    {
+        return Ok(image);
+    }
+    Ok(FileContent::ReadOnly(reason))
+}
+
+/// The editable buffer for `text`, read from `relative_path`.
+fn editable_text(relative_path: &Path, text: String) -> FileContent {
     let markdown = relative_path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("README"))
@@ -574,11 +593,11 @@ fn load_regular_file(
             .is_some_and(|extension| {
                 matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
             });
-    Ok(FileContent::Editable {
+    FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
         markdown,
-    })
+    }
 }
 
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -1248,6 +1267,101 @@ mod tests {
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
         assert!(matches!(
             content(root.path(), "broken.png"),
+            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+        ));
+    }
+
+    /// Several signatures `image::guess_format` knows are printable ASCII,
+    /// two of them only two bytes long, so they also begin ordinary prose.
+    /// Content alone is not evidence of an image when it reads as text and
+    /// the name does not say image.
+    #[test]
+    fn text_that_begins_like_an_image_signature_opens_as_text() {
+        let root = tempdir().unwrap();
+        for (name, text, markdown) in [
+            ("ranking.md", "BM25 ranking beats TF-IDF here.\n", true),
+            ("notes.txt", "P1: ship the fix\nP2: write tests\n", false),
+            ("plan", "P3 is blocked on review\n", false),
+            ("todo.txt", "P7 first, then P4\n", false),
+            ("textures.txt", "DDS files hold GPU textures.\n", false),
+            ("formats.txt", "qoif is the QOI magic.\n", false),
+            ("farbfeld.txt", "farbfeld is a lossless format.\n", false),
+            ("radiance.txt", "#?RADIANCE starts an HDR file.\n", false),
+            ("history.txt", "GIF89a added animation.\n", false),
+            // A plain-text bitmap is still text to a reader who did not name
+            // it as an image, whether or not this build can decode it.
+            ("sample.txt", "P1\n2 2\n0 1\n1 0\n", false),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                editable(text, markdown),
+                "{name} must open as editable text"
+            );
+        }
+    }
+
+    /// Text-first classification must not cost a real image that carries one
+    /// of those printable signatures: its bytes are not text, so the content
+    /// decides whatever the name says.
+    #[test]
+    fn a_real_image_with_a_printable_signature_still_renders() {
+        let root = tempdir().unwrap();
+        let image = image::RgbImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgb([200, 10, 30])
+            } else {
+                image::Rgb([5, 90, 250])
+            }
+        });
+        let mut bmp = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(bmp.starts_with(b"BM"));
+        for name in ["pixels.bmp", "pixels.dat", "pixels"] {
+            fs::write(root.path().join(name), &bmp).unwrap();
+            let FileContent::Image {
+                width,
+                height,
+                rgba,
+            } = content(root.path(), name)
+            else {
+                panic!("{name} must render as an image");
+            };
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(&*rgba, &[200, 10, 30, 255, 5, 90, 250, 255]);
+        }
+    }
+
+    /// A signature that fails to decode is only a guess, and when the name
+    /// does not back it up the bytes are classified like any other file's.
+    #[test]
+    fn an_undecodable_signature_falls_back_to_the_bytes_unless_named_as_an_image() {
+        let root = tempdir().unwrap();
+        let mut binary = b"\x89PNG\r\n\x1a\n".to_vec();
+        binary.extend_from_slice(b"\0\0\0\rgarbage");
+        fs::write(root.path().join("payload.bin"), &binary).unwrap();
+        assert_eq!(
+            content(root.path(), "payload.bin"),
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        );
+        let mut invalid = b"\x89PNG\r\n\x1a\n".to_vec();
+        invalid.extend_from_slice(b"\xff\xfe no NUL here");
+        fs::write(root.path().join("payload"), &invalid).unwrap();
+        assert_eq!(
+            content(root.path(), "payload"),
+            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+        );
+        // Named as an image, the decoder's reason is the useful answer.
+        fs::write(root.path().join("payload.png"), &binary).unwrap();
+        assert!(matches!(
+            content(root.path(), "payload.png"),
+            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+        ));
+        fs::write(root.path().join("weak.bmp"), "BM25 ranking\n").unwrap();
+        assert!(matches!(
+            content(root.path(), "weak.bmp"),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
     }
