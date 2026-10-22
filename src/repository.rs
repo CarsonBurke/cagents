@@ -6935,8 +6935,8 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
-        /// Runs `contract` as the only test of a private libtest subprocess
-        /// whose working tree lives in a 0700 namespace under `/var/tmp`; the
+        /// Runs `contract` as the only test of a private libtest subprocess,
+        /// against a repository in a 0700 namespace under `/var/tmp`; the
         /// fixture repositories are too large for a RAM-backed temporary
         /// directory.
         ///
@@ -6949,8 +6949,10 @@ mod tests {
         /// Git's detached auto-maintenance can, is invisible to the owner. So
         /// the child makes itself the subreaper of its whole family and reaps
         /// until none remains before its test reports ok; the owner removes the
-        /// namespace only after asserting that report. On failure or timeout
-        /// it is retained, with its path printed.
+        /// namespace only after asserting that report, and a removal failure
+        /// then fails the test: it means a broken proof or a host fault, and
+        /// staying silent would leak the fixture. On failure or timeout the
+        /// namespace is retained, with its path printed.
         fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Path)) {
             use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
             let name = name
@@ -6991,18 +6993,16 @@ mod tests {
                 return;
             }
 
-            /// Retained, and named, whenever the owner panics: a failed or
-            /// timed-out child proves nothing about its family. Otherwise the
-            /// owner returned only after asserting the child's settled ok.
+            /// Retained and named if the owner panics, removed if it returns.
             struct Namespace(PathBuf);
             impl Drop for Namespace {
                 fn drop(&mut self) {
                     if std::thread::panicking() {
                         eprintln!("Retained pathspec contract root: {}", self.0.display());
-                    } else if let Err(error) = fs::remove_dir_all(&self.0) {
-                        // Nothing can still write into a settled private
-                        // namespace, so this is a broken proof or a host
-                        // fault, and staying silent would leak the fixture.
+                    } else if let Err(error) = fs::remove_dir_all(&self.0)
+                        // A manual sweep of these namespaces may have won.
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
                         panic!(
                             "removing settled pathspec contract root {}: {error}",
                             self.0.display()
