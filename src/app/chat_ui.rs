@@ -2453,14 +2453,28 @@ impl Runtime {
         true
     }
 
-    /// Puts a whole new draft in the composer. Whatever the completion list
-    /// was doing belonged to the old one.
-    fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+    fn cancel_attachment_jobs(&mut self) {
         self.attachment_jobs.clear();
         self.attachment_bookmarks.clear();
         self.pastes_pending = 0;
         self.image_pastes_saving = 0;
         self.submit_after_paste = None;
+    }
+
+    /// Callback targets are lifetime fences. Moving a retained runtime must
+    /// retire old insert ownership before those callbacks become unreachable.
+    fn retarget(&mut self, target: Target) {
+        if self.target != target {
+            self.cancel_attachment_jobs();
+            self.attachment_chooser_pending = None;
+            self.target = target;
+        }
+    }
+
+    /// Puts a whole new draft in the composer. Whatever the completion list
+    /// was doing belonged to the old one.
+    fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+        self.cancel_attachment_jobs();
         self.composer = composer;
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
@@ -7506,7 +7520,7 @@ impl Cagents {
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.target = target;
+                            runtime.retarget(target);
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
@@ -15039,6 +15053,49 @@ mod tests {
             assert_eq!(runtime.composer.text(), first_ref.token());
             assert_eq!(runtime.attachments, [first.clone()]);
         });
+    }
+
+    #[test]
+    fn retargeted_runtime_retires_old_insert_leases_before_ignoring_old_callbacks() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let old_target = chat_runtime(&app, card).target;
+        write(&mut app, card, "retained prose");
+        let runtime = app.chat_runtime_mut(old_target).unwrap();
+        let first = runtime.begin_attachment_insert();
+        let second = runtime.begin_attachment_insert();
+        runtime.attachment_chooser_pending = Some(first.id);
+        runtime.submit_after_paste = Some(PromptMode::Send);
+        let target = Target {
+            generation: old_target.generation.wrapping_add(1),
+            ..old_target
+        };
+        runtime.retarget(target);
+        assert!(!first.active());
+        assert!(!second.active());
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachment_jobs.is_empty());
+        assert!(runtime.attachment_bookmarks.is_empty());
+        assert!(runtime.attachment_chooser_pending.is_none());
+        assert!(runtime.submit_after_paste.is_none());
+        assert!(
+            runtime.try_attachment_insert().is_none(),
+            "old callbacks still own their global slots until completion"
+        );
+        drop(app.handle_chat_ui(Action::PastedImage(old_target, first, None)));
+        let next = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .try_attachment_insert()
+            .unwrap();
+        drop(app.handle_chat_ui(Action::PastedImage(old_target, second, None)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let another = runtime.try_attachment_insert().unwrap();
+        assert!(next.active());
+        assert!(another.active());
+        assert_eq!(runtime.pastes_pending, 2);
+        assert_eq!(runtime.composer.text(), "retained prose");
+        assert!(runtime.attachments.is_empty());
     }
 
     #[test]
