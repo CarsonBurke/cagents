@@ -1057,6 +1057,10 @@ mod tests {
 
     #[test]
     fn an_installed_window_inspects_while_focused_and_when_focus_or_the_daemon_changes() {
+        assert!(
+            !crate::instance::update_in_progress(),
+            "an update in progress would keep inspection off"
+        );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.settings.check_for_updates = false;
         app.update_ui.watch_installation = true;

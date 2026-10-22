@@ -220,10 +220,35 @@ mod tests {
                 .is_some()
         );
 
+        let snapshot = |app: &Cagents| {
+            let (_, snapshot) = app
+                .refresh_ui
+                .review_requests
+                .snapshots()
+                .next()
+                .expect("the watched repository's snapshot");
+            Arc::clone(snapshot)
+        };
+        // A worktree's row is replaced whole, so a rewrite of it, even with
+        // equal contents, shows up as a new title allocation.
+        let worktree_row = |app: &Cagents| {
+            app.sidebar_model.projects[0].worktrees[0]
+                .pull_request()
+                .expect("the worktree's pull request")
+                .title
+                .as_ptr()
+        };
         let projects = app.sidebar_model.projects.clone();
         let revision = app.refresh_ui.review_requests.revision();
+        let shown = snapshot(&app);
+        let row = worktree_row(&app);
         app.complete_review_read_for_test(&[7]);
         assert_eq!(app.refresh_ui.review_requests.revision(), revision);
+        assert!(
+            Arc::ptr_eq(&snapshot(&app), &shown),
+            "a read that found the same requests keeps the snapshot every view shares"
+        );
+        assert_eq!(worktree_row(&app), row, "the worktree's row is not rebuilt");
         assert_eq!(app.sidebar_model.projects, projects);
         assert!(
             app.notification_ui
@@ -241,12 +266,46 @@ mod tests {
         );
     }
 
+    /// How the runtime tells subscriptions apart: a timer whose interval
+    /// changes hashes differently, and is restarted at the new interval.
+    fn recipe_identities(subscription: Subscription<Message>) -> Vec<u64> {
+        use cosmic::iced::advanced::subscription::{Hasher, Recipe, into_recipes};
+        use std::hash::Hasher as _;
+        into_recipes(subscription)
+            .iter()
+            .map(|recipe| {
+                let mut hasher = Hasher::default();
+                Recipe::hash(&**recipe, &mut hasher);
+                hasher.finish()
+            })
+            .collect()
+    }
+
     #[test]
     fn an_unfocused_window_backs_off_even_when_the_daemon_is_healthy() {
         assert_eq!(review_interval(true, false), Duration::from_secs(10));
         assert_eq!(review_interval(true, true), Duration::from_secs(30));
         assert_eq!(review_interval(false, false), Duration::from_secs(120));
         assert_eq!(review_interval(false, true), Duration::from_secs(120));
+
+        // The shell's timer follows its own window focus. Daemon health is
+        // process-wide and other tests may move it, which only ever changes
+        // the focused interval, so only the unfocused timer is compared with
+        // itself.
+        let mut app = watching_one_repository();
+        app.refresh_ui.focused = false;
+        let background = recipe_identities(app.review_request_subscription());
+        assert_eq!(background.len(), 1);
+        app.refresh_ui.focused = true;
+        let focused = recipe_identities(app.review_request_subscription());
+        assert_eq!(focused.len(), 1);
+        assert_ne!(focused, background, "focus changes the review timer");
+        app.refresh_ui.focused = false;
+        assert_eq!(
+            recipe_identities(app.review_request_subscription()),
+            background,
+            "losing focus again returns to the same background timer"
+        );
     }
 
     #[test]
