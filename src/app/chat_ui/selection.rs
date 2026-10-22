@@ -254,10 +254,45 @@ struct LogicalText {
     plain: Arc<str>,
 }
 
+// Native row positions and clip extents can round on opposite sides of one
+// f32 addition. Admit only the adjacent representable boundary, never a pixel
+// tolerance or a genuinely clipped/offscreen caret row.
+fn enclosed_caret_row(bounds: Rectangle, clip: Rectangle, translation: Vector) -> bool {
+    let bottom = bounds.y + bounds.height;
+    // Compare in the original native layout frame. At a large scroll offset,
+    // one representable layout step is larger than a screen-coordinate step.
+    let clip_top = clip.y + translation.y;
+    let clip_bottom = (clip.y + clip.height) + translation.y;
+    bounds.x.is_finite()
+        && translation.x.is_finite()
+        && translation.y.is_finite()
+        && bounds.width.is_finite()
+        && bounds.width >= 0.0
+        && bounds.y.is_finite()
+        && bounds.height.is_finite()
+        && bottom.is_finite()
+        && clip.x.is_finite()
+        && clip.y.is_finite()
+        && clip.height.is_finite()
+        && clip_top.is_finite()
+        && clip_bottom.is_finite()
+        && clip.width.is_finite()
+        && clip.width > 0.0
+        && bounds.height > 0.0
+        && clip.height > 0.0
+        && bottom > clip_top
+        && bounds.y < clip_bottom
+        && bounds.y >= clip_top.next_down()
+        && bottom <= clip_bottom.next_up()
+}
+
 struct Read {
     catalog: Option<Arc<Catalog>>,
     blocks: Vec<Block>,
     pointer: Option<Point>,
+    // Only an active drag supplies raw boundary intent. Ordinary hit testing
+    // and endpoint candidate choice keep their clipped pointer.
+    drag_pointer: Option<Point>,
     translation: Vector,
     pending: Option<(Vector, Rectangle)>,
     clip: Option<Rectangle>,
@@ -272,6 +307,7 @@ impl Read {
             catalog: None,
             blocks: Vec::new(),
             pointer,
+            drag_pointer: None,
             translation: Vector::ZERO,
             pending: None,
             clip: None,
@@ -287,6 +323,26 @@ impl Read {
             ..Self::new(pointer)
         }
     }
+    fn terminal_caret_end(&self, prose: &Prose, bounds: Rectangle) -> Option<usize> {
+        let logical = prose.logical.as_ref().filter(|_| prose.logical_active)?;
+        let pointer = self.drag_pointer?;
+        let pointer_y = pointer.y + self.translation.y;
+        let clip = self.clip?;
+        if !prose.empty_line_caret()
+            || !matches!(prose.plain.as_ref(), "\n" | "\r\n")
+            || !pointer.x.is_finite()
+            || !pointer_y.is_finite()
+            || pointer_y < bounds.y + bounds.height
+            || !enclosed_caret_row(bounds, clip, self.translation)
+        {
+            return None;
+        }
+        let source = self.catalog.as_ref()?.text(logical.identity)?;
+        let end = logical.start.checked_add(prose.plain.len())?;
+        (end == source.len() && source.get(logical.start..end) == Some(prose.plain.as_ref()))
+            .then_some(prose.plain.len())
+    }
+
     fn list_markers(&self) -> Vec<ListMarker> {
         let mut lists = Vec::new();
         let mut indent = 0;
@@ -664,6 +720,7 @@ impl Operation for Read {
             }
             return;
         }
+        let native_bounds = bounds;
         let bounds = Rectangle {
             x: bounds.x - self.translation.x,
             y: bounds.y - self.translation.y,
@@ -684,7 +741,9 @@ impl Operation for Read {
                         .and_then(|logical| self.catalog.as_ref()?.text(logical.identity))
                         .unwrap_or_else(|| prose.plain.clone()),
                     position.map_or(0, |point| {
-                        prose.hit(point) + logical.map_or(0, |logical| logical.start)
+                        self.terminal_caret_end(prose, native_bounds)
+                            .unwrap_or_else(|| prose.hit(point))
+                            + logical.map_or(0, |logical| logical.start)
                     }),
                     position
                         .filter(|_| self.pointer.is_some_and(|point| bounds.contains(point)))
@@ -1142,6 +1201,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 },
                 self.catalog.clone(),
             );
+            read.drag_pointer = (state.dragging && !press)
+                .then(|| cursor.position())
+                .flatten();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1315,6 +1377,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 clipped_pointer(tree.state.downcast_ref::<State>().pointer, visible),
                 self.catalog.clone(),
             );
+            read.drag_pointer = tree.state.downcast_ref::<State>().pointer;
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 layout,
@@ -1431,6 +1494,600 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_caret_enclosure_allows_one_float_step_and_refuses_clipped_or_invalid_rows() {
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(600.0, 10920.0));
+        let actual = Rectangle::new(
+            Point::new(0.0, 10901.80078125),
+            Size::new(0.0, 18.19999885559082),
+        );
+        assert_eq!(
+            (actual.y + actual.height).to_bits(),
+            clip.height.to_bits() + 1
+        );
+        assert!(enclosed_caret_row(actual, clip, Vector::ZERO));
+        assert!(!enclosed_caret_row(
+            actual,
+            Rectangle {
+                height: clip.height.next_down(),
+                ..clip
+            },
+            Vector::ZERO
+        ));
+        let clip = Rectangle::new(Point::new(0.0, 10.0), Size::new(100.0, 5.0));
+        let row = |top| Rectangle::new(Point::new(0.0, top), Size::new(0.0, 15.0 - top));
+        assert!(enclosed_caret_row(
+            row(clip.y.next_down()),
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(
+            row(clip.y.next_down().next_down()),
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(row(9.0), clip, Vector::ZERO));
+        assert!(!enclosed_caret_row(
+            Rectangle {
+                y: 15.0,
+                height: 1.0,
+                ..row(10.0)
+            },
+            clip,
+            Vector::ZERO
+        ));
+        assert!(!enclosed_caret_row(
+            Rectangle {
+                y: 8.0,
+                height: 1.0,
+                ..row(10.0)
+            },
+            clip,
+            Vector::ZERO
+        ));
+        for bad in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert!(!enclosed_caret_row(
+                Rectangle {
+                    height: bad,
+                    ..row(10.0)
+                },
+                clip,
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle {
+                    height: bad,
+                    ..clip
+                },
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle { width: bad, ..clip },
+                Vector::ZERO
+            ));
+        }
+        for bad in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert!(!enclosed_caret_row(row(10.0), clip, Vector::new(0.0, bad)));
+            assert!(!enclosed_caret_row(row(10.0), clip, Vector::new(bad, 0.0)));
+            assert!(!enclosed_caret_row(
+                Rectangle {
+                    y: bad,
+                    ..row(10.0)
+                },
+                clip,
+                Vector::ZERO
+            ));
+            assert!(!enclosed_caret_row(
+                row(10.0),
+                Rectangle { y: bad, ..clip },
+                Vector::ZERO
+            ));
+        }
+    }
+
+    #[test]
+    fn native_terminal_newline_drag_keeps_source_end_and_rejects_hidden_or_stale_rows() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = logical_identity("terminal-pointer", &[0]);
+        let prefix = "head\n";
+        #[derive(Default)]
+        struct Rows(Vec<(Rectangle, usize, String, bool)>);
+        impl Operation for Rows {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+                if let Some(prose) = state.downcast_ref::<Prose>() {
+                    self.0.push((
+                        bounds,
+                        prose.logical.as_ref().unwrap().start,
+                        prose.plain.to_string(),
+                        prose.empty_line_caret(),
+                    ));
+                }
+            }
+        }
+        for ending in ["\n", "\r\n"] {
+            let source = format!("{prefix}{ending}");
+            let make = |inner_height: f32, outer_height: f32, current_source: &str| {
+                let leaf = |text: &str, start| {
+                    selectable_prose::logical_text(
+                        vec![iced::widget::text::Span::new(text.to_owned())].into(),
+                        14.0.into(),
+                        iced::Font::MONOSPACE,
+                        target,
+                        None,
+                        selectable_prose::Logical { identity, start },
+                    )
+                };
+                let inner = widget::scrollable(widget::column::with_children(vec![
+                    leaf(prefix, 0),
+                    leaf(ending, prefix.len()),
+                ]))
+                .height(Length::Fixed(inner_height))
+                .width(Length::Fill);
+                let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
+                let mut catalog = Catalog::builder();
+                catalog.plain("terminal-pointer", &[0], Arc::from(current_source));
+                let element = transcript_virtualized(
+                    content,
+                    target,
+                    None,
+                    catalog.finish(),
+                    Default::default(),
+                );
+                (
+                    element,
+                    layout::Limits::new(Size::ZERO, Size::new(300.0, outer_height)),
+                )
+            };
+            // Derive the real native row boundary from its actual laid-out
+            // Tree, then use native scrollable heights to expose or clip it.
+            let (mut calibration, limits) = make(100.0, 400.0, &source);
+            let mut calibration_tree = Tree::new(&calibration);
+            let calibration_node =
+                calibration
+                    .as_widget_mut()
+                    .layout(&mut calibration_tree, &renderer, &limits);
+            let mut rows = Rows::default();
+            calibration.as_widget_mut().operate(
+                &mut calibration_tree,
+                Layout::new(&calibration_node),
+                &renderer,
+                &mut rows,
+            );
+            assert_eq!(rows.0.len(), 2);
+            let first = rows.0[0].0;
+            let last = rows.0[1].0;
+            assert_eq!(
+                (rows.0[1].1, rows.0[1].2.as_str(), rows.0[1].3),
+                (prefix.len(), ending, true)
+            );
+            let bottom = last.y + last.height;
+            let wrong_tail = format!("{prefix}{}", "X".repeat(ending.len()));
+            let wrong_length = format!("{source}x");
+            for (case, inner_height, outer_height, current_source, reaches_end) in [
+                ("full inner row", bottom, 400.0, source.as_str(), true),
+                (
+                    "outer viewport boundary",
+                    bottom,
+                    bottom,
+                    source.as_str(),
+                    true,
+                ),
+                (
+                    "one float step",
+                    bottom.next_down(),
+                    400.0,
+                    source.as_str(),
+                    true,
+                ),
+                (
+                    "two float steps clipped",
+                    bottom.next_down().next_down(),
+                    400.0,
+                    source.as_str(),
+                    false,
+                ),
+                (
+                    "partially clipped",
+                    bottom - last.height / 2.0,
+                    400.0,
+                    source.as_str(),
+                    false,
+                ),
+                ("fully hidden", last.y - 1.0, 400.0, source.as_str(), false),
+                (
+                    "changed terminal bytes",
+                    bottom,
+                    400.0,
+                    wrong_tail.as_str(),
+                    false,
+                ),
+                (
+                    "changed source length",
+                    bottom,
+                    400.0,
+                    wrong_length.as_str(),
+                    false,
+                ),
+            ] {
+                let (mut element, limits) = make(inner_height, outer_height, current_source);
+                let mut tree = Tree::new(&element);
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let viewport = Rectangle::with_size(Size::new(300.0, outer_height));
+                let start = Point::new(first.x, first.y + 3.0);
+                let end = Point::new(last.x + 5.0, bottom + 1.0);
+                let mut clipboard = ClipboardText::default();
+                for (event, pointer) in [
+                    (
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        start,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        end,
+                    ),
+                    (command("c"), end),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &viewport,
+                    );
+                    assert!(
+                        shell.is_event_captured(),
+                        "actual pointer/copy ownership: {case}"
+                    );
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
+                }
+                let end = tree
+                    .state
+                    .downcast_ref::<State>()
+                    .end
+                    .expect("actual selected endpoint");
+                if reaches_end {
+                    assert_eq!(
+                        end.byte,
+                        source.len(),
+                        "current visible terminal endpoint: {case}"
+                    );
+                    assert_eq!(
+                        clipboard.0, source,
+                        "LF/CRLF copied without normalization: {case}"
+                    );
+                } else {
+                    assert!(
+                        end.byte < current_source.len(),
+                        "clipped or stale source cannot claim terminal end: {case}"
+                    );
+                }
+            }
+            // A press INSIDE a blank row still begins before its newline;
+            // only a real drag past the fully visible boundary owns its end.
+            let (mut element, limits) = make(bottom, 400.0, &source);
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let point = Point::new(last.x + 5.0, last.y + last.height / 2.0);
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut ClipboardText::default(),
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(300.0, 400.0)),
+            );
+            assert_eq!(
+                tree.state.downcast_ref::<State>().anchor.unwrap().byte,
+                prefix.len()
+            );
+        }
+    }
+
+    #[test]
+    fn native_scrolled_terminal_drag_uses_layout_frame_and_preserves_outer_clip_intent() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let identity = logical_identity("scrolled-terminal", &[0]);
+        let inner_id = Id::new("terminal-pointer-inner");
+        struct ScrollEnd {
+            id: Id,
+            trim: f32,
+            travel: f32,
+        }
+        impl Operation for ScrollEnd {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                viewport: Rectangle,
+                content: Rectangle,
+                _: Vector,
+                state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.id) {
+                    self.travel = (content.height - viewport.height).max(0.0);
+                    state.scroll_to(operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some((self.travel - self.trim).max(0.0)),
+                    });
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Rows {
+            translation: Vector,
+            pending: Option<Vector>,
+            max_translation: f32,
+            rows: Vec<(Rectangle, Rectangle, usize, usize, bool)>,
+        }
+        impl Operation for Rows {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let before = self.translation;
+                if let Some(offset) = self.pending.take() {
+                    self.translation += offset;
+                }
+                self.max_translation = self.max_translation.max(self.translation.y);
+                visit(self);
+                self.translation = before;
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.pending = Some(translation);
+            }
+            fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
+                if let Some(prose) = state.downcast_ref::<Prose>() {
+                    let logical = prose.logical.as_ref().unwrap();
+                    let screen = Rectangle {
+                        x: bounds.x - self.translation.x,
+                        y: bounds.y - self.translation.y,
+                        ..bounds
+                    };
+                    self.rows.push((
+                        bounds,
+                        screen,
+                        logical.start,
+                        prose.plain.len(),
+                        prose.empty_line_caret(),
+                    ));
+                }
+            }
+        }
+        for ending in ["\n", "\r\n"] {
+            // Real physical source rows include ordinary and Bidi text. Their
+            // native hit/selection path remains the ordinary clipped path.
+            let source: Arc<str> = format!("αβ item שלום line{ending}{ending}")
+                .repeat(300)
+                .into();
+            for (case, trim, reaches_end) in [
+                ("visible", 0.0, true),
+                ("partial terminal", 2.0, false),
+                ("hidden terminal", 40.0, false),
+            ] {
+                let code = prose::code_text(
+                    source.clone(),
+                    Arc::from([]),
+                    14.0.into(),
+                    iced::Font::MONOSPACE,
+                    target,
+                    None,
+                    Some(selectable_prose::Logical { identity, start: 0 }),
+                    None,
+                    None,
+                );
+                let inner = widget::scrollable(code)
+                    .id(inner_id.clone())
+                    .height(Length::Fixed(400.0))
+                    .width(Length::Fill);
+                let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
+                let mut catalog = Catalog::builder();
+                catalog.plain("scrolled-terminal", &[0], source.clone());
+                let mut element = transcript_virtualized(
+                    content,
+                    target,
+                    None,
+                    catalog.finish(),
+                    Default::default(),
+                );
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(400.0, 400.0));
+                let limits = layout::Limits::new(Size::ZERO, viewport.size());
+                let mut node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut scroll = ScrollEnd {
+                    id: inner_id.clone(),
+                    trim,
+                    travel: 0.0,
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut scroll,
+                );
+                assert!(
+                    scroll.travel > 10_000.0,
+                    "real long-source native scroll travel"
+                );
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut converged = false;
+                for _ in 0..8 {
+                    let mut observed = virtualized::UpdateViewport::default();
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut observed,
+                    );
+                    if !observed.changed {
+                        converged = true;
+                        break;
+                    }
+                    node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                }
+                assert!(converged, "actual scrolled virtual windows converge");
+                let mut rows = Rows::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut rows,
+                );
+                assert!(rows.max_translation > 10_000.0);
+                let terminal = rows
+                    .rows
+                    .iter()
+                    .find(|row| row.2 + row.3 == source.len())
+                    .unwrap();
+                assert!(terminal.4);
+                assert!(
+                    terminal.0.y > 10_000.0,
+                    "guard must use native layout precision"
+                );
+                if reaches_end {
+                    assert!(
+                        (terminal.1.y + terminal.1.height - viewport.height).abs() < 0.01,
+                        "actual terminal row sits at the finite outer viewport edge"
+                    );
+                }
+                let first = rows
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        !row.4 && row.1.y >= 0.0 && row.1.y + row.1.height <= viewport.height
+                    })
+                    .unwrap();
+                let first_byte = first.2;
+                let start = Point::new(first.1.x, first.1.y + 3.0);
+                let end = Point::new(terminal.1.x + 5.0, terminal.1.y + terminal.1.height + 1.0);
+                assert!(
+                    end.y > viewport.height,
+                    "raw drag intent really crosses outer clip"
+                );
+                let mut clipboard = ClipboardText::default();
+                for (event, pointer) in [
+                    (
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        start,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                        end,
+                    ),
+                    (
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                        end,
+                    ),
+                    (command("c"), end),
+                ] {
+                    let mut messages = Vec::new();
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(pointer),
+                        &renderer,
+                        &mut clipboard,
+                        &mut shell,
+                        &viewport,
+                    );
+                    assert!(shell.is_event_captured(), "real scrolled drag/copy: {case}");
+                    if shell.is_layout_invalid() {
+                        node = element
+                            .as_widget_mut()
+                            .layout(&mut tree, &renderer, &limits);
+                    }
+                }
+                let state = tree.state.downcast_ref::<State>();
+                assert_eq!(
+                    state.anchor.unwrap().byte,
+                    first_byte,
+                    "ordinary/Bidi source row keeps native clipped hit origin"
+                );
+                if reaches_end {
+                    assert_eq!(
+                        state.end.unwrap().byte,
+                        source.len(),
+                        "visible translated terminal: {case}"
+                    );
+                    assert_eq!(
+                        clipboard.0,
+                        &source[first_byte..],
+                        "actual source suffix retains LF/CRLF and Bidi bytes"
+                    );
+                    let point =
+                        Point::new(terminal.1.x + 5.0, terminal.1.y + terminal.1.height / 2.0);
+                    let mut messages = Vec::new();
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(point),
+                        &renderer,
+                        &mut clipboard,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                    assert_eq!(
+                        tree.state.downcast_ref::<State>().anchor.unwrap().byte,
+                        source.len() - ending.len(),
+                        "translated inband blank press remains start"
+                    );
+                } else {
+                    assert!(
+                        state.end.unwrap().byte < source.len(),
+                        "translated clipped source cannot jump to EOF: {case}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn idle_selection_schedules_frames_before_painting_managed_and_standalone_text() {
