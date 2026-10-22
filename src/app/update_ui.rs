@@ -11,6 +11,9 @@ pub(super) struct State {
     applying: bool,
     polling: bool,
     poll_retry: bool,
+    /// Whether this window runs from an installation tree, the only place an
+    /// install can leave it behind.
+    watch_installation: bool,
     inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
@@ -32,6 +35,13 @@ pub(super) struct State {
     /// Whether the check in flight was asked for, so its failure is shown.
     manual_check: bool,
 }
+
+/// How often a focused installed window looks for an install that left it
+/// behind. An install that restarts the daemon shows up first as a change of
+/// the daemon's health, which inspects at once, so this mostly bounds how
+/// long a quieter switch of `current` goes unnoticed while someone is using
+/// the window. An unfocused window inspects when it is focused again instead.
+const INSTALLATION_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long background checks wait between attempts.
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -223,6 +233,15 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
 }
 
 impl State {
+    /// A window's update state, watching the installation it runs from if
+    /// it runs from one.
+    pub(super) fn new() -> Self {
+        Self {
+            watch_installation: crate::update::runs_from_installation(),
+            ..Self::default()
+        }
+    }
+
     fn updating(&self) -> bool {
         self.applying
             || self
@@ -495,10 +514,14 @@ impl Cagents {
         // An install performed under this window breaks every terminal it owns
         // the moment the daemon restarts, so the window has to notice on its
         // own timescale rather than on the release check's. This needs no
-        // instance gate: it is inert unless the running executable is itself
-        // inside an installation tree, which a source build never is.
-        let installation = iced::time::every(Duration::from_secs(5))
-            .map(|_| Message::UpdateUi(Action::InspectInstallation));
+        // instance gate: only an executable inside an installation tree, which
+        // a source build never is, watches at all.
+        let installation = if self.update_ui.watch_installation && self.refresh_ui.focused {
+            iced::time::every(INSTALLATION_INTERVAL)
+                .map(|_| Message::UpdateUi(Action::InspectInstallation))
+        } else {
+            Subscription::none()
+        };
         // Release discovery talks to GitHub and drives the installer, neither
         // of which a development instance may do.
         if crate::instance::NAME == "development"
@@ -930,7 +953,8 @@ impl Cagents {
                 Task::none()
             }
             Action::InspectInstallation => {
-                if self.update_ui.inspecting
+                if !self.update_ui.watch_installation
+                    || self.update_ui.inspecting
                     || self.update_ui.restarting
                     || self.update_ui.updating()
                     // A release update owns the same launch fence and reopens
@@ -987,6 +1011,64 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_build_never_schedules_installation_inspection() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.check_for_updates = false;
+        for focused in [true, false] {
+            app.refresh_ui.focused = focused;
+            assert_eq!(app.update_subscription().units(), 0);
+        }
+        drop(app.update_update_ui(Action::InspectInstallation));
+        assert!(
+            !app.update_ui.inspecting,
+            "a source build has no installation to inspect"
+        );
+    }
+
+    #[test]
+    fn an_installed_window_inspects_while_focused_and_when_focus_or_the_daemon_changes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.check_for_updates = false;
+        app.update_ui.watch_installation = true;
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        app.refresh_ui.focused = true;
+        assert_eq!(app.update_subscription().units(), 1);
+        let inspected = |app: &mut Cagents| {
+            let started = app.update_ui.inspecting;
+            drop(app.update_update_ui(Action::InstallationInspected(None)));
+            started
+        };
+        for (window, focused) in [(window::Id::unique(), true), (main, true), (main, false)] {
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                window, focused,
+            ))));
+            assert!(!inspected(&mut app));
+        }
+        assert_eq!(
+            app.update_subscription().units(),
+            0,
+            "an unfocused window does not poll its installation"
+        );
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
+        assert!(inspected(&mut app), "regaining focus inspects at once");
+
+        drop(app.update(Message::DaemonHealth(
+            crate::daemon_health::State::Responsive,
+        )));
+        assert!(!inspected(&mut app), "an unchanged daemon is no news");
+        drop(app.update(Message::DaemonHealth(
+            crate::daemon_health::State::Unreachable {
+                since: std::time::SystemTime::now(),
+            },
+        )));
+        assert!(
+            inspected(&mut app),
+            "a daemon an install restarted is inspected without waiting for a tick"
+        );
+    }
 
     #[test]
     fn a_reconciled_historical_failure_clears_the_live_warning() {
@@ -1404,6 +1486,7 @@ mod tests {
     #[test]
     fn a_superseded_window_reopens_only_when_nothing_holds_it_open() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.update_ui.watch_installation = true;
         let installed = PathBuf::from("/nonexistent/current/bin/cagents-ui");
         app.update_ui.superseded = Some(installed.clone());
         app.settings_reset_confirm = true;

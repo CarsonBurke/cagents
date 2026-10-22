@@ -581,12 +581,23 @@ impl SidebarProject {
             crate::github::review_requests::scan::Requested,
         >,
     ) {
-        let apply = |row: &mut SidebarPullRequest| {
+        // Discovery reapplies the same requests on nearly every pass, so only
+        // a row whose flags differ is written.
+        let flags = |row: &SidebarPullRequest| {
             let request = requested.get(&row.number);
-            row.needs_review = request.is_some();
-            row.review_requested_again = request.is_some_and(|request| {
-                request.history == crate::github::review_requests::scan::History::ReRequested
-            });
+            let flags = (
+                request.is_some(),
+                request.is_some_and(|request| {
+                    request.history == crate::github::review_requests::scan::History::ReRequested
+                }),
+            );
+            (flags != (row.needs_review, row.review_requested_again)).then_some(flags)
+        };
+        let apply = |row: &mut SidebarPullRequest| {
+            if let Some((needs_review, requested_again)) = flags(row) {
+                row.needs_review = needs_review;
+                row.review_requested_again = requested_again;
+            }
         };
         for row in &mut self.pull_requests {
             apply(row);
@@ -597,11 +608,10 @@ impl SidebarProject {
             }
         }
         for worktree in &mut self.worktrees {
-            if let Some(mut row) = worktree.pull_request().cloned() {
+            if let Some(row) = worktree.pull_request().filter(|row| flags(row).is_some()) {
+                let mut row = row.clone();
                 apply(&mut row);
-                if worktree.pull_request() != Some(&row) {
-                    worktree.set_pull_request(row);
-                }
+                worktree.set_pull_request(row);
             }
         }
     }

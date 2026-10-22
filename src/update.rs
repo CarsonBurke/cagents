@@ -797,6 +797,13 @@ pub fn superseding_ui() -> Option<PathBuf> {
     (owner.version_root != layout.version_root).then(|| layout.version_root.join("bin/cagents-ui"))
 }
 
+/// Whether this process runs from an installation tree: the only place an
+/// install can leave it behind, so the only process [`superseding_ui`] can
+/// ever find a replacement for. A source build never is one.
+pub fn runs_from_installation() -> bool {
+    std::env::current_exe().is_ok_and(|executable| locate(&executable).is_ok())
+}
+
 fn daemon_protocol_mismatch() -> bool {
     crate::terminal_ipc::daemon_socket_path()
         .ok()

@@ -126,6 +126,16 @@ impl State {
             .preferences
     }
 
+    /// Presence queued for the daemon and not yet sent, taken as if sent.
+    #[cfg(test)]
+    pub(super) fn take_pending_presence(&self) -> Option<Presence> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .presence
+            .take()
+    }
+
     #[cfg(test)]
     pub(super) fn focused_session_for_test(&self) -> Option<TerminalId> {
         self.presence

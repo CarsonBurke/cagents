@@ -13315,7 +13315,7 @@ impl Application for Cagents {
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_drafts(chat_drafts),
             resume_ui: resume_ui::State::default(),
-            update_ui: update_ui::State::default(),
+            update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -13507,6 +13507,7 @@ impl Application for Cagents {
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
+            app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -16654,7 +16655,23 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                // What only polls while the window is focused may have
+                // changed while it was not.
+                let resumed = if account_focus.is_some_and(|(_, regained)| regained) {
+                    Task::batch([
+                        self.update_update_ui(update_ui::Action::InspectInstallation),
+                        self.review_requests_focus_regained(),
+                    ])
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    resumed,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -16743,13 +16760,23 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
+                // A daemon that went away or speaks another protocol may have
+                // been replaced by an install, which is when a stale window
+                // starts losing its terminals: look now, not at the next tick.
+                let inspection = if self.daemon_health_ui.health == health {
+                    Task::none()
+                } else {
+                    self.update_update_ui(update_ui::Action::InspectInstallation)
+                };
                 self.daemon_health_ui.health = health;
-                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                let confirmation = if !self.daemon_health_ui.health.unavailable()
+                    && self.daemon_health_ui.confirmation
                 {
                     self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([inspection, confirmation])
             }
             Message::AcknowledgeSessionRecovery => {
                 if let Some(health) = &mut self.save_health {
