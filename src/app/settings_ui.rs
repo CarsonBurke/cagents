@@ -467,11 +467,22 @@ fn settings_category_controls<'a>(
                 SettingsField::HibernationDelayMs,
                 invalid,
             );
+            let stale = setting_input(
+                "A card with no commits, file changes or agent work for this many days moves to Stale.",
+                &draft.work_stale_after_days,
+                SettingsField::WorkStaleAfterDays,
+                invalid,
+            );
             vec![
                 settings_group(
                     "Worktrees",
                     "Locations, ordering and the first pane in a worktree.",
                     vec![directory, worktree_pane, cleanup, order],
+                ),
+                settings_group(
+                    "Work board",
+                    "How the board sorts work that has gone quiet.",
+                    vec![stale],
                 ),
                 settings_group(
                     "Workspace",

@@ -127,6 +127,8 @@ pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
 pub mod work;
+#[cfg(feature = "ui")]
+pub mod work_ui;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
 #[cfg(any(feature = "ui", feature = "host"))]

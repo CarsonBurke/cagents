@@ -166,7 +166,10 @@ use crate::{
 /// Version 103 adds retained Claude actor continuity to native descriptors and
 /// snapshots. Private actor protocol 2 has a separate authenticated namespace.
 /// Version 104 preserves version 103 and appends the Work board request and
-/// its response.
+/// its response. The Work board subscription - `ClientRequest::WatchWork`,
+/// `work::Response::Watching` and `ServerMessage::WorkBoard` - deliberately
+/// does not move it, for the reasons terminal-inventory observation did not:
+/// each is appended, and none reaches a peer that cannot issue the request.
 pub const PROTOCOL_VERSION: u16 = 104;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -513,6 +516,10 @@ pub enum ClientRequest {
     },
     /// Reads the Work board or pins one of its cards.
     Work(crate::work::Request),
+    /// Subscribes this connection to the whole Work board and returns it in
+    /// the same response, as [`crate::work::Response::Watching`]. Each later
+    /// change arrives as [`ServerMessage::WorkBoard`].
+    WatchWork,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,6 +724,14 @@ pub enum ServerMessage {
     NotificationsChanged,
     NotificationActivated {
         target: crate::notifications::Target,
+    },
+    /// The whole Work board after a change, delivered only to a connection
+    /// that subscribed with [`ClientRequest::WatchWork`]. `revision` grows with
+    /// every board the daemon sends, so a receiver keeps the newest of a board
+    /// pushed while its subscription was being answered and the answer.
+    WorkBoard {
+        revision: u64,
+        board: Box<crate::work::Board>,
     },
 }
 

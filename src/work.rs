@@ -153,6 +153,8 @@ pub enum Request {
 pub enum Response {
     Board(Board),
     Pinned(Box<Item>),
+    /// The answer to a subscription: the board as of `revision`.
+    Watching { revision: u64, board: Box<Board> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -45,7 +45,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::TerminalAcknowledge { .. }
         | R::SearchTerminal { .. }
         | R::CopyTerminalSelection { .. }
-        | R::Work(crate::work::Request::Board { .. }) => Access::Open,
+        | R::Work(crate::work::Request::Board { .. })
+        | R::WatchWork => Access::Open,
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }

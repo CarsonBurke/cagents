@@ -36,7 +36,7 @@ mod review_cache;
 // decode safely. Admission must reject them before partial workspace loading
 // can omit a card and a later snapshot can tombstone it. This supplements the
 // normal local IPC startup gate; it also fences permitted old-set/remote opens.
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -184,6 +184,7 @@ pub enum PersistedCardKind {
     Settings,
     Accounts,
     Automations,
+    Work,
 }
 
 impl PersistedCardKind {
@@ -197,6 +198,7 @@ impl PersistedCardKind {
             Self::Settings => "settings",
             Self::Accounts => "accounts",
             Self::Automations => "automations",
+            Self::Work => "work",
         }
     }
 
@@ -210,6 +212,7 @@ impl PersistedCardKind {
             "settings" => Ok(Self::Settings),
             "accounts" => Ok(Self::Accounts),
             "automations" => Ok(Self::Automations),
+            "work" => Ok(Self::Work),
             other => Err(StoreError::corrupt_row(
                 "card kind",
                 format!("unknown kind `{other}`"),
@@ -3372,6 +3375,29 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         // Version 12 is a reader-admission boundary for payloads in existing
         // columns. The v11 layout needs no additional DDL or data rewrite.
+        if current < 13 {
+            transaction.execute_batch(
+                "CREATE TABLE cards_v13 (
+                    card_id TEXT PRIMARY KEY NOT NULL,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    generation INTEGER NOT NULL CHECK (generation >= 0),
+                    title TEXT NOT NULL,
+                    width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),
+                    existence_json TEXT NOT NULL,
+                    kind_tag TEXT NOT NULL CHECK (kind_tag IN (
+                        'terminal', 'chat', 'browser', 'pull_requests', 'repository',
+                        'settings', 'accounts', 'automations', 'work')),
+                    content_json TEXT,
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    content_hash INTEGER
+                 ) STRICT;
+                 INSERT INTO cards_v13 SELECT * FROM cards;
+                 DROP TABLE cards;
+                 ALTER TABLE cards_v13 RENAME TO cards;
+                 CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
+            )?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -4456,7 +4482,8 @@ impl<'card> CardWrite<'card> {
             | CardKind::Browser(_)
             | CardKind::Settings
             | CardKind::Accounts
-            | CardKind::Automations => None,
+            | CardKind::Automations
+            | CardKind::Work => None,
         };
         let payload = match &card.kind {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
@@ -4499,7 +4526,8 @@ impl<'card> CardWrite<'card> {
             | CardKind::Repository(_)
             | CardKind::Settings
             | CardKind::Accounts
-            | CardKind::Automations => CardPayloadWrite::Inline,
+            | CardKind::Automations
+            | CardKind::Work => CardPayloadWrite::Inline,
         };
 
         let mut hasher = ContentHasher::new();
@@ -5343,6 +5371,7 @@ fn load_card_connection(
         PersistedCardKind::Settings => CardKind::Settings,
         PersistedCardKind::Accounts => CardKind::Accounts,
         PersistedCardKind::Automations => CardKind::Automations,
+        PersistedCardKind::Work => CardKind::Work,
     };
 
     Ok(Some(CardState {
@@ -5591,6 +5620,7 @@ fn card_kind(kind: &CardKind) -> PersistedCardKind {
         CardKind::Settings => PersistedCardKind::Settings,
         CardKind::Accounts => PersistedCardKind::Accounts,
         CardKind::Automations => PersistedCardKind::Automations,
+        CardKind::Work => PersistedCardKind::Work,
     }
 }
 
@@ -9652,6 +9682,7 @@ mod tests {
             CardKind::Settings,
             CardKind::Accounts,
             CardKind::Automations,
+            CardKind::Work,
         ] {
             let mut card = workspace.cards[1].clone();
             card.id = CardId::new();
@@ -9671,7 +9702,8 @@ mod tests {
             vec![
                 CardKind::Settings,
                 CardKind::Accounts,
-                CardKind::Automations
+                CardKind::Automations,
+                CardKind::Work
             ]
         );
         let inner = store.lock_inner().unwrap();

@@ -671,6 +671,7 @@ mod wire_kind {
         Settings,
         Accounts,
         Automations,
+        Work,
     }
     pub(super) fn serialize<S: serde::Serializer>(
         kind: &CardKind,
@@ -698,6 +699,7 @@ mod wire_kind {
             CardKind::Settings => Kind::Settings,
             CardKind::Accounts => Kind::Accounts,
             CardKind::Automations => Kind::Automations,
+            CardKind::Work => Kind::Work,
         };
         kind.serialize(serializer)
     }
@@ -736,6 +738,7 @@ mod wire_kind {
             Kind::Settings => CardKind::Settings,
             Kind::Accounts => CardKind::Accounts,
             Kind::Automations => CardKind::Automations,
+            Kind::Work => CardKind::Work,
         })
     }
 }
