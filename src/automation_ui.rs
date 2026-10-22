@@ -3504,20 +3504,6 @@ mod tests {
         state.update(Action::New);
         assert!(state.draft.as_ref().unwrap().accounts.is_empty());
     }
-}
-pub fn state_label(state: crate::automations::FiringState) -> &'static str {
-    use crate::automations::FiringState::*;
-    match state {
-        Prechecking => "Checking",
-        Accepted => "Queued",
-        Running => "Running",
-        Waiting => "Waiting for input",
-        Succeeded => "Succeeded",
-        Failed => "Failed",
-        Skipped => "Skipped",
-        Cancelled => "Cancelled",
-        Interrupted => "Outcome uncertain",
-    }
     #[test]
     fn automation_lifecycle_pages_are_read_only_bounded_and_deduplicated() {
         use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
@@ -3639,5 +3625,19 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
             }))),
         });
         assert!(state.lifecycle.is_none());
+    }
+}
+pub fn state_label(state: crate::automations::FiringState) -> &'static str {
+    use crate::automations::FiringState::*;
+    match state {
+        Prechecking => "Checking",
+        Accepted => "Queued",
+        Running => "Running",
+        Waiting => "Waiting for input",
+        Succeeded => "Succeeded",
+        Failed => "Failed",
+        Skipped => "Skipped",
+        Cancelled => "Cancelled",
+        Interrupted => "Outcome uncertain",
     }
 }
