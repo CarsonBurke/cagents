@@ -800,9 +800,15 @@ impl Adapter for Omp {
                 super::image_references::check_image_count(mapped)?;
                 let mut prepared = Vec::with_capacity(ordered.len());
                 for attachment in ordered {
-                    let attachment = crate::chat::attachment_assets::resolve(attachment)?;
-                    let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
-                    let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
+                    // ordered() already checked the managed extension schema.
+                    // Counting does not resolve/read a managed receipt or blob.
+                    let (path, ext) = if let Some(reference) = &attachment.reference {
+                        (None, reference.extension.clone())
+                    } else {
+                        let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
+                        let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
+                        (Some(path), ext)
+                    };
                     let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
                     prepared.push((attachment, path, mime));
                 }
@@ -816,6 +822,13 @@ impl Adapter for Omp {
                 let mut images=Vec::new();
                 let mut references=Vec::new();
                 for (attachment, path, mime) in prepared {
+                    let path = match path {
+                        Some(path) => path,
+                        None => {
+                            let owned = crate::chat::attachment_assets::resolve(attachment)?;
+                            owned.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",owned.path.display()))?
+                        }
+                    };
                     if let Some(mime)=mime {
                         let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take(MAX_IMAGE+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
                         if bytes.len() as u64>MAX_IMAGE {return Err("Image exceeds the 16 MiB attachment limit.".into());}
@@ -1863,6 +1876,49 @@ mod tests {
             error.contains("Too many image mappings"),
             "mapping cap must precede the sentinel path/receipt error: {error}"
         );
+    }
+
+    #[test]
+    fn mixed_mapping_overflow_precedes_even_the_first_managed_blob_read() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let directory = tempfile::tempdir().unwrap();
+            let legacy = directory.path().join("legacy.png");
+            std::fs::write(&legacy, std::fs::read(&first.path).unwrap()).unwrap();
+            let mut attachments = vec![first.clone()];
+            attachments.extend(
+                (1..128).map(|i| {
+                    crate::chat::attachment_assets::test_image(&format!("managed-{i}.png"))
+                }),
+            );
+            attachments.push(chat::Attachment::file(legacy));
+            // All128 UUID receipts are real. A missing first blob is an IO
+            // sentinel: exact129-image overflow must win before resolving it.
+            std::fs::remove_file(&first.path).unwrap();
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let error = adapter
+                .command(Command::Prompt {
+                    text: String::new(),
+                    attachments,
+                    mode: PromptMode::Send,
+                })
+                .err()
+                .expect("mixed129-image mapping must fail");
+            assert!(
+                error.contains("Too many image mappings"),
+                "count refusal must precede the missing managed blob read: {error}"
+            );
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .all(|image| !image.retained),
+                "failed preflight must not retain any image"
+            );
+        });
     }
 
     #[test]
