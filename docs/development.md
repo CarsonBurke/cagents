@@ -243,7 +243,42 @@ then the actual configuration and build script follow A → B → A with the sam
 commit, different dirty sources, and old timestamps. It also verifies that an
 unchanged dependency remains cached. Pass `--evidence PATH` to retain the
 fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
-workloads.
+workloads. Its historical-producer control also demonstrates the supported
+package bootstrap below and checks that unrelated dependency bytes and mtimes
+remain unchanged.
+
+A historical checkout without the compile-time checkout anchor can replace a
+shared build-script executable. Returning to an anchored checkout can then
+rerun that historical body without recompiling it, even though relative inputs
+and the runtime manifest path are correct. The checkout identity does not
+retroactively repair that missing compiler dependency.
+
+If a selected package demonstrably lacks that anchor, or a source/body
+qualification shows this mismatch, explicitly admit a bootstrap for that
+package before trusting its generated output. First record the selected
+checkout commit and dirty diff, package name/version, Cargo version, effective
+`CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` (including Cargo config), exact
+isolated command and the mismatching observation. Stop other writers using
+those same build directories. From the selected checkout, run a package-scoped
+clean, then immediately repeat the **same isolated command** with the **same
+Cargo environment, profile, target and build directories**. For example, after
+identifying `libsqlite3-sys` as the affected package in a browserless UI check:
+
+```sh
+# Explicit maintenance operation: only after evidence identifies this package.
+cargo clean --package libsqlite3-sys
+CARGO_BUILD_JOBS=2 cargo check --locked --no-default-features --features ui --bin cagents-ui
+```
+
+Use `name@version` if the package name is ambiguous. Preserve the clean output,
+complete check output and the source/stamp or generated-body observation that
+originally detected the mismatch. A successful check alone does not prove that
+the expected source body or native behavior was selected. Recheck that same
+observation before using the artifacts, and retain the original failed result.
+This is an opt-in recovery for an identified package; do not add a global cache
+clean, change source mtimes, switch build directories during recovery, or
+infer a historical producer from timestamps. Other cached packages remain
+available, though Cargo may rebuild dependents of the selected package.
 
 ```sh
 # Reduce compilation concurrency further on a memory-constrained host.
