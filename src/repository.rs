@@ -2581,6 +2581,18 @@ fn parse_index_entries(output: &[u8]) -> Result<Vec<IndexEntry>, GitParseError> 
     Ok(entries)
 }
 
+fn parse_index_paths(output: &[u8]) -> Result<IndexPaths, GitParseError> {
+    let entries = parse_index_entries(output)?;
+    let gitlinks = entries.iter().any(|entry| entry.mode == GITLINK_MODE);
+    let mut paths = entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    // Git lists the index in path order, conflict stages adjacent.
+    paths.dedup();
+    Ok(IndexPaths { paths, gitlinks })
+}
+
 /// One tree entry from `git ls-tree -z`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeEntry {
@@ -3540,23 +3552,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(files)
     }
 
-    /// Tracked paths alone are sufficient to watch the sidebar's tracked-only
-    /// status without enumerating ignored build trees or untracked files.
-    pub fn tracked_files(
-        &self,
-        worktree: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<WorkingFiles, RepositoryError> {
-        let output = self.run_checked(
-            &self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"]),
-            cancellation,
-        )?;
-        let parsed = parse_working_files(&output.stdout);
-        invalid_output(parsed, output)
-    }
-
-    /// What the index of `worktree` tracks. Entry modes tell submodules apart,
-    /// where [`Self::tracked_files`] would need a `stat` per path.
+    /// What the index of `worktree` tracks, for watching it. Entry modes tell
+    /// submodules apart without a `stat` per path.
     pub fn index_paths(
         &self,
         worktree: &Path,
@@ -3566,16 +3563,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             &self.git_read(worktree, ["ls-files", "-s", "-z"]),
             cancellation,
         )?;
-        let parsed = parse_index_entries(&output.stdout).map(|entries| {
-            let gitlinks = entries.iter().any(|entry| entry.mode == GITLINK_MODE);
-            let mut paths = entries
-                .into_iter()
-                .map(|entry| entry.path)
-                .collect::<Vec<_>>();
-            // Git lists the index in path order, conflict stages adjacent.
-            paths.dedup();
-            IndexPaths { paths, gitlinks }
-        });
+        let parsed = parse_index_paths(&output.stdout);
         invalid_output(parsed, output)
     }
 
@@ -10831,6 +10819,27 @@ mod tests {
         let files = parse_working_files(b"H sp ace.txt\0").unwrap();
         assert_eq!(files.paths, vec![path("sp ace.txt")]);
         assert_eq!(files.tracked_count, 1);
+    }
+
+    #[test]
+    fn index_paths_collapse_conflict_stages_and_flag_gitlinks() {
+        let blob = "0123456789012345678901234567890123456789";
+        let index = [
+            format!("100644 {blob} 1\tconflict.rs"),
+            format!("100644 {blob} 2\tconflict.rs"),
+            format!("100644 {blob} 3\tconflict.rs"),
+            format!("100644 {blob} 0\tsrc/main.rs"),
+            format!("160000 {blob} 0\tvendor/library"),
+        ]
+        .map(|entry| entry + "\0")
+        .concat();
+        let index = parse_index_paths(index.as_bytes()).unwrap();
+        assert_eq!(
+            index.paths,
+            ["conflict.rs", "src/main.rs", "vendor/library"].map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
+        );
+        assert!(index.gitlinks);
+        assert!(!parse_index_paths(b"").unwrap().gitlinks);
     }
 
     /// `git status` rewrites `.git/index` whenever it finds the stat cache

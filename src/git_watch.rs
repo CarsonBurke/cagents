@@ -137,6 +137,7 @@ impl Worktree {
         }
     }
 
+    /// `relative` beneath the root; `join("")` would append a separator.
     fn absolute(&self, relative: &Path) -> PathBuf {
         if relative.as_os_str().is_empty() {
             self.root.clone()
@@ -192,14 +193,15 @@ impl Project {
             let git_dir = git
                 .git_dir(&record.path, cancellation)
                 .map_err(|error| error.to_string())?;
-            let index = git
-                .index_paths(&record.path, cancellation)
-                .map_err(|error| error.to_string())?;
-            let census = Census::new(
-                index.paths.iter().map(|path| path.as_os_str().as_bytes()),
-                index.gitlinks,
-            )?;
-            drop(index);
+            let census = {
+                let index = git
+                    .index_paths(&record.path, cancellation)
+                    .map_err(|error| error.to_string())?;
+                Census::new(
+                    index.paths.iter().map(|path| path.as_os_str().as_bytes()),
+                    index.gitlinks,
+                )?
+            };
             let census = worktrees
                 .iter()
                 .chain(previous.iter().flat_map(|previous| &previous.worktrees))
@@ -862,6 +864,13 @@ mod tests {
         assert_eq!(main.tracks(&first.join("src")), Some(Tracked::Directory));
         assert_eq!(main.tracks(&first), Some(Tracked::Directory));
         assert_eq!(main.tracks(&first.join("target/debug")), None);
+        // Roots match by component: a sibling sharing their prefix is not
+        // beneath them, and a trailing separator names the same directory.
+        assert_eq!(main.tracks(&directory.join("first2/src")), None);
+        assert_eq!(
+            main.tracks(Path::new(&format!("{}/src/", first.display()))),
+            Some(Tracked::Directory)
+        );
         assert_eq!(main.tracks(&linked.join("src/main.rs")), None);
         assert!(plan.polling.is_none());
 
