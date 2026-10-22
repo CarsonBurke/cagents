@@ -355,6 +355,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_known_chat_cwd_retargets_the_file_pane_to_a_contextual_error() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::file_ui::tests::missing_known_chat_cwd_retargets_the_file_pane_to_a_contextual_error",
+        ) {
+            return;
+        }
+        let mut app = app();
+        crate::worktree_cleanup::prepare_standalone_editor_protection();
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([217, 0, 217, 255]))
+            .save(&old)
+            .unwrap();
+        let task = app.open_document_link(None, old.to_str().unwrap());
+        settle(&mut app, task).await;
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(
+            runtime(&app, card).inspector_context().document,
+            "Image preview"
+        );
+        assert_eq!(app.card_state(card).unwrap().title, "old.png");
+        let before = app.workspace.order().count();
+
+        // A known but unavailable conversation cwd is different from an
+        // unverified child cwd: resolve the former exactly, then show its own
+        // failure. Neither route may borrow another repository's image.
+        let missing = directory.path().join("retired-history");
+        assert!(!missing.exists());
+        let document = missing.join(".chat");
+        let task = app.open_document_link_from(Some(card), Some(&document), "./image.png");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.workspace.order().count(), before);
+        assert_eq!(app.card_state(card).unwrap().title, "image.png");
+        let runtime = runtime(&app, card);
+        assert_eq!(runtime.descriptor.worktree, missing);
+        assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
+        let context = runtime.inspector_context();
+        assert_eq!(context.document, "Unavailable");
+        let error = context.document_error.expect("explicit-file error");
+        assert!(error.contains(&missing.join("image.png").display().to_string()));
+        assert!(error.contains("on this device"));
+        assert!(error.contains("os error 2"));
+        assert!(runtime.editor_text().is_none());
+    }
+
+    #[tokio::test]
     async fn chat_image_links_keep_the_rendered_worktree_after_project_and_launch_changes() {
         use super::super::chat_ui::{Action, Target};
         let directory = tempfile::tempdir().unwrap();
