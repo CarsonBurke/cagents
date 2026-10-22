@@ -3217,11 +3217,14 @@ mod tests {
         wrong.host_incarnation = crate::model::HostIncarnation::new("another-owner");
         assert!(authorize(&control, &wrong).is_err());
         let startup = |protocol| {
-            let prepared = chat::protocol::create(&source.launch)
-                .unwrap()
-                .1
-                .prepared_launch_identity()
-                .unwrap();
+            let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+            let session_id = spec
+                .arguments
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--session-id="))
+                .expect("fresh Claude launch must issue a session ID")
+                .to_owned();
+            let prepared = adapter.prepared_launch_identity().unwrap();
             Startup {
                 protocol,
                 source: source.clone(),
@@ -3239,7 +3242,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
 "#
                     .into(),
                     "scope-fixture".into(),
-                    prepared.session_id.clone(),
+                    session_id,
                     marker.to_string_lossy().into_owned(),
                 ],
                 prepared_identity: prepared,
