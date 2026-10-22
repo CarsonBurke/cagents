@@ -144,6 +144,12 @@ fn blocker(inspection: &Inspection) -> &Blocker {
 const UNSAVED: Verdict = Verdict::Unsaved {
     uncommitted: true,
     unreachable: false,
+    beyond_snapshot: false,
+};
+const DISCARD_ONLY: Verdict = Verdict::Unsaved {
+    uncommitted: true,
+    unreachable: false,
+    beyond_snapshot: true,
 };
 
 #[test]
@@ -354,7 +360,7 @@ fn a_nested_repository_is_unsaved() {
     write(&nested, "f.txt", "f");
 
     let inspection = fixture.inspect();
-    assert_eq!(inspection.verdict, UNSAVED);
+    assert_eq!(inspection.verdict, DISCARD_ONLY);
     assert_eq!(inspection.nested, vec!["nested/".to_owned()]);
 }
 
@@ -367,7 +373,7 @@ fn an_ignored_nested_repository_is_unsaved() {
     git(&fixture.worktree, &["init", "-q", nested.to_str().unwrap()]);
 
     let inspection = fixture.inspect();
-    assert_eq!(inspection.verdict, UNSAVED);
+    assert_eq!(inspection.verdict, DISCARD_ONLY);
     assert_eq!(inspection.nested, vec!["vendor/".to_owned()]);
 }
 
@@ -467,7 +473,8 @@ fn detached_commits_no_ref_reaches_are_unsaved() {
         fixture.inspect().verdict,
         Verdict::Unsaved {
             uncommitted: false,
-            unreachable: true
+            unreachable: true,
+            beyond_snapshot: false,
         }
     );
 }
@@ -802,7 +809,7 @@ fn a_repository_deep_in_an_ignored_directory_is_unsaved() {
     git(&nested, &["init", "-q"]);
 
     let first = fixture.inspect();
-    assert_eq!(first.verdict, UNSAVED);
+    assert_eq!(first.verdict, DISCARD_ONLY);
     assert_eq!(first.nested, vec!["build/vendor/dependency/".to_owned()]);
     // Its content is not bound, but its presence is.
     std::fs::remove_dir_all(nested.join(".git")).unwrap();
@@ -847,7 +854,7 @@ fn content_a_clean_filter_drops_is_unsaved() {
 
     write(&fixture.worktree, "n.nb", "cell\nOUTPUT computed for hours\n");
     let inspection = fixture.inspect();
-    assert_eq!(inspection.verdict, UNSAVED);
+    assert_eq!(inspection.verdict, DISCARD_ONLY);
     assert_eq!(inspection.filtered, vec!["n.nb".to_owned()]);
 }
 
@@ -963,7 +970,7 @@ fn a_repository_path_with_a_colon_is_inspected() {
 }
 
 #[test]
-fn an_unreadable_directory_blocks() {
+fn an_unremovable_directory_blocks() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new();
     let locked = fixture.worktree.join("locked");
@@ -974,7 +981,7 @@ fn an_unreadable_directory_blocks() {
 
     assert_eq!(
         blocker(&inspection),
-        &Blocker::Unreadable("locked/".into())
+        &Blocker::Unremovable("locked/".into())
     );
 }
 
@@ -993,7 +1000,114 @@ fn a_remote_tracking_ref_does_not_keep_detached_commits() {
         fixture.inspect().verdict,
         Verdict::Unsaved {
             uncommitted: false,
-            unreachable: true
+            unreachable: true,
+            beyond_snapshot: false,
         }
+    );
+}
+
+#[test]
+fn a_driver_named_like_an_attribute_state_voids_the_proof() {
+    let fixture = Fixture::new();
+    write(&fixture.worktree, "a.txt", "feature\n");
+    commit(&fixture.worktree, "feature");
+    write(&fixture.repository, "a.txt", "main\n");
+    commit(&fixture.repository, "main");
+    git(
+        &fixture.repository,
+        &["config", "merge.unspecified.driver", "true"],
+    );
+    write(
+        &fixture.repository.join(".git/info"),
+        "attributes",
+        "* merge=unspecified\n",
+    );
+
+    assert_eq!(fixture.inspect().verdict, Verdict::CommitsKept);
+}
+
+/// A stand-in for Git LFS's clean filter: the pointer of what it reads.
+const LFS_CLEAN: &str = "sh -c 'f=$(mktemp); cat >\"$f\"; \
+    printf \"version https://git-lfs.github.com/spec/v1\\noid sha256:%s\\nsize %s\\n\" \
+    \"$(sha256sum \"$f\" | cut -d\" \" -f1)\" \"$(wc -c <\"$f\" | tr -d \" \")\"; rm \"$f\"'";
+
+#[test]
+fn lfs_files_are_judged_by_their_pointer_without_smudging() {
+    let fixture = Fixture::new();
+    git(&fixture.repository, &["config", "filter.lfs.clean", LFS_CLEAN]);
+    git(&fixture.repository, &["config", "filter.lfs.smudge", "cat"]);
+    write(&fixture.worktree, ".gitattributes", "*.bin filter=lfs\n");
+    write(&fixture.worktree, "asset.bin", "large asset\n");
+    commit(&fixture.worktree, "asset");
+    let pointer = git(&fixture.worktree, &["cat-file", "blob", "HEAD:asset.bin"]);
+    assert!(pointer.starts_with("version https://git-lfs"));
+    // A smudge would fetch a missing object; inspection never runs one.
+    git(&fixture.repository, &["config", "filter.lfs.smudge", "false"]);
+
+    let inspection = fixture.inspect();
+    assert_eq!(inspection.verdict, Verdict::CommitsKept);
+    assert!(inspection.filtered.is_empty());
+
+    // A checkout that skipped smudging holds the pointer itself.
+    write(&fixture.worktree, "asset.bin", &format!("{pointer}\n"));
+    assert_eq!(fixture.inspect().verdict, Verdict::CommitsKept);
+}
+
+#[test]
+fn a_filtered_file_outside_a_sparse_checkout_is_skipped() {
+    let fixture = Fixture::new();
+    git(&fixture.repository, &["config", "filter.strip.clean", "cat"]);
+    git(&fixture.repository, &["config", "filter.strip.smudge", "cat"]);
+    write(&fixture.worktree, ".gitattributes", "*.nb filter=strip\n");
+    write(&fixture.worktree, "e/n.nb", "cell\n");
+    commit(&fixture.worktree, "notebook");
+    git(&fixture.worktree, &["sparse-checkout", "set", "d"]);
+    assert!(!fixture.worktree.join("e/n.nb").exists());
+
+    assert_eq!(fixture.inspect().verdict, Verdict::CommitsKept);
+}
+
+#[test]
+fn a_stale_ident_expansion_is_not_a_change() {
+    let fixture = Fixture::new();
+    write(&fixture.worktree, ".gitattributes", "*.c ident\n");
+    write(&fixture.worktree, "main.c", "/* $Id$ */\n");
+    commit(&fixture.worktree, "ident");
+    // Git stores the stale expansion as `$Id$`, so the tree is unchanged.
+    write(&fixture.worktree, "main.c", "/* $Id: stale $ */\n");
+
+    let inspection = fixture.inspect();
+    assert_eq!(inspection.verdict, Verdict::CommitsKept);
+    assert!(inspection.filtered.is_empty());
+}
+
+#[test]
+fn a_bare_repository_in_an_ignored_directory_is_unsaved() {
+    let fixture = Fixture::new();
+    write(&fixture.worktree, ".gitignore", "tmp/\n");
+    commit(&fixture.worktree, "ignore tmp");
+    let bare = fixture.worktree.join("tmp/remote.git");
+    git(&fixture.worktree, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+
+    let inspection = fixture.inspect();
+    assert_eq!(inspection.verdict, DISCARD_ONLY);
+    assert_eq!(inspection.nested, vec!["tmp/remote.git/".to_owned()]);
+}
+
+#[test]
+fn a_read_only_directory_blocks() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    write(&fixture.worktree, ".gitignore", "cache/\n");
+    commit(&fixture.worktree, "ignore cache");
+    let cache = fixture.worktree.join("cache/module");
+    write(&cache, "module.go", "package module\n");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let inspection = fixture.inspect();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        blocker(&inspection),
+        &Blocker::Unremovable("cache/module/".into())
     );
 }

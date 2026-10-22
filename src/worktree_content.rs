@@ -18,8 +18,10 @@
 //! them, with ignored directories collapsed. Its token binds the content it
 //! judged, so the daemon can refuse a removal when anything changed after the
 //! user saw the plan; changes inside a collapsed ignored directory are not
-//! bound. Removal also drops the worktree's HEAD reflog, so commits reachable
-//! only from it, such as those a `reset --hard` left behind, are not judged.
+//! bound, nor are the contents of nested repositories. Removal also drops the
+//! worktree's admin directory: its HEAD reflog, so commits reachable only from
+//! it, such as those a `reset --hard` left behind, are not judged; and its
+//! `config.worktree` and sparse-checkout patterns.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -55,7 +57,8 @@ pub struct Inspection {
     pub untracked_bytes: u64,
     /// The first files a clean filter, `ident` or a working-tree encoding
     /// changes on the way into Git, such as notebooks under nbstripout. What
-    /// Git stores does not give them back, so no snapshot keeps them.
+    /// Git stores does not give them back, so no snapshot keeps them. When
+    /// such files are too large to compare, all of them are listed.
     pub filtered: Vec<String>,
     /// The first repositories below the top level, ignored directories
     /// included, such as a tool's cached clone. Removal deletes them whole.
@@ -90,6 +93,9 @@ pub enum Verdict {
         uncommitted: bool,
         /// No shared ref reaches HEAD, as for a detached HEAD's own commits.
         unreachable: bool,
+        /// Some of it is filtered content or nested repositories, which a
+        /// snapshot cannot keep: only an explicit discard permits removal.
+        beyond_snapshot: bool,
     },
     /// Removal is refused.
     Blocked(Blocker),
@@ -125,9 +131,9 @@ pub enum Blocker {
     NestedWorktree(String),
     #[error("{0} is present but marked skip-worktree")]
     SkipWorktree(String),
-    #[error("{0} cannot be read, so it cannot be removed")]
-    Unreadable(String),
-    #[error("untracked or filtered files exceed {bytes} bytes")]
+    #[error("{0} cannot be read or changed, so removal could not empty it")]
+    Unremovable(String),
+    #[error("untracked files exceed {bytes} bytes")]
     TooLarge { bytes: u64 },
     #[error("the worktree holds more than {limit} files")]
     TooManyFiles { limit: u64 },
@@ -182,6 +188,8 @@ pub enum ContentError {
     Blocked(Blocker),
     #[error("the worktree changed since it was inspected")]
     Changed,
+    #[error("the inspection was cancelled")]
+    Cancelled,
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]

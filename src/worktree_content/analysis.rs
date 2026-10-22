@@ -33,7 +33,7 @@ const OPERATIONS: [(&str, Operation); 7] = [
 ];
 /// Inherited variables that would change what Git reads, ignores, merges or
 /// fetches. The daemon's environment is not the user's repository config.
-const SCRUBBED: [&str; 14] = [
+const SCRUBBED: [&str; 16] = [
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
@@ -48,6 +48,8 @@ const SCRUBBED: [&str; 14] = [
     "GIT_GLOB_PATHSPECS",
     "GIT_NOGLOB_PATHSPECS",
     "GIT_ICASE_PATHSPECS",
+    "GIT_TEST_SPLIT_INDEX",
+    "GIT_LFS_SKIP_SMUDGE",
 ];
 const IDENTITY: [(&str, &str); 4] = [
     ("GIT_AUTHOR_NAME", "cagents"),
@@ -316,6 +318,11 @@ impl Drivers {
     /// Whether a `merge` attribute value selects a driver that could report a
     /// clean merge it never computed. `union` is built in but does.
     fn custom(&self, value: &[u8]) -> bool {
+        // `check-attr` prints a literal `merge=unspecified` or `merge=unset`
+        // like the states, but Git looks those up as driver names.
+        if self.configured.contains(value) {
+            return true;
+        }
         let name = match value {
             b"unspecified" => match &self.default {
                 Some(name) => name.as_slice(),
@@ -444,30 +451,39 @@ fn prune_scratch(common: &Path) {
 /// What `git worktree remove --force` would destroy without Git knowing.
 #[derive(Default)]
 struct Walk {
-    /// Repositories anywhere below the top level, ignored directories
-    /// included.
+    /// Repositories anywhere below the top level, bare ones and those in
+    /// ignored directories included.
     nested: Vec<String>,
-    /// A directory removal cannot read, and so cannot remove, or a tree too
-    /// large to walk.
+    /// A directory removal could not empty, or a tree too large to walk.
     blocker: Option<Blocker>,
 }
 
-fn walk(root: &Path) -> Result<Walk, ContentError> {
+fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentError> {
     let mut walk = Walk::default();
     let mut pending = vec![PathBuf::new()];
     let mut visited = 0u64;
+    let mut reported = Vec::<PathBuf>::new();
     while let Some(relative) = pending.pop() {
-        let entries = match std::fs::read_dir(root.join(&relative)) {
+        let directory = root.join(&relative);
+        let unremovable = || Some(Blocker::Unremovable(format!("{}/", relative.display())));
+        // Removal lists, enters and unlinks inside every directory.
+        let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .map_err(|_| ContentError::Path(directory.clone()))?;
+        if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) } != 0 {
+            walk.blocker = unremovable();
+            return Ok(walk);
+        }
+        let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                walk.blocker = Some(Blocker::Unreadable(format!("{}/", relative.display())));
+                walk.blocker = unremovable();
                 return Ok(walk);
             }
             Err(error) => return Err(error.into()),
         };
         let mut directories = Vec::new();
-        let mut repository = false;
+        let (mut dot_git, mut head, mut objects, mut refs) = (false, false, false, false);
         for entry in entries {
             let entry = entry?;
             visited += 1;
@@ -475,35 +491,122 @@ fn walk(root: &Path) -> Result<Walk, ContentError> {
                 walk.blocker = Some(Blocker::TooManyFiles { limit: WALK_LIMIT });
                 return Ok(walk);
             }
+            if visited % 4096 == 0 && cancellation.is_cancelled() {
+                return Err(ContentError::Cancelled);
+            }
             let name = entry.file_name();
-            if name == ".git" && !relative.as_os_str().is_empty() {
-                repository = true;
-            } else if entry.file_type()?.is_dir() {
+            let is_directory = entry.file_type()?.is_dir();
+            match name.as_bytes() {
+                b".git" => dot_git = !relative.as_os_str().is_empty(),
+                b"HEAD" => head = !is_directory,
+                b"objects" => objects = is_directory,
+                b"refs" => refs = is_directory,
+                _ => {}
+            }
+            if is_directory && !(name == ".git" && relative.as_os_str().is_empty()) {
                 directories.push(relative.join(name));
             }
         }
-        // A nested repository is reported once, but still walked: removal
-        // must be able to read it too.
-        if repository {
+        // A nested repository is reported once, not again for its own git
+        // directory, but still walked: removal must be able to empty it too.
+        let repository = dot_git || (head && objects && refs && !relative.as_os_str().is_empty());
+        if repository && !reported.iter().any(|outer| relative.starts_with(outer)) {
             walk.nested.push(format!("{}/", relative.display()));
+            reported.push(relative.clone());
         }
-        pending.extend(directories.into_iter().filter(|directory| {
-            relative.as_os_str().is_empty() || directory.file_name() != Some(OsStr::new(".git"))
-        }));
+        pending.extend(directories);
     }
     walk.nested.sort();
     Ok(walk)
 }
 
+/// Whether two files hold the same bytes, read in chunks.
+fn same_content(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut left, mut right) = (std::fs::File::open(left)?, std::fs::File::open(right)?);
+    let (mut left_buffer, mut right_buffer) = (vec![0; 1 << 16], vec![0; 1 << 16]);
+    loop {
+        let read = left.read(&mut left_buffer)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        right.read_exact(&mut right_buffer[..read])?;
+        if left_buffer[..read] != right_buffer[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Whether a worktree file is what a Git LFS pointer names, or the pointer
+/// itself, as a checkout that skipped smudging leaves it. Hashing the file
+/// avoids the smudge filter, which would download a missing object.
+fn lfs_matches(file: &Path, pointer: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    let length = file.metadata()?.len();
+    if length == pointer.len() as u64 && std::fs::read(file)? == pointer {
+        return Ok(true);
+    }
+    let field = |key: &[u8]| {
+        pointer
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(key))
+            .map(<[u8]>::to_vec)
+    };
+    let (Some(oid), Some(size)) = (field(b"oid sha256:"), field(b"size ")) else {
+        return Ok(false);
+    };
+    if size != length.to_string().as_bytes() {
+        return Ok(false);
+    }
+    let mut hasher = Sha256::new();
+    let mut reader = std::fs::File::open(file)?;
+    let mut buffer = vec![0; 1 << 16];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()).as_bytes() == oid.as_slice())
+}
+
+/// `$Id: <oid> $` as `$Id$`: the form `ident` stores, so a file committed
+/// with a stale expansion still matches.
+fn collapse_ident(content: &[u8]) -> Vec<u8> {
+    let mut collapsed = Vec::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.windows(4).position(|window| window == b"$Id:") {
+        collapsed.extend_from_slice(&rest[..start]);
+        let after = &rest[start + 4..];
+        match after.iter().position(|byte| matches!(byte, b'$' | b'\n')) {
+            Some(end) if after[end] == b'$' => {
+                collapsed.extend_from_slice(b"$Id$");
+                rest = &after[end + 1..];
+            }
+            _ => {
+                collapsed.extend_from_slice(b"$Id:");
+                rest = after;
+            }
+        }
+    }
+    collapsed.extend_from_slice(rest);
+    collapsed
+}
+
 /// Present files whose content a clean filter, `ident` or a working-tree
 /// encoding changes on the way in, so that what Git stores does not give back
-/// the file. Returns `None` when they are too large to compare.
+/// the file. Every such file counts when together they are too large to
+/// compare.
 fn filtered(
     git: &Git,
     worktree: &Path,
     tree: &str,
     scratch: &Path,
-) -> Result<Option<Vec<Vec<u8>>>, ContentError> {
+) -> Result<Vec<Vec<u8>>, ContentError> {
     let filters = git
         .answer([
             "config",
@@ -519,62 +622,118 @@ fn filtered(
             Some(rest[..dot].to_vec())
         })
         .collect::<BTreeSet<_>>();
-    // "<mode> <type> <oid>\t<path>"; symlinks and gitlinks are never filtered.
+    // "<mode> <type> <oid>\t<path>"; symlinks and gitlinks are never
+    // filtered, and a sparse checkout's absent files have nothing to lose.
     let listing = git.read(["ls-tree", "-r", "-z", "--full-tree", tree])?;
-    let files = fields(&listing)
+    let blobs = fields(&listing)
         .filter(|record| record.starts_with(b"100"))
         .filter_map(|record| {
             let tab = record.iter().position(|byte| *byte == b'\t')?;
-            Some(record[tab + 1..].to_vec())
+            let oid = record[..tab].rsplit(|byte| *byte == b' ').next()?;
+            Some((record[tab + 1..].to_vec(), oid.to_vec()))
         })
-        .collect::<Vec<_>>();
-    let mut candidates = git
-        .attributes(&files, &["filter", "ident", "working-tree-encoding"], None)?
-        .into_iter()
-        .filter(|(_, name, value)| match name.as_slice() {
-            b"filter" => filters.contains(value),
-            b"ident" => value == b"set",
-            _ => !matches!(value.as_slice(), b"unspecified" | b"unset"),
+        .filter(|(path, _)| {
+            worktree
+                .join(OsStr::from_bytes(path))
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file())
         })
-        .map(|(path, _, _)| path)
-        .collect::<Vec<_>>();
-    candidates.dedup();
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let files = blobs.keys().cloned().collect::<Vec<_>>();
+    // Per candidate: whether `filter=lfs`, whether `ident`.
+    let mut candidates = std::collections::BTreeMap::<Vec<u8>, (bool, bool)>::new();
+    for (path, name, value) in
+        git.attributes(&files, &["filter", "ident", "working-tree-encoding"], None)?
+    {
+        let flags = match name.as_slice() {
+            b"filter" if filters.contains(&value) => (value == b"lfs", false),
+            b"ident" if value == b"set" => (false, true),
+            b"working-tree-encoding" if !matches!(value.as_slice(), b"unspecified" | b"unset") => {
+                (false, false)
+            }
+            _ => continue,
+        };
+        let entry = candidates.entry(path).or_insert((true, false));
+        // Only a file LFS alone filters is judged by its pointer.
+        entry.0 &= flags.0 && name == b"filter";
+        entry.1 |= flags.1;
+    }
     if candidates.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     let bytes = candidates
-        .iter()
+        .keys()
         .filter_map(|path| worktree.join(OsStr::from_bytes(path)).metadata().ok())
         .map(|metadata| metadata.len())
         .sum::<u64>();
     if bytes > CONTENT_LIMIT {
-        return Ok(None);
+        return Ok(candidates.into_keys().collect());
     }
-    // Check the stored content out through the same filters, beside the
-    // index copy rather than into the worktree.
-    let checkout = scratch.join("checkout");
-    let mut prefix = checkout.as_os_str().to_owned();
-    prefix.push("/");
-    let mut argument = OsString::from("--prefix=");
-    argument.push(prefix);
-    git.checked(
-        &git.command([
-            OsString::from("checkout-index"),
-            OsString::from("-z"),
-            OsString::from("--stdin"),
-            argument,
-        ])
-        .stdin(nul_joined(&candidates)),
-    )?;
     let mut lossy = Vec::new();
-    for path in candidates {
-        let relative = OsStr::from_bytes(&path);
-        if std::fs::read(worktree.join(relative))? != std::fs::read(checkout.join(relative))? {
-            lossy.push(path);
+    let (lfs, checkout): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(_, (lfs, ident))| *lfs && !*ident);
+    if !lfs.is_empty() {
+        let input = lfs.iter().fold(Vec::new(), |mut input, (path, _)| {
+            input.extend_from_slice(&blobs[path]);
+            input.push(b'\n');
+            input
+        });
+        let output = git.checked(&git.command(["cat-file", "--batch"]).stdin(input))?;
+        let mut rest = output.as_slice();
+        for (path, _) in &lfs {
+            let newline = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(|| ContentError::Git("unexpected cat-file output".into()))?;
+            let size = std::str::from_utf8(&rest[..newline])
+                .ok()
+                .and_then(|header| header.rsplit(' ').next()?.parse::<usize>().ok())
+                .filter(|size| newline + 1 + size < rest.len())
+                .ok_or_else(|| ContentError::Git("unexpected cat-file output".into()))?;
+            let pointer = &rest[newline + 1..newline + 1 + size];
+            rest = &rest[newline + 2 + size..];
+            if !lfs_matches(&worktree.join(OsStr::from_bytes(path)), pointer)? {
+                lossy.push(path.clone());
+            }
         }
     }
-    std::fs::remove_dir_all(&checkout)?;
-    Ok(Some(lossy))
+    if !checkout.is_empty() {
+        // Check the stored content out through the same filters, beside the
+        // index copy rather than into the worktree.
+        let directory = scratch.join("checkout");
+        let mut argument = OsString::from("--prefix=");
+        argument.push(directory.as_os_str());
+        argument.push("/");
+        let paths = checkout
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        git.checked(
+            &git.command([
+                OsString::from("checkout-index"),
+                OsString::from("-z"),
+                OsString::from("--stdin"),
+                argument,
+            ])
+            .stdin(nul_joined(&paths)),
+        )?;
+        for (path, (_, ident)) in checkout {
+            let relative = OsStr::from_bytes(&path);
+            let (file, stored) = (worktree.join(relative), directory.join(relative));
+            let same = if ident {
+                collapse_ident(&std::fs::read(&file)?) == collapse_ident(&std::fs::read(&stored)?)
+            } else {
+                same_content(&file, &stored)?
+            };
+            if !same {
+                lossy.push(path);
+            }
+        }
+        std::fs::remove_dir_all(&directory)?;
+    }
+    lossy.sort();
+    Ok(lossy)
 }
 
 /// The verdict's class, which the token binds: a removal planned for one
@@ -723,7 +882,7 @@ fn analyze(
             Blocker::NestedWorktree(format!("{}/", inner.display())),
         ));
     }
-    let walk = walk(path)?;
+    let walk = walk(path, cancellation)?;
     if let Some(blocker) = walk.blocker {
         return Ok(blocked(path, blocker));
     }
@@ -797,27 +956,29 @@ fn analyze(
     // Untracked nested repositories, the only directories this listing
     // shows, are reported apart; `add` would record them as gitlinks, or
     // refuse one without a commit.
-    let mut add = ["add", "-A", "--sparse", "--", ":/"].map(OsString::from).to_vec();
+    let mut pathspecs = b":/\0".to_vec();
     for nested in fields(&others).filter(|entry| entry.ends_with(b"/")) {
-        let mut pathspec = OsString::from(":(top,literal,exclude)");
-        pathspec.push(OsStr::from_bytes(&nested[..nested.len() - 1]));
-        add.push(pathspec);
+        pathspecs.extend_from_slice(b":(top,literal,exclude)");
+        pathspecs.extend_from_slice(&nested[..nested.len() - 1]);
+        pathspecs.push(0);
     }
-    git.read(add)?;
+    git.checked(
+        &git.command([
+            "add",
+            "-A",
+            "--sparse",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ])
+        .stdin(pathspecs),
+    )?;
     let full_tree = git.line(["write-tree"])?;
     let head_tree = git.tree_of(&head)?;
     let staged = git.changed(&head_tree, &index_tree)?.len();
     let modified = git.changed(&index_tree, &work_tree)?.len();
     // What `add -A` added, rather than what an earlier listing saw.
     let untracked = git.changed_by(&work_tree, &full_tree, Some("--diff-filter=A"))?;
-    let Some(lossy) = filtered(&git, path, &full_tree, scratch.path())? else {
-        return Ok(blocked(
-            path,
-            Blocker::TooLarge {
-                bytes: CONTENT_LIMIT,
-            },
-        ));
-    };
+    let lossy = filtered(&git, path, &full_tree, scratch.path())?;
 
     // A remote-tracking ref disappears with a pruning fetch once its branch
     // is deleted, so it never keeps commits alive.
@@ -871,7 +1032,8 @@ fn analyze(
         probes.push((tree.clone(), commit, git.changed(&head_tree, tree)?));
     }
     let mut landed_in = None;
-    // Git keeps neither filtered-away content nor nested repositories.
+    // Neither Git nor a snapshot keeps filtered-away content or nested
+    // repositories.
     let unkept = !lossy.is_empty() || !walk.nested.is_empty();
     let mut uncommitted_landed = !unkept && probes.is_empty();
     for target in targets {
@@ -922,6 +1084,7 @@ fn analyze(
         Verdict::Unsaved {
             uncommitted: !uncommitted_landed,
             unreachable: !reachable,
+            beyond_snapshot: unkept,
         }
     };
 
