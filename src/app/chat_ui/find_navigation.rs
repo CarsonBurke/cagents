@@ -3016,12 +3016,30 @@ mod tests {
 
 #[cfg(test)]
 pub(super) fn find_for_test(app: &mut Cagents, target: Target, query: String) -> Task<Message> {
-    use iced::futures::StreamExt;
     let empty = query.is_empty();
-    let mut task = app.handle_chat_ui(Action::Find(target, query));
+    let task = app.handle_chat_ui(Action::Find(target, query));
     if empty {
         return task;
     }
+    finish_raw_find_for_test(app, target, task)
+}
+
+/// Settle the accepted current query after a publication/context change. Do
+/// not issue another Find action: query identity and disclosure ownership stay
+/// those of the real user request being refreshed.
+#[cfg(test)]
+pub(super) fn settle_current_find_for_test(app: &mut Cagents, target: Target) -> Task<Message> {
+    let task = app.resume_current_find(target, false);
+    finish_raw_find_for_test(app, target, task)
+}
+
+#[cfg(test)]
+fn finish_raw_find_for_test(
+    app: &mut Cagents,
+    target: Target,
+    mut task: Task<Message>,
+) -> Task<Message> {
+    use iced::futures::StreamExt;
     let executor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

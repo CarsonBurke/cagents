@@ -7190,7 +7190,10 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         app.chat_runtime_mut(target).unwrap().refresh();
         let renderer = crate::app::tests::headless_renderer();
-        let rendered = |runtime: &Runtime| {
+        let rendered = |runtime: &mut Runtime| {
+            // A newly selected child has its own actual parser preparation;
+            // completing Flow cannot manufacture a missing prompt DTO.
+            preparation::drain_fixture(runtime);
             let mut element = runtime.prompt_view(runtime.active_item("same#opaque-id").unwrap());
             let mut tree = Tree::new(element.as_widget());
             let mut node = element.as_widget_mut().layout(
@@ -10019,10 +10022,12 @@ mod tests {
         };
         let items = frame_cost::transcript(1);
         let (runtime, _handle) = frame_cost::live_runtime(&items);
-        let prompt = items
+        let prompt = runtime
+            .snapshot
+            .items
             .iter()
             .find(|item| item.role == chat::Role::User)
-            .expect("user prompt");
+            .expect("accepted user prompt");
         let expected = match &prompt.content {
             ItemContent::Text { text, .. } => text.clone(),
             _ => panic!("fixture prompt must be text"),
@@ -10638,24 +10643,32 @@ mod tests {
             layout,
             widget::{Operation, Tree},
         };
-        let items = frame_cost::transcript(1);
-        let (runtime, _handle) = frame_cost::live_runtime(&items);
+        use iced::futures::StreamExt;
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         for (source, raw_code) in [
             ("bounded αβ words ".repeat(300), false),
             ("αβ item line\n\n".repeat(300), true),
             ("αβ item line\r\n\r\n".repeat(300), true),
         ] {
-            let cached = CachedItem::new(
-                &ItemContent::Text {
+            let item = chat::Item {
+                id: "copy-source".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
                     text: source.clone(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },
-                crate::settings::EditorSyntaxTheme::Auto,
-            );
-            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+                at: None,
+                started_at: None,
+            };
+            let (runtime, _handle) = frame_cost::live_runtime(&[item]);
+            let target = runtime.target;
+            let cached = &runtime.cache["copy-source"];
             let mut builder = selection::Catalog::builder();
-            let item = format!("unbound-{}", cached.revision);
+            let item = cached.item.as_ref().unwrap().id.clone();
             if raw_code {
                 // Code copy retains the raw CRLF and terminal newline rather
                 // than testing only a Markdown parser's normalized projection.
@@ -10664,56 +10677,135 @@ mod tests {
                 builder.markdown(&item, &[0], cached.markdown.items());
             }
             let catalog = builder.finish();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
             let expected = catalog
                 .search_blocks()
                 .into_iter()
                 .map(|(_, text)| text.to_string())
                 .collect::<String>();
-            let body = if raw_code {
-                let code = prose::code_text(
-                    Arc::from(source.as_str()),
-                    Arc::from([]),
-                    design::TEXT_BODY.into(),
-                    iced::Font::MONOSPACE,
-                    runtime.target,
+            let code_source: Arc<str> = Arc::from(source.as_str());
+            let reader_source = super::super::reader_source::Source::new(&source);
+            let make = |app: &Cagents| {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                    panic!("copy fixture retains its live runtime");
+                };
+                let cached = &runtime.cache["copy-source"];
+                let body = if raw_code {
+                    let code = prose::code_text(
+                        code_source.clone(),
+                        Arc::from([]),
+                        design::TEXT_BODY.into(),
+                        iced::Font::MONOSPACE,
+                        target,
+                        None,
+                        Some(selectable_prose::Logical {
+                            identity: selection::logical_identity(&item, &[0]),
+                            start: 0,
+                        }),
+                        Some(cached.flow_cache.clone()),
+                        Some(reader_source.clone()),
+                    );
+                    widget::scrollable(code)
+                        .direction(iced::widget::scrollable::Direction::Horizontal(
+                            iced::widget::scrollable::Scrollbar::new(),
+                        ))
+                        .width(Length::Fill)
+                        .into()
+                } else {
+                    prose::view(
+                        cached,
+                        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                        target,
+                        None,
+                    )
+                };
+                let content = scroll::transcript(body, target, None, vec![], true, vec![]);
+                selection::transcript_virtualized(
+                    content,
+                    target,
                     None,
-                    Some(selectable_prose::Logical {
-                        identity: selection::logical_identity(&item, &[0]),
-                        start: 0,
-                    }),
-                    Some(cached.flow_cache.clone()),
-                    Some(super::super::reader_source::Source::new(&source)),
-                );
-                widget::scrollable(code)
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::new(),
-                    ))
-                    .width(Length::Fill)
-                    .into()
-            } else {
-                prose::view(&cached, settings, runtime.target, None)
+                    catalog.clone(),
+                    Default::default(),
+                )
             };
-            let content = scroll::transcript(body, runtime.target, None, vec![], true, vec![]);
-            let mut element = selection::transcript_virtualized(
-                content,
-                runtime.target,
-                None,
-                catalog,
-                Default::default(),
-            );
+            let mut element = make(&app);
             let renderer = crate::app::tests::headless_renderer();
             let mut tree = Tree::new(&element);
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 30000.0));
             let mut node = element
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
-            // Full-context flow is prepared explicitly in this geometry
-            // oracle. Production/cold timing never invokes the fixture drain.
-            if cached.flow_cache.complete_fixture() {
+            // Follow actual Redraw -> FlowRequest -> admitted worker ->
+            // FlowReady -> owner revision -> retained diff/layout. Completing
+            // an Entry directly cannot invalidate a retained paragraph node.
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 30000.0));
+            let mut settled = false;
+            for _ in 0..64 {
+                let mut messages = Vec::new();
+                let mut shell = iced::advanced::Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Window(iced::window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    )),
+                    iced::advanced::Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                let invalid = shell.is_layout_invalid();
+                let mut shaped = false;
+                drop(element);
+                for message in messages {
+                    let is_request = matches!(&message, Message::ChatUi(Action::FlowRequest(..)));
+                    let task = app.update(message);
+                    if !is_request {
+                        drop(task);
+                        continue;
+                    }
+                    shaped = true;
+                    let ready = executor.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let mut task = task;
+                            let mut available = Box::pin(flow_layout::availability_stream());
+                            for _ in 0..64 {
+                                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                                    while let Some(effect) = stream.next().await {
+                                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                                            message @ Message::ChatUi(Action::FlowReady(..)),
+                                        )) = effect
+                                        {
+                                            return message;
+                                        }
+                                    }
+                                }
+                                // A denied admission waits for the same real
+                                // availability notification used by the UI.
+                                task =
+                                    app.update(available.next().await.expect("Flow availability"));
+                            }
+                            panic!("actual Flow request did not complete");
+                        })
+                        .await
+                        .expect("bounded actual Flow worker completes")
+                    });
+                    drop(app.update(ready));
+                }
+                element = make(&app);
+                tree.diff(element.as_widget_mut());
                 node = element
                     .as_widget_mut()
                     .layout(&mut tree, &renderer, &limits);
+                if !invalid && !shaped {
+                    settled = true;
+                    break;
+                }
             }
+            assert!(settled, "actual Flow and transcript layouts converge");
             #[derive(Default)]
             struct ReadText(Vec<(String, iced::Rectangle, usize)>);
             impl Operation for ReadText {
@@ -10809,7 +10901,6 @@ mod tests {
                 ));
             }
             let mut clipboard = ClipboardText::default();
-            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 30000.0));
             for (start, end, expected_selection) in selections {
                 for (event, pointer) in [
                     (

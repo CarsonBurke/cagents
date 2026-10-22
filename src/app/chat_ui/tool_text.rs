@@ -1056,13 +1056,39 @@ mod tests {
     fn finding_a_deep_source_match_reveals_it_without_an_inner_scroll_barrier() {
         use iced::advanced::{layout, widget::Tree};
         let renderer = crate::app::tests::headless_renderer();
-        let target = Target {
-            card: CardId::new(),
-            generation: 0,
-        };
         let source = format!("{}needle at the end", "ordinary line\n".repeat(200));
-        let block = ToolText::update(None, &source, Language::Shell);
-        let height = |query| {
+        let item = chat::Item {
+            id: "deep-tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "FixtureInspect".into(),
+                input: "{}".into(),
+                output: source,
+                status: chat::ToolStatus::Succeeded,
+            },
+            at: None,
+            started_at: None,
+        };
+        let (runtime, _handle) = view::prepared_runtime_for_test(&[item]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::Toggle(target, "deep-tool".into())));
+        let mut height = |query: Option<&str>| {
+            if let Some(query) = query {
+                drop(find_navigation::find_for_test(
+                    &mut app,
+                    target,
+                    query.into(),
+                ));
+            } else {
+                drop(app.handle_chat_ui(Action::CloseFind(target)));
+            }
+            let block = app.chat_runtime_mut(target).unwrap().cache["deep-tool"]
+                .tool_output
+                .as_ref()
+                .expect("actual expanded tool output");
             let mut element = block.view_from_start(
                 crate::settings::EditorSyntaxTheme::Auto,
                 320.0,

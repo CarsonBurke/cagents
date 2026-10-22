@@ -1458,7 +1458,10 @@ mod tests {
 
     #[test]
     fn giant_single_list_table_and_heading_keep_only_viewport_widget_trees() {
-        use iced::advanced::{layout, widget::Tree};
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
         fn residents(tree: &Tree) -> (usize, usize) {
             let prose = usize::from(
                 tree.tag == iced::advanced::widget::tree::Tag::of::<selectable_prose::State>(),
@@ -1470,7 +1473,70 @@ mod tests {
                     (widgets + children, prose + leaves)
                 })
         }
+        // Observe mounted State geometry through the same native clipping and
+        // scroll translations as UpdateViewport. This does not assert that a
+        // giant Flow source has already been shaped by its background worker.
+        #[derive(Default)]
+        struct Visible {
+            translation: iced::Vector,
+            pending: Option<(iced::Rectangle, iced::Vector)>,
+            clip: Option<iced::Rectangle>,
+            states: usize,
+        }
+        impl Operation for Visible {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                let previous = self.translation;
+                let clip = self.clip;
+                if let Some((bounds, translation)) = self.pending.take() {
+                    let bounds = iced::Rectangle {
+                        x: bounds.x - self.translation.x,
+                        y: bounds.y - self.translation.y,
+                        ..bounds
+                    };
+                    self.clip = Some(self.clip.map_or(bounds, |clip| {
+                        clip.intersection(&bounds).unwrap_or_default()
+                    }));
+                    self.translation += translation;
+                }
+                visit(self);
+                self.translation = previous;
+                self.clip = clip;
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.pending = Some((bounds, translation));
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if state.is::<selectable_prose::State>() {
+                    let bounds = iced::Rectangle {
+                        x: bounds.x - self.translation.x,
+                        y: bounds.y - self.translation.y,
+                        ..bounds
+                    };
+                    if self
+                        .clip
+                        .and_then(|clip| clip.intersection(&bounds))
+                        .is_some_and(|visible| visible.width > 0.0 && visible.height > 0.0)
+                    {
+                        self.states += 1;
+                    }
+                }
+            }
+        }
         let renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
         let sources = [
             "- list row with meaningful text\n".repeat(20_000),
             format!(
@@ -1493,22 +1559,61 @@ mod tests {
                 1,
                 "adversarial single top-level item"
             );
-            let mut element = view(
-                &cached,
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
-                Target {
-                    card: CardId::new(),
-                    generation: 0,
-                },
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let mut element = scroll::transcript(
+                view(
+                    &cached,
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    target,
+                    None,
+                ),
+                target,
                 None,
+                vec![],
+                true,
+                vec![],
             );
             let mut tree = Tree::new(&element);
-            element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY)),
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut converged = false;
+            for _ in 0..8 {
+                let mut observed = virtualized::UpdateViewport::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut observed,
+                );
+                if !observed.changed {
+                    converged = true;
+                    break;
+                }
+                node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+            }
+            assert!(converged, "real finite native viewport windows converge");
+            let mut visible = Visible {
+                clip: Some(viewport),
+                ..Visible::default()
+            };
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+            assert!(
+                visible.states > 0,
+                "finite viewport intersects mounted selectable States"
             );
             let (widgets, prose) = residents(&tree);
+            assert!(
+                prose > 0,
+                "resident bound cannot pass by evicting every State"
+            );
             assert!(
                 prose < 100,
                 "hidden leaf shaping escaped viewport bound: {prose}"

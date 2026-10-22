@@ -1160,6 +1160,37 @@ impl CachedItem {
         cached.placeholder = true;
         cached.token = ChangeToken::of(&item.content);
         cached.item = Some(item.clone());
+        // Preview decoding has its own bounded worker/admission. Its immutable
+        // source metadata must also exist while literal text is being prepared.
+        if matches!(item.content, ItemContent::Image { .. }) {
+            cached.image_item = Some(item.clone());
+            cached.image_source = Some(item.clone());
+        }
+        cached
+    }
+
+    fn preparing_replacement(
+        item: &Arc<chat::Item>,
+        theme: crate::settings::EditorSyntaxTheme,
+        previous: Option<&Self>,
+    ) -> Self {
+        let mut cached = Self::preparing(item, theme);
+        if let Some(previous) = previous.filter(|previous| {
+            matches!(item.content, ItemContent::Image { .. })
+                && previous
+                    .image_item
+                    .as_ref()
+                    .is_some_and(|old| old.content == item.content)
+        }) {
+            // An equal-content replacement needs its own exact literal source,
+            // but does not invalidate an accepted/in-flight image decode.
+            cached.image = previous.image.clone();
+            cached.image_source = previous.image_source.clone();
+            cached.image_unavailable = previous.image_unavailable;
+            cached.image_attempt = previous.image_attempt;
+            cached.image_wait = previous.image_wait.clone();
+            cached.image_evicted = previous.image_evicted;
+        }
         cached
     }
     /// Approximate exposed presentation storage. Opaque Markdown/parser
@@ -3124,7 +3155,14 @@ impl Runtime {
                         },
                     );
                     if replaced && !exact && !proven_from_cache {
-                        cache.insert(item.id.clone(), CachedItem::preparing(item, theme));
+                        let replacement = CachedItem::preparing_replacement(
+                            item,
+                            theme,
+                            cache
+                                .get(&item.id)
+                                .filter(|cached| cached.reader_context == context),
+                        );
+                        cache.insert(item.id.clone(), replacement);
                         presentation_changed = true;
                     }
                     if !cache.contains_key(&item.id) {
@@ -10922,6 +10960,7 @@ mod tests {
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.visible.store(true, Ordering::Relaxed);
             runtime.refresh();
+            preparation::drain_fixture(runtime);
         };
         publish(&mut app, old.clone(), 10);
         publish(&mut app, changed.clone(), 11);
@@ -11245,6 +11284,7 @@ mod tests {
         assert!(chat_runtime(&app, card).cache[&parent.id].image.is_none());
         // The real lease can now be acquired for the selected transcript.
         let runtime = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(runtime);
         let child_attempt = runtime.child_cache[&child.id].image_attempt;
         finish_preview(
             runtime,
@@ -13699,6 +13739,9 @@ mod tests {
                     "needle".into(),
                 ));
             } else {
+                drop(find_navigation::settle_current_find_for_test(
+                    &mut app, target,
+                ));
                 drop(app.handle_chat_ui(Action::FindNext(target, true)));
             }
             drop(app.handle_chat_ui(Action::FindNext(target, true)));
@@ -13887,6 +13930,9 @@ mod tests {
         snapshot.generation += 1;
         snapshot.subagents[0].items = vec![child_find_tool("before streamed-needle")];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(find_navigation::settle_current_find_for_test(
+            &mut app, target,
+        ));
         assert_eq!(
             chat_runtime(&app, card).find_matches,
             vec!["same#opaque-id"]
@@ -13907,6 +13953,9 @@ mod tests {
         snapshot.generation += 1;
         snapshot.subagents.clear();
         show_chat_snapshot_for_test(&mut app, card, snapshot);
+        drop(find_navigation::settle_current_find_for_test(
+            &mut app, target,
+        ));
         let runtime = chat_runtime(&app, card);
         assert!(runtime.selected_subagent.is_none());
         assert!(
@@ -13993,6 +14042,7 @@ mod tests {
             child_revision
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-1".into()))));
+        preparation::retirement_barrier();
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.child_cache.len(), 1);
         assert!(runtime.child_cache.contains_key("answer-1"));
