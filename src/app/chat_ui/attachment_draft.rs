@@ -281,21 +281,46 @@ impl Ticket {
     }
 }
 pub(super) fn admit() -> Option<(Ticket, Lease)> {
-    #[cfg(not(test))]
-    let pool = {
-        static POOL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        POOL.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
-            .clone()
-    };
-    // Reducer tests run independently in parallel; each test thread owns its
-    // pool. Production uses one pool across every window/card/runtime.
+    static POOL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let pool = POOL
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone();
     #[cfg(test)]
-    let pool = {
-        thread_local! { static POOL: std::sync::Arc<tokio::sync::Semaphore> = std::sync::Arc::new(tokio::sync::Semaphore::new(2)); }
-        POOL.with(Clone::clone)
-    };
+    let pool = TEST_POOL.with(|slot| slot.borrow().clone()).unwrap_or(pool);
     Ticket::acquire(pool)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_POOL: std::cell::RefCell<Option<std::sync::Arc<tokio::sync::Semaphore>>> = const { std::cell::RefCell::new(None) };
+}
+/// An explicit isolated application fixture uses the same two-slot contract.
+/// All Runtime/cards inside that fixture share it; ordinary test code still
+/// uses production's process-global pool unless this guard is installed.
+#[cfg(test)]
+pub(super) struct TestAdmission {
+    previous: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    pool: std::sync::Arc<tokio::sync::Semaphore>,
+}
+#[cfg(test)]
+pub(super) fn test_admission() -> TestAdmission {
+    let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let previous = TEST_POOL.with(|slot| slot.replace(Some(pool.clone())));
+    TestAdmission { previous, pool }
+}
+#[cfg(test)]
+impl Drop for TestAdmission {
+    fn drop(&mut self) {
+        TEST_POOL.with(|slot| *slot.borrow_mut() = self.previous.take());
+        if !std::thread::panicking() {
+            assert_eq!(
+                self.pool.available_permits(),
+                2,
+                "fixture must settle every owned staging callback/lease before retirement"
+            );
+        }
+    }
 }
 
 /// IDs below are constructed by cagents' provider decoders, not image labels

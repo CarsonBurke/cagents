@@ -213,6 +213,7 @@ mod tests {
 
     #[test]
     fn cancelled_staging_does_not_read_a_selected_file_or_allocate_a_receipt() {
+        let _admission = super::super::attachment_draft::test_admission();
         let (ticket, lease) = super::super::attachment_draft::admit().unwrap();
         drop(lease);
         let error = stage_file_active(

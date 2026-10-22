@@ -14799,6 +14799,7 @@ mod tests {
 
     #[test]
     fn dropped_mentions_restart_completion_and_promote_the_recalled_prompt() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         write(&mut app, card, "original unsent draft");
@@ -14863,6 +14864,7 @@ mod tests {
 
     #[test]
     fn late_image_insert_preserves_a_later_native_word_selection() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = draft_chat(&mut app);
@@ -14943,6 +14945,7 @@ mod tests {
 
     #[test]
     fn same_caret_image_pastes_follow_initiation_order_in_both_completion_orders() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|first| {
             let second = chat::attachment_assets::test_image("second sequence image.png");
             for second_finishes_first in [false, true] {
@@ -14981,6 +14984,7 @@ mod tests {
 
     #[test]
     fn completing_an_image_selection_cancels_an_overlapping_jobs_lease_before_its_io() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|first| {
             let second = chat::attachment_assets::test_image("overlapping second.png");
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -15021,6 +15025,7 @@ mod tests {
 
     #[test]
     fn managed_images_keep_caret_identity_through_out_of_order_pastes_remove_and_draft_restore() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|first| {
             let second = chat::attachment_assets::test_image("second.png");
             let first_ref = first.reference.as_ref().unwrap();
@@ -15260,6 +15265,7 @@ mod tests {
 
     #[test]
     fn retargeted_runtime_retires_old_insert_leases_before_ignoring_old_callbacks() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let old_target = chat_runtime(&app, card).target;
@@ -15303,6 +15309,7 @@ mod tests {
 
     #[test]
     fn replacing_drafts_cannot_admit_more_owned_clipboard_callbacks() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let target = chat_runtime(&app, card).target;
@@ -15330,6 +15337,7 @@ mod tests {
 
     #[test]
     fn cancelled_empty_image_callback_does_not_read_a_later_clipboard() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let target = chat_runtime(&app, card).target;
@@ -15349,6 +15357,7 @@ mod tests {
 
     #[test]
     fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = draft_chat(&mut app);
@@ -15416,6 +15425,7 @@ mod tests {
 
     #[test]
     fn a_mixed_drop_replaces_selection_once_and_keeps_its_images_after_its_own_prose() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = draft_chat(&mut app);
@@ -15496,6 +15506,7 @@ mod tests {
 
     #[test]
     fn conflicting_pending_image_selection_refuses_without_erasing_new_prose() {
+        let _admission = attachment_draft::test_admission();
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = draft_chat(&mut app);
@@ -15530,6 +15541,7 @@ mod tests {
 
     #[test]
     fn a_pending_image_paste_stays_with_the_message_it_precedes() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("thread"));
         let target = chat_runtime(&app, card).target;
@@ -15581,6 +15593,7 @@ mod tests {
 
     #[test]
     fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
+        let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("thread"));
         let target = chat_runtime(&app, card).target;
