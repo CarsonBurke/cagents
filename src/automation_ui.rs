@@ -624,6 +624,15 @@ impl Section {
         }
     }
 
+    /// The current tab's accessible name and tooltip while something is open
+    /// beneath it, which choosing the tab leaves.
+    fn back(self) -> &'static str {
+        match self {
+            Self::Automations => "Back to the automation list",
+            Self::RunHistory => "Back to Run history",
+        }
+    }
+
     fn enter(self) -> Action {
         match self {
             Self::Automations => Action::Browse,
@@ -1443,21 +1452,30 @@ impl State {
     /// in flight no tab publishes.
     fn view_tabs(&self, busy: bool) -> Vec<crate::ui_controls::ViewTab<'static, Action>> {
         let current = self.section();
+        let root = self.section_root();
         Section::ALL
             .into_iter()
-            .map(|section| crate::ui_controls::ViewTab {
-                label: section.label().into(),
-                description: section.description().into(),
-                count: None,
-                selected: section == current,
-                id: None,
-                on_press: if busy {
-                    None
-                } else if section == current {
-                    self.section_root()
-                } else {
-                    Some(section.enter())
-                },
+            .map(|section| {
+                let returns = section == current && root.is_some();
+                crate::ui_controls::ViewTab {
+                    label: section.label().into(),
+                    description: if returns {
+                        section.back()
+                    } else {
+                        section.description()
+                    }
+                    .into(),
+                    count: None,
+                    selected: section == current,
+                    id: None,
+                    on_press: if busy {
+                        None
+                    } else if section == current {
+                        root.clone()
+                    } else {
+                        Some(section.enter())
+                    },
+                }
             })
             .collect()
     }
@@ -1607,12 +1625,13 @@ impl State {
             .into()
     }
 
-    /// Refresh, which stays the same control while the work it started is
-    /// in flight: disabled, with progress in place of its glyph and the work
-    /// as its name, so a keyboard user's focus stays on it.
+    /// Refresh, which stays the same control while any foreground request
+    /// is in flight, whether Refresh started it or not ("Opening agent…"):
+    /// disabled, with progress in place of its glyph and the request as its
+    /// name, so a keyboard user's focus stays on it.
     ///
     /// Its tooltip belongs to the glyph rather than the button, so it can
-    /// still name the work while the button is disabled.
+    /// still name the request while the button is disabled.
     fn refresh_control(&self, progress: Option<&'static str>) -> Element<'_, Action> {
         let label = progress.unwrap_or(if self.run.is_some() {
             "Refresh run"
@@ -2642,16 +2661,9 @@ fn crumb_style() -> cosmic::theme::Button {
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
-        disabled: Box::new(move |theme| {
-            let container = theme.current_container();
-            widget::button::Style {
-                text_color: Some(crate::design::mix(
-                    container.base.into(),
-                    container.on.into(),
-                    0.42,
-                )),
-                ..appearance(false, theme)
-            }
+        disabled: Box::new(move |theme| widget::button::Style {
+            text_color: Some(crate::design::disabled_color(theme)),
+            ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
             background: Some(Background::Color(
@@ -3614,22 +3626,34 @@ mod tests {
     #[test]
     fn the_current_tab_returns_to_its_view_from_anything_open_beneath_it() {
         let owner = automation();
-        let tab = |state: &State| {
+        let tab = |state: &State, name: &str| {
             buttons(state, 900.0)
                 .into_iter()
-                .find(|(name, _)| name == "Automations and their schedules")
-                .expect("the Automations tab is announced")
+                .find(|(announced, _)| announced == name)
+                .unwrap_or_else(|| panic!("{name:?} in {:?}", buttons(state, 900.0)))
                 .1
         };
         let mut state = State {
             rows: vec![owner.summary(None)],
             ..Default::default()
         };
-        assert!(!tab(&state), "the list on screen is not chosen again");
+        assert!(
+            !tab(&state, "Automations and their schedules"),
+            "the list on screen is not chosen again"
+        );
+        // Where it leads back to is what the tab is named for.
         state.selected = Some(owner.clone());
-        assert!(tab(&state), "a selection is left through its tab");
+        assert!(
+            tab(&state, "Back to the automation list"),
+            "a selection is left through its tab"
+        );
         state.run = Some(run_of(&owner));
-        assert!(tab(&state), "a run is left through its tab");
+        assert!(
+            tab(&state, "Back to the automation list"),
+            "a run is left through its tab"
+        );
+        state.all_history = true;
+        assert!(tab(&state, "Back to Run history"));
     }
 
     #[test]
@@ -3769,6 +3793,29 @@ mod tests {
             "{:?}",
             buttons(&state, 900.0)
         );
+    }
+
+    #[test]
+    fn a_narrow_header_draws_its_tabs_compact_ahead_of_its_commands() {
+        let state = State {
+            rows: vec![automation().summary(None)],
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        let wide = Outline::of(&state, 900.0, 700.0).text("Run history");
+        for width in [300.0, 360.0] {
+            let tab = Outline::of(&state, width, 700.0).text("Run history");
+            assert!(
+                tab.height < wide.height,
+                "at {width} px the tabs use caption text: {tab:?} {wide:?}"
+            );
+            // Refresh and New automation, each an icon, follow the tabs.
+            let commands = 2.0 * (crate::design::PRIMARY_CONTROL_SIZE + space::S);
+            assert!(
+                tab.x + tab.width <= width - space::L - commands,
+                "at {width} px the last tab ends before the header's commands: {tab:?}"
+            );
+        }
     }
 
     #[test]
