@@ -2060,7 +2060,13 @@ impl Runtime {
             self.submit_after_paste = None;
             return false;
         }
-        let current = self.composer.cursor();
+        let current = attachment_draft::Bookmark::capture(&self.composer);
+        if !current.valid {
+            self.error = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
+            self.submit_after_paste = None;
+            return false;
+        }
+        let current = current.cursor;
         self.composer.move_to(bookmark.cursor);
         let mut insertion = text.to_owned();
         if !attachments.is_empty()
@@ -2134,7 +2140,7 @@ impl Runtime {
             .into_iter()
             .rev()
         {
-            let current = self.composer.cursor();
+            let current = attachment_draft::Bookmark::capture(&self.composer).cursor;
             self.composer.move_to(text_editor::Cursor {
                 position: excerpt.position(offset + token.len()),
                 selection: Some(excerpt.position(offset)),
@@ -14814,6 +14820,43 @@ mod tests {
     fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
         let _ = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+    }
+
+    #[test]
+    fn late_image_insert_preserves_a_later_native_word_selection() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, "start middle end");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            });
+            let ticket = runtime.begin_attachment_insert();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 8 },
+                selection: None,
+            });
+            runtime.composer.perform(text_editor::Action::SelectWord);
+            assert_eq!(runtime.composer.selection().as_deref(), Some("middle"));
+            assert!(runtime.finish_attachment_insert(ticket.id, "", vec![image.clone()]));
+            assert_eq!(
+                runtime.composer.selection().as_deref(),
+                Some("middle"),
+                "late image callback preserves the user's exact expanded selection"
+            );
+            assert_eq!(
+                runtime.composer.text(),
+                format!(
+                    "{} start middle end",
+                    image.reference.as_ref().unwrap().token()
+                )
+            );
+            runtime.remove_image_token(&image.reference.as_ref().unwrap().token());
+            assert_eq!(runtime.composer.selection().as_deref(), Some("middle"));
+        });
     }
 
     #[test]
