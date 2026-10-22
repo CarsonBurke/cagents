@@ -713,7 +713,7 @@ impl Claude {
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
         for attachment in super::image_references::ordered(&text, &attachments)? {
-            crate::chat::attachment_assets::validate(attachment)?;
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
@@ -5339,6 +5339,16 @@ mod tests {
     #[test]
     fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
         crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
             let reference = attachment.reference.clone().unwrap();
             let text = format!(
                 "Earlier [Image 77777] was dark; compare new {} after",
@@ -5350,7 +5360,7 @@ mod tests {
                 ..Default::default()
             };
             let submitted = adapter
-                .send_prompt(text.clone(), vec![attachment.clone()], PromptMode::Queue)
+                .send_prompt(text.clone(), vec![hinted.clone()], PromptMode::Queue)
                 .unwrap();
             let frame = &submitted.writes[0];
             let content = frame["message"]["content"].as_array().unwrap();
@@ -5370,7 +5380,7 @@ mod tests {
             );
             let queued = &adapter.queued[0];
             assert_eq!(queued.text, text);
-            assert_eq!(queued.attachments, [attachment.clone()]);
+            assert_eq!(queued.attachments, [hinted]);
             assert!(queued.editable);
             let mut retry = Claude {
                 ready: true,

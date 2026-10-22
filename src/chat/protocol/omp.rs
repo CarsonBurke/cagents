@@ -798,7 +798,7 @@ impl Adapter for Omp {
                 let mut images=Vec::new();
                 let mut references=Vec::new();
                 for attachment in ordered {
-                    crate::chat::attachment_assets::validate(attachment)?;
+                    let attachment = crate::chat::attachment_assets::resolve(attachment)?;
                     let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
                     let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
                     let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
@@ -1820,6 +1820,10 @@ mod tests {
     fn referenced_image_array_mapping_restores_only_verified_retained_history() {
         crate::chat::attachment_assets::with_test_image(|first| {
             let second = crate::chat::attachment_assets::test_image("second.png");
+            let display = tempfile::tempdir().unwrap();
+            let mut hinted = first.clone();
+            hinted.path = display.path().join(first.path.file_name().unwrap());
+            std::fs::copy(&second.path, &hinted.path).unwrap();
             let first_ref = first.reference.as_ref().unwrap();
             let second_ref = second.reference.as_ref().unwrap();
             let text = format!(
@@ -1834,7 +1838,7 @@ mod tests {
             let submitted = adapter
                 .command(Command::Prompt {
                     text: text.clone(),
-                    attachments: vec![first.clone(), second.clone()],
+                    attachments: vec![hinted, second.clone()],
                     mode: PromptMode::Send,
                 })
                 .unwrap();

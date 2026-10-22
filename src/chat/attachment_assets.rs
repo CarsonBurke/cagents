@@ -222,6 +222,28 @@ impl Store {
         self.validate_with(&registry, &attachment)?;
         Ok(attachment)
     }
+    fn read(&self, reference: &ImageReference, limit: usize) -> Result<Vec<u8>, String> {
+        let registry = self.read_registry()?;
+        let receipt = self.receipt(&registry, reference)?;
+        let limit = limit.min(MAX_IMAGE_BYTES as usize);
+        if receipt.bytes > limit as u64 {
+            return Err(format!(
+                "{} exceeds the {} KiB image preview limit on its device.",
+                reference.label(),
+                limit / 1024
+            ));
+        }
+        let mut file = self.private_file(&receipt.leaf())?;
+        let bytes = fs_safety::read_bounded(&mut file, receipt.bytes).map_err(storage_error)?;
+        if bytes.len() as u64 != receipt.bytes || digest(&bytes) != reference.sha256 {
+            return Err(format!(
+                "{} has changed or is missing. Attach the image again.",
+                reference.label()
+            ));
+        }
+        Ok(bytes)
+    }
+
     fn validate_with(&self, registry: &Registry, attachment: &Attachment) -> Result<(), String> {
         let Some(reference) = &attachment.reference else {
             return Ok(());
@@ -249,7 +271,14 @@ impl Store {
         };
         let _lock = self.lock()?;
         let mut registry = self.read_registry()?;
-        self.validate_with(&registry, attachment)?;
+        let receipt = self.receipt(&registry, reference)?;
+        // A displaying client may carry another machine's path spelling.
+        // Only this backend's UUID receipt chooses the file to validate/retain.
+        let owned = Attachment {
+            path: self.root.path().join(receipt.leaf()),
+            reference: Some(reference.clone()),
+        };
+        self.validate_with(&registry, &owned)?;
         let receipt = registry
             .images
             .get_mut(&reference.id)
@@ -570,18 +599,6 @@ fn store(create: bool) -> Result<Store, String> {
     Store::at(&store_path()?, create)
 }
 
-/// Reconstruct a draft candidate without filesystem IO on the UI thread.
-/// This is not authorization: validate/retain must verify its UUID receipt,
-/// physical device and bytes before any thumbnail or provider file read.
-#[cfg(feature = "ui")]
-pub(crate) fn unverified_attachment(reference: &ImageReference) -> Result<Attachment, String> {
-    reference.validate()?;
-    Ok(Attachment {
-        path: store_path()?.join(format!("{}.{}", reference.id, reference.extension)),
-        reference: Some(reference.clone()),
-    })
-}
-
 pub fn validate(attachment: &Attachment) -> Result<(), String> {
     let Some(reference) = &attachment.reference else {
         return Ok(());
@@ -598,6 +615,23 @@ pub fn retain(attachment: &Attachment) -> Result<(), String> {
 }
 pub fn attachment(reference: &ImageReference) -> Result<Attachment, String> {
     store(false)?.attachment(reference)
+}
+
+/// Resolve only a managed UUID receipt on the receiving physical backend.
+/// The path supplied by a displaying client is a hint, never file authority.
+/// Legacy path-only files keep their existing provider-specific behavior.
+pub fn resolve(attachment: &Attachment) -> Result<Attachment, String> {
+    match &attachment.reference {
+        Some(reference) => self::attachment(reference),
+        None => Ok(attachment.clone()),
+    }
+}
+
+/// Read an exact immutable backend receipt within the caller's transport cap.
+/// No caller-supplied path is accepted, and no missing/foreign receipt falls
+/// back to a same-named file on the displaying computer.
+pub fn read(reference: &ImageReference, limit: usize) -> Result<Vec<u8>, String> {
+    store(false)?.read(reference, limit)
 }
 #[cfg(any(feature = "host", feature = "ui"))]
 pub fn restore_reference(reference: &ImageReference, source: &str) -> Option<ImageReference> {
@@ -663,6 +697,93 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn backend_resolution_ignores_display_paths_and_never_rebinds_foreign_receipts() {
+        with_test_image(|backend| {
+            let display = tempfile::tempdir().unwrap();
+            let coincident = display.path().join(backend.path.file_name().unwrap());
+            std::fs::write(&coincident, b"different display pixels").unwrap();
+            let hinted = Attachment {
+                path: coincident.clone(),
+                reference: backend.reference.clone(),
+            };
+            assert_eq!(resolve(&hinted).unwrap(), backend);
+            retain(&hinted).unwrap();
+            assert!(
+                list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .find(|row| row.id == backend.reference.as_ref().unwrap().id)
+                    .unwrap()
+                    .retained
+            );
+            assert_eq!(
+                std::fs::read(coincident).unwrap(),
+                b"different display pixels"
+            );
+            let expected = std::fs::read(&backend.path).unwrap();
+            assert_eq!(
+                read(backend.reference.as_ref().unwrap(), expected.len()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                resolve(&Attachment::file("relative legacy.png")).unwrap(),
+                Attachment::file("relative legacy.png")
+            );
+            with_test_image(|other_device| {
+                assert_ne!(
+                    backend.reference.as_ref().unwrap().device,
+                    other_device.reference.as_ref().unwrap().device
+                );
+                let foreign = Attachment {
+                    path: other_device.path.clone(),
+                    reference: backend.reference.clone(),
+                };
+                assert!(resolve(&foreign).unwrap_err().contains("another device"));
+                assert!(retain(&foreign).unwrap_err().contains("another device"));
+                assert!(
+                    read(
+                        backend.reference.as_ref().unwrap(),
+                        MAX_IMAGE_BYTES as usize
+                    )
+                    .unwrap_err()
+                    .contains("another device")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn receipt_reads_check_declared_cap_before_file_access_and_verify_exact_bytes() {
+        with_test_image(|image| {
+            let reference = image.reference.as_ref().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            assert!(
+                read(reference, bytes.len() - 1)
+                    .unwrap_err()
+                    .contains("preview limit")
+            );
+            std::fs::write(&image.path, vec![0; bytes.len()]).unwrap();
+            assert!(
+                read(reference, bytes.len())
+                    .unwrap_err()
+                    .contains("changed or is missing")
+            );
+            std::fs::remove_file(&image.path).unwrap();
+            assert!(
+                read(reference, bytes.len() - 1)
+                    .unwrap_err()
+                    .contains("preview limit"),
+                "cap precedes opening the blob"
+            );
+            assert!(
+                read(reference, bytes.len()).is_err(),
+                "missing bytes never fall back to another path"
+            );
+        });
+    }
 
     #[test]
     fn immutable_receipt_roundtrip_rejects_changed_pixels_paths_and_devices() {

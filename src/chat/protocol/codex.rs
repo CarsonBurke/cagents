@@ -1322,7 +1322,7 @@ impl Codex {
                 .map(|(name, path)| json!({"type":"skill","name":name,"path":path})),
         );
         for attachment in attachments {
-            crate::chat::attachment_assets::validate(attachment)?;
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             if !self.capabilities().attachments {
                 return Err("The selected Codex model does not advertise image input".into());
             }
@@ -4191,6 +4191,16 @@ mod tests {
     #[test]
     fn referenced_image_is_real_provider_input_and_survives_history_and_queue() {
         crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
             let reference = attachment.reference.clone().unwrap();
             let mut adapter = adapter();
             adapter
@@ -4200,9 +4210,7 @@ mod tests {
                 "Earlier [Image 77777] was dark; compare new {} after",
                 reference.token()
             );
-            let input = adapter
-                .input(text.clone(), vec![attachment.clone()])
-                .unwrap();
+            let input = adapter.input(text.clone(), vec![hinted.clone()]).unwrap();
             assert_eq!(input.len(), 3);
             assert_eq!(input[0], json!({"type":"text","text":text}));
             assert_eq!(
@@ -4271,6 +4279,26 @@ mod tests {
                     ..
                 }
             ));
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text,
+                    attachments: vec![hinted],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["params"]["input"][2]["path"],
+                attachment.path.to_str().unwrap()
+            );
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .find(|image| image.id == reference.id)
+                    .unwrap()
+                    .retained
+            );
         });
     }
 
