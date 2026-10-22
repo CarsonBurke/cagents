@@ -44,7 +44,13 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::AcknowledgeRedraw { .. }
         | R::TerminalAcknowledge { .. }
         | R::SearchTerminal { .. }
-        | R::CopyTerminalSelection { .. } => Access::Open,
+        | R::CopyTerminalSelection { .. }
+        | R::Work(
+            crate::work::Request::Board { .. }
+            | crate::work::Request::RemovalPlan { .. }
+            | crate::work::Request::Snapshots { .. },
+        )
+        | R::WatchWork => Access::Open,
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }
@@ -97,7 +103,10 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatStartSelected { .. }
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
-        | R::ChatPrepareResume { .. } => Access::Refused,
+        | R::ChatPrepareResume { .. }
+        | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
+            Access::Refused
+        }
     }
 }
 

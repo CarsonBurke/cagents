@@ -112,7 +112,16 @@ pub struct IssuePreview {
 impl IssuePreview {
     pub fn fetch(reference: &str, workspace: Option<&str>) -> Result<Self, Error> {
         let reference = issue_reference(reference)?;
-        let client = api::Client::from_workspace(workspace)?;
+        Self::query(&api::Client::from_workspace(workspace)?, &reference)
+    }
+
+    /// Resolves with a client the caller already holds, so resolving several
+    /// issues reads the credential once.
+    pub fn fetch_with(client: &api::Client, reference: &str) -> Result<Self, Error> {
+        Self::query(client, &issue_reference(reference)?)
+    }
+
+    fn query(client: &api::Client, reference: &str) -> Result<Self, Error> {
         Self::from_response(client.request(
             "query($id:String!){issue(id:$id){id identifier title branchName url state{name}}}",
             serde_json::json!({"id": reference}),

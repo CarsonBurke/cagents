@@ -5,7 +5,7 @@ use crate::{git_watch, model::WorktreeId, repository::HeadState};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn local_workers() -> usize {
-    std::thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 8))
+    2
 }
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -164,35 +164,6 @@ impl Snapshot {
     }
 }
 
-/// A stale listing can also carry stale watch coverage. Keep previously planned
-/// coverage for rows whose newer status won, without doing filesystem work on
-/// the UI thread. Only missing coverage needs one coalesced worker replan.
-fn reconcile_watch_plan(
-    plan: &mut git_watch::Project,
-    previous: Option<&git_watch::Project>,
-    snapshot: &Snapshot,
-    preserved: &HashSet<WorktreeId>,
-) -> BTreeSet<WorktreeId> {
-    let upstreams = snapshot
-        .worktrees
-        .iter()
-        .filter_map(|(record, status)| {
-            let upstream = match &status.as_ref()?.tracking {
-                crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
-                crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
-                crate::repository::TrackingState::NoUpstream => None,
-            }?;
-            Some((record.id, upstream.clone()))
-        })
-        .collect();
-    plan.reconcile_coverage(
-        previous,
-        snapshot.worktrees.iter().map(|(record, _)| record),
-        &preserved.iter().copied().collect(),
-        &upstreams,
-    )
-}
-
 struct Entry {
     snapshot: Snapshot,
     generation: u64,
@@ -213,12 +184,27 @@ struct Entry {
     failed_status_attempts: HashMap<WorktreeId, Instant>,
 }
 
+/// The window's watcher and the channel its wakes arrive on.
+struct Watch {
+    monitor: git_watch::Monitor,
+    receiver: async_channel::Receiver<()>,
+}
+
+impl Watch {
+    fn start() -> std::io::Result<Self> {
+        let (wake, receiver) = async_channel::bounded(1);
+        let monitor = git_watch::Monitor::start(move || {
+            let _ = wake.try_send(());
+        })?;
+        Ok(Self { monitor, receiver })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
-    monitor: Option<git_watch::Monitor>,
+    watch: Option<Watch>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
-    activity: Vec<ProjectId>,
     reloads: HashMap<ProjectId, ReloadStatus>,
 }
 
@@ -464,11 +450,6 @@ impl State {
         };
         *cached = Some(status.display_summary());
         apply_status_head(record, status);
-        let upstream = match &status.tracking {
-            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream.as_str()),
-            crate::repository::TrackingState::Unknown { upstream } => upstream.as_deref(),
-            crate::repository::TrackingState::NoUpstream => None,
-        };
         // The worker selected this fork from the same successful snapshot's
         // configuration. Authoritative None also revokes an old attachment.
         if let Some(repository) = head_repository {
@@ -479,20 +460,9 @@ impl State {
         } else {
             entry.snapshot.heads.remove(&key.worktree_id);
         }
-        let routed = entry
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.refresh_worktree_routing(record, upstream));
-        let reconfigure = routed.is_some();
-        if let Some(plan) = routed {
-            entry.plan = Some(Arc::new(plan));
-        }
         entry.snapshot.status_errors.remove(&key.worktree_id);
         entry.failed_status_attempts.remove(&key.worktree_id);
         entry.snapshot.status_reads.insert(key.worktree_id, read);
-        if reconfigure {
-            self.configure();
-        }
         true
     }
 
@@ -577,8 +547,8 @@ impl State {
     }
 
     fn configure(&self) {
-        if let Some(monitor) = &self.monitor {
-            monitor.configure(
+        if let Some(watch) = &self.watch {
+            watch.monitor.configure(
                 self.entries
                     .values()
                     .filter_map(|entry| entry.plan.clone())
@@ -597,7 +567,11 @@ impl State {
         if let Some(error) = &change.error {
             entry.fallback = Some(error.clone());
         }
-        if change.worktrees.is_empty() && !change.topology && !change.membership {
+        if change.worktrees.is_empty()
+            && !change.references
+            && !change.topology
+            && !change.membership
+        {
             return;
         }
         entry.pending.merge(change);
@@ -639,10 +613,8 @@ fn panel_invalidation(
     key: &ActiveWorktreeKey,
 ) -> Option<u8> {
     (key.project_id == project
-        && (change.topology
-            || change.shared_snapshot
-            || change.worktrees.contains(&key.worktree_id)))
-    .then_some(if change.metadata || change.membership {
+        && (change.topology || change.references || change.worktrees.contains(&key.worktree_id)))
+    .then_some(if change.references || change.membership {
         3
     } else {
         1
@@ -661,15 +633,6 @@ impl Cagents {
         let project = loaded.project.id;
         let state = &mut self.refresh_ui.git;
         let old = state.entries.remove(&project);
-        let records = loaded
-            .worktrees
-            .iter()
-            .map(|(record, _)| record.clone())
-            .collect::<Vec<_>>();
-        let reusable_plan = old
-            .as_ref()
-            .and_then(|entry| entry.plan.clone())
-            .filter(|plan| plan.matches(&repository.common_dir, &records));
         if let Some(old) = old {
             if let Some(cancel) = &old.cancellation {
                 cancel.cancel();
@@ -684,10 +647,10 @@ impl Cagents {
                 ));
             }
         }
-        let failure = if state.monitor.is_none() {
-            match git_watch::Monitor::start() {
-                Ok(monitor) => {
-                    state.monitor = Some(monitor);
+        let failure = if state.watch.is_none() {
+            match Watch::start() {
+                Ok(watch) => {
+                    state.watch = Some(watch);
                     None
                 }
                 Err(error) => Some(error.to_string()),
@@ -708,7 +671,7 @@ impl Cagents {
                     status_reads: loaded.status_order.reads.clone(),
                 },
                 generation,
-                plan: reusable_plan.clone(),
+                plan: None,
                 archived: Vec::new(),
                 remote_started: false,
                 cancellation: None,
@@ -728,7 +691,7 @@ impl Cagents {
         state.changed(
             project,
             git_watch::Change {
-                membership: reusable_plan.is_none(),
+                membership: true,
                 ..Default::default()
             },
         );
@@ -737,15 +700,15 @@ impl Cagents {
     }
 
     pub(super) fn git_subscription(&self) -> Subscription<Message> {
-        let events =
-            self.refresh_ui
-                .git
-                .monitor
-                .as_ref()
-                .map_or_else(Subscription::none, |monitor| {
-                    Subscription::run_with(Source(monitor.receiver.clone()), stream)
-                        .map(|()| Message::GitUi(Action::Changed))
-                });
+        let events = self
+            .refresh_ui
+            .git
+            .watch
+            .as_ref()
+            .map_or_else(Subscription::none, |watch| {
+                Subscription::run_with(Source(watch.receiver.clone()), stream)
+                    .map(|()| Message::GitUi(Action::Changed))
+            });
         Subscription::batch([
             events,
             iced::time::every(FALLBACK_INTERVAL).map(|_| Message::GitUi(Action::Fallback)),
@@ -753,11 +716,11 @@ impl Cagents {
     }
 
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
-        if self.refresh_ui.git.monitor.is_none()
+        if self.refresh_ui.git.watch.is_none()
             && !self.refresh_ui.git.entries.is_empty()
-            && let Ok(monitor) = git_watch::Monitor::start()
+            && let Ok(watch) = Watch::start()
         {
-            self.refresh_ui.git.monitor = Some(monitor);
+            self.refresh_ui.git.watch = Some(watch);
             self.refresh_ui.git.configure();
         }
         let open = self
@@ -818,7 +781,6 @@ impl Cagents {
                         project,
                         git_watch::Change {
                             worktrees: failed,
-                            untracked: true,
                             ..Default::default()
                         },
                     ));
@@ -916,13 +878,13 @@ impl Cagents {
                 let changes = self
                     .refresh_ui
                     .git
-                    .monitor
+                    .watch
                     .as_ref()
-                    .map(git_watch::Monitor::drain)
+                    .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
                 let mut reload = None;
                 for (project, change) in changes {
-                    if change.metadata
+                    if change.references
                         && self
                             .sidebar_model
                             .source_control
@@ -994,13 +956,13 @@ impl Cagents {
                 match result {
                     Ok((mut snapshot, mut plan)) => {
                         let preserved = snapshot.preserve_newer_status(&entry.snapshot);
-                        if let Some(plan) = plan.as_mut() {
-                            repair = reconcile_watch_plan(
-                                plan,
-                                entry.plan.as_deref(),
-                                &snapshot,
-                                &preserved,
-                            );
+                        if !preserved.is_empty() && plan.is_some() {
+                            // Current main's plans have no per-branch routing.
+                            // An old listing may omit a newer bound row: keep
+                            // the current registrations until a worker replans
+                            // these rows using the authoritative index census.
+                            repair.extend(preserved);
+                            plan = None;
                         }
                         if entry.read_full_scan {
                             entry.read_failure = None;
@@ -1086,56 +1048,7 @@ impl Cagents {
         self.start_git_reads()
     }
 
-    pub(super) fn prioritize_git_watches(&mut self) {
-        let active = self.sidebar_state.active_worktree().cloned();
-        let state = &mut self.refresh_ui.git;
-        if let Some(active) = &active {
-            state
-                .activity
-                .retain(|id| *id != active.project_id && state.entries.contains_key(id));
-            state.activity.insert(0, active.project_id);
-        }
-        let mut targets = self.sidebar_state.git_watch_targets();
-        if let Some(active) = active {
-            targets.insert(0, (active.project_id, Some(active.worktree_id)));
-        }
-        let mut priority = Vec::new();
-        let mut selected = Vec::new();
-        for (project_id, worktree_id) in targets {
-            if !priority.contains(&project_id) {
-                priority.push(project_id);
-            }
-            let worktree_id = worktree_id.or_else(|| {
-                let plan = state.entries.get(&project_id)?.plan.as_ref()?;
-                plan.worktrees
-                    .iter()
-                    .find(|worktree| worktree.git_dir == plan.common_dir)
-                    .or_else(|| plan.worktrees.first())
-                    .map(|worktree| worktree.id)
-            });
-            if let Some(id) = worktree_id {
-                if !selected.contains(&id) {
-                    selected.push(id);
-                }
-            }
-        }
-        for project_id in state
-            .activity
-            .iter()
-            .copied()
-            .chain(self.sidebar_model.projects.iter().map(|project| project.id))
-        {
-            if !priority.contains(&project_id) {
-                priority.push(project_id);
-            }
-        }
-        if let Some(monitor) = &state.monitor {
-            monitor.prioritize(priority, selected);
-        }
-    }
-
     fn start_git_reads(&mut self) -> Task<Message> {
-        self.prioritize_git_watches();
         let state = &mut self.refresh_ui.git;
         let mut running = state
             .entries
@@ -1239,13 +1152,16 @@ fn read_local_with_plan(
     }
     let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
-        if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
+        // Shared refs move every worktree's upstream comparison.
+        if record.bare
+            || (!change.topology && !change.references && !change.worktrees.contains(&record.id))
+        {
             continue;
         }
-        // A membership edge replaces the cached full count in this same
-        // coalesced status process. Tracked-only writes do not rescan untracked
-        // trees; the bounded topology fallback repairs incomplete watch coverage.
-        let include_untracked = change.topology || change.membership || change.untracked;
+        // Current main reports index/directory membership, not a complete
+        // untracked-directory census. Explicit membership/topology refreshes
+        // include untracked counts; tracked-file writes use a tracked read.
+        let include_untracked = change.topology || change.membership;
         snapshot.status_updates.insert(record.id);
         snapshot.status_reads.insert(record.id, next_status_read());
         let current = match git.status_projection(
@@ -1274,7 +1190,7 @@ fn read_local_with_plan(
         let head_changed = status
             .as_ref()
             .is_none_or(|previous| previous.head != current.head);
-        if head_changed || change.metadata {
+        if head_changed || change.references {
             snapshot.heads.remove(&record.id);
             if let Some(branch) = current.branch()
                 && let Some(head) =
@@ -1299,18 +1215,6 @@ fn read_local_with_plan(
         .status_reads
         .retain(|id, _| retained.contains(id) || removed.contains(id) || vanished.contains(id));
     snapshot.heads.retain(|id, _| retained.contains(id));
-    let upstreams = snapshot
-        .worktrees
-        .iter()
-        .filter_map(|(record, status)| {
-            let upstream = match &status.as_ref()?.tracking {
-                crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
-                crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
-                crate::repository::TrackingState::NoUpstream => None,
-            }?;
-            Some((record.id, upstream.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
             git_watch::Project::read_changed(
@@ -1324,18 +1228,9 @@ fn read_local_with_plan(
                 &cancellation,
                 previous_plan,
                 &change.worktrees,
-                &upstreams,
             )
         })
-        .transpose()?
-        .or_else(|| {
-            previous_plan.and_then(|plan| {
-                plan.refresh_routing(
-                    snapshot.worktrees.iter().map(|(record, _)| record),
-                    &upstreams,
-                )
-            })
-        });
+        .transpose()?;
     Ok((snapshot, plan))
 }
 
@@ -1708,7 +1603,7 @@ mod tests {
         fs::write(private.join("index"), b"invalid index\n").unwrap();
         let change = || git_watch::Change {
             worktrees: [linked_id].into(),
-            untracked: true,
+            membership: true,
             ..Default::default()
         };
         let expected_failure = service
@@ -1818,7 +1713,7 @@ mod tests {
             let project_id = ProjectId::new();
             let change = || git_watch::Change {
                 worktrees: [worktree].into(),
-                untracked: true,
+                membership: true,
                 ..Default::default()
             };
             let (baseline, _) = read_local(project_id, initial, change(), cancel.clone()).unwrap();
@@ -2034,13 +1929,39 @@ mod tests {
                 .snapshot(&linked, &cancel)
                 .unwrap();
             let mut app = app_with_status_snapshot(baseline, &key);
-            app.refresh_ui
-                .git
-                .entries
-                .get_mut(&project_id)
-                .unwrap()
-                .plan = Some(Arc::new(baseline_plan));
-            app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
+            let loaded = LoadedRepository {
+                project: ProjectState {
+                    kind: Default::default(),
+                    id: project_id,
+                    generation: 0,
+                    name: "Fixture".into(),
+                    repository: baseline_plan.common_dir.clone(),
+                    existence: Existence::Open,
+                },
+                repository: Some(
+                    app.refresh_ui.git.entries[&project_id]
+                        .snapshot
+                        .repository
+                        .clone(),
+                ),
+                worktrees: app.refresh_ui.git.entries[&project_id]
+                    .snapshot
+                    .worktrees
+                    .clone(),
+                github: GitHubAvailability::NotAssociated,
+                review_repository: None,
+                head_repositories: HashMap::new(),
+                status_order: Default::default(),
+            };
+            // Install the current callback watcher and index census through
+            // the actual worker/updater, never by seeding an expected plan.
+            let initial =
+                super::super::tests::task_app_message(app.observe_git_repository(&loaded, 9));
+            assert!(matches!(
+                &initial,
+                Message::GitUi(Action::Read { result: Ok(_), .. })
+            ));
+            drop(app.update(initial));
             drop(app.update(bound_status_message(
                 app.discard_ui.source().unwrap().clone(),
                 &key,
@@ -2048,11 +1969,11 @@ mod tests {
                 snapshot,
                 read,
             )));
-            drop(app.update(Message::GitUi(Action::Read {
+            let repair = app.update(Message::GitUi(Action::Read {
                 project: project_id,
                 generation: 9,
                 result: Ok((removed, Some(removed_plan))),
-            })));
+            }));
             let row = app.sidebar_model.projects[0]
                 .worktrees
                 .iter()
@@ -2077,366 +1998,38 @@ mod tests {
                     .any(|record| record.id == worktree && record.root == linked),
                 "recovered B keeps its content and private metadata coverage"
             );
-            // No prior coverage must request one worker repair; a newer
-            // removal must also strip any stale incoming registration.
-            let current = &app.refresh_ui.git.entries[&project_id].snapshot;
-            let preserved = [worktree].into_iter().collect();
-            let mut absent_plan = (**plan).clone();
-            absent_plan.worktrees.retain(|row| row.id != worktree);
-            assert_eq!(
-                reconcile_watch_plan(&mut absent_plan, None, current, &preserved),
-                [worktree].into()
-            );
-            let mut without_b = current.clone();
-            without_b
-                .worktrees
-                .retain(|(record, _)| record.id != worktree);
-            let mut stale_plan = (**plan).clone();
+            // The delayed omission cannot retire the newer bound row. The
+            // current index planner repairs its registrations on its worker;
+            // the held old callback is not accepted as watch-plan authority.
+            let repaired = super::super::tests::task_app_message(repair);
+            assert!(matches!(
+                &repaired,
+                Message::GitUi(Action::Read { result: Ok(_), .. })
+            ));
+            drop(app.update(repaired));
             assert!(
-                reconcile_watch_plan(&mut stale_plan, Some(plan), &without_b, &preserved)
-                    .is_empty()
-            );
-            assert!(
-                !stale_plan
+                app.sidebar_model.projects[0]
                     .worktrees
                     .iter()
-                    .any(|record| record.id == worktree)
+                    .any(|row| row.id == worktree)
             );
-            let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if monitor
-                    .drain()
-                    .get(&project_id)
-                    .is_some_and(|change| change.coverage == Some(true))
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "reconciled native watch coverage was not acknowledged"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            monitor.drain();
-            fs::write(linked.join("new.txt"), "edit after recovery\n").unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if monitor
-                    .drain()
-                    .get(&project_id)
-                    .is_some_and(|change| change.worktrees.contains(&worktree))
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "recovered worktree lost subsequent native events"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-
-    #[test]
-    fn bound_success_repairs_missed_branch_and_upstream_watch_routing_without_a_census() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("repo");
-        let initial = fixture(&root);
-        let project = ProjectId::new();
-        let cancel = CancellationToken::default();
-        let (baseline, plan) = read_local(
-            project,
-            initial,
-            git_watch::Change {
-                topology: true,
-                ..Default::default()
-            },
-            cancel.clone(),
-        )
-        .unwrap();
-        let key = ActiveWorktreeKey {
-            project_id: project,
-            worktree_id: baseline.worktrees[0].0.id,
-            canonical_path: root.clone(),
-        };
-        let old = Arc::new(plan.unwrap());
-        git(&root, &["checkout", "-b", "learned"]);
-        git(&root, &["remote", "add", "origin", root.to_str().unwrap()]);
-        git(
-            &root,
-            &["update-ref", "refs/remotes/origin/learned", "HEAD"],
-        );
-        git(&root, &["config", "branch.learned.remote", "origin"]);
-        git(
-            &root,
-            &["config", "branch.learned.merge", "refs/heads/learned"],
-        );
-        let read = next_status_read();
-        let full = RepositoryService::system("git")
-            .snapshot(&root, &cancel)
-            .unwrap();
-        let mut app = app_with_status_snapshot(baseline, &key);
-        app.refresh_ui.git.entries.get_mut(&project).unwrap().plan = Some(old.clone());
-        app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
-        let prior_repository = GitHubRepoKey::new("github.com", None, "old-fork", "repo").unwrap();
-        app.refresh_ui
-            .git
-            .entries
-            .get_mut(&project)
-            .unwrap()
-            .snapshot
-            .heads
-            .insert(key.worktree_id, prior_repository.clone());
-        app.sidebar_model.projects[0].worktrees[0].head_repository = Some(prior_repository);
-        app.sidebar_model.projects[0].worktrees[0].pull_request_state =
-            Some(sidebar::WorktreePullRequestState::Open);
-        let delayed_watch = app.refresh_ui.git.entries[&project].snapshot.clone();
-        drop(app.update(bound_status_message(
-            app.discard_ui.source().unwrap().clone(),
-            &key,
-            7,
-            full,
-            read,
-        )));
-        let row = &app.sidebar_model.projects[0].worktrees[0];
-        assert_eq!(row.branch.as_deref(), Some("learned"));
-        assert_eq!(
-            row.label(),
-            "learned",
-            "bound-only success repairs the visible branch too"
-        );
-        assert_eq!(row.id, key.worktree_id);
-        assert_eq!(row.path, key.canonical_path);
-        assert!(row.head_repository.is_none());
-        assert!(row.pull_request_state.is_none());
-        assert!(
-            !app.refresh_ui.git.entries[&project]
-                .snapshot
-                .heads
-                .contains_key(&key.worktree_id)
-        );
-        let entry = &app.refresh_ui.git.entries[&project];
-        let current = entry.plan.as_ref().unwrap().clone();
-        assert!(
-            !Arc::ptr_eq(&old, &current),
-            "changed routing must replace the plan"
-        );
-        assert!(
-            current.matches(
-                &entry.snapshot.repository.common_dir,
-                &entry
+            let current = &app.refresh_ui.git.entries[&project_id];
+            assert!(
+                current
                     .snapshot
                     .worktrees
                     .iter()
-                    .map(|(record, _)| record.clone())
-                    .collect::<Vec<_>>()
-            )
-        );
-        let status = entry.snapshot.worktrees[0]
-            .1
-            .as_ref()
-            .unwrap()
-            .display_summary();
-        let mut stale_status = status.clone();
-        stale_status.head = HeadState::Branch {
-            name: "stale-branch".into(),
-            oid: "a".repeat(40),
-        };
-        drop(app.update(Message::SourceControlLoaded {
-            source: app.discard_ui.source().expect("fixture read actor").clone(),
-            key: key.clone(),
-            request: 7,
-            result: Ok(SourceControlRead {
-                prepared: None,
-                status,
-                head_repository: None,
-                read: next_status_read(),
-            }),
-        }));
-        assert!(
-            Arc::ptr_eq(
-                &current,
-                app.refresh_ui.git.entries[&project].plan.as_ref().unwrap()
-            ),
-            "unchanged proof must not clone/rebuild coverage"
-        );
-        drop(app.update(Message::SourceControlLoaded {
-            source: app.discard_ui.source().expect("fixture read actor").clone(),
-            key: key.clone(),
-            request: 7,
-            result: Ok(SourceControlRead {
-                prepared: None,
-                status: stale_status,
-                head_repository: None,
-                read: read.saturating_sub(1),
-            }),
-        }));
-        assert_eq!(
-            app.sidebar_model.projects[0].worktrees[0].label(),
-            "learned",
-            "an older accepted-generation callback cannot rewind the visible head"
-        );
-        drop(app.update(Message::GitUi(Action::Read {
-            project,
-            generation: 9,
-            result: Ok((delayed_watch, None)),
-        })));
-        assert_eq!(
-            app.sidebar_model.projects[0].worktrees[0].label(),
-            "learned"
-        );
-        assert!(
-            app.sidebar_model.projects[0].worktrees[0]
-                .head_repository
-                .is_none(),
-            "old watcher cannot restore revoked fork/PR identity"
-        );
-        assert!(
-            !app.refresh_ui.git.entries[&project]
-                .snapshot
-                .heads
-                .contains_key(&key.worktree_id)
-        );
-        let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if monitor
-                .drain()
-                .get(&project)
-                .is_some_and(|change| change.coverage == Some(true))
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "bound routing configuration not acknowledged"
+                    .any(|(row, _)| row.id == worktree)
             );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        for name in ["refs/heads/learned", "refs/remotes/origin/learned"] {
-            monitor.drain();
-            let path = root.join(".git").join(name);
-            let bytes = fs::read(&path).unwrap();
-            fs::write(&path, bytes).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if monitor
-                    .drain()
-                    .get(&project)
-                    .is_some_and(|change| change.worktrees.contains(&key.worktree_id))
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "bound-only new ref routing omitted {name}"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-
-    #[test]
-    fn partial_watcher_recovery_repairs_missed_branch_routing_without_a_census() {
-        const TEST: &str = "app::git_ui::tests::partial_watcher_recovery_repairs_missed_branch_routing_without_a_census";
-        if !crate::git_watch::tests::fixture_isolated(TEST) {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("repo");
-        let project = ProjectId::new();
-        let cancel = CancellationToken::default();
-        let (snapshot, plan) = read_local(
-            project,
-            fixture(&root),
-            git_watch::Change {
-                topology: true,
-                ..Default::default()
-            },
-            cancel.clone(),
-        )
-        .unwrap();
-        let old_plan = plan.unwrap();
-        let id = snapshot.worktrees[0].0.id;
-        let index = fs::read(root.join(".git/index")).unwrap();
-        fs::write(root.join(".git/index"), "corrupt index").unwrap();
-        let partial = git_watch::Change {
-            worktrees: [id].into(),
-            untracked: true,
-            ..Default::default()
-        };
-        let (failed, plan) = read_local_with_plan(
-            project,
-            snapshot,
-            partial.clone(),
-            cancel.clone(),
-            Some(&old_plan),
-        )
-        .unwrap();
-        assert!(failed.status_errors.contains_key(&id));
-        assert!(plan.is_none(), "failed row retains prior watch plan");
-        fs::write(root.join(".git/index"), index).unwrap();
-        git(&root, &["switch", "-c", "learned"]);
-        let (recovered, plan) = read_local_with_plan(
-            project,
-            failed,
-            partial.clone(),
-            cancel.clone(),
-            Some(&old_plan),
-        )
-        .unwrap();
-        assert!(!recovered.status_errors.contains_key(&id));
-        assert_eq!(
-            recovered.worktrees[0].0.branch.as_deref(),
-            Some("refs/heads/learned")
-        );
-        let plan = plan.expect("a new branch needs a pure routing refresh");
-        assert!(plan.matches(
-            &recovered.repository.common_dir,
-            &[recovered.worktrees[0].0.clone()]
-        ));
-        let (_, unchanged) =
-            read_local_with_plan(project, recovered, partial, cancel, Some(&plan)).unwrap();
-        assert!(
-            unchanged.is_none(),
-            "unchanged partial success reuses existing coverage"
-        );
-        let monitor = git_watch::Monitor::start().unwrap();
-        monitor.configure(vec![Arc::new(plan)]);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if monitor
-                .drain()
-                .get(&project)
-                .is_some_and(|change| change.coverage == Some(true))
-            {
-                break;
-            }
             assert!(
-                Instant::now() < deadline,
-                "routing configuration was not acknowledged"
+                current
+                    .plan
+                    .as_ref()
+                    .unwrap()
+                    .worktrees
+                    .iter()
+                    .any(|row| row.id == worktree && row.root == linked)
             );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        monitor.drain();
-        let path = root.join(".git/refs/heads/learned");
-        let bytes = fs::read(&path).unwrap();
-        fs::write(&path, bytes).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if monitor
-                .drain()
-                .get(&project)
-                .is_some_and(|change| change.worktrees.contains(&id))
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "new-branch event omitted the recovered worktree"
-            );
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -2464,7 +2057,7 @@ mod tests {
                 app.refresh_ui.git.entries[&key.project_id].snapshot.clone(),
                 git_watch::Change {
                     worktrees: [key.worktree_id].into(),
-                    untracked: true,
+                    membership: true,
                     ..Default::default()
                 },
                 cancel.clone(),
@@ -2646,53 +2239,8 @@ mod tests {
         change.worktrees = [WorktreeId::new()].into();
         assert_eq!(panel_invalidation(key.project_id, &change, &key), None);
         change.topology = true;
-        change.metadata = true;
+        change.references = true;
         assert_eq!(panel_invalidation(key.project_id, &change, &key), Some(3));
-    }
-
-    #[test]
-    fn unchanged_topology_reuses_watch_plan_and_index_events_do_not_rescan_membership() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("repo");
-        let snapshot = fixture(&root);
-        let id = snapshot.worktrees[0].0.id;
-        let project = ProjectId::new();
-        let (_, plan) = read_local(
-            project,
-            snapshot.clone(),
-            git_watch::Change {
-                membership: true,
-                ..Default::default()
-            },
-            CancellationToken::default(),
-        )
-        .unwrap();
-        let plan = plan.unwrap();
-        assert!(
-            plan.matches(
-                &snapshot.repository.common_dir,
-                &snapshot
-                    .worktrees
-                    .iter()
-                    .map(|(record, _)| record.clone())
-                    .collect::<Vec<_>>()
-            )
-        );
-        fs::write(root.join("new.txt"), "new\n").unwrap();
-        git(&root, &["add", "new.txt"]);
-        let (_, next) = read_local_with_plan(
-            project,
-            snapshot,
-            git_watch::Change {
-                worktrees: [id].into(),
-                metadata: true,
-                ..Default::default()
-            },
-            CancellationToken::default(),
-            Some(&plan),
-        )
-        .unwrap();
-        assert!(next.is_none());
     }
 
     #[test]
@@ -3323,7 +2871,7 @@ mod tests {
             baseline,
             git_watch::Change {
                 worktrees: [id].into(),
-                untracked: true,
+                membership: true,
                 ..Default::default()
             },
             cancel,
@@ -3539,7 +3087,6 @@ mod tests {
                 git_watch::Change {
                     membership: true,
                     topology: true,
-                    untracked: true,
                     ..Default::default()
                 },
                 CancellationToken::default(),
@@ -3787,7 +3334,7 @@ mod tests {
                     previous,
                     git_watch::Change {
                         worktrees: [key.worktree_id].into(),
-                        untracked: true,
+                        membership: true,
                         ..Default::default()
                     },
                     CancellationToken::new(),

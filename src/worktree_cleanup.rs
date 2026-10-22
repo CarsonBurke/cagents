@@ -35,9 +35,74 @@ pub struct RemovedWorktree {
 #[cfg(feature = "host")]
 pub(crate) struct PreparedRemoval {
     request: RemovalRequest,
-    common_dir: PathBuf,
-    admin_dir: PathBuf,
-    directory_identity: (u64, u64),
+    target: FencedTarget,
+}
+
+/// A worktree identified before a fenced removal takes its fences, which the
+/// removal confirms again once it holds them.
+#[cfg(feature = "host")]
+pub(crate) struct FencedTarget {
+    pub(crate) repository: PathBuf,
+    pub(crate) path: PathBuf,
+    /// The checked-out branch's short name; `None` when detached.
+    pub(crate) branch: Option<String>,
+    pub(crate) common_dir: PathBuf,
+    pub(crate) admin_dir: PathBuf,
+    pub(crate) directory_identity: (u64, u64),
+}
+
+#[cfg(feature = "host")]
+impl FencedTarget {
+    /// Identifies the worktree at `path`, a canonical directory registered
+    /// with `repository`, as it is now.
+    pub(crate) fn capture(
+        repository: &Path,
+        path: &Path,
+        branch: Option<String>,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let cancellation = crate::process::CancellationToken::new();
+        let service = crate::repository::RepositoryService::system("git");
+        let common_dir = service
+            .common_dir(repository, &cancellation)
+            .map_err(|error| error.to_string())?;
+        if service
+            .common_dir(path, &cancellation)
+            .map_err(|error| error.to_string())?
+            != common_dir
+        {
+            return Err("Worktree repository changed".into());
+        }
+        // Files-backend locks do not fence a reftable repository. Preserve
+        // unsupported ref storage rather than claiming the same guarantee.
+        use crate::process::ProcessExecutor;
+        let command = crate::process::CommandSpec::new("git")
+            .cwd(repository)
+            .args(["config", "--get", "extensions.refStorage"]);
+        let output = crate::process::SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .map_err(|error| error.to_string())?;
+        if (!output.stdout.is_empty() && output.stdout.as_slice() != b"files\n")
+            || (output.exit_code != Some(0) && output.exit_code != Some(1))
+        {
+            return Err("Repository reference storage is unsupported".into());
+        }
+        let admin_dir = service
+            .git_dir(path, &cancellation)
+            .map_err(|error| error.to_string())?;
+        let metadata = path.symlink_metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_dir() {
+            return Err("Worktree is not a directory".into());
+        }
+        Ok(Self {
+            repository: repository.to_owned(),
+            path: path.to_owned(),
+            branch,
+            common_dir,
+            admin_dir,
+            directory_identity: (metadata.dev(), metadata.ino()),
+        })
+    }
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
@@ -120,31 +185,8 @@ impl PreparedRemoval {
     /// GitHub is read afresh before taking exclusive lifecycle fences. Sidebar
     /// branch badges and cached archived PRs never authorize removal.
     pub(crate) fn prepare(request: RemovalRequest) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
         checked_record(&request)?;
         let cancellation = crate::process::CancellationToken::new();
-        let service = crate::repository::RepositoryService::system("git");
-        // Files-backend locks do not fence a reftable repository. Preserve
-        // unsupported ref storage rather than claiming the same guarantee.
-        use crate::process::ProcessExecutor;
-        let command = crate::process::CommandSpec::new("git")
-            .cwd(&request.repository)
-            .args(["config", "--get", "extensions.refStorage"]);
-        let output = crate::process::SystemProcessExecutor
-            .execute(&command, &cancellation)
-            .map_err(|error| error.to_string())?;
-        if (!output.stdout.is_empty() && output.stdout.as_slice() != b"files\n")
-            || (output.exit_code != Some(0) && output.exit_code != Some(1))
-        {
-            return Err("Repository reference storage is unsupported for automatic cleanup".into());
-        }
-        let common_dir = service
-            .common_dir(&request.repository, &cancellation)
-            .map_err(|error| error.to_string())?;
-        let admin_dir = service
-            .git_dir(&request.path, &cancellation)
-            .map_err(|error| error.to_string())?;
-        let metadata = request.path.metadata().map_err(|error| error.to_string())?;
         let pr = crate::github::GitHubService::system("gh")
             .view(&request.pull_request, &cancellation)
             .map_err(|error| error.to_string())?;
@@ -152,10 +194,12 @@ impl PreparedRemoval {
             return Err("The exact current worktree commit is not confirmed merged".into());
         }
         Ok(Self {
+            target: FencedTarget::capture(
+                &request.repository,
+                &request.path,
+                Some(request.branch.clone()),
+            )?,
             request,
-            common_dir,
-            admin_dir,
-            directory_identity: (metadata.dev(), metadata.ino()),
         })
     }
 
@@ -164,98 +208,162 @@ impl PreparedRemoval {
         self,
         check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
-        use crate::process::ProcessExecutor;
-        use std::os::unix::fs::MetadataExt;
-        let _launch =
-            crate::instance::worktree_mutation_launch_fence().map_err(|error| error.to_string())?;
-        let windows =
-            crate::instance::verified_running_windows().map_err(|error| error.to_string())?;
-        if windows.is_empty()
-            || windows
-                .iter()
-                .any(|window| !window.protects_worktrees().unwrap_or(false))
-        {
-            return Err("Window directory protection is not ready".into());
-        }
-        // Busy applications skip before the independent-editor process census.
-        // Admission remains fenced while directory leases are then acquired.
-        check_quiescence(&windows)?;
-        let _editors =
-            crate::instance::verified_running_editors().map_err(|error| error.to_string())?;
-        let _directory = acquire(
-            &crate::instance::runtime_directory().map_err(|error| error.to_string())?,
-            &self.request.path,
-            true,
+        let request = self.request;
+        remove_fenced(
+            self.target,
+            WindowPolicy::RequireOne,
+            check_quiescence,
+            || checked_record(&request).map(drop),
+            false,
+            std::time::Duration::from_secs(30),
         )
-        .map_err(|_| "Worktree is selected or open in an editor".to_owned())?;
-        // Git's own metadata locks prevent checkout, commit, and packed-ref
-        // maintenance from changing the confirmed head during removal.
-        let mut head = crate::repository::GitFileLock::acquire(&self.admin_dir.join("HEAD"))?;
-        let branch = crate::repository::GitFileLock::acquire(
-            &self
-                .common_dir
-                .join("refs/heads")
-                .join(&self.request.branch),
-        )?;
-        let packed = crate::repository::GitFileLock::acquire(&self.common_dir.join("packed-refs"))?;
-        let config = crate::repository::GitFileLock::acquire(&self.common_dir.join("config"))?;
-        head.check()?;
-        branch.check()?;
-        packed.check()?;
-        config.check()?;
-        checked_record(&self.request)?;
-        let metadata = self
-            .request
-            .path
-            .metadata()
-            .map_err(|error| error.to_string())?;
-        if (metadata.dev(), metadata.ino()) != self.directory_identity {
-            return Err("Worktree directory was replaced".into());
-        }
-        let cancellation = crate::process::CancellationToken::new();
-        let service = crate::repository::RepositoryService::system("git");
-        if service
-            .common_dir(&self.request.repository, &cancellation)
-            .map_err(|error| error.to_string())?
-            != self.common_dir
-            || service
-                .git_dir(&self.request.path, &cancellation)
-                .map_err(|error| error.to_string())?
-                != self.admin_dir
-        {
-            return Err("Worktree administrative identity changed".into());
-        }
-        let command = crate::process::CommandSpec::new("git")
-            .cwd(&self.request.repository)
-            .args(["worktree", "remove", "--"])
-            .arg(self.request.path.as_os_str())
-            .timeout(std::time::Duration::from_secs(30))
-            .output_limits(64 * 1024, 64 * 1024);
-        let result = crate::process::SystemProcessExecutor
-            .execute(&command, &cancellation)
-            .and_then(|output| output.require_success(&command.program));
-        if let Err(error) = result {
-            // A timeout does not certify removal. Preserve the UI row unless
-            // both Git's registration and the exact directory are gone.
-            let records = service
-                .list_worktrees(&self.request.repository, &cancellation)
-                .map_err(|_| error.reported_detail())?;
-            if self.request.path.exists()
-                || records
-                    .iter()
-                    .any(|record| record.path == self.request.path)
-            {
-                return Err(error.reported_detail());
-            }
-        }
-        head.retired_with_directory();
-        Ok(crate::repository::RemovedWorktree {
-            common_dir: self.common_dir,
-            admin_dir: self.admin_dir,
-            path: self.request.path,
-            branch: Some(format!("refs/heads/{}", self.request.branch)),
-        })
     }
+}
+
+/// Which running windows a fenced removal accepts. Every window must have
+/// established directory protection, so none can show the worktree unfenced.
+#[cfg(feature = "host")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowPolicy {
+    /// At least one window, as for a removal a window asked for.
+    RequireOne,
+    /// Any number, none included, as for the command line.
+    AllowNone,
+}
+
+/// Removes a worktree behind every fence that keeps its content from changing
+/// or coming back into use: the window launch fence, `admit` while windows are
+/// verified, the independent-editor census, the exclusive directory lease,
+/// and Git's own locks on HEAD and the branch. `verify` runs once the
+/// target's identity is confirmed under those locks; it may still refuse, or
+/// act on the worktree before it goes. Git's locks on packed refs and config
+/// are checked after it. `force` removes
+/// it even with changes, which `verify` must have accounted for; Git gets
+/// `timeout` to delete the tree.
+///
+/// Automatic cleanup holds the exclusive control gate through this call,
+/// which `admit` checks for global quiescence. A removal the worktree's own
+/// reservation fences holds no control admission, so a long inspection and
+/// deletion hold off no other request.
+#[cfg(feature = "host")]
+pub(crate) fn remove_fenced(
+    target: FencedTarget,
+    windows: WindowPolicy,
+    admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
+    verify: impl FnOnce() -> Result<(), String>,
+    force: bool,
+    timeout: std::time::Duration,
+) -> Result<crate::repository::RemovedWorktree, String> {
+    use crate::process::ProcessExecutor;
+    use std::os::unix::fs::MetadataExt;
+    let launch = crate::instance::worktree_mutation_launch_fence().map_err(|_| {
+        "An update or another worktree removal is in progress; retry shortly".to_owned()
+    })?;
+    let policy = windows;
+    let windows = crate::instance::verified_running_windows().map_err(|error| error.to_string())?;
+    if (policy == WindowPolicy::RequireOne && windows.is_empty())
+        || windows
+            .iter()
+            .any(|window| !window.protects_worktrees().unwrap_or(false))
+    {
+        return Err("Window directory protection is not ready".into());
+    }
+    // Busy applications skip before the independent-editor process census.
+    // Admission remains fenced while directory leases are then acquired.
+    admit(&windows)?;
+    let _editors = crate::instance::verified_running_editors().map_err(|error| error.to_string())?;
+    let _directory = acquire(
+        &crate::instance::runtime_directory().map_err(|error| error.to_string())?,
+        &target.path,
+        true,
+    )
+    .map_err(|_| "Worktree is selected or open in an editor".to_owned())?;
+    // A window launched from here on cannot take the shared lease that showing
+    // the worktree needs, as a running window that selects it now cannot.
+    drop(launch);
+    // Git's own metadata locks prevent checkout, commit, and packed-ref
+    // maintenance from changing the confirmed head during removal.
+    let mut head = crate::repository::GitFileLock::acquire(&target.admin_dir.join("HEAD"))?;
+    let branch = target
+        .branch
+        .as_ref()
+        .map(|branch| {
+            // A packed branch below a directory of refs may have no loose
+            // directory to lock in; Git creates leading directories alike.
+            let loose = target.common_dir.join("refs/heads").join(branch);
+            if Path::new(branch).components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+                return Err(format!("Branch {branch} is not a valid branch name"));
+            }
+            if let Some(parent) = loose.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            crate::repository::GitFileLock::acquire(&loose)
+        })
+        .transpose()?;
+    head.check()?;
+    if let Some(branch) = &branch {
+        branch.check()?;
+    }
+    let metadata = target.path.metadata().map_err(|error| error.to_string())?;
+    if (metadata.dev(), metadata.ino()) != target.directory_identity {
+        return Err("Worktree directory was replaced".into());
+    }
+    let cancellation = crate::process::CancellationToken::new();
+    let service = crate::repository::RepositoryService::system("git");
+    if service
+        .common_dir(&target.repository, &cancellation)
+        .map_err(|error| error.to_string())?
+        != target.common_dir
+        || service
+            .git_dir(&target.path, &cancellation)
+            .map_err(|error| error.to_string())?
+            != target.admin_dir
+    {
+        return Err("Worktree administrative identity changed".into());
+    }
+    verify()?;
+    // The repository-wide locks confirm that no ref packing or config write
+    // is in flight as the removal commits, then go: the HEAD and branch locks
+    // alone fix the confirmed head while Git deletes the tree, which can take
+    // minutes that other worktrees of the repository need not wait out.
+    for name in ["packed-refs", "config"] {
+        crate::repository::GitFileLock::acquire(&target.common_dir.join(name))
+            .and_then(|lock| lock.check())
+            .map_err(|error| {
+                format!("Another Git operation in this repository is running ({error}); retry shortly")
+            })?;
+    }
+    let mut command = crate::process::CommandSpec::new("git")
+        .cwd(&target.repository)
+        .args(["worktree", "remove"]);
+    if force {
+        command = command.arg("--force");
+    }
+    let command = command
+        .arg("--")
+        .arg(target.path.as_os_str())
+        .timeout(timeout)
+        .output_limits(64 * 1024, 64 * 1024);
+    let result = crate::process::SystemProcessExecutor
+        .execute(&command, &cancellation)
+        .and_then(|output| output.require_success(&command.program));
+    if let Err(error) = result {
+        // A timeout does not certify removal. Preserve the UI row unless
+        // both Git's registration and the exact directory are gone.
+        let records = service
+            .list_worktrees(&target.repository, &cancellation)
+            .map_err(|_| error.reported_detail())?;
+        if target.path.exists() || records.iter().any(|record| record.path == target.path) {
+            return Err(error.reported_detail());
+        }
+    }
+    head.retired_with_directory();
+    Ok(crate::repository::RemovedWorktree {
+        common_dir: target.common_dir,
+        admin_dir: target.admin_dir,
+        path: target.path,
+        branch: target.branch.map(|branch| format!("refs/heads/{branch}")),
+    })
 }
 
 pub struct Protection {

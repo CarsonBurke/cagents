@@ -335,23 +335,31 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
 }
 
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
-    let gate = control_gate(host);
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    let handles = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down {
-            // Shutdown owns the remaining session state. Removing delivery is
-            // safe, but unregistering would enqueue visibility/redraw effects
-            // after the upgrade's terminal snapshots have been committed.
-            state.forget_client_delivery(client_id);
-            Vec::new()
-        } else {
-            state.unregister_client(client_id)
+    {
+        let gate = control_gate(host);
+        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+        let handles = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down {
+                // Shutdown owns the remaining session state. Removing delivery is
+                // safe, but unregistering would enqueue visibility/redraw effects
+                // after the upgrade's terminal snapshots have been committed.
+                state.forget_client_delivery(client_id);
+                Vec::new()
+            } else {
+                state.unregister_client(client_id)
+            }
+        };
+        // Clear a disconnected GUI's outstanding redraw edge outside HostState.
+        for handle in handles {
+            handle.acknowledge_redraw(handle.generation());
         }
-    };
-    // Clear a disconnected GUI's outstanding redraw edge outside HostState.
-    for handle in handles {
-        handle.acknowledge_redraw(handle.generation());
+    }
+    // Outside the control gate: unwatching waits for a board being assembled,
+    // which must not hold up a writer queued at the gate.
+    let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
+    if let Some(work) = work {
+        work.unwatch(client_id);
     }
 }
 
@@ -441,6 +449,7 @@ pub(super) fn process_request(
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
+    super::worktree_removal::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -492,6 +501,56 @@ pub(super) fn process_request(
         ClientRequest::Authenticate { authority } => {
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::Work(request) => {
+            // Admission was checked above. A board may wait on scans and
+            // GitHub for its bound, which must not hold the fence that
+            // shutdown and upgrades take.
+            drop(_shared);
+            let work = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .work
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "The Work board is unavailable",
+                        false,
+                    )
+                })?;
+            let response = work.process(host, request).map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            Ok((ServerResponse::Work(response), Vec::new(), false))
+        }
+        ClientRequest::WatchWork => {
+            // Like a board read, the first answer may wait on scans.
+            drop(_shared);
+            let (work, delivery) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.work.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, board) = work
+                .watch(host, client_id, delivery)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::Work(crate::work::Response::Watching {
+                    revision,
+                    board: Box::new(board),
+                }),
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::Automation {
             authority,

@@ -57,7 +57,7 @@ pub mod file_icon;
 pub mod file_manager;
 mod filesystem_recovery_context;
 pub mod fs_safety;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
@@ -128,8 +128,12 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+pub mod work;
+#[cfg(feature = "ui")]
+pub mod work_ui;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
+pub mod worktree_content;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_setup;
 pub use terminal::ipc as terminal_ipc;

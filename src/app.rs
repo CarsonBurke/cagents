@@ -49,6 +49,7 @@ mod terminal_failure;
 mod terminal_output_tests;
 mod terminal_ui;
 mod update_ui;
+mod work_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
@@ -1169,7 +1170,9 @@ fn restored_runtime_residency(
         CardKind::Chat(_) => Residency::Hibernated,
         CardKind::Repository(_) | CardKind::PullRequests(_) => durable_residency.clone(),
         // Utility panes hold no process or page, so they are never hibernated.
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => Residency::Hot,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
+            Residency::Hot
+        }
     }
 }
 
@@ -1441,6 +1444,12 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             starting: "Loading automations…",
             unavailable: "Automations unavailable",
         },
+        Some(CardKind::Work) => CardLabels {
+            type_label: "Work",
+            icon: Icon::Board,
+            starting: "Loading the Work board…",
+            unavailable: "Work board unavailable",
+        },
         None => CardLabels {
             type_label: "Pane",
             icon: Icon::Grid,
@@ -1460,7 +1469,7 @@ fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
         CardKind::PullRequests(view) => display_path(&view.repository),
         CardKind::Repository(view) => display_path(&view.worktree),
         // Neither pane belongs to a place: both apply to the whole application.
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
             Cow::Borrowed("Application-wide")
         }
     }
@@ -1471,7 +1480,7 @@ fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
 /// Every path this application shows lives under the user's home, so the
 /// absolute prefix is noise that costs the readable tail its space when the
 /// label has to ellipsize.
-fn display_path(path: &Path) -> Cow<'_, str> {
+pub(crate) fn display_path(path: &Path) -> Cow<'_, str> {
     static HOME: LazyLock<Option<PathBuf>> =
         LazyLock::new(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()));
     let relative = HOME
@@ -2552,6 +2561,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
+        Message::WorkUi(action) => !action.background(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2687,6 +2697,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::CreatePullRequest { .. }
                     | SidebarAction::OpenSettings
                     | SidebarAction::OpenAutomations
+                    | SidebarAction::OpenWork
             )
     ) || matches!(
         message,
@@ -2775,6 +2786,7 @@ pub enum SettingsField {
     TerminalTheme,
     MaxHotCards,
     HibernationDelayMs,
+    WorkStaleAfterDays,
     TerminalFontSize,
     TerminalFontFamily,
     ConfirmMultilinePaste,
@@ -2910,6 +2922,7 @@ impl SettingsField {
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
             Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::WorkStaleAfterDays => "Stale after (days)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
             Self::TerminalScrollbackLines => "Scrollback lines",
@@ -3005,6 +3018,7 @@ impl SettingsField {
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
             | Self::HibernationDelayMs
+            | Self::WorkStaleAfterDays
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
             | Self::DefaultWorktreePane
@@ -3183,6 +3197,7 @@ struct SettingsDraft {
     has_custom_terminal_theme: bool,
     max_hot_cards: String,
     hibernation_delay_ms: String,
+    work_stale_after_days: String,
     terminal_font_size: String,
     terminal_font_family: String,
     editor_font_family: String,
@@ -3237,6 +3252,7 @@ impl SettingsDraft {
             has_custom_terminal_theme: settings.custom_terminal_theme.is_some(),
             max_hot_cards: settings.max_hot_cards.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
+            work_stale_after_days: settings.work_stale_after_days.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
             editor_font_family: settings.editor_font_family.clone().unwrap_or_default(),
@@ -3292,6 +3308,7 @@ impl SettingsDraft {
             SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
+            SettingsField::WorkStaleAfterDays => self.work_stale_after_days = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
             SettingsField::ConfirmMultilinePaste => self.confirm_multiline_paste = value == "true",
@@ -3708,6 +3725,10 @@ fn settings_update(
             .parse::<u64>()
             .map(|value| next.hibernation_delay_ms = value)
             .map_err(|_| "Hibernation delay must be milliseconds as a whole number.".to_owned()),
+        SettingsField::WorkStaleAfterDays => value
+            .parse::<u16>()
+            .map(|value| next.work_stale_after_days = value)
+            .map_err(|_| "Stale after must be a whole number of days.".to_owned()),
         SettingsField::TerminalFontSize => value
             .parse::<f32>()
             .map(|value| next.terminal_font_size = value)
@@ -3877,6 +3898,10 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
         SettingsField::HibernationDelayMs => {
             "Hibernation delay must be a whole number of milliseconds.".to_owned()
         }
+        SettingsField::WorkStaleAfterDays => format!(
+            "{label} must be 1–{} days.",
+            crate::work::MAX_STALE_AFTER_DAYS
+        ),
         SettingsField::TerminalFontFamily
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
         {
@@ -4451,6 +4476,7 @@ pub enum Message {
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
+    WorkUi(crate::work_ui::Action),
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -4641,6 +4667,7 @@ enum CardRuntime {
     Settings,
     Accounts,
     Automations,
+    Work,
 }
 
 impl CardRuntime {
@@ -4650,6 +4677,7 @@ impl CardRuntime {
             CardKind::Settings => Self::Settings,
             CardKind::Accounts => Self::Accounts,
             CardKind::Automations => Self::Automations,
+            CardKind::Work => Self::Work,
             _ => unreachable!("only utility panes have a utility runtime"),
         }
     }
@@ -5049,6 +5077,7 @@ pub struct Cagents {
     operation_recovery: crate::operation_recovery::Shared,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
+    work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -5552,7 +5581,10 @@ impl Cagents {
                 CardKind::PullRequests(view) => {
                     repository_tasks.push(self.attach_pull_request_pane(card.id, view));
                 }
-                kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
+                kind @ (CardKind::Settings
+                | CardKind::Accounts
+                | CardKind::Automations
+                | CardKind::Work) => {
                     if let Some(state) = self.card_state_mut(card.id) {
                         state.residency = Residency::Hot;
                     }
@@ -6134,7 +6166,7 @@ impl Cagents {
             CardKind::Repository(_) | CardKind::PullRequests(_) => {
                 card.residency = Residency::Hot;
             }
-            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes are refused before cloning")
             }
         }
@@ -6190,7 +6222,7 @@ impl Cagents {
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
             CardKind::Repository(view) => self.attach_repository_pane(id, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(id, view),
-            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes are refused before cloning")
             }
         };
@@ -7991,7 +8023,8 @@ impl Cagents {
                 | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
-                | CardRuntime::Automations,
+                | CardRuntime::Automations
+                | CardRuntime::Work,
             )
             | None => {}
         }
@@ -8176,7 +8209,7 @@ impl Cagents {
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
             CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
-            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes return before a retry registers them")
             }
         }
@@ -8624,7 +8657,8 @@ impl Cagents {
                     | Some(CardRuntime::PullRequests(_))
                     | Some(CardRuntime::Settings)
                     | Some(CardRuntime::Accounts)
-                    | Some(CardRuntime::Automations) => false,
+                    | Some(CardRuntime::Automations)
+                    | Some(CardRuntime::Work) => false,
                     #[cfg(feature = "integrated-browser")]
                     Some(CardRuntime::Browser(_)) => true,
                     _ => self
@@ -9652,6 +9686,7 @@ impl Cagents {
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
+            Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, ended_terminal(card))
             }
@@ -9979,7 +10014,9 @@ impl Cagents {
                             })
                     })
             }),
-            CardKind::Settings | CardKind::Accounts | CardKind::Automations => None,
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
+                None
+            }
         };
         if let Some(action) = action {
             self.sidebar_state.apply(&action);
@@ -10433,7 +10470,8 @@ impl Cagents {
             | CardKind::PullRequests(_)
             | CardKind::Settings
             | CardKind::Accounts
-            | CardKind::Automations => SidebarFocus::None,
+            | CardKind::Automations
+            | CardKind::Work => SidebarFocus::None,
         }
     }
 
@@ -10511,7 +10549,6 @@ impl Cagents {
             self.discard_ui.select(None);
             return self.release_source_control();
         }
-        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -11721,7 +11758,8 @@ impl Cagents {
                 | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
-                | CardRuntime::Automations => Ok(()),
+                | CardRuntime::Automations
+                | CardRuntime::Work => Ok(()),
             };
             if failure.is_none() {
                 failure = result.err();
@@ -12064,7 +12102,8 @@ impl Cagents {
             | Some(CardRuntime::PullRequests(_))
             | Some(CardRuntime::Settings)
             | Some(CardRuntime::Accounts)
-            | Some(CardRuntime::Automations) => InspectorRuntimeStatus::Ready,
+            | Some(CardRuntime::Automations)
+            | Some(CardRuntime::Work) => InspectorRuntimeStatus::Ready,
             Some(CardRuntime::Repository(runtime)) => match runtime.inspector_runtime_status() {
                 RepositoryRuntimeStatus::Loading => InspectorRuntimeStatus::Loading,
                 RepositoryRuntimeStatus::Ready => InspectorRuntimeStatus::Ready,
@@ -13564,6 +13603,7 @@ impl Application for Cagents {
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
+            work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -15173,6 +15213,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
                     SidebarAction::OpenAutomations => self.open_automations(),
+                    SidebarAction::OpenWork => self.open_utility_card(CardKind::Work),
                     // The handle clamps to its own rendered bounds, and the
                     // settings file accepts a narrower range, so the width is
                     // clamped again before it can reach a rejected save.
@@ -17012,6 +17053,7 @@ impl Application for Cagents {
             Message::AccountUi(action) => self.update_account_ui(action),
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
+            Message::WorkUi(action) => self.update_work_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -17469,6 +17511,7 @@ impl Application for Cagents {
             self.git_subscription(),
             self.account_subscription(),
             self.automation_subscription(),
+            self.work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
@@ -26722,6 +26765,7 @@ mod tests {
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
+            work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),

@@ -2920,33 +2920,6 @@ impl SidebarState {
         self.rows.select(row, intent, visible);
     }
 
-    /// Navigation can point at another project while an editor remains active.
-    /// Keep those explicit targets live alongside the active workspace.
-    pub fn git_watch_targets(&self) -> Vec<(ProjectId, Option<WorktreeId>)> {
-        let mut targets = Vec::new();
-        if let Some(selection) = self.selection {
-            targets.push(match selection {
-                SidebarSelection::Project(project_id)
-                | SidebarSelection::PullRequest { project_id, .. } => (project_id, None),
-                SidebarSelection::Worktree {
-                    project_id,
-                    worktree_id,
-                } => (project_id, Some(worktree_id)),
-            });
-        }
-        for row in self.rows.iter() {
-            let target = match row {
-                SelectionRow::Project(project_id) => (project_id, None),
-                SelectionRow::Worktree(project_id, worktree_id) => (project_id, Some(worktree_id)),
-                SelectionRow::Channel(_) => continue,
-            };
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
-        }
-        targets
-    }
-
     pub fn selected_rows(&self, visible: &[SelectionRow]) -> Vec<SelectionRow> {
         self.rows.ordered(visible)
     }
@@ -3575,6 +3548,7 @@ impl SidebarState {
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
             | SidebarAction::OpenAutomations
+            | SidebarAction::OpenWork
             | SidebarAction::Stage { .. }
             | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
@@ -3741,6 +3715,8 @@ pub enum SidebarAction {
     },
     OpenSettings,
     OpenAutomations,
+    /// Opens the window's Work board.
+    OpenWork,
 
     OpenCommit {
         key: ActiveWorktreeKey,
@@ -4376,9 +4352,9 @@ fn utilities<'a>(
     .on_press_maybe(gated(SidebarAction::ToggleProjects, modal_open))
     .id(Id::new("command.toggle-projects"))
     .into();
-    let [settings, automations] = utility_controls(modal_open, Some(shortcuts));
+    let [settings, automations, work] = utility_controls(modal_open, Some(shortcuts));
     if compact {
-        let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
+        let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations, work];
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(space::XS)
@@ -4390,6 +4366,7 @@ fn utilities<'a>(
         widget::row::with_children(vec![
             settings,
             automations,
+            work,
             cosmic::iced::widget::Space::new()
                 .width(Length::Fill)
                 .into(),
@@ -4406,7 +4383,7 @@ fn utilities<'a>(
 fn utility_controls<'a>(
     modal_open: bool,
     shortcuts: Option<&crate::settings::KeyboardShortcuts>,
-) -> [Element<'a, SidebarAction>; 2] {
+) -> [Element<'a, SidebarAction>; 3] {
     let label = shortcuts.map_or_else(
         || "Settings".to_owned(),
         |shortcuts| {
@@ -4425,21 +4402,25 @@ fn utility_controls<'a>(
         .on_press_maybe(gated(SidebarAction::OpenAutomations, modal_open))
         .id(stable_id("automations"))
         .into();
-    [settings, automations]
+    let work = crate::ui_controls::icon_button(Icon::Board, "Work board")
+        .on_press_maybe(gated(SidebarAction::OpenWork, modal_open))
+        .id(stable_id("work"))
+        .into();
+    [settings, automations, work]
 }
 
 // The standalone editor still mounts its utility controls below its file pane.
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
-    let [settings, automations] = utility_controls(modal_open, None);
+    let [settings, automations, work] = utility_controls(modal_open, None);
     if compact {
-        widget::column::with_children(vec![automations, settings])
+        widget::column::with_children(vec![work, automations, settings])
             .align_x(Alignment::Center)
             .spacing(space::XS)
             .padding(space::XS)
             .width(Length::Fill)
             .into()
     } else {
-        widget::row::with_children(vec![automations, settings])
+        widget::row::with_children(vec![work, automations, settings])
             .align_y(Alignment::Center)
             .padding(space::XS)
             .width(Length::Fill)

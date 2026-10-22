@@ -100,9 +100,11 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
         CardKind::PullRequests(view) => Some(&view.repository),
-        CardKind::Browser(_) | CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
-            None
-        }
+        CardKind::Browser(_)
+        | CardKind::Settings
+        | CardKind::Accounts
+        | CardKind::Automations
+        | CardKind::Work => None,
     }
 }
 

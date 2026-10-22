@@ -14,6 +14,8 @@ mod notifications;
 mod provider_shutdown_tests;
 mod service;
 mod state;
+mod work;
+mod worktree_removal;
 
 use std::{
     fs, io,
@@ -297,6 +299,16 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             None
         }
     };
+    let work_board = match work::Service::start(&host) {
+        Ok(service) => {
+            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+            Some(service)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the Work board is unavailable");
+            None
+        }
+    };
     let courier = match agent_execution::mailbox::Courier::start(&host) {
         Ok(courier) => Some(courier),
         Err(error) => {
@@ -401,6 +413,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
     drop(automation_broker);
     drop(courier);
+    host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+    drop(work_board);
     let proof = host
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

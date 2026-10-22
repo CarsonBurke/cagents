@@ -38,6 +38,7 @@ host = [
     "dep:imara-diff",
     "dep:ksni",
     "dep:libghostty-vt",
+    "dep:notify",
     "dep:portable-pty",
     "dep:rusqlite",
     "dep:tokio",

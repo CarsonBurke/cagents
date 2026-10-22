@@ -268,6 +268,8 @@ pub(crate) struct HostState {
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
     pub(super) automations: Option<super::automations::Handle>,
+    /// Answers Work board reads; absent before startup and after shutdown.
+    pub(super) work: Option<super::work::Handle>,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
     /// Seals the messages the courier delivers and recognizes them in
@@ -311,6 +313,7 @@ pub(crate) struct HostState {
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
+    pub(super) worktree_removals: super::worktree_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
@@ -342,6 +345,7 @@ impl HostState {
         Self {
             recover_holders: false,
             account_lifecycle: Default::default(),
+            worktree_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -352,6 +356,7 @@ impl HostState {
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
+            work: None,
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),

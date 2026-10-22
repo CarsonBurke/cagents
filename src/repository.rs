@@ -31,6 +31,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod branch_census;
+pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
@@ -1309,6 +1311,16 @@ pub struct WorkingFiles {
     pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
 }
 
+/// The paths one worktree's index tracks, for watching them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexPaths {
+    /// Sorted, with conflict stages collapsed into one path.
+    pub paths: Vec<RepoPath>,
+    /// Whether any entry is a gitlink: a submodule, whose contents the index
+    /// does not list.
+    pub gitlinks: bool,
+}
+
 /// Everything the source-control surfaces need about one worktree in one shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
@@ -2209,7 +2221,11 @@ fn parse_status_details(
             } else if let Some(value) = header.strip_prefix(b"branch.upstream ") {
                 upstream = Some(String::from_utf8_lossy(value).into_owned());
             } else if let Some(value) = header.strip_prefix(b"branch.ab ") {
-                ahead_behind = Some(parse_ahead_behind(value, index)?);
+                // `--no-ahead-behind` says only that the branch and its
+                // upstream differ, which leaves the counts unknown.
+                if value != b"+? -?" {
+                    ahead_behind = Some(parse_ahead_behind(value, index)?);
+                }
             }
             index += 1;
             continue;
@@ -3233,6 +3249,18 @@ fn parse_index_entries(output: &[u8]) -> Result<Vec<IndexEntry>, GitParseError> 
     Ok(entries)
 }
 
+fn parse_index_paths(output: &[u8]) -> Result<IndexPaths, GitParseError> {
+    let entries = parse_index_entries(output)?;
+    let gitlinks = entries.iter().any(|entry| entry.mode == GITLINK_MODE);
+    let mut paths = entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    // Git lists the index in path order, conflict stages adjacent.
+    paths.dedup();
+    Ok(IndexPaths { paths, gitlinks })
+}
+
 /// One tree entry from `git ls-tree -z`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeEntry {
@@ -4245,49 +4273,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(files)
     }
 
-    /// Watch membership includes untracked directories, so later edits and
-    /// creations within them produce native events too.
-    pub fn watch_files(
+    /// What the index of `worktree` tracks, for watching it. Entry modes tell
+    /// submodules apart without a `stat` per path.
+    pub fn index_paths(
         &self,
         worktree: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<WorkingFiles, RepositoryError> {
-        let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
-        invalid_output(parse_working_files(&output.stdout), output)
-    }
-
-    /// A bounded read-only inventory prefix for watch planning. A truncated
-    /// prefix is not complete membership: callers must preserve root/admin
-    /// coverage and provide an explicit directory census or polling fallback.
-    pub fn watch_files_projection(
-        &self,
-        worktree: &Path,
-        limit: usize,
-        cancellation: &CancellationToken,
-    ) -> Result<WorkingFiles, RepositoryError> {
-        let (output, truncated) = self.listing_output(
-            &self.working_files_command(worktree),
-            Some(limit.clamp(1, 100_000)),
-            status_limit::Format::Files,
-            cancellation,
-        )?;
-        let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
-        files.listing_truncated = truncated;
-        Ok(files)
-    }
-
-    /// Tracked paths alone are sufficient to watch the sidebar's tracked-only
-    /// status without enumerating ignored build trees or untracked files.
-    pub fn tracked_files(
-        &self,
-        worktree: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<WorkingFiles, RepositoryError> {
+    ) -> Result<IndexPaths, RepositoryError> {
         let output = self.run_checked(
-            &self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"]),
+            &self.git_read(worktree, ["ls-files", "-s", "-z"]),
             cancellation,
         )?;
-        let parsed = parse_working_files(&output.stdout);
+        let parsed = parse_index_paths(&output.stdout);
         invalid_output(parsed, output)
     }
 
@@ -8659,25 +8656,6 @@ mod tests {
     }
 
     #[test]
-    fn watch_projection_preserves_a_prefix_without_changing_complete_inventory_reads() {
-        let listing = b"H first.txt\0H second.txt\0";
-        let service = fake_service(vec![success(listing), success(listing)]);
-        let cancel = CancellationToken::new();
-        let prefix = service
-            .watch_files_projection(Path::new("/repo"), 1, &cancel)
-            .unwrap();
-        assert_eq!(prefix.paths, vec![path("first.txt")]);
-        assert_eq!(prefix.tracked_count, 1);
-        assert!(prefix.listing_truncated);
-        let complete = service.watch_files(Path::new("/repo"), &cancel).unwrap();
-        assert_eq!(complete.paths.len(), 2);
-        assert!(!complete.listing_truncated);
-        let commands = service.executor.commands.lock().unwrap();
-        assert_eq!(commands[0].stdout_record_limit, Some(1));
-        assert_eq!(commands[1].stdout_record_limit, None);
-    }
-
-    #[test]
     fn ui_listing_cap_preserves_a_snapshot_when_status_exceeds_sixteen_megabytes() {
         let mut stdout = b"# branch.head main\0# branch.oid (initial)\0".to_vec();
         let path = "x".repeat(200);
@@ -9475,6 +9453,14 @@ mod tests {
     fn rejects_missing_rename_source_and_malformed_ab() {
         assert!(parse_status(b"2 R. N... 100644 100644 100644 a b R100 path\0").is_err());
         assert!(parse_status(b"# branch.ab +x -2\0").is_err());
+        assert_eq!(
+            parse_status(b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head feature\0# branch.upstream origin/feature\0# branch.ab +? -?\0")
+                .unwrap()
+                .tracking,
+            TrackingState::Unknown {
+                upstream: Some("origin/feature".into())
+            }
+        );
         assert!(matches!(
             parse_status(b"? path"),
             Err(GitParseError::Truncated { .. })
@@ -14972,6 +14958,27 @@ mod tests {
         let files = parse_working_files(b"H sp ace.txt\0").unwrap();
         assert_eq!(files.paths, vec![path("sp ace.txt")]);
         assert_eq!(files.tracked_count, 1);
+    }
+
+    #[test]
+    fn index_paths_collapse_conflict_stages_and_flag_gitlinks() {
+        let blob = "0123456789012345678901234567890123456789";
+        let index = [
+            format!("100644 {blob} 1\tconflict.rs"),
+            format!("100644 {blob} 2\tconflict.rs"),
+            format!("100644 {blob} 3\tconflict.rs"),
+            format!("100644 {blob} 0\tsrc/main.rs"),
+            format!("160000 {blob} 0\tvendor/library"),
+        ]
+        .map(|entry| entry + "\0")
+        .concat();
+        let index = parse_index_paths(index.as_bytes()).unwrap();
+        assert_eq!(
+            index.paths,
+            ["conflict.rs", "src/main.rs", "vendor/library"].map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
+        );
+        assert!(index.gitlinks);
+        assert!(!parse_index_paths(b"").unwrap().gitlinks);
     }
 
     /// `git status` rewrites `.git/index` whenever it finds the stat cache
