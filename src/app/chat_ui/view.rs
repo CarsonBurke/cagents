@@ -1099,7 +1099,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending {
+        } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
@@ -1520,7 +1520,7 @@ impl Runtime {
         } else if self.capacity_refused {
             let enabled = !transitioning
                 && self.pending.is_none()
-                && !self.attachment_chooser_pending
+                && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
                     || !self.attachments.is_empty());
@@ -1543,8 +1543,9 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let enabled =
-                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && self.attachment_chooser_pending.is_none();
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -2096,7 +2097,7 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                available && self.attachment_chooser_pending.is_none(),
                 Action::Attach(target),
             ));
         }
