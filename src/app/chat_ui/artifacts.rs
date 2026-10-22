@@ -10,7 +10,6 @@ pub(super) fn links(request: &chat::Request) -> Vec<(String, String)> {
     if request.kind != chat::RequestKind::Question {
         return Vec::new();
     }
-    let style = design::markdown_settings(&cosmic::theme::active(), design::TEXT_BODY).style;
     let mut output = Vec::new();
     let mut remaining = MAX_TEXT;
     let texts = std::iter::once(request.description.as_str()).chain(
@@ -35,8 +34,7 @@ pub(super) fn links(request: &chat::Request) -> Vec<(String, String)> {
         if !text.contains(['[', '<']) {
             continue;
         }
-        let items: Vec<_> = markdown::parse(text).take(128).collect();
-        collect(&items, style, 0, &mut output);
+        collect(text, &mut output);
     }
     output
 }
@@ -67,54 +65,46 @@ fn add(label: &str, uri: &str, output: &mut Vec<(String, String)>) {
     output.push((Runtime::short_description(label, 80), uri.to_owned()));
 }
 
-fn collect(
-    items: &[markdown::Item],
-    style: markdown::Style,
-    depth: usize,
-    output: &mut Vec<(String, String)>,
-) {
-    if depth == 16 {
-        return;
-    }
-    for item in items {
+fn collect(text: &str, output: &mut Vec<(String, String)>) {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    // Read the explicit CommonMark link events, not the display parser's
+    // paragraph/image projections. Mixed inline images must not consume an
+    // earlier link's label or destination.
+    let mut pending = Vec::<(usize, String, String)>::new();
+    let mut depth = 0usize;
+    for event in Parser::new(text).take(4096) {
         if output.len() == MAX_LINKS {
-            return;
+            break;
         }
-        match item {
-            markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => {
-                for span in text.spans(style).iter() {
-                    if let Some(uri) = &span.link {
-                        add(&span.text, &uri.to_string(), output);
+        match event {
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                depth += 1;
+                if depth <= 16 {
+                    pending.push((depth, dest_url.into_string(), String::new()));
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                for (_, _, label) in &mut pending {
+                    let end = text
+                        .floor_char_boundary(text.len().min(320usize.saturating_sub(label.len())));
+                    label.push_str(&text[..end]);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                for (_, _, label) in &mut pending {
+                    if label.len() < 320 {
+                        label.push(' ');
                     }
                 }
             }
-            markdown::Item::Image { url, alt, .. } => {
-                let label: String = alt
-                    .spans(style)
-                    .iter()
-                    .map(|span| span.text.as_ref())
-                    .collect();
-                add(&label, &url.to_string(), output);
-            }
-            markdown::Item::Quote(items) => collect(items, style, depth + 1, output),
-            markdown::Item::List { bullets, .. } => {
-                for bullet in bullets {
-                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
-                        bullet;
-                    collect(items, style, depth + 1, output);
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                if pending.last().is_some_and(|(level, _, _)| *level == depth) {
+                    let (_, uri, label) = pending.pop().unwrap();
+                    add(&label, &uri, output);
                 }
+                depth = depth.saturating_sub(1);
             }
-            markdown::Item::Table { columns, rows } => {
-                for column in columns {
-                    collect(&column.header, style, depth + 1, output);
-                }
-                for row in rows {
-                    for cell in &row.cells {
-                        collect(cell, style, depth + 1, output);
-                    }
-                }
-            }
-            markdown::Item::CodeBlock { .. } | markdown::Item::Rule => {}
+            _ => {}
         }
     }
 }

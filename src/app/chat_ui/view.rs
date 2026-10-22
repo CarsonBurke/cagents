@@ -4845,9 +4845,11 @@ mod tests {
             .iter()
             .chain(accessible.children())
             .filter(|node| {
-                node.node()
-                    .label()
-                    .is_some_and(|label| label.starts_with("Open artifact:"))
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Open artifact:"))
             })
             .collect();
         assert_eq!(
