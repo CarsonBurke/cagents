@@ -3411,12 +3411,18 @@ impl Runtime {
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
+    ///
+    /// A connection already lost has nothing to tell: the pane reports the
+    /// disconnection itself, and the handle that replaces it is shown with the
+    /// visibility recorded here.
     fn present(&self) -> Result<(), String> {
         let visible = self.visible.load(Ordering::Relaxed)
             || self.queued.is_some()
             || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        match self.handle() {
+            Some(handle) if handle.is_connected() => handle.set_visible(visible),
+            _ => Ok(()),
+        }
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -5578,6 +5584,8 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        // Nothing is left to reopen, so a failure to reopen it is moot.
+        self.resolve_notice(NoticeKey::ChatAttach(card));
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -7633,6 +7641,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
+                        self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         if account_source.is_some() || attempt.upgrade_admission.is_some() {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
@@ -7765,12 +7774,31 @@ impl Cagents {
                                 self.chat_ui.capacity_offers.remove(&target.card);
                             }
                             self.fail_runtime(target.card, failure.message.clone());
-                            self.status = Some(TransientNotice::error(failure.message));
+                            // The notice says what the reader lost in their
+                            // terms; the pane keeps the daemon's reason, and
+                            // the attempt that succeeds withdraws the notice.
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a conversation".to_owned());
+                            self.status = Some(
+                                TransientNotice::error(format!("Could not reopen {pane}."))
+                                    .with_details(failure.message)
+                                    .keyed(NoticeKey::ChatAttach(target.card)),
+                            );
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error(failure.message));
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a terminal".to_owned());
+                            self.status = Some(
+                                TransientNotice::error(format!(
+                                    "Could not switch {pane} to native chat."
+                                ))
+                                .with_details(failure.message)
+                                .keyed(NoticeKey::ChatAttach(target.card)),
+                            );
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -16593,6 +16621,62 @@ mod tests {
         }
     }
 
+    /// A restored conversation that cannot be reopened says so in the reader's
+    /// terms, keeps the daemon's reason as detail, and stops saying it once a
+    /// retry has reopened it.
+    #[test]
+    fn a_successful_retry_clears_the_failed_reopen_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let reason = "Exact native chat not found; no replacement process was spawned";
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(reason)));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let title = app.card_display_title(app.card_state(card).unwrap()).to_owned();
+        assert_eq!(errors(&app), [format!("Could not reopen “{title}”.")]);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(reason));
+
+        // A retry that fails for another reason replaces the notice rather
+        // than adding one beside it.
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let later = "fixture: executable unavailable";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(later)));
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(later));
+
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, attempt, Ok(handle));
+        assert!(chat_runtime(&app, card).connected());
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// A conversation whose connection is gone already says so in its pane,
+    /// and reattaching presents its visibility afresh, so telling it whether
+    /// it is on screen cannot fail in a way worth a notice.
+    #[test]
+    fn a_disconnected_chat_raises_no_visibility_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        chat_runtime(&app, card)
+            .handle()
+            .unwrap()
+            .disconnect_for_test();
+        app.set_workspace_surfaces_visible(false);
+        app.set_workspace_surfaces_visible(true);
+        assert!(
+            app.status.is_none(),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+    }
+
     #[test]
     fn failed_retry_adapter_cannot_acknowledge_retained_native_cleanup() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -16748,6 +16832,14 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// The reason recorded beneath `card`'s failure to open its conversation.
+    fn attach_failure_details(app: &Cagents, card: CardId) -> Option<String> {
+        app.notices
+            .recent()
+            .find(|entry| entry.notice.key == Some(crate::app::NoticeKey::ChatAttach(card)))
+            .and_then(|entry| entry.notice.details.clone())
     }
 
     /// The errors the shell has recorded. `status` is drained into the notice
@@ -20164,7 +20256,15 @@ mod tests {
             app.chat_switch_ready(id),
             "a failed attachment can be retried"
         );
-        assert_eq!(errors(&app), [reason]);
+        assert_eq!(
+            errors(&app),
+            ["Could not switch “Terminal” to native chat."]
+        );
+        assert_eq!(
+            attach_failure_details(&app, id).as_deref(),
+            Some(reason),
+            "the reason stays readable beneath it"
+        );
         assert!(
             matches!(
                 crate::app::tests::task_app_message(task),

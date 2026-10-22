@@ -2554,8 +2554,10 @@ impl Cagents {
                     Ok(registry) => {
                         self.account_ui.set_registry(registry);
                         self.account_ui.table.link = None;
-                        self.status =
-                            Some(TransientNotice::success("Existing account home added."));
+                        self.status = Some(
+                            TransientNotice::success("Existing account home added.")
+                                .keyed(NoticeKey::AccountLink),
+                        );
                         let id = self
                             .account_ui
                             .accounts
@@ -2566,9 +2568,11 @@ impl Cagents {
                             .unwrap_or_else(Task::none)
                     }
                     Err(error) => {
-                        self.status = Some(TransientNotice::error(format!(
-                            "Could not use that account home: {error}"
-                        )));
+                        self.status = Some(
+                            TransientNotice::error("Could not use that account home.")
+                                .with_details(error)
+                                .keyed(NoticeKey::AccountLink),
+                        );
                         Task::none()
                     }
                 }
@@ -3786,10 +3790,13 @@ impl Cagents {
                 }
                 let login = self.account_ui.logins.remove(index);
                 if !login.recovered {
-                    self.status = Some(TransientNotice::warning(format!(
-                        "{} could not say which account signed in. cagents will check again the next time it starts.",
-                        probe::cli_name(login.provider)
-                    )));
+                    self.status = Some(
+                        TransientNotice::warning(format!(
+                            "{} could not say which account signed in. cagents will check again the next time it starts.",
+                            probe::cli_name(login.provider)
+                        ))
+                        .keyed(NoticeKey::SignIn(key)),
+                    );
                 }
                 return Task::none();
             }
@@ -3899,10 +3906,16 @@ impl Cagents {
                 // daemon registration is idempotent for this exact key.
                 login.phase = LoginPhase::Waiting;
                 login.next_check = now_ms() + LOGIN_RETRY * Millis::from(login.attempts.max(1));
-                self.status = Some(TransientNotice::warning(format!(
-                    "The new {} account could not be saved yet; cagents will retry: {error}",
-                    login.provider.label()
-                )));
+                // Each retry replaces the warning before it, and the save that
+                // lands replaces it with the outcome.
+                self.status = Some(
+                    TransientNotice::warning(format!(
+                        "The new {} account could not be saved yet. cagents will try again.",
+                        login.provider.label()
+                    ))
+                    .with_details(error.clone())
+                    .keyed(NoticeKey::SignIn(key)),
+                );
                 return Task::none();
             }
         }
@@ -3929,7 +3942,10 @@ impl Cagents {
                     }
                     state.identity = identity;
                 }
-                self.status = Some(TransientNotice::success(format!("{name} was added.")));
+                self.status = Some(
+                    TransientNotice::success(format!("{name} was added."))
+                        .keyed(NoticeKey::SignIn(key)),
+                );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Duplicate { existing, registry }) => {
@@ -3941,22 +3957,29 @@ impl Cagents {
                     .account(&existing)
                     .map(|state| self.account_ui.display_name(state))
                     .unwrap_or_else(|| "an account you already have".into());
-                self.status = Some(TransientNotice::warning(format!(
-                    "That login is already added as {name}."
-                )));
+                self.status = Some(
+                    TransientNotice::warning(format!("That login is already added as {name}."))
+                        .keyed(NoticeKey::SignIn(key)),
+                );
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Abandoned(registry)) => {
                 if let Some(registry) = registry {
                     self.account_ui.set_registry(registry);
                 }
+                // Nothing is left to save, so an earlier retry warning is moot.
+                self.resolve_notice(NoticeKey::SignIn(key));
                 self.close_settled_sign_in(login.provider, &login.home)
             }
             Err(error) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "The new {} account could not be saved: {error}",
-                    login.provider.label()
-                )));
+                self.status = Some(
+                    TransientNotice::error(format!(
+                        "The new {} account could not be saved.",
+                        login.provider.label()
+                    ))
+                    .with_details(error)
+                    .keyed(NoticeKey::SignIn(key)),
+                );
                 Task::none()
             }
         }
@@ -7864,6 +7887,65 @@ mod app_tests {
         assert!(state.present);
         assert_eq!(state.identity.as_ref(), Some(&identity));
         assert_eq!(app.account_ui.display_name(state), "new@example.com");
+    }
+
+    /// Each retry of a sign-in's save replaces the warning before it, and the
+    /// save that lands replaces the warning with a confirmation.
+    #[test]
+    fn a_saved_sign_in_replaces_its_retry_warning() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 14);
+        for (attempt, error) in [(1, "auth terminal is still closing"), (2, "reply lost")] {
+            app.account_ui.logins[0].phase = LoginPhase::Settling;
+            app.account_ui.logins[0].attempts = attempt;
+            let _ = app.update(Message::AccountUi(Action::LoginSettled {
+                key,
+                result: Err(error.into()),
+            }));
+        }
+        assert_eq!(app.notices.len(), 1, "a retry replaces the warning before it");
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .register(
+                registry::Registered {
+                    key,
+                    provider: Provider::Claude,
+                    linked_home: None,
+                    label: None,
+                    email: Some("new@example.com".into()),
+                    organization: None,
+                    added_at: NOW,
+                },
+                &[],
+            )
+            .unwrap();
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Registered {
+                registry,
+                identity: None,
+                snapshot: None,
+            }),
+        }));
+        let notices = app
+            .notices
+            .recent()
+            .map(|entry| (entry.notice.severity, entry.notice.message.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices,
+            [(
+                crate::app::NoticeSeverity::Success,
+                "A Claude Code account was added."
+            )]
+        );
+        // The confirmation retires on its own.
+        let due = app
+            .notices
+            .next_expiry()
+            .expect("a confirmation has a deadline");
+        app.notices.expire(due);
+        assert!(app.notices.is_empty());
     }
 
     #[test]

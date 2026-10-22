@@ -275,16 +275,44 @@ impl NoticeSeverity {
     }
 }
 
+/// The operation, and the object it acted on, that a notice reports on.
+///
+/// A notice raised under a key takes the place of whatever that key last
+/// raised: a retry that fails again does not stack a second report, and one
+/// that succeeds replaces the failure with its confirmation. Resolving a key
+/// withdraws its notice without announcing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKey {
+    /// Opening the conversation in this card, or switching its terminal to one.
+    ChatAttach(CardId),
+    /// Saving the account that one sign-in produced.
+    SignIn(uuid::Uuid),
+    /// Adding an existing account home from the accounts table.
+    AccountLink,
+    /// Telling panes whether they are on screen.
+    SurfaceVisibility,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransientNotice {
     severity: NoticeSeverity,
+    /// What happened, in the reader's terms.
     message: String,
+    /// The underlying reason as the failing component reported it, for a
+    /// bug report or a search; drawn beneath the message.
+    details: Option<String>,
+    key: Option<NoticeKey>,
 }
 
 /// Notices retained for review. Bounded because nothing else bounds them: the
 /// shell raises a notice from almost a hundred call sites, several of them on
 /// per-frame or per-poll paths.
 const NOTICE_LOG_CAPACITY: usize = 24;
+
+/// How long a confirmation stays before it retires on its own: long enough to
+/// read one sentence, short enough that a success glyph in the header still
+/// means something just happened.
+const NOTICE_SUCCESS_LIFETIME: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoggedNotice {
@@ -293,6 +321,9 @@ struct LoggedNotice {
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
+    /// When a confirmation retires. Warnings and errors have none: they wait
+    /// for their key to resolve or for the reader to dismiss them.
+    expires_at: Option<Instant>,
 }
 
 /// The shell's notice history: a bounded ring plus the identity counter that
@@ -305,26 +336,71 @@ struct NoticeLog {
 
 impl NoticeLog {
     fn record(&mut self, notice: TransientNotice) {
-        // Scanning the whole log rather than only its tail is what makes
-        // deduplication survive interleaving: a poll that raises two failures
-        // in turn would otherwise alternate them forever and fill the log with
-        // copies. The repeat moves to the back because the user cares that it
-        // is happening now, and `recent` reads newest first.
-        if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
+        self.record_at(notice, Instant::now());
+    }
+
+    fn record_at(&mut self, notice: TransientNotice, now: Instant) {
+        let expires_at =
+            (notice.severity == NoticeSeverity::Success).then(|| now + NOTICE_SUCCESS_LIFETIME);
+        // A keyed notice takes over its key's entry, whatever either says, so
+        // a key never holds more than one. An unkeyed one only collapses onto
+        // an identical message. Scanning the whole log rather than only its
+        // tail is what makes that survive interleaving: a poll that raises two
+        // failures in turn would otherwise alternate them forever and fill the
+        // log with copies. The repeat moves to the back because the user cares
+        // that it is happening now, and `recent` reads newest first.
+        let previous = self.entries.iter().position(|entry| match notice.key {
+            Some(key) => entry.notice.key == Some(key),
+            None => entry.notice == notice,
+        });
+        if let Some(index) = previous {
             let mut entry = self.entries.remove(index).expect("index came from the log");
-            entry.repeats = entry.repeats.saturating_add(1);
-            self.entries.push_back(entry);
-            return;
+            if entry.notice == notice {
+                entry.repeats = entry.repeats.saturating_add(1);
+                entry.expires_at = expires_at;
+                self.entries.push_back(entry);
+                return;
+            }
+            // Replaced: the new report gets an identity of its own, so a
+            // Dismiss aimed at the old one cannot remove it.
         }
         self.next_id = self.next_id.wrapping_add(1);
         self.entries.push_back(LoggedNotice {
             id: self.next_id,
             notice,
             repeats: 1,
+            expires_at,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // The oldest entry of the lowest severity present goes first, so a
+            // run of confirmations or warnings cannot push out a failure that
+            // nothing has resolved.
+            let index = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index)
+                .expect("an overflowing log is not empty");
+            self.entries.remove(index);
         }
+    }
+
+    /// Withdraws whatever `key` last reported, because its condition no
+    /// longer holds.
+    fn resolve(&mut self, key: NoticeKey) {
+        self.entries.retain(|entry| entry.notice.key != Some(key));
+    }
+
+    /// Retires every confirmation due by `now`.
+    fn expire(&mut self, now: Instant) {
+        self.entries
+            .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
+    }
+
+    /// When the next confirmation is due to retire, if any is waiting to.
+    fn next_expiry(&self) -> Option<Instant> {
+        self.entries.iter().filter_map(|entry| entry.expires_at).min()
     }
 
     fn dismiss(&mut self, id: u64) {
@@ -337,9 +413,9 @@ impl NoticeLog {
 
     /// Newest first: the log reads downward from the most recent event.
     ///
-    /// Nothing retires on a timer. A notice the user never saw is worse than
-    /// one that waits: the header carries the severity until it is dismissed,
-    /// and capacity is what bounds the log.
+    /// Only confirmations retire on a timer. A failure the user never saw is
+    /// worse than one that waits: the header carries its severity until the
+    /// operation that raised it resolves it or the reader dismisses it.
     fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
         self.entries.iter().rev()
     }
@@ -463,7 +539,20 @@ impl TransientNotice {
         Self {
             severity,
             message: message.into(),
+            details: None,
+            key: None,
         }
+    }
+
+    /// Ties the notice to the operation that raised it; see [`NoticeKey`].
+    fn keyed(mut self, key: NoticeKey) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
     }
 
     fn success(message: impl Into<String>) -> Self {
@@ -4428,6 +4517,8 @@ pub enum Message {
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
     DismissAllNotices,
+    /// The earliest confirmation in the notice log is due to retire.
+    ExpireNotices,
 }
 
 /// An application exit in progress.
@@ -11453,6 +11544,27 @@ impl Cagents {
         })
     }
 
+    /// How a notice names a pane: quoted, as its tab shows it. The notice log
+    /// is shared by every pane, so "this conversation" would not say which.
+    fn notice_pane_name(&self, card: CardId) -> Option<String> {
+        self.card_state(card)
+            .map(|state| format!("“{}”", self.card_display_title(state)))
+    }
+
+    /// Withdraws whatever `key` reported, because its condition no longer
+    /// holds, including a report raised earlier in this same update that the
+    /// log has not drained yet.
+    fn resolve_notice(&mut self, key: NoticeKey) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|notice| notice.key == Some(key))
+        {
+            self.status = None;
+        }
+        self.notices.resolve(key);
+    }
+
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .durable
@@ -11488,14 +11600,28 @@ impl Cagents {
                 | CardRuntime::Work => Ok(()),
             };
             if failure.is_none() {
-                failure = result.err();
+                failure = result.err().map(|error| (*id, visible, error));
             }
         }
-        if let Some(error) = failure {
-            self.status = Some(TransientNotice::error(format!(
-                "could not update workspace visibility: {error}"
-            )));
-        }
+        // Visibility is reapplied on every pass, so a pass that reaches every
+        // pane is what resolves an earlier failure.
+        let Some((card, visible, error)) = failure else {
+            self.resolve_notice(NoticeKey::SurfaceVisibility);
+            return;
+        };
+        let pane = self
+            .notice_pane_name(card)
+            .unwrap_or_else(|| "A pane".to_owned());
+        let message = if visible {
+            format!("{pane} may not show its latest content.")
+        } else {
+            format!("{pane} may keep updating while hidden.")
+        };
+        self.status = Some(
+            TransientNotice::warning(message)
+                .with_details(error)
+                .keyed(NoticeKey::SurfaceVisibility),
+        );
     }
 
     /// The focused card when it is a repository card showing an editable
@@ -16773,6 +16899,10 @@ impl Application for Cagents {
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
             }
+            Message::ExpireNotices => {
+                self.notices.expire(Instant::now());
+                self.reconcile_notice_popup()
+            }
             Message::DirectoryFilesLoaded {
                 key,
                 request,
@@ -16944,15 +17074,22 @@ impl Application for Cagents {
             self.sync_worktree_protections();
         }
         self.sync_popup_keyboard_nav();
+        // The transport wording the health banner replaces may sit in either
+        // part of a notice: a reworded one keeps the raw reason as detail.
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
+            && !notice
+                .details
+                .as_deref()
+                .is_some_and(crate::daemon_health::replaces_notice)
         {
+            let details = notice.details.as_deref();
             match notice.severity {
                 NoticeSeverity::Error => {
-                    tracing::error!(message = %notice.message, "application notice")
+                    tracing::error!(message = %notice.message, details, "application notice")
                 }
                 NoticeSeverity::Warning => {
-                    tracing::warn!(message = %notice.message, "application notice")
+                    tracing::warn!(message = %notice.message, details, "application notice")
                 }
                 NoticeSeverity::Success => {}
             }
@@ -17024,6 +17161,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.notification_subscription(),
+            self.notice_expiry_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
             self.review_request_subscription(),
@@ -20576,6 +20714,112 @@ mod tests {
         }
     }
 
+    /// A key names one operation on one object: raising it again replaces
+    /// its report, a success replaces its failure, and resolving it withdraws
+    /// the report without touching anything else.
+    #[test]
+    fn keyed_notices_replace_and_resolve_their_own_report() {
+        let card = CardId::new();
+        let key = NoticeKey::ChatAttach(card);
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::warning("unrelated"));
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("Exact native chat not found")
+                .keyed(key),
+        );
+        let first = log.recent().next().unwrap().id;
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("daemon refused")
+                .keyed(key),
+        );
+        assert_eq!(log.len(), 2, "re-raising a key replaces its report");
+        let replaced = log.recent().next().unwrap();
+        assert_eq!(replaced.notice.details.as_deref(), Some("daemon refused"));
+        assert_ne!(replaced.id, first, "a Dismiss for the old report is stale");
+        // An identical report under the same key is a repeat, as unkeyed.
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("daemon refused")
+                .keyed(key),
+        );
+        assert_eq!(log.recent().next().unwrap().repeats, 2);
+
+        // Another object's report under the same operation is its own.
+        let other = NoticeKey::ChatAttach(CardId::new());
+        log.record(TransientNotice::error("Could not reopen “Other”.").keyed(other));
+        assert_eq!(log.len(), 3);
+
+        log.record(TransientNotice::success("Reopened.").keyed(key));
+        assert_eq!(log.len(), 3, "the success takes the failure's place");
+        assert!(
+            log.recent()
+                .filter(|entry| entry.notice.key == Some(key))
+                .all(|entry| entry.notice.severity == NoticeSeverity::Success)
+        );
+
+        log.resolve(other);
+        log.resolve(key);
+        let remaining = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, ["unrelated"]);
+    }
+
+    /// Confirmations retire on their own; warnings and errors wait. With
+    /// nothing left to retire there is no deadline, so no timer runs.
+    #[test]
+    fn successes_expire_and_failures_remain() {
+        let now = Instant::now();
+        let mut log = NoticeLog::default();
+        assert_eq!(log.next_expiry(), None);
+        log.record_at(TransientNotice::error("Could not reopen"), now);
+        log.record_at(TransientNotice::warning("May be stale"), now);
+        assert_eq!(log.next_expiry(), None, "nothing here retires on a timer");
+        log.record_at(TransientNotice::success("Account added."), now);
+        let later = now + Duration::from_secs(2);
+        log.record_at(TransientNotice::success("Copied."), later);
+        assert_eq!(log.next_expiry(), Some(now + NOTICE_SUCCESS_LIFETIME));
+
+        log.expire(now + NOTICE_SUCCESS_LIFETIME - Duration::from_millis(1));
+        assert_eq!(log.len(), 4, "nothing retires early");
+        log.expire(now + NOTICE_SUCCESS_LIFETIME);
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.next_expiry(), Some(later + NOTICE_SUCCESS_LIFETIME));
+
+        // A repeat of a confirmation is a fresh one, and waits afresh.
+        log.record_at(TransientNotice::success("Copied."), later + Duration::from_secs(5));
+        log.expire(later + NOTICE_SUCCESS_LIFETIME);
+        assert_eq!(log.len(), 3);
+
+        log.expire(now + Duration::from_secs(3600));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        assert_eq!(log.next_expiry(), None);
+    }
+
+    /// A burst of confirmations stays bounded without evicting a failure or a
+    /// warning that nothing has resolved.
+    #[test]
+    fn a_success_flood_preserves_unresolved_failures() {
+        let now = Instant::now();
+        let mut log = NoticeLog::default();
+        log.record_at(TransientNotice::error("Still disconnected"), now);
+        log.record_at(TransientNotice::warning("May be stale"), now);
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record_at(TransientNotice::success(format!("Copied {index}.")), now);
+            assert!(log.len() <= NOTICE_LOG_CAPACITY);
+        }
+        log.expire(now + NOTICE_SUCCESS_LIFETIME);
+        let remaining = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, ["May be stale", "Still disconnected"]);
+    }
+
     /// The log is what keeps a report from being overwritten by the next one,
     /// and capacity is the only thing bounding it: the shell raises notices
     /// from a per-poll path, so a repeating failure must not evict the history.
@@ -20610,13 +20854,20 @@ mod tests {
         log.dismiss(newest);
         assert_eq!(log.len(), 1);
 
-        // Distinct messages past capacity drop the oldest, never grow.
+        // Distinct messages past capacity drop the oldest of the lowest
+        // severity, never grow, and never push out the unresolved error.
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
-        assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.contains(&"first failure"));
+        assert!(!messages.contains(&"failure 0"));
+        assert_eq!(messages[0], format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1));
 
         log.clear();
         assert!(log.is_empty());
@@ -22811,7 +23062,11 @@ mod tests {
             app.notices
                 .entries
                 .iter()
-                .any(|entry| entry.notice.message.contains("refused the handoff")),
+                .any(|entry| entry
+                    .notice
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("refused the handoff"))),
             "the refusal is recorded as a notice, not a process abort: {:?}",
             app.notices.entries
         );

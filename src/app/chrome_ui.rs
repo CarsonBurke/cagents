@@ -588,6 +588,37 @@ mod tests {
         assert!(app.context_inspector_overlay_active);
     }
 
+    /// The expiry timer runs only while a confirmation is waiting to retire
+    /// and the reader is not looking at the notices; it fires as a message
+    /// that retires what is due.
+    #[test]
+    fn confirmations_retire_only_while_the_notices_are_closed() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.notices.record(TransientNotice::error("Still failing."));
+        assert_eq!(app.notice_expiry_deadline(), None, "an idle window arms no timer");
+        let recorded = Instant::now();
+        app.notices
+            .record_at(TransientNotice::success("Account added."), recorded);
+        let due = recorded + NOTICE_SUCCESS_LIFETIME;
+        assert_eq!(app.notice_expiry_deadline(), Some(due));
+
+        let _ = app.update_chrome(Action::ToggleNotices);
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(app.notice_expiry_deadline(), None, "nothing retires while read");
+        let _ = app.update_chrome(Action::Close);
+        assert_eq!(app.notice_expiry_deadline(), Some(due));
+
+        // Backdated, so the repeat is already due when the timer fires.
+        app.notices.record_at(
+            TransientNotice::success("Account added."),
+            recorded - NOTICE_SUCCESS_LIFETIME,
+        );
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices.severity(), Some(NoticeSeverity::Error));
+        assert_eq!(app.notice_expiry_deadline(), None);
+    }
+
     #[test]
     fn showing_a_switch_failure_keeps_its_explanation_open() {
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -1089,6 +1120,22 @@ mod tab_style_tests {
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
 
+/// The deadline a notice expiry timer is armed for. As the subscription's
+/// identity, an earlier deadline replaces the timer and an unchanged one
+/// keeps it.
+#[derive(Hash)]
+struct NoticeExpiry(Instant);
+
+fn notice_expiry_stream(
+    expiry: &NoticeExpiry,
+) -> impl cosmic::iced::futures::Stream<Item = Message> + use<> {
+    let deadline = tokio::time::Instant::from_std(expiry.0);
+    cosmic::iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline).await;
+        Message::ExpireNotices
+    })
+}
+
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
@@ -1562,6 +1609,26 @@ impl Cagents {
                 .is_some_and(SaveHealthState::is_visible)
     }
 
+    /// Wakes the shell when the earliest confirmation is due to retire, and
+    /// never otherwise: with nothing waiting to retire there is no timer.
+    ///
+    /// Nothing retires while the reader has the notices open, so an entry
+    /// does not vanish from under the pointer or the keyboard; whatever came
+    /// due meanwhile goes as soon as the popup closes.
+    pub(super) fn notice_expiry_subscription(&self) -> Subscription<Message> {
+        self.notice_expiry_deadline()
+            .map_or_else(Subscription::none, |deadline| {
+                Subscription::run_with(NoticeExpiry(deadline), notice_expiry_stream)
+            })
+    }
+
+    fn notice_expiry_deadline(&self) -> Option<Instant> {
+        if self.chrome_ui.popup == Some(Popup::Notices) {
+            return None;
+        }
+        self.notices.next_expiry()
+    }
+
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
@@ -1611,18 +1678,23 @@ impl Cagents {
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
                 for entry in self.notices.recent() {
-                    let body: Element<'_, Message> = if entry.repeats > 1 {
-                        widget::column::with_children(vec![
-                            super::notice_body(&entry.notice.message),
-                            super::notice_surface_detail(
-                                entry.notice.severity,
-                                format!("Repeated {} times", entry.repeats),
-                            ),
-                        ])
-                        .spacing(space::XS)
-                        .into()
+                    let severity = entry.notice.severity;
+                    let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    if let Some(details) = &entry.notice.details {
+                        lines.push(super::notice_surface_detail(severity, details));
+                    }
+                    if entry.repeats > 1 {
+                        lines.push(super::notice_surface_detail(
+                            severity,
+                            format!("Repeated {} times", entry.repeats),
+                        ));
+                    }
+                    let body: Element<'_, Message> = if lines.len() > 1 {
+                        widget::column::with_children(lines)
+                            .spacing(space::XS)
+                            .into()
                     } else {
-                        super::notice_body(&entry.notice.message)
+                        lines.pop().expect("a notice has its message")
                     };
                     notices.push(super::notice_surface(
                         entry.notice.severity,
