@@ -6805,14 +6805,6 @@ mod tests {
                 app.handle_chat_ui(Action::Find(target, needle.into())),
             );
             let identity = selection::logical_identity(&item.id, &path);
-            let (catalog, _) = app.chat_runtime_mut(target).unwrap().selection_document();
-            let actual = catalog
-                .owned_search_blocks(&HashSet::from([item.id.clone()]))
-                .into_iter()
-                .find(|(_, _, text)| text.contains(needle))
-                .expect("actual prepared source catalog includes the deep needle");
-            assert_eq!(actual.1, identity, "fixture logical path {path:?}");
-            assert_eq!(actual.2.find(needle), Some(byte), "fixture logical byte");
             // Stall the actual worker boundary for the single large paragraph.
             // Dropping the sender on panic releases the reclaimer immediately.
             let mut release = delayed.then(preparation::hold_retirement);
@@ -7122,6 +7114,17 @@ mod tests {
                     .find_navigation
                     .diagnostic(),
             );
+            // A collapsed tool exposes its output only after the real accepted
+            // Find plan expands it. Verify the same source oracle after that
+            // user path and actual mounted glyph, without pre-expanding it.
+            let (catalog, _) = app.chat_runtime_mut(target).unwrap().selection_document();
+            let actual = catalog
+                .owned_search_blocks(&HashSet::from([item.id.clone()]))
+                .into_iter()
+                .find(|(_, _, text)| text.contains(needle))
+                .expect("actual prepared source catalog includes the deep needle");
+            assert_eq!(actual.1, identity, "fixture logical path {path:?}");
+            assert_eq!(actual.2.find(needle), Some(byte), "fixture logical byte");
             assert_eq!(
                 app.chat_runtime_mut(target).unwrap().find_matches.len(),
                 1,
