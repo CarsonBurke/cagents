@@ -386,6 +386,20 @@ where
             );
         });
     }
+
+    #[cfg(feature = "a11y")]
+    /// get the a11y nodes for the widget
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &widget::Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        // The tooltip itself is an overlay; its trigger is the content.
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &state.children[0], cursor)
+    }
 }
 
 impl<'a, Message, Theme, Renderer> From<Tooltip<'a, Message, Theme, Renderer>>

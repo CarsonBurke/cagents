@@ -667,6 +667,18 @@ where
         self.row
             .overlay(tree, layout, renderer, viewport, translation)
     }
+
+    #[cfg(feature = "a11y")]
+    /// get the a11y nodes for the widget
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        // Wrapping only repositions children; their layouts stay one-to-one.
+        self.row.a11y_nodes(layout, state, cursor)
+    }
 }
 
 impl<'a, Message, Theme, Renderer> From<Wrapping<'a, Message, Theme, Renderer>>

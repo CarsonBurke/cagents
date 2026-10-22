@@ -341,6 +341,21 @@ where
             );
         });
     }
+
+    #[cfg(feature = "a11y")]
+    /// get the a11y nodes for the widget
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.with_element(|element| {
+            element
+                .as_widget()
+                .a11y_nodes(layout, &state.children[0], cursor)
+        })
+    }
 }
 
 #[self_referencing]

@@ -403,6 +403,30 @@ where
             translation,
         )
     }
+
+    #[cfg(feature = "a11y")]
+    /// get the a11y nodes for the widget
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::A11yTree;
+        A11yTree::join(
+            self.children
+                .iter()
+                .zip(layout.children())
+                .zip(state.children.iter())
+                .map(|((c, c_layout), state)| {
+                    c.as_widget().a11y_nodes(
+                        c_layout.with_virtual_offset(layout.virtual_offset()),
+                        state,
+                        cursor,
+                    )
+                }),
+        )
+    }
 }
 
 impl<'a, Key, Message, Theme, Renderer>
