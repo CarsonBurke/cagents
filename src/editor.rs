@@ -581,10 +581,26 @@ fn load_regular_file(
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason)));
     }
     if let Ok(format) = image::guess_format(&bytes) {
-        return Ok(decode_raster(&bytes, format)
-            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
+        match decode_raster(&bytes, format) {
+            Ok(image) => return Ok(image),
+            // A weak signature is no evidence on its own, so a file it fails
+            // to decode is classified by its bytes.
+            Err(_) if weak_signature(format) => {}
+            Err(reason) => return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason))),
+        }
     }
     Ok(FileContent::ReadOnly(reason))
+}
+
+/// Whether `format`'s signature, as `image::guess_format` matches it, is too
+/// weak to call a file an image without a name that says so: two bytes
+/// ("BM", "P1" to "P7") or printable ASCII ("DDS ", "qoif", "farbfeld",
+/// "#?RADIANCE") that text in another encoding, or another binary format,
+/// can begin with. The rest pin binary bytes (PNG, JPEG, TIFF, ICO, OpenEXR,
+/// the AVIF and WebP containers) or are distinctive enough (GIF).
+fn weak_signature(format: image::ImageFormat) -> bool {
+    use image::ImageFormat::{Bmp, Dds, Farbfeld, Hdr, Pnm, Qoi};
+    matches!(format, Bmp | Pnm | Dds | Qoi | Farbfeld | Hdr)
 }
 
 /// The editable buffer for `text`, read from `relative_path`.
@@ -1378,8 +1394,9 @@ mod tests {
         image::RgbaImage::new(MAX_IMAGE_DIMENSION + 1, 1)
             .write_to(&mut Cursor::new(&mut wide), image::ImageFormat::Png)
             .unwrap();
-        // Bytes that are not text, under any name: the signature is the
-        // evidence, so the decoder's reason is the answer.
+        // Bytes that are not text, under any name, with a strong signature:
+        // the signature is the evidence, so the decoder's reason is the
+        // answer.
         for (name, bytes) in [
             ("screenshot", truncated),
             ("screenshot.png", truncated),
@@ -1394,6 +1411,45 @@ mod tests {
                 "{name} must be refused as an image, not as {content:?}"
             );
         }
+    }
+
+    /// A weak signature counts only beside a name that says image, so a file
+    /// in another encoding that happens to begin like one is refused for
+    /// what its bytes are.
+    #[test]
+    fn a_weak_signature_without_an_image_name_is_not_evidence() {
+        let root = tempdir().unwrap();
+        for (name, bytes, reason) in [
+            (
+                "notes.txt",
+                &b"BM25 r\xe9sum\xe9\n"[..],
+                ReadOnlyReason::InvalidUtf8,
+            ),
+            (
+                "plan",
+                b"P3 caf\xe9 opens at nine\n",
+                ReadOnlyReason::InvalidUtf8,
+            ),
+            (
+                "blob",
+                b"BM\0\0\x01\x02 not a bitmap",
+                ReadOnlyReason::Binary,
+            ),
+            ("frames", b"P6\0\x01 not a pixmap", ReadOnlyReason::Binary),
+        ] {
+            fs::write(root.path().join(name), bytes).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                FileContent::ReadOnly(reason),
+                "{name}"
+            );
+        }
+        // Named as an image, the same bytes get the decoder's reason.
+        fs::write(root.path().join("notes.bmp"), b"BM25 r\xe9sum\xe9\n").unwrap();
+        assert!(matches!(
+            content(root.path(), "notes.bmp"),
+            FileContent::ReadOnly(ReadOnlyReason::Image(_))
+        ));
     }
 
     #[test]
