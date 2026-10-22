@@ -5783,8 +5783,9 @@ mod tests {
                 json!({"run_in_background":true}),
             ));
             frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
-            // Real SDK async-result correlation keeps the task→tool identity
-            // after child result removes this child from the background set.
+            // Keep accepted async-result metadata alongside task_started.
+            // The child result itself owns its terminal diagnostic; a later
+            // notification need not emit another child status patch.
             frames.push(json!({"type":"user","uuid":format!("async-{tool}"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":task},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Async agent launched successfully.","is_error":false}]}}));
         }
         frames.extend([result.clone(), terminal.clone(), result.clone(), terminal,
@@ -5804,9 +5805,9 @@ mod tests {
             .unwrap();
         assert_eq!(child.status, ToolStatus::Failed);
         assert!(!child.waiting);
-        assert!(
-            child.detail.is_empty(),
-            "terminal notification still clears transient detail"
+        assert_eq!(
+            child.detail, raw,
+            "without a later child status patch, the result's exact diagnostic remains"
         );
         assert_eq!(
             child.items.len(),
