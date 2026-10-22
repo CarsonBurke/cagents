@@ -106,8 +106,15 @@ impl ManagerNamespace {
             return Err(io::Error::other("manager peer is no longer live"));
         }
         // SAFETY: this ioctl returns a new fd for the exact pidfd's active PID
-        // namespace, or fails. It never looks up credentials.pid in /proc.
-        let namespace = unsafe { libc::ioctl(peer.as_raw_fd(), libc::PIDFD_GET_PID_NAMESPACE) };
+        // namespace, or fails. Its third argument must be explicitly zero;
+        // pidfs rejects nonzero arguments. No numeric /proc/PID lookup occurs.
+        let namespace = unsafe {
+            libc::ioctl(
+                peer.as_raw_fd(),
+                libc::PIDFD_GET_PID_NAMESPACE,
+                0 as libc::c_ulong,
+            )
+        };
         if namespace < 0 {
             return Err(io::Error::last_os_error());
         }
