@@ -12,7 +12,7 @@ const LIMIT: usize = 256;
 
 type Candidate = (Weak<Item>, Option<String>, String);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Lineage {
     edges: VecDeque<(Weak<Item>, Weak<Item>)>,
 }
@@ -32,6 +32,11 @@ fn item<'a>(snapshot: &'a Snapshot, child: Option<&str>, id: &str) -> Option<&'a
 }
 
 impl Lineage {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
     pub fn clear(&mut self) {
         self.edges.clear();
     }
