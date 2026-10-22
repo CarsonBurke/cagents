@@ -834,6 +834,7 @@ impl Gallery {
         Self {
             entries: vec![Entry {
                 id: "file".into(),
+                managed: false,
                 // Keep non-UTF8 filenames and literal URL characters exact.
                 path: Url::from_file_path(&path)
                     .map(|url| url.to_string())
@@ -1256,6 +1257,7 @@ mod tests {
         );
         assert!(remote.entries[0].label.contains("FW16 fixture"));
         let local = Gallery::file(path.clone(), None, handle.clone());
+        assert!(!remote.entries[0].managed && !local.entries[0].managed);
         assert_eq!(local.url().unwrap().to_file_path().unwrap(), path);
 
         use std::os::unix::ffi::OsStringExt;
