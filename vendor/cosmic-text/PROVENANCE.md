@@ -10,9 +10,14 @@ are not vendored. It declares the focused cagents regression target instead.
 
 Backported fix: [upstream PR #535](https://github.com/pop-os/cosmic-text/pull/535),
 head `0c5d9c507798bcb779e5fbdb48ae339face06f9c` (open when backported).
-Only `src/shape.rs` differs from the published library source: after committing
-a word-wrapped visual line, the final ellipsized line starts at the next word,
-not at the preceding separator that ordinary wrapping already omitted.
+Two library files differ from the published source:
+
+- `src/shape.rs`: after committing a word-wrapped visual line, the final
+  ellipsized line starts at the next word, not at the preceding separator that
+  ordinary wrapping already omitted.
+- `src/lib.rs`: the repository's standard `CAGENTS_CHECKOUT_ROOT` compile-time
+  anchor prevents stale reuse when worktrees share Cargo artifacts. It is
+  registered in `scripts/qualify-checkout-cache.py` with the other local patches.
 
 The fix is shared by congruent LTR and RTL spans. Incongruent spans traverse
 words backward and use an exclusive end index; that branch is unchanged.

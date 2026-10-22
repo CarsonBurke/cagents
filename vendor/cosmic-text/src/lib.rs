@@ -86,6 +86,10 @@
 // Ensure numbers are readable
 #![warn(clippy::unreadable_literal)]
 #![cfg_attr(not(feature = "std"), no_std)]
+
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 extern crate alloc;
 
 #[cfg(not(any(feature = "std", feature = "no_std")))]
