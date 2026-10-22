@@ -444,9 +444,12 @@ struct Claude {
     tool_order: VecDeque<ScopedId>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
-    /// Report-producing tasks, oldest first. Preserve their explicit native
-    /// kind through progress frames, which omit it, until final notification.
+    /// Bounded origin metadata, not running state. Preserve the explicit
+    /// native kind through progress and terminal-notification replay.
     report_tasks: VecDeque<(String, ReportTask)>,
+    /// Exact successful child failure/result and task-notification receipts,
+    /// not bodies or running work. Changed payloads remain observable.
+    failure_receipts: VecDeque<[u8; 32]>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
@@ -489,6 +492,15 @@ struct Claude {
     forced_history: bool,
 }
 impl Claude {
+    fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
+        if let Some(receipt) = receipt {
+            self.failure_receipts.push_back(receipt);
+            if self.failure_receipts.len() > MAX_TOOLS {
+                self.failure_receipts.pop_front();
+            }
+        }
+    }
+
     fn observe_title(&mut self, step: &mut Step) {
         if let Some(id) = self.session_id.clone()
             && let Some(titles) = &mut self.titles
@@ -2145,6 +2157,29 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // Reject only exact previously accepted receipts, before metadata or
+        // lifecycle bookkeeping. An old child failure cannot re-block fresh
+        // activity; parent result and unrelated SDK frames are untouched.
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+        let guarded = match string(&frame, "type") {
+            "result" => child,
+            "stream_event" => child && string(&frame["event"], "type") == "error",
+            "system" => string(&frame, "subtype") == "task_notification",
+            _ => false,
+        };
+        let receipt = if guarded {
+            scoped_failure_receipt(&frame)?
+        } else {
+            None
+        };
+        if receipt
+            .as_ref()
+            .is_some_and(|key| self.failure_receipts.contains(key))
+        {
+            return Ok(step);
+        }
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -2207,6 +2242,7 @@ impl Adapter for Claude {
                 self.tool_order.clear();
                 self.tasks.clear();
                 self.report_tasks.clear();
+                self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.stopped_agents.clear();
                 self.handed_back.clear();
@@ -2439,7 +2475,7 @@ impl Adapter for Claude {
                 }
             }
             "stream_event" => {
-                if let Some(id) = frame["uuid"].as_str() {
+                if !guarded && let Some(id) = frame["uuid"].as_str() {
                     if self.stream_events.iter().any(|seen| seen == id) {
                         return Ok(step);
                     }
@@ -2512,6 +2548,12 @@ impl Adapter for Claude {
                     if let Some(stream) = self.streams.remove(parent) {
                         self.settle(Some(parent), &stream.message);
                     }
+                    if frame["is_error"].as_bool() == Some(true) && !detail.is_empty() {
+                        step.events.push(Event::SubagentItem {
+                            id: parent.into(),
+                            item: child_failure_item(&frame, "result-error", detail.clone()),
+                        });
+                    }
                     step.events.push(Event::Subagent {
                         id: parent.into(),
                         kind: String::new(),
@@ -2522,6 +2564,7 @@ impl Adapter for Claude {
                         waiting: Some(false),
                         detail: Some(detail),
                     });
+                    self.remember_failure_receipt(receipt);
                     return Ok(step);
                 }
                 if frame["parent_tool_use_id"].is_null() {
@@ -2757,6 +2800,7 @@ impl Adapter for Claude {
             "keep_alive" => {}
             other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
+        self.remember_failure_receipt(receipt);
         Ok(step)
     }
 }
@@ -2918,6 +2962,50 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
 }
+/// Explicit child API/result failures retain their original diagnostic in
+/// history as well as transient status. A carrier identifies exact replay;
+/// without one, distinct actual receipts must never share a fabricated ID.
+fn child_failure_item(frame: &Value, source: &str, message: String) -> Item {
+    let carrier = frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut item = text_item(
+        format!("claude-{source}:{carrier}:0"),
+        Role::System,
+        message,
+        false,
+    );
+    chat::failure::mark_provider_error(Provider::Claude, &mut item);
+    item
+}
+
+/// Hash the already parsed frame without allocating another full diagnostic.
+/// UUID-less receipts have no replay authority and are always processed.
+fn scoped_failure_receipt(frame: &Value) -> Result<Option<[u8; 32]>, String> {
+    if frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    struct HashWriter(sha2::Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            sha2::Digest::update(&mut self.0, bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(<sha2::Sha256 as sha2::Digest>::new());
+    serde_json::to_writer(&mut writer, frame).map_err(|error| error.to_string())?;
+    Ok(Some(sha2::Digest::finalize(writer.0).into()))
+}
+
 /// A child frame belongs to its agent's transcript, even when Claude gives it
 /// the wire role `user` for an internal prompt or tool result.
 fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
@@ -4102,10 +4190,23 @@ impl Claude {
                 }
             }
             "ping" => {}
-            "error" => step.events.push(Event::Error {
-                message: content_text(&event["error"]),
-                fatal: false,
-            }),
+            "error" => {
+                let message = content_text(&event["error"]);
+                if !parent.is_empty() {
+                    // Transient child detail is cleared by terminal task
+                    // notifications. Keep explicit API failures in that child's
+                    // transcript as well, with the same exact original cause.
+                    step.events.push(Event::Item(child_failure_item(
+                        frame,
+                        "stream-error",
+                        message.clone(),
+                    )));
+                }
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
             other => step.events.push(Event::Error {
                 message: format!("Unsupported Claude API stream event {other}"),
                 fatal: false,
@@ -4367,18 +4468,20 @@ impl Claude {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
                 }
-                if string(frame, "subtype") == "task_started"
-                    && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
-                {
-                    let kind = if string(frame, "task_type") == "local_workflow" {
-                        ReportTask::Workflow
-                    } else {
-                        ReportTask::Agent
-                    };
+                if string(frame, "subtype") == "task_started" {
+                    // A new task identity binding retires any prior native
+                    // origin, including reuse for a Bash or unknown task.
                     self.report_tasks.retain(|(known, _)| known != task);
-                    self.report_tasks.push_back((task.into(), kind));
-                    if self.report_tasks.len() > MAX_TOOLS {
-                        self.report_tasks.pop_front();
+                    if matches!(string(frame, "task_type"), "local_agent" | "local_workflow") {
+                        let kind = if string(frame, "task_type") == "local_workflow" {
+                            ReportTask::Workflow
+                        } else {
+                            ReportTask::Agent
+                        };
+                        self.report_tasks.push_back((task.into(), kind));
+                        if self.report_tasks.len() > MAX_TOOLS {
+                            self.report_tasks.pop_front();
+                        }
                     }
                 }
                 // Headless Claude Code tells the model a task finished in a turn
@@ -4396,7 +4499,6 @@ impl Claude {
                         .report_tasks
                         .iter()
                         .find_map(|(known, kind)| (known == task).then_some(*kind));
-                    self.report_tasks.retain(|(known, _)| known != task);
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
@@ -5478,8 +5580,10 @@ mod tests {
         assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
         assert!(adapter.tasks.iter().any(|task| task == "task-live"));
         assert!(
-            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
-                if id=="failed-child" && detail==failure
+            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+                if owner=="failed-child" && id=="failed-child" && detail==failure
+                && item.id=="claude-result-error:child-result:0"
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
                 && denial.tool_use_id=="colliding-edit" && denial.tool_name=="Edit"
                 && denial.reason=="Child edit was refused"
                 && denial.tool_input.as_deref().and_then(|input|serde_json::from_str::<Value>(input).ok())==Some(child_input))
@@ -5512,7 +5616,9 @@ mod tests {
         let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
         let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
         assert!(
-            matches!(error.events.as_slice(), [Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }] if id=="waiting-child" && detail.contains(failure))
+            matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }]
+                if owner=="waiting-child" && id=="waiting-child" && detail.contains(failure)
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(detail.as_str()))
         );
         assert!(adapter.busy);
         let notice = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bash-done","status":"completed","summary":"Background command completed (exit code 0)","uuid":"bash-notice"})).unwrap();
@@ -5529,6 +5635,299 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::TurnStarted | Event::Status { .. }))
         );
+    }
+
+    #[test]
+    fn child_api_failures_survive_terminal_task_notifications_and_replay_through_runtime_store() {
+        let first = json!({"type":"connection_error","message":"Connection reset by peer\nrequest-id: original-network"});
+        let second = json!({"type":"rate_limit_error","message":"You've hit your limit · resets 1:30pm\nrequest-id: distinct-quota"});
+        let error = |carrier: &str, cause: &Value| json!({"type":"stream_event","uuid":carrier,"parent_tool_use_id":"failed-child","event":{"type":"error","error":cause}});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+        }
+        frames.push(json!({"type":"assistant","uuid":"retained-child-answer","parent_tool_use_id":"failed-child","message":{"id":"retained-child-answer","content":[{"type":"text","text":"Original child work remains visible"}]}}));
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        frames.push(json!({"type":"system","subtype":"task_notification","uuid":"terminal-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":"The child task failed"}));
+        // Exact old API frames after the terminal notification cannot erase or
+        // multiply history, or put this failed child back into waiting.
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        // The helper requires a real outcome callback, then returns the actual
+        // resident Actor/Store snapshot and proves its cat process teardown.
+        frames.push(json!({"type":"result","uuid":"parent-settlement","subtype":"success","is_error":false}));
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert!(
+            child.detail.is_empty(),
+            "terminal transient-detail cleanup remains unchanged"
+        );
+        assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
+        let failures: Vec<_> = child
+            .items
+            .iter()
+            .filter_map(|item| {
+                chat::failure::provider_error_text(Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        let first_raw = content_text(&first);
+        let second_raw = content_text(&second);
+        assert_eq!(
+            failures,
+            [
+                ("claude-stream-error:first-failure:0", first_raw.as_str()),
+                ("claude-stream-error:second-failure:0", second_raw.as_str()),
+            ]
+        );
+        assert_eq!(
+            child.items.len(),
+            3,
+            "one original answer plus two errors; replay adds no entries"
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|item| chat::failure::provider_error_text(Provider::Claude, item).is_some()),
+            "child diagnostic originals must not enter the parent transcript"
+        );
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state.error.is_none(),
+            "child API errors must never become parent failures"
+        );
+        assert!(
+            !state.busy,
+            "only the explicit parent result settles parent busy"
+        );
+        assert!(state.is_working(), "the live sibling remains genuine work");
+
+        // Without a provider carrier ID, preserve distinct actual receipts
+        // rather than guessing that identical unkeyed errors are replay.
+        let mut adapter = Claude::default();
+        let mut unkeyed = error("discarded", &first);
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let item = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(item(&a), item(&b));
+        for carrier in ["", " \t\n"] {
+            let blank = error(carrier, &first);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(
+                item(&a),
+                item(&b),
+                "a blank carrier is not replay authority"
+            );
+        }
+        let parent = adapter.receive(json!({"type":"stream_event","uuid":"root-error","event":{"type":"error","error":first}})).unwrap();
+        assert!(
+            matches!(parent.events.as_slice(), [Event::Error { .. }]),
+            "ordinary parent API errors keep their existing event representation"
+        );
+    }
+
+    #[test]
+    fn child_result_failures_keep_exact_history_across_terminal_notifications_without_parent_failure()
+     {
+        let raw = "Authentication failed: invalid_api_key\nrequest-id: exact-child-result";
+        let result = json!({"type":"result","uuid":"failed-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[raw],"usage":{"input_tokens":9000}});
+        let terminal = json!({"type":"system","subtype":"task_notification","uuid":"failed-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":raw});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+            // Real SDK async-result correlation keeps the task→tool identity
+            // after child result removes this child from the background set.
+            frames.push(json!({"type":"user","uuid":format!("async-{tool}"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":task},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Async agent launched successfully.","is_error":false}]}}));
+        }
+        frames.extend([result.clone(), terminal.clone(), result.clone(), terminal,
+            json!({"type":"result","uuid":"only-parent-settlement","subtype":"success","is_error":false})]);
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert!(
+            child.detail.is_empty(),
+            "terminal notification still clears transient detail"
+        );
+        assert_eq!(
+            child.items.len(),
+            1,
+            "stable result replay upserts only its original failure"
+        );
+        assert_eq!(child.items[0].id, "claude-result-error:failed-result:0");
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Claude, &child.items[0]),
+            Some(raw)
+        );
+        assert!(state.error.is_none());
+        assert!(!state.busy);
+        assert!(state.is_working());
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .all(|item| chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+
+        let mut adapter = Claude {
+            busy: true,
+            interruption: Some(false),
+            ..Default::default()
+        };
+        let generation = adapter.attention_generation;
+        let mut unkeyed = result.clone();
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let id = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(id(&a), id(&b));
+        for carrier in ["", " \t\n"] {
+            let mut blank = result.clone();
+            blank["uuid"] = json!(carrier);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(id(&a), id(&b));
+        }
+        assert!(adapter.busy);
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(a.events.iter().chain(&b.events).all(|event| !matches!(
+            event,
+            Event::Error { .. }
+                | Event::TurnStarted
+                | Event::TurnSettled
+                | Event::TurnFinished { .. }
+                | Event::Status { .. }
+        )));
+    }
+
+    #[test]
+    fn exact_child_failure_receipts_cannot_rollback_fresh_activity_but_changed_payloads_remain_visible()
+     {
+        for source in ["stream", "result"] {
+            let mut adapter = Claude {
+                busy: true,
+                ..Default::default()
+            };
+            adapter
+                .receive(scoped_call(
+                    None,
+                    "launch-receipt-child",
+                    "child",
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ))
+                .unwrap();
+            let started = json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"child","task_type":"local_agent"});
+            adapter.receive(started.clone()).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"async-receipt-child","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"child","content":"Async agent launched successfully."}]}})).unwrap();
+            let mut failure = if source == "stream" {
+                json!({"type":"stream_event","uuid":"actual-failure","parent_tool_use_id":"child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})
+            } else {
+                json!({"type":"result","uuid":"actual-failure","parent_tool_use_id":"child","is_error":true,"errors":["quota exceeded"]})
+            };
+            failure["session_id"] = json!("00000000-0000-4000-8000-000000000001");
+            adapter.receive(failure.clone()).unwrap();
+            let terminal = json!({"type":"system","subtype":"task_notification","task_id":"task","tool_use_id":"child","uuid":"actual-terminal","status":"failed","summary":"quota exceeded"});
+            adapter.receive(terminal.clone()).unwrap();
+            adapter.receive(started).unwrap();
+            let fresh = adapter.receive(json!({"type":"stream_event","uuid":"actual-new-work","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"new-child-message"}}})).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Subagent { id, waiting:Some(false),.. } if id=="child")));
+            let generation = adapter.attention_generation;
+            for replay in [failure.clone(), terminal] {
+                assert!(
+                    adapter.receive(replay).unwrap().events.is_empty(),
+                    "an exact old failure/result/notification cannot re-block or settle fresh child work"
+                );
+            }
+            assert!(adapter.tasks.iter().any(|task| task == "task"));
+            assert_eq!(adapter.streams["child"].message, "new-child-message");
+            assert!(adapter.busy);
+            assert_eq!(adapter.attention_generation, generation);
+            if source == "stream" {
+                failure["event"]["error"]["message"] = json!("quota exceeded; revised diagnostics");
+            } else {
+                failure["errors"] = json!(["quota exceeded; revised diagnostics"]);
+            }
+            let changed = adapter.receive(failure).unwrap();
+            assert!(changed.events.iter().any(|event| matches!(event,Event::SubagentItem { id,item }
+                if id=="child" && chat::failure::provider_error_text(Provider::Claude,item).is_some_and(|body|body.contains("revised diagnostics")))),
+                "a reused UUID with new payload remains observable");
+        }
     }
 
     #[test]
@@ -8508,8 +8907,107 @@ mod tests {
             let mut adapter = Claude::default();
             adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
             adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
-            let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"})).unwrap();
+            let notification = json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"});
+            let done = adapter.receive(notification.clone()).unwrap();
             assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
+            assert!(
+                adapter.tasks.is_empty(),
+                "origin retention is never running work"
+            );
+            assert_eq!(adapter.report_tasks.len(), usize::from(report));
+            let replay = adapter.receive(notification.clone()).unwrap();
+            assert!(
+                replay.events.is_empty(),
+                "exact replay cannot replace the original role/ID/kind/heading/raw body"
+            );
+            let mut changed = notification;
+            changed["summary"] = json!("Revised findings");
+            let changed = adapter.receive(changed).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind,summary,body,..},.. })
+                if if report { *kind==DeliveryKind::Report && summary==heading && body=="Revised findings" } else { *kind==DeliveryKind::Notice && summary=="Revised findings" && body.is_empty() })),
+                "same UUID with changed payload must still be processed");
+            // Same task ID reused for a nonreport producer must not inherit an
+            // old native-agent/workflow origin.
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":"local_bash","description":"New command"})).unwrap();
+            let command = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Command finished","uuid":"new-command-report"})).unwrap();
+            assert!(command.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind:DeliveryKind::Notice, summary,body,..},.. }) if summary=="Command finished" && body.is_empty())));
+            assert!(adapter.report_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_task_receipts_do_not_reexpose_a_handed_back_report_and_cache_stays_bounded() {
+        for kind in ["local_agent", "local_workflow"] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"actual-handback","isMeta":true,
+                "origin":{"kind":"peer","from":"task","senderTaskId":"task","body":format!("{HANDBACK_PREAMBLE}\n  Original findings"),"handback":true},
+                "message":{"role":"user","content":"unused"}})).unwrap();
+            let mut notification = json!({"type":"system","subtype":"task_notification","task_id":"task","uuid":"terminal-after-handback","status":"completed","summary":"Original findings"});
+            let done = adapter.receive(notification.clone()).unwrap();
+            assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Notice,body,..},..}) if body.is_empty())));
+            assert!(
+                adapter
+                    .receive(notification.clone())
+                    .unwrap()
+                    .events
+                    .is_empty(),
+                "exact replay must not consume handoff state again or re-expose its body"
+            );
+            notification["summary"] = json!("Revised findings");
+            let changed = adapter.receive(notification.clone()).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification["uuid"] = json!("fresh-report");
+            let fresh = adapter.receive(notification.clone()).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification.as_object_mut().unwrap().remove("uuid");
+            for _ in 0..2 {
+                assert!(
+                    adapter
+                        .receive(notification.clone())
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|event| matches!(
+                            event,
+                            Event::Item(Item {
+                                content: ItemContent::Delivery { .. },
+                                ..
+                            })
+                        )),
+                    "missing UUID never authorizes global replay suppression"
+                );
+            }
+            for carrier in ["", " \t\n"] {
+                notification["uuid"] = json!(carrier);
+                for _ in 0..2 {
+                    assert!(
+                        adapter
+                            .receive(notification.clone())
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|event| matches!(
+                                event,
+                                Event::Item(Item {
+                                    content: ItemContent::Delivery { .. },
+                                    ..
+                                })
+                            )),
+                        "blank UUID does not suppress an actual notification"
+                    );
+                }
+            }
+            for index in 0..=MAX_TOOLS {
+                notification["uuid"] = json!(format!("bounded-{index}"));
+                adapter.receive(notification.clone()).unwrap();
+            }
+            assert_eq!(adapter.failure_receipts.len(), MAX_TOOLS);
+            assert!(adapter.tasks.is_empty());
+            adapter
+                .receive(json!({"type":"conversation_reset"}))
+                .unwrap();
+            assert!(adapter.failure_receipts.is_empty());
             assert!(adapter.report_tasks.is_empty());
         }
     }

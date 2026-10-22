@@ -3916,6 +3916,83 @@ impl Runtime {
                 })))
                 .into()
         };
+        if *kind == chat::DeliveryKind::Report {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // Preserve an explicit task outcome even when its name needs to
+            // shorten. This is report presentation, not failure inference:
+            // arbitrary report prose never becomes a parent account error.
+            let short = [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|ending| {
+                    heading
+                        .strip_suffix(ending)
+                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
+                })
+                .unwrap_or_else(|| Self::short_description(&heading, 96));
+            let disclosure = widget::button::custom(design::caption(if expanded {
+                "Hide details"
+            } else {
+                "Details"
+            }))
+            .name(format!(
+                "{} report details: {heading}",
+                if expanded { "Hide" } else { "Show" }
+            ))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(action(Action::Toggle(self.target, item.id.clone())));
+            let copy = widget::button::custom(design::caption("Copy report"))
+                .name(format!("Copy original report: {heading}"))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Copy(
+                    self.target,
+                    item.id.clone(),
+                    CopyPart::Text,
+                )));
+            let mut rows = vec![
+                widget::row::with_children(vec![
+                    glyph(Icon::Chat),
+                    crate::interaction::tooltip(
+                        design::caption(short).width(Length::Fill),
+                        heading.clone(),
+                    )
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+                widget::row::with_children(vec![disclosure.into(), copy.into()])
+                    .spacing(step::GAP_S)
+                    .into(),
+            ];
+            if expanded {
+                if !sender.is_empty() && !heading.contains(sender) {
+                    rows.push(selectable_prose::plain(
+                        format!("Sender: {sender}"),
+                        design::TEXT_CAPTION,
+                        iced::Font::MONOSPACE,
+                        self.target,
+                    ));
+                }
+                rows.push(selectable_prose::plain(
+                    heading,
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+                if !body.is_empty() {
+                    rows.push(prose::view(
+                        cached,
+                        settings,
+                        self.target,
+                        self.find.as_deref(),
+                    ));
+                }
+            }
+            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+                .max_width(design::READABLE_MEASURE)
+                .width(Length::Fill)
+                .into();
+        }
         if *kind == chat::DeliveryKind::Notice {
             let mut rows = vec![
                 widget::row::with_children(vec![

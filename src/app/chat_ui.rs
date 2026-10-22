@@ -998,6 +998,7 @@ struct CachedItem {
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
     diagnostic: bool,
+    report_expanded: Option<bool>,
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
@@ -1141,6 +1142,14 @@ impl CachedItem {
         };
         let mut cached = Self {
             diagnostic: false,
+            report_expanded: matches!(
+                content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                }
+            )
+            .then_some(expanded),
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             tool_output,
@@ -1170,7 +1179,19 @@ impl CachedItem {
         }
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
-                if let Some(body) = Self::prose(content) {
+                // Reports stay wholly behind their disclosure, including a
+                // one-line API diagnostic. Keep large hidden reports out of
+                // Markdown preparation; Toggle and Find prepare the original
+                // body when they explicitly open it.
+                let hidden_report = !expanded
+                    && matches!(
+                        content,
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        }
+                    );
+                if !hidden_report && let Some(body) = Self::prose(content) {
                     cached.extend(body, growing, theme);
                 }
             }
@@ -2906,6 +2927,38 @@ impl Runtime {
                 &mut HashMap::new(),
             );
         }
+        // A temporary Find reveal owns the report's parsed body too. Drop it
+        // again when search restores a collapsed report; manual disclosures
+        // retain both their state and their prepared body.
+        fn collapse_reports(
+            cache: &mut HashMap<String, CachedItem>,
+            expanded: &HashSet<String>,
+            theme: crate::settings::EditorSyntaxTheme,
+        ) {
+            let closed: Vec<_> = cache
+                .iter()
+                .filter_map(|(id, cached)| {
+                    (cached.report_expanded == Some(true) && !expanded.contains(id))
+                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
+                        .flatten()
+                })
+                .collect();
+            for (id, item) in closed {
+                let previous = cache.remove(&id);
+                let mut cached =
+                    CachedItem::updated(&item.content, theme, previous, false, false, None);
+                cached.item = Some(item);
+                cache.insert(id, cached);
+            }
+        }
+        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
+        if let Some(child) = &self.selected_subagent {
+            collapse_reports(
+                &mut self.child_cache,
+                self.child_expanded.entry(child.clone()).or_default(),
+                self.syntax_theme,
+            );
+        }
     }
 
     fn find_anchor(&self, key: &str) -> iced::advanced::widget::Id {
@@ -2951,7 +3004,14 @@ impl Runtime {
                         && matches!(item.content, ItemContent::Text { .. }))
             }
         };
-        let delivery = matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query));
+        let delivery = match &item.content {
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                ..
+            } => contains_text(&item.content, query),
+            ItemContent::Delivery { body, .. } => find::contains(body, query),
+            _ => false,
+        };
         let expand = (raw && contains_text(&item.content, query)) || delivery;
         let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
         for part in parts {
@@ -4012,13 +4072,38 @@ impl Cagents {
                 if let Some(item) = runtime.snapshot.items.get(*index)
                     && match &item.content {
                         ItemContent::Text { text, .. } => find::contains(text, &query),
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        } => contains_text(&item.content, &query),
                         ItemContent::Delivery { body, .. } => find::contains(body, &query),
                         _ => false,
                     }
                 {
-                    runtime
+                    let changed = runtime
                         .find_disclosure
                         .item(&item.id, &mut runtime.expanded);
+                    if changed
+                        && matches!(
+                            item.content,
+                            ItemContent::Delivery {
+                                kind: chat::DeliveryKind::Report,
+                                ..
+                            }
+                        )
+                    {
+                        let previous = runtime.cache.remove(&item.id);
+                        let mut cached = CachedItem::updated(
+                            &item.content,
+                            runtime.syntax_theme,
+                            previous,
+                            true,
+                            false,
+                            None,
+                        );
+                        cached.item = Some(item.clone());
+                        runtime.cache.insert(item.id.clone(), cached);
+                    }
                 }
             }
         }

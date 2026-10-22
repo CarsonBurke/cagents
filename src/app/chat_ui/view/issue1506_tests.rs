@@ -1075,3 +1075,349 @@ fn expanded_diagnostic_preview_and_copy_follow_changed_sources_with_the_same_key
         }
     }
 }
+
+fn task_report(id: &str, summary: String, body: String) -> chat::Item {
+    chat::Item {
+        id: id.into(),
+        role: Role::User,
+        at: None,
+        started_at: None,
+        content: ItemContent::Delivery {
+            kind: chat::DeliveryKind::Report,
+            from: String::new(),
+            sender: "task-report-sender".into(),
+            summary,
+            body,
+        },
+    }
+}
+
+#[derive(Default)]
+struct ReportSurface {
+    text: Vec<String>,
+    accessible: Vec<String>,
+}
+
+fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    impl Operation for ReportSurface {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.text.push(text.to_owned());
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
+                self.text.push(prose.plain.to_string());
+            }
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let item = runtime.active_item(id).expect("current report source");
+    let mut element = runtime.delivery_view(
+        item,
+        &runtime.presentation_cache()[id],
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 12000.0)),
+    );
+    let mut result = ReportSurface::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut result);
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    result.accessible = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .flat_map(|node| [node.node().label(), node.node().value()])
+        .flatten()
+        .map(str::to_owned)
+        .collect();
+    result
+}
+
+#[test]
+fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy() {
+    use iced::futures::StreamExt;
+    let long_name =
+        "Review implementation and ownership with a deliberately long task name ".repeat(8);
+    for (outcome, body) in [
+        (
+            " finished",
+            "SHORT_REPORT_BODY quota exceeded is quoted task output, not a parent failure."
+                .to_owned(),
+        ),
+        (
+            " failed",
+            format!(
+                "HUGE_RAW_REPORT_BODY\n{}\nHUGE_REPORT_END",
+                "{\"request\":\"quota exceeded\",\"raw\":true}\n".repeat(60_000)
+            ),
+        ),
+        (
+            " was stopped",
+            "STOPPED_REPORT_BODY with raw diagnostics".to_owned(),
+        ),
+    ] {
+        let heading = format!("Agent \"{long_name}\"{outcome}");
+        if outcome == " failed" {
+            assert!(
+                body.len() >= 2 * 1024 * 1024,
+                "exercise a genuinely huge raw report"
+            );
+        }
+        let report = task_report("task-report", heading.clone(), body.clone());
+        let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&report));
+        let target = runtime.target;
+        let original = runtime.snapshot.items[0].clone();
+        assert!(
+            runtime.failure_ui.incidents.is_empty(),
+            "report prose is not a provider error carrier"
+        );
+        let cached = &runtime.cache["task-report"];
+        assert!(cached.markdown.items().is_empty());
+        assert!(cached.blocks.is_empty());
+        assert!(!cached.source.provisional());
+        assert_eq!(cached.source.retained_tail_capacity(), 0);
+        let surface = report_surface(&runtime, "task-report");
+        assert!(
+            surface
+                .accessible
+                .contains(&format!("Show report details: {heading}"))
+        );
+        assert!(
+            surface
+                .accessible
+                .contains(&format!("Copy original report: {heading}"))
+        );
+        assert!(!surface.text.iter().any(|text| text == &heading));
+        assert!(
+            surface.text.iter().any(|text| text.ends_with(outcome)
+                && text.contains('…')
+                && text.chars().count() <= 73 + outcome.chars().count()),
+            "compact task identity must preserve {outcome}: {:?}",
+            surface.text
+        );
+        let marker = body.lines().next().unwrap();
+        assert!(
+            !surface
+                .text
+                .iter()
+                .chain(&surface.accessible)
+                .any(|text| text.contains(marker)),
+            "even short report bodies stay behind Details"
+        );
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let copy = app.handle_chat_ui(Action::Copy(target, "task-report".into(), CopyPart::Text));
+        let copied = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects =
+                    iced::runtime::task::into_stream(copy).expect("actual Copy action");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Clipboard(
+                            iced::runtime::clipboard::Action::Write { contents, .. },
+                        ) = effect
+                        {
+                            return contents;
+                        }
+                    }
+                    panic!("Copy report must publish original bytes");
+                })
+                .await
+                .expect("bounded clipboard effect")
+            });
+        assert_eq!(copied, format!("{heading}\n\n{body}"));
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(Arc::ptr_eq(&original, &live.snapshot.items[0]));
+        assert_eq!(live.snapshot.items[0].as_ref(), &report);
+        assert!(
+            live.cache["task-report"].markdown.items().is_empty(),
+            "Copy must not parse hidden Markdown"
+        );
+    }
+}
+
+#[test]
+fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure() {
+    let needle = "REPORT_LATE_FIND_NEEDLE";
+    let body = format!(
+        "# Full Markdown report\n\n{}\n```rust\nlet report_value = 7;\n```\n\n{needle}\n",
+        "A report paragraph with quoted quota exceeded diagnostic prose.\n\n".repeat(48)
+    );
+    let heading = "Agent \"Detailed review\" finished";
+    for selected_child in [false, true] {
+        let report = task_report("disclosed-report", heading.into(), body.clone());
+        let (mut runtime, handle) = frame_cost::live_runtime(if selected_child {
+            &[]
+        } else {
+            std::slice::from_ref(&report)
+        });
+        if selected_child {
+            let mut snapshot = runtime.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            let mut agent = child("report-child", ToolStatus::Succeeded, false);
+            agent.items = vec![Arc::new(report.clone())];
+            snapshot.subagents = vec![agent];
+            handle.publish_snapshot_for_test(snapshot);
+            runtime.refresh();
+        }
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        if selected_child {
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("report-child".into()))));
+        }
+        let original = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .active_item("disclosed-report")
+            .unwrap()
+            .clone();
+        for temporary_find in [false, true] {
+            if temporary_find {
+                drop(app.handle_chat_ui(Action::Find(target, needle.into())));
+            } else {
+                drop(app.handle_chat_ui(Action::Toggle(target, "disclosed-report".into())));
+            }
+            let live = app.chat_runtime_mut(target).unwrap();
+            assert!(
+                live.item_expanded("disclosed-report"),
+                "child={selected_child}, Find={temporary_find}"
+            );
+            let cached = &live.presentation_cache()["disclosed-report"];
+            assert!(
+                !cached.markdown.items().is_empty(),
+                "explicit disclosure must prepare original Markdown"
+            );
+            assert!(
+                !cached.blocks.is_empty(),
+                "the original fenced code block is prepared too"
+            );
+            assert!(!cached.source.provisional());
+            let surface = report_surface(live, "disclosed-report");
+            assert!(surface.text.iter().any(|text| text == heading));
+            assert!(
+                surface.text.iter().any(|text| text.contains(needle)),
+                "the late body match must actually be rendered"
+            );
+            assert!(
+                surface
+                    .accessible
+                    .contains(&format!("Hide report details: {heading}"))
+            );
+            assert!(live.failure_ui.incidents.is_empty());
+            if temporary_find {
+                assert!(!live.find_matches.is_empty());
+                drop(app.handle_chat_ui(Action::CloseFind(target)));
+            } else {
+                drop(app.handle_chat_ui(Action::Toggle(target, "disclosed-report".into())));
+            }
+            let live = app.chat_runtime_mut(target).unwrap();
+            assert!(!live.item_expanded("disclosed-report"));
+            let cached = &live.presentation_cache()["disclosed-report"];
+            assert!(
+                cached.markdown.items().is_empty(),
+                "collapse releases parsed report Markdown"
+            );
+            assert!(cached.blocks.is_empty());
+            assert!(!cached.source.provisional());
+            assert_eq!(cached.source.retained_tail_capacity(), 0);
+            let collapsed = report_surface(live, "disclosed-report");
+            assert!(
+                !collapsed
+                    .text
+                    .iter()
+                    .chain(&collapsed.accessible)
+                    .any(|text| text.contains(needle))
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                live.active_item("disclosed-report").unwrap()
+            ));
+            assert_eq!(
+                copy_text(CopyPart::Text, &original.content),
+                Some(format!("{heading}\n\n{body}"))
+            );
+        }
+        // The full opaque sender is indexed even when its suffix is absent
+        // from the compact/full heading and the report body.
+        let sender_suffix = "report-sender";
+        assert!(!heading.contains(sender_suffix) && !body.contains(sender_suffix));
+        drop(app.handle_chat_ui(Action::Find(target, sender_suffix.into())));
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(!live.find_matches.is_empty());
+        assert!(
+            live.item_expanded("disclosed-report"),
+            "metadata Find must reveal the matching report"
+        );
+        let metadata = report_surface(live, "disclosed-report");
+        assert!(
+            metadata
+                .text
+                .iter()
+                .any(|text| text == "Sender: task-report-sender"),
+            "the indexed opaque sender suffix must actually be visible"
+        );
+        assert_eq!(
+            copy_text(CopyPart::Text, &original.content),
+            Some(format!("{heading}\n\n{body}"))
+        );
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(!live.item_expanded("disclosed-report"));
+        assert!(
+            live.presentation_cache()["disclosed-report"]
+                .markdown
+                .items()
+                .is_empty()
+        );
+        assert!(
+            !report_surface(live, "disclosed-report")
+                .text
+                .iter()
+                .any(|text| text.contains(sender_suffix))
+        );
+
+        // Search restores its own temporary disclosure, never a reader's
+        // explicit Details choice, even when no publication arrives.
+        drop(app.handle_chat_ui(Action::Toggle(target, "disclosed-report".into())));
+        drop(app.handle_chat_ui(Action::Find(target, needle.into())));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let live = app.chat_runtime_mut(target).unwrap();
+        assert!(live.item_expanded("disclosed-report"));
+        assert!(
+            !live.presentation_cache()["disclosed-report"]
+                .markdown
+                .items()
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            live.active_item("disclosed-report").unwrap()
+        ));
+    }
+}
