@@ -1847,7 +1847,7 @@ mod tests {
     fn managed_mapping_limit_refuses_before_any_sentinel_path_lookup_or_payload_read() {
         let device = uuid::Uuid::new_v4();
         let mut attachments = vec![chat::Attachment::file(
-            "/must-not-read-before-image-mapping-limit.txt".into(),
+            "/must-not-read-before-image-mapping-limit.txt",
         )];
         attachments.extend((1..=129).map(|number| chat::Attachment {
             path: format!("/must-not-read-before-image-mapping-limit-{number}.png").into(),

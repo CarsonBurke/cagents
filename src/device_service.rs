@@ -816,9 +816,13 @@ mod tests {
                 version: crate::terminal::ipc::PROTOCOL_VERSION,
                 request_id: Some(u64::MAX),
                 proof: crate::model::HostSessionProof {
-                    host_session_id: uuid::Uuid::new_v4().to_string(),
-                    boot_id: uuid::Uuid::new_v4().to_string(),
-                    host_incarnation: uuid::Uuid::new_v4().to_string(),
+                    host_session_id: crate::model::HostSessionId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                    boot_id: crate::model::BootId::new(uuid::Uuid::new_v4().to_string()),
+                    host_incarnation: crate::model::HostIncarnation::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
                 },
                 message: crate::terminal::ipc::ServerMessage::Response {
                     response: crate::terminal::ipc::ServerResponse::DeviceOperation {
