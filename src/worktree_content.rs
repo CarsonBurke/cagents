@@ -164,7 +164,9 @@ impl std::fmt::Display for Operation {
 
 /// A stash-shaped commit holding a worktree's uncommitted content: its tree is
 /// `W`, and its parents are HEAD, the index and, when there are any, the
-/// untracked files. `git stash apply --index <refname>` restores it.
+/// untracked files. `git stash apply --index <refname>` restores it. A Git
+/// LFS file is kept as its pointer; `git lfs prune` may delete an object only
+/// a snapshot refers to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub refname: String,

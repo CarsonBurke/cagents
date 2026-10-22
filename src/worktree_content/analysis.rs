@@ -15,6 +15,8 @@ const MINIMUM_GIT: (u32, u32) = (2, 40);
 /// Content an analysis hashes or compares beyond what is committed. Past this
 /// the worktree needs a human.
 const CONTENT_LIMIT: u64 = 1 << 30;
+/// Git LFS files are only hashed, never copied, so they get more room.
+const LFS_LIMIT: u64 = 16 << 30;
 /// Directory entries the nested-repository walk visits.
 const WALK_LIMIT: u64 = 5_000_000;
 const LISTED: usize = 100;
@@ -259,13 +261,13 @@ impl Git<'_> {
             .map(str::to_owned))
     }
 
-    /// `(path, value)` of one attribute for each of `paths`.
+    /// Each of `names` for each of `paths`.
     fn attributes(
         &self,
         paths: &[Vec<u8>],
         names: &[&str],
         source: Option<&str>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>, ContentError> {
+    ) -> Result<Vec<Attribute>, ContentError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -280,11 +282,16 @@ impl Git<'_> {
             .split(|byte| *byte == 0)
             .collect::<Vec<_>>();
         Ok(fields
-            .chunks_exact(3)
-            .map(|record| (record[0].to_vec(), record[1].to_vec(), record[2].to_vec()))
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|[path, name, value]| (path.to_vec(), name.to_vec(), value.to_vec()))
             .collect())
     }
 }
+
+/// `(path, attribute, value)`, as `check-attr` prints them.
+type Attribute = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// The merge drivers the repository's config defines. Git consults them before
 /// its built-in drivers, so one may hide behind a built-in name.
@@ -491,7 +498,7 @@ fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentEr
                 walk.blocker = Some(Blocker::TooManyFiles { limit: WALK_LIMIT });
                 return Ok(walk);
             }
-            if visited % 4096 == 0 && cancellation.is_cancelled() {
+            if visited.is_multiple_of(4096) && cancellation.is_cancelled() {
                 return Err(ContentError::Cancelled);
             }
             let name = entry.file_name();
@@ -600,7 +607,7 @@ fn collapse_ident(content: &[u8]) -> Vec<u8> {
 /// Present files whose content a clean filter, `ident` or a working-tree
 /// encoding changes on the way in, so that what Git stores does not give back
 /// the file. Every such file counts when together they are too large to
-/// compare.
+/// compare: Git LFS files past [`LFS_LIMIT`], others past [`CONTENT_LIMIT`].
 fn filtered(
     git: &Git,
     worktree: &Path,
@@ -658,21 +665,25 @@ fn filtered(
         entry.0 &= flags.0 && name == b"filter";
         entry.1 |= flags.1;
     }
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let bytes = candidates
-        .keys()
-        .filter_map(|path| worktree.join(OsStr::from_bytes(path)).metadata().ok())
-        .map(|metadata| metadata.len())
-        .sum::<u64>();
-    if bytes > CONTENT_LIMIT {
-        return Ok(candidates.into_keys().collect());
-    }
-    let mut lossy = Vec::new();
     let (lfs, checkout): (Vec<_>, Vec<_>) = candidates
         .into_iter()
         .partition(|(_, (lfs, ident))| *lfs && !*ident);
+    let bytes = |set: &[(Vec<u8>, (bool, bool))]| {
+        set.iter()
+            .filter_map(|(path, _)| worktree.join(OsStr::from_bytes(path)).metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>()
+    };
+    let mut lossy = Vec::new();
+    let mut within = |set: Vec<(Vec<u8>, (bool, bool))>, limit: u64| {
+        if bytes(&set) <= limit {
+            return set;
+        }
+        lossy.extend(set.into_iter().map(|(path, _)| path));
+        Vec::new()
+    };
+    let lfs = within(lfs, LFS_LIMIT);
+    let checkout = within(checkout, CONTENT_LIMIT);
     if !lfs.is_empty() {
         let input = lfs.iter().fold(Vec::new(), |mut input, (path, _)| {
             input.extend_from_slice(&blobs[path]);
