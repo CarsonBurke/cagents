@@ -40,7 +40,12 @@ pub(super) fn links(request: &chat::Request) -> Vec<(String, String)> {
 }
 
 fn add(label: &str, uri: &str, output: &mut Vec<(String, String)>) {
-    if output.len() == MAX_LINKS || uri.len() > 4096 || output.iter().any(|(_, old)| old == uri) {
+    if output.len() == MAX_LINKS
+        || uri.is_empty()
+        || uri.starts_with('#')
+        || uri.len() > 4096
+        || output.iter().any(|(_, old)| old == uri)
+    {
         return;
     }
     let web = match Url::parse(uri) {
@@ -151,5 +156,15 @@ mod tests {
         assert_eq!(links(&question(&many)).len(), MAX_LINKS);
         let oversized = format!("{} [late](hidden.png)", "界".repeat(MAX_TEXT));
         assert!(links(&question(&oversized)).is_empty());
+    }
+
+    #[test]
+    fn review_artifacts_require_a_destination_beyond_the_question_itself() {
+        assert_eq!(
+            links(&question(
+                "[empty]() [section](#details) [real](docs/image.png#details)"
+            )),
+            vec![("real".into(), "docs/image.png#details".into())]
+        );
     }
 }
