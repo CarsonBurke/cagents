@@ -418,17 +418,50 @@ impl Omp {
                 at: None,
             }];
         }
-        message["content"]
+        let blocks = message["content"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mapping = if role == Role::User
+            && blocks
+                .first()
+                .is_some_and(|block| text(block, "type") == "text")
+            && blocks.len() > 1
+            && blocks[1..]
+                .iter()
+                .all(|block| text(block, "type") == "image")
+        {
+            let sources = blocks[1..]
+                .iter()
+                .map(|block| {
+                    format!(
+                        "data:{};base64,{}",
+                        text(block, "mimeType"),
+                        text(block, "data")
+                    )
+                })
+                .collect::<Vec<_>>();
+            super::image_references::restore_list(text(&blocks[0], "text"), &sources)
+        } else {
+            None
+        };
+        blocks
+            .iter()
             .enumerate()
             .filter_map(|(index, block)| {
                 let (id, content) = match text(block, "type") {
                     "text" => (
                         format!("{key}:{index}"),
                         ItemContent::Text {
-                            text: text(block, "text").into(),
+                            text: if index == 0 {
+                                mapping
+                                    .as_ref()
+                                    .map(|(plain, _)| *plain)
+                                    .unwrap_or_else(|| text(block, "text"))
+                                    .into()
+                            } else {
+                                text(block, "text").into()
+                            },
                             thinking: false,
                             phase: phase(block),
                         },
@@ -454,12 +487,28 @@ impl Omp {
                     "image" => (
                         format!("{key}:{index}"),
                         ItemContent::Image {
+                            reference: mapping.as_ref().and_then(|(_, refs)| {
+                                index
+                                    .checked_sub(1)
+                                    .and_then(|index| refs.get(index))
+                                    .cloned()
+                                    .flatten()
+                            }),
                             path: format!(
                                 "data:{};base64,{}",
                                 text(block, "mimeType"),
                                 text(block, "data")
                             ),
-                            description: "Image attachment".into(),
+                            description: mapping
+                                .as_ref()
+                                .and_then(|(_, refs)| {
+                                    index
+                                        .checked_sub(1)
+                                        .and_then(|index| refs.get(index))
+                                        .and_then(Option::as_ref)
+                                })
+                                .map(|reference| reference.label())
+                                .unwrap_or_else(|| "Image attachment".into()),
                         },
                     ),
                     _ => return None,
@@ -744,21 +793,27 @@ impl Adapter for Omp {
                 }
                 let kind=match mode {PromptMode::Send=>"prompt",PromptMode::Steer=>"steer",PromptMode::Queue=>"follow_up"};
                 let mut request=self.request(kind);
+                let ordered = super::image_references::ordered(&message, &attachments)?;
                 let mut message=message;
                 let mut images=Vec::new();
-                for attachment in attachments {
+                let mut references=Vec::new();
+                for attachment in ordered {
+                    crate::chat::attachment_assets::validate(attachment)?;
                     let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
                     let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
                     let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
                     if let Some(mime)=mime {
                         let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take(MAX_IMAGE+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
                         if bytes.len() as u64>MAX_IMAGE {return Err("Image exceeds the 16 MiB attachment limit.".into());}
+                        references.push(attachment.reference.clone());
                         images.push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(bytes)}));
                     } else {
                         message.push_str("\nAttached file (read this exact path): "); message.push_str(&serde_json::to_string(&path.to_string_lossy()).map_err(|e|e.to_string())?);
                     }
                 }
+                if references.iter().any(Option::is_some) { message.push_str(&super::image_references::image_list(&references)?); }
                 request["message"]=message.into(); if !images.is_empty(){request["images"]=images.into();}
+                for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 step.writes.push(request);
             }
             Command::Interrupt => step.writes.push(self.request("abort")),
@@ -1760,6 +1815,77 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_image_array_mapping_restores_only_verified_retained_history() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!(
+                "Before {} between {} after",
+                second_ref.token(),
+                first_ref.token()
+            );
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: text.clone(),
+                    attachments: vec![first.clone(), second.clone()],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let request = &submitted.writes[0];
+            let images = request["images"].as_array().unwrap();
+            assert_eq!(images.len(), 2);
+            assert_eq!(
+                STANDARD
+                    .decode(images[0]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&second.path).unwrap()
+            );
+            let mut content = vec![json!({"type":"text","text":request["message"]})];
+            content.extend(images.iter().cloned());
+            let mut history = json!({"role":"user","id":"omp-images","content":content});
+            let restored = adapter.message_items(&history);
+            assert!(
+                matches!(&restored[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            let identities = restored
+                .iter()
+                .filter_map(|item| match &item.content {
+                    ItemContent::Image {
+                        reference: Some(reference),
+                        ..
+                    } => Some(reference.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(identities, [second_ref.id, first_ref.id]);
+            history["content"][1]["data"] = json!(STANDARD.encode(b"different image"));
+            let untrusted = adapter.message_items(&history);
+            assert!(
+                matches!(&untrusted[0].content, ItemContent::Text { text: visible, .. } if visible.contains("cagents-image-inputs"))
+            );
+            assert!(untrusted.iter().all(|item| !matches!(
+                &item.content,
+                ItemContent::Image {
+                    reference: Some(_),
+                    ..
+                }
+            )));
+            history["content"] = json!(request["message"]);
+            let unavailable = adapter.message_items(&history);
+            assert_eq!(
+                unavailable.len(),
+                1,
+                "text-only provider history never manufactures image items"
+            );
+        });
+    }
 
     #[test]
     fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {

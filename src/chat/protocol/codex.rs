@@ -891,12 +891,29 @@ impl Codex {
             let inputs = array(entry, "input")?;
             let mut parts = Vec::new();
             let mut attachments = Vec::new();
-            for input in inputs {
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            for (index, pair) in inputs.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && pair[1]["type"] == "localImage"
+                    && let (Some(marker), Some(path)) =
+                        (pair[0]["text"].as_str(), pair[1]["path"].as_str())
+                    && let Some(reference) = super::image_references::restore(marker, path)
+                {
+                    synthetic.insert(index);
+                    references.insert(index + 1, reference);
+                }
+            }
+            for (index, input) in inputs.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 parts.push(match input["type"].as_str() {
                     Some("text") => string(input, "text")?.to_owned(),
                     Some("localImage") => {
                         attachments.push(chat::Attachment {
                             path: string(input, "path")?.into(),
+                            reference: references.remove(&index),
                         });
                         continue;
                     }
@@ -917,7 +934,9 @@ impl Codex {
             // sent, and local images.
             let texts = inputs
                 .iter()
-                .filter(|input| input["type"] == "text")
+                .enumerate()
+                .filter(|(index, input)| input["type"] == "text" && !synthetic.contains(index))
+                .map(|(_, input)| input)
                 .collect::<Vec<_>>();
             let named = texts
                 .first()
@@ -1279,6 +1298,7 @@ impl Codex {
         // Each skill the text names goes with it as an input of its own, as
         // Codex's own composer sends one: the text names a skill only by its
         // name, which loads nothing when two skills share it.
+        let attachments = super::image_references::ordered(&text, &attachments)?;
         let skills = self.named_skills(&text);
         if !text.is_empty() {
             input.push(json!({"type":"text","text":text}));
@@ -1289,19 +1309,25 @@ impl Codex {
                 .map(|(name, path)| json!({"type":"skill","name":name,"path":path})),
         );
         for attachment in attachments {
+            crate::chat::attachment_assets::validate(attachment)?;
             if !self.capabilities().attachments {
                 return Err("The selected Codex model does not advertise image input".into());
             }
             let path = if attachment.path.is_absolute() {
-                attachment.path
+                attachment.path.clone()
             } else {
-                self.cwd.join(attachment.path)
+                self.cwd.join(&attachment.path)
             };
             if !crate::chat::is_image_path(&path) {
                 return Err("Codex native attachments support local images (PNG/JPEG/GIF/WebP), not arbitrary files".into());
             }
             if !path.is_file() {
                 return Err(format!("Attachment is not a file: {}", path.display()));
+            }
+            if let Some(reference) = &attachment.reference {
+                input.push(
+                    json!({"type":"text","text":super::image_references::marker(reference)?}),
+                );
             }
             input.push(json!({"type":"localImage","path":path.to_str().ok_or("Attachment path is not UTF-8")?}));
         }
@@ -1672,7 +1698,13 @@ impl Adapter for Codex {
         match command {
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
-                let input = self.input(text, attachments)?;
+                let input = self.input(text, attachments.clone())?;
+                match mode {
+                    PromptMode::Send if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) => return Err("A Codex turn is active; explicitly steer or queue instead".into()),
+                    PromptMode::Steer if self.turn.is_none() => return Err("There is no known active Codex turn to steer".into()),
+                    _ => {}
+                }
+                for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
@@ -3564,7 +3596,26 @@ fn parse_item_with_windows(
         }],
         "userMessage" => {
             let mut items = Vec::new();
-            for (index, content) in array(value, "content")?.iter().enumerate() {
+            let contents = array(value, "content")?;
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            for (index, pair) in contents.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && matches!(pair[1]["type"].as_str(), Some("localImage" | "image"))
+                    && let (Some(marker), Some(source)) = (
+                        pair[0]["text"].as_str(),
+                        pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
+                    )
+                    && let Some(reference) = super::image_references::restore(marker, source)
+                {
+                    synthetic.insert(index);
+                    references.insert(index + 1, reference);
+                }
+            }
+            for (index, content) in contents.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 let part_id = format!("{id}/input/{index}");
                 match content["type"].as_str().unwrap_or_default() {
                     "text" => items.push(text(
@@ -3577,12 +3628,16 @@ fn parse_item_with_windows(
                         id: part_id,
                         role: Role::User,
                         content: ItemContent::Image {
+                            reference: references.get(&index).cloned(),
                             path: content["path"]
                                 .as_str()
                                 .or_else(|| content["url"].as_str())
                                 .ok_or("Missing image path")?
                                 .into(),
-                            description: "User attachment".into(),
+                            description: references
+                                .get(&index)
+                                .map(|reference| reference.label())
+                                .unwrap_or_else(|| "User attachment".into()),
                         },
                         started_at: None,
                         at: None,
@@ -3711,6 +3766,7 @@ fn parse_item_with_windows(
             id: id.into(),
             role: Role::Assistant,
             content: ItemContent::Image {
+                reference: None,
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
@@ -3745,6 +3801,7 @@ fn parse_item_with_windows(
                         started_at: None,
                         at: None,
                         content: ItemContent::Image {
+                            reference: None,
                             path,
                             description: "Generated image".into(),
                         },
@@ -4033,6 +4090,164 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_image_is_real_provider_input_and_survives_history_and_queue() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let reference = attachment.reference.clone().unwrap();
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let text = format!("Before {} after", reference.token());
+            let input = adapter
+                .input(text.clone(), vec![attachment.clone()])
+                .unwrap();
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(
+                input[2],
+                json!({"type":"localImage","path":attachment.path.to_str().unwrap()})
+            );
+            assert_eq!(
+                std::fs::read(&attachment.path).unwrap()[..8],
+                [137, 80, 78, 71, 13, 10, 26, 10]
+            );
+            let items = parse_item(
+                &json!({"type":"userMessage","id":"images","content":input}),
+                true,
+                "turn",
+            )
+            .unwrap();
+            assert_eq!(items.len(), 2, "only the verified mapping is hidden");
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path == attachment.path.to_str().unwrap() && description == &reference.label())
+            );
+            let mut step = Step::default();
+            adapter
+                .queue_page(
+                    &json!({"data":[{"id":"queued-image","input":input}],"nextCursor":null}),
+                    &mut step,
+                )
+                .unwrap();
+            let queued = step
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::QueueChanged(messages) => messages.first(),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(queued.editable);
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [attachment.clone()]);
+            let resent = adapter
+                .input(queued.text.clone(), queued.attachments.clone())
+                .unwrap();
+            assert_eq!(
+                resent, input,
+                "take-back and retry preserve identity and real image input"
+            );
+
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            let forged = json!({"type":"userMessage","id":"forged","content":[
+                {"type":"text","text":super::super::image_references::marker(&forged).unwrap()},
+                {"type":"localImage","path":attachment.path.to_str().unwrap()}
+            ]});
+            let items = parse_item(&forged, true, "turn").unwrap();
+            assert_eq!(items.len(), 2, "unverified prose remains visible");
+            assert!(matches!(
+                &items[1].content,
+                ItemContent::Image {
+                    reference: None,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn multiple_image_inputs_follow_caret_order_without_renumbering() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!(
+                "Compare {} before {} and again {}",
+                second_ref.token(),
+                first_ref.token(),
+                second_ref.token()
+            );
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let input = adapter
+                .input(text.clone(), vec![first.clone(), second.clone()])
+                .unwrap();
+            assert_eq!(input[0]["text"], text);
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(input[2]["path"], second.path.to_str().unwrap());
+            assert_eq!(
+                input[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(input[4]["path"], first.path.to_str().unwrap());
+            assert!(adapter.input(text, vec![first.clone(), first]).is_err());
+        });
+    }
+
+    #[test]
+    fn image_only_legacy_and_foreign_references_keep_their_distinct_contracts() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let image_only = adapter
+                .input(String::new(), vec![attachment.clone()])
+                .unwrap();
+            assert_eq!(image_only.len(), 2);
+            assert_eq!(image_only[1]["type"], "localImage");
+            let legacy = adapter
+                .input(
+                    "[Image 1] literal".into(),
+                    vec![Attachment::file(&attachment.path)],
+                )
+                .unwrap();
+            assert_eq!(
+                legacy.len(),
+                2,
+                "legacy files do not acquire a UUID from text"
+            );
+            let mut foreign = attachment.clone();
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let error = adapter.input(String::new(), vec![foreign]).unwrap_err();
+            assert!(
+                !error.contains("Attachment is not a file"),
+                "foreign origin is refused before path access: {error}"
+            );
+            adapter.modalities.clear();
+            assert!(
+                adapter
+                    .input(String::new(), vec![attachment])
+                    .unwrap_err()
+                    .contains("does not advertise image")
+            );
+        });
+    }
 
     fn output_window_command(output: &str) -> Value {
         json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
@@ -5068,7 +5283,7 @@ mod tests {
         );
         assert_eq!(page.writes[0]["params"]["cursor"], "page2");
         let last = adapter.receive(json!({"id":page.writes[0]["id"],"result":{"data":[{"id":"q2","input":[{"type":"localImage","path":"/fixture/image.png"}]}],"nextCursor":null}})).unwrap();
-        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into() }])));
+        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into(), reference: None }])));
         let changed = adapter
             .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
             .unwrap();

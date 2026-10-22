@@ -8,6 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 mod claude_titles;
 pub mod codex;
+mod image_references;
 pub mod omp;
 mod terminal_output;
 
