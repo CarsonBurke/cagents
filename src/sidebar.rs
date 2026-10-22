@@ -4629,16 +4629,17 @@ fn lists_kept_attention_rows(projects: &[FilteredProject<'_>]) -> bool {
 /// without them. It closes the list rather than heading it: appearing above
 /// the rows on the first read would push every row down, the very move the
 /// kept rows avoid. It names no count: a search or a collapsed project can
-/// hide kept rows that hiding still drops.
+/// hide kept rows that hiding still drops. Its name extends the visible
+/// "Hide read" to say it drops handled rows too, keeping the label within it.
 fn hide_read_attention(compact: bool, modal_open: bool) -> Element<'static, SidebarAction> {
     let action = gated(SidebarAction::HideReadAttention, modal_open);
     let id = stable_id("attention.hide_read");
     if compact {
-        return icon_action(Icon::Private, "Hide read rows", action, id);
+        return icon_action(Icon::Hide, "Hide read and handled rows", action, id);
     }
     widget::container(
         crate::ui_controls::button::quiet("Hide read")
-            .name("Hide read rows")
+            .name("Hide read and handled rows")
             .on_press_maybe(action)
             .id(id),
     )
@@ -15454,11 +15455,15 @@ pub(crate) mod tests {
             assert_eq!(hide(&model, &state, compact, false), 1, "compact={compact}");
             assert_eq!(hide(&model, &state, compact, true), 0, "a dialog is up");
         }
-        let names = accessible_names(&renderer, project_list(&model, &state, false, false));
-        assert!(
-            names.iter().any(|name| name == "Hide read rows"),
-            "{names:?}"
-        );
+        for compact in [false, true] {
+            let names = accessible_names(&renderer, project_list(&model, &state, compact, false));
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name == "Hide read and handled rows"),
+                "compact={compact}: {names:?}"
+            );
+        }
 
         // News arriving again draws the row as news, not as read.
         state.observe_agent_update(in_worktree, project, worktree);
