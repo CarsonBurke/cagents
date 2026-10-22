@@ -416,6 +416,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 viewport.top
             };
             let range = visible(&state.offsets, top, viewport.height);
+            // A measurement in this layout can shrink the mounted source
+            // below the old observed viewport. Keep this pass's native owners
+            // until the parent refreshes that viewport; dropping them here can
+            // discard the ready geometry that produced the shrink. An empty
+            // window on the first pass still evicts genuinely offscreen rows.
+            if range.is_empty() && !nodes.is_empty() {
+                break;
+            }
             state.realized = range.clone();
             let mut previous: HashMap<_, _> = state
                 .mounted
@@ -912,6 +920,131 @@ impl Operation for UpdateViewport {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn measured_shrink_keeps_mounted_flow_until_parent_refresh_and_offscreen_evicts() {
+        use std::cell::RefCell;
+
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let cache = flow_layout::Cache::default();
+        let owner = Rc::new(RefCell::new(std::rc::Weak::new()));
+        let spans: Arc<[iced::widget::text::Span<'static, markdown::Uri>]> =
+            vec![iced::widget::text::Span::new(
+                "geometry source ".repeat(256),
+            )]
+            .into();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 9_600.0,
+            height: 400.0,
+            bottom: false,
+        })));
+        let reader = |height: f32| {
+            let cache = cache.clone();
+            let owner = owner.clone();
+            let spans = spans.clone();
+            column(
+                vec![Row::new(
+                    7,
+                    u64::from(height.to_bits()),
+                    10_000.0,
+                    None,
+                    move || {
+                        let flow = cache.entry(7, spans.clone());
+                        *owner.borrow_mut() = Rc::downgrade(&flow);
+                        widget::container(selectable_prose::flow_source(
+                            iced::Pixels(14.0),
+                            iced::Font::default(),
+                            target,
+                            None,
+                            selectable_prose::Logical {
+                                identity: 7,
+                                start: 0,
+                            },
+                            flow,
+                        ))
+                        .height(height)
+                        .into()
+                    },
+                )],
+                window.clone(),
+            )
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut element = reader(10_000.0);
+        let mut tree = Tree::new(&element);
+        let initial = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(initial.size().height, 10_000.0);
+        let original = owner.borrow().clone();
+        assert!(
+            original.upgrade().is_some(),
+            "the actual mounted Flow owns its geometry"
+        );
+
+        // Model an asynchronous measurement replacing a larger estimate while
+        // the parent still observes its old end window. The real native tree
+        // and weak Flow cache must keep the same owner through this layout.
+        element = reader(1_000.0);
+        tree.diff(element.as_widget_mut());
+        let shrunk = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert_eq!(shrunk.size().height, 1_000.0);
+        assert!(
+            original.upgrade().is_some(),
+            "own measurement must not evict ready Flow before its parent refreshes"
+        );
+        assert_eq!(tree.children.len(), 1);
+
+        window.set(Some(Viewport {
+            top: 600.0,
+            height: 400.0,
+            bottom: false,
+        }));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            original.upgrade().is_some(),
+            "the refreshed intersecting viewport reuses its existing owner"
+        );
+
+        // A later authoritative viewport really is past this whole column.
+        // It must release both the native tree and the row's element, rather
+        // than clamp every local viewport into its own content and pin it.
+        window.set(Some(Viewport {
+            top: 10_000.0,
+            height: 400.0,
+            bottom: false,
+        }));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(tree.children.is_empty());
+        assert!(
+            original.upgrade().is_none(),
+            "genuinely offscreen Flow must retire"
+        );
+
+        window.set(Some(Viewport {
+            top: 0.0,
+            height: 400.0,
+            bottom: false,
+        }));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(
+            owner.borrow().upgrade().is_some(),
+            "normal reentry rebuilds the evicted owner"
+        );
+        assert!(original.upgrade().is_none());
+    }
 
     #[test]
     fn empty_virtual_windows_settle_and_reenter_after_native_scroll() {
