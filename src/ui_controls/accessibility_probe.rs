@@ -74,11 +74,23 @@ pub(crate) fn headless_renderer() -> cosmic::Renderer {
 }
 
 /// Lays `element` out within `max` and returns the accessible name and bounds
-/// of every button it exposes, in tree order. An unnamed button reports "".
+/// of every button it exposes. An unnamed button reports "". Buttons come in
+/// `A11yTree` order: every top-level node, then every descendant. Sibling
+/// buttons keep their widget order, but this is not reading order in general.
 pub(crate) fn accessible_buttons<Message>(
-    mut element: cosmic::Element<'_, Message>,
+    element: cosmic::Element<'_, Message>,
     max: Size,
 ) -> Vec<(String, iced_accessibility::accesskit::Rect)> {
+    laid_out_buttons(element, max).1
+}
+
+fn laid_out_buttons<Message>(
+    mut element: cosmic::Element<'_, Message>,
+    max: Size,
+) -> (
+    layout::Node,
+    Vec<(String, iced_accessibility::accesskit::Rect)>,
+) {
     let renderer = headless_renderer();
     let mut tree = Tree::new(element.as_widget());
     let node =
@@ -89,7 +101,7 @@ pub(crate) fn accessible_buttons<Message>(
         element
             .as_widget()
             .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    accessible
+    let buttons = accessible
         .root()
         .iter()
         .chain(accessible.children())
@@ -101,13 +113,15 @@ pub(crate) fn accessible_buttons<Message>(
                 node.bounds().expect("buttons report bounds"),
             )
         })
-        .collect()
+        .collect();
+    (node, buttons)
 }
 
 /// Upstream wrappers must forward their children's accessibility nodes; the
 /// trait default reports none, which hides every control inside them.
 mod tests {
-    use super::accessible_buttons;
+    use super::{accessible_buttons, laid_out_buttons};
+    use cosmic::iced::advanced::Layout;
     use cosmic::iced::{Length, Size};
     use cosmic::{Element, widget};
     use iced_accessibility::accesskit::Rect;
@@ -132,39 +146,61 @@ mod tests {
         assert_eq!(names, labels, "{wrapper} must expose its buttons by name");
     }
 
+    /// Each button reports the bounds its wrapped child layout received, and
+    /// the layout really wrapped: the buttons start more than one `line`.
+    fn assert_wrapped(
+        element: Element<'static, ()>,
+        max: Size,
+        line: fn(&Rect) -> f64,
+        wrapper: &str,
+    ) {
+        let (node, found) = laid_out_buttons(element, max);
+        assert_named(&found, &LABELS, wrapper);
+        let laid_out = Layout::new(&node)
+            .children()
+            .map(|child| {
+                let bounds = child.bounds();
+                Rect::new(
+                    f64::from(bounds.x),
+                    f64::from(bounds.y),
+                    f64::from(bounds.x + bounds.width),
+                    f64::from(bounds.y + bounds.height),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reported = found.iter().map(|(_, bounds)| *bounds).collect::<Vec<_>>();
+        assert_eq!(reported, laid_out, "{wrapper} reports wrapped bounds");
+        let mut lines = laid_out.iter().map(line).collect::<Vec<_>>();
+        lines.dedup();
+        assert!(lines.len() > 1, "{wrapper} did not wrap: {laid_out:?}");
+    }
+
     #[test]
     fn wrapping_rows_and_columns_expose_children_at_their_wrapped_positions() {
-        let found = accessible_buttons(
+        // No two buttons fit in 60 across or, at 28 high plus spacing, in 50
+        // down, so each starts its own line whatever the font metrics.
+        assert_wrapped(
             widget::row::with_children(buttons())
                 .spacing(8)
                 .wrap()
                 .into(),
-            Size::new(200.0, 600.0),
+            Size::new(60.0, 600.0),
+            |bounds| bounds.y0,
+            "a wrapping row",
         );
-        assert_named(&found, &LABELS, "a wrapping row");
-        let (first, last) = (found[0].1, found[3].1);
-        assert!(
-            last.y0 >= first.y1 && last.x0 == first.x0,
-            "the last button wraps to a new line under the first: {found:?}"
-        );
-
-        let found = accessible_buttons(
+        assert_wrapped(
             widget::column::with_children(buttons())
                 .spacing(8)
                 .wrap()
                 .into(),
-            Size::new(600.0, 80.0),
-        );
-        assert_named(&found, &LABELS, "a wrapping column");
-        let (first, last) = (found[0].1, found[3].1);
-        assert!(
-            last.x0 >= first.x1 && last.y0 == first.y0,
-            "the last button wraps to a new column beside the first: {found:?}"
+            Size::new(600.0, 50.0),
+            |bounds| bounds.x0,
+            "a wrapping column",
         );
     }
 
     #[test]
-    fn keyed_lazy_and_tooltip_wrappers_expose_their_content() {
+    fn single_child_and_keyed_wrappers_expose_their_content() {
         let max = Size::new(600.0, 600.0);
         let keyed = cosmic::iced::widget::keyed::Column::with_children(
             LABELS
