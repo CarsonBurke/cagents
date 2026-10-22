@@ -3629,7 +3629,11 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
             chat::ItemContent::Delivery { body, .. } if body == &sent.message.body)
             })
             .count();
-        if deliveries == 1 && handle.is_idle() {
+        let provider_prompts = std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count();
+        if deliveries == 1 && provider_prompts == 2 && handle.is_idle() {
             assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
             assert_eq!(
                 snapshot
