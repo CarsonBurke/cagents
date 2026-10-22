@@ -14,7 +14,7 @@ use crate::fs_safety::{self, Root};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(any(feature = "ui", test))]
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::BTreeMap,
@@ -161,7 +161,7 @@ impl Store {
         }
         self.write(REGISTRY, &bytes, true)
     }
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     fn initialize(&self) -> Result<Registry, String> {
         match fs_safety::metadata_beneath(&self.root, Path::new(REGISTRY)) {
             Ok(_) => return self.read_registry(),
@@ -288,7 +288,7 @@ impl Store {
     }
 
     /// Caller has validated real image decoding under UI's shared budgets.
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     pub(crate) fn stage_validated(
         &self,
         bytes: &[u8],
@@ -350,11 +350,12 @@ impl Store {
             reference: Some(reference),
         })
     }
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     fn remove_private_temporary(&self, name: &OsStr) -> Result<(), String> {
         self.private_file(name.to_str().ok_or("Invalid temporary image filename")?)?;
         fs_safety::unlink_within(&self.root, name).map_err(storage_error)
     }
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
         let mut unrecognized = false;
         for (count, entry) in std::fs::read_dir(self.root.process_path())
@@ -413,7 +414,7 @@ impl Store {
 /// Exact create_temporary_in naming contract: 128 random bits as lowercase
 /// hex. Recognition is limited to our private store while its writer lock is
 /// held, followed by nofollow/singly-linked/private validation before unlink.
-#[cfg(any(feature = "ui", test))]
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 fn is_staging_temporary(name: &OsStr) -> bool {
     name.to_str()
         .and_then(|s| s.strip_prefix(".cagents-tmp-"))
@@ -543,7 +544,7 @@ fn storage_error(error: impl std::fmt::Display) -> String {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-#[cfg(any(feature = "ui", test))]
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
 fn now_ms() -> Result<u64, String> {
     u64::try_from(
         SystemTime::now()
@@ -572,6 +573,7 @@ fn store(create: bool) -> Result<Store, String> {
 /// Reconstruct a draft candidate without filesystem IO on the UI thread.
 /// This is not authorization: validate/retain must verify its UUID receipt,
 /// physical device and bytes before any thumbnail or provider file read.
+#[cfg(feature = "ui")]
 pub(crate) fn unverified_attachment(reference: &ImageReference) -> Result<Attachment, String> {
     reference.validate()?;
     Ok(Attachment {
