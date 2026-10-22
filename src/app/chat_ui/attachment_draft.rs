@@ -78,6 +78,25 @@ pub(super) fn mapped(cursor: Cursor, change: &TextChange) -> Option<Cursor> {
     })
 }
 
+/// IDs below are constructed by cagents' provider decoders, not image labels
+/// or model prose. Strip only the final canonical block suffix, retaining any
+/// delimiters inside the provider's opaque message identity. This groups
+/// adjacent image-only user messages without borrowing another turn's text.
+pub(super) fn message_key(provider: crate::agent::Provider, item_id: &str) -> Option<&str> {
+    let (message, index) = match provider {
+        crate::agent::Provider::Codex => item_id.rsplit_once("/input/")?,
+        crate::agent::Provider::Claude | crate::agent::Provider::Omp => item_id.rsplit_once(':')?,
+    };
+    if message.is_empty()
+        || index.is_empty()
+        || !index.bytes().all(|b| b.is_ascii_digit())
+        || index.parse::<usize>().ok()?.to_string() != index
+    {
+        return None;
+    }
+    Some(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +176,40 @@ mod tests {
                     "alpha !beta gamma",
                     "left-edge concurrent insertion must not be selected by the late paste"
                 );
+            }
+        }
+    }
+    #[test]
+    fn native_message_keys_strip_only_canonical_final_provider_block_suffixes() {
+        use crate::agent::Provider;
+        for (provider, text, image, expected) in [
+            (
+                Provider::Codex,
+                "raw/input/nested/input/0",
+                "raw/input/nested/input/2",
+                "raw/input/nested",
+            ),
+            (Provider::Claude, "raw:uuid:0", "raw:uuid:2", "raw:uuid"),
+            (
+                Provider::Omp,
+                r#"user:"2026-10-22T00:00:00Z":0"#,
+                r#"user:"2026-10-22T00:00:00Z":2"#,
+                r#"user:"2026-10-22T00:00:00Z""#,
+            ),
+        ] {
+            assert_eq!(message_key(provider, text), Some(expected));
+            assert_eq!(message_key(provider, image), Some(expected));
+        }
+        for provider in [Provider::Codex, Provider::Claude, Provider::Omp] {
+            for bad in [
+                "unknown",
+                ":",
+                "/input/",
+                "raw/input/01",
+                "raw:01",
+                "raw:184467440737095516160",
+            ] {
+                assert!(message_key(provider, bad).is_none());
             }
         }
     }

@@ -1729,7 +1729,7 @@ pub(super) struct Runtime {
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
-    history_images: HashMap<String, Vec<Attachment>>,
+    history_images: Vec<Vec<Attachment>>,
     history_attachment_stash: Option<Vec<Attachment>>,
     /// Which entry the composer is showing while the reader walks the
     /// history; `None` while they are writing.
@@ -2265,11 +2265,11 @@ impl Runtime {
         self.remember_with_attachments(sent, Vec::new());
     }
     fn remember_with_attachments(&mut self, sent: String, attachments: Vec<Attachment>) {
-        if self.history.last() != Some(&sent) {
-            self.history.push(sent.clone());
-        }
-        if !attachments.is_empty() {
-            self.history_images.insert(sent, attachments);
+        self.history_images
+            .resize_with(self.history.len(), Vec::new);
+        if self.history.last() != Some(&sent) || self.history_images.last() != Some(&attachments) {
+            self.history.push(sent);
+            self.history_images.push(attachments);
         }
         self.history_cursor = None;
         self.history_stash = None;
@@ -2311,7 +2311,7 @@ impl Runtime {
                     .filter(|attachment| attachment.reference.is_none())
                     .cloned()
                     .collect::<Vec<_>>();
-                if let Some(images) = self.history_images.get(&self.history[index]) {
+                if let Some(images) = self.history_images.get(index) {
                     attachments.extend(images.clone());
                 }
                 attachments
@@ -2491,7 +2491,7 @@ impl Runtime {
             picker_focus: 0,
             picker_keyboard: false,
             history: Vec::new(),
-            history_images: HashMap::new(),
+            history_images: Vec::new(),
             history_attachment_stash: None,
             history_cursor: None,
             history_stash: None,
@@ -2875,14 +2875,20 @@ impl Runtime {
         if self.history_cursor.is_none() {
             self.history.clear();
             self.history_images.clear();
-            let mut prompt: Option<String> = None;
+            let mut prompt: Option<(String, usize, bool)> = None;
             for item in &snapshot.items {
                 match (&item.role, &item.content) {
-                    (chat::Role::User, ItemContent::Text { text, .. })
-                        if !text.trim().is_empty() =>
-                    {
+                    (chat::Role::User, ItemContent::Text { text, .. }) => {
+                        // A blank original user block still starts a fresh
+                        // image-only prompt instead of borrowing older prose.
+                        let index = self.history.len();
                         self.history.push(text.clone());
-                        prompt = Some(text.clone());
+                        self.history_images.push(Vec::new());
+                        let key =
+                            attachment_draft::message_key(self.session.launch.provider, &item.id)
+                                .unwrap_or(&item.id)
+                                .to_owned();
+                        prompt = Some((key, index, text.trim().is_empty()));
                     }
                     (
                         chat::Role::User,
@@ -2894,21 +2900,43 @@ impl Runtime {
                         if let Ok(attachment) =
                             chat::attachment_assets::unverified_attachment(reference)
                         {
-                            let text = prompt.get_or_insert_with(|| {
-                                let text = reference.token();
-                                self.history.push(text.clone());
-                                text
-                            });
-                            self.history_images
-                                .entry(text.clone())
-                                .or_default()
-                                .push(attachment);
+                            let key = attachment_draft::message_key(
+                                self.session.launch.provider,
+                                &item.id,
+                            )
+                            .unwrap_or(&item.id)
+                            .to_owned();
+                            if prompt
+                                .as_ref()
+                                .is_none_or(|(current, _, _)| current != &key)
+                            {
+                                let index = self.history.len();
+                                self.history.push(String::new());
+                                self.history_images.push(Vec::new());
+                                prompt = Some((key, index, true));
+                            }
+                            let (_, index, image_only) = prompt.as_ref().unwrap();
+                            let (index, image_only) = (*index, *image_only);
+                            if image_only {
+                                if !self.history[index].is_empty() {
+                                    self.history[index].push(' ');
+                                }
+                                self.history[index].push_str(&reference.token());
+                            }
+                            self.history_images[index].push(attachment);
                         }
                     }
                     (chat::Role::User, _) => {}
                     _ => prompt = None,
                 }
             }
+            // Preserve index alignment while omitting empty nonimage records.
+            let pairs = std::mem::take(&mut self.history)
+                .into_iter()
+                .zip(std::mem::take(&mut self.history_images))
+                .filter(|(text, images)| !text.trim().is_empty() || !images.is_empty())
+                .collect::<Vec<_>>();
+            (self.history, self.history_images) = pairs.into_iter().unzip();
         }
         let live_ids: HashSet<&str> = snapshot
             .items
@@ -5328,6 +5356,11 @@ impl Cagents {
             .drafts
             .get(&card)
             .is_some_and(|draft| !draft.is_empty())
+            || self
+                .chat_ui
+                .draft_attachments
+                .get(&card)
+                .is_some_and(|images| !images.is_empty())
     }
 
     pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
@@ -6818,6 +6851,13 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        let Some(bookmark) = runtime.attachment_bookmarks.get(&id) else {
+            return Task::none();
+        };
+        if !bookmark.valid {
+            runtime.cancel_attachment_insert(id, Some("The image insertion point changed while loading. Attach the image again at the new caret.".into()));
+            return Task::none();
+        }
         if crate::device::is_remote() {
             runtime.cancel_attachment_insert(
                 id,
@@ -8011,7 +8051,11 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime.attachment_bookmarks.contains_key(&id) {
+                let Some(bookmark) = runtime.attachment_bookmarks.get(&id) else {
+                    return Task::none();
+                };
+                if !bookmark.valid {
+                    runtime.cancel_attachment_insert(id, Some("The image insertion point changed while loading. Attach the image again at the new caret.".into()));
                     return Task::none();
                 }
                 let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
@@ -8110,8 +8154,9 @@ impl Cagents {
                         return self.handle_chat_ui(Action::Submit(target, mode));
                     }
                 }
-                // No direct unlink: a late/cancelled draft is bounded by the
-                // store's draft expiry, and may be referenced by another view.
+                // No direct unlink: a late/cancelled draft may be referenced
+                // by another view. The hard quota and explicit scoped cleanup
+                // bound storage without guessing persisted-draft liveness.
             }
             Action::AttachmentsPrepared(target, id, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -9166,8 +9211,13 @@ impl Cagents {
                             }
                         }
                         if !files.is_empty() {
-                            let id = runtime.begin_attachment_insert();
-                            staged = Some((id, files));
+                            if runtime.pastes_pending >= 2 {
+                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                rest.extend(files.into_iter().map(file_drop::Item::File));
+                            } else {
+                                let id = runtime.begin_attachment_insert();
+                                staged = Some((id, files));
+                            }
                         }
                         file_drop::Dropped::Items(rest)
                     }
@@ -14729,6 +14779,222 @@ mod tests {
             assert_eq!(attachments, [sent.clone(), draft.clone()]);
             assert_eq!(attachments[0].reference, sent.reference);
             assert_eq!(attachments[1].reference, draft.reference);
+        });
+    }
+
+    #[test]
+    fn identical_history_prose_does_not_borrow_an_earlier_turns_image_authority() {
+        chat::attachment_assets::with_test_image(|image| {
+            let text = format!("Compare {}", image.reference.as_ref().unwrap().token());
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.remember_with_attachments(text.clone(), vec![image.clone()]);
+            runtime.remember_with_attachments(text.clone(), Vec::new());
+            assert_eq!(
+                runtime.history.len(),
+                2,
+                "same words can represent different image inputs"
+            );
+            runtime.recall(true);
+            assert_eq!(runtime.composer.text(), text);
+            assert!(
+                runtime.attachments.is_empty(),
+                "the latest prose-only message gains no image from prior history"
+            );
+            runtime.recall(true);
+            assert_eq!(runtime.attachments, [image]);
+        });
+    }
+
+    #[test]
+    fn refreshed_history_keeps_identical_prose_turns_separate_and_replays_all_image_only_inputs() {
+        chat::attachment_assets::with_test_image(|first| {
+            let second = chat::attachment_assets::test_image("second history.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("image-history"));
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .session
+                .launch
+                .provider = Provider::Codex;
+            let text = format!("Compare {}", first_ref.token());
+            let item = |id: &str, role, content| {
+                Arc::new(chat::Item {
+                    id: id.into(),
+                    role,
+                    content,
+                    started_at: None,
+                    at: None,
+                })
+            };
+            let image = |id: &str, attachment: &Attachment| {
+                item(
+                    id,
+                    chat::Role::User,
+                    ItemContent::Image {
+                        path: attachment.path.to_str().unwrap().into(),
+                        description: attachment.label(),
+                        reference: attachment.reference.clone(),
+                    },
+                )
+            };
+            let snapshot = Snapshot {
+                generation: 91,
+                items: vec![
+                    item(
+                        "old/input/0",
+                        chat::Role::User,
+                        ItemContent::Text {
+                            text: text.clone(),
+                            thinking: false,
+                            phase: chat::Phase::Final,
+                        },
+                    ),
+                    image("old/input/2", &first),
+                    item(
+                        "answer",
+                        chat::Role::Assistant,
+                        ItemContent::Text {
+                            text: "answer".into(),
+                            thinking: false,
+                            phase: chat::Phase::Final,
+                        },
+                    ),
+                    item(
+                        "new/input/0",
+                        chat::Role::User,
+                        ItemContent::Text {
+                            text: text.clone(),
+                            thinking: false,
+                            phase: chat::Phase::Final,
+                        },
+                    ),
+                ],
+                ..Default::default()
+            };
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.recall(true);
+            assert_eq!(runtime.composer.text(), text);
+            assert!(
+                runtime.attachments.is_empty(),
+                "later plain prose cannot inherit earlier real image input"
+            );
+            runtime.recall(true);
+            assert_eq!(runtime.attachments, [first.clone()]);
+            runtime.recall(false);
+            runtime.recall(false);
+            let snapshot = Snapshot {
+                generation: 92,
+                items: vec![
+                    image("only/input/0", &first),
+                    image("only/input/1", &second),
+                ],
+                ..Default::default()
+            };
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.recall(true);
+            assert_eq!(
+                runtime.composer.text(),
+                format!("{} {}", first_ref.token(), second_ref.token())
+            );
+            assert_eq!(runtime.attachments, [first.clone(), second.clone()]);
+            runtime.recall(false);
+            let snapshot = Snapshot {
+                generation: 93,
+                items: vec![image("one/input/0", &first), image("two/input/0", &second)],
+                ..Default::default()
+            };
+            show_chat_snapshot_for_test(&mut app, card, snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.recall(true);
+            assert_eq!(runtime.composer.text(), second_ref.token());
+            assert_eq!(runtime.attachments, [second.clone()]);
+            runtime.recall(true);
+            assert_eq!(runtime.composer.text(), first_ref.token());
+            assert_eq!(runtime.attachments, [first.clone()]);
+        });
+    }
+
+    #[test]
+    fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot)
+                .capabilities
+                .attachments = true;
+            runtime.attachment_chooser_pending = true;
+            let old_id = runtime.begin_attachment_insert();
+            runtime.replace_draft(text_editor::Content::with_text("replacement"));
+            let task = app.handle_chat_ui(Action::Attached(
+                target,
+                old_id,
+                Ok(Some(vec![PathBuf::from("/must-not-read-after-cancel.png")])),
+            ));
+            assert_eq!(
+                task.units(),
+                0,
+                "stale chooser result must schedule no blocking file read"
+            );
+            assert_eq!(chat_runtime(&app, card).pastes_pending, 0);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.begin_attachment_insert();
+            runtime.begin_attachment_insert();
+            for _ in 0..10 {
+                drop(
+                    app.handle_chat_ui(Action::Dropped(
+                        target,
+                        file_drop::Payload::new(
+                            "text/uri-list".into(),
+                            Url::from_file_path(&image.path)
+                                .unwrap()
+                                .as_str()
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                    )),
+                );
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.pastes_pending, 2);
+                assert_eq!(runtime.attachment_bookmarks.len(), 2);
+                assert!(runtime.attachments.is_empty());
+            }
+            assert_eq!(
+                chat::attachment_assets::list().unwrap().images.len(),
+                1,
+                "drops at capacity must not allocate invisible receipt blobs"
+            );
+            assert!(
+                chat_runtime(&app, card)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("already loading")
+            );
+        });
+    }
+
+    #[test]
+    fn metadata_only_stashed_image_draft_blocks_alias_overwrite() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alias = CardId::new();
+            let canonical = CardId::new();
+            app.chat_ui
+                .draft_attachments
+                .insert(canonical, vec![image.clone()]);
+            assert!(app.shared_chat_has_local_work(canonical));
+            assert!(!app.rekey_shared_terminal_draft(alias, canonical));
+            assert_eq!(app.chat_ui.draft_attachments[&canonical], [image]);
         });
     }
 
