@@ -2749,6 +2749,7 @@ struct CommitDraft {
     amend_loaded_message: Option<String>,
     amend_loading: bool,
     amend_read_dispatched: bool,
+    amend_read_owner: Option<ActiveWorktreeKey>,
     amend_error: Option<String>,
     amend_edited: bool,
     amend_head: Option<Oid>,
@@ -3206,14 +3207,18 @@ impl SidebarState {
         } else {
             self.parked_commit_drafts.get_mut(&key.canonical_path)
         };
-        let Some(draft) =
-            draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
-        else {
+        let Some(draft) = draft.filter(|draft| {
+            draft.amend
+                && draft.amend_loading
+                && draft.amend_read_owner.as_ref() == Some(key)
+                && draft.revision == revision
+        }) else {
             return false;
         };
         draft.set_message(message);
         draft.amend_loaded_message = Some(message.to_owned());
         draft.amend_loading = false;
+        draft.amend_read_owner = None;
         draft.amend_error = None;
         true
     }
@@ -3237,10 +3242,14 @@ impl SidebarState {
         } else {
             self.parked_commit_drafts.get_mut(&key.canonical_path)
         };
-        if let Some(draft) =
-            draft.filter(|draft| draft.amend && draft.amend_loading && draft.revision == revision)
-        {
+        if let Some(draft) = draft.filter(|draft| {
+            draft.amend
+                && draft.amend_loading
+                && draft.amend_read_owner.as_ref() == Some(key)
+                && draft.revision == revision
+        }) {
             draft.amend_loading = false;
+            draft.amend_read_owner = None;
             draft.amend_error = Some(error);
             return true;
         }
@@ -3298,6 +3307,26 @@ impl SidebarState {
             .as_ref()
             .and_then(|key| self.parked_commit_drafts.remove(&key.canonical_path))
             .unwrap_or_default();
+        if self.commit_draft.amend_loading
+            && self.commit_draft.amend_read_owner.as_ref() != next.as_ref()
+        {
+            // The user's draft follows its path, but an in-flight Git read
+            // belongs to the full identity that requested it. Its old reply
+            // cannot settle this newly bound project or worktree.
+            if let Some(stash) = self.commit_draft.amend_stash.take() {
+                self.commit_draft = *stash;
+            }
+            self.commit_draft.amend = false;
+            self.commit_draft.amend_loading = false;
+            self.commit_draft.amend_read_dispatched = false;
+            self.commit_draft.amend_read_owner = None;
+            self.commit_draft.amend_head = None;
+            self.commit_draft.amend_error = Some(
+                "Worktree changed while loading HEAD’s message. Enable Amend again to load this worktree’s commit."
+                    .into(),
+            );
+            self.revise_commit_draft();
+        }
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
@@ -3428,6 +3457,7 @@ impl SidebarState {
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
                 self.commit_draft.amend_loading = false;
+                self.commit_draft.amend_read_owner = None;
                 self.commit_draft.amend_error = None;
                 self.commit_draft.amend_edited = true;
                 self.commit_draft.set_message(message);
@@ -3442,6 +3472,7 @@ impl SidebarState {
                 self.commit_draft.subject_composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_read_owner = None;
                     self.commit_draft.amend_error = None;
                     self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
@@ -3464,6 +3495,7 @@ impl SidebarState {
                 self.commit_draft.composer.0.perform(action.clone());
                 if action.is_edit() {
                     self.commit_draft.amend_loading = false;
+                    self.commit_draft.amend_read_owner = None;
                     self.commit_draft.amend_error = None;
                     self.commit_draft.amend_edited = true;
                     self.revise_commit_draft();
@@ -3473,7 +3505,7 @@ impl SidebarState {
                     );
                 }
             }
-            SidebarAction::AmendChanged { amend, .. } => {
+            SidebarAction::AmendChanged { key, amend } => {
                 if self.commit_draft.amend != *amend {
                     if *amend {
                         let stash = std::mem::take(&mut self.commit_draft);
@@ -3482,6 +3514,7 @@ impl SidebarState {
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = true;
                         self.commit_draft.amend_read_dispatched = false;
+                        self.commit_draft.amend_read_owner = Some(key.clone());
                         self.commit_draft.amend_error = None;
                         self.commit_draft.amend_edited = false;
                     } else {
@@ -3496,6 +3529,7 @@ impl SidebarState {
                         self.commit_draft.amend_loaded_message = None;
                         self.commit_draft.amend_loading = false;
                         self.commit_draft.amend_read_dispatched = false;
+                        self.commit_draft.amend_read_owner = None;
                         self.commit_draft.amend_error = None;
                         self.commit_draft.amend_edited = false;
                         self.commit_draft.amend_head = None;
@@ -17023,6 +17057,106 @@ pub(crate) mod tests {
         });
         assert!(state.amend_error().is_none());
         assert!(state.commit_draft.ready());
+    }
+
+    #[test]
+    fn amend_pending_read_rebinds_by_full_identity_without_losing_the_original_draft() {
+        use cosmic::iced::widget::text_editor::{Cursor, Position};
+
+        for remove_first in [false, true] {
+            for late_success in [false, true] {
+                let model = panel_model();
+                let mut state = panel_state(&model);
+                let key = main_key();
+                state.apply(&SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: "Draft subject\n\nDraft body".into(),
+                });
+                let cursor = Cursor {
+                    position: Position { line: 0, column: 5 },
+                    selection: Some(Position { line: 0, column: 1 }),
+                };
+                state.commit_draft.subject_composer.0.move_to(cursor);
+                state.commit_draft.composer.0.move_to(cursor);
+                state.apply(&SidebarAction::AmendChanged {
+                    key: key.clone(),
+                    amend: true,
+                });
+                let old_revision = state.take_amend_request(&key).unwrap();
+                state.pin_amend_head(&key, old_revision, oid_of(0x11));
+
+                // Ordinary navigation preserves a read owned by the same key.
+                assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+                assert!(state.sync_active_worktree(&model, &focus_on(&key)));
+                assert_eq!(state.amend_request_revision(), Some(old_revision));
+                assert!(state.take_amend_request(&key).is_none());
+                assert_eq!(state.amend_target(), Some(oid_of(0x11)));
+
+                if remove_first {
+                    let closed = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
+                    assert!(state.sync_active_worktree(&closed, &focus_on(&key)));
+                    assert!(state.active_worktree().is_none());
+                }
+                // Reopening a removed project assigns a fresh ProjectId even
+                // when its canonical path and path-derived WorktreeId match.
+                let mut reopened = model.clone();
+                reopened.projects[0].id = project_id(20);
+                let rebound = reopened.worktree_at(&key.canonical_path).unwrap();
+                assert_ne!(rebound.project_id, key.project_id);
+                assert_eq!(rebound.worktree_id, key.worktree_id);
+                assert_eq!(rebound.canonical_path, key.canonical_path);
+                reopened.source_control.as_mut().unwrap().key = rebound.clone();
+                assert!(state.sync_active_worktree(&reopened, &focus_on(&rebound)));
+
+                assert_eq!(state.active_worktree(), Some(&rebound));
+                assert!(!state.commit_draft.amend);
+                assert!(state.commit_draft.ready());
+                assert!(state.amend_request_revision().is_none());
+                assert!(state.take_amend_request(&rebound).is_none());
+                assert!(state.amend_target().is_none());
+                assert!(state.commit_draft.amend_stash.is_none());
+                assert_eq!(state.commit_message(), "Draft subject\n\nDraft body");
+                assert_commit_editor_selection(&state, cursor, "Draft subject", "Draft body");
+                let retry_hint = state.amend_error().unwrap().to_owned();
+                assert!(retry_hint.contains("Enable Amend again"));
+                let rebound_revision = state.commit_draft.revision;
+                assert_ne!(rebound_revision, old_revision);
+
+                if late_success {
+                    assert!(!state.load_amend_message(&key, old_revision, "Old HEAD body"));
+                } else {
+                    assert!(!state.fail_amend_read(&key, old_revision, "Old read failed".into()));
+                }
+                assert_eq!(state.amend_error(), Some(retry_hint.as_str()));
+                assert_eq!(state.commit_draft.revision, rebound_revision);
+                assert_commit_editor_selection(&state, cursor, "Draft subject", "Draft body");
+
+                // The visible retry starts one read owned by the new full key.
+                state.apply(&SidebarAction::AmendChanged {
+                    key: rebound.clone(),
+                    amend: true,
+                });
+                let new_revision = state.take_amend_request(&rebound).unwrap();
+                assert_ne!(new_revision, old_revision);
+                assert!(state.take_amend_request(&rebound).is_none());
+                state.pin_amend_head(&rebound, new_revision, oid_of(0x22));
+                assert!(state.load_amend_message(&rebound, new_revision, "Current HEAD body"));
+                assert!(state.commit_draft.ready());
+                assert_eq!(state.amend_target(), Some(oid_of(0x22)));
+                assert_eq!(state.commit_message(), "Current HEAD body");
+                assert!(!state.load_amend_message(&key, old_revision, "Late old success"));
+                assert!(!state.fail_amend_read(&key, old_revision, "Late old error".into()));
+                assert!(state.amend_error().is_none());
+                assert_eq!(state.commit_message(), "Current HEAD body");
+
+                state.apply(&SidebarAction::AmendChanged {
+                    key: rebound,
+                    amend: false,
+                });
+                assert_eq!(state.commit_message(), "Draft subject\n\nDraft body");
+                assert_commit_editor_selection(&state, cursor, "Draft subject", "Draft body");
+            }
+        }
     }
 
     #[test]
