@@ -6935,22 +6935,89 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
-        fn isolated_large_pathspec_test(name: &str) -> bool {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        /// Runs `contract` as the only test of a private libtest subprocess
+        /// whose working tree lives in a 0700 namespace under `/var/tmp`; the
+        /// fixture repositories are too large for a RAM-backed temporary
+        /// directory.
+        ///
+        /// The namespace is removed only once the owner has proven that no
+        /// member of the child's process family can still write into it. The
+        /// executor's successful result is not that proof: it means the child
+        /// was reaped and every holder of its output pipes closed them, but the
+        /// Git processes the child starts hold only the child's own pipes, and
+        /// lead process groups of their own. One that outlives its call, as
+        /// Git's detached auto-maintenance can, is invisible to the owner. So
+        /// the child makes itself the subreaper of its whole family and reaps
+        /// until none remains before its test reports ok; the owner removes the
+        /// namespace only after asserting that report. On failure or timeout
+        /// it is retained, with its path printed.
+        fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Path)) {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
             let name = name
                 .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
                 .unwrap_or(name);
             if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
-                return false;
+                // SAFETY: prctl takes no pointers here. Adopting orphans is
+                // confined to this dedicated single-test subprocess.
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                let root = Path::new(
+                    &std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
+                        .expect("owning private contract namespace"),
+                )
+                .join("repository");
+                fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+                contract(&root);
+                eprintln!("Contract passed; settling its process family");
+                // The kernel reparents an orphan to this subreaper as its
+                // parent exits, so while any descendant lives this process
+                // still has a child of its own; ECHILD is settlement.
+                loop {
+                    // SAFETY: a null status pointer is valid for waitpid.
+                    if unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {
+                        continue;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ECHILD) => break,
+                        Some(libc::EINTR) => {}
+                        _ => panic!("settling the contract's process family: {error}"),
+                    }
+                }
+                return;
             }
-            // Keep the namespace on every outcome until the outer owner has
-            // established full-family settlement; a child result is not that proof.
-            let directory = tempfile::Builder::new()
-                .prefix("cagents-pathspec-contract-")
-                .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in("/var/tmp")
-                .unwrap()
-                .keep();
+
+            /// Retained, and named, whenever the owner panics: a failed or
+            /// timed-out child proves nothing about its family. Otherwise the
+            /// owner returned only after asserting the child's settled ok.
+            struct Namespace(PathBuf);
+            impl Drop for Namespace {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        eprintln!("Retained pathspec contract root: {}", self.0.display());
+                    } else if let Err(error) = fs::remove_dir_all(&self.0) {
+                        // Nothing can still write into a settled private
+                        // namespace, so this is a broken proof or a host
+                        // fault, and staying silent would leak the fixture.
+                        panic!(
+                            "removing settled pathspec contract root {}: {error}",
+                            self.0.display()
+                        );
+                    }
+                }
+            }
+            let directory = Namespace(
+                tempfile::Builder::new()
+                    .prefix("cagents-pathspec-contract-")
+                    .permissions(fs::Permissions::from_mode(0o700))
+                    .tempdir_in("/var/tmp")
+                    .unwrap()
+                    .keep(),
+            );
             let mut command = CommandSpec::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -6968,7 +7035,7 @@ mod tests {
             }
             command = command
                 .env("CAGENTS_LARGE_PATHSPEC_CONTRACT", name)
-                .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory)
+                .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory.0)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -7001,12 +7068,11 @@ mod tests {
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
-                    .open(directory.join(name))
+                    .open(directory.0.join(name))
                     .unwrap()
                     .write_all(bytes)
                     .unwrap();
             }
-            eprintln!("Retained pathspec contract root: {}", directory.display());
             let stdout = String::from_utf8_lossy(&stdout);
             let stderr = String::from_utf8_lossy(&stderr);
             assert!(success, "{status}\n{stdout}\n{stderr}");
@@ -7024,298 +7090,288 @@ mod tests {
             );
             print!("{stdout}");
             eprint!("{stderr}");
-            true
-        }
-
-        fn retained_large_pathspec_directory() -> tempfile::TempDir {
-            use std::os::unix::fs::PermissionsExt;
-            let parent = std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
-                .expect("owning private contract namespace");
-            let mut directory = tempfile::Builder::new()
-                .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in(parent)
-                .unwrap();
-            directory.disable_cleanup(true);
-            directory
         }
 
         #[test]
         fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
-            if isolated_large_pathspec_test(concat!(
-                module_path!(),
-                "::small_membership_queries_do_not_enumerate_large_index_or_head_tree"
-            )) {
-                return;
-            }
-            let directory = retained_large_pathspec_directory();
-            let root = directory.path();
-            git(root, &["init", "-b", "main"]);
-            fs::write(root.join("selected.txt"), "base").unwrap();
-            git(root, &["add", "selected.txt"]);
-            let blob =
-                String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
-            let mut input = Vec::new();
-            // Over 17 MB of index names, plus substantially larger ls-tree
-            // records, reproduced the default 16 MiB process-output failure.
-            for index in 0..250_000 {
-                input.extend_from_slice(format!("100644 {}\tgenerated_component_file_with_an_extraordinarily_long_name_{index:06}.txt\0", blob.trim()).as_bytes());
-            }
-            let service = service();
-            let cancel = CancellationToken::new();
-            let command = service
-                .git_mutation(root, ["update-index", "-z", "--index-info"])
-                .stdin(input);
-            service.run_checked(&command, &cancel).unwrap();
-            git(root, &["commit", "--quiet", "-m", "large sparse fixture"]);
-            fs::write(root.join("selected.txt"), "modified").unwrap();
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: vec![PathSelection {
-                                path: path("selected.txt"),
-                                old_path: None
-                            }]
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .unstage(
-                        &UnstageRequest {
-                            worktree: root.into(),
-                            selection: vec![PathSelection {
-                                path: path("selected.txt"),
-                                old_path: None
-                            }]
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            let head = service.resolve_head(root, &cancel).unwrap().unwrap();
-            assert_eq!(
-                service
-                    .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
-                    .unwrap(),
-                vec![path("selected.txt")]
+            isolated_large_pathspec_test(
+                concat!(
+                    module_path!(),
+                    "::small_membership_queries_do_not_enumerate_large_index_or_head_tree"
+                ),
+                |root| {
+                    git(root, &["init", "-b", "main"]);
+                    fs::write(root.join("selected.txt"), "base").unwrap();
+                    git(root, &["add", "selected.txt"]);
+                    let blob = String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"]))
+                        .unwrap();
+                    let mut input = Vec::new();
+                    // Over 17 MB of index names, plus substantially larger ls-tree
+                    // records, reproduced the default 16 MiB process-output failure.
+                    for index in 0..250_000 {
+                        input.extend_from_slice(format!("100644 {}\tgenerated_component_file_with_an_extraordinarily_long_name_{index:06}.txt\0", blob.trim()).as_bytes());
+                    }
+                    let service = service();
+                    let cancel = CancellationToken::new();
+                    let command = service
+                        .git_mutation(root, ["update-index", "-z", "--index-info"])
+                        .stdin(input);
+                    service.run_checked(&command, &cancel).unwrap();
+                    git(root, &["commit", "--quiet", "-m", "large sparse fixture"]);
+                    fs::write(root.join("selected.txt"), "modified").unwrap();
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: vec![PathSelection {
+                                        path: path("selected.txt"),
+                                        old_path: None
+                                    }]
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .unstage(
+                                &UnstageRequest {
+                                    worktree: root.into(),
+                                    selection: vec![PathSelection {
+                                        path: path("selected.txt"),
+                                        old_path: None
+                                    }]
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    let head = service.resolve_head(root, &cancel).unwrap().unwrap();
+                    assert_eq!(
+                        service
+                            .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
+                            .unwrap(),
+                        vec![path("selected.txt")]
+                    );
+                },
             );
         }
 
         #[test]
         fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
-            if isolated_large_pathspec_test(concat!(
-                module_path!(),
-                "::large_literal_pathspec_mutations_roundtrip_without_argv_limits"
-            )) {
-                return;
-            }
-            let directory = retained_large_pathspec_directory();
-            let root = directory.path();
-            git(root, &["init", "-b", "main"]);
-            let names = [
-                "space name",
-                "line\nname",
-                "-leading",
-                "[glob]*",
-                ":(glob)magic",
-            ];
-            let selection: Vec<_> = names
-                .iter()
-                .map(|name| PathSelection {
-                    path: path(name),
-                    old_path: None,
-                })
-                .collect();
-            for name in names {
-                fs::write(root.join(name), "base").unwrap();
-            }
-            let service = service();
-            let cancel = CancellationToken::new();
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            git(root, &["commit", "-m", "initial"]);
-            for name in names {
-                fs::write(root.join(name), "changed").unwrap();
-            }
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .unstage(
-                        &UnstageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .discard(
-                        &DiscardRequest {
-                            worktree: root.into(),
-                            tracked: selection,
-                            untracked: vec![],
-                            confirmed: true
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            for name in names {
-                assert_eq!(fs::read_to_string(root.join(name)).unwrap(), "base");
-            }
+            isolated_large_pathspec_test(
+                concat!(
+                    module_path!(),
+                    "::large_literal_pathspec_mutations_roundtrip_without_argv_limits"
+                ),
+                |root| {
+                    git(root, &["init", "-b", "main"]);
+                    let names = [
+                        "space name",
+                        "line\nname",
+                        "-leading",
+                        "[glob]*",
+                        ":(glob)magic",
+                    ];
+                    let selection: Vec<_> = names
+                        .iter()
+                        .map(|name| PathSelection {
+                            path: path(name),
+                            old_path: None,
+                        })
+                        .collect();
+                    for name in names {
+                        fs::write(root.join(name), "base").unwrap();
+                    }
+                    let service = service();
+                    let cancel = CancellationToken::new();
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    git(root, &["commit", "-m", "initial"]);
+                    for name in names {
+                        fs::write(root.join(name), "changed").unwrap();
+                    }
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .unstage(
+                                &UnstageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .discard(
+                                &DiscardRequest {
+                                    worktree: root.into(),
+                                    tracked: selection,
+                                    untracked: vec![],
+                                    confirmed: true
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    for name in names {
+                        assert_eq!(fs::read_to_string(root.join(name)).unwrap(), "base");
+                    }
 
-            // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
-            let mut selection = Vec::with_capacity(40_000);
-            for index in 0..40_000 {
-                let name = format!(
-                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
-                );
-                fs::write(root.join(&name), "generated").unwrap();
-                selection.push(PathSelection {
-                    path: path(&name),
-                    old_path: None,
-                });
-            }
-            assert!(pathspec_input(&selection_pathspecs(&selection)).len() > 2_097_152);
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .unstage(
-                        &UnstageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .discard(
-                        &DiscardRequest {
-                            worktree: root.into(),
-                            tracked: vec![],
-                            untracked: selection.iter().map(|entry| entry.path.clone()).collect(),
-                            confirmed: true
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(
-                !root
-                    .join("generated_component_file_with_an_extraordinarily_long_name_00000.txt")
-                    .exists()
+                    // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
+                    let mut selection = Vec::with_capacity(40_000);
+                    for index in 0..40_000 {
+                        let name = format!(
+                            "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                        );
+                        fs::write(root.join(&name), "generated").unwrap();
+                        selection.push(PathSelection {
+                            path: path(&name),
+                            old_path: None,
+                        });
+                    }
+                    assert!(pathspec_input(&selection_pathspecs(&selection)).len() > 2_097_152);
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .unstage(
+                                &UnstageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .discard(
+                                &DiscardRequest {
+                                    worktree: root.into(),
+                                    tracked: vec![],
+                                    untracked: selection
+                                        .iter()
+                                        .map(|entry| entry.path.clone())
+                                        .collect(),
+                                    confirmed: true
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(
+                        !root
+                            .join("generated_component_file_with_an_extraordinarily_long_name_00000.txt")
+                            .exists()
+                    );
+                    // Exercise the >ARG_MAX tracked restore path as well as unlinking
+                    // untracked files: all three Git mutation operations use stdin.
+                    for entry in &selection {
+                        fs::write(root.join(entry.path.as_os_str()), "generated").unwrap();
+                    }
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    git(root, &["commit", "--quiet", "-m", "generated baseline"]);
+                    for entry in &selection {
+                        fs::write(root.join(entry.path.as_os_str()), "modified").unwrap();
+                    }
+                    assert!(matches!(
+                        service
+                            .stage(
+                                &StageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .unstage(
+                                &UnstageRequest {
+                                    worktree: root.into(),
+                                    selection: selection.clone()
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    assert!(matches!(
+                        service
+                            .discard(
+                                &DiscardRequest {
+                                    worktree: root.into(),
+                                    tracked: selection.clone(),
+                                    untracked: vec![],
+                                    confirmed: true
+                                },
+                                &cancel
+                            )
+                            .unwrap(),
+                        MutationOutcome::Applied { .. }
+                    ));
+                    for entry in &selection {
+                        assert_eq!(
+                            fs::read(root.join(entry.path.as_os_str())).unwrap(),
+                            b"generated"
+                        );
+                    }
+                },
             );
-            // Exercise the >ARG_MAX tracked restore path as well as unlinking
-            // untracked files: all three Git mutation operations use stdin.
-            for entry in &selection {
-                fs::write(root.join(entry.path.as_os_str()), "generated").unwrap();
-            }
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            git(root, &["commit", "--quiet", "-m", "generated baseline"]);
-            for entry in &selection {
-                fs::write(root.join(entry.path.as_os_str()), "modified").unwrap();
-            }
-            assert!(matches!(
-                service
-                    .stage(
-                        &StageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .unstage(
-                        &UnstageRequest {
-                            worktree: root.into(),
-                            selection: selection.clone()
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            assert!(matches!(
-                service
-                    .discard(
-                        &DiscardRequest {
-                            worktree: root.into(),
-                            tracked: selection.clone(),
-                            untracked: vec![],
-                            confirmed: true
-                        },
-                        &cancel
-                    )
-                    .unwrap(),
-                MutationOutcome::Applied { .. }
-            ));
-            for entry in &selection {
-                assert_eq!(
-                    fs::read(root.join(entry.path.as_os_str())).unwrap(),
-                    b"generated"
-                );
-            }
         }
 
         #[test]
