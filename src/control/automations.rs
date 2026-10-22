@@ -291,33 +291,8 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"history": history}), human)
         }
         Response::Audit(page) => {
-            let mut lines = page
-                .events
-                .iter()
-                .map(|event| {
-                    format!(
-                        "{}\trevision {}\t{}\t{}\t{}",
-                        event.sequence,
-                        event.revision,
-                        timestamp_for_audit(event.occurred_ms),
-                        event.cause.label(),
-                        event.actor.label(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if lines.is_empty() {
-                lines.push("No recorded lifecycle events.".into());
-            }
-            if page.earlier_events_unavailable {
-                lines.push(
-                    "Earlier lifecycle events are unavailable; their actor and cause are unknown."
-                        .into(),
-                );
-            }
-            if let Some(next) = page.next {
-                lines.push(format!("Continue with --before {next}"));
-            }
-            (json!({"audit": page}), lines.join("\n"))
+            let human = audit_human(&page);
+            (json!({"audit": page}), human)
         }
         Response::Detail(detail) => {
             let human = format!(
@@ -373,6 +348,42 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+fn audit_human(page: &crate::automations::LifecyclePage) -> String {
+    let mut human = super::format::table(
+        ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"],
+        page.events
+            .iter()
+            .map(|event| {
+                [
+                    event.sequence.to_string(),
+                    event.revision.to_string(),
+                    timestamp_for_audit(event.occurred_ms),
+                    event.cause.label().into(),
+                    event.actor.label().into(),
+                    if event.blocked {
+                        "Blocked"
+                    } else if event.enabled {
+                        "Enabled"
+                    } else {
+                        "Paused"
+                    }
+                    .into(),
+                ]
+            })
+            .collect(),
+        "No recorded lifecycle events",
+    );
+    if page.earlier_events_unavailable {
+        human.push_str(
+            "\nEarlier lifecycle events are unavailable; their actor and cause are unknown.",
+        );
+    }
+    if let Some(next) = page.next {
+        human.push_str(&format!("\nContinue with --before {next}"));
+    }
+    human
 }
 
 fn list_human(entries: &[crate::automations::Summary]) -> String {
@@ -810,6 +821,50 @@ mod tests {
                 request: retry.parse().unwrap(),
                 confirmed: true,
             }
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_human_view_labels_actor_state_and_missing_history() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let page = LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 42,
+                automation: Uuid::new_v4(),
+                revision: 7,
+                occurred_ms: 100,
+                cause: LifecycleCause::ReleaseBlocked,
+                actor: LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: Some(Uuid::new_v4()),
+            }],
+            next: Some(42),
+            earlier_events_unavailable: true,
+        };
+        let human = audit_human(&page);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"]
+        );
+        assert!(
+            human.contains("Session cleanup blocked")
+                && human.contains("System")
+                && human.contains("Blocked")
+        );
+        assert!(human.contains("actor and cause are unknown") && human.contains("--before 42"));
+        assert_eq!(
+            audit_human(&LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: false
+            }),
+            "No recorded lifecycle events"
         );
     }
 

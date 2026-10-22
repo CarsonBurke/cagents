@@ -1646,6 +1646,13 @@ impl State {
                                 actor,
                                 event.revision,
                             )));
+                            if let Some(firing) = event.firing {
+                                content = content.push(button_owned(
+                                    format!("Inspect run {firing}"),
+                                    Action::Run(firing),
+                                    !busy,
+                                ));
+                            }
                         }
                         if page.earlier_events_unavailable {
                             content = content.push(crate::design::body(
