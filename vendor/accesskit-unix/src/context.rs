@@ -8,32 +8,30 @@ use accesskit_atspi_common::{Adapter as AdapterImpl, AppContext, Event};
 #[cfg(not(feature = "tokio"))]
 use async_channel::{Receiver, Sender};
 use atspi::proxy::bus::StatusProxy;
-use futures_lite::{future, FutureExt, StreamExt};
+use futures_lite::{FutureExt, StreamExt, future};
 use std::{
     fmt::Display,
     future::Future,
-    pin::pin,
+    io,
     sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
     time::{Duration, Instant},
 };
 #[cfg(feature = "tokio")]
 use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
-#[cfg(feature = "tokio")]
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use zbus::{
+    Connection,
     connection::Builder,
     fdo::{DBusProxy, NameOwnerChangedStream},
     names::{BusName, OwnedUniqueName, WellKnownName},
     proxy::{CacheProperties, PropertyChanged, PropertyStream},
-    Connection,
 };
 
 use crate::{
     adapter::{AdapterState, Callback, Message},
     atspi::Bus,
-    executor::{sleep_until, Executor, Task},
+    executor::{Executor, Task, sleep_until},
     util::block_on,
 };
 
@@ -73,23 +71,58 @@ pub(crate) fn get_or_init_messages() -> Sender<Message> {
         .clone()
 }
 
+/// Bounds each D-Bus request, and each attempt to establish a connection, so
+/// that an unresponsive bus, launcher or registry cannot hold up the context.
+/// Tests use a shorter bound to exercise it quickly.
+pub(crate) const REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(10)
+};
+
 async fn connect_session_bus() -> zbus::Result<Connection> {
-    Builder::session()?.internal_executor(false).build().await
+    Builder::session()?
+        .method_timeout(REQUEST_TIMEOUT)
+        .internal_executor(false)
+        .build()
+        .await
+}
+
+/// Fails with a timeout unless `future` completes within `REQUEST_TIMEOUT`.
+async fn bounded<T>(future: impl Future<Output = zbus::Result<T>>) -> zbus::Result<T> {
+    let timed_out = async {
+        sleep_until(Instant::now() + REQUEST_TIMEOUT).await;
+        Err(zbus::Error::InputOutput(Arc::new(
+            io::ErrorKind::TimedOut.into(),
+        )))
+    };
+    future.or(timed_out).await
+}
+
+/// Whether `error` means that the connection itself failed, rather than one
+/// request on it.
+fn ends_connection(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::InputOutput(_))
+}
+
+async fn receive(messages: &mut Receiver<Message>) -> Option<Message> {
+    #[cfg(not(feature = "tokio"))]
+    return messages.recv().await.ok();
+    #[cfg(feature = "tokio")]
+    return messages.recv().await;
 }
 
 /// Serves adapters until every message sender is dropped. Unreachable or lost
 /// buses never end the context: adapters stay registered, are deactivated
 /// while no AT-SPI bus is connected, and are activated again once one is.
-async fn run_context<C, F>(executor: &Executor<'_>, rx: Receiver<Message>, connect_session: C)
+async fn run_context<C, F>(executor: &Executor<'_>, messages: Receiver<Message>, connect_session: C)
 where
     C: FnMut() -> F,
     F: Future<Output = zbus::Result<Connection>>,
 {
-    #[cfg(feature = "tokio")]
-    let rx = UnboundedReceiverStream::new(rx);
-    let mut messages = pin!(rx);
     let mut context = Context {
         executor,
+        messages,
         connect_session,
         session: None,
         session_reconnect: Reconnect::default(),
@@ -99,18 +132,17 @@ where
     };
     context.connect_session().await;
     loop {
-        let message = async { ContextEvent::Message(messages.next().await) };
-        match context.next_event().or(message).await {
+        match context.next_event().await {
             ContextEvent::Message(Some(message)) => context.process_message(message).await,
             ContextEvent::Message(None) => return,
-            ContextEvent::SessionClosed => context.session_lost(),
+            ContextEvent::SessionClosed => context.session_lost().await,
             ContextEvent::LauncherOwnerChanged(owner) => {
                 context.launcher_owner_changed(owner).await
             }
             ContextEvent::ScreenReaderChanged(change) => {
                 context.screen_reader_changed(change).await
             }
-            ContextEvent::AtspiBusClosed => context.atspi_bus_lost(&"connection closed"),
+            ContextEvent::AtspiBusClosed => context.atspi_bus_lost(&"connection closed").await,
             ContextEvent::ReconnectDue => context.reconnect().await,
         }
     }
@@ -127,10 +159,12 @@ enum ContextEvent {
 
 struct Context<'a, 'e, C> {
     executor: &'a Executor<'e>,
+    messages: Receiver<Message>,
     connect_session: C,
     session: Option<Session>,
     session_reconnect: Reconnect,
     atspi_bus: Option<Bus>,
+    /// Paces retries of both the AT-SPI bus and the launcher that reports it.
     atspi_reconnect: Reconnect,
     adapters: Vec<AdapterEntry>,
 }
@@ -140,8 +174,11 @@ where
     C: FnMut() -> F,
     F: Future<Output = zbus::Result<Connection>>,
 {
-    /// Waits for a bus to change state or for a reconnection attempt to be due.
+    /// Waits for a message, for a bus to change state or for a reconnection
+    /// attempt to be due.
     async fn next_event(&mut self) -> ContextEvent {
+        let messages = &mut self.messages;
+        let message = async { ContextEvent::Message(receive(messages).await) };
         let Some(Session {
             connection,
             launcher_owner_changes,
@@ -149,8 +186,12 @@ where
             ..
         }) = &mut self.session
         else {
-            self.session_reconnect.due().await;
-            return ContextEvent::ReconnectDue;
+            let session_reconnect = &self.session_reconnect;
+            let reconnect_due = async {
+                session_reconnect.due().await;
+                ContextEvent::ReconnectDue
+            };
+            return reconnect_due.or(message).await;
         };
         let atspi_bus = &self.atspi_bus;
         let atspi_reconnect = &self.atspi_reconnect;
@@ -193,16 +234,18 @@ where
             .or(atspi_bus_closed)
             .or(screen_reader_changed)
             .or(reconnect_due)
+            .or(message)
             .await
     }
 
     async fn connect_session(&mut self) {
         let connection = (self.connect_session)();
-        let session = async { Session::new(connection.await?, self.executor).await }.await;
-        match session {
+        let executor = self.executor;
+        match bounded(async { Session::new(connection.await?, executor).await }).await {
             Ok(session) => {
                 self.session = Some(session);
                 self.session_reconnect.connected();
+                self.watch_launcher().await;
             }
             Err(error) => self
                 .session_reconnect
@@ -210,28 +253,44 @@ where
         }
     }
 
-    fn session_lost(&mut self) {
+    async fn session_lost(&mut self) {
         self.session = None;
-        self.disconnect_atspi_bus();
-        self.atspi_reconnect.reset();
+        self.session_reconnect.disconnected();
+        self.disconnect_atspi_bus().await;
+        // The AT-SPI bus is found through the session bus.
+        self.atspi_reconnect.cancel();
         self.session_reconnect
             .schedule("The D-Bus session bus", &"connection closed");
     }
 
     /// A new launcher runs a new AT-SPI bus, and a departed one runs none.
     async fn launcher_owner_changed(&mut self, owner: Option<OwnedUniqueName>) {
-        let Some(session) = &self.session else {
+        let Some(session) = &mut self.session else {
             return;
         };
         if session.launcher_owner == owner {
             return;
         }
-        self.disconnect_atspi_bus();
-        self.atspi_reconnect.reset();
-        if let Some(session) = &mut self.session {
-            match owner {
-                Some(owner) => session.watch_launcher(Some(owner)).await,
-                None => session.forget_launcher(),
+        session.launcher_owner = owner;
+        session.forget_status();
+        self.disconnect_atspi_bus().await;
+        self.watch_launcher().await;
+    }
+
+    /// Watches the screen-reader status published by the launcher. Without a
+    /// launcher, this may start one by D-Bus activation, as upstream does;
+    /// failing that, the owner watch reports when one appears. A launcher that
+    /// is running but does not answer is retried like the AT-SPI bus.
+    async fn watch_launcher(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Err(error) = session.watch_status().await {
+            if session.launcher_owner.is_some() {
+                self.atspi_reconnect
+                    .schedule("The AT-SPI bus launcher", &error);
+            } else {
+                debug!(%error, "The AT-SPI bus launcher is not running");
             }
         }
     }
@@ -246,9 +305,11 @@ where
         };
         session.screen_reader_enabled = enabled;
         if !enabled {
-            self.disconnect_atspi_bus();
-            self.atspi_reconnect.reset();
-        } else if self.atspi_bus.is_none() {
+            self.disconnect_atspi_bus().await;
+            self.atspi_reconnect.cancel();
+        } else if self.atspi_bus.is_none() && !self.atspi_reconnect.is_scheduled() {
+            // A pending retry stays pending, so a launcher that keeps
+            // restarting cannot bypass the backoff.
             self.connect_atspi_bus().await;
         }
     }
@@ -257,7 +318,7 @@ where
         let Some(session) = &self.session else {
             return;
         };
-        match Bus::new(&session.connection, self.executor).await {
+        match bounded(Bus::new(&session.connection, self.executor)).await {
             Ok(bus) => {
                 self.atspi_bus = Some(bus);
                 self.atspi_reconnect.connected();
@@ -265,42 +326,62 @@ where
                     activate_adapter(entry);
                 }
             }
-            Err(error) => self.atspi_bus_lost(&error),
+            Err(error) => self.atspi_bus_lost(&error).await,
         }
     }
 
-    fn atspi_bus_lost(&mut self, error: &dyn Display) {
-        self.disconnect_atspi_bus();
+    async fn atspi_bus_lost(&mut self, error: &dyn Display) {
+        self.disconnect_atspi_bus().await;
         self.atspi_reconnect.schedule("The AT-SPI bus", error);
     }
 
-    fn disconnect_atspi_bus(&mut self) {
-        self.atspi_bus = None;
+    /// Deactivates every adapter until an AT-SPI bus is connected again.
+    async fn disconnect_atspi_bus(&mut self) {
+        if self.atspi_bus.take().is_some() {
+            self.atspi_reconnect.disconnected();
+        }
         for entry in &mut self.adapters {
             deactivate_adapter(entry);
+        }
+        // Adapters that were active may have queued updates for the lost bus.
+        // Activation registers each tree afresh, and an update applied first
+        // would claim its nodes on the next bus for the discarded tree. So
+        // process the queue as though no bus were connected, which keeps only
+        // adapter additions and removals. Deactivated adapters queue nothing
+        // more, so this ends.
+        while let Ok(message) = self.messages.try_recv() {
+            // Without a bus, processing cannot fail.
+            let _ = process_adapter_message(&None, &mut self.adapters, message).await;
         }
     }
 
     async fn process_message(&mut self, message: Message) {
-        if let Err(error) =
-            process_adapter_message(&self.atspi_bus, &mut self.adapters, message).await
-        {
-            self.atspi_bus_lost(&error);
+        let result = bounded(process_adapter_message(
+            &self.atspi_bus,
+            &mut self.adapters,
+            message,
+        ))
+        .await;
+        let Err(error) = result else {
+            return;
+        };
+        if ends_connection(&error) || self.atspi_bus.as_ref().is_some_and(Bus::is_closed) {
+            self.atspi_bus_lost(&error).await;
+        } else {
+            debug!(%error, "An AT-SPI request failed");
         }
     }
 
     async fn reconnect(&mut self) {
-        match &self.session {
-            None => {
-                self.session_reconnect.cancel();
-                self.connect_session().await
-            }
-            Some(session) => {
-                self.atspi_reconnect.cancel();
-                if session.screen_reader_enabled && self.atspi_bus.is_none() {
-                    self.connect_atspi_bus().await
-                }
-            }
+        let Some(session) = &self.session else {
+            self.session_reconnect.cancel();
+            return self.connect_session().await;
+        };
+        self.atspi_reconnect.cancel();
+        if session.launcher_owner.is_some() && session.screen_reader_changes.is_none() {
+            self.watch_launcher().await
+        } else if session.screen_reader_enabled && self.atspi_bus.is_none() {
+            self.connect_atspi_bus().await
         }
     }
 }
@@ -337,40 +418,31 @@ impl Session {
             .await?;
         let launcher = BusName::from(WellKnownName::from_static_str_unchecked(LAUNCHER));
         let launcher_owner = dbus.get_name_owner(launcher).await.ok();
-        let mut session = Self {
+        Ok(Self {
             connection,
             _task: task,
             launcher_owner_changes,
-            launcher_owner: None,
+            launcher_owner,
             screen_reader_changes: None,
             screen_reader_enabled: false,
-        };
-        session.watch_launcher(launcher_owner).await;
-        Ok(session)
+        })
     }
 
-    /// Watches the screen-reader status published by `owner`. Without an owner,
-    /// this may start the launcher by D-Bus activation, as upstream does. An
-    /// unavailable launcher is not an error: the owner watch reports when one
-    /// appears.
-    async fn watch_launcher(&mut self, owner: Option<OwnedUniqueName>) {
-        self.forget_launcher();
-        self.launcher_owner = owner;
-        let status = StatusProxy::builder(&self.connection)
-            .cache_properties(CacheProperties::Yes)
-            .build()
-            .await;
-        match status {
-            Ok(status) => {
-                self.screen_reader_changes =
-                    Some(status.receive_screen_reader_enabled_changed().await)
-            }
-            Err(error) => debug!(%error, "The AT-SPI status is unavailable"),
-        }
+    async fn watch_status(&mut self) -> zbus::Result<()> {
+        self.forget_status();
+        let changes = bounded(async {
+            let status = StatusProxy::builder(&self.connection)
+                .cache_properties(CacheProperties::Yes)
+                .build()
+                .await?;
+            Ok(status.receive_screen_reader_enabled_changed().await)
+        })
+        .await?;
+        self.screen_reader_changes = Some(changes);
+        Ok(())
     }
 
-    fn forget_launcher(&mut self) {
-        self.launcher_owner = None;
+    fn forget_status(&mut self) {
         self.screen_reader_changes = None;
         self.screen_reader_enabled = false;
     }
@@ -378,9 +450,11 @@ impl Session {
 
 /// Paces reconnection to one bus while it is unreachable. The first failure of
 /// an outage is a warning and later ones are debug messages; attempts back off
-/// exponentially to one every `MAX_DELAY`. An outage ends once a connection
-/// stays up for `MAX_DELAY`, so a bus that accepts connections and then drops
-/// them keeps backing off instead of being retried every second.
+/// exponentially to one every `MAX_DELAY`. An outage ends only once a
+/// connection stays up for `MAX_DELAY`. Until then, disconnections, launcher
+/// restarts and screen-reader toggles keep its backoff and warning, so a bus
+/// that accepts connections and then drops them, or a launcher that keeps
+/// restarting, is neither retried faster nor warned about again.
 #[derive(Debug)]
 struct Reconnect {
     delay: Duration,
@@ -409,11 +483,15 @@ impl Reconnect {
         self.connected_at = Some(Instant::now());
     }
 
-    fn schedule(&mut self, bus: &str, error: &dyn Display) {
+    /// Ends the outage if the connection that just ended stayed up long enough.
+    fn disconnected(&mut self) {
         let connected_at = self.connected_at.take();
         if connected_at.is_some_and(|at| at.elapsed() >= Self::MAX_DELAY) {
             *self = Self::default();
         }
+    }
+
+    fn schedule(&mut self, bus: &str, error: &dyn Display) {
         if self.warned {
             debug!(%error, "{bus} is still unreachable; retrying in {:?}", self.delay);
         } else {
@@ -428,9 +506,8 @@ impl Reconnect {
         self.due = None;
     }
 
-    /// Ends the outage because the bus is no longer wanted.
-    fn reset(&mut self) {
-        *self = Self::default();
+    fn is_scheduled(&self) -> bool {
+        self.due.is_some()
     }
 
     /// Resolves when a scheduled attempt is due, and never otherwise.
@@ -581,7 +658,7 @@ async fn process_adapter_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accesskit::{ActionHandler, ActionRequest, TreeUpdate};
+    use accesskit::{ActionHandler, ActionRequest, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
     use accesskit_atspi_common::ActionHandlerWrapper;
     use std::{
         fs::File,
@@ -589,11 +666,11 @@ mod tests {
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
     };
-    use zbus::zvariant::OwnedObjectPath;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
     /// Set in the re-executed copy of this test binary that owns an isolated environment.
     const ISOLATED: &str = "ACCESSKIT_UNIX_ISOLATED_TEST";
@@ -614,23 +691,45 @@ mod tests {
         }
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
 
-        // A connection that drops at once continues the outage.
+        // Cancelling a retry, as a departed launcher or a disabled screen
+        // reader does, continues the outage.
+        reconnect.cancel();
+        assert!(!reconnect.is_scheduled());
+        assert_eq!(reconnect.delay, Reconnect::MAX_DELAY);
+        assert!(reconnect.warned);
+
+        // So does a connection that drops at once.
         reconnect.connected();
-        assert_eq!(reconnect.due, None);
+        assert!(!reconnect.is_scheduled());
+        reconnect.disconnected();
         reconnect.schedule("The test bus", &"closed");
         assert_eq!(reconnect.delay, Reconnect::MAX_DELAY);
 
-        // One that stayed up starts a new outage, which warns again.
+        // One that stayed up ends the outage, so the next one warns again.
         reconnect.connected();
         reconnect.connected_at = Instant::now().checked_sub(Reconnect::MAX_DELAY);
+        reconnect.disconnected();
+        assert_eq!(reconnect.delay, Reconnect::FIRST_DELAY);
+        assert!(!reconnect.is_scheduled());
+        assert!(!reconnect.warned);
         reconnect.schedule("The test bus", &"closed");
         assert_eq!(reconnect.delay, 2 * Reconnect::FIRST_DELAY);
         assert!(reconnect.warned);
+    }
 
-        reconnect.reset();
-        assert_eq!(reconnect.delay, Reconnect::FIRST_DELAY);
-        assert_eq!(reconnect.due, None);
-        assert!(!reconnect.warned);
+    #[test]
+    fn only_connection_failures_end_the_connection() {
+        let timed_out = || zbus::Error::InputOutput(Arc::new(io::ErrorKind::TimedOut.into()));
+        assert!(ends_connection(&timed_out()));
+        assert!(ends_connection(&zbus::Error::InputOutput(Arc::new(
+            io::ErrorKind::ConnectionReset.into()
+        ))));
+        assert!(!ends_connection(&zbus::Error::Failure(
+            "one request".into()
+        )));
+        assert!(!ends_connection(
+            &zbus::fdo::Error::UnknownObject("/".into()).into()
+        ));
     }
 
     #[test]
@@ -684,9 +783,7 @@ mod tests {
         for expected in [Observed::SessionConnect, Observed::SessionConnect] {
             assert_eq!(observed.recv_timeout(PATIENCE), Ok(expected));
         }
-        let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
-        let _session_bus =
-            PrivateBus::start(Path::new(session_bus.strip_prefix("unix:path=").unwrap()));
+        let _session_bus = PrivateBus::start(&session_socket());
         let _atspi_bus = start_atspi_bus(&dir.path().join("atspi-bus"));
         let _launcher = serve_launcher(&dir, 0, observed_tx);
         expect(&observed, &context, Observed::Activated);
@@ -719,6 +816,370 @@ mod tests {
         expect_shutdown(tx, context, finished);
     }
 
+    #[test]
+    fn unresponsive_registry_does_not_hold_up_the_context() {
+        if !in_isolated_process(
+            "unresponsive_registry_does_not_hold_up_the_context",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let atspi_bus = PrivateBus::start(&dir.path().join("atspi-bus"));
+        let registry = FakeRegistry {
+            unanswered: AtomicUsize::new(1),
+            ..Default::default()
+        };
+        let _registry = serve_registry(&atspi_bus.address, registry);
+        let (observed_tx, observed) = mpsc::channel();
+        let _launcher = serve_launcher(&dir, 0, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+
+        // The registry never answers the first request to embed the application.
+        for expected in [
+            Observed::SessionConnect,
+            Observed::AddressRequested,
+            Observed::AddressRequested,
+            Observed::Activated,
+        ] {
+            assert_eq!(observed.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
+    fn launcher_restarts_do_not_bypass_the_backoff() {
+        if !in_isolated_process(
+            "launcher_restarts_do_not_bypass_the_backoff",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let (observed_tx, observed) = mpsc::channel();
+        // No AT-SPI bus runs at the address that any launcher reports.
+        let mut launcher = serve_launcher(&dir, usize::MAX, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+        for expected in [Observed::SessionConnect, Observed::AddressRequested] {
+            assert_eq!(observed.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        let mut failed_at = Instant::now();
+        for backoff in [Reconnect::FIRST_DELAY, 2 * Reconnect::FIRST_DELAY] {
+            // The replacement launcher is noticed at once, but its bus is
+            // tried only when the retry is due.
+            let _replaced = std::mem::replace(
+                &mut launcher,
+                serve_launcher(&dir, usize::MAX, observed_tx.clone()),
+            );
+            assert_eq!(
+                observed.recv_timeout(PATIENCE),
+                Ok(Observed::AddressRequested)
+            );
+            let retried_after = failed_at.elapsed();
+            assert!(
+                retried_after >= backoff * 4 / 5,
+                "retried after {retried_after:?}, within the {backoff:?} backoff"
+            );
+            failed_at = Instant::now();
+        }
+
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
+    fn unresponsive_launcher_status_is_retried() {
+        if !in_isolated_process(
+            "unresponsive_launcher_status_is_retried",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let _atspi_bus = start_atspi_bus(&dir.path().join("atspi-bus"));
+        let (observed_tx, observed) = mpsc::channel();
+        // The launcher never answers the first read of the screen-reader status.
+        let _launcher = serve_launcher_with(&dir, 0, 1, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+        for expected in [
+            Observed::SessionConnect,
+            Observed::AddressRequested,
+            Observed::Activated,
+        ] {
+            assert_eq!(observed.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
+    fn session_bus_loss_is_followed() {
+        if !in_isolated_process("session_bus_loss_is_followed", SessionBus::Missing) {
+            return;
+        }
+        let dir = TempDir::new();
+        let session_bus = PrivateBus::start(&session_socket());
+        let _atspi_bus = start_atspi_bus(&dir.path().join("atspi-bus"));
+        let (observed_tx, observed) = mpsc::channel();
+        let launcher = serve_launcher(&dir, 0, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+        expect(&observed, &context, Observed::Activated);
+
+        // The AT-SPI bus outlives the session bus, so only the closed session
+        // connection can tell the context to deactivate.
+        drop(session_bus);
+        expect(&observed, &context, Observed::Deactivated);
+        drop(launcher);
+        let _ = std::fs::remove_file(session_socket());
+        let _session_bus = PrivateBus::start(&session_socket());
+        let _launcher = serve_launcher(&dir, 0, observed_tx);
+        expect(&observed, &context, Observed::Activated);
+
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
+    fn launcher_flapping_does_not_leak() {
+        if !in_isolated_process("launcher_flapping_does_not_leak", SessionBus::Running) {
+            return;
+        }
+        let dir = TempDir::new();
+        let _atspi_bus = start_atspi_bus(&dir.path().join("atspi-bus"));
+        let (observed_tx, observed) = mpsc::channel();
+        let mut launcher = Some(serve_launcher(&dir, 0, observed_tx.clone()));
+        let (tx, context, finished) = start_context(&observed_tx);
+        expect(&observed, &context, Observed::Activated);
+
+        let count = |dir: &str| std::fs::read_dir(dir).unwrap().count();
+        let mut flap = |cycles: usize| {
+            for _ in 0..cycles {
+                drop(launcher.take());
+                expect(&observed, &context, Observed::Deactivated);
+                launcher = Some(serve_launcher(&dir, 0, observed_tx.clone()));
+                expect(&observed, &context, Observed::Activated);
+            }
+            // Let the departed launchers' threads finish.
+            thread::sleep(Duration::from_millis(500));
+            (count("/proc/self/fd"), count("/proc/self/task"))
+        };
+        let (warm_fds, warm_threads) = flap(3);
+        let (fds, threads) = flap(40);
+        assert!(
+            fds <= warm_fds + 8 && threads <= warm_threads + 4,
+            "40 launcher restarts grew descriptors {warm_fds} -> {fds} and threads {warm_threads} -> {threads}"
+        );
+
+        drop(launcher);
+        expect_shutdown(tx, context, finished);
+    }
+
+    /// A replaced launcher is noticed at once, while an adapter may still be
+    /// updating the tree it registered on the old AT-SPI bus. Those updates
+    /// must not reach the new bus ahead of the tree registered there.
+    #[test]
+    fn updates_for_a_lost_bus_do_not_reach_the_next_one() {
+        if !in_isolated_process(
+            "updates_for_a_lost_bus_do_not_reach_the_next_one",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let atspi_bus = PrivateBus::start(&dir.path().join("atspi-bus"));
+        let (embedded_tx, embedded) = mpsc::channel();
+        let _registry = serve_registry(&atspi_bus.address, FakeRegistry::reporting(embedded_tx));
+        let (unobserved, _) = mpsc::channel();
+        let _launcher = serve_launcher(&dir, 0, unobserved.clone());
+
+        let (lifecycle_tx, lifecycle) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let extended = Arc::new(AtomicBool::new(false));
+        let _a = window_adapter("A", &Arc::default(), &lifecycle_tx, Some(gate));
+        let mut b = window_adapter("B", &extended, &lifecycle_tx, None);
+        for expected in [Lifecycle::Activated("A"), Lifecycle::Activated("B")] {
+            assert_eq!(lifecycle.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        // The context deactivates A first and is held there, with B still active.
+        let _replacement = serve_launcher(&dir, 0, unobserved);
+        assert_eq!(
+            lifecycle.recv_timeout(PATIENCE),
+            Ok(Lifecycle::Deactivated("A"))
+        );
+        extended.store(true, Ordering::SeqCst);
+        b.update_if_active(|| window("B", true));
+        release.send(()).unwrap();
+        for expected in [
+            Lifecycle::Deactivated("B"),
+            Lifecycle::Activated("A"),
+            Lifecycle::Activated("B"),
+        ] {
+            assert_eq!(lifecycle.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        // Each tree was registered afresh on the new connection, and every
+        // node registered there answers for the current tree.
+        embedded.recv_timeout(PATIENCE).unwrap();
+        let app = embedded.recv_timeout(PATIENCE).unwrap();
+        let expected = [vec!["A", "two"], vec!["B", "three", "two"]];
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let names = accessible_names(&atspi_bus.address, &app);
+            if names == expected {
+                break;
+            }
+            assert!(Instant::now() < deadline, "registered nodes: {names:?}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Lifecycle {
+        Activated(&'static str),
+        Deactivated(&'static str),
+    }
+
+    /// A window labelled `label` with a button "two" and, if `extended`, "three".
+    fn window(label: &str, extended: bool) -> TreeUpdate {
+        let button = |label: &str| {
+            let mut node = Node::new(Role::Button);
+            node.set_label(label);
+            node
+        };
+        let mut nodes = vec![(NodeId(2), button("two"))];
+        if extended {
+            nodes.push((NodeId(3), button("three")));
+        }
+        let mut root = Node::new(Role::Window);
+        root.set_label(label);
+        root.set_children(nodes.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        nodes.insert(0, (NodeId(1), root));
+        TreeUpdate {
+            nodes,
+            tree: Some(Tree::new(NodeId(1))),
+            tree_id: TreeId::ROOT,
+            focus: NodeId(1),
+        }
+    }
+
+    /// The handlers of a window that reports its lifecycle. A gated window's
+    /// first deactivation waits until the gate is released.
+    struct Window {
+        label: &'static str,
+        extended: Arc<AtomicBool>,
+        lifecycle: mpsc::Sender<Lifecycle>,
+        gate: Option<mpsc::Receiver<()>>,
+    }
+
+    impl ActivationHandler for Window {
+        fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+            let _ = self.lifecycle.send(Lifecycle::Activated(self.label));
+            Some(window(self.label, self.extended.load(Ordering::SeqCst)))
+        }
+    }
+
+    impl DeactivationHandler for Window {
+        fn deactivate_accessibility(&mut self) {
+            let _ = self.lifecycle.send(Lifecycle::Deactivated(self.label));
+            if let Some(gate) = self.gate.take() {
+                gate.recv_timeout(PATIENCE).unwrap();
+            }
+        }
+    }
+
+    /// A production adapter, served by the process-wide context.
+    fn window_adapter(
+        label: &'static str,
+        extended: &Arc<AtomicBool>,
+        lifecycle: &mpsc::Sender<Lifecycle>,
+        gate: Option<mpsc::Receiver<()>>,
+    ) -> crate::Adapter {
+        let window = |gate| Window {
+            label,
+            extended: Arc::clone(extended),
+            lifecycle: lifecycle.clone(),
+            gate,
+        };
+        crate::Adapter::new(window(None), NoActions, window(gate))
+    }
+
+    /// The names of the nodes `app` registered on the bus at `address`, by
+    /// adapter in ascending order and sorted within each.
+    fn accessible_names(address: &str, app: &str) -> Vec<Vec<String>> {
+        const ACCESSIBLE: &str = "/org/a11y/atspi/accessible";
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let connection = Builder::address(address)
+                .unwrap()
+                .internal_executor(false)
+                .build()
+                .await
+                .unwrap();
+            let connection_copy = connection.clone();
+            let _task = executor.spawn(
+                async move {
+                    loop {
+                        connection_copy.executor().tick().await;
+                    }
+                },
+                "test_client_task",
+            );
+            let children = |path: String| {
+                let connection = &connection;
+                async move {
+                    let reply = connection
+                        .call_method(
+                            Some(app),
+                            path.as_str(),
+                            Some("org.freedesktop.DBus.Introspectable"),
+                            "Introspect",
+                            &(),
+                        )
+                        .await
+                        .unwrap();
+                    let xml: String = reply.body().deserialize().unwrap();
+                    xml.split("<node name=\"")
+                        .skip(1)
+                        .filter_map(|node| Some(node.split_once('"')?.0.to_owned()))
+                        .collect::<Vec<_>>()
+                }
+            };
+            let mut adapters: Vec<usize> = children(ACCESSIBLE.into())
+                .await
+                .iter()
+                .filter_map(|child| child.parse().ok())
+                .collect();
+            adapters.sort();
+            let mut names = Vec::new();
+            for adapter in adapters {
+                let mut adapter_names = Vec::new();
+                for node in children(format!("{ACCESSIBLE}/{adapter}")).await {
+                    let path = format!("{ACCESSIBLE}/{adapter}/{node}");
+                    let reply = connection
+                        .call_method(
+                            Some(app),
+                            path.as_str(),
+                            Some("org.freedesktop.DBus.Properties"),
+                            "Get",
+                            &("org.a11y.atspi.Accessible", "Name"),
+                        )
+                        .await;
+                    adapter_names.push(match reply {
+                        Ok(reply) => match reply.body().deserialize::<OwnedValue>() {
+                            Ok(name) => String::try_from(name).unwrap_or_default(),
+                            Err(error) => format!("{path}: {error}"),
+                        },
+                        Err(error) => format!("{path}: {error}"),
+                    });
+                }
+                adapter_names.sort();
+                names.push(adapter_names);
+            }
+            names
+        }))
+    }
+
     enum SessionBus {
         /// A private bus is running at the session bus address.
         Running,
@@ -730,10 +1191,18 @@ mod tests {
     /// this test binary with its own session bus address and without
     /// `AT_SPI_BUS_ADDRESS`. Every bus involved is a private `dbus-daemon`; the
     /// user's session and accessibility buses are never contacted. Returns true
-    /// inside that process.
+    /// inside that process. Without `dbus-daemon`, the scenario is skipped.
     fn in_isolated_process(test: &str, session_bus: SessionBus) -> bool {
         if std::env::var_os(ISOLATED).is_some() {
             return true;
+        }
+        let dbus_daemon = Command::new("dbus-daemon")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status();
+        if !dbus_daemon.is_ok_and(|status| status.success()) {
+            eprintln!("skipping `{test}`: it needs dbus-daemon");
+            return false;
         }
         let dir = TempDir::new();
         let socket = dir.path().join("session-bus");
@@ -745,7 +1214,7 @@ mod tests {
         };
         let test = format!("context::tests::{test}");
         let log = dir.path().join("output");
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = killed_with_spawner(&mut Command::new(std::env::current_exe().unwrap()))
             .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
             .env(ISOLATED, "1")
             .env("DBUS_SESSION_BUS_ADDRESS", address)
@@ -766,17 +1235,63 @@ mod tests {
         false
     }
 
+    /// Makes `command`'s process receive `SIGKILL` when the thread that
+    /// spawned it ends, so that a test process that is killed leaves no bus
+    /// or isolated test process behind. Each is spawned and reaped by the same
+    /// test thread. `prctl` is declared here because the crate does not depend
+    /// on `libc`.
+    fn killed_with_spawner(command: &mut Command) -> &mut Command {
+        use std::{
+            ffi::{c_int, c_ulong},
+            os::unix::process::CommandExt,
+        };
+        extern "C" {
+            fn prctl(option: c_int, ...) -> c_int;
+        }
+        const PR_SET_PDEATHSIG: c_int = 1;
+        const SIGKILL: c_ulong = 9;
+        // SAFETY: prctl is async-signal-safe and only changes the child.
+        unsafe {
+            command.pre_exec(|| match prctl(PR_SET_PDEATHSIG, SIGKILL) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            })
+        }
+    }
+
     struct TempDir(PathBuf);
 
     impl TempDir {
-        /// A new directory, short enough to hold Unix socket paths.
+        const PREFIX: &'static str = "accesskit-test-";
+
+        /// A new directory, short enough to hold Unix socket paths. The first
+        /// one in a process removes those left by test processes that died.
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
+            static SWEEP: std::sync::Once = std::sync::Once::new();
+            SWEEP.call_once(Self::remove_abandoned);
             let index = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("accesskit-{}-{index}", std::process::id()));
+            let name = format!("{}{}-{index}", Self::PREFIX, std::process::id());
+            let path = std::env::temp_dir().join(name);
             std::fs::create_dir(&path).unwrap();
             Self(path)
+        }
+
+        fn remove_abandoned() {
+            let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let owner = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(Self::PREFIX))
+                    .and_then(|name| name.split_once('-'))
+                    .and_then(|(pid, _)| pid.parse::<u32>().ok());
+                if owner.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
         }
 
         fn path(&self) -> &Path {
@@ -818,12 +1333,12 @@ mod tests {
                 ),
             )
             .unwrap();
-            let mut daemon = Command::new("dbus-daemon")
+            let mut daemon = killed_with_spawner(&mut Command::new("dbus-daemon"))
                 .arg(format!("--config-file={}", config.display()))
                 .args(["--nofork", "--nopidfile", "--nosyslog", "--print-address"])
                 .stdout(Stdio::piped())
                 .spawn()
-                .expect("these tests run private buses with dbus-daemon");
+                .unwrap();
             let mut address = String::new();
             BufReader::new(daemon.stdout.take().unwrap())
                 .read_line(&mut address)
@@ -914,6 +1429,13 @@ mod tests {
         Deactivated,
     }
 
+    /// Counts down `remaining`, returning whether it was positive.
+    fn take_one(remaining: &AtomicUsize) -> bool {
+        remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
     /// The session-bus side of at-spi-bus-launcher while a screen reader runs.
     struct FakeLauncher {
         /// Requests still to be answered with an address that has no bus.
@@ -927,11 +1449,7 @@ mod tests {
     impl FakeLauncher {
         fn get_address(&self) -> String {
             let _ = self.observed.send(Observed::AddressRequested);
-            let missing = self
-                .missing_requests
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                .is_ok();
-            if missing {
+            if take_one(&self.missing_requests) {
                 self.missing_bus.clone()
             } else {
                 self.atspi_bus.clone()
@@ -939,7 +1457,10 @@ mod tests {
         }
     }
 
-    struct FakeStatus;
+    struct FakeStatus {
+        /// Reads of the screen-reader status still to be left unanswered.
+        unanswered: AtomicUsize,
+    }
 
     #[zbus::interface(name = "org.a11y.Status")]
     impl FakeStatus {
@@ -949,17 +1470,39 @@ mod tests {
         }
 
         #[zbus(property)]
-        fn screen_reader_enabled(&self) -> bool {
+        async fn screen_reader_enabled(&self) -> bool {
+            if take_one(&self.unanswered) {
+                future::pending::<()>().await;
+            }
             true
         }
     }
 
-    /// Serves a launcher on the session bus for the AT-SPI bus in `dir`.
+    /// The socket of the session bus that this isolated process was given.
+    fn session_socket() -> PathBuf {
+        let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+        PathBuf::from(address.strip_prefix("unix:path=").unwrap())
+    }
+
+    /// Serves a launcher on the session bus for the AT-SPI bus in `dir`. Like a
+    /// restarted at-spi-bus-launcher, it takes the name from any running one.
     fn serve_launcher(
         dir: &TempDir,
         missing_requests: usize,
         observed: mpsc::Sender<Observed>,
     ) -> Service {
+        serve_launcher_with(dir, missing_requests, 0, observed)
+    }
+
+    fn serve_launcher_with(
+        dir: &TempDir,
+        missing_requests: usize,
+        unanswered_status_reads: usize,
+        observed: mpsc::Sender<Observed>,
+    ) -> Service {
+        let status = FakeStatus {
+            unanswered: AtomicUsize::new(unanswered_status_reads),
+        };
         let launcher = FakeLauncher {
             missing_requests: AtomicUsize::new(missing_requests),
             missing_bus: format!("unix:path={}", dir.path().join("missing-bus").display()),
@@ -969,19 +1512,48 @@ mod tests {
         let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
         serve(&session_bus, LAUNCHER, |builder| {
             builder
+                .allow_name_replacements(true)
+                .replace_existing_names(true)
                 .serve_at("/org/a11y/bus", launcher)?
-                .serve_at("/org/a11y/bus", FakeStatus)
+                .serve_at("/org/a11y/bus", status)
         })
     }
 
     /// The AT-SPI registry, which embeds each application's root.
-    struct FakeRegistry;
+    #[derive(Default)]
+    struct FakeRegistry {
+        /// Receives the bus name of each embedded application.
+        embedded: Option<mpsc::Sender<String>>,
+        /// Requests still to be left unanswered.
+        unanswered: AtomicUsize,
+    }
+
+    impl FakeRegistry {
+        fn reporting(embedded: mpsc::Sender<String>) -> Self {
+            Self {
+                embedded: Some(embedded),
+                ..Default::default()
+            }
+        }
+    }
 
     #[zbus::interface(name = "org.a11y.atspi.Socket")]
     impl FakeRegistry {
-        fn embed(&self, plug: (String, OwnedObjectPath)) -> (String, OwnedObjectPath) {
+        async fn embed(&self, plug: (String, OwnedObjectPath)) -> (String, OwnedObjectPath) {
+            if take_one(&self.unanswered) {
+                future::pending::<()>().await;
+            }
+            if let Some(embedded) = &self.embedded {
+                let _ = embedded.send(plug.0.clone());
+            }
             plug
         }
+    }
+
+    fn serve_registry(address: &str, registry: FakeRegistry) -> Service {
+        serve(address, "org.a11y.atspi.Registry", |builder| {
+            builder.serve_at("/org/a11y/atspi/accessible/root", registry)
+        })
     }
 
     /// An AT-SPI bus with a registry on it; both stop when dropped.
@@ -992,9 +1564,7 @@ mod tests {
 
     fn start_atspi_bus(socket: &Path) -> AtspiBus {
         let bus = PrivateBus::start(socket);
-        let registry = serve(&bus.address, "org.a11y.atspi.Registry", |builder| {
-            builder.serve_at("/org/a11y/atspi/accessible/root", FakeRegistry)
-        });
+        let registry = serve_registry(&bus.address, FakeRegistry::default());
         AtspiBus {
             _registry: registry,
             _bus: bus,
