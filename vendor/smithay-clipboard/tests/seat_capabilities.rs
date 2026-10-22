@@ -98,6 +98,20 @@ fn capabilities_queued_after_seat_removal() {
     session.barrier();
 }
 
+/// As above, but the queued change adds a capability to the removed seat.
+#[test]
+fn capability_added_after_seat_removal() {
+    let mut session = Session::start();
+    session.run(|compositor| compositor.capabilities(Capability::Pointer));
+    session.observe(Observed::KeyboardReleased);
+    session.run(|compositor| {
+        compositor.remove_seat();
+        compositor.capabilities(Capability::Pointer | Capability::Keyboard);
+    });
+    session.observe(Observed::PointerReleased);
+    session.barrier();
+}
+
 /// Copy from a pointer press after the keyboard, and with it the data device,
 /// went away while the client had keyboard focus.
 #[test]
@@ -112,7 +126,7 @@ fn copy_after_keyboard_release() {
         compositor.frame();
     });
     session.barrier();
-    session.clipboard().store_text("without a data device");
+    session.assert_store_refused("without a data device");
 
     session.restore_keyboard();
     session.run(|compositor| compositor.keyboard_enter(4));
@@ -215,6 +229,17 @@ impl Session {
         assert!(mime_types.iter().any(|mime| mime == "text/plain;charset=utf-8"), "{mime_types:?}");
     }
 
+    /// Copy while the seat cannot authorize a selection.
+    ///
+    /// The worker handles requests in order, so the load's answer proves the
+    /// store was handled before any later Wayland event. A live worker refuses
+    /// the load for lack of keyboard focus.
+    fn assert_store_refused(&self, text: &str) {
+        self.clipboard().store_text(text);
+        let refusal = self.clipboard().load_text().expect_err("loaded without keyboard focus");
+        assert_eq!(refusal.to_string(), "client doesn't have focus");
+    }
+
     /// The keyboard was released; a new keyboard arrives without focus, so a
     /// pointer press must not set a selection until that keyboard enters.
     fn assert_released_keyboard_cannot_authorize_copy(&mut self) {
@@ -226,7 +251,7 @@ impl Session {
             compositor.frame();
         });
         self.barrier();
-        self.clipboard().store_text("without keyboard focus");
+        self.assert_store_refused("without keyboard focus");
 
         self.run(|compositor| compositor.keyboard_enter(4));
         self.assert_copy_after_key(5);

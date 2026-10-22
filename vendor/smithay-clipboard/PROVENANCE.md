@@ -52,17 +52,25 @@ compositor to a real libwayland client connection through a socket pair. Each
 server command is flushed as one batch, so the worker reads it in one batch
 too: for example, a press, the capability removal, then the frame. A
 barrier advertises a new seat and waits for the worker to bind it, which
-proves the worker dispatched everything sent earlier. The tests need
-`libwayland-client` but no display server.
+proves the worker dispatched everything sent earlier. After a Copy that must
+be refused, a blocking load orders the store before later Wayland events and
+must be refused for lack of focus. The tests need `libwayland-client` but no
+display server.
+
+Run them as a standalone package from the repository root:
 
 ```sh
 cargo test --locked --manifest-path vendor/smithay-clipboard/Cargo.toml
 ```
 
-Against the base source, all six tests fail. The worker panics at
-`src/state.rs:395` (pointer), `:359` (seat) and `:157` (keyboard), and the
-two focus tests receive a selection authorized by a pointer press without
-keyboard focus. Reverting any one behavior change other than the
+Cargo cannot run them with `-p smithay-clipboard` from the parent workspace,
+because this package is not a workspace member. Build artifacts are local
+test output.
+
+Against the base source, all seven tests fail. The worker panics at
+`src/state.rs:395` (pointer), `:320` and `:359` (seat) and `:157` (keyboard),
+and the two focus tests' worker answers the refused Copy's load as if the
+keyboard were focused. Reverting any one behavior change other than the
 `store_selection` guard makes its test fail.
 
 `Cargo.lock` covers only this test lane. It was pruned from the cagents
