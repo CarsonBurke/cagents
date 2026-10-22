@@ -3423,7 +3423,12 @@ impl Runtime {
             || self.queued.is_some()
             || !self.followups.is_empty();
         match self.handle() {
-            Some(handle) if handle.is_connected() => handle.set_visible(visible),
+            Some(handle) if handle.is_connected() => match handle.set_visible(visible) {
+                // The connection can drop between the check and the call, and
+                // is then as lost as one found lost: not this pass's to report.
+                Err(_) if !handle.is_connected() => Ok(()),
+                result => result,
+            },
             _ => Ok(()),
         }
     }

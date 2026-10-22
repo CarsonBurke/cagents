@@ -417,13 +417,11 @@ impl NoticeLog {
         }
     }
 
-    /// Whether retiring what is due by `now` would empty the log.
-    fn all_due(&self, now: Instant) -> bool {
-        self.paused_at.is_none()
-            && self
-                .entries
-                .iter()
-                .all(|entry| entry.expires_at.is_some_and(|expiry| expiry <= now))
+    /// Whether `key` has a report standing.
+    fn has(&self, key: NoticeKey) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.notice.key == Some(key))
     }
 
     /// Withdraws whatever `key` last reported, because its condition no
@@ -4592,10 +4590,10 @@ pub enum Message {
     DismissAllNotices,
     /// The earliest confirmation in the notice log is due to retire.
     ExpireNotices,
-    /// Retires what is due, once it is known whether the notices control,
-    /// which goes away with the last notice, held keyboard focus.
-    RetireNotices {
-        control_focused: bool,
+    /// The notices control, kept on screen one frame past the last notice,
+    /// has been asked whether it held keyboard focus.
+    NoticeControlRetired {
+        focused: bool,
     },
 }
 
@@ -11656,6 +11654,15 @@ impl Cagents {
         }
     }
 
+    /// Whether `key` has a report standing, including one raised earlier in
+    /// this same update that the log has not drained yet.
+    fn notice_stands(&self, key: NoticeKey) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|notice| notice.key == Some(key))
+            || self.notices.has(key)
+    }
+
     /// Withdraws whatever `key` reported, because its condition no longer
     /// holds, including a report raised earlier in this same update that the
     /// log has not drained yet.
@@ -13793,6 +13800,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
             Message::RepositoryLoaded { result: Ok(_), .. }
@@ -17031,8 +17039,13 @@ impl Application for Cagents {
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
             }
-            Message::ExpireNotices => self.expire_notices(),
-            Message::RetireNotices { control_focused } => self.retire_notices(control_focused),
+            Message::ExpireNotices => {
+                // Nothing is due while the countdown is paused, which also
+                // makes a timer that fired as the notices opened a no-op.
+                self.notices.expire(Instant::now());
+                Task::none()
+            }
+            Message::NoticeControlRetired { focused } => self.notice_control_retired(focused),
             Message::DirectoryFilesLoaded {
                 key,
                 request,
@@ -17234,6 +17247,9 @@ impl Application for Cagents {
         }
         self.resolve_notices_for_closed_cards();
         self.sync_notice_countdown();
+        // Before `reconcile_notice_popup`, which owns the case of the notices
+        // being open when their last entry goes.
+        let task = Task::batch([task, self.retire_notice_control(notice_control)]);
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
@@ -21005,7 +21021,6 @@ mod tests {
         log.pause(at(2));
         log.pause(at(3));
         assert_eq!(log.next_expiry(), None, "no timer runs while paused");
-        assert!(!log.all_due(at(100)));
         log.record_at(TransientNotice::success("Copied."), at(4));
         log.expire(at(100));
         assert_eq!(log.len(), 2, "nothing retires while paused");
@@ -21016,8 +21031,6 @@ mod tests {
         log.expire(at(14));
         assert_eq!(log.len(), 1);
         assert_eq!(log.next_expiry(), Some(at(16)));
-        assert!(!log.all_due(at(15)));
-        assert!(log.all_due(at(16)));
         log.resume(at(20));
         assert_eq!(log.next_expiry(), Some(at(16)), "resuming twice is a no-op");
     }

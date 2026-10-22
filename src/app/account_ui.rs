@@ -3791,7 +3791,10 @@ impl Cagents {
                     return Task::none();
                 }
                 let login = self.account_ui.logins.remove(index);
-                if !login.recovered {
+                // A sign-in left over from an earlier run is taken up quietly,
+                // unless this run already said something about it: that report
+                // would still claim cagents is trying, so it gives way to this.
+                if !login.recovered || self.notice_stands(NoticeKey::SignIn(key)) {
                     self.status = Some(
                         TransientNotice::warning(format!(
                             "{} could not say which account signed in. cagents will check again the next time it starts.",
@@ -7911,6 +7914,47 @@ mod app_tests {
         assert_eq!(notices, ["Could not use that account home."]);
         let _ = app.update(Message::AccountUi(Action::LinkCancel));
         assert!(app.notices.is_empty());
+    }
+
+    /// A sign-in recovered from an earlier run is taken up quietly, but once
+    /// this run has reported on it, giving up on it says so rather than
+    /// leaving the report that cagents is still trying.
+    #[test]
+    fn a_recovered_sign_in_given_up_replaces_its_retry_warning() {
+        for reported in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let key = pending_login(&mut app, 15);
+            app.account_ui.logins[0].recovered = true;
+            if reported {
+                app.account_ui.logins[0].phase = LoginPhase::Settling;
+                app.account_ui.logins[0].attempts = 1;
+                let _ = app.update(Message::AccountUi(Action::LoginSettled {
+                    key,
+                    result: Err("reply lost".into()),
+                }));
+                assert_eq!(app.notices.len(), 1);
+            }
+            app.account_ui.logins[0].attempts = LOGIN_ATTEMPTS;
+            let _ = app.update(Message::AccountUi(Action::LoginVerified {
+                key,
+                outcome: Outcome::Failed("not now".into()),
+            }));
+            assert!(app.account_ui.logins.is_empty());
+            let notices = app
+                .notices
+                .recent()
+                .map(|entry| entry.notice.message.as_str())
+                .collect::<Vec<_>>();
+            if reported {
+                let gave_up = "Claude Code could not say which account signed in.";
+                assert!(
+                    matches!(notices.as_slice(), [message] if message.starts_with(gave_up)),
+                    "{notices:?}"
+                );
+            } else {
+                assert!(notices.is_empty(), "{notices:?}");
+            }
+        }
     }
 
     /// Each retry of a sign-in's save replaces the warning before it, and the

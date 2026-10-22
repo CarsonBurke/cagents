@@ -58,6 +58,10 @@ pub(super) struct State {
     /// the tab to the viewport edge - including a reveal triggered by merely
     /// hovering an already-visible tab under focus-follows-mouse.
     tabs_offset: f32,
+    /// The notices control kept on screen, at this severity, for the frame
+    /// after the last notice went: long enough to learn whether it held the
+    /// keyboard, which would otherwise go nowhere with it.
+    retiring_notice_control: Option<NoticeSeverity>,
 }
 
 #[cfg(test)]
@@ -599,9 +603,12 @@ mod tests {
 
     /// The expiry timer runs only while a confirmation is waiting to retire
     /// and someone could be reading it: the window in the foreground and the
-    /// notices closed. It fires as a message that retires what is due.
+    /// notices closed. Time spent otherwise is added back to the deadline. It
+    /// fires as a message that retires what is due.
     #[test]
     fn confirmations_retire_only_while_someone_could_read_them() {
+        // A measurable pause, so a resume that shifted nothing cannot pass.
+        let pause = || std::thread::sleep(Duration::from_millis(5));
         let mut app = super::super::tests::context_inspector_test_app(true);
         focus_main_window(&mut app, true);
         app.notices.record(TransientNotice::error("Still failing."));
@@ -623,23 +630,35 @@ mod tests {
             None,
             "nothing retires while read"
         );
+        let paused = app.notices.paused_at.expect("reading pauses the countdown");
         // A timer that fired just before the popup opened changes nothing.
         let _ = app.update(Message::ExpireNotices);
         assert_eq!(app.notices.len(), 2);
         assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        pause();
+        let before = Instant::now();
         let _ = app.update(Message::ChromeUi(Action::Close));
+        let after = Instant::now();
         let resumed = app.notices.next_expiry().expect("the countdown resumes");
-        assert!(resumed >= due, "the time spent reading is not counted");
+        // Moved on by exactly the pause, which ended inside the update.
+        assert!(
+            due + (before - paused) <= resumed && resumed <= due + (after - paused),
+            "the time spent reading is not counted"
+        );
 
         focus_main_window(&mut app, false);
         assert_eq!(app.notices.next_expiry(), None, "nothing retires unseen");
+        let paused = app.notices.paused_at.expect("the background pauses it");
         let _ = app.update(Message::ExpireNotices);
         assert_eq!(app.notices.len(), 2);
+        pause();
+        let before = Instant::now();
         focus_main_window(&mut app, true);
+        let after = Instant::now();
+        let refocused = app.notices.next_expiry().expect("focus resumes it");
         assert!(
-            app.notices
-                .next_expiry()
-                .is_some_and(|next| next >= resumed)
+            resumed + (before - paused) <= refocused && refocused <= resumed + (after - paused),
+            "time in the background is not counted"
         );
 
         // Backdated, so the repeat is already due when the timer fires.
@@ -653,55 +672,83 @@ mod tests {
         assert_eq!(app.notices.next_expiry(), None);
     }
 
-    /// Runs `task`'s widget operations against the notices control, holding
-    /// the keyboard or not, and the inspector toggle. Returns the messages it
-    /// produced and whether it moved the keyboard to the toggle.
-    fn run_notice_task(task: Task<Message>, control_focused: bool) -> (Vec<Message>, bool) {
-        use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
-        use cosmic::iced::futures::StreamExt;
+    /// The header's notices control beside the inspector toggle, as the
+    /// window header mounts them.
+    fn notice_header(app: &Cagents) -> Element<'_, Message> {
+        widget::row::with_children(vec![
+            app.sidebar_toggle(),
+            widget::row::with_children(app.notice_control()).into(),
+        ])
+        .into()
+    }
 
-        struct Control(bool);
-        impl Focusable for Control {
-            fn is_focused(&self) -> bool {
-                self.0
+    /// Mounts the header as `app` now draws it, then applies `task`'s widget
+    /// operations to it, as the runtime does once an update has been drawn.
+    /// Returns the messages the task produced and the ids holding focus after.
+    fn apply_to_header(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+    ) -> (Vec<Message>, Vec<String>) {
+        use iced::advanced::widget::operation::{Focusable, Outcome};
+        use iced::advanced::{Layout, layout, widget::Operation};
+        use iced::{Rectangle, Size, futures::StreamExt};
+
+        struct Focused(Vec<String>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
             }
-            fn focus(&mut self) {
-                self.0 = true;
-            }
-            fn unfocus(&mut self) {
-                self.0 = false;
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id
+                    && state.is_focused()
+                {
+                    self.0.push(id.to_string());
+                }
             }
         }
 
-        let control_id = widget::Id::new(NOTICES_CONTROL_ID);
-        let toggle_id = context_inspector_toggle_id();
-        let mut control = Control(control_focused);
-        let mut toggle = Control(false);
-        let mut messages = Vec::new();
+        let mut element = notice_header(app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 100.0)),
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let mut messages = Vec::new();
         runtime.block_on(async {
-            let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
                 return;
             };
             while let Ok(Some(action)) =
                 tokio::time::timeout(Duration::from_millis(250), stream.next()).await
             {
                 match action {
-                    cosmic::iced::runtime::Action::Widget(operation) => {
+                    iced::runtime::Action::Widget(operation) => {
                         let mut next = Some(operation);
                         while let Some(mut operation) = next.take() {
-                            let bounds = cosmic::iced::Rectangle::default();
-                            operation.focusable(Some(&control_id), bounds, &mut control);
-                            operation.focusable(Some(&toggle_id), bounds, &mut toggle);
+                            element.as_widget_mut().operate(
+                                tree,
+                                Layout::new(&node),
+                                renderer,
+                                operation.as_mut(),
+                            );
                             if let Outcome::Chain(chained) = operation.finish() {
                                 next = Some(chained);
                             }
                         }
                     }
-                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                    iced::runtime::Action::Output(cosmic::Action::App(message)) => {
                         messages.push(message);
                     }
                     _ => {}
@@ -709,42 +756,88 @@ mod tests {
             }
         });
         runtime.shutdown_background();
-        (messages, toggle.0)
+        let mut focused = Focused(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut focused);
+        (messages, focused.0)
     }
 
-    /// The notices control goes away with the last notice. When a
-    /// confirmation retiring on its own takes it while it holds the keyboard,
-    /// the keyboard moves to the inspector toggle beside it rather than to
-    /// nowhere; otherwise it stays where it is.
+    /// The notices control goes with the last notice, whatever removes it.
+    /// When it held the keyboard, the keyboard moves to the inspector toggle
+    /// beside it rather than to nowhere; otherwise it stays where it is.
     #[test]
-    fn retiring_the_last_notice_moves_the_keyboard_off_its_control() {
-        for control_focused in [true, false] {
-            let mut app = super::super::tests::context_inspector_test_app(true);
-            focus_main_window(&mut app, true);
-            app.notices.record_at(
-                TransientNotice::success("Copied."),
-                Instant::now() - NOTICE_SUCCESS_LIFETIME,
-            );
-            let query = app.update(Message::ExpireNotices);
-            assert_eq!(app.notices.len(), 1, "it asks about focus before retiring");
-            let (mut messages, moved) = run_notice_task(query, control_focused);
-            assert!(!moved);
-            assert!(
-                matches!(
-                    messages.as_slice(),
-                    [Message::RetireNotices { control_focused: answer }]
-                        if *answer == control_focused
-                ),
-                "{messages:?}"
-            );
-            let retire = app.update(messages.pop().unwrap());
-            assert!(app.notices.is_empty());
-            let (_, moved) = run_notice_task(retire, true);
-            assert_eq!(moved, control_focused);
+    fn the_last_notice_going_moves_the_keyboard_off_its_control() {
+        let toggle = context_inspector_toggle_id().to_string();
+        let control = widget::Id::new(NOTICES_CONTROL_ID).to_string();
+        // A confirmation retiring on its timer, and a failure withdrawn by
+        // the reader giving up on what failed.
+        let removals: [(&str, fn(&mut Cagents) -> Task<Message>); 2] = [
+            ("timer", |app| {
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                app.update(Message::ExpireNotices)
+            }),
+            ("link cancel", |app| {
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkStart(crate::agent::Provider::Claude),
+                ));
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkReady {
+                        key: uuid::Uuid::new_v4(),
+                        result: Err("no credentials there".into()),
+                    },
+                ));
+                app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkCancel,
+                ))
+            }),
+        ];
+        for (path, remove) in removals {
+            for holds_keyboard in [true, false] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                focus_main_window(&mut app, true);
+                app.notices.record(TransientNotice::warning("Placeholder."));
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = iced::advanced::widget::Tree::new(notice_header(&app).as_widget());
+                let target = if holds_keyboard {
+                    widget::Id::new(NOTICES_CONTROL_ID)
+                } else {
+                    widget::Id::new("elsewhere")
+                };
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(target),
+                );
+                assert_eq!(focused == [control.clone()], holds_keyboard, "{path}");
+                app.notices.clear();
+
+                let query = remove(&mut app);
+                assert!(!app.has_chrome_notices(), "{path}");
+                let (mut messages, _) = apply_to_header(&app, &mut tree, &renderer, query);
+                assert!(
+                    matches!(
+                        messages.as_slice(),
+                        [Message::NoticeControlRetired { focused }] if *focused == holds_keyboard
+                    ),
+                    "{path}: {messages:?}"
+                );
+                let moved = app.update(messages.pop().unwrap());
+                assert!(app.notice_control().is_none(), "{path}");
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, moved);
+                if holds_keyboard {
+                    assert_eq!(focused, [toggle.clone()], "{path}");
+                } else {
+                    assert!(focused.is_empty(), "{path}: {focused:?}");
+                }
+            }
         }
 
-        // A tree without the control answers nothing; the retirement still
-        // happens.
+        // A tree without the control answers nothing; the control still goes.
         let mut app = super::super::tests::context_inspector_test_app(true);
         focus_main_window(&mut app, true);
         app.notices.record_at(
@@ -752,17 +845,17 @@ mod tests {
             Instant::now() - NOTICE_SUCCESS_LIFETIME,
         );
         let query = app.update(Message::ExpireNotices);
+        assert!(app.notice_control().is_some(), "kept for the query");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let messages = runtime.block_on(async {
+        let mut messages = runtime.block_on(async {
             use cosmic::iced::futures::StreamExt;
             let mut messages = Vec::new();
             let mut stream = cosmic::iced::runtime::task::into_stream(query).unwrap();
             while let Some(action) = stream.next().await {
                 match action {
-                    // Nothing in this tree answers the query.
                     cosmic::iced::runtime::Action::Widget(operation) => drop(operation),
                     cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
                         messages.push(message);
@@ -775,12 +868,12 @@ mod tests {
         assert!(
             matches!(
                 messages.as_slice(),
-                [Message::RetireNotices {
-                    control_focused: false
-                }]
+                [Message::NoticeControlRetired { focused: false }]
             ),
             "{messages:?}"
         );
+        let _ = app.update(messages.pop().unwrap());
+        assert!(app.notice_control().is_none());
     }
 
     #[test]
@@ -1800,40 +1893,48 @@ impl Cagents {
         }
     }
 
-    /// Retires the confirmations that are due. When that would take the last
-    /// notice, and with it the notices control, it first asks whether the
-    /// control holds keyboard focus so focus can move somewhere that stays.
-    pub(super) fn expire_notices(&mut self) -> Task<Message> {
-        let now = Instant::now();
-        let removes_control = !self.notices.is_empty()
-            && self.notices.all_due(now)
-            && !self
-                .save_health
-                .as_ref()
-                .is_some_and(SaveHealthState::is_visible);
-        if removes_control {
-            // Collected, because a tree without the control answers nothing
-            // at all, and the confirmations must retire regardless.
-            return iced::widget::operation::is_focused(widget::Id::new(NOTICES_CONTROL_ID))
-                .collect()
-                .map(|answers| {
-                    cosmic::Action::App(Message::RetireNotices {
-                        control_focused: answers.contains(&true),
-                    })
-                });
+    /// The notices control goes with the last notice, whatever removed it:
+    /// a confirmation retiring, a dismissal, a success resolving a failure,
+    /// a pane closing. Holding the keyboard, it would take the keyboard with
+    /// it. So for one more frame it stays, while the tree is asked whether it
+    /// has focus; the answer moves focus to the inspector toggle beside it.
+    /// `before` is the control's severity before this update, if it showed.
+    ///
+    /// With the notices open, `reconcile_notice_popup` closes them and moves
+    /// focus the same way.
+    pub(super) fn retire_notice_control(
+        &mut self,
+        before: Option<NoticeSeverity>,
+    ) -> Task<Message> {
+        let Some(severity) = before else {
+            return Task::none();
+        };
+        if self.has_chrome_notices()
+            || self.chrome_ui.popup == Some(Popup::Notices)
+            || self.chrome_ui.retiring_notice_control.is_some()
+        {
+            return Task::none();
         }
-        self.retire_notices(false)
+        self.chrome_ui.retiring_notice_control = Some(severity);
+        // Collected, because a tree without the control answers nothing at
+        // all, and the control must still go.
+        iced::widget::operation::is_focused(widget::Id::new(NOTICES_CONTROL_ID))
+            .collect()
+            .map(|answers| {
+                cosmic::Action::App(Message::NoticeControlRetired {
+                    focused: answers.contains(&true),
+                })
+            })
     }
 
-    pub(super) fn retire_notices(&mut self, control_focused: bool) -> Task<Message> {
-        // A pause that began since the focus query (the popup opened, the
-        // window lost focus) makes this a no-op; the countdown resumes later.
-        self.notices.expire(Instant::now());
-        if control_focused && !self.has_chrome_notices() {
-            return iced::widget::operation::focus(context_inspector_toggle_id())
-                .map(cosmic::Action::App);
+    pub(super) fn notice_control_retired(&mut self, focused: bool) -> Task<Message> {
+        self.chrome_ui.retiring_notice_control = None;
+        // A notice raised meanwhile keeps the control, focus included.
+        if focused && !self.has_chrome_notices() {
+            iced::widget::operation::focus(context_inspector_toggle_id()).map(cosmic::Action::App)
+        } else {
+            Task::none()
         }
-        self.reconcile_notice_popup()
     }
 
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
@@ -1845,7 +1946,9 @@ impl Cagents {
         }
     }
 
-    fn notice_control(&self) -> Option<Element<'_, Message>> {
+    /// The severity the notices control shows, or `None` when there is no
+    /// control because there is nothing to show.
+    pub(super) fn notice_control_severity(&self) -> Option<NoticeSeverity> {
         if !self.has_chrome_notices() {
             return None;
         }
@@ -1864,7 +1967,13 @@ impl Cagents {
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
-        let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
+        Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
+    }
+
+    fn notice_control(&self) -> Option<Element<'_, Message>> {
+        let severity = self
+            .notice_control_severity()
+            .or(self.chrome_ui.retiring_notice_control)?;
         let control = crate::ui_controls::icon_button(
             severity.icon(),
             match severity {
