@@ -313,6 +313,7 @@ pub(crate) struct HostState {
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) account_lifecycle: super::account_lifecycle::Reservations,
+    pub(super) worktree_removals: super::worktree_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
@@ -344,6 +345,7 @@ impl HostState {
         Self {
             recover_holders: false,
             account_lifecycle: Default::default(),
+            worktree_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),

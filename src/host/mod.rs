@@ -15,6 +15,7 @@ mod provider_shutdown_tests;
 mod service;
 mod state;
 mod work;
+mod worktree_removal;
 
 use std::{
     fs, io,

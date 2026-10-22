@@ -188,6 +188,29 @@ impl Registry {
             [], |row| row.get(0),
         ).map_err(|error| error.to_string())
     }
+    /// Target directories of durable agent work that is running, or accepted
+    /// and yet to launch. Removing one would pull it out from under that work.
+    pub(crate) fn active_agent_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT a.record FROM agents a WHERE a.closed = 0 AND (
+                 a.session_id IS NOT NULL
+                 OR EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
+                 OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id
+                     AND r.state IN ('accepted', 'running', 'waiting')))",
+            )
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records
+            .iter()
+            .map(|record| decode::<Agent>(record).map(|agent| agent.spec.target.directory))
+            .collect()
+    }
     /// Accepted work can be queued behind the daemon's update write gate before
     /// it owns a hosted actor. Do not lose it from impact merely because there
     /// is no terminal/chat to project yet. Call outside HostState; final update
