@@ -69,6 +69,8 @@ struct PreserveRefresh {
 struct ReaderState {
     memory: Memory,
     restore: bool,
+    revealing: bool,
+    needs_layout: bool,
 }
 
 impl Memory {
@@ -1359,6 +1361,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
+        if tree.state.downcast_ref::<ReaderState>().revealing {
+            return iced_accessibility::A11yTree::default();
+        }
         self.content
             .as_widget()
             .a11y_nodes(layout, &tree.children[0], cursor)
@@ -1372,6 +1377,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         tree::State::new(ReaderState {
             memory: self.memory.clone(),
             restore: true,
+            revealing: self.target.is_some(),
+            needs_layout: false,
         })
     }
 
@@ -1397,6 +1404,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        let source_pending = self.restoration_pending;
         let state = tree.state.downcast_mut::<ReaderState>();
         if state.memory.edge(self.subagent).is_some()
             || state.memory.preserve_arrived(self.subagent)
@@ -1406,6 +1414,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         let switching = state.memory.0.borrow().active.is_none_or(|index| {
             state.memory.0.borrow().contexts[index].subagent.as_deref() != self.subagent
         });
+        state.revealing |= self.target.is_some() && switching;
+        state.needs_layout = false;
         if (state.restore || switching) && self.restoration_pending {
             state.restore = true;
             // An empty hydrated-body wait or a cold source placeholder is not
@@ -1515,6 +1525,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             if let Some(top) = pending_window_top {
                 self.restoration_pending = true;
                 state.restore = true;
+                state.needs_layout = false;
                 self.content.as_widget_mut().operate(
                     child,
                     Layout::new(&node),
@@ -1534,7 +1545,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 node = self.content.as_widget_mut().layout(child, renderer, limits);
                 continue;
             }
-            self.restoration_pending = false;
+            self.restoration_pending = source_pending;
             state.restore = false;
             let offset = anchor
                 .layout_following(self.subagent, &rows, next, top.0, self.follow_end)
@@ -1565,8 +1576,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut virtual_viewport,
             );
             if !virtual_viewport.changed {
+                state.revealing &= self.restoration_pending;
+                state.needs_layout = false;
                 break;
             }
+            // A cold reader is not presentable while its native virtual
+            // windows still disagree with the restored scroll position. Keep
+            // the four-pass bound and continue in the next native update.
+            state.needs_layout = state.revealing && !self.restoration_pending;
             node = self.content.as_widget_mut().layout(child, renderer, limits);
         }
         node
@@ -1664,7 +1681,22 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let revealing = tree.state.downcast_ref::<ReaderState>().revealing;
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+            tree.state
+                .downcast_ref::<ReaderState>()
+                .memory
+                .0
+                .borrow_mut()
+                .modifiers = *modifiers;
+        }
         if let Some(intent) = &self.find_intent
+            && (!revealing
+                || matches!(
+                    event,
+                    Event::Mouse(mouse::Event::WheelScrolled { .. })
+                        | Event::Window(iced::window::Event::Resized(_))
+                ))
             && layout.bounds().intersection(viewport).is_some()
             && matches!(
                 event,
@@ -1680,6 +1712,38 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         {
             intent.cancel();
         }
+        // A returning native tree can still be at its default end. Apply a
+        // wheel relative to the saved reader, never that provisional offset.
+        let provisional_wheel = (revealing
+            && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+            && cursor.is_over(layout.bounds())
+            && cursor.is_over(*viewport))
+        .then(|| {
+            let state = tree.state.downcast_ref::<ReaderState>();
+            let anchor = state.memory.0.borrow();
+            let context = anchor
+                .contexts
+                .iter()
+                .find(|context| context.subagent.as_deref() == self.subagent)?;
+            Some((context.top?, context.geometry?))
+        })
+        .flatten();
+        if let Some((top, _)) = provisional_wheel {
+            let travel = (layout
+                .children()
+                .next()
+                .expect("transcript content")
+                .bounds()
+                .height
+                - layout.bounds().height)
+                .max(0.0);
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut SetBottom(travel - top.clamp(0.0, travel)),
+            );
+        }
         let mut before = ReadTop::default();
         if self.target.is_some() {
             self.content.as_widget_mut().operate(
@@ -1692,16 +1756,28 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         if let Some(captured) = &self.captured {
             captured.set(false);
         }
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
+        // Explicit Find/Home/End widget operations still traverse this reader,
+        // and wheel intent may supersede its saved position. Provisional text
+        // cannot receive clicks, touch, typing or queued accessibility actions.
+        if !revealing
+            || matches!(
+                event,
+                Event::Window(_)
+                    | Event::Mouse(mouse::Event::WheelScrolled { .. })
+                    | Event::Keyboard(iced::keyboard::Event::ModifiersChanged(_))
+            )
+        {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
         let mut virtual_viewport = virtualized::UpdateViewport::default();
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
@@ -1709,8 +1785,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             renderer,
             &mut virtual_viewport,
         );
-        if virtual_viewport.changed {
+        if virtual_viewport.changed && (!revealing || !self.restoration_pending) {
             shell.invalidate_layout();
+        }
+        if tree.state.downcast_ref::<ReaderState>().needs_layout {
+            shell.invalidate_layout();
+            shell.request_redraw();
         }
         if self.target.is_none() {
             return;
@@ -1731,6 +1811,68 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             };
             let state = tree.state.downcast_mut::<ReaderState>();
             let mut anchor = state.memory.0.borrow_mut();
+            if let Some((saved_top, saved_geometry)) = provisional_wheel {
+                if !self
+                    .captured
+                    .as_ref()
+                    .is_some_and(|captured| captured.get())
+                    && let Some(context) = anchor
+                        .contexts
+                        .iter_mut()
+                        .find(|context| context.subagent.as_deref() == self.subagent)
+                {
+                    context.edge = None;
+                    let top = (saved_top + top - before.0.unwrap_or(top))
+                        .clamp(0.0, saved_geometry.travel());
+                    context.top = Some(top);
+                    let scroll = Scroll::new(
+                        top,
+                        saved_geometry.content.height,
+                        saved_geometry.viewport.height,
+                    );
+                    let wheel = match event {
+                        Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(match *delta {
+                            mouse::ScrollDelta::Lines { x, y } => {
+                                if anchor.modifiers.shift() && !cfg!(target_os = "macos") {
+                                    x
+                                } else {
+                                    y
+                                }
+                            }
+                            mouse::ScrollDelta::Pixels { y, .. } => y,
+                        }),
+                        _ => None,
+                    };
+                    let user_input = navigation_input(Some(saved_top), top, scroll, wheel, false)
+                        || anchor.pending_input;
+                    anchor.pending_input = false;
+                    anchor.reported = Some(Report {
+                        subagent: self.subagent.map(str::to_owned),
+                        top,
+                        geometry: saved_geometry,
+                    });
+                    if let Some(observations) = &self.observations {
+                        observations
+                            .borrow_mut()
+                            .insert(self.subagent.map(str::to_owned), scroll);
+                    }
+                    if let Some(target) = self
+                        .target
+                        .filter(|_| self.observations.is_none() || user_input)
+                    {
+                        shell.publish(action(Action::Scrolled(
+                            target,
+                            self.subagent.map(str::to_owned),
+                            scroll,
+                            user_input,
+                        )));
+                    }
+                }
+                // Preserve row-relative restoration across the remaining cold
+                // measurements, including a fitting placeholder's zero delta.
+                state.restore = true;
+                return;
+            }
             let moved = before.0.is_some_and(|before| before != top);
             let wheel_intent = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
                 && cursor.is_over(layout.bounds())
@@ -1773,9 +1915,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     || previous.geometry != geometry
             });
             let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height);
-            if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
-                anchor.modifiers = *modifiers;
-            }
             // Only navigation toward an edge can request its page. Content
             // scrollables own their gestures, including retries at their ends.
             let wheel = match event {
@@ -1841,6 +1980,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        if tree.state.downcast_ref::<ReaderState>().revealing {
+            return;
+        }
         self.content.as_widget().draw(
             &tree.children[0],
             renderer,
@@ -1860,6 +2002,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         viewport: &Rectangle,
         renderer: &cosmic::Renderer,
     ) -> mouse::Interaction {
+        if tree.state.downcast_ref::<ReaderState>().revealing {
+            return mouse::Interaction::None;
+        }
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
@@ -1877,6 +2022,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, cosmic::Theme, cosmic::Renderer>> {
+        if tree.state.downcast_ref::<ReaderState>().revealing {
+            return None;
+        }
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout,
@@ -1907,6 +2055,699 @@ mod tests {
         );
         assert_eq!(nodes.root().len(), 1);
         assert_eq!(nodes.root()[0].node().label(), Some("Retained child"));
+    }
+
+    // The draw counter observes actual widget traversal. It does not supply
+    // viewport answers or keep any virtual row/tree alive.
+    struct PresentationProbe {
+        label: &'static str,
+        height: f32,
+        draws: Rc<std::cell::RefCell<Vec<&'static str>>>,
+        clicks: Rc<Cell<usize>>,
+    }
+    impl Widget<Message, cosmic::Theme, cosmic::Renderer> for PresentationProbe {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<iced_accessibility::Id>()
+        }
+        fn state(&self) -> tree::State {
+            tree::State::new(iced_accessibility::Id::unique())
+        }
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fixed(self.height))
+        }
+        fn layout(
+            &mut self,
+            _: &mut Tree,
+            _: &cosmic::Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(Size::new(limits.max().width, self.height))
+        }
+        fn draw(
+            &self,
+            _: &Tree,
+            _: &mut cosmic::Renderer,
+            _: &cosmic::Theme,
+            _: &renderer::Style,
+            _: Layout<'_>,
+            _: mouse::Cursor,
+            _: &Rectangle,
+        ) {
+            self.draws.borrow_mut().push(self.label);
+        }
+        fn update(
+            &mut self,
+            _: &mut Tree,
+            event: &Event,
+            _: Layout<'_>,
+            _: mouse::Cursor,
+            _: &cosmic::Renderer,
+            _: &mut dyn Clipboard,
+            _: &mut Shell<'_, Message>,
+            _: &Rectangle,
+        ) {
+            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
+                self.clicks.set(self.clicks.get() + 1);
+            }
+        }
+        fn mouse_interaction(
+            &self,
+            _: &Tree,
+            _: Layout<'_>,
+            _: mouse::Cursor,
+            _: &Rectangle,
+            _: &cosmic::Renderer,
+        ) -> mouse::Interaction {
+            mouse::Interaction::Pointer
+        }
+        fn a11y_nodes(
+            &self,
+            _: Layout<'_>,
+            tree: &Tree,
+            _: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            let mut node = iced_accessibility::accesskit::Node::new(
+                iced_accessibility::accesskit::Role::Button,
+            );
+            node.set_label(self.label);
+            iced_accessibility::A11yTree::leaf(
+                node,
+                tree.state.downcast_ref::<iced_accessibility::Id>().clone(),
+            )
+        }
+    }
+
+    fn presentation_probe(
+        label: &'static str,
+        height: f32,
+        draws: &Rc<std::cell::RefCell<Vec<&'static str>>>,
+        clicks: &Rc<Cell<usize>>,
+    ) -> Element<'static, Message> {
+        Element::new(PresentationProbe {
+            label,
+            height,
+            draws: draws.clone(),
+            clicks: clicks.clone(),
+        })
+    }
+
+    #[test]
+    fn cold_reader_draw_waits_for_more_than_four_actual_virtual_viewport_passes() {
+        fn nested(
+            depth: u64,
+            draws: Rc<std::cell::RefCell<Vec<&'static str>>>,
+            clicks: Rc<Cell<usize>>,
+        ) -> Element<'static, Message> {
+            if depth == 0 {
+                return presentation_probe("restored beginning", 400.0, &draws, &clicks);
+            }
+            let nested_draws = draws.clone();
+            let nested_clicks = clicks.clone();
+            let mut first = virtualized::Row::new(depth * 2, 0, 12_000.0, None, move || {
+                nested(depth - 1, nested_draws.clone(), nested_clicks.clone())
+            });
+            first.anchor = true;
+            virtualized::column(
+                vec![
+                    first,
+                    virtualized::Row::new(depth * 2 + 1, 0, 6_000.0, None, move || {
+                        presentation_probe("provisional end", 6_000.0, &draws, &clicks)
+                    }),
+                ],
+                Default::default(),
+            )
+        }
+        let mut renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        memory.request_edge(None, Edge::Start);
+        let draws = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let mut element = transcript_observed(
+            nested(10, draws.clone(), clicks.clone()),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+            Observations::default(),
+            memory,
+            false,
+            HashSet::new(),
+            None,
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(tree.state.downcast_ref::<ReaderState>().revealing);
+        assert!(
+            tree.state.downcast_ref::<ReaderState>().needs_layout,
+            "real nested windows exceed the unchanged four-pass layout bound"
+        );
+        for _ in 0..8 {
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::dark(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            assert!(
+                draws.borrow().is_empty(),
+                "provisional windows must not paint"
+            );
+            assert!(
+                element
+                    .as_widget()
+                    .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable)
+                    .root()
+                    .is_empty()
+            );
+            assert_eq!(
+                element.as_widget().mouse_interaction(
+                    &tree,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                    &viewport,
+                    &renderer
+                ),
+                mouse::Interaction::None
+            );
+            assert!(
+                element
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO
+                    )
+                    .is_none()
+            );
+            let mut messages = vec![];
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert_eq!(clicks.get(), 0, "unpainted text is not clickable");
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Window(iced::window::Event::RedrawRequested(
+                    iced::time::Instant::now(),
+                )),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert!(
+                shell.is_layout_invalid(),
+                "cap exhaustion must make native progress"
+            );
+            assert_eq!(
+                shell.redraw_request(),
+                iced::window::RedrawRequest::NextFrame
+            );
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            if !tree.state.downcast_ref::<ReaderState>().revealing {
+                break;
+            }
+        }
+        assert!(
+            !tree.state.downcast_ref::<ReaderState>().revealing,
+            "actual nested windows must eventually converge"
+        );
+        assert!(!tree.state.downcast_ref::<ReaderState>().needs_layout);
+        let mut top = ReadTop::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut top);
+        assert_eq!(top.0, Some(0.0));
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert_eq!(&*draws.borrow(), &["restored beginning"]);
+        assert_eq!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &viewport,
+                &renderer
+            ),
+            mouse::Interaction::Pointer
+        );
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut vec![]),
+            &viewport,
+        );
+        assert!(
+            clicks.get() > 0,
+            "coherent content becomes interactive again"
+        );
+        assert!(
+            !element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable)
+                .root()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cold_pending_reader_is_unpainted_without_spinning_but_find_and_empty_settle() {
+        let mut renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let memory = Memory::default();
+        let draws = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let navigation = find_navigation::State::default();
+        let guard = navigation.guard();
+        let make = |pending, height| {
+            transcript_observed(
+                item("body", presentation_probe("body", height, &draws, &clicks)),
+                target,
+                None,
+                vec![],
+                true,
+                vec![(item_id("body"), "body")],
+                Observations::default(),
+                memory.clone(),
+                pending,
+                HashSet::new(),
+                Some(guard.clone()),
+            )
+        };
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        {
+            let mut ready = make(false, 2_000.0);
+            let mut tree = Tree::new(&ready);
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            ready.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut SetBottom(500.0),
+            );
+        }
+        let mut pending = make(true, 2_000.0);
+        let mut tree = Tree::new(&pending);
+        let node = pending
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(tree.state.downcast_ref::<ReaderState>().revealing);
+        pending.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert!(draws.borrow().is_empty());
+        let mut messages = vec![];
+        let mut shell = Shell::new(&mut messages);
+        pending.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(
+            !shell.is_layout_invalid(),
+            "source-pending alone cannot spin native layouts"
+        );
+        assert_eq!(shell.redraw_request(), iced::window::RedrawRequest::Wait);
+        let mut find = ApplyFind {
+            target,
+            scope: TranscriptScope::default(),
+            scroll: card_control_id(target.card, "chat-transcript"),
+            location: LogicalLocation {
+                offset: 800.0,
+                exact: true,
+                stage: 3,
+                shape_pending: None,
+                horizontal: vec![],
+            },
+            intent: guard.clone(),
+            document: Some(navigation.document_epoch()),
+        };
+        pending
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
+        assert!(guard.current());
+        assert!(
+            !tree.state.downcast_ref::<ReaderState>().restore,
+            "Find operations remain active while presentation is hidden"
+        );
+        // Find can accept a native correction before source readiness. Its
+        // next layout must not turn that correction into presentation readiness.
+        let mut still_pending = make(true, 2_000.0);
+        tree.diff(still_pending.as_widget_mut());
+        let pending_node = still_pending
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(tree.state.downcast_ref::<ReaderState>().revealing);
+        still_pending.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&pending_node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert!(draws.borrow().is_empty());
+        assert!(
+            still_pending
+                .as_widget()
+                .a11y_nodes(
+                    Layout::new(&pending_node),
+                    &tree,
+                    mouse::Cursor::Unavailable
+                )
+                .root()
+                .is_empty()
+        );
+        let mut shell = Shell::new(&mut messages);
+        still_pending.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+            Layout::new(&pending_node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert!(!shell.is_layout_invalid());
+        assert_ne!(
+            shell.redraw_request(),
+            iced::window::RedrawRequest::NextFrame
+        );
+        let mut ready = make(false, 2_000.0);
+        tree.diff(ready.as_widget_mut());
+        let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(!tree.state.downcast_ref::<ReaderState>().revealing);
+        let mut top = ReadTop::default();
+        ready
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut top);
+        assert_eq!(top.0, Some(800.0));
+        ready.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &renderer::Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        assert_eq!(&*draws.borrow(), &["body"]);
+        // A pending explicit edge in an already visible context must not blank it.
+        memory.request_edge(None, Edge::Latest);
+        let mut visible_pending = make(true, 2_000.0);
+        tree.diff(visible_pending.as_widget_mut());
+        visible_pending
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        assert!(!tree.state.downcast_ref::<ReaderState>().revealing);
+        // A new, genuinely empty reader has no geometry to wait for.
+        let mut empty = transcript_observed(
+            widget::column::with_children(Vec::<Element<'_, Message>>::new()),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+            Observations::default(),
+            memory.clone(),
+            false,
+            HashSet::new(),
+            None,
+        );
+        let mut empty_tree = Tree::new(&empty);
+        empty
+            .as_widget_mut()
+            .layout(&mut empty_tree, &renderer, &limits);
+        assert!(!empty_tree.state.downcast_ref::<ReaderState>().revealing);
+        assert!(!empty_tree.state.downcast_ref::<ReaderState>().needs_layout);
+        assert_eq!(memory.edge(None), None);
+        assert!(memory.0.borrow().contexts[0].rows.is_empty());
+    }
+
+    #[test]
+    fn wheel_during_cold_reveal_moves_from_saved_reader_not_provisional_end() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut final_tops = vec![];
+        for pending in [false, true] {
+            let memory = Memory::default();
+            let make = |pending| {
+                transcript_observed(
+                    item(
+                        "body",
+                        widget::Space::new().height(2_000).width(Length::Fill),
+                    ),
+                    target,
+                    None,
+                    vec![],
+                    true,
+                    vec![(item_id("body"), "body")],
+                    Observations::default(),
+                    memory.clone(),
+                    pending,
+                    HashSet::new(),
+                    None,
+                )
+            };
+            {
+                let mut initial = make(false);
+                let mut tree = Tree::new(&initial);
+                let node = initial
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                initial.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut SetBottom(500.0),
+                );
+            }
+            let mut reader = make(pending);
+            let mut tree = Tree::new(&reader);
+            let node = reader.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut before = ReadTop::default();
+            reader
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+            assert_eq!(
+                before.0,
+                Some(if pending { 1_600.0 } else { 1_100.0 }),
+                "cold native default is deliberately different from the saved middle"
+            );
+            reader.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut vec![]),
+                &viewport,
+            );
+            let mut ready = make(false);
+            tree.diff(ready.as_widget_mut());
+            let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut after = ReadTop::default();
+            ready
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+            final_tops.push(after.0.unwrap());
+        }
+        assert!(
+            final_tops[0] > 1_100.0 && final_tops[0] < 1_600.0,
+            "real native wheel actually moves the visible control toward the end"
+        );
+        assert_eq!(
+            final_tops[0], final_tops[1],
+            "pending return preserves exactly the same reader-relative wheel movement"
+        );
+    }
+
+    #[test]
+    fn cold_reader_wheel_reports_saved_geometry_and_dispatches_real_history_edges() {
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        // The third case's conflicting axes require the modifier cached while
+        // source-pending; using the old unshifted y would miss Earlier.
+        for (bottom, shifted) in [(false, false), (true, false), (false, true)] {
+            if shifted && cfg!(target_os = "macos") {
+                continue;
+            }
+            let (mut live, handle) = view::prepared_runtime_for_test(&[]);
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.has_earlier = true;
+            snapshot.has_later = true;
+            handle.replace_snapshot_for_test(snapshot);
+            live.refresh();
+            let memory = live.scroll_memory.clone();
+            let observations = live.observed_scroll.clone();
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            let make = |pending, height| {
+                transcript_observed(
+                    item(
+                        "body",
+                        widget::Space::new().height(height).width(Length::Fill),
+                    ),
+                    target,
+                    None,
+                    vec![],
+                    true,
+                    vec![(item_id("body"), "body")],
+                    observations.clone(),
+                    memory.clone(),
+                    pending,
+                    HashSet::new(),
+                    None,
+                )
+            };
+            {
+                let mut ready = make(false, 2_000.0);
+                let mut tree = Tree::new(&ready);
+                let node = ready.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                ready.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut SetBottom(if bottom { 0.0 } else { 1_600.0 }),
+                );
+            }
+            // A fitting cold placeholder cannot be mistaken for authoritative
+            // fitting history: outward paging uses retained 2000/400 geometry.
+            let mut pending = make(true, 20.0);
+            let mut tree = Tree::new(&pending);
+            let node = pending
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut messages = vec![];
+            if shifted {
+                pending.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+                        iced::keyboard::Modifiers::SHIFT,
+                    )),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert!(memory.0.borrow().modifiers.shift());
+            }
+            pending.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines {
+                        x: if shifted { 1.0 } else { 0.0 },
+                        y: if bottom || shifted { -1.0 } else { 1.0 },
+                    },
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let reports: Vec<_> = messages.into_iter().filter(|message| matches!(message,
+                Message::ChatUi(Action::Scrolled(actual, None, _, true)) if *actual == target
+            )).collect();
+            assert_eq!(
+                reports.len(),
+                1,
+                "outward wheel must publish real reader intent"
+            );
+            let Message::ChatUi(Action::Scrolled(_, _, scroll, _)) = &reports[0] else {
+                unreachable!()
+            };
+            assert_eq!(scroll.content(), 2_000.0);
+            assert_eq!(scroll.window_height(), 400.0);
+            assert_eq!(scroll.from_top(), if bottom { 1_600.0 } else { 0.0 });
+            assert_eq!(observations.borrow()[&None], *scroll);
+            drop(pending);
+            drop(app.update(reports.into_iter().next().unwrap()));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(
+                runtime.pending.as_ref().and_then(|pending| pending.page),
+                Some(if bottom {
+                    view::Page::Newer
+                } else {
+                    view::Page::Earlier
+                }),
+                "actual App consumes the emitted wheel intent and starts the matching provider page"
+            );
+        }
     }
 
     fn geometry(height: f32) -> Geometry {
@@ -2640,6 +3481,7 @@ mod tests {
                     "fitting native operation has no translation change"
                 );
                 assert_eq!(memory.edge(context), Some(edge));
+                assert!(tree.state.downcast_ref::<ReaderState>().revealing);
                 if wheel_cancels {
                     pending.as_widget_mut().update(
                         &mut tree,
