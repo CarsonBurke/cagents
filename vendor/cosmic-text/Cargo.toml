@@ -104,6 +104,10 @@ path = "tests/wrap_stability.rs"
 name = "wrap_word_fallback"
 path = "tests/wrap_word_fallback.rs"
 
+[[test]]
+name = "wrapped_ellipsis"
+path = "tests/wrapped_ellipsis.rs"
+
 [[bench]]
 name = "layout"
 path = "benches/layout.rs"

@@ -1,8 +1,8 @@
 Based on crates.io cosmic-text 0.19.0, checksum
 be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73.
-Source, upstream test targets, font fixtures and licenses are retained. Source
-differs only by the additive API below. Screenshot documentation is
-omitted.
+Source, upstream test targets, font fixtures and licenses are retained. Local
+changes combine the additive snapshot API below, wrapped ellipsis corrections
+and a checkout identity anchor. Screenshot documentation is omitted.
 
 Local API: immutable full-context LayoutSnapshot and visual projections.
 This is not an incremental shaper. Creating a snapshot requires existing complete
@@ -29,3 +29,28 @@ RSS/PSS during opening, streaming, scrolling and hide/reveal; bounded display
 projection alone does not establish those results. See docs/performance.md in
 the application repository for the workloads and residency budgets. Upstream
 adoption and application integration require separate review.
+
+Wrapped ellipsis and checkout identity (cagents1473 / PR1483)
+
+The union also backports the final wrapped-ellipsis separator correction from
+peer ecfe42e7c30d9c26dd780cbe9fd2f2dde4570f19, based on cosmic-text PR535
+head0c5d9c507798bcb779e5fbdb48ae339face06f9c, plus the peer's local
+overwide-blank boundary extension. Only src/shape.rs changes glyph continuation;
+no source text is trimmed. Library src/lib.rs adds the standard compile-time
+CAGENTS_CHECKOUT_ROOT identity anchor, paired with the source-hook entry in
+scripts/qualify-checkout-cache.py. Snapshot constructors, full-context ownership,
+projections and original source-byte mappings remain unchanged from PR1316.
+
+All eight upstream integration-test targets, both benchmarks, development
+dependencies, test profile, fonts and rendering fixtures remain available. The
+wrapped_ellipsis target adds the peer's three bundled-font regressions; the UI
+reexport regression checks the application's selected dependency. This union
+adds no new library dependency or another root Cargo patch; the existing local
+cosmic-text selection and UI unicase requirement remain unchanged.
+
+The shape correction is confined to wrapped line/height-limited ellipsis.
+Multiline End, Start and Middle share continuation handling; the new focused
+End controls do not independently qualify every Start/Middle/Bidi geometry.
+The retained upstream oracles and final composed UI/native/cache qualification
+remain required. Prior separate PR1316/1473 execution is historical evidence,
+not a claim that this source union has been built or run. See PROVENANCE.md.
