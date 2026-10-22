@@ -5127,6 +5127,28 @@ mod tests {
     }
 
     #[test]
+    fn pre_image_reference_daemon_revision_is_rejected_before_snapshot_or_prompt() {
+        assert_eq!(PROTOCOL_VERSION, 105);
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            let mut response = connected_envelope(
+                1,
+                proof("session", "boot", "incarnation"),
+                proof("session", "boot", "incarnation"),
+            );
+            response.version = 104;
+            write_frame(&mut server_stream, &response).unwrap();
+        });
+        assert!(matches!(
+            ControlClient::from_stream(client_stream),
+            Err(ControlError::UnsupportedVersion { actual: 104 })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn request_ids_and_remote_errors_fail_closed() {
         for remote_error in [false, true] {
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();

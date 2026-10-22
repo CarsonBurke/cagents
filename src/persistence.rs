@@ -268,6 +268,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -2017,6 +2018,7 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            chat_draft_attachments: manifest.chat_draft_attachments,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -3898,6 +3900,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:chat_draft_attachments"),
+        &to_json(&state.chat_draft_attachments)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &to_json(&state.repository_navigation)?,
     )?;
@@ -5266,6 +5273,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat drafts", &value))
         .transpose()?
         .unwrap_or_default(),
+        chat_draft_attachments: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:chat_draft_attachments"),
+        )?
+        .map(|value| from_json("workspace chat image drafts", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -5896,6 +5910,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -7248,6 +7263,76 @@ mod tests {
             serde_json::from_value::<WorkspaceState>(legacy)
                 .unwrap()
                 .agent_updates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn workspace_managed_image_drafts_roundtrip_additive_metadata_and_legacy_absence() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("image-draft-boot");
+        let store = StateStore::open(
+            directory.path().join("image-drafts.sqlite3"),
+            boot_id.clone(),
+        )
+        .unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        let reference = crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 37,
+            device: uuid::Uuid::new_v4(),
+            name: "literal {draft} *.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        let image = crate::chat::Attachment {
+            path: "/private/owned/image.png".into(),
+            reference: Some(reference.clone()),
+        };
+        workspace
+            .chat_drafts
+            .insert(card, format!("Keep {}", reference.token()));
+        workspace
+            .chat_draft_attachments
+            .insert(card, vec![image.clone()]);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments[&card],
+            [image.clone()]
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments[&card],
+            [image]
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("chat_draft_attachments");
+        assert!(
+            serde_json::from_value::<WorkspaceState>(legacy)
+                .unwrap()
+                .chat_draft_attachments
+                .is_empty()
+        );
+        workspace.chat_draft_attachments.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments
                 .is_empty()
         );
     }

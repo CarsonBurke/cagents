@@ -15,6 +15,7 @@ use std::sync::{
 };
 
 mod artifacts;
+mod attachment_draft;
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
@@ -195,12 +196,13 @@ pub enum Action {
     ComposerUp(Target),
     ComposerCursor(Target, text_editor::Cursor),
     Paste(Target),
-    PastedImage(Target, Option<clipboard_image::Image>),
-    PastedText(Target, Option<String>),
+    PastedImage(Target, uuid::Uuid, Option<clipboard_image::Image>),
+    PastedText(Target, uuid::Uuid, Option<String>),
     /// A clipboard image the chat cannot take, offered without any text to
     /// paste in its place.
-    PasteRefused(Target, &'static str),
-    ImageSaved(Target, Result<PathBuf, String>),
+    PasteRefused(Target, uuid::Uuid, &'static str),
+    ImageSaved(Target, uuid::Uuid, Result<Attachment, String>),
+    AttachmentsPrepared(Target, uuid::Uuid, Result<Vec<Attachment>, String>),
     Submit(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
@@ -273,7 +275,7 @@ pub enum Action {
     ClearCopied(Target, Instant),
     DropHover(Target, bool),
     Attach(Target),
-    Attached(Target, Result<Option<Vec<PathBuf>>, String>),
+    Attached(Target, uuid::Uuid, Result<Option<Vec<PathBuf>>, String>),
     /// Files or text dropped on the conversation.
     Dropped(Target, file_drop::Payload),
     RemoveAttachment(Target, usize),
@@ -345,6 +347,7 @@ impl Action {
                 | Self::PastedText(..)
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
+                | Self::AttachmentsPrepared(..)
                 | Self::ImageLoaded(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
@@ -498,6 +501,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, and the
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
+    draft_attachments: HashMap<CardId, Vec<Attachment>>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -528,6 +532,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             drafts: HashMap::new(),
+            draft_attachments: HashMap::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -538,9 +543,20 @@ impl Default for State {
     }
 }
 impl State {
+    #[cfg(test)]
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
+            ..Self::default()
+        }
+    }
+    pub(super) fn with_draft_attachments(
+        drafts: HashMap<CardId, String>,
+        draft_attachments: HashMap<CardId, Vec<Attachment>>,
+    ) -> Self {
+        Self {
+            drafts,
+            draft_attachments,
             ..Self::default()
         }
     }
@@ -719,7 +735,9 @@ impl ChangeToken {
                 body: output.len(),
                 digest: tail_digest(tail_digest(tail_digest(0, name), input), output),
             },
-            ItemContent::Image { path, description } => Self {
+            ItemContent::Image {
+                path, description, ..
+            } => Self {
                 shape: 20,
                 body: path.len(),
                 digest: tail_digest(tail_digest(0, path), description),
@@ -897,7 +915,12 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
             Some(text)
         }
         (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[input, output]),
-        (CopyPart::Text, ItemContent::Image { path, description }) => joined(&[description, path]),
+        (
+            CopyPart::Text,
+            ItemContent::Image {
+                path, description, ..
+            },
+        ) => joined(&[description, path]),
         (
             CopyPart::Text,
             ItemContent::Delivery {
@@ -960,7 +983,7 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
                     find::contains(&result.title, query) || find::contains(&result.url, query) || find::contains(&result.snippet, query)
                 })
         }
-        ItemContent::Image { path, description } => {
+        ItemContent::Image { path, description, .. } => {
             find::contains(path, query) || find::contains(description, query)
         }
         ItemContent::Delivery {
@@ -1490,6 +1513,7 @@ struct PendingCommand {
     /// the provider has accepted it. A rejected send is not history: the
     /// draft it came from is still in the composer.
     sent: Option<String>,
+    sent_attachments: Vec<Attachment>,
     /// Which end of the history this command is extending, where it is a
     /// page request at all. The transcript says so at the edge the rows will
     /// appear at, so it has to know which edge is waiting.
@@ -1672,6 +1696,7 @@ pub(super) struct Runtime {
     thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
     pastes_pending: usize,
+    attachment_bookmarks: HashMap<uuid::Uuid, attachment_draft::Bookmark>,
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
@@ -1704,6 +1729,8 @@ pub(super) struct Runtime {
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
+    history_images: HashMap<String, Vec<Attachment>>,
+    history_attachment_stash: Option<Vec<Attachment>>,
     /// Which entry the composer is showing while the reader walks the
     /// history; `None` while they are writing.
     history_cursor: Option<usize>,
@@ -1904,30 +1931,172 @@ impl Runtime {
         }) else {
             return false;
         };
+        for bookmark in self.attachment_bookmarks.values_mut() {
+            bookmark.valid = false;
+        }
         completion::apply(&mut self.composer, &token, insertion);
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.history_cursor = None;
         self.history_stash = None;
+        self.history_attachment_stash = None;
         true
     }
 
-    /// Adds files to the next message, each at most once.
-    fn attach(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+    /// Retain exact receipt metadata across take-back, queue edits and retry.
+    fn merge_attachments(&mut self, attachments: impl IntoIterator<Item = Attachment>) {
         let before = self.attachments.len();
-        for path in paths {
+        for attachment in attachments {
             if !self
                 .attachments
                 .iter()
-                .any(|attachment| attachment.path == path)
+                .any(|old| match (&old.reference, &attachment.reference) {
+                    (Some(a), Some(b)) => a.id == b.id && a.device == b.device,
+                    (None, None) => old.path == attachment.path,
+                    _ => false,
+                })
             {
-                self.attachments.push(Attachment { path });
+                self.attachments.push(attachment);
             }
         }
         self.thumbnails.sync(&self.attachments);
         if self.attachments.len() != before {
             self.revision = self.revision.wrapping_add(1);
         }
+    }
+
+    /// Legacy test/helper files carry no inferred identity.
+    #[cfg(test)]
+    fn attach(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.merge_attachments(paths.into_iter().map(Attachment::file));
+    }
+
+    fn begin_attachment_insert(&mut self) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        self.attachment_bookmarks
+            .insert(id, attachment_draft::Bookmark::new(self.composer.cursor()));
+        self.pastes_pending += 1;
+        id
+    }
+
+    fn composer_action(&mut self, action: text_editor::Action) {
+        match action {
+            text_editor::Action::Edit(edit) => {
+                if let Some(recorded) = self.composer.perform_edit(edit) {
+                    for bookmark in self.attachment_bookmarks.values_mut() {
+                        bookmark.changed(&recorded.change);
+                    }
+                }
+            }
+            other => self.composer.perform(other),
+        }
+    }
+
+    /// Insert at the captured, measured caret. Keep a user who moved elsewhere
+    /// at their own mapped caret; conflicting selection edits refuse insertion.
+    fn finish_attachment_insert(
+        &mut self,
+        id: uuid::Uuid,
+        text: &str,
+        attachments: Vec<Attachment>,
+    ) -> bool {
+        let Some(bookmark) = self.attachment_bookmarks.remove(&id) else {
+            return false;
+        };
+        self.pastes_pending = self.pastes_pending.saturating_sub(1);
+        if !bookmark.valid {
+            self.error = Some("The image insertion point changed while loading. Attach the image again at the new caret.".into());
+            self.submit_after_paste = None;
+            return false;
+        }
+        let current = self.composer.cursor();
+        self.composer.move_to(bookmark.cursor);
+        let mut insertion = text.to_owned();
+        if !attachments.is_empty()
+            && self
+                .composer
+                .line(bookmark.cursor.position.line)
+                .and_then(|line| {
+                    line.text
+                        .get(..bookmark.cursor.position.column)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|left| left.chars().next_back().is_some_and(|c| !c.is_whitespace()))
+        {
+            insertion.push(' ');
+        }
+        for attachment in &attachments {
+            if let Some(reference) = &attachment.reference {
+                if !insertion.is_empty() && !insertion.ends_with(char::is_whitespace) {
+                    insertion.push(' ');
+                }
+                insertion.push_str(&reference.token());
+                insertion.push(' ');
+            }
+        }
+        if !insertion.is_empty() {
+            if let Some(recorded) = self
+                .composer
+                .perform_edit(text_editor::Edit::Paste(Arc::new(insertion)))
+            {
+                for other in self.attachment_bookmarks.values_mut() {
+                    other.changed(&recorded.change);
+                }
+                if current != bookmark.cursor {
+                    if let Some(mapped) = attachment_draft::mapped(current, &recorded.change) {
+                        self.composer.move_to(mapped);
+                    }
+                }
+            }
+        }
+        self.merge_attachments(attachments);
+        self.revision = self.revision.wrapping_add(1);
+        self.completion.restart(true);
+        self.history_cursor = None;
+        self.history_stash = None;
+        self.history_attachment_stash = None;
+        true
+    }
+
+    fn cancel_attachment_insert(&mut self, id: uuid::Uuid, error: Option<String>) {
+        if self.attachment_bookmarks.remove(&id).is_some() {
+            self.pastes_pending = self.pastes_pending.saturating_sub(1);
+            self.submit_after_paste = None;
+            if let Some(error) = error {
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn remove_image_token(&mut self, token: &str) {
+        let text = self.composer.text();
+        let excerpt = crate::editor_history::Excerpt::document(&text);
+        for (offset, _) in text
+            .match_indices(token)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let current = self.composer.cursor();
+            self.composer.move_to(text_editor::Cursor {
+                position: excerpt.position(offset + token.len()),
+                selection: Some(excerpt.position(offset)),
+            });
+            if let Some(recorded) = self
+                .composer
+                .perform_edit(text_editor::Edit::Paste(Arc::new(String::new())))
+            {
+                for bookmark in self.attachment_bookmarks.values_mut() {
+                    bookmark.changed(&recorded.change);
+                }
+                if let Some(mapped) = attachment_draft::mapped(current, &recorded.change) {
+                    self.composer.move_to(mapped);
+                }
+            }
+        }
+        self.history_cursor = None;
+        self.history_stash = None;
+        self.history_attachment_stash = None;
     }
 
     fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -1968,8 +2137,9 @@ impl Runtime {
         // The draft a walk through sent messages set aside is in `combined`.
         self.history_cursor = None;
         self.history_stash = None;
+        self.history_attachment_stash = None;
         let later = self.replace_attachments(attachments);
-        self.attach(later.into_iter().map(|attachment| attachment.path));
+        self.merge_attachments(later);
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -1996,7 +2166,14 @@ impl Runtime {
                 text.push_str(followup.text.trim_end());
             }
             for attachment in &followup.attachments {
-                if !attachments.iter().any(|old| old.path == attachment.path) {
+                if !attachments
+                    .iter()
+                    .any(|old| match (&old.reference, &attachment.reference) {
+                        (Some(a), Some(b)) => a.id == b.id && a.device == b.device,
+                        (None, None) => old.path == attachment.path,
+                        _ => false,
+                    })
+                {
                     attachments.push(attachment.clone());
                 }
             }
@@ -2083,12 +2260,20 @@ impl Runtime {
     /// Records a message the provider accepted. The same message sent twice
     /// in a row is one entry, as a shell keeps it, and the walk restarts
     /// from the newest.
+    #[cfg(test)]
     fn remember(&mut self, sent: String) {
+        self.remember_with_attachments(sent, Vec::new());
+    }
+    fn remember_with_attachments(&mut self, sent: String, attachments: Vec<Attachment>) {
         if self.history.last() != Some(&sent) {
-            self.history.push(sent);
+            self.history.push(sent.clone());
+        }
+        if !attachments.is_empty() {
+            self.history_images.insert(sent, attachments);
         }
         self.history_cursor = None;
         self.history_stash = None;
+        self.history_attachment_stash = None;
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -2101,6 +2286,7 @@ impl Runtime {
                     return;
                 };
                 self.history_stash = Some(std::mem::take(&mut self.composer));
+                self.history_attachment_stash = Some(self.attachments.clone());
                 Some(newest)
             }
             (None, false) => return,
@@ -2115,6 +2301,24 @@ impl Runtime {
             }
             None => self.history_stash.take().unwrap_or_default(),
         };
+        let attachments = match next {
+            Some(index) => {
+                let mut attachments = self
+                    .history_attachment_stash
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|attachment| attachment.reference.is_none())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(images) = self.history_images.get(&self.history[index]) {
+                    attachments.extend(images.clone());
+                }
+                attachments
+            }
+            None => self.history_attachment_stash.take().unwrap_or_default(),
+        };
+        self.replace_attachments(attachments);
         self.history_cursor = next;
         self.replace_draft(composer);
     }
@@ -2136,6 +2340,13 @@ impl Runtime {
             .filter(|_| self.history_cursor.is_some())
             .unwrap_or(&self.composer)
             .text()
+    }
+
+    fn unsent_attachments(&self) -> &[Attachment] {
+        self.history_attachment_stash
+            .as_deref()
+            .filter(|_| self.history_cursor.is_some())
+            .unwrap_or(&self.attachments)
     }
 
     /// An empty draft can show a suggestion only for its exact current turn.
@@ -2181,12 +2392,17 @@ impl Runtime {
         self.replace_draft(text_editor::Content::with_text(&expected.text));
         self.history_cursor = None;
         self.history_stash = None;
+        self.history_attachment_stash = None;
         true
     }
 
     /// Puts a whole new draft in the composer. Whatever the completion list
     /// was doing belonged to the old one.
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+        self.attachment_bookmarks.clear();
+        self.pastes_pending = 0;
+        self.image_pastes_saving = 0;
+        self.submit_after_paste = None;
         self.composer = composer;
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
@@ -2250,6 +2466,7 @@ impl Runtime {
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
+            attachment_bookmarks: HashMap::new(),
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: false,
@@ -2274,6 +2491,8 @@ impl Runtime {
             picker_focus: 0,
             picker_keyboard: false,
             history: Vec::new(),
+            history_images: HashMap::new(),
+            history_attachment_stash: None,
             history_cursor: None,
             history_stash: None,
             scroll: view::Scroll::default(),
@@ -2354,7 +2573,7 @@ impl Runtime {
         };
         self.replace_draft(text_editor::Content::with_text(&text));
         let written = self.replace_attachments(queued.attachments);
-        self.attach(written.into_iter().map(|attachment| attachment.path));
+        self.merge_attachments(written);
         Some(queued.draft)
     }
     /// A conversation that has not started, showing `snapshot` until it does.
@@ -2654,18 +2873,42 @@ impl Runtime {
         // Restored and paged conversations carry their own prompt history.
         // Preserve a recalled index while the reader is walking it.
         if self.history_cursor.is_none() {
-            self.history = snapshot
-                .items
-                .iter()
-                .filter_map(|item| match (&item.role, &item.content) {
+            self.history.clear();
+            self.history_images.clear();
+            let mut prompt: Option<String> = None;
+            for item in &snapshot.items {
+                match (&item.role, &item.content) {
                     (chat::Role::User, ItemContent::Text { text, .. })
                         if !text.trim().is_empty() =>
                     {
-                        Some(text.clone())
+                        self.history.push(text.clone());
+                        prompt = Some(text.clone());
                     }
-                    _ => None,
-                })
-                .collect();
+                    (
+                        chat::Role::User,
+                        ItemContent::Image {
+                            reference: Some(reference),
+                            ..
+                        },
+                    ) => {
+                        if let Ok(attachment) =
+                            chat::attachment_assets::unverified_attachment(reference)
+                        {
+                            let text = prompt.get_or_insert_with(|| {
+                                let text = reference.token();
+                                self.history.push(text.clone());
+                                text
+                            });
+                            self.history_images
+                                .entry(text.clone())
+                                .or_default()
+                                .push(attachment);
+                        }
+                    }
+                    (chat::Role::User, _) => {}
+                    _ => prompt = None,
+                }
+            }
         }
         let live_ids: HashSet<&str> = snapshot
             .items
@@ -4612,8 +4855,26 @@ impl Cagents {
             .filter(|(card, draft)| open_cards.contains(card) && !draft.is_empty())
             .map(|(card, draft)| (*card, draft.clone()))
             .collect();
+        let mut chat_draft_attachments = self
+            .chat_ui
+            .draft_attachments
+            .iter()
+            .filter(|(card, images)| open_cards.contains(card) && !images.is_empty())
+            .map(|(card, images)| (*card, images.clone()))
+            .collect::<HashMap<_, _>>();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
+                let images = runtime
+                    .unsent_attachments()
+                    .iter()
+                    .filter(|a| a.reference.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if images.is_empty() {
+                    chat_draft_attachments.remove(card);
+                } else {
+                    chat_draft_attachments.insert(*card, images);
+                }
                 let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
@@ -4626,6 +4887,17 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
+                let images = runtime
+                    .unsent_attachments()
+                    .iter()
+                    .filter(|a| a.reference.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if images.is_empty() {
+                    chat_draft_attachments.remove(card);
+                } else {
+                    chat_draft_attachments.insert(*card, images);
+                }
                 let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
@@ -4678,12 +4950,14 @@ impl Cagents {
         if defaults.is_empty()
             && admission_sources.is_empty()
             && chat_drafts == self.durable.chat_drafts
+            && chat_draft_attachments == self.durable.chat_draft_attachments
             && repository_navigation == self.durable.repository_navigation
         {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
+        saved.chat_draft_attachments = chat_draft_attachments;
         saved.repository_navigation = repository_navigation;
         for card in &mut saved.cards {
             if let Some(source) = admission_sources.get(&card.id) {
@@ -4865,6 +5139,11 @@ impl Cagents {
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
         if let Some(source) = draft_from
+            && let Some(images) = self.chat_ui.draft_attachments.remove(&source)
+        {
+            self.chat_ui.draft_attachments.insert(card_id, images);
+        }
+        if let Some(source) = draft_from
             && let Some(draft) = self.chat_ui.drafts.remove(&source)
         {
             self.chat_ui.drafts.insert(card_id, draft);
@@ -4993,6 +5272,14 @@ impl Cagents {
         {
             runtime.replace_draft(text_editor::Content::with_text(&draft));
         }
+        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
+            runtime.replace_attachments(
+                images
+                    .into_iter()
+                    .filter(|a| a.reference.is_some())
+                    .collect(),
+            );
+        }
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
         self.lifecycle.remove(card);
@@ -5053,6 +5340,9 @@ impl Cagents {
         if !self.can_rekey_shared_terminal_draft(alias, canonical) {
             return false;
         }
+        if let Some(images) = self.chat_ui.draft_attachments.remove(&alias) {
+            self.chat_ui.draft_attachments.insert(canonical, images);
+        }
         if let Some(draft) = self.chat_ui.drafts.remove(&alias) {
             self.chat_ui.drafts.insert(canonical, draft);
         }
@@ -5089,6 +5379,17 @@ impl Cagents {
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+            let images = runtime
+                .unsent_attachments()
+                .iter()
+                .filter(|a| a.reference.is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            if images.is_empty() {
+                self.chat_ui.draft_attachments.remove(&card);
+            } else {
+                self.chat_ui.draft_attachments.insert(card, images);
+            }
             let draft = runtime.unsent_text();
             if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
@@ -5124,6 +5425,7 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
@@ -6031,6 +6333,7 @@ impl Cagents {
         runtime.replace_draft(text_editor::Content::new());
         runtime.history_cursor = None;
         runtime.history_stash = None;
+        runtime.history_attachment_stash = None;
         runtime.error = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
@@ -6208,15 +6511,18 @@ impl Cagents {
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
-        let text = runtime.queued.take().map(|queued| queued.text);
+        let text = runtime
+            .queued
+            .take()
+            .map(|queued| (queued.text, queued.attachments));
         let _ = runtime.present();
         if let Some(error) = error {
             runtime.note(format!(
                 "The first message arrived, but its sending reported: {error}"
             ));
         }
-        if let Some(text) = text {
-            runtime.remember(text);
+        if let Some((text, attachments)) = text {
+            runtime.remember_with_attachments(text, attachments);
         }
         runtime.refresh();
         if let Some(prompt) = first_prompt {
@@ -6427,6 +6733,10 @@ impl Cagents {
             Command::Slash { command } => Some(command.clone()),
             _ => None,
         };
+        let sent_attachments = match &command {
+            Command::Prompt { attachments, .. } => attachments.clone(),
+            _ => Vec::new(),
+        };
         let model = match &command {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
@@ -6441,6 +6751,7 @@ impl Cagents {
             model,
             page,
             sent,
+            sent_attachments,
             queued: step,
         });
         runtime.error = None;
@@ -6498,11 +6809,56 @@ impl Cagents {
         task
     }
 
+    fn stage_chat_attachments(
+        &mut self,
+        target: Target,
+        id: uuid::Uuid,
+        paths: Vec<PathBuf>,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if crate::device::is_remote() {
+            runtime.cancel_attachment_insert(
+                id,
+                Some("Local files need transfer to the selected device before attachment.".into()),
+            );
+            return Task::none();
+        }
+        let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+        if rules
+            .max_count
+            .is_some_and(|limit| runtime.attachments.len() + paths.len() > limit)
+        {
+            runtime.cancel_attachment_insert(
+                id,
+                Some("This chat has reached its attachment limit.".into()),
+            );
+            return Task::none();
+        }
+        return cosmic::task::future(async move {
+            let result = images::run_worker(move || {
+                paths
+                    .into_iter()
+                    .map(|path| clipboard_image::stage_file(path, rules.max_image_bytes))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .and_then(|r| r);
+            Message::ChatUi(Action::AttachmentsPrepared(target, id, result))
+        });
+    }
+
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
-        if crate::device::is_remote() && matches!(&action, Action::PastedImage(_, Some(_))) {
-            self.status = Some(TransientNotice::warning(
-                "Images need transfer to the selected device before attachment",
-            ));
+        if crate::device::is_remote()
+            && let Action::PastedImage(target, id, Some(_)) = &action
+        {
+            if let Some(runtime) = self.chat_runtime_mut(*target) {
+                runtime.cancel_attachment_insert(
+                    *id,
+                    Some("Images need transfer to the selected device before attachment.".into()),
+                );
+            }
             return Task::none();
         }
         let focus = if let Action::Switch(card) = &action {
@@ -7069,6 +7425,16 @@ impl Cagents {
                             {
                                 runtime.replace_draft(text_editor::Content::with_text(&draft));
                             }
+                            if let Some(images) =
+                                self.chat_ui.draft_attachments.remove(&target.card)
+                            {
+                                runtime.replace_attachments(
+                                    images
+                                        .into_iter()
+                                        .filter(|a| a.reference.is_some())
+                                        .collect(),
+                                );
+                            }
                             runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
@@ -7601,12 +7967,13 @@ impl Cagents {
                         // so the next Up starts again from the newest.
                         runtime.history_cursor = None;
                         runtime.history_stash = None;
+                        runtime.history_attachment_stash = None;
                     }
                     // The completion rows follow the word at the caret, so
                     // anything that can change that word starts them afresh.
                     let rescroll = !matches!(action, text_editor::Action::Scroll { .. })
                         && runtime.completion.restart(action.is_edit());
-                    runtime.composer.perform(action);
+                    runtime.composer_action(action);
                     if runtime.files.is_none() && runtime.composer.text().contains('@') {
                         runtime.files = Some(Arc::new(Vec::new()));
                         files = Some(runtime.session.launch.recipe.working_directory.clone());
@@ -7628,19 +7995,25 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                runtime.pastes_pending += 1;
+                if runtime.pastes_pending >= 2 {
+                    runtime.error = Some(
+                        "Two attachments are already loading. Wait for them before pasting again."
+                            .into(),
+                    );
+                    return Task::none();
+                }
+                let id = runtime.begin_attachment_insert();
                 return iced::clipboard::read_data::<clipboard_image::Image>().map(move |image| {
-                    cosmic::Action::App(Message::ChatUi(Action::PastedImage(target, image)))
+                    cosmic::Action::App(Message::ChatUi(Action::PastedImage(target, id, image)))
                 });
             }
-            Action::PastedImage(target, Some(image)) => {
+            Action::PastedImage(target, id, Some(image)) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                // Many apps offer text alongside an image; where the chat
-                // cannot take the image, the text is pasted instead, and the
-                // refusal is shown only when there is no text. The paste
-                // stays pending until that text read resolves.
+                if !runtime.attachment_bookmarks.contains_key(&id) {
+                    return Task::none();
+                }
                 let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
                 let refusal = if !runtime.snapshot.capabilities.attachments {
                     Some("The current model cannot accept images.")
@@ -7654,105 +8027,107 @@ impl Cagents {
                 if let Some(refusal) = refusal {
                     return iced::clipboard::read().map(move |text| {
                         cosmic::Action::App(Message::ChatUi(match text {
-                            Some(text) => Action::PastedText(target, Some(text)),
-                            None => Action::PasteRefused(target, refusal),
+                            Some(text) => Action::PastedText(target, id, Some(text)),
+                            None => Action::PasteRefused(target, id, refusal),
                         }))
                     });
                 }
                 runtime.image_pastes_saving += 1;
                 return cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
+                    let result = images::run_worker(move || {
                         clipboard_image::save(image, rules.max_image_bytes)
                     })
                     .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                    Message::ChatUi(Action::ImageSaved(target, result))
+                    .and_then(|r| r);
+                    Message::ChatUi(Action::ImageSaved(target, id, result))
                 });
             }
-            Action::PastedImage(target, None) => {
+            Action::PastedImage(target, id, None) => {
                 return iced::clipboard::read().map(move |text| {
-                    cosmic::Action::App(Message::ChatUi(Action::PastedText(target, text)))
+                    cosmic::Action::App(Message::ChatUi(Action::PastedText(target, id, text)))
                 });
             }
-            Action::PastedText(target, Some(text)) => {
-                let submit = if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
-                    (runtime.pastes_pending == 0)
-                        .then(|| runtime.submit_after_paste.take())
-                        .flatten()
-                } else {
-                    None
-                };
-                let edited = self.handle_chat_ui(Action::Composer(
-                    target,
-                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text))),
-                ));
-                return Task::batch(
-                    std::iter::once(edited).chain(
-                        submit.map(|mode| self.handle_chat_ui(Action::Submit(target, mode))),
-                    ),
-                );
-            }
-            Action::PastedText(target, None) => {
+            Action::PastedText(target, id, text) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
-                    if runtime.pastes_pending == 0
+                    let success = runtime.finish_attachment_insert(
+                        id,
+                        text.as_deref().unwrap_or_default(),
+                        Vec::new(),
+                    );
+                    if success
+                        && runtime.pastes_pending == 0
                         && let Some(mode) = runtime.submit_after_paste.take()
                     {
                         return self.handle_chat_ui(Action::Submit(target, mode));
                     }
                 }
             }
-            Action::PasteRefused(target, refusal) => {
+            Action::PasteRefused(target, id, refusal) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
-                    runtime.submit_after_paste = None;
-                    runtime.error = Some(refusal.into());
+                    runtime.cancel_attachment_insert(id, Some(refusal.into()));
                 }
             }
-            Action::ImageSaved(target, result) => {
+            Action::ImageSaved(target, id, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    if !runtime.attachment_bookmarks.contains_key(&id) {
+                        return Task::none();
+                    }
                     runtime.image_pastes_saving = runtime.image_pastes_saving.saturating_sub(1);
                     let rules =
                         chat::AttachmentRules::for_provider(runtime.session.launch.provider);
                     let success = match result {
-                        Ok(path)
+                        Ok(attachment)
                             if runtime.snapshot.capabilities.attachments
                                 && rules
                                     .max_count
                                     .is_none_or(|limit| runtime.attachments.len() < limit) =>
                         {
-                            runtime.attach([path]);
-                            true
+                            runtime.finish_attachment_insert(id, "", vec![attachment])
                         }
-                        Ok(path) => {
-                            let _ = std::fs::remove_file(path);
-                            runtime.error = Some(
-                                if runtime.snapshot.capabilities.attachments {
-                                    "This chat has reached its attachment limit."
-                                } else {
-                                    "The current model cannot accept images."
-                                }
-                                .into(),
+                        Ok(_) => {
+                            runtime.cancel_attachment_insert(
+                                id,
+                                Some(
+                                    if runtime.snapshot.capabilities.attachments {
+                                        "This chat has reached its attachment limit."
+                                    } else {
+                                        "The current model cannot accept images."
+                                    }
+                                    .into(),
+                                ),
                             );
                             false
                         }
                         Err(error) => {
-                            runtime.error = Some(error);
+                            runtime.cancel_attachment_insert(id, Some(error));
                             false
                         }
                     };
-                    if !success {
-                        runtime.submit_after_paste = None;
-                    } else if runtime.pastes_pending == 0
+                    if success
+                        && runtime.pastes_pending == 0
                         && let Some(mode) = runtime.submit_after_paste.take()
                     {
                         return self.handle_chat_ui(Action::Submit(target, mode));
                     }
-                } else if let Ok(path) = result {
-                    let _ = std::fs::remove_file(path);
+                }
+                // No direct unlink: a late/cancelled draft is bounded by the
+                // store's draft expiry, and may be referenced by another view.
+            }
+            Action::AttachmentsPrepared(target, id, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let rules =
+                        chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                    match result {
+                        Ok(attachments) if runtime.snapshot.capabilities.attachments
+                            && rules.max_count.is_none_or(|limit| runtime.attachments.len() + attachments.len() <= limit) => {
+                            let success = runtime.finish_attachment_insert(id, "", attachments);
+                            if success && runtime.pastes_pending == 0 && let Some(mode) = runtime.submit_after_paste.take() {
+                                return self.handle_chat_ui(Action::Submit(target, mode));
+                            }
+                        }
+                        Ok(_) => runtime.cancel_attachment_insert(id, Some("The model or attachment limit changed while files loaded. Attach them again.".into())),
+                        Err(error) => runtime.cancel_attachment_insert(id, Some(error)),
+                    }
                 }
             }
             Action::AppendProviderDraft(target) => {
@@ -7767,6 +8142,7 @@ impl Cagents {
                         // draft, just as typing or completing a word does.
                         runtime.history_cursor = None;
                         runtime.history_stash = None;
+                        runtime.history_attachment_stash = None;
                         runtime.replace_draft(text_editor::Content::with_text(&text));
                     }
                 }
@@ -8066,6 +8442,7 @@ impl Cagents {
                     // real unsent draft, just like typing in the composer.
                     runtime.history_cursor = None;
                     runtime.history_stash = None;
+                    runtime.history_attachment_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
                     runtime.footer_picker = false;
@@ -8341,7 +8718,7 @@ impl Cagents {
                             runtime.take_attachments();
                         }
                         if let Some(sent) = pending.sent {
-                            runtime.remember(sent);
+                            runtime.remember_with_attachments(sent, pending.sent_attachments);
                         }
                         if let Some(request) = pending.request {
                             runtime.answers.retain(|(id, _), _| id != &request);
@@ -8707,7 +9084,15 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                if runtime.pastes_pending >= 2 {
+                    runtime.error = Some(
+                        "Two attachments are already loading. Wait for them before attaching more."
+                            .into(),
+                    );
+                    return Task::none();
+                }
                 runtime.attachment_chooser_pending = true;
+                let id = runtime.begin_attachment_insert();
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -8726,18 +9111,18 @@ impl Cagents {
                         Err(file_chooser::Error::Cancelled) => Ok(None),
                         Err(error) => Err(error.to_string()),
                     };
-                    Message::ChatUi(Action::Attached(target, result))
+                    Message::ChatUi(Action::Attached(target, id, result))
                 });
             }
-            Action::Attached(target, result) => {
+            Action::Attached(target, id, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if !std::mem::take(&mut runtime.attachment_chooser_pending) {
                         return Task::none();
                     }
                     match result {
-                        Ok(Some(paths)) => runtime.attach(paths),
-                        Ok(None) => {}
-                        Err(error) => runtime.error = Some(error),
+                        Ok(Some(paths)) => return self.stage_chat_attachments(target, id, paths),
+                        Ok(None) => runtime.cancel_attachment_insert(id, None),
+                        Err(error) => runtime.cancel_attachment_insert(id, Some(error)),
                     }
                 }
             }
@@ -8753,6 +9138,7 @@ impl Cagents {
                 // at send - a document for Codex, a ninth file for Claude, a
                 // folder for any - is written into the draft as its path
                 // instead, with web addresses and dropped text, as they are.
+                let mut staged = None;
                 let dropped = match payload.decode() {
                     file_drop::Dropped::Items(items)
                         if runtime.snapshot.capabilities.attachments =>
@@ -8779,7 +9165,10 @@ impl Cagents {
                                 other => rest.push(other),
                             }
                         }
-                        runtime.attach(files);
+                        if !files.is_empty() {
+                            let id = runtime.begin_attachment_insert();
+                            staged = Some((id, files));
+                        }
                         file_drop::Dropped::Items(rest)
                     }
                     dropped => dropped,
@@ -8800,13 +9189,19 @@ impl Cagents {
                 };
                 return Task::batch([
                     edited,
+                    staged.map_or_else(Task::none, |(id, files)| {
+                        self.stage_chat_attachments(target, id, files)
+                    }),
                     cosmic::task::message(Message::FocusCard(target.card)),
                 ]);
             }
             Action::RemoveAttachment(target, index) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if index < runtime.attachments.len() {
-                        runtime.attachments.remove(index);
+                        let removed = runtime.attachments.remove(index);
+                        if let Some(reference) = removed.reference {
+                            runtime.remove_image_token(&reference.token());
+                        }
                         runtime.thumbnails.sync(&runtime.attachments);
                         runtime.revision = runtime.revision.wrapping_add(1);
                     }
@@ -9544,6 +9939,7 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("/PERMISSIONS"));
         runtime.attachments.push(Attachment {
             path: "retained.png".into(),
+            reference: None,
         });
         let target = runtime.target;
         drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
@@ -9587,6 +9983,7 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("Keep this next task"));
         runtime.attachments.push(Attachment {
             path: "retained.png".into(),
+            reference: None,
         });
         let target = runtime.target;
         drop(app.handle_chat_ui(Action::PermissionRetry(target, "stale".into())));
@@ -9615,6 +10012,7 @@ mod tests {
             runtime.replace_draft(text_editor::Content::with_text("original unsent draft"));
             runtime.attachments.push(Attachment {
                 path: "retained.png".into(),
+                reference: None,
             });
             Arc::make_mut(&mut runtime.snapshot)
                 .permission_denials
@@ -9721,6 +10119,7 @@ mod tests {
         let content = ItemContent::Image {
             path: "/fixture/image.png".into(),
             description: "Generated image".into(),
+            reference: None,
         };
         let mut cached = CachedItem::new(&content, runtime.syntax_theme);
         cached.image = Some(iced::widget::image::Handle::from_rgba(
@@ -9763,6 +10162,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: path.into(),
                     description: "Image".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -9830,6 +10230,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: format!("/{prefix}/{}.png", "same-tail".repeat(20)),
                     description: "Image".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -9898,6 +10299,7 @@ mod tests {
             content: ItemContent::Image {
                 path: format!("/{id}.png"),
                 description: id.into(),
+                reference: None,
             },
             started_at: None,
             at: None,
@@ -10262,6 +10664,7 @@ mod tests {
                     content: ItemContent::Image {
                         path: format!("/image-{index}.png"),
                         description: "Image".into(),
+                        reference: None,
                     },
                     started_at: None,
                     at: None,
@@ -10284,6 +10687,7 @@ mod tests {
             content: ItemContent::Image {
                 path: "/child.png".into(),
                 description: "Child".into(),
+                reference: None,
             },
             started_at: None,
             at: None,
@@ -10320,7 +10724,10 @@ mod tests {
             text: text.into(),
             attachments: paths
                 .iter()
-                .map(|path| Attachment { path: path.into() })
+                .map(|path| Attachment {
+                    path: path.into(),
+                    reference: None,
+                })
                 .collect(),
         }
     }
@@ -10575,6 +10982,7 @@ mod tests {
         let attachments = (0..8)
             .map(|index| Attachment {
                 path: format!("{index}.png").into(),
+                reference: None,
             })
             .collect::<Vec<_>>();
         runtime.followups = vec![Followup {
@@ -10592,7 +11000,8 @@ mod tests {
         assert_eq!(
             runtime.attachments,
             [Attachment {
-                path: "extra.png".into()
+                path: "extra.png".into(),
+                reference: None,
             }]
         );
         assert!(runtime.error.as_ref().unwrap().contains("attachment limit"));
@@ -11158,6 +11567,7 @@ mod tests {
         let mut newest = provider_message("newest", "revise me");
         newest.attachments = vec![Attachment {
             path: "queued.png".into(),
+            reference: None,
         }];
         let (card, target, handle) =
             provider_queue(&mut app, vec![provider_message("older", "stay"), newest]);
@@ -13555,6 +13965,7 @@ mod tests {
             match kind {
                 0 => runtime.attachments.push(Attachment {
                     path: "/workspace/draft.txt".into(),
+                    reference: None,
                 }),
                 1 => runtime
                     .followups
@@ -13592,6 +14003,7 @@ mod tests {
         };
         runtime.attachments.push(Attachment {
             path: "/workspace/example.txt".into(),
+            reference: None,
         });
         assert!(runtime.restart_blocker().is_some());
         runtime.attachments.clear();
@@ -13643,6 +14055,7 @@ mod tests {
         };
         runtime.attachments.push(Attachment {
             path: "/workspace/example.txt".into(),
+            reference: None,
         });
         let _ = app.select_worktree("/workspace/elsewhere".into(), false);
         assert!(app.card_state(card).unwrap().existence.is_open());
@@ -14221,17 +14634,153 @@ mod tests {
     }
 
     #[test]
+    fn managed_images_keep_caret_identity_through_out_of_order_pastes_remove_and_draft_restore() {
+        chat::attachment_assets::with_test_image(|first| {
+            let second = chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, "alpha omega");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 6 },
+                selection: None,
+            });
+            let first_id = runtime.begin_attachment_insert();
+            runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('λ')));
+            runtime.composer_action(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            let second_id = runtime.begin_attachment_insert();
+            assert!(runtime.finish_attachment_insert(second_id, "", vec![second.clone()]));
+            assert!(runtime.finish_attachment_insert(first_id, "", vec![first.clone()]));
+            let expected = format!("alpha {} λomega {} ", first_ref.token(), second_ref.token());
+            assert_eq!(runtime.composer.text(), expected);
+            assert_eq!(runtime.pastes_pending, 0);
+            assert_eq!(runtime.attachments, [second.clone(), first.clone()]);
+            let session = runtime.session.clone();
+            let saved = app.persistent_workspace();
+            assert_eq!(
+                saved.chat_draft_attachments[&card],
+                [second.clone(), first.clone()]
+            );
+            app.chat_forget(card);
+            assert_eq!(
+                app.chat_ui.draft_attachments[&card],
+                [second.clone(), first.clone()]
+            );
+            app.chat_ui = State::with_draft_attachments(
+                saved.chat_drafts.clone(),
+                saved.chat_draft_attachments.clone(),
+            );
+            drop(app.open_chat_draft(card, session));
+            let target = chat_runtime(&app, card).target;
+            assert_eq!(chat_runtime(&app, card).composer.text(), expected);
+            assert_eq!(
+                chat_runtime(&app, card).attachments,
+                [second.clone(), first.clone()]
+            );
+            drop(app.handle_chat_ui(Action::RemoveAttachment(target, 1)));
+            let runtime = chat_runtime(&app, card);
+            assert!(!runtime.composer.text().contains(&first_ref.token()));
+            assert!(runtime.composer.text().contains(&second_ref.token()));
+            assert_eq!(runtime.attachments, [second.clone()]);
+            assert_eq!(
+                runtime.attachments[0].reference.as_ref().unwrap().number,
+                second_ref.number
+            );
+            chat::attachment_assets::validate(&first).unwrap();
+            chat::attachment_assets::validate(&second).unwrap();
+        });
+    }
+
+    #[test]
+    fn image_history_recall_takeback_and_retry_preserve_full_receipts_and_unsent_stash() {
+        chat::attachment_assets::with_test_image(|sent| {
+            let draft = chat::attachment_assets::test_image("draft.png");
+            let sent_text = format!("Describe {}", sent.reference.as_ref().unwrap().token());
+            let draft_text = format!("Unsent {}", draft.reference.as_ref().unwrap().token());
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.remember_with_attachments(sent_text.clone(), vec![sent.clone()]);
+            runtime.replace_draft(text_editor::Content::with_text(&draft_text));
+            runtime.replace_attachments(vec![draft.clone()]);
+            runtime.recall(true);
+            assert_eq!(runtime.composer.text(), sent_text);
+            assert_eq!(runtime.attachments, [sent.clone()]);
+            assert_eq!(runtime.unsent_text(), draft_text);
+            assert_eq!(runtime.unsent_attachments(), [draft.clone()]);
+            runtime.recall(false);
+            assert_eq!(runtime.composer.text(), draft_text);
+            assert_eq!(runtime.attachments, [draft.clone()]);
+            runtime.take_back(&sent_text, vec![sent.clone()], PromptMode::Queue);
+            assert_eq!(runtime.attachments, [sent.clone(), draft.clone()]);
+            let Command::Prompt { attachments, .. } = submission(
+                &runtime.composer.text(),
+                &runtime.snapshot,
+                &runtime.attachments,
+                PromptMode::Queue,
+            )
+            .unwrap() else {
+                panic!("prompt expected");
+            };
+            assert_eq!(attachments, [sent.clone(), draft.clone()]);
+            assert_eq!(attachments[0].reference, sent.reference);
+            assert_eq!(attachments[1].reference, draft.reference);
+        });
+    }
+
+    #[test]
+    fn conflicting_pending_image_selection_refuses_without_erasing_new_prose() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, "alpha beta gamma");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 10,
+                },
+                selection: Some(text_editor::Position { line: 0, column: 6 }),
+            });
+            let id = runtime.begin_attachment_insert();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 8 },
+                selection: None,
+            });
+            runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+            assert!(!runtime.finish_attachment_insert(id, "", vec![image]));
+            assert_eq!(runtime.composer.text(), "alpha be!ta gamma");
+            assert!(runtime.attachments.is_empty());
+            assert!(
+                runtime
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("insertion point changed")
+            );
+        });
+    }
+
+    #[test]
     fn a_pending_image_paste_stays_with_the_message_it_precedes() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("thread"));
         let target = chat_runtime(&app, card).target;
         write(&mut app, card, "describe this image");
+        let id = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .begin_attachment_insert();
         {
             let runtime = app.chat_runtime_mut(target).unwrap();
             Arc::make_mut(&mut runtime.snapshot)
                 .capabilities
                 .attachments = true;
-            runtime.pastes_pending = 1;
             runtime.image_pastes_saving = 1;
         }
         submit(&mut app, card);
@@ -14248,13 +14797,20 @@ mod tests {
         let path = PathBuf::from("/fixture/pasted.png");
         let _ = app.update(Message::ChatUi(Action::ImageSaved(
             target,
-            Ok(path.clone()),
+            id,
+            Ok(Attachment::file(path.clone())),
         )));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.pastes_pending, 0);
         assert_eq!(runtime.image_pastes_saving, 0);
         assert_eq!(runtime.submit_after_paste, None);
-        assert_eq!(runtime.attachments, [Attachment { path }]);
+        assert_eq!(
+            runtime.attachments,
+            [Attachment {
+                path,
+                reference: None,
+            }]
+        );
         assert!(
             runtime.pending.is_some(),
             "send resumes after the image is ready"
@@ -14266,12 +14822,15 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("thread"));
         let target = chat_runtime(&app, card).target;
+        let id = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .begin_attachment_insert();
         {
             let runtime = app.chat_runtime_mut(target).unwrap();
             Arc::make_mut(&mut runtime.snapshot)
                 .capabilities
                 .attachments = false;
-            runtime.pastes_pending = 1;
             runtime.submit_after_paste = Some(PromptMode::Send);
         }
         let image = clipboard_image::Image::try_from((
@@ -14279,7 +14838,11 @@ mod tests {
             "image/png".to_owned(),
         ))
         .unwrap();
-        let _ = app.update(Message::ChatUi(Action::PastedImage(target, Some(image))));
+        let _ = app.update(Message::ChatUi(Action::PastedImage(
+            target,
+            id,
+            Some(image),
+        )));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.error, None, "the clipboard text is read first");
         assert_eq!(runtime.pastes_pending, 1);
@@ -14287,6 +14850,7 @@ mod tests {
 
         let _ = app.update(Message::ChatUi(Action::PastedText(
             target,
+            id,
             Some("pasted cell".into()),
         )));
         let runtime = chat_runtime(&app, card);
@@ -14299,9 +14863,10 @@ mod tests {
         );
 
         let runtime = app.chat_runtime_mut(target).unwrap();
-        runtime.pastes_pending = 1;
+        let id = runtime.begin_attachment_insert();
         let _ = app.update(Message::ChatUi(Action::PasteRefused(
             target,
+            id,
             "The current model cannot accept images.",
         )));
         let runtime = chat_runtime(&app, card);
@@ -15302,6 +15867,7 @@ mod tests {
         let card = draft_chat(&mut app);
         let dropped = Attachment {
             path: PathBuf::from("/tmp/dropped.png"),
+            reference: None,
         };
         let target = match app.cards.get_mut(&card) {
             Some(CardRuntime::Chat(runtime)) => {
@@ -18399,6 +18965,7 @@ mod tests {
         };
         let attachment = [Attachment {
             path: "shot.png".into(),
+            reference: None,
         }];
         assert_eq!(
             prompt(
@@ -18509,6 +19076,7 @@ mod tests {
         };
         runtime.attachments.push(Attachment {
             path: PathBuf::from("/tmp/unsent-attachment.png"),
+            reference: None,
         });
         let reason = "Send or remove the attached files before leaving the chat.";
         assert_eq!(app.chat_switch_blocker(card).as_deref(), Some(reason));

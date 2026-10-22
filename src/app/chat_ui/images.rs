@@ -107,7 +107,11 @@ pub(super) fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     bounded_handle_size(bytes, budget, None)
 }
 fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Loaded {
-    if bytes.len() > chat::MAX_INLINE_IMAGE_BYTES {
+    decode_handle(&bytes, budget, edge, chat::MAX_INLINE_IMAGE_BYTES)
+}
+
+fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
+    if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
     let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -449,6 +453,14 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
 /// Transcript previews and composer thumbnails share worker admission. A
 /// cancelled subscription cannot release a slot while its blocking work runs.
 pub(super) async fn worker(load: impl FnOnce() -> Loaded + Send + 'static) -> Loaded {
+    run_worker(load).await.unwrap_or(Loaded::Unavailable)
+}
+
+/// Staging pasted/selected images shares both worker and memory admission
+/// with previews; cancelling the UI task cannot release running blocking work.
+pub(super) async fn run_worker<T: Send + 'static>(
+    load: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let workers = WORKERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)));
     let permit = workers
@@ -461,8 +473,44 @@ pub(super) async fn worker(load: impl FnOnce() -> Loaded + Send + 'static) -> Lo
         load()
     })
     .await
-    .unwrap_or(Loaded::Unavailable)
+    .map_err(|error| format!("Image processing failed: {error}"))
 }
+
+/// Fully decode before publishing durable bytes, with the existing global
+/// admission limits. Only a 1-pixel temporary preview is retained and dropped.
+pub(super) fn validate_attachment(
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Result<image::ImageFormat, String> {
+    if bytes.is_empty()
+        || bytes.len() as u64 > max_bytes.min(chat::attachment_assets::MAX_IMAGE_BYTES)
+    {
+        return Err("Image exceeds this provider's image size limit.".into());
+    }
+    let format = image::guess_format(bytes).map_err(|_| "The file is not a supported image.")?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+    ) {
+        return Err("The file is not a supported attachment image.".into());
+    }
+    match decode_handle(
+        bytes,
+        budget(),
+        Some(1),
+        chat::attachment_assets::MAX_IMAGE_BYTES as usize,
+    ) {
+        Loaded::Ready(_) => Ok(format),
+        Loaded::Deferred(_) => Err("Image memory is busy. Try attaching the image again.".into()),
+        Loaded::Unavailable | Loaded::Failed(_) => {
+            Err("The image is damaged or exceeds the image dimensions limit.".into())
+        }
+    }
+}
+
 pub(super) fn thumbnail(path: &Path) -> Loaded {
     read_file(path).map_or(Loaded::Unavailable, |bytes| {
         bounded_handle_size(bytes, budget(), Some(128))
@@ -761,7 +809,10 @@ impl Gallery {
         let entries: Vec<_> = items
             .iter()
             .filter_map(|item| {
-                let ItemContent::Image { path, description } = &item.content else {
+                let ItemContent::Image {
+                    path, description, ..
+                } = &item.content
+                else {
                     return None;
                 };
                 Some(Entry {
@@ -980,6 +1031,7 @@ mod tests {
             content: ItemContent::Image {
                 path,
                 description: "Fixture".into(),
+                reference: None,
             },
         }
     }

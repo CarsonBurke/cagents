@@ -1808,16 +1808,15 @@ impl Runtime {
                 } else {
                     crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
                 },
-                crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
-                    "Pasted image".to_owned()
-                } else {
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                crate::design::caption(
+                    if attachment.reference.is_none()
+                        && clipboard_image::is_pasted(&attachment.path)
+                    {
+                        "Pasted image".into()
+                    } else {
+                        attachment.label()
+                    },
+                )
                 .width(Length::Fill)
                 .into(),
                 icon(
@@ -1832,7 +1831,10 @@ impl Runtime {
             attachment_chips.push(
                 widget::tooltip(
                     chip,
-                    design::caption(attachment.path.display().to_string()),
+                    design::caption(attachment.reference.as_ref().map_or_else(
+                        || attachment.path.display().to_string(),
+                        |reference| reference.name.clone(),
+                    )),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
@@ -3735,7 +3737,9 @@ impl Runtime {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
-            ItemContent::Image { path, description } => Self::attachment_label(path, description),
+            ItemContent::Image {
+                path, description, ..
+            } => Self::attachment_label(path, description),
             content => turn::step_label(content),
         }
         .to_owned();
@@ -7744,6 +7748,7 @@ mod tests {
             content: ItemContent::Image {
                 path: "/image.png".into(),
                 description: "Image".into(),
+                reference: None,
             },
             started_at: None,
             at: None,

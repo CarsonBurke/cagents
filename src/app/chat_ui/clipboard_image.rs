@@ -3,7 +3,6 @@
 use std::{
     borrow::Cow,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -45,35 +44,67 @@ impl TryFrom<(Vec<u8>, String)> for Image {
 /// provider without its own limit would otherwise keep any size offered.
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
-pub(super) fn save(image: Image, max_bytes: u64) -> Result<PathBuf, String> {
+pub(super) fn save(image: Image, max_bytes: u64) -> Result<crate::chat::Attachment, String> {
     let max_bytes = max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES);
-    let (format, extension) = match image.mime.as_str() {
-        "image/png" => (image::ImageFormat::Png, ".png"),
-        "image/jpeg" => (image::ImageFormat::Jpeg, ".jpg"),
-        "image/webp" => (image::ImageFormat::WebP, ".webp"),
-        "image/gif" => (image::ImageFormat::Gif, ".gif"),
+    let expected = match image.mime.as_str() {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/webp" => image::ImageFormat::WebP,
+        "image/gif" => image::ImageFormat::Gif,
         _ => return Err("Unsupported clipboard image type".into()),
     };
-    if image.bytes.is_empty() || image.bytes.len() as u64 > max_bytes {
-        return Err("Clipboard image exceeds this provider's image size limit.".into());
-    }
-    if image::guess_format(&image.bytes).ok() != Some(format) {
+    let actual = super::images::validate_attachment(&image.bytes, max_bytes)?;
+    if actual != expected {
         return Err("Clipboard image data does not match its image type.".into());
     }
-    let directory = cache_directory().ok_or("Application cache directory is unavailable.")?;
-    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
-    prune_cache();
-    let mut file = tempfile::Builder::new()
-        .prefix("paste-")
-        .suffix(extension)
-        .tempfile_in(directory)
-        .map_err(|error| error.to_string())?;
-    std::io::Write::write_all(&mut file, &image.bytes).map_err(|error| error.to_string())?;
-    file.keep()
-        .map(|(_, path)| path)
-        .map_err(|error| error.to_string())
+    let extension = extension(actual)?;
+    crate::chat::attachment_assets::stage_validated(
+        &image.bytes,
+        "Pasted image",
+        extension,
+        max_bytes,
+    )
+}
+
+fn extension(format: image::ImageFormat) -> Result<&'static str, String> {
+    match format {
+        image::ImageFormat::Png => Ok("png"),
+        image::ImageFormat::Jpeg => Ok("jpg"),
+        image::ImageFormat::Gif => Ok("gif"),
+        image::ImageFormat::WebP => Ok("webp"),
+        _ => Err("Unsupported attachment image type".into()),
+    }
+}
+
+/// A user-selected local image is read once, bounded, then validated and
+/// copied to immutable device-owned data. Non-image files stay provider files.
+pub(super) fn stage_file(path: PathBuf, max_bytes: u64) -> Result<crate::chat::Attachment, String> {
+    if crate::device::is_remote() {
+        return Err(
+            "Attach the image on the conversation's device; local image transfer is unavailable."
+                .into(),
+        );
+    }
+    if !crate::chat::is_image_path(&path) {
+        return Ok(crate::chat::Attachment::file(path));
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| format!("Cannot open image {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Attachment image is not a regular file.".into());
+    }
+    let bytes = crate::fs_safety::read_bounded(&mut file, max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES))
+        .map_err(|e| format!("Cannot read image {}: {e}", path.display()))?;
+    let actual = super::images::validate_attachment(&bytes, max_bytes)?;
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    crate::chat::attachment_assets::stage_validated(&bytes, &name, extension(actual)?, max_bytes)
 }
 
 /// Resolved once: the attachment row asks for every attachment on each redraw.
