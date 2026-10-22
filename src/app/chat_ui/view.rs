@@ -1061,8 +1061,8 @@ impl Runtime {
         identity
     }
 
-    /// Completion requires provider evidence; an idle, attached conversation
-    /// without that evidence is ready, while an unattached one is connecting.
+    /// Completion requires provider evidence. An unstarted conversation is a
+    /// draft; an idle attached one is ready, while an attachment is connecting.
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
         let (glyph, label) = self.conversation_status_base(transitioning);
         let snapshot = &self.snapshot;
@@ -1206,6 +1206,8 @@ impl Runtime {
             }
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
+        } else if self.is_draft() {
+            (None, "Draft")
         } else if snapshot.ready {
             (None, "Ready")
         } else {

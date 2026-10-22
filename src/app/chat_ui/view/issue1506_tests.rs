@@ -1,6 +1,72 @@
 use super::*;
 use crate::chat::{Role, ToolStatus};
 
+#[test]
+fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
+    for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let session = chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: chat::Launch {
+                provider,
+                recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::ReconnectOnly,
+        };
+        let mut draft = Runtime::draft(
+            target,
+            session.clone(),
+            Snapshot::default(),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        assert!(draft.is_draft());
+        assert!(draft.handle().is_none());
+        assert!(draft.queued.is_none());
+        assert!(!draft.snapshot.ready);
+        assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
+
+        draft.composer_action(text_editor::Action::Edit(text_editor::Edit::Paste(
+            Arc::new("Unsent local draft".into()),
+        )));
+        assert_eq!(draft.composer.text(), "Unsent local draft");
+        assert!(draft.handle().is_none());
+        assert!(draft.queued.is_none());
+        assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
+        assert_eq!(draft.conversation_status(true).1, "Switching session");
+        draft.error = Some("Local attachment could not be read".into());
+        assert_eq!(
+            draft.conversation_status(false),
+            (Some(Icon::Warning), "Error".into())
+        );
+
+        let connecting = Runtime::new(
+            target,
+            session,
+            Connection::Connecting,
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        assert!(!connecting.is_draft());
+        assert!(connecting.handle().is_none());
+        assert_eq!(
+            connecting.conversation_status(false),
+            (Some(Icon::AgentWorking), "Connecting".into())
+        );
+    }
+    let (live, _handle) = frame_cost::live_runtime(&[]);
+    assert!(!live.is_draft());
+    assert!(live.handle().is_some());
+    assert_eq!(live.conversation_status(false), (None, "Ready".into()));
+}
+
 fn item(id: &str, role: Role, text: &str) -> chat::Item {
     chat::Item {
         id: id.into(),
