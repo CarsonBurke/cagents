@@ -5496,7 +5496,8 @@ mod tests {
         // The terminal host respells links naming its own machine before
         // they get here. This window may run elsewhere, so a host name that
         // happens to be its own still names another machine's file.
-        for host in ["elsewhere".into(), crate::file_url::host_name().unwrap()] {
+        for host in std::iter::once("elsewhere".to_owned()).chain(crate::file_url::test_host_name())
+        {
             assert_eq!(hyperlink(&format!("file://{host}/tmp/a")), None, "{host}");
         }
     }

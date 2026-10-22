@@ -517,8 +517,11 @@ fn localize_file_links(
         let Ok(mut url) = url::Url::parse(&span.uri) else {
             continue;
         };
-        let local_host = local_host.get_or_init(crate::file_url::host_name);
-        if crate::file_url::localize(&mut url, local_host.as_deref()) {
+        if crate::file_url::localize(&mut url, || {
+            local_host
+                .get_or_init(crate::file_url::host_name)
+                .as_deref()
+        }) {
             span.uri = url.into();
         }
     }
@@ -579,34 +582,68 @@ mod tests {
 
     #[test]
     fn file_links_naming_this_machine_lose_the_host_and_others_keep_it() {
-        // `ls --hyperlink` spells its links with this machine's name.
-        let host = crate::file_url::host_name().expect("this machine has a name");
+        let span = |uri: &str| HyperlinkSpan {
+            start: 0,
+            end: 1,
+            uri: uri.into(),
+        };
+        let mut spans = [
+            "file://Workstation/tmp/a%20b#L2",
+            "FILE://WORKSTATION/tmp/b",
+            "file://elsewhere/tmp/c",
+            "file://localhost/tmp/d",
+            "file:///tmp/e",
+            "https://workstation/f",
+        ]
+        .map(span);
+        localize_file_links(
+            &mut spans,
+            &std::cell::OnceCell::from(Some("workstation".to_owned())),
+        );
+        assert_eq!(
+            spans.map(|span| span.uri),
+            [
+                "file:///tmp/a%20b#L2",
+                "file:///tmp/b",
+                "file://elsewhere/tmp/c",
+                "file://localhost/tmp/d",
+                "file:///tmp/e",
+                "https://workstation/f",
+            ]
+        );
+        // Rows without a file link named by host never look the name up.
+        let unasked = std::cell::OnceCell::new();
+        let mut spans = [
+            "file:///tmp/e",
+            "https://workstation/f",
+            "file://localhost/d",
+        ]
+        .map(span);
+        localize_file_links(&mut spans, &unasked);
+        assert_eq!(unasked.get(), None);
+    }
+
+    #[test]
+    fn live_and_scrolled_back_captures_localize_file_links() {
+        // `ls --hyperlink` spells its links with this machine's own name.
+        let Some(host) = crate::file_url::test_host_name() else {
+            eprintln!("skipped: this machine has no name a file URL can carry");
+            return;
+        };
         let links = [
             format!("file://{}/tmp/a%20b", host.to_uppercase()),
             "file://elsewhere/tmp/c".into(),
-            "file://localhost/tmp/d".into(),
-            "file:///tmp/e".into(),
-            format!("https://{host}/f"),
         ];
+        let expected = ["file:///tmp/a%20b", "file://elsewhere/tmp/c"];
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 8,
-            rows: 6,
-            max_scrollback: 16,
+            rows: 3,
+            max_scrollback: 64,
         })
         .unwrap();
-        for (row, link) in links.iter().enumerate() {
-            if row > 0 {
-                terminal.vt_write(b"\r\n");
-            }
-            terminal.vt_write(format!("\x1b]8;;{link}\x1b\\name\x1b]8;;\x1b\\").as_bytes());
+        for link in &links {
+            terminal.vt_write(format!("\x1b]8;;{link}\x1b\\name\x1b]8;;\x1b\\\r\n").as_bytes());
         }
-        let expected = [
-            "file:///tmp/a%20b".into(),
-            "file://elsewhere/tmp/c".into(),
-            "file://localhost/tmp/d".into(),
-            "file:///tmp/e".into(),
-            format!("https://{host}/f"),
-        ];
         let uris = |snapshot: &RenderSnapshot| {
             snapshot.lines[..links.len()]
                 .iter()
@@ -620,11 +657,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut visual = VisualResources::new().unwrap();
-        let snapshot = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
-        assert_eq!(uris(&snapshot), expected);
-        // A scrolled-back viewport reads the same links the same way.
-        let viewport = capture_viewport(&terminal, &snapshot, Some(0), 6).unwrap();
-        assert_eq!(uris(&viewport), expected);
+        let live = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        assert_eq!(uris(&live), expected);
+        // Push the links off the screen; only history holds them now.
+        for _ in 0..8 {
+            terminal.vt_write(b"line\r\n");
+        }
+        let live = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        assert!(live.lines.iter().all(|line| line.hyperlinks.is_empty()));
+        assert!(live.scroll.offset > 0);
+        let history = capture_viewport(&terminal, &live, Some(0), 3).unwrap();
+        assert_eq!(history.scroll.offset, 0);
+        assert_eq!(uris(&history), expected);
     }
 
     #[test]

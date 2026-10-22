@@ -32,15 +32,20 @@ pub(crate) fn host_name() -> Option<String> {
 /// leaving the same file in the host-less spelling [`Url::to_file_path`]
 /// accepts. Returns whether it did; any other URL is left as it is.
 ///
+/// `local_host` is asked only for a file URL that names a host, so the common
+/// host-less links never look this machine's name up; pass [`host_name`] or a
+/// name already in hand.
+///
 /// Host names compare without regard to ASCII case, as DNS names do. `Url`
 /// lowercases the host it parses, while `gethostname` may not.
-pub(crate) fn localize(url: &mut Url, local_host: Option<&str>) -> bool {
-    if url.scheme() != "file"
-        || !url
-            .host_str()
-            .zip(local_host)
-            .is_some_and(|(host, local)| host.eq_ignore_ascii_case(local))
-    {
+pub(crate) fn localize<S: AsRef<str>>(
+    url: &mut Url,
+    local_host: impl FnOnce() -> Option<S>,
+) -> bool {
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "file") else {
+        return false;
+    };
+    if !local_host().is_some_and(|local| host.eq_ignore_ascii_case(local.as_ref())) {
         return false;
     }
     // Not `Url::set_host(None)`: in url 2.5 it drops the host from the text
@@ -55,6 +60,16 @@ pub(crate) fn localize(url: &mut Url, local_host: Option<&str>) -> bool {
     }
 }
 
+/// This machine's name, when a file URL can carry it as a host. A name that
+/// URLs read as no host, such as `localhost`, or cannot hold, is none; tests
+/// that need a real name skip without one.
+#[cfg(test)]
+pub(crate) fn test_host_name() -> Option<String> {
+    host_name().filter(|name| {
+        Url::parse(&format!("file://{name}/")).is_ok_and(|url| url.host_str().is_some())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -63,7 +78,7 @@ mod tests {
 
     fn localized(text: &str, local_host: Option<&str>) -> (bool, String) {
         let mut url = Url::parse(text).unwrap();
-        let changed = localize(&mut url, local_host);
+        let changed = localize(&mut url, || local_host);
         (changed, url.into())
     }
 
@@ -71,35 +86,35 @@ mod tests {
     fn this_machines_name_is_removed_and_the_path_kept() {
         assert_eq!(
             localized(
-                "file://Workstation/tmp/a%20b/%E7%95%8C.md#L3",
+                "file://Workstation/tmp/a%20b/%E7%95%8C.md?q=1#L3",
                 Some("workstation")
             ),
-            (true, "file:///tmp/a%20b/%E7%95%8C.md#L3".into())
+            (true, "file:///tmp/a%20b/%E7%95%8C.md?q=1#L3".into())
         );
         let mut url = Url::parse("file://workstation/tmp/a%20b").unwrap();
-        assert!(localize(&mut url, Some("WORKSTATION")));
+        assert!(localize(&mut url, || Some("WORKSTATION")));
         assert_eq!(url.to_file_path(), Ok(PathBuf::from("/tmp/a b")));
     }
 
     #[test]
-    fn hosts_url_already_reads_as_local_are_left_alone() {
+    fn hosts_url_already_reads_as_local_are_left_alone_without_a_lookup() {
         for text in [
             "file:///tmp/a",
             "file://localhost/tmp/a",
             "file://LOCALHOST/tmp/a",
         ] {
-            assert_eq!(
-                localized(text, Some("workstation")),
-                (false, "file:///tmp/a".into()),
-                "{text}"
-            );
+            let mut url = Url::parse(text).unwrap();
+            assert!(!localize(&mut url, || -> Option<&str> {
+                panic!("{text} has no host to compare")
+            }));
+            assert_eq!(url.as_str(), "file:///tmp/a", "{text}");
         }
     }
 
     #[test]
     fn another_host_stays_unopenable() {
         let mut url = Url::parse("file://elsewhere/tmp/a").unwrap();
-        assert!(!localize(&mut url, Some("workstation")));
+        assert!(!localize(&mut url, || Some("workstation")));
         assert_eq!(url.as_str(), "file://elsewhere/tmp/a");
         assert!(url.to_file_path().is_err());
         // Without a name for this machine, only the spellings every source
@@ -119,7 +134,8 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_has_a_name() {
-        assert!(host_name().is_some_and(|name| !name.contains('\0')));
+    fn a_host_name_is_whole_or_absent() {
+        // A machine may have no name; gethostname must not yield an empty one.
+        assert!(host_name().is_none_or(|name| !name.is_empty() && !name.contains('\0')));
     }
 }

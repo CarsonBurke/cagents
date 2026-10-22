@@ -438,7 +438,7 @@ fn uri_list(data: &[u8], local_host: Option<&str>) -> Vec<Item> {
                 // The path is percent-decoded to the file name's own bytes,
                 // which need not be UTF-8. A host other than this one names
                 // a file this machine cannot open, so it stays a URI.
-                crate::file_url::localize(&mut uri, local_host);
+                crate::file_url::localize(&mut uri, || local_host);
                 if let Ok(path) = uri.to_file_path() {
                     return Item::File(path);
                 }

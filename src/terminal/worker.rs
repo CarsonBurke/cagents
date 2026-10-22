@@ -2867,7 +2867,7 @@ impl Worker {
                 }
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
-                    let path = working_directory_path(raw, crate::file_url::host_name().as_deref());
+                    let path = working_directory_path(raw, crate::file_url::host_name);
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
                         self.publish_fallback_title();
@@ -4099,7 +4099,12 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
     }
 }
 
-fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf> {
+/// `local_host` is asked only when the URL names a host; see
+/// [`crate::file_url::localize`].
+fn working_directory_path<S: AsRef<str>>(
+    raw: &str,
+    local_host: impl FnOnce() -> Option<S>,
+) -> Option<PathBuf> {
     if let Ok(mut uri) = url::Url::parse(raw) {
         if uri.scheme() != "file" {
             return None;
@@ -4188,19 +4193,25 @@ mod tests {
             "file://workstation/tmp/my%20project"
         );
         assert_eq!(
-            working_directory_path(terminal.pwd().unwrap(), Some("WORKSTATION")),
+            working_directory_path(terminal.pwd().unwrap(), || Some("WORKSTATION")),
             Some(PathBuf::from("/tmp/my project"))
         );
         assert_eq!(
-            working_directory_path("file://remote/tmp/project", Some("workstation")),
+            working_directory_path("file://remote/tmp/project", || Some("workstation")),
             None
         );
+        // Only a directory named by host needs this machine's name.
+        let unasked = || -> Option<&str> { panic!("no host to compare") };
         assert_eq!(
-            working_directory_path("file://localhost/tmp/project", None),
+            working_directory_path("file://localhost/tmp/project", unasked),
             Some(PathBuf::from("/tmp/project"))
         );
         assert_eq!(
-            working_directory_path("/tmp/project", None),
+            working_directory_path("file:///tmp/project", unasked),
+            Some(PathBuf::from("/tmp/project"))
+        );
+        assert_eq!(
+            working_directory_path("/tmp/project", unasked),
             Some(PathBuf::from("/tmp/project"))
         );
     }
