@@ -5414,6 +5414,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_artifact_shorthand_is_not_a_concrete_file_link() {
+        let directory = tempfile::tempdir().unwrap();
+        for matches in [0, 1, 2] {
+            if matches > 0 {
+                std::fs::write(
+                    directory.path().join(format!("tree-real-{matches}.png")),
+                    "fixture",
+                )
+                .unwrap();
+            }
+            for text in [
+                "tree-real-*.png",
+                ".worktrees/review/docs/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png",
+                "docs/tree-?.png",
+                "docs/tree-[12].png",
+            ] {
+                let snapshot = RenderSnapshot {
+                    lines: vec![row(text)].into(),
+                    ..RenderSnapshot::empty()
+                };
+                assert!(
+                    terminal_link_at(&snapshot, 0, 5, directory.path()).is_none(),
+                    "{text}, {matches} matches"
+                );
+            }
+        }
+        for text in [
+            "\"tree-real-*.png\"",
+            "`tree-real-*.png`",
+            "'tree-real-*.png'",
+        ] {
+            let snapshot = RenderSnapshot {
+                lines: vec![row(text)].into(),
+                ..RenderSnapshot::empty()
+            };
+            assert_eq!(
+                terminal_link_at(&snapshot, 0, 5, directory.path()),
+                Some(url::Url::from_file_path(directory.path().join("tree-real-*.png")).unwrap()),
+                "quoted literal {text}"
+            );
+        }
+        let snapshot = RenderSnapshot {
+            lines: vec![row("file:///concrete/tree-real-*.png")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            terminal_link_at(&snapshot, 0, 5, directory.path())
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            std::path::PathBuf::from("/concrete/tree-real-*.png")
+        );
+    }
+
+    #[test]
     fn terminal_link_spans_exclude_prose_and_follow_soft_wraps() {
         let mut first = (*row("(https://example.")).clone();
         first.wrapped = true;
