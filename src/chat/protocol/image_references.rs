@@ -76,7 +76,8 @@ pub(super) fn ordered<'a>(
             if digits > 0 && suffix.as_bytes().get(digits) == Some(&b']') {
                 let token = &suffix[..digits];
                 if token.parse::<u64>().ok().is_none_or(|number| {
-                    !managed.iter().any(|reference| reference.number == number)
+                    number.to_string() != token
+                        || !managed.iter().any(|reference| reference.number == number)
                 }) {
                     return Err(format!(
                         "[Image {token}] has no attached image. Attach that image or remove its inline reference."
@@ -172,6 +173,7 @@ mod tests {
             number,
             device: uuid::Uuid::from_u128(7),
             name: "literal <file> image.png".into(),
+            extension: "png".into(),
             sha256: "a".repeat(64),
         }
     }

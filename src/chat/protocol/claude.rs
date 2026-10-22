@@ -5334,7 +5334,7 @@ mod history_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     #[test]
     fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
@@ -5468,6 +5468,24 @@ mod tests {
                 super::super::image_references::marker(first_ref).unwrap()
             );
             assert_eq!(content[4]["type"], "image");
+            let first_bytes = std::fs::read(&first.path).unwrap();
+            let second_bytes = std::fs::read(&second.path).unwrap();
+            assert_ne!(
+                first_bytes, second_bytes,
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                second_bytes
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[4]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                first_bytes
+            );
             let mut restored = Step::default();
             Claude::default()
                 .message(&submitted.writes[0], &mut restored)

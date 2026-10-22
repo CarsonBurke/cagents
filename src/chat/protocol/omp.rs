@@ -1841,6 +1841,17 @@ mod tests {
             let request = &submitted.writes[0];
             let images = request["images"].as_array().unwrap();
             assert_eq!(images.len(), 2);
+            assert_ne!(
+                std::fs::read(&first.path).unwrap(),
+                std::fs::read(&second.path).unwrap(),
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(images[1]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&first.path).unwrap()
+            );
             assert_eq!(
                 STANDARD
                     .decode(images[0]["data"].as_str().unwrap())
