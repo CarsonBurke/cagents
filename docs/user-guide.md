@@ -620,6 +620,9 @@ Use the audit page's `next` value as `--before SEQUENCE` for an older page.
 Earlier unrecorded or expired events remain explicitly unavailable: their actor
 and cause cannot be recovered from the current enabled state. Prompt bodies,
 launch environment and provider diagnostics are excluded from these receipts.
+Hosted conversations can read only receipts committed in their own project.
+Moving a definition does not move its earlier audit receipts into the new
+project; management inspection retains the complete retained chain.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History

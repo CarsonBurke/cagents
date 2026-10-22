@@ -159,6 +159,9 @@ pub enum LifecycleCause {
     ProjectClosed,
     StartPaused,
     PrecheckInterrupted,
+    PrecheckRecovered,
+    PrecheckPaused,
+    ProjectUnavailable,
     ReleaseBlocked,
     RunInterrupted,
     ReleaseRecovered,
@@ -173,6 +176,9 @@ impl LifecycleCause {
             Self::ProjectClosed
             | Self::StartPaused
             | Self::PrecheckInterrupted
+            | Self::PrecheckRecovered
+            | Self::PrecheckPaused
+            | Self::ProjectUnavailable
             | Self::ReleaseBlocked
             | Self::RunInterrupted
             | Self::ReleaseRecovered => LifecycleActor::System,
@@ -189,6 +195,9 @@ impl LifecycleCause {
             Self::ProjectClosed => "Project closed",
             Self::StartPaused => "Paused before launch",
             Self::PrecheckInterrupted => "Precheck interrupted",
+            Self::PrecheckRecovered => "Precheck cleanup recovered",
+            Self::PrecheckPaused => "Paused after precheck",
+            Self::ProjectUnavailable => "Paused because project is unavailable",
             Self::ReleaseBlocked => "Session cleanup blocked",
             Self::RunInterrupted => "Run interrupted",
             Self::ReleaseRecovered => "Session cleanup recovered",

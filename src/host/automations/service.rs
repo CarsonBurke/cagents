@@ -277,8 +277,7 @@ fn process_hosted(
         }
         Request::Audit { id, before, limit } => {
             let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            require_scope(&registry.automation_audit_repository(id)?)?;
-            registry.automation_audit(id, before, limit).map(Response::Audit)
+            registry.project_automation_audit(&repository, id, before, limit).map(Response::Audit)
         }
         Request::ShowFiring { id } => {
             let detail = registry.lock().unwrap_or_else(|p| p.into_inner()).automation_run_detail(id)?;

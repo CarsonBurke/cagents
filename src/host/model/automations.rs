@@ -1363,6 +1363,14 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if !project_open {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::ProjectUnavailable,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
             firing,
@@ -1404,6 +1412,12 @@ impl Registry {
             automation.blocked = None;
             automation.updated_ms = now_ms;
             write_automation(&tx, &automation)?;
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckRecovered,
+                Some(firing.id),
+            )?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
@@ -1446,6 +1460,14 @@ impl Registry {
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
         write_automation(&tx, &automation)?;
+        if firing.state == FiringState::Interrupted {
+            automation_audit::record(
+                &tx,
+                &automation,
+                LifecycleCause::PrecheckPaused,
+                Some(firing.id),
+            )?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -3563,5 +3585,118 @@ mod tests {
             registry.automation_audit(created.id, None, 100).unwrap(),
             current
         );
+    }
+    #[test]
+    fn automation_lifecycle_audit_keeps_immutable_event_scope_after_cross_project_edit() {
+        let (mut registry, directory, definition) = fixture();
+        let source = definition.agent.target.repository.clone();
+        let target = directory.path().join("destination");
+        std::fs::create_dir(&target).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: target.clone(),
+                name: "Destination".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let source_page = registry
+            .project_automation_audit(&source, created.id, None, 100)
+            .unwrap();
+        assert!(
+            registry
+                .project_automation_audit(&target, created.id, None, 100)
+                .is_err()
+        );
+        let mut moved = definition;
+        moved.agent.target.repository = target.clone();
+        moved.agent.target.directory = target.clone();
+        registry
+            .edit_automation(created.id, 1, moved, 200, test_identity())
+            .unwrap();
+        assert_eq!(
+            registry
+                .project_automation_audit(&source, created.id, None, 100)
+                .unwrap(),
+            source_page
+        );
+        let target_page = registry
+            .project_automation_audit(&target, created.id, None, 100)
+            .unwrap();
+        assert_eq!(target_page.events.len(), 1);
+        assert_eq!(target_page.events[0].cause, LifecycleCause::Edited);
+        assert!(target_page.earlier_events_unavailable);
+        assert!(
+            registry
+                .project_automation_audit(
+                    &target,
+                    created.id,
+                    Some(target_page.events[0].sequence),
+                    100
+                )
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .automation_audit(created.id, None, 100)
+                .unwrap()
+                .events
+                .len(),
+            2,
+            "management reads retain the full receipt chain"
+        );
+    }
+    #[test]
+    fn automation_lifecycle_precheck_cleanup_recovery_is_atomic_and_does_not_reenable() {
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let created = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                created.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .interrupt_automation_precheck(claim.firing.id, "uncertain private cleanup".into(), 300)
+            .unwrap();
+        let blocked = registry.automation_audit(created.id, None, 100).unwrap();
+        assert_eq!(blocked.events[0].cause, LifecycleCause::PrecheckInterrupted);
+        assert!(blocked.events[0].blocked);
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    crate::host::automations::precheck::Outcome::Passed,
+                    400
+                )
+                .unwrap()
+                .is_none()
+        );
+        let page = registry.automation_audit(created.id, None, 100).unwrap();
+        let recovered = &page.events[0];
+        assert_eq!(recovered.cause, LifecycleCause::PrecheckRecovered);
+        assert_eq!(recovered.firing, Some(claim.firing.id));
+        assert_eq!(recovered.occurred_ms, 400);
+        assert!(!recovered.blocked && !recovered.enabled);
+        let current = registry.automation(created.id).unwrap();
+        assert!(!current.enabled && current.blocked.is_none() && current.active_firing.is_none());
+        assert_eq!(recovered.revision, current.revision);
     }
 }
