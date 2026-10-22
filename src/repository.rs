@@ -29,6 +29,8 @@ pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
+#[cfg(test)]
+pub(crate) mod test_fixture;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
     PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
