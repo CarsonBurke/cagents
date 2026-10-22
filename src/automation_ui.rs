@@ -804,6 +804,9 @@ impl State {
                 }
                 Ok(Response::Automation(automation)) => {
                     let id = automation.id;
+                    if self.selected.as_ref().map(|selected| selected.id) != Some(id) {
+                        self.lifecycle = None;
+                    }
                     if let Some(row) = self.rows.iter_mut().find(|row| row.id == id) {
                         *row = automation.summary(row.last_state);
                     } else {
@@ -953,6 +956,7 @@ impl State {
                     self.history.insert(0, firing);
                 }
                 Ok(Response::Removed) => {
+                    self.lifecycle = None;
                     if let Some(selected) = self.selected.take() {
                         self.rows.retain(|row| row.id != selected.id);
                         self.last_firings.remove(&selected.id);
@@ -978,6 +982,7 @@ impl State {
             // read. Supersede reads using the request sequence; never discard
             // a user's draft, consent, or an in-flight mutation.
             self.selected = None;
+            self.lifecycle = None;
             self.all_history = false;
             self.run = None;
             self.history.clear();
@@ -1064,6 +1069,7 @@ impl State {
             Action::Browse => {
                 self.run = None;
                 self.selected = None;
+                self.lifecycle = None;
                 self.all_history = false;
                 return self.request(
                     Pending::List { append: false },
@@ -1346,6 +1352,7 @@ impl State {
                     self.history_next = None;
                     self.history_status = HistoryStatus::Unrequested;
                     self.selected = None;
+                    self.lifecycle = None;
                     self.run = None;
                 }
                 if self.all_history || self.selected.is_some() {
@@ -3576,6 +3583,45 @@ mod tests {
         assert!(
             state.history.is_empty(),
             "lifecycle does not fabricate execution outcomes"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_create_receipt_retires_the_previous_selection_audit() {
+        use crate::automations::LifecyclePage;
+        let mut first = automation();
+        first.id = Uuid::new_v4();
+        let mut created = first.clone();
+        created.id = Uuid::new_v4();
+        let mut state = State {
+            selected: Some(first),
+            lifecycle: Some(LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: true,
+            }),
+            ..Default::default()
+        };
+        state.update(Action::New);
+        assert!(state.has_draft());
+        // Exercise the same saved-create callback as Action::Save. Definition
+        // editing/validation has its own tests; attribution belongs to this reducer.
+        let Some(Effect::Request { sequence, .. }) = state.request(
+            Pending::Save,
+            Request::Create {
+                definition: created.definition.clone(),
+            },
+        ) else {
+            panic!("create request");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(created.clone()))),
+        });
+        assert_eq!(state.selected.as_ref().unwrap().id, created.id);
+        assert!(
+            state.lifecycle.is_none(),
+            "the new definition must never inherit another audit"
         );
     }
 
