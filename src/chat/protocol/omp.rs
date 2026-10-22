@@ -1823,7 +1823,7 @@ mod tests {
             let first_ref = first.reference.as_ref().unwrap();
             let second_ref = second.reference.as_ref().unwrap();
             let text = format!(
-                "Before {} between {} after",
+                "Earlier [Image 77777] was dark; compare new {} between {} after",
                 second_ref.token(),
                 first_ref.token()
             );

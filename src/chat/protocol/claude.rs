@@ -5340,7 +5340,10 @@ mod tests {
     fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
         crate::chat::attachment_assets::with_test_image(|attachment| {
             let reference = attachment.reference.clone().unwrap();
-            let text = format!("Before {} after", reference.token());
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
             let mut adapter = Claude {
                 ready: true,
                 async_input: true,

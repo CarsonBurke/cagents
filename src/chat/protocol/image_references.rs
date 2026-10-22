@@ -70,22 +70,9 @@ pub(super) fn ordered<'a>(
                 ));
             }
         }
-        let mut remaining = text;
-        while let Some((_, suffix)) = remaining.split_once("[Image ") {
-            let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
-            if digits > 0 && suffix.as_bytes().get(digits) == Some(&b']') {
-                let token = &suffix[..digits];
-                if token.parse::<u64>().ok().is_none_or(|number| {
-                    number.to_string() != token
-                        || !managed.iter().any(|reference| reference.number == number)
-                }) {
-                    return Err(format!(
-                        "[Image {token}] has no attached image. Attach that image or remove its inline reference."
-                    ));
-                }
-            }
-            remaining = suffix;
-        }
+        // Other labels may refer to earlier conversation images or quoted
+        // prose. Text alone neither selects an image nor grants authority to
+        // resolve one; only the current attachment metadata is validated.
     }
     let mut ordered = attachments.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by_key(|(index, attachment)| {
@@ -214,11 +201,18 @@ mod tests {
                 .unwrap_err()
                 .contains("inline reference is missing")
         );
-        assert!(
-            ordered("[Image 13] then [Image 999]", &[first.clone()])
-                .unwrap_err()
-                .contains("no attached image")
+        let current = [second.clone()];
+        let mixed = ordered(
+            "Earlier [Image 13] was dark; compare new [Image 29]",
+            &current,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed,
+            [&second],
+            "a history label never adds a current attachment"
         );
+        assert!(ordered("[Image 13] then literal [Image 999]", &[first.clone()]).is_ok());
         assert!(ordered("", &[first]).is_ok());
         assert!(ordered("literal [Image 999]", &[Attachment::file("/legacy.png")]).is_ok());
     }

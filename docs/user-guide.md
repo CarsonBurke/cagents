@@ -812,8 +812,9 @@ Pasted and selected images receive stable **Image N** labels. Their inline
 `[Image N]` references stay with the actual image through edits, queued message
 revision, retry and supported provider history. Removing an attachment does not
 silently attach another image with the same display number. A prompt with
-managed images explains missing or dangling references before sending. Legacy
-text that merely says `[Image N]` does not select an image.
+managed images explains when an attached image's inline reference is missing
+before sending. Text may also refer to earlier images by label; a label alone
+does not select or attach an image.
 
 Owned image assets persist separately from disposable preview caches. The
 physical-device store is bounded to 4096 images and 2 GiB; accepted images and

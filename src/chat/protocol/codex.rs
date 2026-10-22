@@ -4099,7 +4099,10 @@ mod tests {
             adapter
                 .modalities
                 .insert("model".into(), vec!["image".into()]);
-            let text = format!("Before {} after", reference.token());
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
             let input = adapter
                 .input(text.clone(), vec![attachment.clone()])
                 .unwrap();
