@@ -451,6 +451,9 @@ pub(super) fn validate_target(
     )?;
     // Detect replacement during discovery too; retain the original descriptor.
     target::verify(&definition.agent.target.directory, identity).map_err(|e| e.to_string())?;
+    // Prechecks run here directly; accepted work is refused again at launch.
+    crate::host::worktree_removal::ensure_outside_directory(host, &directory)
+        .map_err(|error| error.message)?;
     Ok(Arc::new(directory))
 }
 

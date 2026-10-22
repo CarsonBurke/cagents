@@ -985,6 +985,80 @@ fn an_unremovable_directory_blocks() {
     );
 }
 
+/// Mounts a file system inside the worktree, in a mount namespace of a child
+/// test process where unprivileged namespaces allow.
+#[test]
+fn a_mount_inside_the_worktree_blocks() {
+    const CHILD: &str = "CAGENTS_CONTENT_MOUNT_TEST";
+    let unshare = || {
+        let mut command = std::process::Command::new("unshare");
+        command.args(["--user", "--map-root-user", "--mount"]);
+        command
+    };
+    if std::env::var_os(CHILD).is_none() {
+        if !unshare().arg("true").status().is_ok_and(|status| status.success()) {
+            eprintln!("skipped: no unprivileged mount namespace");
+            return;
+        }
+        let name = module_path!().split_once("::").unwrap().1;
+        let output = unshare()
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{name}::a_mount_inside_the_worktree_blocks"),
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the namespaced fixture failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let fixture = Fixture::new();
+    let mount = fixture.worktree.join("cache/mounted");
+    std::fs::create_dir_all(&mount).unwrap();
+    let status = std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=1m", "fixture"])
+        .arg(&mount)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    assert_eq!(
+        blocker(&fixture.inspect()),
+        &Blocker::MountPoint("cache/mounted/".into())
+    );
+
+    // A bind mount of the same file system has the same device; only its
+    // mount, which kernels report since 5.8, tells it apart.
+    if analysis::filesystem(&fixture.worktree)
+        .unwrap()
+        .is_none_or(|(_, _, mount)| mount.is_none())
+    {
+        eprintln!("bind mounts skipped: the kernel reports no mount IDs");
+        return;
+    }
+    let mount_command = |arguments: &[&std::ffi::OsStr]| {
+        let status = std::process::Command::new(arguments[0])
+            .args(&arguments[1..])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{arguments:?}");
+    };
+    mount_command(&["umount".as_ref(), mount.as_os_str()]);
+    let elsewhere = fixture.repository.parent().unwrap().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    mount_command(&["mount".as_ref(), "--bind".as_ref(), elsewhere.as_os_str(), mount.as_os_str()]);
+    assert_eq!(
+        blocker(&fixture.inspect()),
+        &Blocker::MountPoint("cache/mounted/".into())
+    );
+}
+
 #[test]
 fn a_remote_tracking_ref_does_not_keep_detached_commits() {
     let fixture = Fixture::new();

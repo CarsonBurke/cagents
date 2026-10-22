@@ -133,6 +133,8 @@ pub enum Blocker {
     SkipWorktree(String),
     #[error("{0} cannot be read or changed, so removal could not empty it")]
     Unremovable(String),
+    #[error("{0} is another file system or subvolume, which removal would empty")]
+    MountPoint(String),
     #[error("untracked files exceed {bytes} bytes")]
     TooLarge { bytes: u64 },
     #[error("the worktree holds more than {limit} files")]

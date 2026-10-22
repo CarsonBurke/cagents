@@ -48,6 +48,22 @@ pub(super) fn table<const N: usize>(
         .join("\n")
 }
 
+/// A byte count in the largest binary unit that keeps it at least one.
+pub(super) fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 pub(super) fn relative_time(at_ms: u64, now_ms: u64) -> String {
     let future = at_ms > now_ms;
     let seconds = at_ms.abs_diff(now_ms) / 1000;
@@ -82,6 +98,14 @@ mod tests {
         assert_eq!(relative_time(180_000, 120_000), "in 1 min");
         assert_eq!(relative_time(0, 7_200_000), "2 hr ago");
         assert_eq!(relative_time(0, 172_800_000), "2 days ago");
+    }
+
+    #[test]
+    fn cli_sizes_use_binary_units() {
+        assert_eq!(size(0), "0 B");
+        assert_eq!(size(1023), "1023 B");
+        assert_eq!(size(1536), "1.5 KiB");
+        assert_eq!(size(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 
     #[test]

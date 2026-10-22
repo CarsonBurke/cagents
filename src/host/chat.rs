@@ -133,6 +133,14 @@ pub(super) struct TerminalHandoff {
 pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
 
 impl TerminalHandoff {
+    /// Where both sides of the handoff run.
+    pub(super) fn working_directories(&self) -> [&std::path::Path; 2] {
+        [
+            &self.source.launch.recipe.working_directory,
+            &self.terminal.launch.working_directory,
+        ]
+    }
+
     pub(super) fn new(
         source: Session,
         terminal: crate::model::TerminalSession,
@@ -214,6 +222,10 @@ pub(super) struct PendingBinding {
 }
 
 impl PendingBinding {
+    pub(super) fn working_directory(&self) -> &std::path::Path {
+        &self.process.launch.working_directory
+    }
+
     fn authorizes(
         &self,
         process: &crate::model::agent_recovery::AgentProcess,

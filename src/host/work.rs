@@ -12,6 +12,7 @@
 //! session changes it.
 mod board;
 mod forge;
+mod removal;
 mod scan;
 mod store;
 mod tickets;
@@ -639,7 +640,28 @@ impl Handle {
             } => self
                 .pin(host, &scope, &item, column)
                 .map(|item| Response::Pinned(Box::new(item))),
+            Request::RemovalPlan { scope, item, fetch } => self
+                .removal_plan(host, &scope, &item, fetch)
+                .map(|plan| Response::RemovalPlan(Box::new(plan))),
+            Request::Remove(removal) => self
+                .remove(host, &removal)
+                .map(|removed| Response::Removed(Box::new(removed))),
+            Request::Snapshots { scope } => {
+                self.snapshots(host, &scope).map(Response::Snapshots)
+            }
         }
+    }
+
+    /// Rescans `repository` soon, so the board drops what was removed.
+    fn rescan(&self, repository: &Path) {
+        if let Some(tracked) = self.shared().projects.get_mut(repository) {
+            tracked
+                .pending
+                .get_or_insert_with(Default::default)
+                .merge(full_change());
+            tracked.urgent = true;
+        }
+        self.0.scanner.notify();
     }
 
     /// The repositories `scope` covers, read from the shared workspace model.
@@ -916,14 +938,9 @@ impl Handle {
         true
     }
 
-    fn pin(
-        &self,
-        host: &SharedHost,
-        scope: &Scope,
-        name: &str,
-        column: Option<Column>,
-    ) -> Result<Item, String> {
-        let board = self.board(host, scope, false)?;
+    /// The one card on `board` named by `name`: its branch, its storage key or
+    /// its worktree's path.
+    fn card(board: &Board, name: &str) -> Result<Item, String> {
         // A path names a worktree however it is spelled: through a symlink,
         // or as Git recorded it.
         let path = Path::new(name)
@@ -932,7 +949,7 @@ impl Handle {
             .flatten();
         let mut matches = board
             .items
-            .into_iter()
+            .iter()
             .filter(|item| {
                 item.branch.as_deref() == Some(name)
                     || item.key.storage_key() == name
@@ -944,20 +961,29 @@ impl Handle {
                     })
             })
             .collect::<Vec<_>>();
-        let mut item = match matches.len() {
-            0 => return Err(format!("No card on the board is named {name}")),
-            1 => matches.remove(0),
-            count => {
-                return Err(format!(
-                    "{count} cards are named {name}, in {}; choose one with --project",
-                    matches
-                        .iter()
-                        .map(|item| item.project_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-        };
+        match matches.len() {
+            0 => Err(format!("No card on the board is named {name}")),
+            1 => Ok(matches.remove(0).clone()),
+            count => Err(format!(
+                "{count} cards are named {name}, in {}; choose one with --project",
+                matches
+                    .iter()
+                    .map(|item| item.project_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    fn pin(
+        &self,
+        host: &SharedHost,
+        scope: &Scope,
+        name: &str,
+        column: Option<Column>,
+    ) -> Result<Item, String> {
+        let board = self.board(host, scope, false)?;
+        let mut item = Self::card(&board, name)?;
         let key = item.key.storage_key();
         self.store(|store| store.set_pin(&item.project, &key, column))
             .ok_or("The Work board store is unavailable, so pins cannot be saved")?;
