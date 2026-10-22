@@ -5867,7 +5867,29 @@ impl Cagents {
     }
 
     fn new_pane_fraction(&self, configured: f32) -> f32 {
-        let width = self.workspace.viewport_width();
+        let width = if self.workspace.cards().is_empty() {
+            // The welcome view has no WorkspaceSurface to replace the startup
+            // width estimate. Use the window's current bounds until one mounts.
+            let sidebar = sidebar::effective_width(
+                self.projects_sidebar_mode(),
+                self.settings.sidebar_width,
+            );
+            let inspector = if matches!(
+                self.context_inspector_mount(),
+                Some(InspectorLayout::Docked)
+            ) {
+                self.settings
+                    .inspector_width
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+                    .min(self.window_width.max(0.0))
+                    * self.context_inspector_progress()
+            } else {
+                0.0
+            };
+            (self.window_width - sidebar - inspector).max(0.0)
+        } else {
+            self.workspace.viewport_width()
+        };
         if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH {
             1.0
         } else {
@@ -19073,6 +19095,71 @@ mod tests {
             working_directory: working_directory.into(),
             environment: Default::default(),
         }
+    }
+
+    #[test]
+    fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
+        for (window, seed, with_project, inspector_open, expected, measured) in [
+            (1280.0, 1340.0, false, false, 1.0, 1020.0),
+            (1600.0, 600.0, false, false, 0.5, 1340.0),
+            (1360.0, 1340.0, false, false, 0.5, 1100.0),
+            (1600.0, 1340.0, true, true, 1.0, 960.0),
+            (2000.0, 600.0, true, true, 0.5, 1360.0),
+            (900.0, 1340.0, true, true, 1.0, 640.0),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            app.context_inspector_open = inspector_open;
+            app.settings.default_native_pane_fraction = 0.5;
+            if with_project {
+                app.sidebar_model = sidebar::tests::panel_model();
+            }
+            app.workspace.resize_viewport(seed);
+            drop(app.update(Message::WindowResized(window, 900.0)));
+            assert!(app.workspace.cards().is_empty());
+            assert_eq!(app.window_width, window);
+            assert_eq!(app.workspace.viewport_width(), seed);
+            assert_eq!(app.sidebar_model.projects.is_empty(), !with_project);
+
+            // This is a real insertion, not a full-width singleton rendering
+            // assertion: the stored preference must survive adding a neighbour.
+            drop(app.add_utility_card(CardKind::Settings));
+            let first = app.workspace.focused().unwrap();
+            assert_eq!(app.card_state(first).unwrap().width_fraction, expected);
+            assert_eq!(
+                app.workspace.card(first).unwrap().width,
+                CardWidth::Fraction(expected)
+            );
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(measured),
+            }));
+            drop(app.add_utility_card(CardKind::Accounts));
+            assert_eq!(app.card_state(first).unwrap().width_fraction, expected);
+            assert_eq!(
+                app.workspace.card(first).unwrap().width,
+                CardWidth::Fraction(expected)
+            );
+        }
+
+        // Once mounted, the measured strip remains authoritative even if the
+        // outer window has resized and its next native width event is pending.
+        let mut app = context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        app.card_state_mut(first).unwrap().width_fraction = 0.375;
+        app.workspace
+            .set_card_width(first, CardWidth::Fraction(0.375))
+            .unwrap();
+        app.workspace.resize_viewport(600.0);
+        drop(app.update(Message::WindowResized(2000.0, 900.0)));
+        assert_eq!(app.workspace.viewport_width(), 600.0);
+        drop(app.add_utility_card(CardKind::Settings));
+        let second = app.workspace.focused().unwrap();
+        assert_eq!(app.card_state(second).unwrap().width_fraction, 1.0);
+        assert_eq!(app.card_state(first).unwrap().width_fraction, 0.375);
+        assert_eq!(
+            app.workspace.card(first).unwrap().width,
+            CardWidth::Fraction(0.375)
+        );
     }
 
     #[test]
