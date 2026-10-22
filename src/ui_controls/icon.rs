@@ -65,6 +65,7 @@ icons! {
         AgentWaiting => "waiting",
         AgentWorking => "working",
         Attention => "attention",
+        Board => "board",
         Branch => "branch",
         Browser => "browser",
         Changes => "changes",

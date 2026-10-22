@@ -58,6 +58,86 @@ impl ControlClient {
             response => Err(unexpected_response("Work board", &response)),
         }
     }
+
+    /// Rescans every open project and polls GitHub, waiting within the
+    /// daemon's bound for the board those produce. A watching connection is
+    /// sent that board as well.
+    pub fn refresh_work_board(&mut self) -> Result<(), ControlError> {
+        self.work(
+            Request::Board {
+                scope: Scope::All,
+                fresh: true,
+            },
+            FRESH_BOARD_TIMEOUT,
+        )
+        .map(drop)
+    }
+
+    /// Pins the card `item` (its storage key, a branch name or a worktree
+    /// path) of the project `repository` to `column`, or unpins it.
+    pub fn pin_work_card(
+        &mut self,
+        repository: PathBuf,
+        item: String,
+        column: Option<Column>,
+    ) -> Result<(), ControlError> {
+        self.work(
+            Request::Pin {
+                scope: Scope::Project(repository),
+                item,
+                column,
+            },
+            BOARD_TIMEOUT,
+        )
+        .map(drop)
+    }
+
+    /// Subscribes this connection to the Work board and returns it, with the
+    /// revision later boards from [`Self::next_work_board`] supersede.
+    pub fn watch_work(&mut self) -> Result<(u64, Board), ControlError> {
+        match self.request_with_deadline(ClientRequest::WatchWork, Instant::now() + BOARD_TIMEOUT)? {
+            ServerResponse::Work(Response::Watching { revision, board }) => Ok((revision, *board)),
+            response => Err(unexpected_response("a Work board subscription", &response)),
+        }
+    }
+
+    /// Blocks until the daemon sends a board newer than `revision`.
+    ///
+    /// A board change has no deadline, so this drops the read timeout rather
+    /// than polling: a timeout expiring mid-frame would desynchronize the
+    /// stream, and a subscribed connection issues no further requests.
+    pub fn next_work_board(&mut self, revision: u64) -> Result<(u64, Board), ControlError> {
+        if let Some((observed, board)) = self.observed_work.take()
+            && observed > revision
+        {
+            return Ok((observed, *board));
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::WorkBoard {
+                    revision: observed,
+                    board,
+                } if observed > revision => return Ok((observed, *board)),
+                // The daemon is about to close this connection. Reporting it as
+                // a closed connection is what makes a watcher reconnect and
+                // resubscribe to the successor's board.
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn scope(project: Option<PathBuf>) -> Result<Scope, AppError> {

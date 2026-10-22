@@ -514,6 +514,15 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+/// Ends a [`ControlClient`]'s connection from another thread.
+pub struct Hangup(UnixStream);
+
+impl Hangup {
+    pub fn hang_up(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -529,6 +538,9 @@ pub struct ControlClient {
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
     observed_notifications: VecDeque<crate::notifications::Update>,
+    /// The newest Work board pushed while a correlated response was pending.
+    /// Each carries the whole board, so only the newest matters.
+    observed_work: Option<(u64, Box<crate::work::Board>)>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -659,6 +671,7 @@ impl ControlClient {
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
+            observed_work: None,
             attached_chats: BTreeSet::new(),
         })
     }
@@ -742,6 +755,15 @@ impl ControlClient {
                 _ => {}
             }
         }
+    }
+
+    /// A handle that ends this connection from another thread, so a read
+    /// blocked in one of the `next_*` calls returns a closed connection.
+    pub fn hangup(&self) -> Result<Hangup, ControlError> {
+        self.stream
+            .try_clone()
+            .map(Hangup)
+            .map_err(ControlError::Configure)
     }
 
     /// Subscribes to shared-model edges and returns the model in one round trip.
@@ -1660,6 +1682,15 @@ impl ControlClient {
                         .push_back(crate::notifications::Update::Activated(target));
                 }
             }
+            ServerMessage::WorkBoard { revision, board } => {
+                if self
+                    .observed_work
+                    .as_ref()
+                    .is_none_or(|(observed, _)| *observed < revision)
+                {
+                    self.observed_work = Some((revision, board));
+                }
+            }
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
@@ -1876,6 +1907,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
         | ServerMessage::NotificationActivated { .. }
+        | ServerMessage::WorkBoard { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -1898,6 +1930,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
+        ServerMessage::WorkBoard { .. } => "work_board",
     }
 }
 

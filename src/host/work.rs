@@ -5,8 +5,11 @@
 //! scan them, so one large checkout delays only itself. The watcher wakes the
 //! coordinator for the projects within the watch budget; the rest are polled,
 //! sooner while something happens in them. A separate forge thread polls
-//! GitHub with bounded `gh` calls, so a slow forge delays no local scan. Requests assemble a board from the latest facts without spawning a
-//! process unless they ask for a fresh one.
+//! GitHub with bounded `gh` calls, so a slow forge delays no local scan.
+//! Requests assemble a board from the latest facts without spawning a
+//! process unless they ask for a fresh one. A publisher thread sends windows
+//! that watch the board each changed board as soon as a scan, poll, pin or
+//! session changes it.
 mod board;
 mod forge;
 mod scan;
@@ -23,13 +26,15 @@ use std::{
 
 use super::{
     agent_execution,
-    state::{HostLock, SharedHost},
+    delivery::{DeliveryQueue, Outbound},
+    state::{ClientId, HostLock, SharedHost},
 };
 use crate::{
     agent::ActivityState,
     git_watch,
     model::{ProjectId, ProjectKind},
     repository::CancellationToken,
+    terminal_ipc::ServerMessage,
     work::{Board, Column, Forge, Item, Request, Response, Scope},
 };
 
@@ -60,6 +65,14 @@ const FRESH_ENOUGH: Duration = Duration::from_secs(5);
 const SCAN_WORKERS: usize = 4;
 /// Bursts of file events coalesce into one scanner pass per interval.
 const TICK_FLOOR: Duration = Duration::from_millis(250);
+/// Changes arriving together, such as several workers finishing at once, are
+/// sent to watchers as one board.
+const PUBLISH_FLOOR: Duration = Duration::from_millis(150);
+/// How often a watched board is reassembled without a change to wake it:
+/// session states and the clock move cards without a scan.
+const REPUBLISH: Duration = Duration::from_secs(5);
+/// Unwatched, the publisher waits for a watcher's notification.
+const UNWATCHED: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default)]
 struct SignalState {
@@ -376,6 +389,49 @@ impl Shared {
     }
 }
 
+/// The connections watching the board and what they were last sent.
+#[derive(Default)]
+struct Publication {
+    watchers: BTreeMap<ClientId, Weak<DeliveryQueue>>,
+    revision: u64,
+    /// The last board sent, with its generation time cleared, so a pass that
+    /// changes nothing sends nothing.
+    sent: Option<Board>,
+}
+
+impl Publication {
+    /// Makes `board` the watchers' board, sending it to all but `except` when
+    /// it differs from the last one sent.
+    fn offer(&mut self, host: &SharedHost, board: &Board, except: Option<ClientId>) {
+        let mut comparable = board.clone();
+        comparable.generated_at_unix_ms = 0;
+        if self.sent.as_ref() == Some(&comparable) {
+            return;
+        }
+        self.sent = Some(comparable);
+        self.revision += 1;
+        let proof = Arc::new(host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone());
+        let revision = self.revision;
+        self.watchers.retain(|client, delivery| {
+            if Some(*client) == except {
+                return true;
+            }
+            let Some(delivery) = delivery.upgrade() else {
+                return false;
+            };
+            delivery
+                .push(Outbound::broadcast(
+                    &proof,
+                    ServerMessage::WorkBoard {
+                        revision,
+                        board: Box::new(board.clone()),
+                    },
+                ))
+                .is_ok()
+        });
+    }
+}
+
 struct Inner {
     host: Weak<HostLock>,
     shared: Mutex<Shared>,
@@ -383,6 +439,11 @@ struct Inner {
     updated: Condvar,
     scanner: Signal,
     forge: Signal,
+    /// Wakes the publisher when the board may have changed.
+    publisher: Signal,
+    /// Held while a board is assembled and sent, so watchers receive boards
+    /// in the order their facts were read.
+    publication: Mutex<Publication>,
     jobs: Jobs,
     /// `None` when the store could not be opened: the board still works, but
     /// pins and session history last only as long as the daemon.
@@ -449,6 +510,8 @@ impl Service {
             updated: Condvar::new(),
             scanner: Signal::default(),
             forge: Signal::default(),
+            publisher: Signal::default(),
+            publication: Mutex::new(Publication::default()),
             jobs: Jobs::default(),
             store: Mutex::new(store),
             cancellation: CancellationToken::new(),
@@ -469,6 +532,13 @@ impl Service {
             std::thread::Builder::new()
                 .name("work-forge".into())
                 .spawn(move || forge.forge_loop())
+                .map_err(|error| error.to_string())?,
+        );
+        let publisher = handle.clone();
+        service.threads.push(
+            std::thread::Builder::new()
+                .name("work-publisher".into())
+                .spawn(move || publisher.publish_loop())
                 .map_err(|error| error.to_string())?,
         );
         for _ in 0..SCAN_WORKERS {
@@ -493,6 +563,7 @@ impl Drop for Service {
         self.handle.0.cancellation.cancel();
         self.handle.0.scanner.stop();
         self.handle.0.forge.stop();
+        self.handle.0.publisher.stop();
         self.handle.0.jobs.stop();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -608,12 +679,20 @@ impl Handle {
 
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
         let selected = self.resolve(host, scope)?;
+        self.settle(&selected, fresh);
+        Ok(self.assemble(host, &selected))
+    }
+
+    /// Waits, within a bound, for what a board of `selected` needs: each
+    /// project's first scan, and with `fresh` a scan and a forge poll that
+    /// start after this call.
+    fn settle(&self, selected: &[(PathBuf, String)], fresh: bool) {
         let deadline = Instant::now() + if fresh { FRESH_WAIT } else { FIRST_SCAN_WAIT };
         let mut targets = Vec::new();
         {
             let mut shared = self.shared();
             shared.read_at = Some(Instant::now());
-            for (repository, name) in &selected {
+            for (repository, name) in selected {
                 let tracked = shared.track(repository, name);
                 let recent = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < FRESH_ENOUGH);
                 // Waits for a scan that starts after this request: one already
@@ -660,7 +739,7 @@ impl Handle {
         self.0.scanner.notify();
         self.0.forge.notify();
         let shared = self.shared();
-        let (shared, _) = self
+        let _settled = self
             .0
             .updated
             .wait_timeout_while(
@@ -682,6 +761,11 @@ impl Handle {
                 },
             )
             .unwrap_or_else(|p| p.into_inner());
+    }
+
+    /// The board of `selected` from the latest facts, without waiting.
+    fn assemble(&self, host: &SharedHost, selected: &[(PathBuf, String)]) -> Board {
+        let shared = self.shared();
         // Take what the board needs and release the lock before reading the
         // live sessions, which takes the host lock.
         let projects = selected
@@ -718,7 +802,7 @@ impl Handle {
                 },
             )
             .collect::<Vec<_>>();
-        Ok(board::assemble(
+        board::assemble(
             &views,
             &board::Context {
                 now_unix_ms: now_unix_ms(),
@@ -729,7 +813,107 @@ impl Handle {
                 tickets: &tickets,
                 linear_unavailable: linear_unavailable.as_deref(),
             },
-        ))
+        )
+    }
+
+    /// Subscribes `client` to every board change and returns the whole board
+    /// as of the revision it starts from.
+    pub(super) fn watch(
+        &self,
+        host: &SharedHost,
+        client: ClientId,
+        delivery: Weak<DeliveryQueue>,
+    ) -> Result<(u64, Board), String> {
+        let selected = self.resolve(host, &Scope::All)?;
+        self.settle(&selected, false);
+        let mut publication = self.publication();
+        publication.watchers.insert(client, delivery);
+        // Assembled while subscribed, so no later change can miss this
+        // client; the others are sent the same board if it is new to them.
+        let board = self.assemble(host, &selected);
+        publication.offer(host, &board, Some(client));
+        let revision = publication.revision;
+        drop(publication);
+        // The publisher now has a watcher to republish for.
+        self.0.publisher.notify();
+        Ok((revision, board))
+    }
+
+    pub(super) fn unwatch(&self, client: ClientId) {
+        self.publication().watchers.remove(&client);
+    }
+
+    fn publication(&self) -> MutexGuard<'_, Publication> {
+        self.0.publication.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Something the board shows may have changed: wakes requests waiting on
+    /// facts and the publisher.
+    fn changed(&self) {
+        self.0.updated.notify_all();
+        self.0.publisher.notify();
+    }
+
+    fn publish_loop(&self) {
+        while let Some(observed) = self.0.publisher.observe() {
+            let Some(host) = self.0.host.upgrade() else {
+                break;
+            };
+            let started = Instant::now();
+            let watched = super::service::attempt("Work board publishing", || {
+                Ok(self.republish(&host))
+            })
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Work board publishing is temporarily unavailable");
+                true
+            });
+            drop(host);
+            // Unwatched, only a new watcher's notification wakes this thread.
+            self.0
+                .publisher
+                .wait(observed, if watched { REPUBLISH } else { UNWATCHED });
+            std::thread::sleep(PUBLISH_FLOOR.saturating_sub(started.elapsed()));
+        }
+    }
+
+    /// Sends watchers the board when it changed, and reports whether anyone
+    /// is watching.
+    fn republish(&self, host: &SharedHost) -> bool {
+        let mut publication = self.publication();
+        publication
+            .watchers
+            .retain(|_, delivery| delivery.strong_count() > 0);
+        if publication.watchers.is_empty() {
+            publication.sent = None;
+            return false;
+        }
+        let selected = match self.resolve(host, &Scope::All) {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::debug!(%error, "the Work board could not read the open projects");
+                return true;
+            }
+        };
+        let untracked = {
+            let mut shared = self.shared();
+            // A watched board is a read, which keeps polls and tickets current.
+            shared.read_at = Some(Instant::now());
+            let untracked = selected
+                .iter()
+                .any(|(repository, _)| !shared.projects.contains_key(repository));
+            for (repository, name) in &selected {
+                shared.track(repository, name);
+            }
+            untracked
+        };
+        if untracked {
+            // A project opened since the last pass is scanned now rather than
+            // at the next model refresh.
+            self.0.scanner.notify();
+        }
+        let board = self.assemble(host, &selected);
+        publication.offer(host, &board, None);
+        true
     }
 
     fn pin(
@@ -785,6 +969,7 @@ impl Handle {
                 None => shared.pins.remove(&entry),
             };
         }
+        self.0.publisher.notify();
         crate::work::place(&mut item, column, now_unix_ms(), board.stale_after_days);
         Ok(item)
     }
@@ -866,7 +1051,7 @@ impl Handle {
         if !stale.is_empty() {
             self.store(|store| store.retain_pins(&job.repository, |item| !stale.contains(item)));
         }
-        self.0.updated.notify_all();
+        self.changed();
         if first {
             // The forge needs a checkout to resolve the repository from.
             self.0.forge.notify();
@@ -1045,7 +1230,7 @@ impl Handle {
                     forge::interval(watched, tracked.failures)
                 };
             drop(shared);
-            self.0.updated.notify_all();
+            self.changed();
         }
 
         // Tickets are resolved only while someone reads the board, so the
@@ -1072,7 +1257,7 @@ impl Handle {
             shared.linear_unavailable = unavailable;
             drop(shared);
             if changed {
-                self.0.updated.notify_all();
+                self.changed();
             }
         }
 
@@ -1138,12 +1323,24 @@ impl Scanner {
         };
         let stale_after_days = stale_after_days();
         let mut shared = handle.shared();
+        let unchanged = shared.stale_after_days == stale_after_days
+            && shared.projects.len() == projects.len()
+            && projects.iter().all(|(repository, name)| {
+                shared
+                    .projects
+                    .get(repository)
+                    .is_some_and(|tracked| tracked.name == *name)
+            });
         shared.stale_after_days = stale_after_days;
         shared
             .projects
             .retain(|repository, _| projects.iter().any(|(open, _)| open == repository));
         for (repository, name) in &projects {
             shared.track(repository, name);
+        }
+        drop(shared);
+        if !unchanged {
+            handle.0.publisher.notify();
         }
     }
 
@@ -1354,6 +1551,48 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         signal.stop();
         assert_eq!(signal.observe(), None);
+    }
+
+    #[test]
+    fn watchers_are_sent_each_new_board_once_in_revision_order() {
+        let host = super::super::service::test_host();
+        let board = |generated_at_unix_ms, stale_after_days| Board {
+            generated_at_unix_ms,
+            stale_after_days,
+            projects: Vec::new(),
+            items: Vec::new(),
+            linear_unavailable: None,
+        };
+        // Everything a queue was sent; `pop` blocks while one is open.
+        let received = |delivery: &DeliveryQueue| {
+            delivery.close_after_drain();
+            std::iter::from_fn(|| delivery.pop())
+                .map(|outbound| match outbound.message {
+                    ServerMessage::WorkBoard { revision, board } => {
+                        (revision, board.stale_after_days)
+                    }
+                    message => panic!("unexpected {message:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = Arc::new(DeliveryQueue::new(1, 16));
+        let second = Arc::new(DeliveryQueue::new(2, 16));
+        let gone = Arc::new(DeliveryQueue::new(3, 16));
+        let mut publication = Publication::default();
+        publication.watchers.insert(1, Arc::downgrade(&first));
+        publication.watchers.insert(2, Arc::downgrade(&second));
+        publication.watchers.insert(3, Arc::downgrade(&gone));
+        drop(gone);
+
+        publication.offer(&host, &board(1, 7), None);
+        assert!(!publication.watchers.contains_key(&3));
+        // Only the clock moved: nothing to send.
+        publication.offer(&host, &board(2, 7), None);
+        // A subscriber's own board is its answer, not a push.
+        publication.offer(&host, &board(3, 14), Some(1));
+        assert_eq!(publication.revision, 2);
+        assert_eq!(received(&first), [(1, 7)]);
+        assert_eq!(received(&second), [(1, 7), (2, 14)]);
     }
 
     #[test]

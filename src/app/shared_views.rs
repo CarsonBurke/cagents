@@ -1766,7 +1766,10 @@ impl Cagents {
             }
             CardKind::Repository(view) => self.attach_repository_pane(pane.id, view.clone()),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(pane.id, view.clone()),
-            kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
+            kind @ (CardKind::Settings
+            | CardKind::Accounts
+            | CardKind::Automations
+            | CardKind::Work) => {
                 self.cards.insert(pane.id, CardRuntime::utility(kind));
                 if matches!(kind, CardKind::Automations) {
                     self.update_automation_ui(crate::automation_ui::Action::Refresh)

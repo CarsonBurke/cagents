@@ -411,8 +411,20 @@ Created commit, and a failure to release it is reported rather than hidden.
 ## Work board
 
 The Work board answers "what was I working on?" across every open project. The
-daemon keeps one card per worktree or branch in progress, and `cagents work`
-reads them:
+daemon keeps one card per worktree or branch in progress. The **Work board**
+button in the sidebar opens it as a pane, and `cagents work` reads it from the
+command line.
+
+The pane shows one column per state below, or every card in one list newest
+first. The scope menu narrows it to one project, and search matches branches,
+projects, worktree paths, pull request titles and numbers, and Linear tickets.
+The daemon pushes each changed board to open panes, so a commit, an edited file
+or a merged pull request moves its card without a refresh. Refresh rescans
+every project and polls GitHub at once. Clicking a card opens its worktree, or
+its pull request when it has no worktree. Its menu, also on right-click, opens
+either one or its Linear issue, copies the branch, and pins or unpins the card.
+A pin shows at once. A card's sessions are buttons that focus the session in
+whichever window shows it.
 
 ```sh
 cagents work ls                      # every open project, newest activity first
