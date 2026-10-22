@@ -270,6 +270,7 @@ libcosmic = { path = "vendor/libcosmic" }
 iced_core = { path = "vendor/iced-core" }
 iced_accessibility = { path = "vendor/iced-accessibility" }
 iced_runtime = { path = "vendor/iced-runtime" }
+iced_widget = { path = "vendor/iced-widget" }
 iced_winit = { path = "vendor/iced-winit" }
 
 # Backport upstream long-line shaping fix until cosmic-text accepts its release.
