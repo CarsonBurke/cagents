@@ -164,8 +164,6 @@ pub struct Caret {
     scalars: u32,
     /// The same, in UTF-16 code units.
     utf16: u32,
-    /// The same, in UTF-8 bytes.
-    bytes: u32,
 }
 
 impl Caret {
@@ -178,7 +176,6 @@ impl Caret {
             line,
             scalars: count(before.chars().count()),
             utf16: count(before.encode_utf16().count()),
-            bytes: count(before.len()),
         }
     }
 }
@@ -197,7 +194,6 @@ enum Syntax {
 #[derive(Debug, Clone, Copy)]
 enum Unit {
     Utf16,
-    Bytes,
     Scalars,
 }
 
@@ -210,9 +206,11 @@ fn position_syntax(id: &str) -> Option<(Syntax, Unit)> {
         // becomes a Monaco `startColumn`, which indexes the line's UTF-16
         // string. Cursor and VSCodium inherit VS Code's command line.
         "code" | "codium" | "cursor" => Some((Syntax::Goto, Unit::Utf16)),
-        // Zed's CLI parses `path:row:column` and moves to the `Point`
-        // (row - 1, column - 1), whose column is a byte offset.
-        "zed" => Some((Syntax::Suffix, Unit::Bytes)),
+        // Zed's CLI parses `path:row:column` and, since zed-industries/zed
+        // #51238 (March 2026), walks `column - 1` characters along the row
+        // through `point_from_external_input`. Releases before it read the
+        // column as a byte offset, which agrees only on ASCII lines.
+        "zed" => Some((Syntax::Suffix, Unit::Scalars)),
         // `subl --help`: "Filenames may be given a :line or :line:column
         // suffix". Sublime Text counts columns in Unicode characters.
         "sublime" => Some((Syntax::Suffix, Unit::Scalars)),
@@ -242,7 +240,6 @@ fn arguments(id: &str, path: &Path, caret: Option<Caret>) -> Vec<OsString> {
             }
             let column = match unit {
                 Unit::Utf16 => caret.utf16,
-                Unit::Bytes => caret.bytes,
                 Unit::Scalars => caret.scalars,
             };
             let target = format!(
@@ -303,8 +300,8 @@ mod tests {
 
     #[test]
     fn a_caret_is_measured_in_every_unit_an_editor_counts() {
-        // One scalar of each UTF-8 length: 1, 2, 3 and 4 bytes, the last
-        // outside the Basic Multilingual Plane and so two UTF-16 units.
+        // One scalar of each UTF-8 length, the last outside the Basic
+        // Multilingual Plane and so two UTF-16 units.
         let caret = Caret::new(119, "aé→😀");
         assert_eq!(
             caret,
@@ -312,7 +309,6 @@ mod tests {
                 line: 119,
                 scalars: 4,
                 utf16: 5,
-                bytes: 10,
             }
         );
         assert_eq!(
@@ -321,7 +317,6 @@ mod tests {
                 line: 0,
                 scalars: 0,
                 utf16: 0,
-                bytes: 0,
             }
         );
     }
@@ -349,10 +344,10 @@ mod tests {
     #[test]
     fn each_editor_gets_the_column_in_the_unit_it_counts() {
         let caret = Some(Caret::new(0, "aé→😀"));
-        // VS Code columns index the line's UTF-16 string, Zed's are byte
-        // offsets, and Sublime Text's are Unicode characters; all are 1-based.
+        // VS Code columns index the line's UTF-16 string, while Zed and
+        // Sublime Text count Unicode characters; all are 1-based.
         assert_eq!(argv("code", PATH, caret)[2], "/work/src/main.rs:1:6");
-        assert_eq!(argv("zed", PATH, caret)[1], "/work/src/main.rs:1:11");
+        assert_eq!(argv("zed", PATH, caret)[1], "/work/src/main.rs:1:5");
         assert_eq!(argv("sublime", PATH, caret)[1], "/work/src/main.rs:1:5");
     }
 
