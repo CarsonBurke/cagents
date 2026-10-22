@@ -23,4 +23,4 @@ pub use icon_button::{
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
 pub use responsive::responsive;
-pub use tabs::{ViewTab, view_tab, view_tab_height, view_tabs};
+pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};

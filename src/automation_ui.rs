@@ -21,8 +21,12 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const PAGE: usize = 50;
-/// Narrower than this, the header stacks its view switcher under the title.
-const SINGLE_ROW_HEADER_WIDTH: f32 = 560.0;
+/// Narrower than this, the header's primary command is drawn as an icon so
+/// the header keeps one row.
+const COMPACT_HEADER_WIDTH: f32 = 440.0;
+/// What a breadcrumb leaves for its separators and current page when it
+/// shortens a long parent name.
+const TRAIL_RESERVE: f32 = 120.0;
 /// From this width the automation list sits beside the selection.
 const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
 const LIST_WIDTH: f32 = 240.0;
@@ -842,6 +846,15 @@ impl State {
                     }
                     self.last_firings
                         .retain(|id, _| self.rows.iter().any(|row| row.id == *id));
+                    // Refreshing with an automation open also reads it and its
+                    // newest runs; its poll keeps a stable page instead.
+                    if matches!(pending, Pending::List { append: false })
+                        && self.run.is_none()
+                        && let Some(id) = self.selected.as_ref().map(|selected| selected.id)
+                    {
+                        self.history_status = HistoryStatus::Unrequested;
+                        return self.request(Pending::Show, Request::Show { id });
+                    }
                 }
                 Ok(Response::Automation(automation)) => {
                     let id = automation.id;
@@ -1393,8 +1406,19 @@ impl State {
         }
     }
 
-    /// The view switcher's tabs. The view on screen is selected and publishes
-    /// nothing; while a command is in flight neither tab does.
+    /// What returns the view on screen to its root, while something is open
+    /// beneath it: a run, or a selected automation.
+    fn section_root(&self) -> Option<Action> {
+        match self.section() {
+            Section::RunHistory => self.run.is_some().then_some(Action::CloseRun),
+            Section::Automations => (self.run.is_some() || self.selected.is_some())
+                .then_some(Action::Browse),
+        }
+    }
+
+    /// The view switcher's tabs. The view on screen is selected, and choosing
+    /// it again returns from whatever is open beneath it; while a command is
+    /// in flight no tab publishes.
     fn view_tabs(&self, busy: bool) -> Vec<crate::ui_controls::ViewTab<'static, Action>> {
         let current = self.section();
         Section::ALL
@@ -1405,83 +1429,108 @@ impl State {
                 count: None,
                 selected: section == current,
                 id: None,
-                on_press: (!busy && section != current).then(|| section.enter()),
+                on_press: if busy {
+                    None
+                } else if section == current {
+                    self.section_root()
+                } else {
+                    Some(section.enter())
+                },
             })
             .collect()
     }
 
-    /// The levels above the open run, each a way back to it: the view it was
-    /// opened from, then its automation. A level that is still loaded behind
-    /// the run is returned to as it was rather than read again.
-    fn run_trail<'a>(&self, run: &'a RunDetail) -> [(&'a str, Action); 2] {
+    /// The levels above the open run: the view it was opened from, then its
+    /// automation. A level still loaded behind the run is returned to as it
+    /// was rather than read again.
+    ///
+    /// The name leads only to an automation that can be shown. Inside Run
+    /// history it stays plain: the run may outlive its automation, and
+    /// leaving for the other view would discard the loaded page. Opened from
+    /// an alert, only a listed automation is linked.
+    fn run_trail<'a>(&self, run: &'a RunDetail) -> [(&'a str, Option<Action>); 2] {
         let section = self.section();
         let automation = run.firing.automation;
-        [
-            (
-                section.label(),
-                match section {
-                    Section::RunHistory => Action::CloseRun,
-                    Section::Automations => Action::Browse,
-                },
-            ),
-            (
-                run.definition.name.as_str(),
+        let name = match section {
+            Section::RunHistory => None,
+            Section::Automations
                 if self
                     .selected
                     .as_ref()
-                    .is_some_and(|selected| selected.id == automation)
-                {
-                    Action::CloseRun
-                } else {
-                    Action::Select(automation)
-                },
+                    .is_some_and(|selected| selected.id == automation) =>
+            {
+                Some(Action::CloseRun)
+            }
+            Section::Automations => self
+                .rows
+                .iter()
+                .any(|row| row.id == automation)
+                .then_some(Action::Select(automation)),
+        };
+        [
+            (
+                section.label(),
+                Some(match section {
+                    Section::RunHistory => Action::CloseRun,
+                    Section::Automations => Action::Browse,
+                }),
             ),
+            (run.definition.name.as_str(), name),
         ]
     }
 
-    /// The pane's name and its view-level commands, above every layout so
-    /// they keep one place at every width. A draft or a confirmation keeps
-    /// only the name and progress: each carries its own way out and its own
-    /// primary action.
+    /// The pane's one header row, above every layout so its controls keep
+    /// their place at every width.
+    ///
+    /// The view switcher leads it: the tab strip already names the pane, and
+    /// a title beside an "Automations" tab would say it twice. A draft or a
+    /// confirmation takes the switcher's place with its own trail, since each
+    /// carries its own way out and its own primary action.
     fn header(&self, busy: bool, width: f32) -> Element<'_, Action> {
-        let browsing = self.draft.is_none() && self.confirmation.is_none();
-        let mut identity = widget::row::with_capacity(4)
+        let inner = width - 2.0 * space::L;
+        let mut row = widget::row::with_capacity(4)
             .spacing(space::S)
             .align_y(Alignment::Center)
-            .height(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE))
-            .push(
-                crate::design::title("Automations")
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None),
-            );
-        let tabs = browsing.then(|| crate::ui_controls::view_tabs(self.view_tabs(busy), false));
-        // Side by side, the tab row's fill is the gap that pushes the
-        // commands to the trailing edge; stacked, a spacer does that.
-        let stacked = width < SINGLE_ROW_HEADER_WIDTH;
-        let tabs = match tabs {
-            Some(tabs) if !stacked => {
-                identity = identity.push(tabs);
-                None
-            }
-            tabs => {
-                identity = identity.push(widget::Space::new().width(Length::Fill));
-                tabs
-            }
+            .height(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE));
+        let browsing = if let Some(draft) = &self.draft {
+            let current = if draft.base.is_some() {
+                "Edit automation"
+            } else {
+                "New automation"
+            };
+            row = row.push(breadcrumb(
+                [("Automations", Some(Action::CancelEdit))],
+                current,
+                inner,
+                busy,
+            ));
+            false
+        } else if let Some(confirmation) = &self.confirmation {
+            row = row.push(breadcrumb(
+                [("Automations", Some(Action::CancelConfirmation))],
+                confirmation.automation.definition.name.as_str(),
+                inner,
+                busy,
+            ));
+            false
+        } else {
+            row = row.push(crate::ui_controls::nested_view_tabs(
+                self.view_tabs(busy),
+                false,
+            ));
+            true
         };
-        if busy {
-            identity = identity.push(crate::interaction::tooltip(
+        if let Some((_, pending)) = self.pending.filter(|_| busy) {
+            row = row.push(crate::interaction::tooltip(
                 widget::container(crate::ui_controls::activity_spinner(
                     14.0,
                     crate::design::muted_color,
                 ))
                 .center(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE)),
-                if self.history_status == HistoryStatus::Loading {
-                    "Loading run history…"
-                } else {
-                    "Updating automations…"
-                },
+                progress_label(pending),
             ));
         } else if browsing {
-            identity = identity.push(
+            row = row.push(
                 crate::ui_controls::icon_button(
                     crate::ui_controls::Icon::Refresh,
                     if self.run.is_some() {
@@ -1496,18 +1545,21 @@ impl State {
             );
         }
         if browsing {
-            identity = identity.push(
+            let new = (!busy).then_some(Action::New);
+            // A narrow pane keeps one row by naming the command in its
+            // tooltip instead of its label.
+            let button: Element<'_, Action> = if width < COMPACT_HEADER_WIDTH {
+                crate::ui_controls::icon_button(crate::ui_controls::Icon::Plus, "New automation")
+                    .on_press_maybe(new)
+                    .into()
+            } else {
                 crate::ui_controls::button::primary("New automation")
-                    .on_press_maybe((!busy).then_some(Action::New)),
-            );
+                    .on_press_maybe(new)
+                    .into()
+            };
+            row = row.push(button);
         }
-        let mut header = widget::column::with_capacity(2)
-            .spacing(space::S)
-            .push(identity);
-        if let Some(tabs) = tabs {
-            header = header.push(tabs);
-        }
-        widget::container(header)
+        widget::container(row)
             .padding([space::S, space::L])
             .width(Length::Fill)
             .into()
@@ -1524,10 +1576,24 @@ impl State {
         let mut scrolls = true;
         let mut content = widget::column::with_capacity(8)
             .spacing(space::M)
-            .padding(space::L)
             .width(Length::Fill);
+        // A failed read that left nothing to show is stated in place, beside
+        // its retry, rather than above it as well.
+        let browsing = self.draft.is_none() && self.confirmation.is_none() && self.run.is_none();
+        let list_failed = browsing
+            && !self.all_history
+            && self.selected.is_none()
+            && self.rows.is_empty()
+            && !busy
+            && self.error.is_some();
+        let history_failed = browsing
+            && (self.all_history || self.selected.is_some())
+            && self.history_status == HistoryStatus::Failed
+            && self.history.is_empty();
         if let Some(error) = &self.error
             && self.draft.is_none()
+            && !list_failed
+            && !history_failed
         {
             content = content.push(
                 crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
@@ -1641,22 +1707,37 @@ impl State {
                         listing.push(button("Load more automations", Action::More, !busy));
                     }
                     // A read in flight is announced by the header's progress,
-                    // so neither statement anticipates the list or selection
-                    // it is about to replace.
-                    let empty = match self.pending {
-                        _ if self.selected.is_some() => None,
-                        Some((_, Pending::List { append: false } | Pending::Show)) => None,
-                        _ if self.rows.is_empty() => Some(
+                    // so no statement anticipates the list or selection it is
+                    // about to replace. Rows already on screen keep theirs.
+                    let empty = if self.selected.is_some()
+                        || matches!(self.pending, Some((_, Pending::Show)))
+                    {
+                        None
+                    } else if !self.rows.is_empty() {
+                        Some(
+                            crate::ui_controls::placeholder("Select an automation")
+                                .detail("Its schedule, launch settings and runs appear here."),
+                        )
+                    } else if busy {
+                        None
+                    } else if let Some(error) = self.error.as_deref().filter(|_| list_failed) {
+                        Some(
+                            crate::ui_controls::placeholder("Couldn't load automations")
+                                .icon(crate::ui_controls::Icon::Warning.handle())
+                                .detail(error)
+                                .action(
+                                    crate::ui_controls::button::secondary("Retry")
+                                        .on_press(Action::Refresh),
+                                ),
+                        )
+                    } else {
+                        Some(
                             crate::ui_controls::placeholder("No automations yet")
                                 .icon(crate::ui_controls::Icon::Alarm.handle())
                                 .detail(
                                     "Run an agent on a schedule in an open project. Automations keep running while this window is closed.",
                                 ),
-                        ),
-                        _ => Some(
-                            crate::ui_controls::placeholder("Select an automation")
-                                .detail("Its schedule, launch settings and runs appear here."),
-                        ),
+                        )
                     };
                     if let Some(empty) = empty {
                         scrolls = false;
@@ -1725,28 +1806,52 @@ impl State {
                     }
                 }
                 if self.selected.is_some() || self.all_history {
-                    content = content.push(button("Refresh history", Action::History, !busy));
                     if self.history_newer {
                         content = content.push(crate::design::body(
-                            "Newer runs are available. Refresh history to show the latest page.",
+                            "Newer runs are available. Refresh to show the latest page.",
                         ));
                     }
-                    let history_notice = match self.history_status {
-                        HistoryStatus::Unrequested => Some("History has not been loaded."),
+                    let empty = match self.history_status {
                         HistoryStatus::Loading if self.history.is_empty() => {
-                            Some("Loading run history…")
+                            Some(crate::ui_controls::placeholder("Loading run history…"))
                         }
-                        HistoryStatus::Loading => None,
+                        HistoryStatus::Failed if history_failed => Some(
+                            crate::ui_controls::placeholder("Couldn't load run history")
+                                .icon(crate::ui_controls::Icon::Warning.handle())
+                                .detail(self.error.as_deref().unwrap_or_default())
+                                .action(
+                                    crate::ui_controls::button::secondary("Retry")
+                                        .on_press_maybe((!busy).then_some(Action::History)),
+                                ),
+                        ),
                         HistoryStatus::Failed => {
-                            Some("Could not refresh history. Try Refresh history.")
+                            content = content.push(crate::design::caption(
+                                "Couldn't refresh run history. These runs may be out of date.",
+                            ));
+                            None
                         }
-                        HistoryStatus::Loaded if self.history.is_empty() => {
-                            Some("No runs in this history page.")
-                        }
-                        HistoryStatus::Loaded => None,
+                        HistoryStatus::Loaded if self.history.is_empty() => Some(
+                            crate::ui_controls::placeholder("No runs yet")
+                                .icon(crate::ui_controls::Icon::History.handle())
+                                .detail(if self.all_history {
+                                    "Runs of every automation appear here, newest first."
+                                } else {
+                                    "Runs appear here when the schedule fires or you choose Run now."
+                                }),
+                        ),
+                        HistoryStatus::Unrequested
+                        | HistoryStatus::Loading
+                        | HistoryStatus::Loaded => None,
                     };
-                    if let Some(notice) = history_notice {
-                        content = content.push(crate::design::body(notice));
+                    if let Some(empty) = empty {
+                        // History alone centers its state; under a selected
+                        // automation it follows the details.
+                        if self.all_history {
+                            scrolls = false;
+                            content = content.push(empty);
+                        } else {
+                            content = content.push(empty.height(Length::Shrink));
+                        }
                     }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
@@ -1779,9 +1884,10 @@ impl State {
             }
             if let Some(run) = &self.run {
                 content = content.push(breadcrumb(
-                    self.run_trail(run)
-                        .map(|(label, action)| (label, (!busy).then_some(action))),
+                    self.run_trail(run),
                     "Run",
+                    width - 2.0 * space::L - crate::design::SCROLLBAR_GUTTER,
+                    busy,
                 ));
                 content = content
                     .push(crate::design::title(format!(
@@ -1821,7 +1927,6 @@ impl State {
                 }
                 content = content.push(
                     widget::row::with_children(vec![
-                        button("Refresh run", Action::Run(run.firing.id), !busy),
                         button(
                             "Cancel run",
                             Action::CancelRun,
@@ -1842,13 +1947,19 @@ impl State {
                 );
             }
         }
+        let vertical = || {
+            cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar())
+        };
         let content: Element<'_, Action> = if scrolls {
-            widget::scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into()
+            widget::scrollable(content.padding(crate::design::with_vertical_rail(
+                cosmic::iced::Padding::from(space::L),
+            )))
+            .direction(vertical())
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
         } else {
-            content.height(Length::Fill).into()
+            content.padding(space::L).height(Length::Fill).into()
         };
         let body = if listing.is_empty() {
             content
@@ -1870,8 +1981,11 @@ impl State {
                 widget::scrollable(
                     widget::column::with_children(listing)
                         .spacing(space::XS)
-                        .padding([0.0, space::S, space::S, space::S]),
+                        .padding(crate::design::with_vertical_rail(
+                            cosmic::iced::Padding::from([0.0, space::S, space::S, space::S]),
+                        )),
                 )
+                .direction(vertical())
                 .height(if side_by_side {
                     Length::Fill
                 } else {
@@ -2332,42 +2446,121 @@ fn launch_description<'a>(
     }
     column.into()
 }
-/// The levels above the current page, each a way back to it, ending at the
-/// page itself.
+/// What the header's progress says a command in flight is doing.
+fn progress_label(pending: Pending) -> &'static str {
+    match pending {
+        Pending::List { .. } => "Loading automations…",
+        Pending::Show => "Loading automation…",
+        Pending::Save => "Saving automation…",
+        Pending::Mutate => "Updating automation…",
+        Pending::History { .. } => "Loading run history…",
+        Pending::Run => "Loading run…",
+        Pending::OpenRun => "Opening agent…",
+        // Background reads draw no progress.
+        _ => "Refreshing…",
+    }
+}
+
+/// The levels above the current page on one line, then the page itself.
+///
+/// A level with a press message is a way back to it, drawn unavailable while
+/// `busy`; one without cannot be returned to and is plain text. Long names
+/// end in an ellipsis within `width` and keep their full text in a tooltip.
 fn breadcrumb<'a>(
     parents: impl IntoIterator<Item = (&'a str, Option<Action>)>,
     current: &'a str,
+    width: f32,
+    busy: bool,
 ) -> Element<'a, Action> {
+    let longest = (width - TRAIL_RESERVE).max(TRAIL_RESERVE);
+    let label = |text: &'a str| {
+        crate::design::body(text)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+    };
     let mut trail = widget::row::with_capacity(5)
         .spacing(space::XXS)
         .align_y(Alignment::Center);
-    for (label, action) in parents {
-        let enabled = action.is_some();
-        let crumb = widget::button::custom(
-            crate::design::body(label)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .class(cosmic::theme::Text::Custom(crate::design::muted_text)),
-        )
-        .name(label)
-        .class(crate::ui_controls::control_style(false, None))
-        .padding([space::XXS, space::XS])
-        .on_press_maybe(action);
+    for (text, action) in parents {
+        let crumb: Element<'a, Action> = match action {
+            Some(action) => {
+                let name = format!("Back to {text}");
+                crate::interaction::tooltip(
+                    crate::interaction::hover(
+                        widget::button::custom(label(text))
+                            .name(name.clone())
+                            .class(crumb_style())
+                            .padding([space::XXS, space::XS])
+                            .on_press_maybe((!busy).then_some(action)),
+                    ),
+                    name,
+                )
+            }
+            None => crate::interaction::tooltip(
+                widget::container(
+                    label(text).class(cosmic::theme::Text::Custom(crate::design::muted_text)),
+                )
+                .padding([space::XXS, space::XS]),
+                text,
+            ),
+        };
         trail = trail
-            .push(if enabled {
-                crate::interaction::hover(crumb)
-            } else {
-                crumb.into()
-            })
+            .push(widget::container(crumb).max_width(longest))
             .push(crate::ui_controls::passive_icon(
                 crate::ui_controls::Icon::ChevronRight.handle(),
                 crate::design::COMPACT_ICON_SIZE,
             ));
     }
     trail
-        .push(crate::design::body(current).wrapping(cosmic::iced::widget::text::Wrapping::None))
-        .wrap()
+        .push(widget::container(label(current)).max_width(longest))
         .into()
 }
+
+/// A trail level that leads back: quiet until hovered, as a peer view tab
+/// is, and visibly unavailable while a command is in flight.
+fn crumb_style() -> cosmic::theme::Button {
+    use cosmic::iced::Background;
+    let appearance = |focused: bool, theme: &cosmic::Theme| {
+        let component = &theme.current_container().component;
+        widget::button::Style {
+            background: focused
+                .then(|| Background::Color(component.selected_state_color().into())),
+            text_color: Some(crate::design::muted_color(theme)),
+            ..crate::design::button_style()
+        }
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(move |theme| {
+            let container = theme.current_container();
+            widget::button::Style {
+                text_color: Some(crate::design::mix(
+                    container.base.into(),
+                    container.on.into(),
+                    0.42,
+                )),
+                ..appearance(false, theme)
+            }
+        }),
+        hovered: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
+            text_color: Some(theme.current_container().component.on.into()),
+            ..appearance(focused, theme)
+        }),
+        pressed: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
+            text_color: Some(theme.current_container().component.on.into()),
+            ..appearance(focused, theme)
+        }),
+    }
+}
+
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
     let mut button = crate::ui_controls::button::secondary(label);
     if enabled {
@@ -3003,7 +3196,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_list_reads_title_then_search_then_rows_at_every_width() {
+    fn automation_list_reads_views_then_search_then_rows_at_every_width() {
         let state = State {
             rows: vec![automation().summary(None)],
             ..Default::default()
@@ -3011,12 +3204,12 @@ mod tests {
         // Either side of the split between stacked and side-by-side lists.
         for width in [480.0, 900.0] {
             let outline = Outline::of(&state, width, 700.0);
-            let title = outline.text("Automations");
+            let tab = outline.text("Automations");
             let search = outline.field.expect("the list offers its search field");
             let row = outline.text("Daily review");
             assert!(
-                title.y + title.height <= search.y,
-                "at {width} px the pane's title precedes the search field: {title:?} {search:?}"
+                tab.y + tab.height <= search.y,
+                "at {width} px the view switcher precedes the search field: {tab:?} {search:?}"
             );
             assert!(
                 search.y + search.height <= row.y,
@@ -3050,7 +3243,11 @@ mod tests {
             let tabs = state.view_tabs(busy);
             let chosen = tabs.iter().filter(|tab| tab.selected).collect::<Vec<_>>();
             assert_eq!(chosen.len(), 1, "exactly one view is current");
-            assert!(chosen[0].on_press.is_none(), "the current view publishes nothing");
+            assert_eq!(
+                chosen[0].on_press.is_some(),
+                !busy && state.section_root().is_some(),
+                "the current view publishes only a return from what is open beneath it"
+            );
             for tab in tabs.iter().filter(|tab| !tab.selected) {
                 assert_eq!(tab.on_press.is_some(), !busy, "{} is a way out", tab.label);
             }
@@ -3087,9 +3284,16 @@ mod tests {
         assert_eq!(selected(&state, false), Section::RunHistory);
         let [(root, back), (name, automation_link)] = state.run_trail(&detail);
         assert_eq!((root, name), ("Run history", "Daily review"));
-        assert!(matches!(automation_link, Action::Select(id) if id == firing.automation));
-        assert!(matches!(back, Action::CloseRun));
-        assert!(state.update(back).is_none(), "closing a run reads nothing");
+        assert!(automation_link.is_none(), "the trail stays inside Run history");
+        assert!(matches!(back, Some(Action::CloseRun)));
+        assert!(
+            matches!(
+                state.view_tabs(false)[1].on_press,
+                Some(Action::CloseRun)
+            ),
+            "the current tab also returns to the page"
+        );
+        assert!(state.update(Action::CloseRun).is_none(), "closing a run reads nothing");
         assert!(state.run.is_none());
         assert_eq!(selected(&state, false), Section::RunHistory);
         assert_eq!(state.history.len(), 1, "the history page is kept");
@@ -3104,15 +3308,183 @@ mod tests {
         assert_eq!(selected(&state, false), Section::Automations);
         let [(root, list), (_, back)] = state.run_trail(&detail);
         assert_eq!(root, "Automations");
-        assert!(matches!(list, Action::Browse));
-        assert!(matches!(back, Action::CloseRun));
-        state.update(back);
+        assert!(matches!(list, Some(Action::Browse)));
+        assert!(matches!(back, Some(Action::CloseRun)));
+        state.update(Action::CloseRun);
         assert!(state.run.is_none() && state.selected.is_some());
         assert!(matches!(
             state.update(Section::RunHistory.enter()),
             Some(Effect::Request { .. })
         ));
         assert!(state.selected.is_none() && state.all_history);
+    }
+
+    #[test]
+    fn refreshing_with_an_automation_open_reads_the_list_it_and_its_newest_runs() {
+        use crate::automations::FiringState;
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner.clone()),
+            history: vec![history_firing(100, FiringState::Succeeded)],
+            history_status: HistoryStatus::Loaded,
+            history_newer: true,
+            ..Default::default()
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::List { .. },
+        }) = state.update(Action::Refresh)
+        else {
+            panic!("the list is read first");
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![owner.summary(None)]))),
+        })
+        else {
+            panic!("then the open automation");
+        };
+        assert_eq!(id, owner.id);
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+            }),
+            Some(Effect::Request {
+                request: Request::History { before: None, .. },
+                ..
+            })
+        ));
+        assert!(
+            matches!(state.pending, Some((_, Pending::History { append: false }))),
+            "the newest page replaces the kept one"
+        );
+    }
+
+    /// The buttons the pane announces, by accessible name, and whether each
+    /// can be pressed.
+    fn buttons(state: &State, width: f32) -> Vec<(String, bool)> {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.view();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 700.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+            .map(|node| {
+                (
+                    node.node().label().unwrap_or_default().to_owned(),
+                    !node.node().is_disabled(),
+                )
+            })
+            .collect()
+    }
+
+    fn run_of(owner: &Automation) -> RunDetail {
+        let mut firing = history_firing(100, crate::automations::FiringState::Succeeded);
+        firing.automation = owner.id;
+        RunDetail {
+            definition: owner.definition.clone(),
+            firing,
+            agent: None,
+            run: None,
+        }
+    }
+
+    #[test]
+    fn a_run_trail_never_leaves_run_history_or_links_an_automation_it_cannot_show() {
+        let owner = automation();
+        let detail = run_of(&owner);
+        let links_name = |state: &State| {
+            buttons(state, 900.0)
+                .into_iter()
+                .any(|(name, enabled)| enabled && name.contains("Daily review"))
+        };
+        // Opened from Run history: the automation may have been removed, and
+        // the loaded page must survive, so the name is not a way out.
+        let mut state = State {
+            all_history: true,
+            history: vec![detail.firing.clone()],
+            history_status: HistoryStatus::Loaded,
+            run: Some(detail.clone()),
+            ..Default::default()
+        };
+        assert!(!links_name(&state), "{:?}", buttons(&state, 900.0));
+        assert!(
+            buttons(&state, 900.0).contains(&("Back to Run history".to_owned(), true)),
+            "the trail leads back to the loaded page: {:?}",
+            buttons(&state, 900.0)
+        );
+        // Opened from an alert with no list behind it: unknown, so unlinked.
+        state.all_history = false;
+        state.history.clear();
+        assert!(!links_name(&state), "{:?}", buttons(&state, 900.0));
+        // A listed automation can be shown.
+        state.rows = vec![owner.summary(None)];
+        assert!(links_name(&state), "{:?}", buttons(&state, 900.0));
+    }
+
+    #[test]
+    fn the_current_tab_returns_to_its_view_from_anything_open_beneath_it() {
+        let owner = automation();
+        let tab = |state: &State| {
+            buttons(state, 900.0)
+                .into_iter()
+                .find(|(name, _)| name == "Automations and their schedules")
+                .expect("the Automations tab is announced")
+                .1
+        };
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            ..Default::default()
+        };
+        assert!(!tab(&state), "the list on screen is not chosen again");
+        state.selected = Some(owner.clone());
+        assert!(tab(&state), "a selection is left through its tab");
+        state.run = Some(run_of(&owner));
+        assert!(tab(&state), "a run is left through its tab");
+    }
+
+    #[test]
+    fn an_empty_list_is_not_claimed_while_reading_or_after_a_failed_read() {
+        let says_empty = |state: &State| {
+            Outline::of(state, 900.0, 700.0)
+                .texts
+                .iter()
+                .any(|(text, _)| text == "No automations yet")
+        };
+        assert!(says_empty(&State::default()));
+        // An alert opening its run before any list has been read.
+        let mut state = State {
+            pending: Some((1, Pending::Run)),
+            ..Default::default()
+        };
+        assert!(!says_empty(&state), "a read in flight is not an empty list");
+        state.pending = None;
+        state.error = Some("Daemon unavailable".into());
+        assert!(!says_empty(&state), "a failed read is not an empty list");
+        assert!(
+            buttons(&state, 900.0)
+                .into_iter()
+                .any(|(name, enabled)| enabled && name == "Retry"),
+            "a failed read offers a retry"
+        );
     }
 
     #[test]
