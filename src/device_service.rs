@@ -774,7 +774,7 @@ mod tests {
         for path in [
             PathBuf::from(".worktrees/review/docs/tree-fixture-dark-{collapsed,expanded}.png"),
             PathBuf::from(".worktrees/review/docs/tree-real-*.png"),
-            PathBuf::from("../outside.png"),
+            PathBuf::from(".worktrees/review/docs/missing.png"),
         ] {
             assert!(
                 execute(Operation::ReadImage {
