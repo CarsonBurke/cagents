@@ -148,6 +148,12 @@ where
     }
 }
 
+/// What a due AT-SPI retry attempts.
+enum AtspiRetry {
+    WatchLauncher,
+    ConnectBus,
+}
+
 enum ContextEvent {
     Message(Option<Message>),
     SessionClosed,
@@ -165,6 +171,8 @@ struct Context<'a, 'e, C> {
     session_reconnect: Reconnect,
     atspi_bus: Option<Bus>,
     /// Paces retries of both the AT-SPI bus and the launcher that reports it.
+    /// Its deadline outlasts the screen reader being disabled and the session
+    /// bus being lost, and is only waited for while there is something to retry.
     atspi_reconnect: Reconnect,
     adapters: Vec<AdapterEntry>,
 }
@@ -177,6 +185,7 @@ where
     /// Waits for a message, for a bus to change state or for a reconnection
     /// attempt to be due.
     async fn next_event(&mut self) -> ContextEvent {
+        let atspi_retry = self.atspi_retry().is_some();
         let messages = &mut self.messages;
         let message = async { ContextEvent::Message(receive(messages).await) };
         let Some(Session {
@@ -218,7 +227,11 @@ where
             ContextEvent::AtspiBusClosed
         };
         let reconnect_due = async {
-            atspi_reconnect.due().await;
+            if atspi_retry {
+                atspi_reconnect.due().await
+            } else {
+                future::pending().await
+            }
             ContextEvent::ReconnectDue
         };
         let screen_reader_changed = async {
@@ -257,8 +270,6 @@ where
         self.session = None;
         self.session_reconnect.disconnected();
         self.disconnect_atspi_bus().await;
-        // The AT-SPI bus is found through the session bus.
-        self.atspi_reconnect.cancel();
         self.session_reconnect
             .schedule("The D-Bus session bus", &"connection closed");
     }
@@ -306,10 +317,10 @@ where
         session.screen_reader_enabled = enabled;
         if !enabled {
             self.disconnect_atspi_bus().await;
-            self.atspi_reconnect.cancel();
         } else if self.atspi_bus.is_none() && !self.atspi_reconnect.is_scheduled() {
-            // A pending retry stays pending, so a launcher that keeps
-            // restarting cannot bypass the backoff.
+            // A pending retry stays pending, so neither a launcher that keeps
+            // restarting nor a screen reader toggled off and on can bypass the
+            // backoff.
             self.connect_atspi_bus().await;
         }
     }
@@ -372,16 +383,28 @@ where
         }
     }
 
+    /// What an AT-SPI retry would attempt now, if anything.
+    fn atspi_retry(&self) -> Option<AtspiRetry> {
+        let session = self.session.as_ref()?;
+        if session.launcher_owner.is_some() && session.screen_reader_changes.is_none() {
+            Some(AtspiRetry::WatchLauncher)
+        } else if session.screen_reader_enabled && self.atspi_bus.is_none() {
+            Some(AtspiRetry::ConnectBus)
+        } else {
+            None
+        }
+    }
+
     async fn reconnect(&mut self) {
-        let Some(session) = &self.session else {
+        if self.session.is_none() {
             self.session_reconnect.cancel();
             return self.connect_session().await;
-        };
+        }
         self.atspi_reconnect.cancel();
-        if session.launcher_owner.is_some() && session.screen_reader_changes.is_none() {
-            self.watch_launcher().await
-        } else if session.screen_reader_enabled && self.atspi_bus.is_none() {
-            self.connect_atspi_bus().await
+        match self.atspi_retry() {
+            Some(AtspiRetry::WatchLauncher) => self.watch_launcher().await,
+            Some(AtspiRetry::ConnectBus) => self.connect_atspi_bus().await,
+            None => (),
         }
     }
 }
@@ -691,8 +714,7 @@ mod tests {
         }
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
 
-        // Cancelling a retry, as a departed launcher or a disabled screen
-        // reader does, continues the outage.
+        // Cancelling a retry once it is due continues the outage.
         reconnect.cancel();
         assert!(!reconnect.is_scheduled());
         assert_eq!(reconnect.delay, Reconnect::MAX_DELAY);
@@ -873,6 +895,45 @@ mod tests {
                 &mut launcher,
                 serve_launcher(&dir, usize::MAX, observed_tx.clone()),
             );
+            assert_eq!(
+                observed.recv_timeout(PATIENCE),
+                Ok(Observed::AddressRequested)
+            );
+            let retried_after = failed_at.elapsed();
+            assert!(
+                retried_after >= backoff * 4 / 5,
+                "retried after {retried_after:?}, within the {backoff:?} backoff"
+            );
+            failed_at = Instant::now();
+        }
+
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
+    fn screen_reader_toggles_do_not_bypass_the_backoff() {
+        if !in_isolated_process(
+            "screen_reader_toggles_do_not_bypass_the_backoff",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let (observed_tx, observed) = mpsc::channel();
+        // No AT-SPI bus runs at the address that the launcher reports.
+        let _launcher = serve_launcher(&dir, usize::MAX, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+        for expected in [Observed::SessionConnect, Observed::AddressRequested] {
+            assert_eq!(observed.recv_timeout(PATIENCE), Ok(expected));
+        }
+
+        let mut failed_at = Instant::now();
+        for backoff in [Reconnect::FIRST_DELAY, 2 * Reconnect::FIRST_DELAY] {
+            // Re-enabling the screen reader retries the bus only when the
+            // retry is due.
+            set_screen_reader_enabled(false);
+            thread::sleep(backoff / 4);
+            set_screen_reader_enabled(true);
             assert_eq!(
                 observed.recv_timeout(PATIENCE),
                 Ok(Observed::AddressRequested)
@@ -1108,23 +1169,7 @@ mod tests {
     /// adapter in ascending order and sorted within each.
     fn accessible_names(address: &str, app: &str) -> Vec<Vec<String>> {
         const ACCESSIBLE: &str = "/org/a11y/atspi/accessible";
-        let executor = Executor::new();
-        block_on(executor.run(async {
-            let connection = Builder::address(address)
-                .unwrap()
-                .internal_executor(false)
-                .build()
-                .await
-                .unwrap();
-            let connection_copy = connection.clone();
-            let _task = executor.spawn(
-                async move {
-                    loop {
-                        connection_copy.executor().tick().await;
-                    }
-                },
-                "test_client_task",
-            );
+        with_client(address, |connection| async move {
             let children = |path: String| {
                 let connection = &connection;
                 async move {
@@ -1177,7 +1222,55 @@ mod tests {
                 names.push(adapter_names);
             }
             names
+        })
+    }
+
+    /// Runs `client` with a new connection to the bus at `address`, from this thread.
+    fn with_client<T, F: Future<Output = T>>(
+        address: &str,
+        client: impl FnOnce(Connection) -> F,
+    ) -> T {
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let connection = Builder::address(address)
+                .unwrap()
+                .internal_executor(false)
+                .build()
+                .await
+                .unwrap();
+            let connection_copy = connection.clone();
+            let _task = executor.spawn(
+                async move {
+                    loop {
+                        connection_copy.executor().tick().await;
+                    }
+                },
+                "test_client_task",
+            );
+            client(connection).await
         }))
+    }
+
+    /// Sets the screen-reader status that the launcher publishes, as a
+    /// desktop's accessibility setting does.
+    fn set_screen_reader_enabled(enabled: bool) {
+        let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+        with_client(&session_bus, |connection| async move {
+            connection
+                .call_method(
+                    Some(LAUNCHER),
+                    "/org/a11y/bus",
+                    Some("org.freedesktop.DBus.Properties"),
+                    "Set",
+                    &(
+                        "org.a11y.Status",
+                        "ScreenReaderEnabled",
+                        zbus::zvariant::Value::from(enabled),
+                    ),
+                )
+                .await
+                .unwrap();
+        })
     }
 
     enum SessionBus {
@@ -1235,46 +1328,93 @@ mod tests {
         false
     }
 
+    /// The few C library calls that the harness needs; declared here because
+    /// the crate does not depend on `libc`.
+    mod sys {
+        use std::ffi::{c_int, c_ulong};
+
+        pub const PR_SET_PDEATHSIG: c_int = 1;
+        pub const SIGKILL: c_ulong = 9;
+        pub const LOCK_EX: c_int = 2;
+        pub const LOCK_NB: c_int = 4;
+
+        extern "C" {
+            pub fn prctl(option: c_int, ...) -> c_int;
+            pub fn getppid() -> c_int;
+            pub fn _exit(status: c_int) -> !;
+            pub fn flock(fd: c_int, operation: c_int) -> c_int;
+        }
+    }
+
     /// Makes `command`'s process receive `SIGKILL` when the thread that
     /// spawned it ends, so that a test process that is killed leaves no bus
     /// or isolated test process behind. Each is spawned and reaped by the same
-    /// test thread. `prctl` is declared here because the crate does not depend
-    /// on `libc`.
+    /// test thread, which waits in `spawn` until the program has started, so
+    /// only the death of the whole spawning process can come before the
+    /// signal is armed; the child then exits at once.
     fn killed_with_spawner(command: &mut Command) -> &mut Command {
-        use std::{
-            ffi::{c_int, c_ulong},
-            os::unix::process::CommandExt,
-        };
-        extern "C" {
-            fn prctl(option: c_int, ...) -> c_int;
-        }
-        const PR_SET_PDEATHSIG: c_int = 1;
-        const SIGKILL: c_ulong = 9;
-        // SAFETY: prctl is async-signal-safe and only changes the child.
+        use std::os::unix::process::CommandExt;
+        let spawner = std::ffi::c_int::try_from(std::process::id()).unwrap();
+        // SAFETY: prctl, getppid and _exit are async-signal-safe, and only
+        // the child is affected.
         unsafe {
-            command.pre_exec(|| match prctl(PR_SET_PDEATHSIG, SIGKILL) {
-                0 => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
+            command.pre_exec(move || {
+                if sys::prctl(sys::PR_SET_PDEATHSIG, sys::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if sys::getppid() != spawner {
+                    sys::_exit(1);
+                }
+                Ok(())
             })
         }
     }
 
-    struct TempDir(PathBuf);
+    /// Takes an exclusive lock on `file` if no one holds one.
+    fn try_lock(file: &File) -> bool {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor stays open for the duration of the call.
+        unsafe { sys::flock(file.as_raw_fd(), sys::LOCK_EX | sys::LOCK_NB) == 0 }
+    }
+
+    /// A directory short enough to hold Unix socket paths. It keeps a lock on
+    /// the `lock` file inside for as long as it exists, which tells test
+    /// processes in any PID namespace that it is in use.
+    struct TempDir {
+        path: PathBuf,
+        _lock: File,
+    }
 
     impl TempDir {
         const PREFIX: &'static str = "accesskit-test-";
+        const LOCK: &'static str = "lock";
 
-        /// A new directory, short enough to hold Unix socket paths. The first
-        /// one in a process removes those left by test processes that died.
+        /// The first directory in a process removes those whose test process
+        /// died. Each is locked before it gets a name that the removal
+        /// considers, so it is never seen unlocked while in use.
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             static SWEEP: std::sync::Once = std::sync::Once::new();
             SWEEP.call_once(Self::remove_abandoned);
-            let index = NEXT.fetch_add(1, Ordering::Relaxed);
-            let name = format!("{}{}-{index}", Self::PREFIX, std::process::id());
-            let path = std::env::temp_dir().join(name);
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
+            loop {
+                let index = NEXT.fetch_add(1, Ordering::Relaxed);
+                let name = format!("{}{}-{index}", Self::PREFIX, std::process::id());
+                let staging = std::env::temp_dir().join(format!(".{name}"));
+                match std::fs::create_dir(&staging) {
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    result => result.unwrap(),
+                }
+                let lock = File::create(staging.join(Self::LOCK)).unwrap();
+                assert!(try_lock(&lock));
+                let path = std::env::temp_dir().join(name);
+                // Fails if a run in another PID namespace has the name.
+                match std::fs::rename(&staging, &path) {
+                    Ok(()) => return Self { path, _lock: lock },
+                    Err(_) => {
+                        let _ = std::fs::remove_dir_all(&staging);
+                    }
+                }
+            }
         }
 
         fn remove_abandoned() {
@@ -1283,25 +1423,30 @@ mod tests {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let owner = name
+                if !name
                     .to_str()
-                    .and_then(|name| name.strip_prefix(Self::PREFIX))
-                    .and_then(|name| name.split_once('-'))
-                    .and_then(|(pid, _)| pid.parse::<u32>().ok());
-                if owner.is_some_and(|pid| !Path::new(&format!("/proc/{pid}")).exists()) {
+                    .is_some_and(|name| name.starts_with(Self::PREFIX))
+                {
+                    continue;
+                }
+                let Ok(lock) = File::open(entry.path().join(Self::LOCK)) else {
+                    continue;
+                };
+                if try_lock(&lock) {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            &self.path
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            // The lock is released only afterwards, when the file is closed.
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -1458,6 +1603,7 @@ mod tests {
     }
 
     struct FakeStatus {
+        screen_reader_enabled: bool,
         /// Reads of the screen-reader status still to be left unanswered.
         unanswered: AtomicUsize,
     }
@@ -1474,7 +1620,12 @@ mod tests {
             if take_one(&self.unanswered) {
                 future::pending::<()>().await;
             }
-            true
+            self.screen_reader_enabled
+        }
+
+        #[zbus(property)]
+        fn set_screen_reader_enabled(&mut self, enabled: bool) {
+            self.screen_reader_enabled = enabled;
         }
     }
 
@@ -1501,6 +1652,7 @@ mod tests {
         observed: mpsc::Sender<Observed>,
     ) -> Service {
         let status = FakeStatus {
+            screen_reader_enabled: true,
             unanswered: AtomicUsize::new(unanswered_status_reads),
         };
         let launcher = FakeLauncher {
