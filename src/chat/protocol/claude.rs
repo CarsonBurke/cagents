@@ -1281,16 +1281,24 @@ impl Claude {
             }
             let mut synthetic = std::collections::HashSet::new();
             let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
             if role == Role::User {
                 for (index, pair) in content.windows(2).enumerate() {
+                    let marker = string(&pair[0], "text");
                     if string(&pair[0], "type") == "text"
                         && string(&pair[1], "type") == "image"
                         && let ItemContent::Image { path, .. } = image_content(&pair[1])
-                        && let Some(reference) =
-                            super::image_references::restore(string(&pair[0], "text"), &path)
+                        && super::image_references::claims_reference(marker)
                     {
-                        synthetic.insert(index);
-                        references.insert(index + 1, reference);
+                        if let Some(reference) = super::image_references::restore(marker, &path) {
+                            synthetic.insert(index);
+                            references.insert(index + 1, reference);
+                        } else if !path.starts_with("data:image/") {
+                            // A structured owned-image claim cannot authorize
+                            // a coincident local path after receipt failure.
+                            // Self-contained actual inline pixels remain safe.
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        }
                     }
                 }
             }
@@ -1299,6 +1307,7 @@ impl Claude {
                     continue;
                 }
                 let reference = references.get(&index).cloned();
+                let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
                 let index = self
                     .blocks
@@ -1520,11 +1529,17 @@ impl Claude {
                             ItemContent::Image {
                                 path, description, ..
                             } => ItemContent::Image {
-                                path,
-                                description: reference
-                                    .as_ref()
-                                    .map(|reference| reference.label())
-                                    .unwrap_or(description),
+                                path: if unavailable.is_some() {
+                                    String::new()
+                                } else {
+                                    path
+                                },
+                                description: unavailable.cloned().unwrap_or_else(|| {
+                                    reference
+                                        .as_ref()
+                                        .map(|reference| reference.label())
+                                        .unwrap_or(description)
+                                }),
                                 reference,
                             },
                             content => content,
@@ -5335,6 +5350,67 @@ mod history_tests;
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.as_ref().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            let image_items = |frame: &Value| {
+                let mut step = Step::default();
+                Claude::default().message(frame, &mut step).unwrap();
+                step.events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for failure in 0..3 {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let mut frame = json!({"type":"user", "uuid":"unverified-image-history", "message":{"role":"user", "content":[
+                    {"type":"text", "text":marker},
+                    {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+                ]}});
+                let items = image_items(&frame);
+                assert_eq!(items.len(), 2, "unverified marker must remain literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference:None, description } if path.is_empty() && description.contains("originating device")),
+                    "a real coincident local PNG is not preview authority"
+                );
+                // The foreign claim still cannot create trusted metadata, but
+                // actual self-contained history pixels need no local path.
+                frame["message"]["content"][1]["source"] = json!({"type":"base64", "media_type":"image/png", "data":STANDARD.encode(&bytes)});
+                let inline = image_items(&frame);
+                assert!(
+                    matches!(&inline[1].content, ItemContent::Image { path, reference:None, .. } if path.starts_with("data:image/png;base64,"))
+                );
+            }
+            let legacy = json!({"type":"user", "uuid":"legacy-url", "message":{"role":"user", "content":[
+                {"type":"text", "text":"ordinary earlier [Image 77777] prose"},
+                {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+            ]}});
+            let items = image_items(&legacy);
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { path, reference:None, .. } if path == image.path.to_str().unwrap()),
+                "unclaimed legacy URL behavior stays unchanged"
+            );
+            assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+        });
+    }
 
     #[test]
     fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
