@@ -291,7 +291,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"history": history}), human)
         }
         Response::Audit(page) => {
-            let human = audit_human(&page);
+            let human = audit_human(&page, now_ms());
             (json!({"audit": page}), human)
         }
         Response::Detail(detail) => {
@@ -350,7 +350,7 @@ fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn audit_human(page: &crate::automations::LifecyclePage) -> String {
+fn audit_human(page: &crate::automations::LifecyclePage, now_ms: u64) -> String {
     let mut human = super::format::table(
         ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"],
         page.events
@@ -359,7 +359,7 @@ fn audit_human(page: &crate::automations::LifecyclePage) -> String {
                 [
                     event.sequence.to_string(),
                     event.revision.to_string(),
-                    timestamp_for_audit(event.occurred_ms),
+                    super::format::relative_time(event.occurred_ms, now_ms),
                     event.cause.label().into(),
                     event.actor.label().into(),
                     if event.blocked {
@@ -842,7 +842,7 @@ mod tests {
             next: Some(42),
             earlier_events_unavailable: true,
         };
-        let human = audit_human(&page);
+        let human = audit_human(&page, 100);
         assert_eq!(
             human
                 .lines()
@@ -859,11 +859,14 @@ mod tests {
         );
         assert!(human.contains("actor and cause are unknown") && human.contains("--before 42"));
         assert_eq!(
-            audit_human(&LifecyclePage {
-                events: vec![],
-                next: None,
-                earlier_events_unavailable: false
-            }),
+            audit_human(
+                &LifecyclePage {
+                    events: vec![],
+                    next: None,
+                    earlier_events_unavailable: false
+                },
+                100
+            ),
             "No recorded lifecycle events"
         );
     }
@@ -1015,12 +1018,4 @@ mod tests {
             .allowed_from_hosted_conversation()
         );
     }
-}
-
-fn timestamp_for_audit(ms: u64) -> String {
-    i64::try_from(ms)
-        .ok()
-        .and_then(|value| jiff::Timestamp::from_millisecond(value).ok())
-        .map(|time| time.to_string())
-        .unwrap_or_else(|| format!("{ms} ms"))
 }
