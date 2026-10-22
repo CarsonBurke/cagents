@@ -17197,7 +17197,9 @@ impl Application for Cagents {
         if self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
-                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                self.device_ui
+                    .can_close()
+                    .then_some(Message::Device(device_ui::Action::Close)),
                 1.0,
             ));
         }

@@ -24,7 +24,7 @@ mod coordination;
 mod find;
 mod fold;
 mod hover;
-mod images;
+pub(super) mod images;
 mod layout;
 mod markdown_source;
 mod monospace;

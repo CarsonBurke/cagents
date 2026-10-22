@@ -1007,6 +1007,10 @@ An image attachment is a separate
 provider image block or a file explicitly selected in the composer. For remote
 conversations, local paths belong to the selected device; a matching filename
 on the UI computer does not identify the same artifact.
+Concrete remote image links open a read-only gallery on the selected device's
+bytes. Loading can be cancelled, and remote files cannot be opened in a local
+external viewer. Missing files and preview-capacity errors report the device
+and path so the producer can supply a concrete supported image.
 
 - Drag across prompts, answers, code, and tool output and press `Ctrl+C` to
   copy the selected text. Double-click selects a word; triple-click selects
