@@ -551,19 +551,20 @@ fn load_regular_file(
         return Ok(decode_svg(&bytes)
             .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
     }
-    // A name that says image is the reader's own claim, so a file that fails
-    // to decode is presented with the decoder's reason. The content picks the
-    // decoder, because a misnamed image is still an image.
+    // A file named as an image that decodes is an image. The content picks
+    // the decoder, because a misnamed image is still an image.
+    let mut failure = None;
     if let Ok(named) = image::ImageFormat::from_path(relative_path) {
         let format = image::guess_format(&bytes).unwrap_or(named);
-        return Ok(decode_raster(&bytes, format)
-            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
+        match decode_raster(&bytes, format) {
+            Ok(image) => return Ok(image),
+            Err(reason) => failure = Some(reason),
+        }
     }
-    // Otherwise text is decided first. Several signatures are printable ASCII
-    // ("BM", "P1" to "P7", "DDS ", "qoif", "GIF89a"), so they also begin
-    // ordinary prose, and a file that reads as text is text. Real images
-    // carrying those signatures are not valid text and still reach the
-    // decoder below, as does every image whose signature is binary.
+    // Otherwise a file that reads as text is text, whatever its name or its
+    // first bytes claim: a Git LFS pointer named `logo.png`, an error page
+    // saved as `.jpg`, or prose that begins with one of the printable
+    // signatures ("BM", "P1" to "P7", "DDS ", "qoif", "GIF89a").
     let (bytes, reason) = if bytes.contains(&0) {
         (bytes, ReadOnlyReason::Binary)
     } else {
@@ -572,12 +573,16 @@ fn load_regular_file(
             Err(error) => (error.into_bytes(), ReadOnlyReason::InvalidUtf8),
         }
     };
-    // A signature without a name to back it up is a guess, so one that does
-    // not decode leaves the file classified by its bytes.
-    if let Ok(format) = image::guess_format(&bytes)
-        && let Ok(image) = decode_raster(&bytes, format)
-    {
-        return Ok(image);
+    // Bytes that are not text but that a name or a signature says are an
+    // image get the decoder's reason, which says more than "binary data"
+    // about a truncated or oversized picture. A named file was decoded
+    // above and is not decoded again.
+    if let Some(reason) = failure {
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::Image(reason)));
+    }
+    if let Ok(format) = image::guess_format(&bytes) {
+        return Ok(decode_raster(&bytes, format)
+            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Image(reason))));
     }
     Ok(FileContent::ReadOnly(reason))
 }
@@ -1264,11 +1269,13 @@ mod tests {
             content(root.path(), "huge.png"),
             FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
         ));
+        // A name alone does not make text an image; see
+        // `a_file_that_claims_to_be_an_image_but_does_not_decode`.
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
-        assert!(matches!(
+        assert_eq!(
             content(root.path(), "broken.png"),
-            FileContent::ReadOnly(ReadOnlyReason::Image(_))
-        ));
+            editable("not a valid image", false)
+        );
     }
 
     /// Several signatures `image::guess_format` knows are printable ASCII,
@@ -1334,36 +1341,59 @@ mod tests {
         }
     }
 
-    /// A signature that fails to decode is only a guess, and when the name
-    /// does not back it up the bytes are classified like any other file's.
+    /// A file whose name or signature says image but that does not decode
+    /// opens as text when it is text, and otherwise says why it is not a
+    /// usable image rather than calling it binary data.
     #[test]
-    fn an_undecodable_signature_falls_back_to_the_bytes_unless_named_as_an_image() {
+    fn a_file_that_claims_to_be_an_image_but_does_not_decode() {
         let root = tempdir().unwrap();
-        let mut binary = b"\x89PNG\r\n\x1a\n".to_vec();
-        binary.extend_from_slice(b"\0\0\0\rgarbage");
-        fs::write(root.path().join("payload.bin"), &binary).unwrap();
-        assert_eq!(
-            content(root.path(), "payload.bin"),
-            FileContent::ReadOnly(ReadOnlyReason::Binary)
-        );
+        // Text named as an image: a Git LFS pointer, a saved error page, and
+        // a printable signature under its own extension.
+        for (name, text) in [
+            (
+                "logo.png",
+                "version https://git-lfs.github.com/spec/v1\n\
+                 oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                 size 12345\n",
+            ),
+            ("photo.jpg", "<!DOCTYPE html><title>404 Not Found</title>\n"),
+            ("weak.bmp", "BM25 ranking\n"),
+        ] {
+            fs::write(root.path().join(name), text).unwrap();
+            assert_eq!(
+                content(root.path(), name),
+                editable(text, false),
+                "{name} must open as editable text"
+            );
+        }
+
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 4]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let truncated = &png[..png.len() / 2];
         let mut invalid = b"\x89PNG\r\n\x1a\n".to_vec();
         invalid.extend_from_slice(b"\xff\xfe no NUL here");
-        fs::write(root.path().join("payload"), &invalid).unwrap();
-        assert_eq!(
-            content(root.path(), "payload"),
-            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
-        );
-        // Named as an image, the decoder's reason is the useful answer.
-        fs::write(root.path().join("payload.png"), &binary).unwrap();
-        assert!(matches!(
-            content(root.path(), "payload.png"),
-            FileContent::ReadOnly(ReadOnlyReason::Image(_))
-        ));
-        fs::write(root.path().join("weak.bmp"), "BM25 ranking\n").unwrap();
-        assert!(matches!(
-            content(root.path(), "weak.bmp"),
-            FileContent::ReadOnly(ReadOnlyReason::Image(_))
-        ));
+        let mut wide = Vec::new();
+        image::RgbaImage::new(MAX_IMAGE_DIMENSION + 1, 1)
+            .write_to(&mut Cursor::new(&mut wide), image::ImageFormat::Png)
+            .unwrap();
+        // Bytes that are not text, under any name: the signature is the
+        // evidence, so the decoder's reason is the answer.
+        for (name, bytes) in [
+            ("screenshot", truncated),
+            ("screenshot.png", truncated),
+            ("screenshot.bin", truncated),
+            ("payload", invalid.as_slice()),
+            ("wide", wide.as_slice()),
+        ] {
+            fs::write(root.path().join(name), bytes).unwrap();
+            let content = content(root.path(), name);
+            assert!(
+                matches!(content, FileContent::ReadOnly(ReadOnlyReason::Image(_))),
+                "{name} must be refused as an image, not as {content:?}"
+            );
+        }
     }
 
     #[test]
