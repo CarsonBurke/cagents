@@ -5215,8 +5215,7 @@ impl RepositoryRuntime {
                     },
                     Err(error) => {
                         let path = identity.worktree.join(&identity.path);
-                        let message =
-                            format!("Could not open {} on this device: {error}", path.display());
+                        let message = local_file_error_detail(&path, &error);
                         DocumentState::Failed { path, message }
                     }
                 };
@@ -6509,10 +6508,7 @@ impl RepositoryRuntime {
     /// departing pixels and fence their callbacks without releasing its lease.
     fn fail_file_open(&mut self, card: CardId, path: PathBuf, error: &std::io::Error) {
         let absolute = self.descriptor.worktree.join(&path);
-        let message = format!(
-            "Could not open {} on this device: {error}",
-            absolute.display()
-        );
+        let message = local_file_error_detail(&absolute, error);
         self.files = FileListState::Failed(message.clone());
         // A refresh must never abandon a dirty buffer, recovery, or an
         // outstanding save merely because its directory became unavailable.
@@ -8397,6 +8393,10 @@ fn selected_file_view<'a>(
     }
 }
 
+fn local_file_error_detail(path: &Path, error: impl std::fmt::Display) -> String {
+    format!("{} on this device: {error}", path.display())
+}
+
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
     let content = match &runtime.document {
         DocumentState::None => information_state(
@@ -8405,7 +8405,11 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         ),
         DocumentState::Loading => loading(),
         DocumentState::Failed { path, message } => {
-            information_state(format!("Could not open {}", path.display()), message)
+            let name = path.file_name().unwrap_or(path.as_os_str());
+            information_state(
+                format!("Could not open {}", name.to_string_lossy()),
+                message,
+            )
         }
         DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
         DocumentState::Editable(document) => editable_document_view(card, runtime, document),

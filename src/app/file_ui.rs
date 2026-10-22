@@ -355,9 +355,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_known_chat_cwd_retargets_the_file_pane_to_a_contextual_error() {
+    async fn missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error() {
         if crate::repository_widget::retained_save_tests::isolated_test(
-            "app::file_ui::tests::missing_known_chat_cwd_retargets_the_file_pane_to_a_contextual_error",
+            "app::file_ui::tests::missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error",
         ) {
             return;
         }
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(app.card_state(card).unwrap().title, "old.png");
         let before = app.workspace.order().count();
 
-        // A known but unavailable conversation cwd is different from an
+        // A known but unavailable source directory is different from an
         // unverified child cwd: resolve the former exactly, then show its own
         // failure. Neither route may borrow another repository's image.
         let missing = directory.path().join("retired-history");
