@@ -8167,6 +8167,18 @@ impl Cagents {
                 });
             }
             Action::PastedImage(target, id, None) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if !id.active()
+                    || !runtime
+                        .attachment_bookmarks
+                        .get(&id.id)
+                        .is_some_and(|bookmark| bookmark.valid)
+                {
+                    runtime.cancel_attachment_insert(id.id, None);
+                    return Task::none();
+                }
                 return iced::clipboard::read().map(move |text| {
                     cosmic::Action::App(Message::ChatUi(Action::PastedText(
                         target,
@@ -15054,6 +15066,25 @@ mod tests {
         let another = runtime.try_attachment_insert().unwrap();
         assert!(next.active());
         assert!(another.active());
+    }
+
+    #[test]
+    fn cancelled_empty_image_callback_does_not_read_a_later_clipboard() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let ticket = runtime.begin_attachment_insert();
+        runtime.replace_draft(text_editor::Content::with_text("replacement draft"));
+        let task = app.handle_chat_ui(Action::PastedImage(target, ticket, None));
+        assert_eq!(
+            task.units(),
+            0,
+            "stale callback must not schedule another clipboard read"
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "replacement draft");
+        assert_eq!(runtime.pastes_pending, 0);
     }
 
     #[test]
