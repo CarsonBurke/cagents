@@ -814,6 +814,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
 
 struct Entry {
     id: String,
+    managed: bool,
     path: String,
     label: String,
     handle: iced::widget::image::Handle,
@@ -861,13 +862,16 @@ impl Gallery {
             .iter()
             .filter_map(|item| {
                 let ItemContent::Image {
-                    path, description, ..
+                    path,
+                    description,
+                    reference,
                 } = &item.content
                 else {
                     return None;
                 };
                 Some(Entry {
                     id: item.id.clone(),
+                    managed: reference.is_some(),
                     path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
                         path.clone()
                     } else {
@@ -906,7 +910,13 @@ impl Gallery {
         self.reset = self.reset.wrapping_add(1);
     }
     pub(super) fn url(&self) -> Option<Url> {
-        let path = &self.entries[self.selected].path;
+        let entry = &self.entries[self.selected];
+        // Managed snapshot paths are non-authority hints. The in-app viewer
+        // owns verified pixels; never hand an unverified hint to another app.
+        if entry.managed {
+            return None;
+        }
+        let path = &entry.path;
         if Path::new(path).is_absolute() {
             (!self.remote)
                 .then(|| Url::from_file_path(path).ok())
@@ -1347,6 +1357,41 @@ mod tests {
     }
 
     #[test]
+    fn managed_gallery_cannot_open_a_different_local_hint_externally() {
+        chat::attachment_assets::with_test_image(|backend_image| {
+            let display = tempfile::tempdir().unwrap();
+            let hint = display.path().join("coincident.png");
+            std::fs::write(&hint, png()).unwrap();
+            let backend_bytes = std::fs::read(&backend_image.path).unwrap();
+            assert_ne!(backend_bytes, png());
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some(display.path().into())));
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                panic!("draft chat");
+            };
+            let mut item = image_item(hint.to_string_lossy().into_owned());
+            if let ItemContent::Image { reference, .. } = &mut item.content {
+                *reference = backend_image.reference.clone();
+            }
+            let item = Arc::new(item);
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.items = vec![item.clone()];
+            runtime.snapshot = Arc::new(snapshot);
+            let mut cached =
+                CachedItem::new(&item.content, crate::settings::EditorSyntaxTheme::Auto);
+            cached.image = bytes_handle(backend_bytes);
+            runtime.cache.insert(item.id.clone(), cached);
+            let gallery = Gallery::new(runtime, &item.id).unwrap();
+            assert!(gallery.entries[0].managed);
+            assert!(
+                gallery.url().is_none(),
+                "verified internal pixels must never authorize a coincident external hint"
+            );
+        });
+    }
+
+    #[test]
     fn inline_image_gallery_never_offers_a_filesystem_external_link() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/tmp/gallery"))));
@@ -1631,6 +1676,7 @@ mod tests {
     fn gallery_navigation_wraps_and_resets_pan_and_zoom() {
         let entry = |id: &str| Entry {
             id: id.into(),
+            managed: false,
             path: format!("/fixture/{id}.png"),
             label: id.into(),
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
