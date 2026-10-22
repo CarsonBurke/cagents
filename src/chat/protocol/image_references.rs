@@ -111,12 +111,18 @@ const LIST_OPEN: &str = "\n<cagents-image-inputs>";
 const LIST_CLOSE: &str = "</cagents-image-inputs>";
 const MAX_IMAGE_LIST: usize = 128;
 
+pub(super) fn check_image_count(count: usize) -> Result<(), String> {
+    if count > MAX_IMAGE_LIST {
+        Err("Too many image mappings (maximum 128 images).".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// OMP accepts a single ordinary message string and a separate ordered image
 /// array. This suffix describes that actual array; it adds no native ID field.
 pub(super) fn image_list(references: &[Option<ImageReference>]) -> Result<String, String> {
-    if references.len() > MAX_IMAGE_LIST {
-        return Err("Too many image mappings".into());
-    }
+    check_image_count(references.len())?;
     for reference in references.iter().flatten() {
         reference.validate()?;
     }

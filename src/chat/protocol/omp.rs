@@ -794,14 +794,28 @@ impl Adapter for Omp {
                 let kind=match mode {PromptMode::Send=>"prompt",PromptMode::Steer=>"steer",PromptMode::Queue=>"follow_up"};
                 let mut request=self.request(kind);
                 let ordered = super::image_references::ordered(&message, &attachments)?;
-                let mut message=message;
-                let mut images=Vec::new();
-                let mut references=Vec::new();
+                let mapped = ordered.iter().filter(|a| a.reference.is_some()).count();
+                // Every managed receipt is an image. Refuse this known lower
+                // bound before even resolving a legacy sentinel path or blob.
+                super::image_references::check_image_count(mapped)?;
+                let mut prepared = Vec::with_capacity(ordered.len());
                 for attachment in ordered {
                     let attachment = crate::chat::attachment_assets::resolve(attachment)?;
                     let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
                     let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
                     let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
+                    prepared.push((attachment, path, mime));
+                }
+                // Legacy paths may resolve through symlinks to images, so use
+                // their actual resolved types. Nonimage files consume no image
+                // slots, and prompts without managed mapping keep old rules.
+                if mapped > 0 {
+                    super::image_references::check_image_count(prepared.iter().filter(|(_, _, mime)| mime.is_some()).count())?;
+                }
+                let mut message=message;
+                let mut images=Vec::new();
+                let mut references=Vec::new();
+                for (attachment, path, mime) in prepared {
                     if let Some(mime)=mime {
                         let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take(MAX_IMAGE+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
                         if bytes.len() as u64>MAX_IMAGE {return Err("Image exceeds the 16 MiB attachment limit.".into());}
@@ -1815,6 +1829,72 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_mapping_limit_refuses_before_any_sentinel_path_lookup_or_payload_read() {
+        let device = uuid::Uuid::new_v4();
+        let mut attachments = vec![chat::Attachment::file(
+            "/must-not-read-before-image-mapping-limit.txt".into(),
+        )];
+        attachments.extend((1..=129).map(|number| chat::Attachment {
+            path: format!("/must-not-read-before-image-mapping-limit-{number}.png").into(),
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number,
+                device,
+                name: "image.png".into(),
+                sha256: "a".repeat(64),
+                extension: "png".into(),
+            }),
+        }));
+        let mut adapter = Omp {
+            ready: true,
+            ..Default::default()
+        };
+        let error = adapter
+            .command(Command::Prompt {
+                text: String::new(),
+                attachments,
+                mode: PromptMode::Send,
+            })
+            .err()
+            .expect("129 managed images must fail");
+        assert!(
+            error.contains("Too many image mappings"),
+            "mapping cap must precede the sentinel path/receipt error: {error}"
+        );
+    }
+
+    #[test]
+    fn nonimage_legacy_files_do_not_consume_managed_image_mapping_slots() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempfile::tempdir().unwrap();
+            let document = directory.path().join("notes.txt");
+            std::fs::write(&document, b"ordinary document").unwrap();
+            let mut attachments = vec![image.clone()];
+            attachments.extend((0..129).map(|_| chat::Attachment::file(document.clone())));
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let sent = adapter
+                .command(Command::Prompt {
+                    text: image.reference.as_ref().unwrap().token(),
+                    attachments,
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            assert_eq!(sent.writes[0]["images"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                sent.writes[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .matches("Attached file (read this exact path)")
+                    .count(),
+                129
+            );
+        });
+    }
 
     #[test]
     fn referenced_image_array_mapping_restores_only_verified_retained_history() {
