@@ -5,6 +5,7 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
+pub mod failure;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;

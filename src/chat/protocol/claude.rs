@@ -1183,6 +1183,9 @@ impl Claude {
         if self.retracted.contains(carrier) {
             return Ok(());
         }
+        // Capture provenance before this carrier updates correlation state.
+        // Replaying an old answer is not evidence that a blocked child resumed.
+        let fresh_live_carrier = !history && !self.carrier_items.contains_key(carrier);
         self.retract(&frame["supersedes"], step)?;
         let child = frame["parent_tool_use_id"]
             .as_str()
@@ -1194,6 +1197,54 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        if let Some(parent) = child
+            && fresh_live_carrier
+            && role == Role::Assistant
+            && frame["error"].is_null()
+            && frame["isMeta"].as_bool() != Some(true)
+            && (frame["message"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+                || frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| match string(block, "type") {
+                            "text" => !string(block, "text").trim().is_empty(),
+                            "thinking" => !string(block, "thinking").trim().is_empty(),
+                            "redacted_thinking" => !string(block, "data").trim().is_empty(),
+                            "tool_use" | "server_tool_use" => {
+                                !string(block, "id").trim().is_empty()
+                                    && !string(block, "name").trim().is_empty()
+                            }
+                            "tool_result" => !string(block, "tool_use_id").trim().is_empty(),
+                            "image" => match string(&block["source"], "type") {
+                                "url" => !string(&block["source"], "url").trim().is_empty(),
+                                "base64" => {
+                                    matches!(
+                                        string(&block["source"], "media_type"),
+                                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                                    ) && !string(&block["source"], "data").trim().is_empty()
+                                }
+                                _ => false,
+                            },
+                            "document" => ["data", "url", "text"]
+                                .iter()
+                                .any(|field| !string(&block["source"], field).trim().is_empty()),
+                            _ => false,
+                        })
+                    }))
+        {
+            step.events.push(Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(false),
+                detail: Some(String::new()),
+            });
+        }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
@@ -1503,6 +1554,13 @@ impl Claude {
             }
         }
         if role == Role::Assistant {
+            if frame["error"].as_str().is_some() {
+                for event in &mut step.events[event_start..] {
+                    if let Event::Item(item) = event {
+                        chat::failure::mark_provider_error(Provider::Claude, item);
+                    }
+                }
+            }
             if child.is_none()
                 && let Some(usage) = frame["context_usage"].as_object()
             {
@@ -1518,7 +1576,14 @@ impl Claude {
             }
             if let Some(error) = frame["error"].as_str() {
                 step.events.push(Event::Error {
-                    message: format!("Claude: {error}"),
+                    message: {
+                        let body = content_text(&message["content"]);
+                        if body.is_empty() {
+                            format!("Claude: {error}")
+                        } else {
+                            format!("Claude: {error}\n{body}")
+                        }
+                    },
                     fatal: false,
                 });
             }
@@ -1812,7 +1877,10 @@ impl Adapter for Claude {
                 for mut frame in frames {
                     frame["parent_tool_use_id"] = json!(parent);
                     let mut child_step = Step::default();
-                    if self.message(&frame, &mut child_step).is_ok() {
+                    if self
+                        .message_with_tools(&frame, &mut child_step, &HashMap::new(), true)
+                        .is_ok()
+                    {
                         history_step.events.extend(child_step.events);
                     }
                 }
@@ -2390,14 +2458,8 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
-                if frame["parent_tool_use_id"].is_null() {
-                    self.observe_title(&mut step);
-                }
-                let can_suggest = frame["parent_tool_use_id"].is_null()
-                    && frame["is_error"] != true
-                    && frame["subtype"] == "success"
-                    && self.interruption.is_none()
-                    && self.started_generation == Some(self.attention_generation);
+                // A delegated result still carries scoped permission evidence,
+                // even though it must never settle the parent turn.
                 for denial in frame["permission_denials"]
                     .as_array()
                     .into_iter()
@@ -2410,6 +2472,66 @@ impl Adapter for Claude {
                         &mut step,
                     )?;
                 }
+                if let Some(parent) = frame["parent_tool_use_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                {
+                    // A child result settles this exact delegated turn, not the
+                    // parent's prompt, usage, interrupt or accepted execution.
+                    let errors = content_text(&frame["errors"]);
+                    let detail = if !errors.is_empty() {
+                        errors
+                    } else {
+                        string(&frame, "result").to_owned()
+                    };
+                    let status = if self.stopped_agents.iter().any(|id| id == parent) {
+                        ToolStatus::Stopped
+                    } else if frame["is_error"].as_bool() == Some(true) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    self.background_agents.remove(parent);
+                    if let Some(Item {
+                        content: ItemContent::Tool { status: known, .. },
+                        ..
+                    }) = self.tools.get_mut(&ScopedId::new(None, parent))
+                    {
+                        *known = status;
+                    }
+                    self.tasks.retain(|task| {
+                        !self
+                            .agent_task_calls
+                            .iter()
+                            .any(|(tool, known)| tool == parent && known == task)
+                            && !self
+                                .agent_calls
+                                .iter()
+                                .any(|(known, tool)| tool == parent && known == task)
+                    });
+                    if let Some(stream) = self.streams.remove(parent) {
+                        self.settle(Some(parent), &stream.message);
+                    }
+                    step.events.push(Event::Subagent {
+                        id: parent.into(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(status),
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(detail),
+                    });
+                    return Ok(step);
+                }
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
+                let can_suggest = frame["parent_tool_use_id"].is_null()
+                    && frame["is_error"] != true
+                    && frame["subtype"] == "success"
+                    && self.interruption.is_none()
+                    && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
                 if had_turn || frame["uuid"].as_str().is_some() {
@@ -2836,6 +2958,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
             Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
                 id: parent.into(),
                 ids,
+            },
+            Event::Error { message, .. } => Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                // A retryable API error is not proof that the task stopped.
+                // Keep its exact status, but expose that it needs attention.
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some(message),
             },
             event => event,
         })
@@ -3761,6 +3895,19 @@ impl Claude {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
+                } else {
+                    // Only actual new child API activity clears a retryable
+                    // child failure; an unrelated background notice cannot.
+                    step.events.push(Event::Subagent {
+                        id: parent.clone(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: None,
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(String::new()),
+                    });
                 }
             }
             "content_block_start" => {
@@ -5283,6 +5430,304 @@ mod tests {
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
+
+    #[test]
+    fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings() {
+        let run = crate::model::RunId::new();
+        let mut adapter = Claude {
+            busy: true,
+            execution: Some(run),
+            interruption: Some(false),
+            ..Default::default()
+        };
+        for (tool, task) in [("failed-child", "task-failed"), ("live-child", "task-live")] {
+            adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
+        }
+        let child_input =
+            json!({"file_path":"child.rs","old_string":"before","new_string":"after"});
+        adapter
+            .receive(scoped_call(
+                Some("failed-child"),
+                "child-edit",
+                "colliding-edit",
+                "Edit",
+                child_input.clone(),
+            ))
+            .unwrap();
+        let root_input = json!({"file_path":"root.rs","content":"root stays separate"});
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-edit",
+                "colliding-edit",
+                "Write",
+                root_input.clone(),
+            ))
+            .unwrap();
+        let generation = adapter.attention_generation;
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let step = adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[failure],"usage":{"input_tokens":999},"permission_denials":[{"tool_use_id":"colliding-edit","tool_name":"Edit","decision_reason":"Child edit was refused"}]})).unwrap();
+        assert!(adapter.busy);
+        assert_eq!(adapter.execution, Some(run));
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(!adapter.background_agents.contains("failed-child"));
+        assert!(adapter.background_agents.contains("live-child"));
+        assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
+        assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+        assert!(
+            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+                if id=="failed-child" && detail==failure
+                && denial.tool_use_id=="colliding-edit" && denial.tool_name=="Edit"
+                && denial.reason=="Child edit was refused"
+                && denial.tool_input.as_deref().and_then(|input|serde_json::from_str::<Value>(input).ok())==Some(child_input))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(None, "colliding-edit"))
+                .and_then(|input| serde_json::from_str::<Value>(input).ok()),
+            Some(root_input),
+            "A child result cannot overwrite the colliding root permission input"
+        );
+        assert!(adapter.completed_tool(None, "failed-child"));
+        let replay = adapter.receive(json!({"type":"assistant","uuid":"launch-failed-child","message":{"id":"message-failed-child","content":[{"type":"tool_use","id":"failed-child","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Running),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
+        assert!(
+            matches!(error.events.as_slice(), [Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }] if id=="waiting-child" && detail.contains(failure))
+        );
+        assert!(adapter.busy);
+        let notice = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bash-done","status":"completed","summary":"Background command completed (exit code 0)","uuid":"bash-notice"})).unwrap();
+        assert!(!notice.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::Subagent { .. }
+        )));
+        assert!(adapter.busy);
+        let resumed = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"message_start","message":{"id":"recovered-child"}}})).unwrap();
+        assert!(resumed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:None, waiting:Some(false), detail:Some(detail), .. } if id=="waiting-child" && detail.is_empty())));
+        assert!(
+            !resumed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarted | Event::Status { .. }))
+        );
+    }
+
+    #[test]
+    fn replayed_and_historical_child_answers_do_not_clear_a_later_retry_failure() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let answer = |uuid: &str| json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":"blocked-child","message":{"id":uuid,"content":[{"type":"text","text":"Earlier child answer"}]}});
+        adapter.receive(answer("old-live-carrier")).unwrap();
+        let failure = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"blocked-child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})).unwrap();
+        assert!(failure.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                waiting: Some(true),
+                ..
+            }
+        )));
+        let clears = |events: &[Event]| {
+            events.iter().any(|event| matches!(event, Event::Subagent { id, waiting:Some(false), detail:Some(detail), .. } if id=="blocked-child" && detail.is_empty()))
+        };
+        let replay = adapter.receive(answer("old-live-carrier")).unwrap();
+        assert!(
+            !clears(&replay.events),
+            "An identical already-seen live carrier is not recovery"
+        );
+        let mut history = Step::default();
+        adapter
+            .message_with_tools(
+                &answer("previously-unseen-history-carrier"),
+                &mut history,
+                &HashMap::new(),
+                true,
+            )
+            .unwrap();
+        assert!(
+            !clears(&history.events),
+            "An unseen saved sidecar carrier is still history"
+        );
+        let replay_history = adapter
+            .receive(answer("previously-unseen-history-carrier"))
+            .unwrap();
+        assert!(
+            !clears(&replay_history.events),
+            "Previously imported history cannot become fresh through replay"
+        );
+        let mut meta = answer("new-model-only-carrier");
+        meta["isMeta"] = json!(true);
+        assert!(!clears(&adapter.receive(meta).unwrap().events));
+        for (index, content) in [
+            json!([]),
+            json!("   \n\t"),
+            json!([{"type":"text","text":"   \n\t"}]),
+            json!([{"type":"thinking","thinking":" "}]),
+            json!([{"type":"image","source":{}}]),
+            json!([{"type":"unknown-content","text":"not proven activity"}]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut empty = answer(&format!("fresh-empty-envelope-{index}"));
+            empty["message"]["content"] = content;
+            assert!(
+                !clears(&adapter.receive(empty).unwrap().events),
+                "A new envelope without meaningful assistant activity cannot clear the blocked child"
+            );
+        }
+        let fresh = adapter
+            .receive(answer("genuinely-new-live-carrier"))
+            .unwrap();
+        assert!(clears(&fresh.events));
+        for (index, content) in [
+            json!("Actual live child response"),
+            json!([{"type":"thinking","thinking":"Considering the current change"}]),
+            json!([{"type":"tool_use","id":"new-child-tool","name":"Read","input":{"file_path":"current.rs"}}]),
+            json!([{"type":"image","source":{"type":"url","url":"https://example.test/current.png"}}]),
+        ].into_iter().enumerate() {
+            let mut active = answer(&format!("fresh-meaningful-envelope-{index}"));
+            active["message"]["content"] = content;
+            assert!(clears(&adapter.receive(active).unwrap().events),
+                "Fresh parsed assistant activity still clears its exact child failure");
+        }
+        assert!(
+            adapter.busy,
+            "Child recovery does not settle or restart the parent"
+        );
+        assert!(!fresh.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::TurnSettled
+        )));
+    }
+
+    #[test]
+    fn explicit_assistant_failure_keeps_raw_text_system_identity_and_reset_cause() {
+        let mut adapter = Claude::default();
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest diagnostics retained";
+        let step = adapter.receive(json!({"type":"assistant","uuid":"quota-carrier","error":"rate_limit","message":{"id":"quota-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Item(item) if item.id=="quota-message:0" && chat::failure::provider_error_text(Provider::Claude, item)==Some(failure))));
+        let current = step
+            .events
+            .iter()
+            .find_map(|event| {
+                if let Event::Error { message, .. } = event {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(current.contains("Claude: rate_limit") && current.contains(failure));
+        assert_eq!(
+            chat::failure::Failure::parse(Provider::Claude, current)
+                .unwrap()
+                .key,
+            chat::failure::Failure::parse(Provider::Claude, failure)
+                .unwrap()
+                .key
+        );
+        let quote = adapter.receive(json!({"type":"assistant","uuid":"quote-carrier","message":{"id":"quote-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(quote.events.iter().any(|event| matches!(
+            event,
+            Event::Item(Item {
+                role: Role::Assistant,
+                ..
+            })
+        )));
+        assert!(
+            !quote
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn explicit_child_failure_blocks_share_only_their_proven_carrier() {
+        let mut adapter = Claude::default();
+        let bodies = [
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+            "request-id: same-provider-envelope\nOriginal details stay separate and exact.",
+        ];
+        for carrier in ["first-error-message", "next-error-message"] {
+            let step = adapter.receive(json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":"same-child","error":"rate_limit","message":{"id":carrier,"content":[{"type":"text","text":bodies[0]},{"type":"text","text":bodies[1]}]}})).unwrap();
+            let items: Vec<_> = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SubagentItem { id, item } if id == "same-child" => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(items.len(), 2);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.id, format!("{carrier}:{index}"));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Claude, item),
+                    Some(bodies[index])
+                );
+                assert_eq!(
+                    chat::failure::provider_error_carrier(Provider::Claude, item),
+                    Some(carrier)
+                );
+            }
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+    }
+
+    #[test]
+    fn child_user_quotations_are_not_provider_errors_and_followup_failures_keep_their_ids() {
+        let mut adapter = Claude::default();
+        let quota = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let frame = |kind: &str, id: &str, error: bool| {
+            let mut value = json!({"type":kind,"uuid":id,"parent_tool_use_id":"same-child","message":{"id":id,"content":[{"type":"text","text":quota}]}});
+            if error {
+                value["error"] = json!("rate_limit");
+            }
+            value
+        };
+        for id in ["original-child-prompt", "followup-child-prompt"] {
+            let quote = adapter.receive(frame("user", id, false)).unwrap();
+            assert!(quote.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id=="same-child" && item.role==Role::System && matches!(&item.content,ItemContent::Text{text,..} if text==quota) && chat::failure::provider_error_text(Provider::Claude,item).is_none())));
+            let error_id = format!("{id}-error");
+            let error = adapter
+                .receive(frame("assistant", &error_id, true))
+                .unwrap();
+            assert!(error.events.iter().any(|event| matches!(event, Event::SubagentItem { id,item } if id=="same-child" && item.id==format!("{error_id}:0") && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+            assert!(!error.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+        let replay = adapter
+            .receive(frame("assistant", "original-child-prompt-error", true))
+            .unwrap();
+        assert!(replay.events.iter().any(|event| matches!(event, Event::SubagentItem { item,.. } if item.id=="original-child-prompt-error:0" && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+    }
 
     #[test]
     fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {

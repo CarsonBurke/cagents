@@ -16,10 +16,12 @@ use std::sync::{
 
 mod auth_recovery;
 mod changes;
+mod child_navigation;
 mod clipboard_image;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod failure;
 mod find;
 mod fold;
 mod hover;
@@ -219,6 +221,12 @@ pub enum Action {
     ToggleTurn(Target, String),
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
+    SubagentPicker(Target, bool),
+    SubagentQuery(Target, String),
+    ToggleFailure(Target, String),
+    CopyFailure(Target, String),
+    SubagentFilter(Target, child_navigation::Filter),
+    SubagentPage(Target, bool),
     /// Shows the whole of one folded part of a coordination card, addressed
     /// by the card's item id and the part's name, or folds it again.
     Unfold(Target, String),
@@ -989,6 +997,7 @@ struct CachedItem {
     item: Option<Arc<chat::Item>>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
+    diagnostic: bool,
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
@@ -1131,6 +1140,7 @@ impl CachedItem {
             _ => (None, None),
         };
         let mut cached = Self {
+            diagnostic: false,
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             tool_output,
@@ -1636,6 +1646,7 @@ pub(super) struct Runtime {
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
     selected_subagent: Option<String>,
+    child_picker: Option<child_navigation::Picker>,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -1686,6 +1697,7 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
+    failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
     footer_picker: bool,
@@ -2234,6 +2246,7 @@ impl Runtime {
             syntax_theme,
             turns: Vec::new(),
             selected_subagent: None,
+            child_picker: None,
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2259,6 +2272,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
             footer_picker: false,
@@ -2305,6 +2319,8 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.failure_ui = failure::State::default();
+        self.child_picker = None;
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -2331,6 +2347,7 @@ impl Runtime {
             self.failures.remove(0);
         }
         self.failures.push((anchor, notice));
+        self.refresh_failure_ui();
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
@@ -2491,6 +2508,35 @@ impl Runtime {
             .enumerate()
             .map(|(index, item)| (item, busy && index == newest));
         for (item, growing) in growing_items {
+            if cache.get(&item.id).is_some_and(|cached| {
+                cached.diagnostic
+                    && cached
+                        .item
+                        .as_ref()
+                        .is_some_and(|previous| Arc::ptr_eq(previous, item))
+            }) {
+                continue;
+            }
+            if failure::diagnostic_item(provider, item) {
+                let unchanged = cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.item.as_ref())
+                    .is_some_and(|previous| Arc::ptr_eq(previous, item));
+                if !unchanged {
+                    let placeholder = ItemContent::Text {
+                        text: String::new(),
+                        thinking: false,
+                        phase: chat::Phase::Commentary,
+                    };
+                    let mut cached =
+                        CachedItem::updated(&placeholder, theme, None, false, false, None);
+                    cached.token = ChangeToken::of(&item.content);
+                    cached.diagnostic = true;
+                    cached.item = Some(item.clone());
+                    cache.insert(item.id.clone(), cached);
+                }
+                continue;
+            }
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             if let Some(cached) = cache.get_mut(&item.id) {
@@ -2835,6 +2881,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        self.refresh_failure_ui();
         images::sync(self);
         self.refresh_find();
     }
@@ -2849,6 +2896,7 @@ impl Runtime {
     }
 
     fn restore_find_disclosures(&mut self) {
+        self.restore_failure_find();
         self.find_disclosure
             .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
@@ -2873,6 +2921,9 @@ impl Runtime {
     }
 
     fn reveal_child_find_match(&mut self, key: &str) {
+        if self.reveal_failure_for_find(key).is_some() {
+            return;
+        }
         let Some(child) = self.selected_subagent.clone() else {
             return;
         };
@@ -2923,6 +2974,7 @@ impl Runtime {
     }
 
     fn refresh_find(&mut self) {
+        self.refresh_failure_previews();
         let previous = self.find_matches.get(self.find_index).cloned();
         let query = self.find.as_deref().unwrap_or_default();
         self.find_matches = if let Some(child) = self.selected_subagent.as_ref() {
@@ -3026,7 +3078,9 @@ impl Runtime {
 
     /// The named control that should receive the keyboard for this card.
     pub(super) fn focus_control(&self) -> &'static str {
-        if self.model_picker.is_some() {
+        if self.child_picker.is_some() {
+            "chat-subagent-search"
+        } else if self.model_picker.is_some() {
             "chat-model-search"
         } else {
             "chat-composer"
@@ -3869,20 +3923,45 @@ impl Cagents {
         };
         let key = runtime.find_matches[runtime.find_index].clone();
         if runtime.selected_subagent.is_some() {
+            let anchor = runtime
+                .reveal_failure_for_find(&key)
+                .unwrap_or_else(|| key.clone());
             runtime.reveal_child_find_match(&key);
             return crate::document_link::scroll_to_heading_anchored(
                 card_control_id(target.card, "chat-transcript"),
-                runtime.find_anchor(&key),
+                runtime.find_anchor(&anchor),
                 true,
             );
         }
+        let mut diagnostic_anchor = None;
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
             runtime.find_disclosure.turn(&key, &mut runtime.opened);
             let query = runtime.find.as_deref().unwrap_or_default();
-            for placed in turn.steps.iter().chain(&turn.prose) {
-                let Some(item) = runtime.snapshot.items.get(placed.index) else {
+            let placed_items: Vec<_> = turn
+                .steps
+                .iter()
+                .chain(&turn.prose)
+                .filter_map(|placed| {
+                    runtime
+                        .snapshot
+                        .items
+                        .get(placed.index)
+                        .map(|item| (placed.clone(), item.clone(), turn.steps.contains(placed)))
+                })
+                .collect();
+            let prompt_indices = turn.prompt.clone();
+            let query = query.to_owned();
+            for (placed, item, is_step) in placed_items {
+                let query = query.as_str();
+                if contains_text(&item.content, query)
+                    && let Some(incident) = runtime.failure_ui.item(&item.id)
+                {
+                    let anchor = format!("failure:{}", incident.key);
+                    runtime.reveal_failure_for_find(&item.id);
+                    diagnostic_anchor.get_or_insert(anchor);
                     continue;
-                };
+                }
+                let item = item.as_ref();
                 // A card's message or prompt, or a message a step read, may
                 // be folded to its opening.
                 let coordinated = runtime
@@ -3905,7 +3984,7 @@ impl Cagents {
                 // match is only in the command or output it was read from.
                 let raw = match coordinated {
                     Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
+                    _ => is_step || placed.slot == turn::Slot::Thinking,
                 };
                 if raw
                     && contains_text(&item.content, query)
@@ -3929,11 +4008,11 @@ impl Cagents {
             }
             // Both long user prompts and deliveries may hide their matching
             // body beneath an opening. Search owns only its temporary reveal.
-            for index in &turn.prompt {
+            for index in &prompt_indices {
                 if let Some(item) = runtime.snapshot.items.get(*index)
                     && match &item.content {
-                        ItemContent::Text { text, .. } => find::contains(text, query),
-                        ItemContent::Delivery { body, .. } => find::contains(body, query),
+                        ItemContent::Text { text, .. } => find::contains(text, &query),
+                        ItemContent::Delivery { body, .. } => find::contains(body, &query),
                         _ => false,
                     }
                 {
@@ -3945,7 +4024,7 @@ impl Cagents {
         }
         crate::document_link::scroll_to_heading_anchored(
             card_control_id(target.card, "chat-transcript"),
-            iced::advanced::widget::Id::new(format!("chat-turn-{}-{key}", target.card)),
+            runtime.find_anchor(diagnostic_anchor.as_deref().unwrap_or(&key)),
             true,
         )
     }
@@ -6455,6 +6534,7 @@ impl Cagents {
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
+            | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
@@ -6462,7 +6542,9 @@ impl Cagents {
                 self.cards.get(&target.card).and_then(|card| match card {
                     CardRuntime::Chat(runtime)
                         if runtime.target == *target
-                            && (runtime.picker_keyboard || runtime.model_picker.is_some()) =>
+                            && (runtime.picker_keyboard
+                                || runtime.model_picker.is_some()
+                                || runtime.child_picker.is_some()) =>
                     {
                         Some(*target)
                     }
@@ -6472,6 +6554,7 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
         }
@@ -6489,6 +6572,14 @@ impl Cagents {
             ]);
         }
         task
+    }
+
+    pub(super) fn reconcile_chat_failure_presentations(&mut self) {
+        for card in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = card {
+                runtime.reconcile_failure_ui();
+            }
+        }
     }
 
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
@@ -8097,6 +8188,7 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.restore_find_disclosures();
                     runtime.find = None;
+                    runtime.refresh_failure_previews();
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
                 }
@@ -8435,9 +8527,111 @@ impl Cagents {
                     }
                 }
             }
+            Action::ToggleFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime
+                        .failure_ui
+                        .incidents
+                        .iter()
+                        .any(|incident| incident.key == key)
+                {
+                    runtime.failure_ui.find_expanded.remove(&key);
+                    if !runtime.failure_ui.expanded.remove(&key) {
+                        runtime.failure_ui.expanded.insert(key.clone());
+                        runtime.cache_failure_preview(&key);
+                    }
+                }
+            }
+            Action::CopyFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(text) = runtime.failure_details(&key)
+                {
+                    text_copy::invalidate();
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_picker =
+                        open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+                    if open {
+                        return widget::text_input::focus(card_control_id(
+                            target.card,
+                            "chat-subagent-search",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        if runtime.snapshot.subagents.is_empty() {
+                            "chat-composer"
+                        } else {
+                            "chat-subagent-picker"
+                        },
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.query = query;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPage(target, next) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    let last = picker
+                        .rows(&runtime.snapshot.subagents)
+                        .len()
+                        .saturating_sub(1)
+                        / 24;
+                    picker.page = if next {
+                        picker.page.saturating_add(1).min(last)
+                    } else {
+                        picker.page.saturating_sub(1)
+                    };
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentFilter(target, filter) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.filter = filter;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
             Action::SelectSubagent(target, id) => {
                 text_copy::invalidate();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_picker = None;
                     let selected = id.filter(|id| {
                         runtime
                             .snapshot
