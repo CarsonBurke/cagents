@@ -24,9 +24,6 @@ const PAGE: usize = 50;
 /// Narrower than this, the header's primary command is drawn as an icon so
 /// the header keeps one row.
 const COMPACT_HEADER_WIDTH: f32 = 440.0;
-/// What a breadcrumb leaves for its separators and current page when it
-/// shortens a long parent name.
-const TRAIL_RESERVE: f32 = 120.0;
 /// From this width the automation list sits beside the selection.
 const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
 const LIST_WIDTH: f32 = 240.0;
@@ -149,10 +146,13 @@ pub enum Effect {
     ReadRun(crate::model::RunId),
 }
 
+/// A request in flight. `Reload` rereads the open automation for Refresh,
+/// then replaces its history with the newest page.
 #[derive(Clone, Copy)]
 enum Pending {
     List { append: bool },
     Show,
+    Reload,
     Save,
     Mutate,
     History { append: bool },
@@ -584,7 +584,18 @@ enum HistoryStatus {
     Unrequested,
     Loading,
     Loaded,
-    Failed,
+    /// Keeps its message, so the history states its own failure.
+    Failed(String),
+}
+
+/// Whether the automation list has been read. A failure keeps its message,
+/// so the list states its own failure and not a later one's.
+#[derive(Default, Debug, PartialEq, Eq)]
+enum ListStatus {
+    #[default]
+    Unread,
+    Loaded,
+    Failed(String),
 }
 
 /// The pane's two peer views. A run opened from one stays inside it, so
@@ -627,6 +638,7 @@ pub struct State {
     sequence: u64,
     pending: Option<(u64, Pending)>,
     rows: Vec<Summary>,
+    list_status: ListStatus,
     // The newest firing learned from an authoritative first history page.
     // Older pages and detail reads may update it, but cannot replace it.
     last_firings: BTreeMap<Uuid, (u64, Uuid)>,
@@ -822,11 +834,18 @@ impl State {
             match result {
                 Err(error) => {
                     if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
-                        self.history_status = HistoryStatus::Failed;
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                    }
+                    if matches!(
+                        pending,
+                        Pending::List { append: false } | Pending::RefreshList
+                    ) {
+                        self.list_status = ListStatus::Failed(error.clone());
                     }
                     self.error = Some(error);
                 }
                 Ok(Response::Listed(rows)) => {
+                    self.list_status = ListStatus::Loaded;
                     self.more = rows.len() == PAGE;
                     self.after = rows.last().map(|row| row.id);
                     if !matches!(pending, Pending::List { append: true }) {
@@ -849,11 +868,9 @@ impl State {
                     // Refreshing with an automation open also reads it and its
                     // newest runs; its poll keeps a stable page instead.
                     if matches!(pending, Pending::List { append: false })
-                        && self.run.is_none()
                         && let Some(id) = self.selected.as_ref().map(|selected| selected.id)
                     {
-                        self.history_status = HistoryStatus::Unrequested;
-                        return self.request(Pending::Show, Request::Show { id });
+                        return self.request(Pending::Reload, Request::Show { id });
                     }
                 }
                 Ok(Response::Automation(automation)) => {
@@ -876,8 +893,12 @@ impl State {
                             "Saved. Review the launch settings before enabling or running.".into(),
                         );
                     }
+                    // The loaded page stays until this read succeeds, so a
+                    // failed reload leaves the poll refreshing it in place.
                     return self.request(
-                        if self.history_status == HistoryStatus::Unrequested {
+                        if self.history_status == HistoryStatus::Unrequested
+                            || matches!(pending, Pending::Reload)
+                        {
                             Pending::History { append: false }
                         } else {
                             Pending::RefreshHistory
@@ -1411,8 +1432,9 @@ impl State {
     fn section_root(&self) -> Option<Action> {
         match self.section() {
             Section::RunHistory => self.run.is_some().then_some(Action::CloseRun),
-            Section::Automations => (self.run.is_some() || self.selected.is_some())
-                .then_some(Action::Browse),
+            Section::Automations => {
+                (self.run.is_some() || self.selected.is_some()).then_some(Action::Browse)
+            }
         }
     }
 
@@ -1487,68 +1509,74 @@ impl State {
     /// confirmation takes the switcher's place with its own trail, since each
     /// carries its own way out and its own primary action.
     fn header(&self, busy: bool, width: f32) -> Element<'_, Action> {
-        let inner = width - 2.0 * space::L;
+        let compact = width < COMPACT_HEADER_WIDTH;
+        let view = self.section().label();
         let mut row = widget::row::with_capacity(4)
             .spacing(space::S)
             .align_y(Alignment::Center)
             .height(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE));
-        let browsing = if let Some(draft) = &self.draft {
-            let current = if draft.base.is_some() {
-                "Edit automation"
-            } else {
-                "New automation"
-            };
-            row = row.push(breadcrumb(
-                [("Automations", Some(Action::CancelEdit))],
-                current,
-                inner,
-                busy,
-            ));
-            false
-        } else if let Some(confirmation) = &self.confirmation {
-            row = row.push(breadcrumb(
-                [("Automations", Some(Action::CancelConfirmation))],
-                confirmation.automation.definition.name.as_str(),
-                inner,
-                busy,
-            ));
-            false
-        } else {
-            row = row.push(crate::ui_controls::nested_view_tabs(
-                self.view_tabs(busy),
-                false,
-            ));
-            true
+        let opened = |id: Uuid| {
+            self.selected
+                .as_ref()
+                .filter(|selected| selected.id == id)
+                .map(|selected| selected.definition.name.as_str())
         };
-        if let Some((_, pending)) = self.pending.filter(|_| busy) {
-            row = row.push(crate::interaction::tooltip(
-                widget::container(crate::ui_controls::activity_spinner(
-                    14.0,
-                    crate::design::muted_color,
-                ))
-                .center(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE)),
-                progress_label(pending),
-            ));
-        } else if browsing {
-            row = row.push(
-                crate::ui_controls::icon_button(
-                    crate::ui_controls::Icon::Refresh,
-                    if self.run.is_some() {
-                        "Refresh run"
-                    } else if self.all_history {
-                        "Refresh run history"
+        let trail = if let Some(draft) = &self.draft {
+            // An edit returns to the automation it changes; a new draft to
+            // the view it was started from.
+            Some(match draft.base.and_then(|(id, _)| opened(id)) {
+                Some(name) => breadcrumb(
+                    [(view, None), (name, Some(Action::CancelEdit))],
+                    "Edit",
+                    Some(1),
+                    busy,
+                ),
+                None => breadcrumb(
+                    [(view, Some(Action::CancelEdit))],
+                    if draft.base.is_some() {
+                        "Edit automation"
                     } else {
-                        "Refresh automations"
+                        "New automation"
                     },
+                    None,
+                    busy,
+                ),
+            })
+        } else {
+            self.confirmation.as_ref().map(|confirmation| {
+                breadcrumb(
+                    [
+                        (view, None),
+                        (
+                            confirmation.automation.definition.name.as_str(),
+                            Some(Action::CancelConfirmation),
+                        ),
+                    ],
+                    match confirmation.request {
+                        Request::SetEnabled { .. } => "Enable",
+                        Request::RunNow { .. } => "Run now",
+                        _ => "Remove",
+                    },
+                    Some(1),
+                    busy,
                 )
-                .on_press(Action::Refresh),
-            );
-        }
-        if browsing {
+            })
+        };
+        let progress = self
+            .pending
+            .filter(|_| busy)
+            .map(|(_, pending)| progress_label(pending));
+        let Some(trail) = trail else {
+            row = row
+                .push(crate::ui_controls::nested_view_tabs(
+                    self.view_tabs(busy),
+                    compact,
+                ))
+                .push(self.refresh_control(progress));
             let new = (!busy).then_some(Action::New);
             // A narrow pane keeps one row by naming the command in its
             // tooltip instead of its label.
-            let button: Element<'_, Action> = if width < COMPACT_HEADER_WIDTH {
+            let button: Element<'_, Action> = if compact {
                 crate::ui_controls::icon_button(crate::ui_controls::Icon::Plus, "New automation")
                     .on_press_maybe(new)
                     .into()
@@ -1557,12 +1585,62 @@ impl State {
                     .on_press_maybe(new)
                     .into()
             };
-            row = row.push(button);
+            return widget::container(row.push(button))
+                .padding([space::S, space::L])
+                .width(Length::Fill)
+                .into();
+        };
+        row = row.push(trail);
+        if let Some(progress) = progress {
+            row = row.push(crate::interaction::tooltip(
+                widget::container(crate::ui_controls::activity_spinner(
+                    14.0,
+                    crate::design::muted_color,
+                ))
+                .center(Length::Fixed(crate::design::PRIMARY_CONTROL_SIZE)),
+                progress,
+            ));
         }
         widget::container(row)
             .padding([space::S, space::L])
             .width(Length::Fill)
             .into()
+    }
+
+    /// Refresh, which stays the same control while the work it started is
+    /// in flight: disabled, with progress in place of its glyph and the work
+    /// as its name, so a keyboard user's focus stays on it.
+    ///
+    /// Its tooltip belongs to the glyph rather than the button, so it can
+    /// still name the work while the button is disabled.
+    fn refresh_control(&self, progress: Option<&'static str>) -> Element<'_, Action> {
+        let label = progress.unwrap_or(if self.run.is_some() {
+            "Refresh run"
+        } else if self.all_history {
+            "Refresh run history"
+        } else {
+            "Refresh automations"
+        });
+        let glyph: Element<'_, Action> = match progress {
+            Some(_) => crate::ui_controls::activity_spinner(14.0, crate::design::muted_color),
+            None => widget::icon(crate::ui_controls::Icon::Refresh.handle())
+                .size(crate::design::ROW_ICON_SIZE)
+                .into(),
+        };
+        widget::button::custom(crate::interaction::tooltip(
+            widget::container(glyph)
+                .class(crate::design::transparent())
+                .center(Length::Fill),
+            label,
+        ))
+        .id(refresh_id())
+        .name(label)
+        .class(crate::ui_controls::control_style(false, None))
+        .width(crate::design::PRIMARY_CONTROL_SIZE)
+        .height(crate::design::PRIMARY_CONTROL_SIZE)
+        .padding(0)
+        .on_press_maybe(progress.is_none().then_some(Action::Refresh))
+        .into()
     }
 
     fn view_layout(&self, size: cosmic::iced::Size) -> Element<'_, Action> {
@@ -1580,20 +1658,34 @@ impl State {
         // A failed read that left nothing to show is stated in place, beside
         // its retry, rather than above it as well.
         let browsing = self.draft.is_none() && self.confirmation.is_none() && self.run.is_none();
-        let list_failed = browsing
-            && !self.all_history
-            && self.selected.is_none()
-            && self.rows.is_empty()
-            && !busy
-            && self.error.is_some();
-        let history_failed = browsing
-            && (self.all_history || self.selected.is_some())
-            && self.history_status == HistoryStatus::Failed
-            && self.history.is_empty();
+        // The list's own failure, while it is the list's whole content.
+        let list_failure = match &self.list_status {
+            ListStatus::Failed(error)
+                if browsing
+                    && !self.all_history
+                    && self.selected.is_none()
+                    && self.rows.is_empty()
+                    && !busy =>
+            {
+                Some(error.as_str())
+            }
+            _ => None,
+        };
+        // The history's own failure, while it has nothing else to show.
+        let history_failure = match &self.history_status {
+            HistoryStatus::Failed(error)
+                if browsing
+                    && (self.all_history || self.selected.is_some())
+                    && self.history.is_empty() =>
+            {
+                Some(error.as_str())
+            }
+            _ => None,
+        };
         if let Some(error) = &self.error
             && self.draft.is_none()
-            && !list_failed
-            && !history_failed
+            && list_failure != Some(error.as_str())
+            && history_failure != Some(error.as_str())
         {
             content = content.push(
                 crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
@@ -1710,7 +1802,7 @@ impl State {
                     // so no statement anticipates the list or selection it is
                     // about to replace. Rows already on screen keep theirs.
                     let empty = if self.selected.is_some()
-                        || matches!(self.pending, Some((_, Pending::Show)))
+                        || matches!(self.pending, Some((_, Pending::Show | Pending::Reload)))
                     {
                         None
                     } else if !self.rows.is_empty() {
@@ -1720,13 +1812,24 @@ impl State {
                         )
                     } else if busy {
                         None
-                    } else if let Some(error) = self.error.as_deref().filter(|_| list_failed) {
+                    } else if let Some(error) = list_failure {
                         Some(
                             crate::ui_controls::placeholder("Couldn't load automations")
                                 .icon(crate::ui_controls::Icon::Warning.handle())
                                 .detail(error)
                                 .action(
                                     crate::ui_controls::button::secondary("Retry")
+                                        .on_press(Action::Refresh),
+                                ),
+                        )
+                    } else if self.list_status == ListStatus::Unread {
+                        // Another read, such as an alert's run, took the
+                        // list's place before it was read.
+                        Some(
+                            crate::ui_controls::placeholder("Automations aren't loaded")
+                                .icon(crate::ui_controls::Icon::Alarm.handle())
+                                .action(
+                                    crate::ui_controls::button::secondary("Load automations")
                                         .on_press(Action::Refresh),
                                 ),
                         )
@@ -1811,20 +1914,20 @@ impl State {
                             "Newer runs are available. Refresh to show the latest page.",
                         ));
                     }
-                    let empty = match self.history_status {
+                    let empty = match &self.history_status {
                         HistoryStatus::Loading if self.history.is_empty() => {
                             Some(crate::ui_controls::placeholder("Loading run history…"))
                         }
-                        HistoryStatus::Failed if history_failed => Some(
+                        HistoryStatus::Failed(error) if self.history.is_empty() => Some(
                             crate::ui_controls::placeholder("Couldn't load run history")
                                 .icon(crate::ui_controls::Icon::Warning.handle())
-                                .detail(self.error.as_deref().unwrap_or_default())
+                                .detail(error)
                                 .action(
                                     crate::ui_controls::button::secondary("Retry")
                                         .on_press_maybe((!busy).then_some(Action::History)),
                                 ),
                         ),
-                        HistoryStatus::Failed => {
+                        HistoryStatus::Failed(_) => {
                             content = content.push(crate::design::caption(
                                 "Couldn't refresh run history. These runs may be out of date.",
                             ));
@@ -1883,12 +1986,7 @@ impl State {
                 }
             }
             if let Some(run) = &self.run {
-                content = content.push(breadcrumb(
-                    self.run_trail(run),
-                    "Run",
-                    width - 2.0 * space::L - crate::design::SCROLLBAR_GUTTER,
-                    busy,
-                ));
+                content = content.push(breadcrumb(self.run_trail(run), "Run", Some(1), busy));
                 content = content
                     .push(crate::design::title(format!(
                         "{} · {}",
@@ -1947,9 +2045,8 @@ impl State {
                 );
             }
         }
-        let vertical = || {
-            cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar())
-        };
+        let vertical =
+            || cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar());
         let content: Element<'_, Action> = if scrolls {
             widget::scrollable(content.padding(crate::design::with_vertical_rail(
                 cosmic::iced::Padding::from(space::L),
@@ -2451,28 +2548,34 @@ fn progress_label(pending: Pending) -> &'static str {
     match pending {
         Pending::List { .. } => "Loading automations…",
         Pending::Show => "Loading automation…",
+        Pending::Reload => "Refreshing automation…",
         Pending::Save => "Saving automation…",
         Pending::Mutate => "Updating automation…",
         Pending::History { .. } => "Loading run history…",
         Pending::Run => "Loading run…",
         Pending::OpenRun => "Opening agent…",
-        // Background reads draw no progress.
-        _ => "Refreshing…",
+        // Background reads draw no progress, but name themselves should one
+        // ever be shown.
+        Pending::RefreshList => "Refreshing automations…",
+        Pending::RefreshAutomation => "Refreshing automation…",
+        Pending::RefreshHistory | Pending::HistoryRun { .. } => "Refreshing run history…",
+        Pending::RefreshRun => "Refreshing run…",
     }
 }
 
 /// The levels above the current page on one line, then the page itself.
 ///
 /// A level with a press message is a way back to it, drawn unavailable while
-/// `busy`; one without cannot be returned to and is plain text. Long names
-/// end in an ellipsis within `width` and keep their full text in a tooltip.
+/// `busy`; one without cannot be returned to and is plain text. The level at
+/// `name` names an automation. It alone gives up width, ending in an
+/// ellipsis with its full text in a tooltip, so the views and the current
+/// page around it always keep their whole labels.
 fn breadcrumb<'a>(
     parents: impl IntoIterator<Item = (&'a str, Option<Action>)>,
     current: &'a str,
-    width: f32,
+    name: Option<usize>,
     busy: bool,
 ) -> Element<'a, Action> {
-    let longest = (width - TRAIL_RESERVE).max(TRAIL_RESERVE);
     let label = |text: &'a str| {
         crate::design::body(text)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -2483,39 +2586,46 @@ fn breadcrumb<'a>(
     let mut trail = widget::row::with_capacity(5)
         .spacing(space::XXS)
         .align_y(Alignment::Center);
-    for (text, action) in parents {
+    for (index, (text, action)) in parents.into_iter().enumerate() {
+        let named = name == Some(index);
         let crumb: Element<'a, Action> = match action {
             Some(action) => {
-                let name = format!("Back to {text}");
+                let back = format!("Back to {text}");
                 crate::interaction::tooltip(
                     crate::interaction::hover(
                         widget::button::custom(label(text))
-                            .name(name.clone())
+                            .name(back.clone())
                             .class(crumb_style())
                             .padding([space::XXS, space::XS])
                             .on_press_maybe((!busy).then_some(action)),
                     ),
-                    name,
+                    back,
                 )
             }
-            None => crate::interaction::tooltip(
-                widget::container(
+            None => {
+                let crumb = widget::container(
                     label(text).class(cosmic::theme::Text::Custom(crate::design::muted_text)),
                 )
-                .padding([space::XXS, space::XS]),
-                text,
-            ),
+                .padding([space::XXS, space::XS]);
+                if named {
+                    crate::interaction::tooltip(crumb, text)
+                } else {
+                    crumb.into()
+                }
+            }
         };
         trail = trail
-            .push(widget::container(crumb).max_width(longest))
+            .push(if named {
+                crate::ui_controls::shrinkable(crumb)
+            } else {
+                crumb
+            })
             .push(crate::ui_controls::passive_icon(
                 crate::ui_controls::Icon::ChevronRight.handle(),
                 crate::design::COMPACT_ICON_SIZE,
             ));
     }
-    trail
-        .push(widget::container(label(current)).max_width(longest))
-        .into()
+    trail.push(label(current)).into()
 }
 
 /// A trail level that leads back: quiet until hovered, as a peer view tab
@@ -2525,8 +2635,7 @@ fn crumb_style() -> cosmic::theme::Button {
     let appearance = |focused: bool, theme: &cosmic::Theme| {
         let component = &theme.current_container().component;
         widget::button::Style {
-            background: focused
-                .then(|| Background::Color(component.selected_state_color().into())),
+            background: focused.then(|| Background::Color(component.selected_state_color().into())),
             text_color: Some(crate::design::muted_color(theme)),
             ..crate::design::button_style()
         }
@@ -2580,6 +2689,9 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
         button = button.on_press(action);
     }
     button.width(Length::Fill).into()
+}
+fn refresh_id() -> widget::Id {
+    widget::Id::new("automation.refresh")
 }
 pub fn draft_dialog_focus_id() -> widget::Id {
     widget::Id::new("dialog.automation-draft.keep")
@@ -3138,12 +3250,7 @@ mod tests {
         ) {
             visit(self);
         }
-        fn text(
-            &mut self,
-            _: Option<&widget::Id>,
-            bounds: cosmic::iced::Rectangle,
-            text: &str,
-        ) {
+        fn text(&mut self, _: Option<&widget::Id>, bounds: cosmic::iced::Rectangle, text: &str) {
             self.texts.push((text.to_owned(), bounds));
         }
         fn text_input(
@@ -3193,6 +3300,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label:?} is drawn"))
                 .1
         }
+
+        /// The last text that reads `label`: below the header, when both
+        /// draw it.
+        fn last(&self, label: &str) -> cosmic::iced::Rectangle {
+            self.texts
+                .iter()
+                .rfind(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label:?} is drawn"))
+                .1
+        }
     }
 
     #[test]
@@ -3231,7 +3348,14 @@ mod tests {
             }
         }
         // With nothing to filter, the pane offers no field and says so.
-        let empty = Outline::of(&State::default(), 480.0, 700.0);
+        let empty = Outline::of(
+            &State {
+                list_status: ListStatus::Loaded,
+                ..Default::default()
+            },
+            480.0,
+            700.0,
+        );
         assert!(empty.field.is_none());
         assert!(empty.text("Automations").y < empty.text("No automations yet").y);
     }
@@ -3284,16 +3408,19 @@ mod tests {
         assert_eq!(selected(&state, false), Section::RunHistory);
         let [(root, back), (name, automation_link)] = state.run_trail(&detail);
         assert_eq!((root, name), ("Run history", "Daily review"));
-        assert!(automation_link.is_none(), "the trail stays inside Run history");
+        assert!(
+            automation_link.is_none(),
+            "the trail stays inside Run history"
+        );
         assert!(matches!(back, Some(Action::CloseRun)));
         assert!(
-            matches!(
-                state.view_tabs(false)[1].on_press,
-                Some(Action::CloseRun)
-            ),
+            matches!(state.view_tabs(false)[1].on_press, Some(Action::CloseRun)),
             "the current tab also returns to the page"
         );
-        assert!(state.update(Action::CloseRun).is_none(), "closing a run reads nothing");
+        assert!(
+            state.update(Action::CloseRun).is_none(),
+            "closing a run reads nothing"
+        );
         assert!(state.run.is_none());
         assert_eq!(selected(&state, false), Section::RunHistory);
         assert_eq!(state.history.len(), 1, "the history page is kept");
@@ -3363,6 +3490,50 @@ mod tests {
             matches!(state.pending, Some((_, Pending::History { append: false }))),
             "the newest page replaces the kept one"
         );
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_loaded_history_for_the_poll_to_refresh() {
+        use crate::automations::FiringState;
+        let owner = automation();
+        let kept = history_firing(100, FiringState::Succeeded);
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner.clone()),
+            history: vec![kept.clone()],
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!("the list is read first");
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![owner.summary(None)]))),
+        }) else {
+            panic!("then the open automation");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline".into())),
+        });
+        assert_eq!(state.history_status, HistoryStatus::Loaded);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("the poll resumes");
+        };
+        assert!(matches!(
+            state.pending,
+            Some((_, Pending::RefreshAutomation))
+        ));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        });
+        assert!(
+            matches!(state.pending, Some((_, Pending::RefreshHistory))),
+            "the poll refreshes the loaded page in the background"
+        );
+        assert_eq!(state.history.len(), 1, "the loaded page stays on screen");
     }
 
     /// The buttons the pane announces, by accessible name, and whether each
@@ -3463,28 +3634,167 @@ mod tests {
 
     #[test]
     fn an_empty_list_is_not_claimed_while_reading_or_after_a_failed_read() {
-        let says_empty = |state: &State| {
+        let texts = |state: &State| {
             Outline::of(state, 900.0, 700.0)
                 .texts
-                .iter()
-                .any(|(text, _)| text == "No automations yet")
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
         };
-        assert!(says_empty(&State::default()));
+        let says = |state: &State, text: &str| texts(state).iter().any(|drawn| drawn == text);
+        let fail = |state: &mut State, pending: Pending, error: &str| {
+            state.pending = Some((7, pending));
+            state.update(Action::Received {
+                sequence: 7,
+                result: std::sync::Arc::new(Err(error.into())),
+            });
+        };
+        let loaded = State {
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        assert!(says(&loaded, "No automations yet"));
         // An alert opening its run before any list has been read.
         let mut state = State {
             pending: Some((1, Pending::Run)),
             ..Default::default()
         };
-        assert!(!says_empty(&state), "a read in flight is not an empty list");
-        state.pending = None;
-        state.error = Some("Daemon unavailable".into());
-        assert!(!says_empty(&state), "a failed read is not an empty list");
         assert!(
-            buttons(&state, 900.0)
-                .into_iter()
-                .any(|(name, enabled)| enabled && name == "Retry"),
-            "a failed read offers a retry"
+            !says(&state, "No automations yet"),
+            "a read in flight is not an empty list"
         );
+
+        // The run's failure is its own: the list was never read, not empty
+        // and not failed.
+        fail(&mut state, Pending::Run, "Run unavailable");
+        assert!(says(&state, "Run unavailable"), "{:?}", texts(&state));
+        assert!(!says(&state, "No automations yet"));
+        assert!(!says(&state, "Couldn't load automations"));
+        assert!(
+            buttons(&state, 900.0).contains(&("Load automations".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+
+        // The list's own failure is stated once, in place, with a retry.
+        fail(
+            &mut state,
+            Pending::List { append: false },
+            "Daemon unavailable",
+        );
+        assert!(says(&state, "Couldn't load automations"));
+        assert!(!says(&state, "No automations yet"));
+        assert_eq!(
+            texts(&state)
+                .iter()
+                .filter(|text| *text == "Daemon unavailable")
+                .count(),
+            1,
+            "{:?}",
+            texts(&state)
+        );
+        assert!(
+            buttons(&state, 900.0).contains(&("Retry".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+
+        // A later failure elsewhere is not the list's.
+        let mut state = loaded;
+        fail(&mut state, Pending::Run, "Run unavailable");
+        assert!(says(&state, "Run unavailable"));
+        assert!(!says(&state, "Couldn't load automations"));
+    }
+
+    #[test]
+    fn a_long_name_gives_up_width_before_the_trail_around_it() {
+        let mut owner = automation();
+        owner.definition.name =
+            "Summarize every pull request opened against the release branch overnight".to_owned();
+        let state = State {
+            all_history: true,
+            run: Some(run_of(&owner)),
+            ..Default::default()
+        };
+        let wide = Outline::of(&state, 2000.0, 700.0);
+        let name = owner.definition.name.as_str();
+        for width in [300.0, 360.0, 480.0] {
+            let outline = Outline::of(&state, width, 700.0);
+            for level in ["Run history", "Run"] {
+                assert!(
+                    outline.last(level).width >= wide.last(level).width - 0.5,
+                    "at {width} px {level:?} keeps its whole label: {:?} of {:?}",
+                    outline.last(level),
+                    wide.last(level)
+                );
+            }
+            let run = outline.last("Run");
+            assert!(
+                run.x + run.width <= width,
+                "at {width} px the trail ends inside the pane: {run:?}"
+            );
+            assert!(
+                outline.text(name).width < wide.text(name).width,
+                "at {width} px the name is shortened instead"
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_trail_returns_to_the_view_it_was_started_from() {
+        let mut state = State::default();
+        state.update(Action::AllHistory);
+        state.pending = None;
+        state.update(Action::New);
+        let trail = buttons(&state, 900.0);
+        assert!(
+            trail.contains(&("Back to Run history".to_owned(), true)),
+            "{trail:?}"
+        );
+        assert!(!trail.iter().any(|(name, _)| name == "Back to Automations"));
+        state.update(Action::CancelEdit);
+        assert!(state.draft.is_none());
+        assert_eq!(state.section(), Section::RunHistory);
+
+        // An edit leads back to the automation it changes.
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner),
+            ..Default::default()
+        };
+        state.update(Action::Edit);
+        assert!(
+            buttons(&state, 900.0).contains(&("Back to Daily review".to_owned(), true)),
+            "{:?}",
+            buttons(&state, 900.0)
+        );
+    }
+
+    #[test]
+    fn refresh_stays_in_place_while_its_work_is_in_flight() {
+        let state = |pending| State {
+            rows: vec![automation().summary(None)],
+            list_status: ListStatus::Loaded,
+            pending,
+            ..Default::default()
+        };
+        let idle = buttons(&state(None), 900.0);
+        let busy = buttons(&state(Some((1, Pending::List { append: false }))), 900.0);
+        let at = |buttons: &[(String, bool)], name: &str| {
+            buttons
+                .iter()
+                .position(|(label, _)| label == name)
+                .unwrap_or_else(|| panic!("{name:?} in {buttons:?}"))
+        };
+        let refresh = at(&idle, "Refresh automations");
+        assert!(idle[refresh].1);
+        assert_eq!(
+            at(&busy, "Loading automations…"),
+            refresh,
+            "the same control names the work: {busy:?}"
+        );
+        assert!(!busy[refresh].1, "and cannot start it again");
     }
 
     #[test]
@@ -3799,7 +4109,10 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Err("offline".into())),
         });
-        assert_eq!(state.history_status, HistoryStatus::Failed);
+        assert_eq!(
+            state.history_status,
+            HistoryStatus::Failed("offline".into())
+        );
         let Some(Effect::Request { sequence, .. }) = state.update(Action::History) else {
             panic!("history retry expected");
         };

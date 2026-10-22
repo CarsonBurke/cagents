@@ -132,11 +132,7 @@ fn tab_button<'a, Message: Clone + 'a>(
         .selected(selected)
         .padding([0.0, if compact { space::S } else { space::M }])
         .height(view_tab_height(compact))
-        .on_press_maybe(if selected && !returns {
-            None
-        } else {
-            on_press
-        });
+        .on_press_maybe(if selected && !returns { None } else { on_press });
     if let Some(id) = id {
         button = button.id(id);
     }
