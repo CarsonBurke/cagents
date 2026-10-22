@@ -7,6 +7,7 @@ pub enum ImageAssetCommand {
     List,
     /// Remove one exact image receipt. Drafts and saved history may lose that image.
     Remove {
+        /// Exact image receipt UUID from image-assets list.
         id: uuid::Uuid,
         /// Exact lowercase SHA-256 from image-assets list; refuses a stale or mismatched receipt.
         #[arg(long)]
