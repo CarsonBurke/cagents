@@ -631,7 +631,7 @@ mod tests {
             return;
         };
         let links = [
-            format!("file://{}/tmp/a%20b", host.to_uppercase()),
+            format!("file://{}/tmp/a%20b", host.to_ascii_uppercase()),
             "file://elsewhere/tmp/c".into(),
         ];
         let expected = ["file:///tmp/a%20b", "file://elsewhere/tmp/c"];

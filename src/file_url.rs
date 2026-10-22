@@ -8,11 +8,20 @@
 //! machine's own name needs a lookup, which [`localize`] makes.
 use url::Url;
 
-/// This machine's host name, as `gethostname` reports it.
+/// This machine's name as a file URL's host spells it, which is how
+/// [`localize`] compares it: lowercase, non-ASCII labels in punycode, an
+/// all-numeric name as the IPv4 address `Url` reads it as. `None` when the
+/// machine has no name a URL host can hold, or one, like `localhost`, that a
+/// file URL reads as no host at all.
 ///
 /// Read afresh on each call: the name can change while a long-lived process
 /// runs, and the programs that put it into URLs read it when they run.
 pub(crate) fn host_name() -> Option<String> {
+    url_host(&system_host_name()?)
+}
+
+/// This machine's name as `gethostname` reports it.
+fn system_host_name() -> Option<String> {
     let mut buffer = [0u8; 256];
     // SAFETY: the pointer and length describe `buffer`, which outlives the
     // call; gethostname writes at most that many bytes into it.
@@ -22,10 +31,17 @@ pub(crate) fn host_name() -> Option<String> {
     // POSIX leaves a truncated name unterminated, and a truncated name is
     // not this machine's, so it matches nothing rather than a prefix.
     let name = std::ffi::CStr::from_bytes_until_nul(&buffer).ok()?;
-    name.to_str()
+    name.to_str().ok().map(str::to_owned)
+}
+
+/// Spells `name` as the host of a file URL naming it: parsed as `Url` parses
+/// a file URL's host, which also refuses an empty name and anything a host
+/// cannot hold.
+fn url_host(name: &str) -> Option<String> {
+    url::Host::parse(name)
         .ok()
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
+        .map(|host| host.to_string())
+        .filter(|host| host != "localhost")
 }
 
 /// Removes the host from a file URL that names this machine as `local_host`,
@@ -33,11 +49,9 @@ pub(crate) fn host_name() -> Option<String> {
 /// accepts. Returns whether it did; any other URL is left as it is.
 ///
 /// `local_host` is asked only for a file URL that names a host, so the common
-/// host-less links never look this machine's name up; pass [`host_name`] or a
-/// name already in hand.
-///
-/// Host names compare without regard to ASCII case, as DNS names do. `Url`
-/// lowercases the host it parses, while `gethostname` may not.
+/// host-less links never look this machine's name up. It must be spelled as
+/// [`host_name`] spells it; pass that or a name it returned earlier. Names
+/// compare without regard to ASCII case, as DNS names do.
 pub(crate) fn localize<S: AsRef<str>>(
     url: &mut Url,
     local_host: impl FnOnce() -> Option<S>,
@@ -60,14 +74,13 @@ pub(crate) fn localize<S: AsRef<str>>(
     }
 }
 
-/// This machine's name, when a file URL can carry it as a host. A name that
-/// URLs read as no host, such as `localhost`, or cannot hold, is none; tests
-/// that need a real name skip without one.
+/// This machine's name as `gethostname` reports it, and as programs put it
+/// into the links they print, when [`localize`] will recognize it as this
+/// machine's: `None` exactly when [`host_name`] is. Tests that need a real
+/// name skip without one.
 #[cfg(test)]
 pub(crate) fn test_host_name() -> Option<String> {
-    host_name().filter(|name| {
-        Url::parse(&format!("file://{name}/")).is_ok_and(|url| url.host_str().is_some())
-    })
+    system_host_name().filter(|name| url_host(name).is_some())
 }
 
 #[cfg(test)]
@@ -134,8 +147,38 @@ mod tests {
     }
 
     #[test]
-    fn a_host_name_is_whole_or_absent() {
-        // A machine may have no name; gethostname must not yield an empty one.
-        assert!(host_name().is_none_or(|name| !name.is_empty() && !name.contains('\0')));
+    fn a_name_is_spelled_as_a_parsed_file_url_spells_its_host() {
+        for (name, spelled) in [
+            ("Workstation", Some("workstation")),
+            ("1234", Some("0.0.4.210")),
+            ("café", Some("xn--caf-dma")),
+            ("LocalHost", None),
+            ("", None),
+            ("a/b", None),
+            ("a b", None),
+        ] {
+            assert_eq!(url_host(name).as_deref(), spelled, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn numeric_and_international_names_match_the_links_that_carry_them() {
+        // `ls --hyperlink` writes the name as `gethostname` reports it.
+        for (name, link) in [
+            ("1234", "file://1234/tmp/a%20b"),
+            ("café", "file://café/tmp/a%20b"),
+            ("café", "file://CAF%C3%A9/tmp/a%20b"),
+        ] {
+            let mut url = Url::parse(link).unwrap();
+            assert!(localize(&mut url, || url_host(name)), "{link}");
+            assert_eq!(url.to_file_path(), Ok(PathBuf::from("/tmp/a b")), "{link}");
+        }
+        let mut url = Url::parse("file://1235/tmp/a").unwrap();
+        assert!(!localize(&mut url, || url_host("1234")));
+    }
+
+    #[test]
+    fn the_test_name_is_present_exactly_when_the_spelled_one_is() {
+        assert_eq!(test_host_name().is_some(), host_name().is_some());
     }
 }
