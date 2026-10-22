@@ -278,15 +278,37 @@ struct Publication {
     clock: Option<SourceClock>,
     resident: bool,
     lineage: append::Lineage,
+    // Ready before installation: hide performs no body/metadata derivation.
+    // Metadata nodes have no pair and own no body or append authority.
+    hidden: Option<Arc<Publication>>,
 }
 
 impl Publication {
     fn initial(snapshot: Snapshot) -> Arc<Self> {
-        Arc::new(Self {
-            clock: SourceClock::from_sample(snapshot.sampled_at, Instant::now()),
-            snapshot: Arc::new(snapshot),
-            resident: true,
+        let clock = SourceClock::from_sample(snapshot.sampled_at, Instant::now());
+        Self::resident(snapshot, clock, append::Lineage::default())
+    }
+
+    fn resident(
+        snapshot: Snapshot,
+        clock: Option<SourceClock>,
+        lineage: append::Lineage,
+    ) -> Arc<Self> {
+        let mut metadata = snapshot.clone();
+        metadata.evict_transcript();
+        let hidden = Arc::new(Self {
+            snapshot: Arc::new(metadata),
+            clock,
+            resident: false,
             lineage: append::Lineage::default(),
+            hidden: None,
+        });
+        Arc::new(Self {
+            snapshot: Arc::new(snapshot),
+            clock,
+            resident: true,
+            lineage,
+            hidden: Some(hidden),
         })
     }
 
@@ -298,12 +320,17 @@ impl Publication {
     ) -> Arc<Self> {
         let mut clock = base.clock;
         SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
-        Arc::new(Self {
-            snapshot: Arc::new(snapshot),
-            clock,
-            resident,
-            lineage,
-        })
+        if resident {
+            Self::resident(snapshot, clock, lineage)
+        } else {
+            Arc::new(Self {
+                snapshot: Arc::new(snapshot),
+                clock,
+                resident: false,
+                lineage: append::Lineage::default(),
+                hidden: None,
+            })
+        }
     }
 }
 
@@ -330,24 +357,16 @@ impl Publications {
         final_body: bool,
     ) -> Option<bool> {
         let base = self.current.load_full();
-        let mut metadata = snapshot.clone();
-        metadata.evict_transcript();
         let mut clock = base.clock;
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         }
-        let full = Arc::new(Publication {
-            snapshot: Arc::new(snapshot),
-            clock,
-            resident: true,
-            lineage: append::Lineage::default(),
-        });
-        let metadata = Arc::new(Publication {
-            snapshot: Arc::new(metadata),
-            clock,
-            resident: false,
-            lineage: append::Lineage::default(),
-        });
+        let full = Publication::resident(snapshot, clock, append::Lineage::default());
+        let metadata = full
+            .hidden
+            .as_ref()
+            .expect("resident publication has ready metadata")
+            .clone();
         self.publish(&base, body, Some(full), metadata, final_body)
     }
 
@@ -929,10 +948,8 @@ impl ClientHandle {
             .apply(&base.snapshot)
             .expect("fixture publication obeys production fences");
         lineage.record(candidates, &next);
-        let mut metadata = next.clone();
-        metadata.evict_transcript();
         let full = Publication::next(&base, next, true, lineage);
-        let metadata = Publication::next(&base, metadata, false, append::Lineage::default());
+        let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
             &self.inner.body_requested,
@@ -1705,10 +1722,8 @@ impl ClientHandle {
                             let candidates = append::Lineage::candidates(&update, &base.snapshot);
                             update.apply(&base.snapshot).map(|next| {
                                 let mut lineage = base.lineage.clone(); lineage.record(candidates, &next);
-                                let mut metadata = next.clone(); metadata.evict_transcript();
                                 let full = Publication::next(&base, next, true, lineage);
-                                let metadata = Arc::new(Publication { snapshot: Arc::new(metadata), clock: full.clock,
-                                    resident: false, lineage: append::Lineage::default() });
+                                let metadata = full.hidden.as_ref().unwrap().clone();
                                 (Some(full), metadata)
                             })
                         } else {
@@ -1739,7 +1754,12 @@ impl ClientHandle {
                             let mut snapshot = (*base.snapshot).clone();
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
-                            let mut proposed = Some(Arc::new(Publication { snapshot: Arc::new(snapshot), clock: base.clock, resident: base.resident, lineage: base.lineage.clone() }));
+                            let mut proposed = Some(if base.resident {
+                                Publication::resident(snapshot, base.clock, base.lineage.clone())
+                            } else {
+                                Arc::new(Publication { snapshot: Arc::new(snapshot), clock: base.clock, resident: false,
+                                    lineage: append::Lineage::default(), hidden: None })
+                            });
                             let (old, current) = {
                                 let _guard = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
                                 let current = publication.current.load_full();
@@ -1869,10 +1889,8 @@ impl ClientHandle {
             Ordering::AcqRel,
         );
         let base = self.inner.publication.current.load_full();
-        let mut metadata = update.clone();
-        metadata.evict_transcript();
         let full = Publication::next(&base, update, true, append::Lineage::default());
-        let metadata = Publication::next(&base, metadata, false, append::Lineage::default());
+        let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
             &self.inner.body_requested,
@@ -2111,64 +2129,38 @@ impl ClientHandle {
             return Err("Chat is disconnected".into());
         }
         let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
-        let body_changed;
-        loop {
-            let base = self.inner.publication.current.load_full();
-            let next = if retain_body {
-                Arc::new(Publication {
-                    snapshot: base.snapshot.clone(),
-                    clock: base.clock,
-                    resident: base.resident,
-                    lineage: base.lineage.clone(),
-                })
+        let (old, current, result) = {
+            let _guard = self
+                .inner
+                .publication
+                .commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let current = self.inner.publication.current.load_full();
+            if !self.inner.alive.load(Ordering::Acquire) {
+                (None, current, Err("Chat is disconnected"))
             } else {
-                let mut metadata = (*base.snapshot).clone();
-                metadata.evict_transcript();
-                Arc::new(Publication {
-                    snapshot: Arc::new(metadata),
-                    clock: base.clock,
-                    resident: false,
-                    lineage: append::Lineage::default(),
-                })
-            };
-            // Proposal allocation, body eviction and lineage cloning are done.
-            let (old, current, committed) = {
-                let _guard = self
+                let body_changed = self
                     .inner
-                    .publication
-                    .commit
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                let current = self.inner.publication.current.load_full();
-                if !self.inner.alive.load(Ordering::Acquire) {
-                    (None, current, Err("Chat is disconnected"))
-                } else if !Arc::ptr_eq(&base, &current) {
-                    (None, current, Ok(None))
+                    .body_requested
+                    .swap(retain_body, Ordering::AcqRel)
+                    != retain_body;
+                let old = if !retain_body {
+                    current
+                        .hidden
+                        .as_ref()
+                        .map(|metadata| self.inner.publication.current.swap(metadata.clone()))
                 } else {
-                    let changed = self
-                        .inner
-                        .body_requested
-                        .swap(retain_body, Ordering::AcqRel)
-                        != retain_body;
-                    let old = if changed || (!retain_body && current.resident) {
-                        Some(self.inner.publication.current.swap(next))
-                    } else {
-                        None
-                    };
-                    (old, current, Ok(Some(changed)))
-                }
-            };
-            drop(old);
-            drop(current);
-            match committed {
-                Err(message) => return Err(message.into()),
-                Ok(None) => continue,
-                Ok(Some(changed)) => {
-                    body_changed = changed;
-                    break;
-                }
+                    None
+                };
+                (old, current, Ok(body_changed))
             }
-        }
+        };
+        // No retry, allocation, Snapshot/lineage cloning or destruction under
+        // the gate. Show keeps the body-free node until fresh hydration arrives.
+        drop(old);
+        drop(current);
+        let body_changed = result.map_err(str::to_owned)?;
         if interested && (changed || body_changed) {
             // Controls can use retained metadata immediately. The visibility
             // notification triggers an unconditional read for evicted history,
