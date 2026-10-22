@@ -338,15 +338,23 @@ struct Publications {
     current: ArcSwap<Publication>,
     // Only writers use this gate. All body derivation and destruction happens
     // outside it; UI presentation readers never acquire a producer lock.
-    commit: Mutex<()>,
+    commit: Mutex<u64>,
 }
 
 impl Publications {
     fn new(snapshot: Snapshot) -> Self {
         Self {
             current: ArcSwap::from(Publication::initial(snapshot)),
-            commit: Mutex::new(()),
+            commit: Mutex::new(0),
         }
+    }
+
+    /// Pair the installed identity with body-policy revision before deriving
+    /// any proposal. Metadata can be the base of a full response, so identity
+    /// alone cannot fence a hide/show cycle while that response is built.
+    fn capture(&self) -> (Arc<Publication>, u64) {
+        let revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
+        (self.current.load_full(), *revision)
     }
 
     fn replace(
@@ -356,7 +364,7 @@ impl Publications {
         sample_clock: bool,
         final_body: bool,
     ) -> Option<bool> {
-        let base = self.current.load_full();
+        let (base, revision) = self.capture();
         let mut clock = base.clock;
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
@@ -367,7 +375,9 @@ impl Publications {
             .as_ref()
             .expect("resident publication has ready metadata")
             .clone();
-        self.publish(&base, body, Some(full), metadata, final_body)
+        #[cfg(test)]
+        tests::pause_before_replacement(self as *const Self as usize);
+        self.publish(&base, revision, body, Some(full), metadata, final_body)
     }
 
     /// The connection reader is the only source writer; visibility is a second
@@ -377,20 +387,23 @@ impl Publications {
     fn publish(
         &self,
         base: &Arc<Publication>,
+        revision: u64,
         body: &AtomicBool,
         mut full: Option<Arc<Publication>>,
         metadata: Arc<Publication>,
         final_body: bool,
     ) -> Option<bool> {
         let (old, current, result) = {
-            let _guard = self.commit.lock().unwrap_or_else(|p| p.into_inner());
+            let current_revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
             let current = self.current.load_full();
             if !final_body && current.snapshot.generation != base.snapshot.generation {
                 (None, current, None)
             } else {
                 let resident = full.is_some()
                     && (final_body
-                        || (Arc::ptr_eq(base, &current) && body.load(Ordering::Acquire)));
+                        || (*current_revision == revision
+                            && Arc::ptr_eq(base, &current)
+                            && body.load(Ordering::Acquire)));
                 let next = if resident {
                     full.take().unwrap()
                 } else {
@@ -941,7 +954,7 @@ impl ClientHandle {
     /// that lineage and cannot stand in for a streaming delta benchmark.
     #[cfg(test)]
     pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
-        let base = self.inner.publication.current.load_full();
+        let (base, revision) = self.inner.publication.capture();
         let mut lineage = base.lineage.clone();
         let candidates = append::Lineage::candidates(&update, &base.snapshot);
         let next = update
@@ -952,6 +965,7 @@ impl ClientHandle {
         let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
+            revision,
             &self.inner.body_requested,
             Some(full),
             metadata,
@@ -1710,7 +1724,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
-                        let base = publication.current.load_full();
+                        let (base, revision) = publication.capture();
                         let observed_user = update.changes.iter().any(|change| {
                             let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
                             item.role == super::Role::User
@@ -1735,7 +1749,7 @@ impl ClientHandle {
                         let committed = derived.map(|(full, metadata)| {
                             #[cfg(test)]
                             if full.is_some() { tests::pause_before_publication(id); }
-                            publication.publish(&base, &body_requested, full, metadata, false)
+                            publication.publish(&base, revision, &body_requested, full, metadata, false)
                         });
                         let accepted = matches!(committed, Ok(Some(_)));
                         user_item_seen.fetch_or(accepted && observed_user, Ordering::AcqRel);
@@ -1750,7 +1764,7 @@ impl ClientHandle {
                     ServerMessage::Error(error) => {
                         read_pending = false;
                         loop {
-                            let base = publication.current.load_full();
+                            let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
@@ -1761,9 +1775,9 @@ impl ClientHandle {
                                     lineage: append::Lineage::default(), hidden: None })
                             });
                             let (old, current) = {
-                                let _guard = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
+                                let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
                                 let current = publication.current.load_full();
-                                let old = if Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
+                                let old = if *current_revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
                                 (old, current)
                             };
                             let applied = old.is_some(); drop(old); drop(current);
@@ -1888,11 +1902,12 @@ impl ClientHandle {
                 .any(|item| item.role == super::Role::User),
             Ordering::AcqRel,
         );
-        let base = self.inner.publication.current.load_full();
+        let (base, revision) = self.inner.publication.capture();
         let full = Publication::next(&base, update, true, append::Lineage::default());
         let metadata = full.hidden.as_ref().unwrap().clone();
         self.inner.publication.publish(
             &base,
+            revision,
             &self.inner.body_requested,
             Some(full),
             metadata,
@@ -2130,7 +2145,7 @@ impl ClientHandle {
         }
         let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
         let (old, current, result) = {
-            let _guard = self
+            let mut revision = self
                 .inner
                 .publication
                 .commit
@@ -2145,6 +2160,11 @@ impl ClientHandle {
                     .body_requested
                     .swap(retain_body, Ordering::AcqRel)
                     != retain_body;
+                if body_changed {
+                    *revision = revision
+                        .checked_add(1)
+                        .expect("chat body-policy revision exhausted");
+                }
                 let old = if !retain_body {
                     current
                         .hidden
@@ -2322,6 +2342,21 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static REPLACEMENT_GATES: Mutex<
+        BTreeMap<usize, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = Mutex::new(BTreeMap::new());
+
+    pub(super) fn pause_before_replacement(owner: usize) {
+        let gate = REPLACEMENT_GATES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&owner);
+        if let Some((paused, resume)) = gate {
+            paused.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    }
 
     static PUBLICATION_GATES: Mutex<
         BTreeMap<TerminalId, (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
@@ -4614,6 +4649,244 @@ mod tests {
     #[test]
     fn hide_then_reveal_while_body_is_derived_requires_fresh_hydration() {
         paused_wire_publication(Some(true));
+    }
+
+    #[test]
+    fn second_hide_reveal_fences_full_hydration_derived_from_metadata() {
+        use crate::chat::{Item, ItemContent, Role};
+        let text = |body: &str| {
+            Arc::new(Item {
+                id: "live".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Text {
+                    text: body.into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+            })
+        };
+        let card = omp_card(None, None);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (first_read_tx, first_read_rx) = std::sync::mpsc::channel();
+        let (send_full_tx, send_full_rx) = std::sync::mpsc::channel();
+        let (fresh_read_tx, fresh_read_rx) = std::sync::mpsc::channel();
+        let (hydrate_tx, hydrate_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("expected start")
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            sampled_at: Some(1_000),
+                            items: vec![text("initial")],
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            // The first reveal requests a full body from nonresident metadata.
+            loop {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                match request.request {
+                    ClientRequest::ChatVisibility { visible: true, .. } => {
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            None,
+                            ServerMessage::ChatChanged { chat_id },
+                        );
+                    }
+                    ClientRequest::ChatVisibility { visible: false, .. } => {}
+                    ClientRequest::ChatRead {
+                        after_generation, ..
+                    } => {
+                        assert_eq!(after_generation, None);
+                        first_read_tx.send(()).unwrap();
+                        send_full_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            Some(request.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::ChatSnapshot {
+                                    chat_id,
+                                    snapshot: Some(Snapshot {
+                                        generation: 2,
+                                        sampled_at: Some(50_000),
+                                        items: vec![text("stale pre-hide body")],
+                                        ..Default::default()
+                                    }),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected first hydration request: {other:?}"),
+                }
+            }
+            loop {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                match request.request {
+                    ClientRequest::ChatVisibility { .. } => {}
+                    ClientRequest::ChatRead {
+                        after_generation, ..
+                    } => {
+                        assert_eq!(
+                            after_generation, None,
+                            "second hide/show must invalidate the full proposal even when metadata identity is unchanged"
+                        );
+                        fresh_read_tx.send(()).unwrap();
+                        hydrate_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        respond(
+                            &mut codec,
+                            &mut server,
+                            Some(request.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::ChatSnapshot {
+                                    chat_id,
+                                    snapshot: Some(Snapshot {
+                                        generation: 2,
+                                        sampled_at: Some(60_000),
+                                        items: vec![text("fresh authorized body")],
+                                        ..Default::default()
+                                    }),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected fresh hydration request: {other:?}"),
+                }
+            }
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            card,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let old = handle.snapshot();
+        handle.set_visible(false).unwrap();
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.set_visible(true).unwrap();
+        first_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        REPLACEMENT_GATES.lock().unwrap().insert(
+            Arc::as_ptr(&handle.inner.publication) as usize,
+            (paused_tx, resume_rx),
+        );
+        send_full_tx.send(()).unwrap();
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let metadata = handle.inner.publication.current.load_full();
+        assert!(!metadata.resident && metadata.hidden.is_none());
+        // This is the ABA case: second hide/show changes only body policy,
+        // retaining the identical nonresident Publication pointer.
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let hidden = handle.clone();
+        let hiding = thread::spawn(move || {
+            hidden.set_visible(false).unwrap();
+            hidden.set_visible(true).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("visibility must not wait for full hydration derivation");
+        hiding.join().unwrap();
+        assert!(Arc::ptr_eq(
+            &metadata,
+            &handle.inner.publication.current.load_full()
+        ));
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        assert_eq!(handle.snapshot_with_clock().1.unwrap().sampled_at, 1_000);
+        resume_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while handle.snapshot().generation != 2 {
+            assert!(
+                Instant::now() < until,
+                "full response proposal did not commit"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let fallback = handle.inner.publication.current.load_full();
+        assert!(
+            !fallback.resident,
+            "a second hide/show must reject the pre-hide full hydration proposal"
+        );
+        assert_eq!(fallback.snapshot.generation, 2);
+        assert_eq!(fallback.clock.unwrap().sampled_at, 50_000);
+        assert_eq!(fallback.snapshot.transcript_bytes(), 0);
+        assert!(fallback.lineage.is_empty());
+        fresh_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            handle.resident_snapshot_with_clock().is_none(),
+            "pre-hide full response was never admitted"
+        );
+        hydrate_tx.send(()).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let (snapshot, clock) = handle.snapshot_with_clock();
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(clock.unwrap().sampled_at, 60_000);
+        assert!(
+            matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "fresh authorized body")
+        );
+        assert!(!handle.known_append(&old.items[0], &snapshot.items[0]));
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
