@@ -128,6 +128,16 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
+    /// Inspect bounded lifecycle receipts (enable, disable, edits and system pauses).
+    Audit {
+        /// Automation ID, including a removed definition's retained audit.
+        id: Uuid,
+        /// Continue before the sequence returned as next by the previous page.
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        limit: usize,
+    },
     /// Read one immutable firing, including its bounded execution result.
     Run {
         #[arg(help = "The firing ID reported by history.")]
@@ -279,6 +289,35 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
         Response::History(history) => {
             let human = history_human(&history, now_ms());
             (json!({"history": history}), human)
+        }
+        Response::Audit(page) => {
+            let mut lines = page
+                .events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "{}\trevision {}\t{}\t{}\t{}",
+                        event.sequence,
+                        event.revision,
+                        timestamp_for_audit(event.occurred_ms),
+                        event.cause.label(),
+                        event.actor.label(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                lines.push("No recorded lifecycle events.".into());
+            }
+            if page.earlier_events_unavailable {
+                lines.push(
+                    "Earlier lifecycle events are unavailable; their actor and cause are unknown."
+                        .into(),
+                );
+            }
+            if let Some(next) = page.next {
+                lines.push(format!("Continue with --before {next}"));
+            }
+            (json!({"audit": page}), lines.join("\n"))
         }
         Response::Detail(detail) => {
             let human = format!(
@@ -513,6 +552,9 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
         ),
         AutomationCommand::Cancel { id, firing } => {
             ("automation.cancel", Request::Cancel { id, firing })
+        }
+        AutomationCommand::Audit { id, before, limit } => {
+            ("automation.audit", Request::Audit { id, before, limit })
         }
         AutomationCommand::History {
             id,
@@ -772,6 +814,36 @@ mod tests {
     }
 
     #[test]
+    fn automation_lifecycle_audit_is_read_only_scoped_and_has_a_bounded_cursor() {
+        let id = Uuid::new_v4().to_string();
+        assert!(parse(&["cagents", "automation", "audit"]).is_err());
+        assert!(parse(&["cagents", "automation", "audit", &id, "--limit", "101"]).is_err());
+        let (_, request) = request(
+            parse(&[
+                "cagents",
+                "automation",
+                "audit",
+                &id,
+                "--before",
+                "42",
+                "--limit",
+                "1",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            Request::Audit {
+                id: id.parse().unwrap(),
+                before: Some(42),
+                limit: 1
+            }
+        );
+        assert!(request.allowed_from_hosted_conversation());
+    }
+
+    #[test]
     fn automation_history_requires_the_complete_stable_cursor() {
         let (_, all) = request(parse(&["cagents", "automation", "history"]).unwrap()).unwrap();
         assert!(matches!(
@@ -888,4 +960,12 @@ mod tests {
             .allowed_from_hosted_conversation()
         );
     }
+}
+
+fn timestamp_for_audit(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(|value| jiff::Timestamp::from_millisecond(value).ok())
+        .map(|time| time.to_string())
+        .unwrap_or_else(|| format!("{ms} ms"))
 }

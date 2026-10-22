@@ -505,3 +505,72 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
         "retry identity cannot authorize another revision"
     );
 }
+
+#[test]
+fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
+    let mut fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/omp");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'unexpected provider\\n' >> \"$HOME/../unexpected-provider\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let definition = json!({
+        "name": "Lifecycle only", "prompt": "PRIVATE_LIFECYCLE_PROMPT",
+        "agent": {"provider": "Omp", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null},
+        "schedule": {"pattern": {"daily": {"hour": 3, "minute": 0}}, "timezone": "UTC"},
+        "session_mode": "fresh", "precheck": null
+    });
+    let path = fixture.root.path().join("audit-definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap().to_owned();
+    fixture.cli(&["automation", "disable", &id, "--revision", "1"]);
+    assert!(
+        !fixture
+            .output(&["automation", "disable", &id, "--revision", "1"])
+            .status
+            .success()
+    );
+    let first = fixture.cli(&["automation", "audit", &id, "--limit", "1"]);
+    assert_eq!(first["audit"]["events"][0]["cause"], "disabled");
+    assert_eq!(first["audit"]["events"][0]["actor"], "user_management");
+    assert_eq!(first["audit"]["events"][0]["revision"], 2);
+    let cursor = first["audit"]["next"].as_u64().unwrap().to_string();
+    let second = fixture.cli(&[
+        "automation",
+        "audit",
+        &id,
+        "--limit",
+        "1",
+        "--before",
+        &cursor,
+    ]);
+    assert_eq!(second["audit"]["events"][0]["cause"], "created");
+    assert!(second["audit"]["next"].is_null());
+    assert_eq!(second["audit"]["earlier_events_unavailable"], false);
+    let audit = fixture.cli(&["automation", "audit", &id]);
+    assert!(!audit.to_string().contains("PRIVATE_LIFECYCLE_PROMPT"));
+    fixture.restart();
+    assert_eq!(fixture.cli(&["automation", "audit", &id]), audit);
+    fixture.cli(&["automation", "remove", &id, "--revision", "2"]);
+    let removed = fixture.cli(&["automation", "audit", &id]);
+    assert_eq!(removed["audit"]["events"].as_array().unwrap().len(), 3);
+    assert_eq!(removed["audit"]["events"][0]["cause"], "removed");
+    assert_eq!(removed["audit"]["events"][0]["revision"], 3);
+    assert_eq!(
+        fixture.cli(&["automation", "history", &id])["history"]["firings"],
+        json!([])
+    );
+    assert!(!fixture.root.path().join("unexpected-provider").exists());
+}

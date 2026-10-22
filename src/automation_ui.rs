@@ -109,6 +109,8 @@ pub enum Action {
     History,
     AllHistory,
     MoreHistory,
+    Lifecycle,
+    MoreLifecycle,
     Run(Uuid),
     InspectRun(crate::model::RunId),
     CancelRun,
@@ -141,6 +143,7 @@ enum Pending {
     Save,
     Mutate,
     History { append: bool },
+    Lifecycle { id: Uuid, append: bool },
     RefreshList,
     RefreshAutomation,
     RefreshHistory,
@@ -590,6 +593,7 @@ pub struct State {
     discard_generation: u64,
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
+    lifecycle: Option<crate::automations::LifecyclePage>,
     history_status: HistoryStatus,
     history_next: Option<HistoryCursor>,
     history_newer: bool,
@@ -887,6 +891,33 @@ impl State {
                     });
                     self.history_next = page.next;
                 }
+                Ok(Response::Audit(mut page)) => {
+                    if let Pending::Lifecycle { id, append } = pending {
+                        if self
+                            .selected
+                            .as_ref()
+                            .is_some_and(|selected| selected.id == id)
+                            && page.events.iter().all(|event| event.automation == id)
+                        {
+                            if append {
+                                if let Some(previous) = self.lifecycle.take() {
+                                    let mut events = previous.events;
+                                    for event in page.events {
+                                        if !events
+                                            .iter()
+                                            .any(|existing| existing.sequence == event.sequence)
+                                        {
+                                            events.push(event);
+                                        }
+                                    }
+                                    events.truncate(crate::automations::MAX_LIFECYCLE_EVENTS);
+                                    page.events = events;
+                                }
+                            }
+                            self.lifecycle = Some(page);
+                        }
+                    }
+                }
                 Ok(Response::Detail(detail)) => {
                     self.refresh_last_outcome(&detail.firing, false);
                     if let Pending::HistoryRun { index } = pending {
@@ -1082,6 +1113,7 @@ impl State {
                 self.draft = None;
                 self.all_history = false;
                 self.selected = None;
+                self.lifecycle = None;
                 self.history.clear();
                 self.history_newer = false;
                 self.history_status = HistoryStatus::Unrequested;
@@ -1280,6 +1312,28 @@ impl State {
                             revision: automation.revision,
                             enabled: false,
                             confirmed: false,
+                        },
+                    );
+                }
+            }
+            Action::Lifecycle | Action::MoreLifecycle => {
+                if let Some(selected) = &self.selected {
+                    let id = selected.id;
+                    let append = matches!(action, Action::MoreLifecycle);
+                    let before = if append {
+                        self.lifecycle.as_ref().and_then(|page| page.next)
+                    } else {
+                        None
+                    };
+                    if append && before.is_none() {
+                        return None;
+                    }
+                    return self.request(
+                        Pending::Lifecycle { id, append },
+                        Request::Audit {
+                            id,
+                            before,
+                            limit: PAGE,
                         },
                     );
                 }
@@ -1565,7 +1619,49 @@ impl State {
                         );
                     }
                 }
+                if self.selected.is_some() {
+                    content = content.push(crate::design::title("Lifecycle")).push(button(
+                        "Refresh lifecycle",
+                        Action::Lifecycle,
+                        !busy,
+                    ));
+                    if let Some(page) = &self.lifecycle {
+                        if page.events.is_empty() {
+                            content =
+                                content.push(crate::design::body("No recorded lifecycle events."));
+                        }
+                        for event in &page.events {
+                            let actor = event.actor.label();
+                            content = content.push(crate::design::body(format!(
+                                "{} · {} · {} · Revision {}",
+                                timestamp(event.occurred_ms),
+                                event.cause.label(),
+                                actor,
+                                event.revision,
+                            )));
+                        }
+                        if page.earlier_events_unavailable {
+                            content = content.push(crate::design::body(
+                                "Earlier lifecycle events are unavailable. Their actor and cause are unknown.",
+                            ));
+                        }
+                        if page.next.is_some()
+                            && page.events.len() < crate::automations::MAX_LIFECYCLE_EVENTS
+                        {
+                            content = content.push(button(
+                                "Older lifecycle events",
+                                Action::MoreLifecycle,
+                                !busy,
+                            ));
+                        }
+                    } else {
+                        content = content.push(crate::design::body(
+                            "Load lifecycle receipts to inspect changes to this automation.",
+                        ));
+                    }
+                }
                 if self.selected.is_some() || self.all_history {
+                    content = content.push(crate::design::title("Run history"));
                     content = content.push(button("Refresh history", Action::History, !busy));
                     if self.history_newer {
                         content = content.push(crate::design::body(
@@ -3421,5 +3517,127 @@ pub fn state_label(state: crate::automations::FiringState) -> &'static str {
         Skipped => "Skipped",
         Cancelled => "Cancelled",
         Interrupted => "Outcome uncertain",
+    }
+    #[test]
+    fn automation_lifecycle_pages_are_read_only_bounded_and_deduplicated() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let automation = automation();
+        let id = automation.id;
+        let mut state = State {
+            selected: Some(automation),
+            ..Default::default()
+        };
+        let event = |sequence| LifecycleEvent {
+            sequence,
+            automation: id,
+            revision: sequence,
+            occurred_ms: 100,
+            cause: LifecycleCause::Disabled,
+            actor: LifecycleActor::UserManagement,
+            enabled: false,
+            blocked: false,
+            firing: None,
+        };
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Lifecycle) else {
+            panic!("audit request");
+        };
+        assert_eq!(
+            request,
+            Request::Audit {
+                id,
+                before: None,
+                limit: PAGE
+            }
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![event(3), event(2)],
+                next: Some(2),
+                earlier_events_unavailable: false,
+            }))),
+        });
+        let Some(Effect::Request { sequence, request }) = state.update(Action::MoreLifecycle)
+        else {
+            panic!("older audit request");
+        };
+        assert_eq!(
+            request,
+            Request::Audit {
+                id,
+                before: Some(2),
+                limit: PAGE
+            }
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![event(2), event(1)],
+                next: None,
+                earlier_events_unavailable: true,
+            }))),
+        });
+        let page = state.lifecycle.as_ref().unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert!(page.earlier_events_unavailable);
+        assert!(state.update(Action::MoreLifecycle).is_none());
+        assert!(
+            state.history.is_empty(),
+            "lifecycle does not fabricate execution outcomes"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_old_context_and_wrong_automation_receipts_are_refused() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let selected = automation();
+        let id = selected.id;
+        let mut state = State {
+            selected: Some(selected),
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Lifecycle) else {
+            panic!("audit request");
+        };
+        let bad = LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 1,
+                automation: Uuid::new_v4(),
+                revision: 1,
+                occurred_ms: 100,
+                cause: LifecycleCause::Created,
+                actor: LifecycleActor::UserManagement,
+                enabled: false,
+                blocked: false,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(bad))),
+        });
+        assert!(state.lifecycle.is_none());
+        assert_eq!(state.selected.as_ref().unwrap().id, id);
+        let other = Uuid::new_v4();
+        assert!(
+            matches!(state.update(Action::Select(other)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == other)
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: false,
+            }))),
+        });
+        assert!(state.lifecycle.is_none());
     }
 }

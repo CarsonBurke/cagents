@@ -224,11 +224,13 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static THIRTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static FOURTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static FIFTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static SIXTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
         14 => &FOURTEEN,
         15 => &FIFTEEN,
+        16 => &SIXTEEN,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published

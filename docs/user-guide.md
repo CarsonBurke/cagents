@@ -605,8 +605,21 @@ cagents automation enable AUTOMATION_ID --revision REVISION --confirm
 cagents automation run-now AUTOMATION_ID --execution-revision EXECUTION_REVISION --request-id REQUEST_UUID --confirm
 cagents automation history
 cagents automation history AUTOMATION_ID --limit 50
+cagents automation audit AUTOMATION_ID --limit 50
 cagents automation run FIRING_ID
 ```
+
+**Lifecycle** in the native automation details, or `automation audit`, lists
+committed management changes and system pause, block and recovery receipts.
+Each receipt identifies its exact revision, time, cause and actor class; these
+classes describe an admitted user management request or a system operation,
+not a person's identity. Run outcomes remain in **Run history**. Audit reads do
+not launch providers or change a schedule. The last 256 lifecycle receipts per
+automation are retained, including after removal; pages contain at most 100.
+Use the audit page's `next` value as `--before SEQUENCE` for an older page.
+Earlier unrecorded or expired events remain explicitly unavailable: their actor
+and cause cannot be recovered from the current enabled state. Prompt bodies,
+launch environment and provider diagnostics are excluded from these receipts.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History

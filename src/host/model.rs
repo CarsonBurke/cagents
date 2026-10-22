@@ -24,6 +24,7 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automation_audit;
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -40,7 +41,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -587,6 +588,10 @@ fn migrate_through(
     if version < 15 && target >= 15 {
         native_actor_retirement::migrate(tx)?;
         schema::migration_checkpoint(15)?;
+    }
+    if version < 16 && target >= 16 {
+        automation_audit::migrate(tx)?;
+        schema::migration_checkpoint(16)?;
     }
     Ok(())
 }
