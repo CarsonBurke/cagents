@@ -2180,6 +2180,37 @@ where
         return ExitCode::SUCCESS;
     }
 
+    // Physical-device image receipts are user-managed local files. Refuse
+    // hosted/remote authority before device preparation, staged-owner routing,
+    // daemon recovery, or even opening the image store.
+    if let TopCommand::Chat {
+        command: ChatCommand::ImageAssets { command },
+    } = &cli.command
+    {
+        let hosted = [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        return match chat::image_assets::execute(
+            command,
+            cli.device.as_deref(),
+            crate::device::is_remote(),
+            hosted,
+        ) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let stopping_daemon = matches!(
         &cli.command,
         TopCommand::Daemon {
