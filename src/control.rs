@@ -5128,7 +5128,10 @@ mod tests {
 
     #[test]
     fn pre_image_reference_daemon_revision_is_rejected_before_snapshot_or_prompt() {
-        assert_eq!(PROTOCOL_VERSION, 105);
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();

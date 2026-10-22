@@ -267,7 +267,7 @@ impl Store {
         if let Some(data) = source.strip_prefix("data:image/") {
             let (kind, data) = data.split_once(";base64,")?;
             if !matches!(kind, "png" | "jpeg" | "gif" | "webp")
-                || data.len() > (MAX_IMAGE_BYTES as usize).div_ceil(3) * 4
+                || data.len() != (receipt.bytes as usize).div_ceil(3) * 4
             {
                 return None;
             }
@@ -356,6 +356,7 @@ impl Store {
     }
     #[cfg(any(feature = "ui", test))]
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
+        let mut unrecognized = false;
         for (count, entry) in std::fs::read_dir(self.root.process_path())
             .map_err(storage_error)?
             .enumerate()
@@ -368,21 +369,30 @@ impl Store {
                 self.remove_private_temporary(&name)?;
                 continue;
             }
+            if name == REGISTRY || name == LOCK {
+                continue;
+            }
             let path = Path::new(&name);
             let Some(id) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
             else {
+                unrecognized = true;
                 continue;
             };
-            if registry.images.contains_key(&id) {
+            if registry
+                .images
+                .get(&id)
+                .is_some_and(|receipt| name.as_os_str() == OsStr::new(&receipt.leaf()))
+            {
                 continue;
             }
             if !matches!(
                 path.extension().and_then(|s| s.to_str()),
                 Some("png" | "jpg" | "gif" | "webp")
             ) {
+                unrecognized = true;
                 continue;
             }
             let leaf = name.to_str().ok_or("Invalid image storage filename")?;
@@ -390,6 +400,12 @@ impl Store {
             // directory content. This namespace owns only its UUID blobs.
             self.private_file(leaf)?;
             fs_safety::unlink_within(&self.root, &name).map_err(storage_error)?;
+        }
+        if unrecognized {
+            return Err(format!(
+                "Image storage contains unrecognized files in {}. No unknown files were removed; inspect that directory before attaching another image.",
+                self.root.path().display()
+            ));
         }
         Ok(())
     }
@@ -565,12 +581,13 @@ pub(crate) fn unverified_attachment(reference: &ImageReference) -> Result<Attach
 }
 
 pub fn validate(attachment: &Attachment) -> Result<(), String> {
-    if attachment.reference.is_none() {
+    let Some(reference) = &attachment.reference else {
         return Ok(());
-    }
-    let store = store(false)?;
+    };
+    let store = store(false).map_err(|error| format!("{} cannot be verified on this device. Attach the image on the conversation's device. {error}", reference.label()))?;
     store.validate_with(&store.read_registry()?, attachment)
 }
+
 pub fn retain(attachment: &Attachment) -> Result<(), String> {
     if attachment.reference.is_none() {
         return Ok(());
@@ -742,10 +759,22 @@ mod tests {
             store.write(&orphan, &bytes, false).unwrap();
             let unknown = store.root.path().join("keep-user-file");
             std::fs::write(&unknown, b"do not remove").unwrap();
-            let next = test_image("after interrupted stage");
+            assert!(
+                store
+                    .stage_validated(
+                        &bytes,
+                        "refuse unrecognized storage",
+                        "png",
+                        MAX_IMAGE_BYTES
+                    )
+                    .unwrap_err()
+                    .contains("unrecognized")
+            );
             assert!(!store.root.path().join(&temporary_name).exists());
             assert!(!store.root.path().join(&orphan).exists());
             assert_eq!(std::fs::read(&unknown).unwrap(), b"do not remove");
+            std::fs::remove_file(&unknown).unwrap();
+            let next = test_image("after interrupted stage");
             validate(&image).unwrap();
             validate(&next).unwrap();
             let linked_temporary = store
@@ -780,6 +809,39 @@ mod tests {
             .unwrap();
         assert_eq!(image.reference.unwrap().number, 1);
         assert!(!store.root.path().join(temporary_name).exists());
+    }
+
+    #[test]
+    fn explicit_cleanup_requires_exact_receipt_and_history_loss_opt_in_without_rebinding() {
+        with_test_image(|image| {
+            let reference = image.reference.clone().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            let inline = format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
+            retain(&image).unwrap();
+            let before = list().unwrap();
+            assert!(before.images[0].retained);
+            assert!(remove(reference.id, &reference.sha256, false).is_err());
+            assert!(remove(reference.id, &"b".repeat(64), true).is_err());
+            assert!(remove(Uuid::new_v4(), &reference.sha256, true).is_err());
+            validate(&image).unwrap();
+            remove(reference.id, &reference.sha256, true).unwrap();
+            assert!(!image.path.exists());
+            assert!(attachment(&reference).is_err());
+            assert!(
+                restore_reference(&reference, &inline).is_none(),
+                "old UUID authority stays removed even when provider history still owns original bytes"
+            );
+            let next = test_image("after explicit removal.png");
+            let next_ref = next.reference.as_ref().unwrap();
+            assert_eq!(next_ref.device, reference.device);
+            assert!(next_ref.number > reference.number);
+            assert_ne!(next_ref.id, reference.id);
+            assert_eq!(list().unwrap().device, before.device);
+            assert!(restore_reference(&reference, next.path.to_str().unwrap()).is_none());
+        });
     }
 
     #[test]

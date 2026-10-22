@@ -893,15 +893,23 @@ impl Codex {
             let mut attachments = Vec::new();
             let mut synthetic = std::collections::HashSet::new();
             let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashSet::new();
             for (index, pair) in inputs.windows(2).enumerate() {
                 if pair[0]["type"] == "text"
                     && pair[1]["type"] == "localImage"
                     && let (Some(marker), Some(path)) =
                         (pair[0]["text"].as_str(), pair[1]["path"].as_str())
-                    && let Some(reference) = super::image_references::restore(marker, path)
+                    && super::image_references::claims_reference(marker)
                 {
-                    synthetic.insert(index);
-                    references.insert(index + 1, reference);
+                    if let Some(reference) = super::image_references::restore(marker, path) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else {
+                        // A canonical owned-image claim is not a legacy local
+                        // file. On another device the same path can mean
+                        // different pixels; never offer it for edit/replay.
+                        unverified.insert(index + 1);
+                    }
                 }
             }
             for (index, input) in inputs.iter().enumerate() {
@@ -912,7 +920,11 @@ impl Codex {
                     Some("text") => string(input, "text")?.to_owned(),
                     Some("localImage") => {
                         attachments.push(chat::Attachment {
-                            path: string(input, "path")?.into(),
+                            path: if unverified.contains(&index) {
+                                std::path::PathBuf::new()
+                            } else {
+                                string(input, "path")?.into()
+                            },
                             reference: references.remove(&index),
                         });
                         continue;
@@ -943,7 +955,8 @@ impl Codex {
                 .and_then(|input| input["text"].as_str())
                 .map(|text| self.named_skills(text))
                 .unwrap_or_default();
-            message.editable &= texts.len() <= 1
+            message.editable &= unverified.is_empty()
+                && texts.len() <= 1
                 && inputs.iter().all(|input| match input["type"].as_str() {
                     Some("text" | "localImage") => true,
                     Some("skill") => named.iter().any(|(name, path)| {
@@ -3599,6 +3612,7 @@ fn parse_item_with_windows(
             let contents = array(value, "content")?;
             let mut synthetic = std::collections::HashSet::new();
             let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
             for (index, pair) in contents.windows(2).enumerate() {
                 if pair[0]["type"] == "text"
                     && matches!(pair[1]["type"].as_str(), Some("localImage" | "image"))
@@ -3606,10 +3620,16 @@ fn parse_item_with_windows(
                         pair[0]["text"].as_str(),
                         pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
                     )
-                    && let Some(reference) = super::image_references::restore(marker, source)
+                    && super::image_references::claims_reference(marker)
                 {
-                    synthetic.insert(index);
-                    references.insert(index + 1, reference);
+                    if let Some(reference) = super::image_references::restore(marker, source) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else if !source.starts_with("data:image/") {
+                        // Keep the literal marker visible, but do not read a
+                        // possibly foreign device's coincident absolute path.
+                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                    }
                 }
             }
             for (index, content) in contents.iter().enumerate() {
@@ -3629,15 +3649,21 @@ fn parse_item_with_windows(
                         role: Role::User,
                         content: ItemContent::Image {
                             reference: references.get(&index).cloned(),
-                            path: content["path"]
-                                .as_str()
-                                .or_else(|| content["url"].as_str())
-                                .ok_or("Missing image path")?
-                                .into(),
-                            description: references
-                                .get(&index)
-                                .map(|reference| reference.label())
-                                .unwrap_or_else(|| "User attachment".into()),
+                            path: if unverified.contains_key(&index) {
+                                String::new()
+                            } else {
+                                content["path"]
+                                    .as_str()
+                                    .or_else(|| content["url"].as_str())
+                                    .ok_or("Missing image path")?
+                                    .into()
+                            },
+                            description: unverified.get(&index).cloned().unwrap_or_else(|| {
+                                references
+                                    .get(&index)
+                                    .map(|reference| reference.label())
+                                    .unwrap_or_else(|| "User attachment".into())
+                            }),
                         },
                         started_at: None,
                         at: None,
@@ -4090,6 +4116,77 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.clone().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            for failure in [0, 1, 2] {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let inputs = json!([
+                    {"type":"text","text":marker},
+                    {"type":"localImage","path":image.path.to_str().unwrap()}
+                ]);
+                let items = parse_item(
+                    &json!({"type":"userMessage","id":"foreign","content":inputs}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert_eq!(items.len(), 2, "unverified marker remains literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference: None, description } if path.is_empty() && description.contains("originating device")),
+                    "even a real coincident local file is not preview authority"
+                );
+                let mut step = Step::default();
+                adapter().queue_page(&json!({"data":[{"id":"foreign-image-only","input":inputs}],"nextCursor":null}), &mut step).unwrap();
+                let queued = step
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(messages) => messages.first(),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    !queued.editable,
+                    "image-only canonical marker cannot become legacy path replay"
+                );
+                assert!(queued.attachments[0].path.as_os_str().is_empty());
+                assert!(queued.attachments[0].reference.is_none());
+                assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+                let inline = format!(
+                    "data:image/png;base64,{}",
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                );
+                let inline_items = parse_item(
+                    &json!({"type":"userMessage","id":"inline","content":[
+                        {"type":"text","text":marker}, {"type":"image","url":inline}
+                    ]}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert!(
+                    matches!(&inline_items[1].content, ItemContent::Image { path, reference: None, .. } if path == &inline),
+                    "self-contained real image bytes remain viewable without borrowing image authority"
+                );
+            }
+        });
+    }
 
     #[test]
     fn referenced_image_is_real_provider_input_and_survives_history_and_queue() {

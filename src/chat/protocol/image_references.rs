@@ -20,7 +20,23 @@ pub(super) fn marker(reference: &ImageReference) -> Result<String, String> {
     Ok(marker)
 }
 
-fn candidate(text: &str) -> Option<ImageReference> {
+/// A reserved structured mapping claim is never permission to downgrade to
+/// a legacy filesystem path when its receipt/schema cannot be verified. Plain
+/// prose labels have no such claim and keep their ordinary meaning.
+pub(super) fn claims_reference(text: &str) -> bool {
+    let Some((label, _)) = text.split_once(OPEN) else {
+        return false;
+    };
+    let Some(number) = label
+        .strip_prefix("[Image ")
+        .and_then(|s| s.strip_suffix(']'))
+    else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && text.ends_with(CLOSE)
+}
+
+pub(super) fn candidate(text: &str) -> Option<ImageReference> {
     if text.len() > MAX_MARKER_BYTES {
         return None;
     }
@@ -171,6 +187,12 @@ mod tests {
         let marker = marker(&reference).unwrap();
         assert_eq!(candidate(&marker), Some(reference.clone()));
         assert!(candidate(&reference.token()).is_none());
+        assert!(!claims_reference(&reference.token()));
+        assert!(claims_reference(&marker));
+        assert!(claims_reference(
+            &marker.replace("{\"id\"", "{\"future\":true,\"id\"")
+        ));
+        assert!(candidate(&marker.replace("{\"id\"", "{\"future\":true,\"id\"")).is_none());
         assert!(candidate(&marker.replace("[Image 13]", "[Image 12]")).is_none());
         assert!(candidate(&marker.replace("{\"id\"", "{ \"id\"")).is_none());
         assert!(candidate(&format!("prefix {marker}")).is_none());

@@ -2352,7 +2352,10 @@ mod tests {
             postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
             "JSON defaults cannot repair positional postcard layout"
         );
-        assert_eq!(PROTOCOL_VERSION, 105);
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
     }
 
     #[test]
