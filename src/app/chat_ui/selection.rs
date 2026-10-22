@@ -286,6 +286,50 @@ fn enclosed_caret_row(bounds: Rectangle, clip: Rectangle, translation: Vector) -
         && bottom <= clip_bottom.next_up()
 }
 
+// A native scrollable rounds its rendered translation to a whole pixel.
+// The final rendered bucket owns its terminal caret even if that rounding
+// leaves a fraction of the source row below the viewport. This is not an
+// assertion about the opaque unrounded scroll offset.
+#[derive(Clone, Copy)]
+struct RenderedEnd {
+    viewport: Rectangle,
+    content: Rectangle,
+    offset: Vector,
+}
+impl RenderedEnd {
+    fn contains_caret(self, row: Rectangle, clip: Rectangle, translation: Vector) -> bool {
+        let travel = (self.content.height - self.viewport.height).max(0.0);
+        let content_bottom = self.content.y + self.content.height;
+        let row_bottom = row.y + row.height;
+        let clip_top = clip.y + translation.y;
+        let clip_bottom = (clip.y + clip.height) + translation.y;
+        // The viewport is before this scrollable's own translation. Bring its
+        // end into the same original layout frame as the current content row.
+        let viewport_bottom = (self.viewport.y + self.viewport.height) + self.offset.y;
+        travel.is_finite()
+            && travel > 0.0
+            && self.offset.x.is_finite()
+            && self.offset.y.is_finite()
+            && self.offset.y == travel.round()
+            && translation.x.is_finite()
+            && translation.y.is_finite()
+            && enclosed_caret_row(self.viewport, self.viewport, Vector::ZERO)
+            && enclosed_caret_row(row, self.content, Vector::ZERO)
+            && enclosed_caret_row(clip, clip, Vector::ZERO)
+            && clip_top.is_finite()
+            && clip_bottom.is_finite()
+            && viewport_bottom.is_finite()
+            && row_bottom >= content_bottom.next_down()
+            && row_bottom <= content_bottom.next_up()
+            && row.y >= clip_top.next_down()
+            && row_bottom > clip_top
+            && row.y < clip_bottom
+            // An ancestor must preserve this scrollable's native end edge;
+            // an outer viewport hiding that edge cannot grant an endpoint.
+            && viewport_bottom <= clip_bottom.next_up()
+    }
+}
+
 struct Read {
     catalog: Option<Arc<Catalog>>,
     blocks: Vec<Block>,
@@ -294,8 +338,12 @@ struct Read {
     // and endpoint candidate choice keep their clipped pointer.
     drag_pointer: Option<Point>,
     translation: Vector,
-    pending: Option<(Vector, Rectangle)>,
+    pending: Option<(Vector, Rectangle, Rectangle)>,
     clip: Option<Rectangle>,
+    // The host viewport constrains only the terminal exception, preserving
+    // ordinary clipped hit testing and endpoint candidate behavior.
+    host_clip: Option<Rectangle>,
+    rendered_end: Option<RenderedEnd>,
     frames: Vec<Frame>,
     tables: HashMap<u64, Table>,
     table_order: Vec<u64>,
@@ -311,6 +359,8 @@ impl Read {
             translation: Vector::ZERO,
             pending: None,
             clip: None,
+            host_clip: None,
+            rendered_end: None,
             frames: Vec::new(),
             tables: HashMap::new(),
             table_order: Vec::new(),
@@ -327,13 +377,19 @@ impl Read {
         let logical = prose.logical.as_ref().filter(|_| prose.logical_active)?;
         let pointer = self.drag_pointer?;
         let pointer_y = pointer.y + self.translation.y;
-        let clip = self.clip?;
+        let clip = match self.host_clip {
+            Some(host) => self.clip?.intersection(&host)?,
+            None => self.clip?,
+        };
         if !prose.empty_line_caret()
             || !matches!(prose.plain.as_ref(), "\n" | "\r\n")
             || !pointer.x.is_finite()
             || !pointer_y.is_finite()
             || pointer_y < bounds.y + bounds.height
-            || !enclosed_caret_row(bounds, clip, self.translation)
+            || !(enclosed_caret_row(bounds, clip, self.translation)
+                || self
+                    .rendered_end
+                    .is_some_and(|end| end.contains_caret(bounds, clip, self.translation)))
         {
             return None;
         }
@@ -643,7 +699,15 @@ impl Operation for Read {
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         let previous = self.translation;
         let clip = self.clip;
-        if let Some((translation, bounds)) = self.pending.take() {
+        let rendered_end = self.rendered_end;
+        if let Some((translation, bounds, content)) = self.pending.take() {
+            // Replace even when the nested scrollable is not at its end, so
+            // an enclosing scrollable can never authorize a nested row.
+            self.rendered_end = Some(RenderedEnd {
+                viewport: bounds,
+                content,
+                offset: translation,
+            });
             let bounds = Rectangle {
                 x: bounds.x - self.translation.x,
                 y: bounds.y - self.translation.y,
@@ -657,17 +721,18 @@ impl Operation for Read {
         operate(self);
         self.translation = previous;
         self.clip = clip;
+        self.rendered_end = rendered_end;
     }
 
     fn scrollable(
         &mut self,
         _: Option<&Id>,
         bounds: Rectangle,
-        _: Rectangle,
+        content: Rectangle,
         translation: Vector,
         _: &mut dyn operation::Scrollable,
     ) {
-        self.pending = Some((translation, bounds));
+        self.pending = Some((translation, bounds, content));
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
@@ -1201,6 +1266,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 },
                 self.catalog.clone(),
             );
+            read.host_clip = Some(visible);
             read.drag_pointer = (state.dragging && !press)
                 .then(|| cursor.position())
                 .flatten();
@@ -1377,6 +1443,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 clipped_pointer(tree.state.downcast_ref::<State>().pointer, visible),
                 self.catalog.clone(),
             );
+            read.host_clip = Some(visible);
             read.drag_pointer = tree.state.downcast_ref::<State>().pointer;
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1585,6 +1652,43 @@ mod tests {
                 Rectangle { y: bad, ..clip },
                 Vector::ZERO
             ));
+        }
+        // Exact failing CRLF native geometry: the actual current end offset
+        // renders at12575 although max travel is12575.189. Strict enclosure
+        // must remain false; only the current rendered-end witness may own it.
+        let native = RenderedEnd {
+            viewport: Rectangle::with_size(Size::new(400.0, 400.0)),
+            content: Rectangle::with_size(Size::new(400.0, 12975.189)),
+            offset: Vector::new(0.0, 12575.0),
+        };
+        let row = Rectangle::new(Point::new(0.0, 12955.59), Size::new(0.0, 19.6));
+        let clip = native.viewport;
+        assert!(!enclosed_caret_row(row, clip, native.offset));
+        assert!(native.contains_caret(row, clip, native.offset));
+        for trim in [1.0, 2.0, 40.0] {
+            let offset = Vector::new(0.0, native.offset.y - trim);
+            assert!(!RenderedEnd { offset, ..native }.contains_caret(row, clip, offset));
+        }
+        assert!(!native.contains_caret(
+            row,
+            Rectangle {
+                height: 399.0,
+                ..clip
+            },
+            native.offset,
+        ));
+        assert!(!native.contains_caret(
+            Rectangle {
+                y: row.y - 1.0,
+                ..row
+            },
+            clip,
+            native.offset,
+        ));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for offset in [Vector::new(bad, native.offset.y), Vector::new(0.0, bad)] {
+                assert!(!RenderedEnd { offset, ..native }.contains_caret(row, clip, offset));
+            }
         }
     }
 
@@ -1853,6 +1957,7 @@ mod tests {
             translation: Vector,
             pending: Option<Vector>,
             max_translation: f32,
+            scrollables: Vec<(Rectangle, Rectangle, Vector)>,
             rows: Vec<(Rectangle, Rectangle, usize, usize, bool)>,
         }
         impl Operation for Rows {
@@ -1868,11 +1973,12 @@ mod tests {
             fn scrollable(
                 &mut self,
                 _: Option<&Id>,
-                _: Rectangle,
-                _: Rectangle,
+                viewport: Rectangle,
+                content: Rectangle,
                 translation: Vector,
                 _: &mut dyn operation::Scrollable,
             ) {
+                self.scrollables.push((viewport, content, translation));
                 self.pending = Some(translation);
             }
             fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
@@ -1899,10 +2005,14 @@ mod tests {
             let source: Arc<str> = format!("αβ item שלום line{ending}{ending}")
                 .repeat(300)
                 .into();
-            for (case, trim, reaches_end) in [
-                ("visible", 0.0, true),
-                ("partial terminal", 2.0, false),
-                ("hidden terminal", 40.0, false),
+            for (case, trim, host_height, reaches_end) in [
+                ("visible", 0.0, 400.0, true),
+                ("preceding rendered bucket", 1.0, 400.0, false),
+                ("partial terminal", 2.0, 400.0, false),
+                ("hidden terminal", 40.0, 400.0, false),
+                ("ancestor clips native end", 0.0, 399.0, false),
+                ("changed catalog tail", 0.0, 400.0, false),
+                ("nonterminal catalog row", 0.0, 400.0, false),
             ] {
                 let code = prose::code_text(
                     source.clone(),
@@ -1920,17 +2030,32 @@ mod tests {
                     .height(Length::Fixed(400.0))
                     .width(Length::Fill);
                 let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
+                let current_source: Arc<str> = match case {
+                    "changed catalog tail" => format!(
+                        "{}{}",
+                        &source[..source.len() - ending.len()],
+                        "x".repeat(ending.len())
+                    )
+                    .into(),
+                    "nonterminal catalog row" => format!("{source}new").into(),
+                    _ => source.clone(),
+                };
                 let mut catalog = Catalog::builder();
-                catalog.plain("scrolled-terminal", &[0], source.clone());
+                catalog.plain("scrolled-terminal", &[0], current_source.clone());
+                let catalog = catalog.finish();
                 let mut element = transcript_virtualized(
                     content,
                     target,
                     None,
-                    catalog.finish(),
+                    catalog.clone(),
                     Default::default(),
                 );
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(400.0, 400.0));
+                let host_viewport = Rectangle {
+                    height: host_height,
+                    ..viewport
+                };
                 let limits = layout::Limits::new(Size::ZERO, viewport.size());
                 let mut node = element
                     .as_widget_mut()
@@ -1989,10 +2114,21 @@ mod tests {
                     terminal.0.y > 10_000.0,
                     "guard must use native layout precision"
                 );
+                let (native_viewport, content, offset) = rows
+                    .scrollables
+                    .iter()
+                    .find(|(_, content, _)| content.height > 10_000.0)
+                    .unwrap();
                 if reaches_end {
+                    // Native translation is a rendered pixel bucket, not the
+                    // hidden unrounded offset. Keep the actual fixed400
+                    // viewport and prove current native END without calibration.
+                    assert_eq!(offset.y, (content.height - native_viewport.height).round());
+                    let row_bottom = terminal.0.y + terminal.0.height;
+                    let content_bottom = content.y + content.height;
                     assert!(
-                        (terminal.1.y + terminal.1.height - viewport.height).abs() < 0.01,
-                        "actual terminal row sits at the finite outer viewport edge"
+                        row_bottom >= content_bottom.next_down()
+                            && row_bottom <= content_bottom.next_up()
                     );
                 }
                 let first = rows
@@ -2008,6 +2144,23 @@ mod tests {
                 assert!(
                     end.y > viewport.height,
                     "raw drag intent really crosses outer clip"
+                );
+                // Real nested operation traversal restores its witness rather
+                // than leaking the inner end to a later sibling or caller.
+                let mut inactive = Read::with_catalog(Some(end), Some(catalog.clone()));
+                inactive.host_clip = Some(host_viewport);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut inactive,
+                );
+                assert!(inactive.rendered_end.is_none());
+                assert!(inactive.clip.is_none());
+                assert_eq!(inactive.translation, Vector::ZERO);
+                assert!(
+                    inactive.blocks.last().unwrap().hit < source.len(),
+                    "without active drag native END cannot claim terminal bytes"
                 );
                 let mut clipboard = ClipboardText::default();
                 for (event, pointer) in [
@@ -2035,7 +2188,7 @@ mod tests {
                         &renderer,
                         &mut clipboard,
                         &mut shell,
-                        &viewport,
+                        &host_viewport,
                     );
                     assert!(shell.is_event_captured(), "real scrolled drag/copy: {case}");
                     if shell.is_layout_invalid() {
@@ -2072,7 +2225,7 @@ mod tests {
                         &renderer,
                         &mut clipboard,
                         &mut Shell::new(&mut messages),
-                        &viewport,
+                        &host_viewport,
                     );
                     assert_eq!(
                         tree.state.downcast_ref::<State>().anchor.unwrap().byte,
