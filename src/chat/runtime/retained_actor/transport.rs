@@ -848,6 +848,11 @@ impl RemoteActor {
         let attached: Result<Attached, String> = receive(&control, Duration::from_secs(30))?;
         let attached = attached?;
         let handle = Self::from_attached(attached, proof, Some(control), notify)?;
+        let record = handle.identity().record;
+        crate::daemon::process_scope::warn_if_shared(
+            record.holder.pid as u32,
+            record.root.pid as u32,
+        );
         if let Some(context) = spec.execution {
             context.claim_owner(Arc::new(handle.clone()));
         }
@@ -1816,6 +1821,18 @@ struct Server {
     close_only: bool,
 }
 impl Server {
+    fn start_after_scope_enrollment(
+        startup: Startup,
+        control: &UnixStream,
+        enroll: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<Self, String> {
+        // This is optional OOM/cgroup isolation, not launch authorization.
+        // Keep the authenticated, descriptor-sealed process-group fallback
+        // used by terminal/native holders when the user manager rejects it.
+        let _ = enroll();
+        Self::start(startup, control)
+    }
+
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
         if startup.protocol != PROTOCOL
             || startup.source.launch.provider != crate::agent::Provider::Claude
@@ -3064,8 +3081,11 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
-            crate::daemon::process_scope::enroll_holder().map_err(|error| error.to_string())?;
-            let server = Server::start(startup, &control)?;
+            let server = Server::start_after_scope_enrollment(
+                startup,
+                &control,
+                crate::daemon::process_scope::enroll_holder,
+            )?;
             server.serve(control.try_clone().map_err(|error| error.to_string())?)
         })();
         if let Err(error) = result {
@@ -3146,6 +3166,168 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+        const CHILD: &str = "CAGENTS_RETAINED_SCOPE_FALLBACK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = root.path().join("initialized");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        // The real caller/lease gate is independent of optional cgroup setup.
+        authorize(&control, &proof).unwrap();
+        let mut wrong = proof.clone();
+        wrong.host_incarnation = crate::model::HostIncarnation::new("another-owner");
+        assert!(authorize(&control, &wrong).is_err());
+        let startup = |protocol| {
+            let prepared = chat::protocol::create(&source.launch)
+                .unwrap()
+                .1
+                .prepared_launch_identity()
+                .unwrap();
+            Startup {
+                protocol,
+                source: source.clone(),
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf initialized > "$2"
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+printf '{"type":"assistant","uuid":"scope-output","message":{"id":"scope-output","role":"assistant","content":[{"type":"text","text":"scope fallback initialized"}]}}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' "$1"
+"#
+                    .into(),
+                    "scope-fixture".into(),
+                    prepared.session_id.clone(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+                prepared_identity: prepared,
+                environment: source.launch.recipe.environment.clone(),
+                working_directory: cwd.clone(),
+                directory_fd: None,
+                directory_identity: None,
+                mailbox_recognition: None,
+                provider_directory_observed: false,
+                recovery_environment: BTreeMap::new(),
+            }
+        };
+        let reject = || {
+            assert!(
+                !marker.exists(),
+                "enrollment must precede provider creation"
+            );
+            let error = crate::daemon::process_scope::tests::rejected_scope_request().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "user scope request failed: exit status: 1"
+            );
+            Err(error)
+        };
+        let error = Server::start_after_scope_enrollment(startup(0), &control, reject)
+            .err()
+            .unwrap();
+        assert!(error.contains("Incompatible retained Claude actor launch"));
+        assert!(!marker.exists(), "required startup failures remain fatal");
+        let server =
+            Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject).unwrap();
+        let socket = server.socket.clone();
+        let record = server.identity.record.clone();
+        let record_path = registry::directory(Kind::Native)
+            .unwrap()
+            .join(format!("{}.json", record.terminal));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = server.actor.snapshot(None).unwrap();
+            if server.actor.is_completed() {
+                assert!(snapshot.exited);
+                assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+                assert!(snapshot.items.iter().any(|item| matches!(
+                    &item.content,
+                    chat::ItemContent::Text { text, .. } if text == "scope fallback initialized"
+                )));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "finite native fixture did not exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"initialized");
+        assert!(
+            !record.root.is_current(),
+            "original provider must be reaped"
+        );
+        assert!(socket.exists() && record_path.exists());
+        struct Serving {
+            parent: Option<UnixStream>,
+            worker: Option<thread::JoinHandle<Result<(), String>>>,
+        }
+        impl Drop for Serving {
+            fn drop(&mut self) {
+                self.parent.take();
+                if let Some(worker) = self.worker.take() {
+                    // The explicit success path checks the result below.
+                    // Still join on unwind without causing a double panic.
+                    let _ = worker.join();
+                }
+            }
+        }
+        let mut serving = Serving {
+            parent: Some(parent),
+            worker: Some(thread::spawn(move || server.serve(control))),
+        };
+        let attached: Result<Attached, String> =
+            receive(serving.parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        assert_eq!(attached.unwrap().identity.record, record);
+        // No installation was committed: startup EOF performs the existing
+        // normal actor cleanup and removes only its exact socket/record.
+        serving.parent.take();
+        serving.worker.take().unwrap().join().unwrap().unwrap();
+        assert!(!socket.exists() && !record_path.exists());
+    }
+
     thread_local! {
         static INSPECT_SOURCES_CAPTURED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
