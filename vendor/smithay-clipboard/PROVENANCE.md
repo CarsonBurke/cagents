@@ -19,8 +19,8 @@ already be in the worker's Rust event queue. wayland-client rebuilds the
 proxy for each of these events. Because the object is dead, that proxy has no
 user data and reports version 0. sctk then calls `pointer_frame` for a queued
 frame that carries pending events. Because version 0 predates frames, sctk also
-calls it immediately for any other pointer event once a surface was entered. `pointer_frame` unwrapped
-`pointer.data::<PointerData>()` and panicked. The panic stopped the worker
+calls it immediately for any other pointer event once a surface was entered.
+`pointer_frame` unwrapped `pointer.data::<PointerData>()` and panicked. The panic stopped the worker
 thread, so every later Copy was silently dropped.
 
 Only `src/state.rs` and `src/lib.rs` differ from the base:
@@ -31,7 +31,10 @@ Only `src/state.rs` and `src/lib.rs` differ from the base:
   longer its seat's keyboard. A queued enter therefore can't restore focus
   after the keyboard was released.
 - Removing the keyboard capability clears the seat's focus and serial, as a
-  leave event does.
+  leave event does. A replacement keyboard therefore authorizes Copy only
+  after the compositor sends it an enter, as the protocol intends. A pointer
+  serial taken just before the keyboard's removal is also cleared, which is
+  the same trade-off upstream's leave handling makes.
 - `new_capability` and `remove_capability` ignore a seat that is already
   removed. Before, a capability change queued after the seat's removal
   panicked.
@@ -42,6 +45,7 @@ Only `src/state.rs` and `src/lib.rs` differ from the base:
 
 ## Manifest and tests
 
+`.gitignore` ignores this package's standalone build output and lockfile.
 `Cargo.toml` has an empty `[workspace]`, so Cargo can test this package
 here without making it a cagents workspace member. Its example-only
 dev-dependencies (`dirs`, `thiserror`, `url`, sctk with `xkbcommon`) are
@@ -57,15 +61,19 @@ be refused, a blocking load orders the store before later Wayland events and
 must be refused for lack of focus. The tests need `libwayland-client` but no
 display server.
 
-Run them as a standalone package from the repository root:
+Run them as a standalone package from the repository root. Seeding the
+standalone lockfile from the cagents lockfile makes Cargo prune it to this
+package, so the tests run against the production versions of sctk,
+wayland-client and wayland-backend:
 
 ```sh
-cargo test --locked --manifest-path vendor/smithay-clipboard/Cargo.toml
+cp Cargo.lock vendor/smithay-clipboard/Cargo.lock
+cargo test --manifest-path vendor/smithay-clipboard/Cargo.toml
 ```
 
 Cargo cannot run them with `-p smithay-clipboard` from the parent workspace,
-because this package is not a workspace member. Build artifacts are local
-test output.
+because this package is not a workspace member. Its lockfile and build
+artifacts are local test output.
 
 Against the base source, all seven tests fail. The worker panics at
 `src/state.rs:395` (pointer), `:320` and `:359` (seat) and `:157` (keyboard),
@@ -73,15 +81,10 @@ and the two focus tests' worker answers the refused Copy's load as if the
 keyboard were focused. Reverting any one behavior change other than the
 `store_selection` guard makes its test fail.
 
-`Cargo.lock` covers only this test lane. It was pruned from the cagents
-lockfile, so the tests run against the production versions of sctk,
-wayland-client and wayland-backend. To refresh it, copy the root `Cargo.lock`
-here and run `cargo metadata` in this directory.
-
 ## Upstream
 
-As of 2026-10-21, the panicking unwrap is still present in Smithay/smithay-clipboard
-`master` (`26c2f53f15f6bdc4f41a442d0ae2c2d63bbc617c`) and in pop-os
+As of 2026-10-21, the panicking unwrap is still present in
+Smithay/smithay-clipboard `master` (`26c2f53f15f6bdc4f41a442d0ae2c2d63bbc617c`) and in pop-os
 `master` (`eebb02816e919b6fc7456843469105560a53f170`) and `dnd`
 (`5a3007def49eb678d1144850c9ee04b80707c56a`). Remove this Cargo patch
 when the smithay-clipboard revision used by window_clipboard handles released
