@@ -1460,6 +1460,33 @@ fn caret_position(
     })
 }
 
+/// The editor's caret as an external editor counts it.
+///
+/// External editors break lines on `\n`, `\r\n` and a lone `\r`, as this
+/// editor does, so its line index is right except after `\n\r`: that is one
+/// terminator here and two line breaks to VS Code and Zed, which normalize
+/// each `\r` that does not precede `\n` into a line break of its own.
+fn external_caret(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<crate::external_editor::Caret> {
+    if caret.line >= content.line_count() {
+        return None;
+    }
+    let mut line = 0u32;
+    for index in 0..caret.line {
+        let breaks = content.with_line(index, |_, ending| match ending {
+            text_editor::LineEnding::LfCr => 2,
+            // An unterminated line before the last is written with `\n`.
+            _ => 1,
+        })?;
+        line = line.saturating_add(breaks);
+    }
+    content.with_line(caret.line, |text, _| {
+        crate::external_editor::Caret::new(line, &text[..char_boundary(text, caret.column)])
+    })
+}
+
 /// The editor-native caret for a protocol position, or `None` when it names a
 /// line the buffer does not have.
 ///
@@ -3111,6 +3138,21 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    /// The caret as an external editor counts it, so the selected file opens
+    /// there where the reader left it.
+    ///
+    /// `None` unless the selected file's own buffer is open.
+    #[must_use]
+    pub fn external_caret(&self) -> Option<crate::external_editor::Caret> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        if self.selected_path() != Some(document.path.as_path()) {
+            return None;
+        }
+        external_caret(&document.content, document.content.cursor().position)
     }
 
     pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
@@ -16221,6 +16263,44 @@ mod tests {
             !runtime.move_cursor_to(LspPosition::new(2, 0)),
             "the protocol sees two lines here, whatever the editor does"
         );
+    }
+
+    #[test]
+    fn the_external_caret_counts_lines_the_way_external_editors_break_them() {
+        use crate::external_editor::Caret;
+        // Every terminator the editor knows, one per line: `\n`, `\r\n`, a
+        // lone `\r`, and `\n\r`, which the built-in editor reads as one
+        // terminator and VS Code and Zed read as two line breaks.
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "one\ntwo\r\nold\rmac\n\rlast é→😀x\n");
+        let mut caret_at = |line, column| {
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line, column },
+                selection: None,
+            });
+            runtime.external_caret()
+        };
+        assert_eq!(caret_at(0, 2), Some(Caret::new(0, "on")));
+        assert_eq!(caret_at(1, 3), Some(Caret::new(1, "two")));
+        assert_eq!(caret_at(2, 0), Some(Caret::new(2, "")));
+        assert_eq!(caret_at(3, 1), Some(Caret::new(3, "m")));
+        // The column is a byte offset into the editor line; this one is after
+        // the emoji.
+        assert_eq!(
+            caret_at(4, "last é→😀".len()),
+            Some(Caret::new(5, "last é→😀"))
+        );
+    }
+
+    #[test]
+    fn there_is_no_external_caret_without_the_selected_file_open_as_text() {
+        let card = CardId::new();
+        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+        assert_eq!(runtime.external_caret(), None);
     }
 
     #[test]
