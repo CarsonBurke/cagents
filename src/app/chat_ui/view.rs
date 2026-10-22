@@ -10807,7 +10807,7 @@ mod tests {
             }
             assert!(settled, "actual Flow and transcript layouts converge");
             #[derive(Default)]
-            struct ReadText(Vec<(String, iced::Rectangle, usize)>);
+            struct ReadText(Vec<(String, iced::Rectangle, usize, bool)>);
             impl Operation for ReadText {
                 fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
                     operate(self);
@@ -10835,6 +10835,7 @@ mod tests {
                             prose.plain.to_string(),
                             bounds,
                             prose.logical.as_ref().map_or(0, |logical| logical.start),
+                            prose.empty_line_caret(),
                         ));
                     }
                 }
@@ -10856,16 +10857,40 @@ mod tests {
                     "raw code oracle preserves every newline byte"
                 );
                 assert!(
-                    text.0
-                        .iter()
-                        .filter(|(plain, _, _)| plain.is_empty())
-                        .count()
-                        > 1,
+                    text.0.iter().filter(|(_, _, _, caret)| *caret).count() > 1,
                     "both middle and terminal empty rows are mounted"
                 );
                 assert!(
                     text.0.len() > 2,
                     "code selection crosses real physical row widgets"
+                );
+                let ending = if source.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                for (plain, _, start, caret) in &text.0 {
+                    if *caret {
+                        assert_eq!(
+                            plain, ending,
+                            "visual blank retains its exact LF/CRLF bytes"
+                        );
+                        assert_eq!(
+                            source.get(*start..*start + plain.len()),
+                            Some(plain.as_str()),
+                            "blank caret belongs to its current logical source slice"
+                        );
+                    }
+                }
+                let terminal = text.0.last().unwrap();
+                assert!(
+                    terminal.3,
+                    "terminal physical blank has real caret geometry"
+                );
+                assert_eq!(
+                    terminal.2 + terminal.0.len(),
+                    source.len(),
+                    "terminal caret covers the original source endpoint"
                 );
             } else {
                 assert_eq!(
@@ -10893,7 +10918,12 @@ mod tests {
             if raw_code {
                 let blank = &text.0[1];
                 let next = &text.0[2];
-                assert!(blank.0.is_empty() && !next.0.is_empty());
+                assert!(blank.3 && !next.3);
+                assert_eq!(
+                    next.2,
+                    blank.2 + blank.0.len(),
+                    "middle blank and next row are adjacent original source ranges"
+                );
                 selections.push((
                     iced::Point::new(blank.1.x + 5.0, blank.1.y + blank.1.height / 2.0),
                     iced::Point::new(next.1.x, next.1.y + 3.0),
