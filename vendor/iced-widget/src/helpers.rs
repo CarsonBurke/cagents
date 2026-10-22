@@ -996,6 +996,30 @@ where
 
             top_overlay
         }
+
+        #[cfg(feature = "a11y")]
+        fn a11y_nodes(
+            &self,
+            layout: Layout<'_>,
+            state: &Tree,
+            cursor: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            // Like `operate`, expose `top` while it is hidden: keyboard focus
+            // reveals it, and assistive technology must be able to reach it.
+            iced_accessibility::A11yTree::join(
+                [&self.base, &self.top]
+                    .into_iter()
+                    .zip(layout.children().zip(&state.children))
+                    .map(|(child, (c_layout, state))| {
+                        child.as_widget().a11y_nodes(
+                            c_layout
+                                .with_virtual_offset(layout.virtual_offset()),
+                            state,
+                            cursor,
+                        )
+                    }),
+            )
+        }
     }
 
     Element::new(Hover {

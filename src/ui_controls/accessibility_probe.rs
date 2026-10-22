@@ -226,5 +226,30 @@ mod tests {
             &["Edit"],
             "a tooltip",
         );
+        // The hover layer stays reachable while it is hidden, as it is for
+        // keyboard focus.
+        let hover = cosmic::iced::widget::hover(button("Edit"), button("Remove"));
+        assert_named(
+            &accessible_buttons(hover, max),
+            &["Edit", "Remove"],
+            "a hover",
+        );
+    }
+
+    #[test]
+    fn tables_expose_their_cells_in_row_major_order() {
+        use cosmic::iced::widget::table;
+        let cells = [["Edit", "Pause"], ["Run now", "Remove"]];
+        let table = table::table(
+            [("Name", 0), ("State", 1)].map(|(header, column)| {
+                table::column(button(header), move |row: usize| button(cells[row][column]))
+            }),
+            0..cells.len(),
+        );
+        assert_named(
+            &accessible_buttons(table.into(), Size::new(600.0, 600.0)),
+            &["Name", "State", "Edit", "Pause", "Run now", "Remove"],
+            "a table",
+        );
     }
 }
