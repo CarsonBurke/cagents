@@ -33,9 +33,11 @@ fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
         assert!(!draft.snapshot.ready);
         assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
 
-        draft.composer_action(text_editor::Action::Edit(text_editor::Edit::Paste(
-            Arc::new("Unsent local draft".into()),
-        )));
+        draft
+            .composer
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new("Unsent local draft".into()),
+            )));
         assert_eq!(draft.composer.text(), "Unsent local draft");
         assert!(draft.handle().is_none());
         assert!(draft.queued.is_none());
