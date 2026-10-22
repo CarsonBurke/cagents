@@ -121,6 +121,20 @@ pub struct DiscardRecoveryEntry {
     pub trash: Option<TrashReceipt>,
 }
 
+/// Inert, worker-cached disclosure. Neither diagnostic pathname authorizes IO;
+/// only the receipt-local nonce selects its already-held original target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverOriginalFile {
+    pub nonce: Uuid,
+    pub path: RepoPath,
+    pub original_path: PathBuf,
+    pub retained_path: PathBuf,
+    pub bytes: u64,
+    pub mode: u32,
+    pub sha256: [u8; 32],
+    pub published_unconfirmed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardRecovery {
     /// Ephemeral exact recovery authority; never serialized or reconstructed
@@ -178,8 +192,35 @@ struct LiveDiscardState {
     completed: std::collections::BTreeSet<RepoPath>,
     resolution_required: bool,
     resumed_until_unix_ms: u64,
+    originals: Vec<publication::PendingOriginal>,
 }
 impl LiveDiscardRecovery {
+    fn add_original(&self, original: publication::PendingOriginal) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .originals
+            .push(original);
+    }
+    fn originals(&self) -> Vec<publication::PendingOriginal> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .originals
+            .clone()
+    }
+    pub fn recoverable_originals(&self) -> Vec<RecoverOriginalFile> {
+        // No IO or native capabilities escape to the UI.
+        self.originals()
+            .into_iter()
+            .filter_map(|p| p.disclosure())
+            .collect()
+    }
+    fn record_confirmed_originals(&self) {
+        for original in self.originals().into_iter().filter(|p| p.is_confirmed()) {
+            self.mark_completed(&original.disclosure.path);
+        }
+    }
     pub fn authority(&self) -> Option<crate::recovery_authority::RecoveryAuthority> {
         self.0
             .lock()
@@ -663,7 +704,39 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         })
     }
 
-    /// Resolves only retained artifacts/metadata. This does NOT perform the
+    /// Publish one complete authenticated private blob to its exact original
+    /// ABSENT target. Occupied files and replaced parents are never repaired or
+    /// overwritten. A known publication is reverified, never attempted twice.
+    pub fn recover_original_file(
+        &self,
+        recovery: &DiscardRecovery,
+        nonce: Uuid,
+        cancellation: &CancellationToken,
+    ) -> Result<DiscardRecoveryResolution, RepositoryError> {
+        if !recovery.live_recovery.needs_resolution() {
+            return Err(
+                ValidationError::Io("This discard recovery is no longer pending".into()).into(),
+            );
+        }
+        let original = recovery
+            .live_recovery
+            .originals()
+            .into_iter()
+            .find(|p| p.disclosure.nonce == nonce)
+            .ok_or_else(|| {
+                ValidationError::Io(
+                    "The original-file action expired or belongs to another receipt".into(),
+                )
+            })?;
+        let result = original.recover(cancellation);
+        recovery.live_recovery.record_confirmed_originals();
+        result.map_err(ValidationError::Io)?;
+        // No holding lock is held while entering RecoveryWork -> Holding.
+        self.resolve_discard_recovery(recovery, cancellation)
+    }
+
+    /// Resolves only retained artifacts/metadata, or confirms a known typed
+    /// original-file publication. This does NOT perform the
     /// remaining file Undo or consume its intent, and needs no pathname Git
     /// recapture. Run on a worker and keep the original receipt on failure.
     pub fn resolve_discard_recovery(
@@ -682,9 +755,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         if let Some(authority) = recovery.live_recovery.authority() {
-            authority
-                .retry()
-                .map_err(|message| ValidationError::Io(message))?;
+            let result = authority.retry();
+            recovery.live_recovery.record_confirmed_originals();
+            result.map_err(ValidationError::Io)?;
         }
         // A pending native source rename is completed only after retry has
         // reverified its SAME original inode/content/access at that endpoint.

@@ -2567,7 +2567,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
         Message::SidebarSnapshot { action, .. } => !answers_discard_confirmation(action),
-        Message::DiscardUndo { .. } => true,
+        Message::DiscardUndo { .. } | Message::DiscardRecoverOriginal { .. } | Message::DiscardCopyRecoveryDetails { .. } => true,
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
@@ -2587,6 +2587,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
             Message::KeyEvent { .. }
                 | Message::SidebarSnapshot { .. }
                 | Message::DiscardUndo { .. }
+                | Message::DiscardRecoverOriginal { .. }
+                | Message::DiscardCopyRecoveryDetails { .. }
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
@@ -4076,6 +4078,14 @@ pub enum Message {
     DiscardUndo {
         id: uuid::Uuid,
         resolve: bool,
+    },
+    DiscardRecoverOriginal {
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
+    },
+    DiscardCopyRecoveryDetails {
+        id: uuid::Uuid,
+        nonce: uuid::Uuid,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -14813,7 +14823,18 @@ impl Application for Cagents {
                 }
                 self.update(Message::Sidebar(*action))
             }
-            Message::DiscardUndo { id, resolve } => {
+            Message::DiscardCopyRecoveryDetails { id, nonce } => {
+                self.discard_ui.original_details(id, nonce).map_or_else(Task::none, |details| {
+                    chat_ui::invalidate_copy_intent();
+                    iced::clipboard::write(details).map(cosmic::Action::App)
+                })
+            }
+            action @ (Message::DiscardUndo { .. } | Message::DiscardRecoverOriginal { .. }) => {
+                let (id, resolve, original) = match action {
+                    Message::DiscardUndo { id, resolve } => (id, resolve, None),
+                    Message::DiscardRecoverOriginal { id, nonce } => (id, true, Some(nonce)),
+                    _ => unreachable!(),
+                };
                 if self.modal_is_open() {
                     return Task::none();
                 }
@@ -14827,7 +14848,12 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
-                let Some(slot) = self.discard_ui.begin_undo(id, resolve) else {
+                let admitted = if let Some(nonce) = original {
+                    self.discard_ui.begin_recover_original(id, nonce)
+                } else {
+                    self.discard_ui.begin_undo(id, resolve)
+                };
+                let Some(slot) = admitted else {
                     return Task::none();
                 };
                 let operation = uuid::Uuid::new_v4();
@@ -14841,8 +14867,10 @@ impl Application for Cagents {
                 );
                 let completed = slot.clone();
                 cosmic::task::future(async move {
-                    let joined =
-                        tokio::task::spawn_blocking(move || slot.finish_undo(resolve)).await;
+                    let joined = tokio::task::spawn_blocking(move || {
+                        if let Some(nonce) = original { slot.finish_recover_original(nonce) }
+                        else { slot.finish_undo(resolve) }
+                    }).await;
                     let report = joined.unwrap_or_else(|e| {
                         Some(format!(
                             "Undo worker failed; original receipt retained: {e}"

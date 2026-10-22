@@ -408,3 +408,177 @@ fn discard_app_partial_undo_preserves_newer_file_and_keeps_remaining_receipt() {
         b"new file original\n"
     );
 }
+
+#[test]
+fn discard_app_recover_original_uses_nonce_and_original_slot_across_navigation() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_recover_original_uses_nonce_and_original_slot_across_navigation";
+    if isolated(NAME) {
+        return;
+    }
+    use crate::process::{ProcessFailure, ProcessOutput};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct MoveParent {
+        root: PathBuf,
+        parked: PathBuf,
+        armed: AtomicBool,
+    }
+    impl ProcessExecutor for MoveParent {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancel: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|arg| arg == "cat-file")
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                fs::rename(self.root.join("nested"), &self.parked).unwrap();
+                fs::create_dir(self.root.join("nested")).unwrap();
+                fs::write(self.root.join("nested/file"), b"foreign preserved\n").unwrap();
+            }
+            SystemProcessExecutor.execute(command, cancel)
+        }
+    }
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), b"index baseline\n").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("nested/file"), b"precious original\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    let task = app.source_control_snapshot_task(key.clone());
+    let loaded = crate::app::tests::task_app_message(task);
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
+    drop(app.update(loaded));
+    let source = app.discard_ui.source().unwrap().clone();
+    let parked = root.with_extension("original-parent");
+    let executor = Arc::new(MoveParent {
+        root: root.clone(),
+        parked: parked.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let service = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(source.authority.get().unwrap().clone().unwrap())
+        .unwrap();
+    let request = DiscardRequest {
+        worktree: root.clone(),
+        tracked: vec![crate::repository::PathSelection::new(
+            RepoPath::parse("nested/file").unwrap(),
+        )],
+        untracked: vec![],
+        confirmed: true,
+    };
+    let discarded = service
+        .discard_recoverable(&request, &CancellationToken::new(), &[root.clone()])
+        .unwrap();
+    assert!(matches!(
+        discarded.outcome,
+        crate::repository::MutationOutcome::Applied { .. }
+    ));
+    executor.armed.store(true, Ordering::SeqCst);
+    let outcome = service
+        .undo_discard(&discarded.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        crate::repository::MutationOutcome::NotApplied { .. }
+    ));
+    let receipt = discarded.recovery;
+    let choice = receipt.live_recovery.recoverable_originals().pop().unwrap();
+    let payload = fs::metadata(&choice.retained_path).unwrap();
+    // Install the genuine backend failed-Undo receipt as the App fixture's
+    // original slot. All recovery actions below use the actual App reducer,
+    // mutation envelope, worker and completion; no synthetic recovery plan.
+    let slot = Slot(Arc::new(Mutex::new(Entry {
+        id: uuid::Uuid::new_v4(),
+        source,
+        receipt: Some(receipt.clone()),
+        running: false,
+        error: Some("Original parent changed".into()),
+    })));
+    app.discard_ui.slots.push(slot.clone());
+    assert!(app.discard_ui.close_block_reason().is_some());
+    drop(app.update(Message::DiscardRecoverOriginal {
+        id: slot.id(),
+        nonce: uuid::Uuid::new_v4(),
+    }));
+    assert!(!app.discard_ui.has_inflight());
+    assert!(!app.source_control_mutations.contains_key(&root));
+    assert!(choice.retained_path.exists());
+    let other = ActiveWorktreeKey {
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.with_file_name("other"),
+        ..key
+    };
+    app.discard_ui.select(Some(other.clone()));
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(other.clone()));
+    // Genuine manual preparation preserves both foreign data and baseline.
+    fs::rename(root.join("nested"), root.join("foreign-preserved")).unwrap();
+    fs::rename(&parked, root.join("nested")).unwrap();
+    fs::rename(
+        root.join("nested/file"),
+        root.join("nested/baseline-preserved"),
+    )
+    .unwrap();
+    let task = app.update(Message::DiscardRecoverOriginal {
+        id: slot.id(),
+        nonce: choice.nonce,
+    });
+    assert!(app.discard_ui.has_inflight());
+    assert!(app.source_control_mutations.contains_key(&root));
+    assert!(app.discard_ui.close_block_reason().is_some());
+    let (response, receiver) = std::sync::mpsc::sync_channel(1);
+    drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
+        action: instance::UiUpdateAction::Prepare,
+        response,
+    })));
+    assert!(receiver.try_recv().unwrap().starts_with("error:"));
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(
+        &finished,
+        Message::DiscardFinished { report: None, .. }
+    ));
+    drop(app.update(finished));
+    assert!(!app.discard_ui.has_inflight());
+    assert!(!app.source_control_mutations.contains_key(&root));
+    assert_eq!(
+        app.sidebar_model.source_control.as_ref().unwrap().key,
+        other
+    );
+    assert!(app.discard_ui.close_block_reason().is_none());
+    assert_eq!(receipt.remaining_paths(), 0);
+    let recovered = fs::metadata(root.join("nested/file")).unwrap();
+    assert_eq!(
+        (recovered.dev(), recovered.ino()),
+        (payload.dev(), payload.ino())
+    );
+    assert_eq!(
+        fs::read(root.join("nested/file")).unwrap(),
+        b"precious original\n"
+    );
+    assert_eq!(
+        fs::read(root.join("nested/baseline-preserved")).unwrap(),
+        b"index baseline\n"
+    );
+    assert_eq!(
+        fs::read(root.join("foreign-preserved/file")).unwrap(),
+        b"foreign preserved\n"
+    );
+    drop(app.update(Message::DiscardRecoverOriginal {
+        id: slot.id(),
+        nonce: choice.nonce,
+    }));
+    assert!(
+        !app.discard_ui.has_inflight(),
+        "a stale rendered action cannot rearm the old slot"
+    );
+}

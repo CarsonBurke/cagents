@@ -190,6 +190,28 @@ impl Slot {
         entry.error = report.clone();
         report
     }
+    pub fn finish_recover_original(&self, nonce: uuid::Uuid) -> Option<String> {
+        let receipt = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receipt
+            .clone();
+        let report = receipt
+            .ok_or_else(|| "The original discard receipt is unavailable".to_owned())
+            .and_then(|receipt| {
+                RepositoryService::system("git")
+                    .recover_original_file(&receipt, nonce, &CancellationToken::new())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .err()
+            .map(|e| format!("Original-file recovery remains unresolved: {e}"));
+        let mut entry = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        entry.running = false;
+        entry.error = report.clone();
+        report
+    }
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -353,6 +375,25 @@ impl State {
         }
         Some(slot)
     }
+    pub fn begin_recover_original(&mut self, id: uuid::Uuid, nonce: uuid::Uuid) -> Option<Slot> {
+        let slot = self.slot(id)?;
+        {
+            let mut entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
+            let receipt = entry.receipt.as_ref()?;
+            if entry.running
+                || !receipt.live_recovery.needs_resolution()
+                || !receipt
+                    .live_recovery
+                    .recoverable_originals()
+                    .iter()
+                    .any(|p| p.nonce == nonce)
+            {
+                return None;
+            }
+            entry.running = true;
+        }
+        Some(slot)
+    }
     pub fn prune(&mut self) {
         self.slots.retain(|slot| {
             let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -363,7 +404,42 @@ impl State {
                     .is_some_and(DiscardRecovery::can_undo)
         });
     }
+    pub fn original_details(&self, id: uuid::Uuid, nonce: uuid::Uuid) -> Option<String> {
+        let slot = self.slot(id)?;
+        let receipt = slot
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receipt
+            .clone()?;
+        let original = receipt
+            .live_recovery
+            .recoverable_originals()
+            .into_iter()
+            .find(|original| original.nonce == nonce)?;
+        let digest: String = original
+            .sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let guidance = if original.published_unconfirmed {
+            "The original inode has already been placed at the original path. Leave it in place. Verify recovered original or Resolve verifies that same inode and finishes durability/cleanup; neither publishes again."
+        } else {
+            "Preserve any replacement folder under a separate name and restore the original folder. Preserve any occupied baseline under a separate name, leaving the original file path empty. Recover original file never overwrites an occupied file. Resolve does not restore an unpublished payload."
+        };
+        Some(format!(
+            "Original file: {}\nRetained payload (original diagnostic path only): {}\nBytes: {}\nMode: {:04o}\nSHA-256: {}\nPublication unconfirmed: {}\n\n{}\n",
+            display_path(&original.original_path),
+            display_path(&original.retained_path),
+            original.bytes,
+            original.mode,
+            digest,
+            original.published_unconfirmed,
+            guidance,
+        ))
+    }
     pub fn banner(&self, disabled: bool) -> Element<'_, Message> {
+        use cosmic::iced::{advanced::text::EllipsizeHeightLimit, widget::text::Ellipsize};
         let mut rows = Vec::new();
         for slot in &self.slots {
             let entry = slot.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -381,41 +457,97 @@ impl State {
             } else {
                 "Discarded work can be restored"
             };
-            let button = crate::ui_controls::button::secondary(if resolve {
-                "Resolve recovery"
-            } else {
-                "Undo discard"
-            })
-            .on_press_maybe((!entry.running && !disabled).then_some(
-                Message::DiscardUndo {
-                    id: entry.id,
-                    resolve,
-                },
-            ));
             let mut content = vec![
-                design::body(format!(
-                    "{} · {label}",
-                    display_path(&entry.source.key.canonical_path)
-                ))
+                widget::row::with_children(vec![
+                    design::body(format!(
+                        "{} · {label}",
+                        display_path(&entry.source.key.canonical_path)
+                    ))
+                    .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
+                    .width(Length::Fill)
+                    .into(),
+                    crate::ui_controls::button::secondary(if resolve {
+                        "Resolve recovery"
+                    } else {
+                        "Undo discard"
+                    })
+                    .on_press_maybe(
+                        (!entry.running && !disabled).then_some(Message::DiscardUndo {
+                            id: entry.id,
+                            resolve,
+                        }),
+                    )
+                    .into(),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
                 .into(),
-                button.into(),
             ];
+            let originals = receipt.live_recovery.recoverable_originals();
+            if originals
+                .iter()
+                .any(|original| !original.published_unconfirmed)
+            {
+                content.push(design::caption("Preserve the replacement folder and baseline first. Restore the original folder and leave the file path empty; Recover never overwrites it.").into());
+            }
+            if originals
+                .iter()
+                .any(|original| original.published_unconfirmed)
+            {
+                content.push(design::caption("A recovered file still needs verification. Leave it in place and choose Verify or Resolve.").into());
+            }
+            for original in originals {
+                content.push(
+                    widget::row::with_children(vec![
+                        design::body(display_path(original.path.as_path()))
+                            .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
+                            .width(Length::Fill)
+                            .into(),
+                        crate::ui_controls::button::secondary(if original.published_unconfirmed {
+                            "Verify recovered original"
+                        } else {
+                            "Recover original file"
+                        })
+                        .on_press_maybe((!entry.running && !disabled).then_some(
+                            Message::DiscardRecoverOriginal {
+                                id: entry.id,
+                                nonce: original.nonce,
+                            },
+                        ))
+                        .into(),
+                        crate::ui_controls::button::quiet("Copy recovery details")
+                            .on_press_maybe((!disabled).then_some(
+                                Message::DiscardCopyRecoveryDetails {
+                                    id: entry.id,
+                                    nonce: original.nonce,
+                                },
+                            ))
+                            .into(),
+                    ])
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .into(),
+                );
+            }
             if let Some(error) = &entry.error {
                 content.push(design::caption(error.clone()).into());
             }
             rows.push(
-                widget::container(
-                    widget::row::with_children(content)
-                        .spacing(space::S)
-                        .align_y(Alignment::Center),
-                )
-                .padding(space::S)
-                .into(),
+                widget::container(widget::column::with_children(content).spacing(space::S))
+                    .padding(space::S)
+                    .into(),
             );
         }
-        widget::column::with_children(rows)
-            .width(Length::Fill)
-            .into()
+        // One shared bounded region, rather than one growing region per file
+        // or receipt. All actions remain scroll-reachable in smaller windows.
+        widget::container(
+            widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
+                .id(widget::Id::new("discard-recovery-notices"))
+                .height(Length::Shrink),
+        )
+        .max_height(180.0)
+        .width(Length::Fill)
+        .into()
     }
 }
 

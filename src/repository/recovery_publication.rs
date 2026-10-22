@@ -42,9 +42,142 @@ struct Holding {
     files: Vec<Arc<fs::File>>,
     private_metadata: fs::Metadata,
     target: Option<(WorktreeAuthority, RepoPath)>,
+    // Armed only after authenticated, read-only blob handoff, and disarmed
+    // before acquiring any destination. Never inferred from directory names.
+    recoverable: Option<Proof>,
     context: FilesystemRecoveryContext,
     // Native owners above close before their creation/private charge releases.
     slot: Option<RecoverySlot>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingOriginal {
+    pub disclosure: RecoverOriginalFile,
+    cell: Arc<Mutex<Option<PendingHolding>>>,
+    published: Arc<std::sync::atomic::AtomicBool>,
+    confirmed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl fmt::Debug for PendingOriginal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingOriginal")
+            .field("disclosure", &self.disclosure)
+            .finish()
+    }
+}
+struct PendingHolding {
+    holding: Holding,
+    proof: Option<Proof>,
+    published: Arc<std::sync::atomic::AtomicBool>,
+    confirmed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl PendingHolding {
+    fn confirm(&mut self, cancellation: &CancellationToken) -> Result<(), String> {
+        if self.confirmed.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.published.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("The original file is still retained. Preserve any occupied baseline and restore the original parent, then choose Recover original file.".into());
+        }
+        self.holding.validate()?;
+        let (_, path) = self
+            .holding
+            .target
+            .as_ref()
+            .ok_or("Original target unavailable")?;
+        let name = path
+            .as_path()
+            .file_name()
+            .ok_or("Original leaf unavailable")?;
+        self.holding.verify_target(name)?;
+        let proof = self
+            .proof
+            .as_ref()
+            .ok_or("Original payload proof unavailable")?;
+        proof.verify_published_file(&self.holding.parent, Path::new(name), cancellation)?;
+        fs_safety::sync_directory(&self.holding.parent).map_err(|e| e.to_string())?;
+        fs_safety::sync_directory(self.holding.root()).map_err(|e| e.to_string())?;
+        self.holding.verify_target(name)?;
+        proof.verify_published_file(&self.holding.parent, Path::new(name), cancellation)?;
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Drop proof aliases before Holding's exclusive-custody cleanup.
+        self.proof = None;
+        Ok(())
+    }
+}
+impl PendingOriginal {
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn disclosure(&self) -> Option<RecoverOriginalFile> {
+        if self.is_confirmed() {
+            return None;
+        }
+        let mut disclosure = self.disclosure.clone();
+        disclosure.published_unconfirmed =
+            self.published.load(std::sync::atomic::Ordering::Acquire);
+        Some(disclosure)
+    }
+    pub fn recover(&self, cancellation: &CancellationToken) -> Result<(), String> {
+        self.recover_after_publication(cancellation, || {})
+    }
+    fn recover_after_publication(
+        &self,
+        cancellation: &CancellationToken,
+        after_publication: impl FnOnce(),
+    ) -> Result<(), String> {
+        let mut cell = self
+            .cell
+            .lock()
+            .map_err(|_| "Original recovery previously panicked; custody is retained")?;
+        let pending = cell
+            .as_mut()
+            .ok_or("This original-file recovery already settled")?;
+        if pending.confirmed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("This original file has already been recovered".into());
+        }
+        if cancellation.is_cancelled() {
+            return Err("Original-file recovery cancelled".into());
+        }
+        if !pending.published.load(std::sync::atomic::Ordering::Acquire) {
+            pending.holding.validate()?;
+            let (_, path) = pending
+                .holding
+                .target
+                .as_ref()
+                .ok_or("Original target unavailable")?;
+            let name = path
+                .as_path()
+                .file_name()
+                .ok_or("Original leaf unavailable")?;
+            pending.holding.verify_target(name)?;
+            pending
+                .proof
+                .as_ref()
+                .ok_or("Original payload proof unavailable")?
+                .verify(&pending.holding, Path::new("restored-blob"), cancellation)?;
+            fs_safety::sync_directory(pending.holding.root()).map_err(|e| e.to_string())?;
+            if cancellation.is_cancelled() {
+                return Err("Original-file recovery cancelled before publication".into());
+            }
+            pending.holding.verify_target(name)?;
+            fs_safety::rename_new_between(
+                pending.holding.root(),
+                OsStr::new("restored-blob"),
+                &pending.holding.parent,
+                name,
+            )
+            .map_err(|e| {
+                format!("Original file was not replaced; preserve any occupied file first: {e}")
+            })?;
+            // Irreversible phase transition BEFORE any fallible proof/sync.
+            pending
+                .published
+                .store(true, std::sync::atomic::Ordering::Release);
+            after_publication();
+        }
+        pending.confirm(cancellation)
+    }
 }
 
 fn remember_directory_error(
@@ -90,6 +223,7 @@ impl Holding {
             files: vec![],
             target: None,
             context,
+            recoverable: None,
         })
     }
     fn verify_target(&self, name: &OsStr) -> Result<(), String> {
@@ -270,10 +404,55 @@ impl Holding {
             .slot
             .take()
             .expect("reserved before Undo filesystem effects");
-        // Whole receiver capture retains root, files, parent and publication.
-        recovery
-            .live_recovery
-            .retain(slot.retain(description, move || self.retry()));
+        if let Some(proof) = self.recoverable.take() {
+            let (source, path) = self
+                .target
+                .as_ref()
+                .expect("authenticated blob has original target");
+            let disclosure = RecoverOriginalFile {
+                nonce: Uuid::new_v4(),
+                path: path.clone(),
+                original_path: source.path().join(path.as_path()),
+                retained_path: self.root().path().join("restored-blob"),
+                bytes: proof.metadata.len(),
+                mode: proof.metadata.mode() & 0o7777,
+                sha256: proof.digest.expect("authenticated blob has digest"),
+                published_unconfirmed: false,
+            };
+            let confirmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cell = Arc::new(Mutex::new(Some(PendingHolding {
+                holding: self,
+                proof: Some(proof),
+                published: published.clone(),
+                confirmed: confirmed.clone(),
+            })));
+            recovery.live_recovery.add_original(PendingOriginal {
+                disclosure,
+                cell: cell.clone(),
+                published,
+                confirmed,
+            });
+            recovery
+                .live_recovery
+                .retain(slot.retain(description, move || {
+                    let mut cell = cell.lock().map_err(
+                        |_| "Original recovery previously panicked; custody is retained",
+                    )?;
+                    if let Some(pending) = cell.as_mut() {
+                        pending.confirm(&CancellationToken::new())?;
+                        pending.holding.retry()?;
+                    }
+                    // All native/proof owners die BEFORE RecoveryAuthority releases
+                    // its slot. Receipt clones keep only a descriptor-free tombstone.
+                    drop(cell.take());
+                    Ok(())
+                }));
+        } else {
+            recovery
+                .live_recovery
+                .retain(slot.retain(description, move || self.retry()));
+        }
     }
 
     fn retry(&mut self) -> Result<(), String> {
@@ -377,6 +556,7 @@ pub(super) fn pin_symlink(_root: &fs_safety::Root, _name: &Path) -> Result<fs::F
     Err("Strong Undo publication requires Linux retained metadata handles".into())
 }
 
+#[derive(Clone)]
 struct Proof {
     metadata: fs::Metadata,
     file: Option<Arc<fs::File>>,
@@ -388,6 +568,42 @@ struct Proof {
 }
 
 impl Proof {
+    fn verify_published_file(
+        &self,
+        root: &fs_safety::Root,
+        name: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let named = fs_safety::metadata_beneath(root, name).map_err(|e| e.to_string())?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or("Original recovery requires a regular file")?;
+        let matches = |metadata: &fs::Metadata| {
+            // The known rename changes ctime, not authenticated data/access.
+            moved_entry_version(metadata) == moved_entry_version(&self.metadata)
+                && (metadata.uid(), metadata.gid()) == (self.metadata.uid(), self.metadata.gid())
+        };
+        if !matches(&named) || !matches(&file.metadata().map_err(|e| e.to_string())?) {
+            return Err(
+                "The original recovery inode or metadata changed; its replacement was preserved"
+                    .into(),
+            );
+        }
+        self.access
+            .as_ref()
+            .ok_or("Original access proof unavailable")?
+            .verify(file)?;
+        if self.digest != Some(digest_file(file, self.metadata.len(), cancellation)?)
+            || !matches(&file.metadata().map_err(|e| e.to_string())?)
+            || !matches(&fs_safety::metadata_beneath(root, name).map_err(|e| e.to_string())?)
+        {
+            return Err(
+                "The original recovery contents changed; custody remains unresolved".into(),
+            );
+        }
+        Ok(())
+    }
     fn capture(
         holding: &mut Holding,
         name: &Path,
@@ -659,6 +875,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(format!("The backup is unavailable: {reason}"));
             }
         };
+        if let (SavedEntry::Blob { .. }, Some((_, proof))) = (&entry.before, &materialized) {
+            holding.recoverable = Some(proof.clone());
+        }
         let current = match fs_safety::metadata_beneath(&holding.parent, Path::new(name)) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.is_not_found() => None,
@@ -679,6 +898,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if current.is_some() {
                 holding.validate()?;
                 holding.verify_target(name)?;
+                // Conservatively exclude every acquired-destination path,
+                // including a later successful rollback. Never strand previous.
+                holding.recoverable = None;
                 fs_safety::rename_new_between(
                     &holding.parent,
                     name,
@@ -742,6 +964,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             fs_safety::sync_directory(holding.root()).map_err(|error| error.to_string())?;
             holding.verify_target(name)?;
             if let Some((generated, _)) = &materialized {
+                holding.recoverable = None;
                 fs_safety::rename_new_between(
                     holding.root(),
                     generated.as_os_str(),
@@ -839,6 +1062,222 @@ mod tests {
         )
         .unwrap();
         (directory, recovery, holding)
+    }
+
+    fn original_fixture() -> (tempfile::TempDir, DiscardRecovery, PendingOriginal) {
+        original_fixture_with_guard(())
+    }
+
+    fn original_fixture_with_guard(
+        guard: impl Send + Sync + 'static,
+    ) -> (tempfile::TempDir, DiscardRecovery, PendingOriginal) {
+        let (directory, recovery, mut holding) = fixture_with_guard(guard);
+        fs::create_dir(directory.path().join(".git")).unwrap();
+        holding.target = Some((
+            WorktreeAuthority::capture(directory.path()).unwrap(),
+            RepoPath::parse("file").unwrap(),
+        ));
+        let writer = holding.create_private_blob().unwrap();
+        let reader = holding.pin_readable_blob(&writer).unwrap();
+        writer.write_all_at(b"precious original", 0).unwrap();
+        writer.sync_all().unwrap();
+        let metadata = writer.metadata().unwrap();
+        let access = SavedFileAccess::capture(&writer).unwrap();
+        let digest = digest_file(&writer, metadata.len(), &CancellationToken::new()).unwrap();
+        let proof = Proof::after_blob_access_change(
+            &holding,
+            Path::new("restored-blob"),
+            access,
+            reader,
+            metadata,
+            digest,
+            0o640,
+            &CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        holding
+            .release_blob_writers(
+                writer,
+                &proof,
+                Path::new("restored-blob"),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        holding.recoverable = Some(proof);
+        holding.retain(&recovery);
+        let original = recovery.live_recovery.originals().pop().unwrap();
+        (directory, recovery, original)
+    }
+
+    #[test]
+    fn recover_original_keeps_native_owners_until_confirmation_then_drains_shared_tombstone() {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+        struct LeaseDrop {
+            descriptor: Arc<AtomicI32>,
+            closed_before_release: Arc<AtomicBool>,
+        }
+        impl Drop for LeaseDrop {
+            fn drop(&mut self) {
+                self.closed_before_release.store(
+                    unsafe { libc::fcntl(self.descriptor.load(Ordering::SeqCst), libc::F_GETFD) }
+                        == -1,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        let watched = Arc::new(AtomicI32::new(-1));
+        let closed_before_release = Arc::new(AtomicBool::new(false));
+        let (directory, recovery, original) = original_fixture_with_guard(LeaseDrop {
+            descriptor: watched.clone(),
+            closed_before_release: closed_before_release.clone(),
+        });
+        {
+            let _worker_holds_native_cell = original.cell.lock().unwrap();
+            assert!(
+                original.disclosure().is_some(),
+                "render-side cached values never acquire the IO mutex"
+            );
+            assert_eq!(recovery.live_recovery.recoverable_originals().len(), 1);
+        }
+        let (file, descriptor, parent, payload_identity) = {
+            use std::os::fd::AsRawFd;
+            let cell = original.cell.lock().unwrap();
+            let pending = cell.as_ref().unwrap();
+            (
+                Arc::downgrade(&pending.holding.files[0]),
+                pending.holding.files[0].as_raw_fd(),
+                pending.holding.parent.metadata().unwrap(),
+                pending.proof.as_ref().unwrap().metadata.ino(),
+            )
+        };
+        watched.store(descriptor, Ordering::SeqCst);
+        let retained = original.disclosure.retained_path.clone();
+        let authority = recovery.live_recovery.authority().unwrap();
+        assert!(
+            authority.retry().is_err(),
+            "cleanup cannot consume an unpublished precious inode"
+        );
+        assert!(file.upgrade().is_some());
+        original.recover(&CancellationToken::new()).unwrap();
+        assert!(original.is_confirmed());
+        assert!(
+            !authority.is_resolved(),
+            "confirmation alone must not release the native reservation"
+        );
+        assert!(file.upgrade().is_some());
+        assert!(
+            authority.retry().is_err(),
+            "an outstanding Weak must still prevent capacity release"
+        );
+        assert!(!closed_before_release.load(Ordering::SeqCst));
+        drop(file);
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert!(
+            closed_before_release.load(Ordering::SeqCst),
+            "the creation lease observes the native payload FD already closed"
+        );
+        assert!(
+            original.cell.lock().unwrap().is_none(),
+            "all clones share a drained native holder"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_GETFD) },
+            -1,
+            "original read/proof owners close before resolved slot"
+        );
+        assert!(!retained.exists());
+        let actual = fs::metadata(directory.path().join("file")).unwrap();
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (parent.dev(), payload_identity)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("file")).unwrap(),
+            b"precious original"
+        );
+        assert!(original.recover(&CancellationToken::new()).is_err());
+    }
+
+    #[test]
+    fn recover_original_known_rename_survives_failed_confirmation_without_republication() {
+        let (directory, recovery, original) = original_fixture();
+        let private = original
+            .disclosure
+            .retained_path
+            .parent()
+            .unwrap()
+            .to_owned();
+        let inode = fs::metadata(&original.disclosure.retained_path)
+            .unwrap()
+            .ino();
+        let result = original.recover_after_publication(&CancellationToken::new(), || {
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o711)).unwrap();
+        });
+        assert!(result.is_err());
+        assert!(!original.is_confirmed());
+        assert!(original.disclosure().unwrap().published_unconfirmed);
+        assert_eq!(
+            fs::metadata(directory.path().join("file")).unwrap().ino(),
+            inode
+        );
+        assert!(
+            !original.disclosure.retained_path.exists(),
+            "the rename actually happened"
+        );
+        let authority = recovery.live_recovery.authority().unwrap();
+        assert!(authority.retry().is_err());
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        // The real published leaf is occupied by our inode. An erroneous
+        // second NOREPLACE publication would fail; Resolve must verify it.
+        authority.retry().unwrap();
+        recovery.live_recovery.record_confirmed_originals();
+        assert!(original.is_confirmed());
+        assert!(
+            recovery
+                .live_recovery
+                .is_completed(&RepoPath::parse("file").unwrap())
+        );
+        authority.retry().unwrap();
+        assert_eq!(recovery.live_recovery.completed_count(), 1);
+        assert_eq!(
+            fs::metadata(directory.path().join("file")).unwrap().ino(),
+            inode
+        );
+    }
+
+    #[test]
+    fn recover_original_refuses_same_byte_replacement_and_preserves_both_inodes() {
+        let (directory, recovery, original) = original_fixture();
+        let payload = &original.disclosure.retained_path;
+        let parked = payload.with_file_name("precious-preserved");
+        let inode = fs::metadata(payload).unwrap().ino();
+        fs::rename(payload, &parked).unwrap();
+        fs::write(payload, b"precious original").unwrap();
+        fs::set_permissions(payload, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(original.recover(&CancellationToken::new()).is_err());
+        assert!(!directory.path().join("file").exists());
+        assert_eq!(fs::metadata(&parked).unwrap().ino(), inode);
+        assert_ne!(fs::metadata(payload).unwrap().ino(), inode);
+        assert!(recovery.live_recovery.authority().unwrap().retry().is_err());
+        assert_eq!(fs::read(&parked).unwrap(), b"precious original");
+    }
+
+    #[test]
+    fn recover_original_does_not_adopt_partial_or_untyped_holding_contents() {
+        for previous in [false, true] {
+            let (_directory, recovery, mut holding) = fixture();
+            let writer = holding.create_private_blob().unwrap();
+            writer.write_all_at(b"partial", 0).unwrap();
+            if previous {
+                fs::write(holding.root().path().join("previous"), b"baseline").unwrap();
+            }
+            drop(writer);
+            holding.retain(&recovery);
+            assert!(recovery.live_recovery.recoverable_originals().is_empty());
+            assert!(recovery.live_recovery.authority().unwrap().retry().is_err());
+        }
     }
 
     #[test]

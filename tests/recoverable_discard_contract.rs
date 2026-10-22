@@ -597,40 +597,118 @@ fn local_tracked_undo_refuses_parent_moved_during_actual_blob_materialization() 
     assert_eq!(fs::read(moved.join("file")).unwrap(), b"index base\n");
     assert_eq!(result.recovery.remaining_paths(), 1);
     assert!(result.recovery.live_recovery.needs_resolution());
-    // Explicitly resolve this fixture's retained private materialization; no
-    // production cleanup adopts diagnostic pathnames or the lookalike parent.
-    for candidate in fs::read_dir(root.parent().unwrap())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(".cagents-undo-")
-        })
-    {
-        assert_eq!(
-            fs::read(candidate.join("restored-blob")).unwrap(),
-            b"precious nested original\n"
-        );
-        fs::remove_file(candidate.join("restored-blob")).unwrap();
-    }
-    service
-        .resolve_discard_recovery(&result.recovery, &CancellationToken::new())
-        .unwrap();
-    assert_eq!(result.recovery.remaining_paths(), 1);
-    fs::remove_file(root.join("nested/file")).unwrap();
-    fs::remove_dir(root.join("nested")).unwrap();
-    fs::rename(&moved, root.join("nested")).unwrap();
-    applied(
-        &service
-            .undo_discard(&result.recovery, &CancellationToken::new())
-            .unwrap(),
-    );
+    let choices = result.recovery.live_recovery.recoverable_originals();
     assert_eq!(
-        fs::read(root.join("nested/file")).unwrap(),
+        choices.len(),
+        1,
+        "only the authenticated complete blob is offered"
+    );
+    let choice = &choices[0];
+    assert_eq!(choice.original_path, root.join("nested/file"));
+    assert_eq!(choice.bytes, b"precious nested original\n".len() as u64);
+    let payload = fs::metadata(&choice.retained_path).unwrap();
+    let payload_identity = (payload.dev(), payload.ino());
+    assert_eq!(
+        fs::read(&choice.retained_path).unwrap(),
         b"precious nested original\n"
     );
+    assert!(
+        service
+            .resolve_discard_recovery(&result.recovery, &CancellationToken::new())
+            .is_err(),
+        "Resolve must not imply restoration or release precious custody"
+    );
+    assert!(
+        service
+            .recover_original_file(
+                &result.recovery,
+                uuid::Uuid::new_v4(),
+                &CancellationToken::new()
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .recover_original_file(&result.recovery, choice.nonce, &CancellationToken::new())
+            .is_err(),
+        "the foreign replacement parent is not adopted"
+    );
+    let foreign = root.join("nested");
+    let foreign_identity = fs::metadata(foreign.join("file")).unwrap();
+    let saved_foreign = root.join("foreign-preserved");
+    fs::rename(&foreign, &saved_foreign).unwrap();
+    fs::rename(&moved, &foreign).unwrap();
+    let baseline = fs::metadata(foreign.join("file")).unwrap();
+    assert!(
+        service
+            .recover_original_file(&result.recovery, choice.nonce, &CancellationToken::new())
+            .is_err(),
+        "even the exact original baseline must never be overwritten"
+    );
+    assert_eq!(fs::read(foreign.join("file")).unwrap(), b"index base\n");
+    fs::rename(foreign.join("file"), foreign.join("preserved-baseline")).unwrap();
+    // A genuine current-source fence, not a convenient recapture after manual
+    // namespace repair. The precious inode remains private on refusal.
+    fs::rename(root.join(".git"), root.join("preserved-git")).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    assert!(
+        service
+            .recover_original_file(&result.recovery, choice.nonce, &CancellationToken::new())
+            .is_err()
+    );
+    assert!(!foreign.join("file").exists());
+    fs::remove_dir(root.join(".git")).unwrap();
+    fs::rename(root.join("preserved-git"), root.join(".git")).unwrap();
+    let resolved = service
+        .recover_original_file(&result.recovery, choice.nonce, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(resolved.remaining_paths, 0);
+    let recovered = fs::metadata(foreign.join("file")).unwrap();
+    assert_eq!(
+        (recovered.dev(), recovered.ino()),
+        payload_identity,
+        "Recover publishes the actual precious inode, never a replacement copy"
+    );
+    assert_eq!(
+        fs::read(foreign.join("file")).unwrap(),
+        b"precious nested original\n"
+    );
+    assert_eq!(recovered.mode() & 0o7777, payload.mode() & 0o7777);
+    let saved_baseline = fs::metadata(foreign.join("preserved-baseline")).unwrap();
+    assert_eq!(
+        (saved_baseline.dev(), saved_baseline.ino()),
+        (baseline.dev(), baseline.ino())
+    );
+    assert_eq!(
+        fs::read(foreign.join("preserved-baseline")).unwrap(),
+        b"index base\n"
+    );
+    let preserved = fs::metadata(saved_foreign.join("file")).unwrap();
+    assert_eq!(
+        (preserved.dev(), preserved.ino()),
+        (foreign_identity.dev(), foreign_identity.ino())
+    );
+    assert_eq!(
+        fs::read(saved_foreign.join("file")).unwrap(),
+        b"foreign replacement parent\n"
+    );
+    assert!(!choice.retained_path.exists());
+    assert!(!result.recovery.live_recovery.is_pending());
+    assert!(!result.recovery.live_recovery.needs_resolution());
+    assert!(
+        result
+            .recovery
+            .live_recovery
+            .recoverable_originals()
+            .is_empty()
+    );
+    assert!(
+        service
+            .recover_original_file(&result.recovery, choice.nonce, &CancellationToken::new())
+            .is_err(),
+        "the stale rendered action cannot publish twice"
+    );
+    assert_eq!(result.recovery.remaining_paths(), 0);
 }
 
 #[test]
@@ -714,4 +792,109 @@ fn local_linked_discard_undo_keeps_original_private_index_and_common_objects() {
     assert!(!primary.join(".git/index.lock").exists());
     assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 0);
+}
+
+#[test]
+fn local_tracked_undo_acquired_previous_never_offers_single_blob_recovery() {
+    const NAME: &str = "local_tracked_undo_acquired_previous_never_offers_single_blob_recovery";
+    if isolated(NAME, false) {
+        return;
+    }
+    use cagents::process::{ProcessFailure, ProcessOutput};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct MoveAfterAcquisition {
+        root: PathBuf,
+        parked: PathBuf,
+        armed: AtomicBool,
+        hashes: AtomicUsize,
+    }
+    impl ProcessExecutor for MoveAfterAcquisition {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancel: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if self.armed.load(Ordering::SeqCst)
+                && command.arguments.iter().any(|arg| arg == "hash-object")
+                && self.hashes.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                // First hash authenticated the precious blob; the second is
+                // the actual acquired baseline at Holding/previous.
+                fs::rename(self.root.join("nested"), &self.parked).unwrap();
+                fs::create_dir(self.root.join("nested")).unwrap();
+                fs::write(self.root.join("nested/file"), b"foreign replacement\n").unwrap();
+            }
+            SystemProcessExecutor.execute(command, cancel)
+        }
+    }
+    let root = setup();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), b"index baseline\n").unwrap();
+    git(&root, &["add", "nested/file"]);
+    git(&root, &["commit", "-qm", "nested base"]);
+    fs::write(root.join("nested/file"), b"precious acquired original\n").unwrap();
+    let executor = Arc::new(MoveAfterAcquisition {
+        root: root.clone(),
+        parked: root.with_extension("parked"),
+        armed: AtomicBool::new(false),
+        hashes: AtomicUsize::new(0),
+    });
+    let service = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(WorktreeAuthority::capture(&root).unwrap())
+        .unwrap();
+    let discarded = service
+        .discard_recoverable(
+            &request(&root, &["nested/file"], &[]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&discarded.outcome);
+    executor.armed.store(true, Ordering::SeqCst);
+    let undo = service
+        .undo_discard(&discarded.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(undo, MutationOutcome::OutcomeUnknown { .. }),
+        "{undo:?}"
+    );
+    assert_eq!(executor.hashes.load(Ordering::SeqCst), 2);
+    assert!(discarded.recovery.live_recovery.needs_resolution());
+    assert!(
+        discarded
+            .recovery
+            .live_recovery
+            .recoverable_originals()
+            .is_empty(),
+        "complete precious bytes do not authorize stranding an acquired baseline"
+    );
+    let holders: Vec<_> = fs::read_dir(root.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".cagents-undo-")
+        })
+        .collect();
+    assert_eq!(holders.len(), 1);
+    assert_eq!(
+        fs::read(holders[0].join("restored-blob")).unwrap(),
+        b"precious acquired original\n"
+    );
+    assert_eq!(
+        fs::read(holders[0].join("previous")).unwrap(),
+        b"index baseline\n"
+    );
+    assert_eq!(
+        fs::read(root.join("nested/file")).unwrap(),
+        b"foreign replacement\n"
+    );
+    assert!(
+        service
+            .resolve_discard_recovery(&discarded.recovery, &CancellationToken::new())
+            .is_err()
+    );
+    assert_eq!(discarded.recovery.remaining_paths(), 1);
 }

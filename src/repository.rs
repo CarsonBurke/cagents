@@ -10,7 +10,9 @@ mod authority;
 mod recovery;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 use recovery::TrashReceipt;
-pub use recovery::{DiscardRecovery, DiscardRecoveryResolution, RecoverableDiscard};
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryResolution, RecoverOriginalFile, RecoverableDiscard,
+};
 
 mod managed_worktrees;
 #[cfg(test)]
@@ -14975,7 +14977,8 @@ mod tests {
         let index = parse_index_paths(index.as_bytes()).unwrap();
         assert_eq!(
             index.paths,
-            ["conflict.rs", "src/main.rs", "vendor/library"].map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
+            ["conflict.rs", "src/main.rs", "vendor/library"]
+                .map(|path| RepoPath::from_bytes(path.as_bytes()).unwrap())
         );
         assert!(index.gitlinks);
         assert!(!parse_index_paths(b"").unwrap().gitlinks);
