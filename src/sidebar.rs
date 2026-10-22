@@ -581,36 +581,34 @@ impl SidebarProject {
             crate::github::review_requests::scan::Requested,
         >,
     ) {
-        // Discovery reapplies the same requests on nearly every pass, so only
-        // a row whose flags differ is written.
-        let flags = |row: &SidebarPullRequest| {
-            let request = requested.get(&row.number);
-            let flags = (
+        let flags = |number: u64| {
+            let request = requested.get(&number);
+            (
                 request.is_some(),
                 request.is_some_and(|request| {
                     request.history == crate::github::review_requests::scan::History::ReRequested
                 }),
-            );
-            (flags != (row.needs_review, row.review_requested_again)).then_some(flags)
-        };
-        let apply = |row: &mut SidebarPullRequest| {
-            if let Some((needs_review, requested_again)) = flags(row) {
-                row.needs_review = needs_review;
-                row.review_requested_again = requested_again;
-            }
+            )
         };
         for row in &mut self.pull_requests {
-            apply(row);
+            (row.needs_review, row.review_requested_again) = flags(row.number);
         }
         if let Some(cached) = &mut self.cached_display {
             for row in &mut cached.rows {
-                apply(row);
+                (row.needs_review, row.review_requested_again) = flags(row.number);
             }
         }
+        // Discovery reapplies the same requests on nearly every pass, and a
+        // worktree's row can only be replaced whole, so it is cloned only
+        // when its flags actually differ.
         for worktree in &mut self.worktrees {
-            if let Some(row) = worktree.pull_request().filter(|row| flags(row).is_some()) {
+            let Some(row) = worktree.pull_request() else {
+                continue;
+            };
+            let flags = flags(row.number);
+            if flags != (row.needs_review, row.review_requested_again) {
                 let mut row = row.clone();
-                apply(&mut row);
+                (row.needs_review, row.review_requested_again) = flags;
                 worktree.set_pull_request(row);
             }
         }

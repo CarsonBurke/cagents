@@ -541,6 +541,17 @@ impl Cagents {
         Subscription::batch([progress, installation])
     }
 
+    /// Focus returning is when a stale window is about to be used again.
+    pub(super) fn installation_focus_regained(&mut self) -> Task<Message> {
+        // A first look that failed for a passing reason (a descriptor limit,
+        // an unreadable marker) must not blind the window for good. A source
+        // build stays off: it is never inside an installation tree.
+        if !self.update_ui.watch_installation {
+            self.update_ui.watch_installation = crate::update::runs_from_installation();
+        }
+        self.update_update_ui(Action::InspectInstallation)
+    }
+
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
         let state = &self.update_ui;
         let (icon, label, action) = if state.updating() {
@@ -1014,17 +1025,34 @@ mod tests {
 
     #[test]
     fn a_source_build_never_schedules_installation_inspection() {
+        // The test binary runs from target/, like any source build.
+        assert!(!crate::update::runs_from_installation());
+        assert!(
+            !crate::instance::update_in_progress(),
+            "an update in progress would also keep inspection off"
+        );
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.update_ui = State::new();
         app.settings.check_for_updates = false;
-        for focused in [true, false] {
-            app.refresh_ui.focused = focused;
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        for focused in [true, false, true] {
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                main, focused,
+            ))));
             assert_eq!(app.update_subscription().units(), 0);
+            assert!(!app.update_ui.watch_installation);
+            assert!(!app.update_ui.inspecting);
         }
         drop(app.update_update_ui(Action::InspectInstallation));
         assert!(
             !app.update_ui.inspecting,
             "a source build has no installation to inspect"
         );
+        // Only the installation gate held it back.
+        app.update_ui.watch_installation = true;
+        drop(app.update_update_ui(Action::InspectInstallation));
+        assert!(app.update_ui.inspecting);
     }
 
     #[test]

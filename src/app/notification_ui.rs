@@ -59,7 +59,10 @@ pub(super) struct State {
     wake: Option<crossbeam_channel::Sender<()>>,
     receiver: async_channel::Receiver<Action>,
     last_workspace: Weak<WorkspaceState>,
-    last_focus: Option<(Option<CardId>, bool, bool)>,
+    /// What the last published presence was derived from, past the durable
+    /// workspace: the focused card, window focus, whether the card's pane is
+    /// active, and which review a focused pull request pane has open.
+    last_focus: Option<(Option<CardId>, bool, bool, Option<u64>)>,
     visible_focus: Option<CardId>,
     visible_notices: BTreeSet<uuid::Uuid>,
     visible_acknowledged: bool,
@@ -128,7 +131,7 @@ impl State {
 
     /// Presence queued for the daemon and not yet sent, taken as if sent.
     #[cfg(test)]
-    pub(super) fn take_pending_presence(&self) -> Option<Presence> {
+    pub(super) fn take_pending_presence_for_test(&self) -> Option<Presence> {
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -381,7 +384,13 @@ impl Cagents {
     pub(super) fn sync_notification_presence(&mut self) {
         let focused_card = self.workspace.focused();
         let qualified = focused_card.is_some_and(|card| self.pane_is_active(card));
-        let focus = (focused_card, self.refresh_ui.focused, qualified);
+        // A pane can open another review without the durable workspace
+        // changing, and the review it shows names the alert it focuses.
+        let review = focused_card.and_then(|card| match self.cards.get(&card) {
+            Some(CardRuntime::PullRequests(pane)) => Some(pane.review.selection_generation()),
+            _ => None,
+        });
+        let focus = (focused_card, self.refresh_ui.focused, qualified, review);
         if self.notification_ui.last_focus == Some(focus)
             && self.notification_ui.last_workspace.as_ptr() == Arc::as_ptr(&self.durable)
         {

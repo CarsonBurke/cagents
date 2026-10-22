@@ -1,28 +1,18 @@
 //! Shell routing for the shared, bounded review-request coordinator.
 use super::*;
-pub use crate::pull_request_review::request_ui::monitor::Action;
+use crate::pull_request_review::request_ui::monitor;
+pub use monitor::Action;
 pub(super) type State = crate::pull_request_review::request_ui::monitor::Monitor;
 
-/// How long the monitor may wait to start a read that has fallen due. A
-/// settled repository falls due once a minute however often this ticks, and
-/// a tick with nothing due changes nothing.
-const FOCUSED_INTERVAL: Duration = Duration::from_secs(10);
-/// A daemon that cannot take alerts leaves only this window's own flags to
-/// keep current.
+/// A daemon that cannot take alerts leaves only a focused window's own flags
+/// to keep current.
 const UNAVAILABLE_INTERVAL: Duration = Duration::from_secs(30);
-/// Out of focus, discovery mostly serves the desktop alerts, which exist for
-/// someone looking elsewhere. Two minutes keeps those on a human timescale,
-/// twice the monitor's per-repository refresh, while waking the window a
-/// twelfth as often. Regaining focus reads whatever has fallen due at once.
-const BACKGROUND_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
 fn review_interval(focused: bool, daemon_unavailable: bool) -> Duration {
-    if !focused {
-        BACKGROUND_INTERVAL
-    } else if daemon_unavailable {
+    if focused && daemon_unavailable {
         UNAVAILABLE_INTERVAL
     } else {
-        FOCUSED_INTERVAL
+        monitor::tick_interval(focused)
     }
 }
 
@@ -113,10 +103,8 @@ impl Cagents {
         }
         for runtime in self.cards.values_mut() {
             if let CardRuntime::PullRequests(pane) = runtime {
-                pane.review.clear_external_review_requests();
-                for (repository, snapshot) in self.refresh_ui.review_requests.snapshots() {
-                    pane.review.apply_review_requests(repository, snapshot);
-                }
+                pane.review
+                    .sync_review_requests(self.refresh_ui.review_requests.snapshots());
             }
         }
         // The review an alert's focus target names comes from the monitor's
@@ -129,44 +117,162 @@ impl Cagents {
 }
 
 #[cfg(test)]
+impl Cagents {
+    /// Completes the monitor's next read as GitHub naming `requested` as the
+    /// pull requests awaiting the viewer's review.
+    pub(super) fn complete_review_read_for_test(&mut self, requested: &[u64]) {
+        use crate::github::review_requests::{Current, Entry, Page, Viewer, scan::Work};
+        self.refresh_ui.review_requests.make_due_for_test();
+        drop(self.update_review_requests(Action::Tick));
+        let (repository, generation) = self
+            .refresh_ui
+            .review_requests
+            .in_flight_for_test()
+            .cloned()
+            .expect("a review read started");
+        let entries = requested
+            .iter()
+            .map(|&number| Entry {
+                number,
+                title: format!("Pull request {number}"),
+                url: format!(
+                    "https://{}/{}/{}/pull/{number}",
+                    repository.host, repository.owner, repository.name
+                )
+                .parse()
+                .unwrap(),
+                viewer_latest_review_request: Some(Current {
+                    id: format!("request-{number}"),
+                    as_code_owner: false,
+                    requested_reviewer: None,
+                }),
+            })
+            .collect();
+        drop(self.update_review_requests(Action::Loaded {
+            repository,
+            generation,
+            work: Work::Page { cursor: None },
+            result: Ok(crate::pull_request_review::request_ui::Reply::Page(Page {
+                viewer: Viewer {
+                    id: "viewer".into(),
+                    login: "viewer".into(),
+                },
+                entries,
+                next_cursor: None,
+            })),
+        }));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn watching_one_repository() -> Cagents {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
         app.github_availability.insert(
-            ProjectId::new(),
+            project,
             GitHubAvailability::Ready {
                 repository_key: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
                 pull_requests: Vec::new(),
                 refreshed_at: 1,
             },
         );
+        let row = sidebar::SidebarPullRequest::new(
+            project,
+            7,
+            "Pull request 7".into(),
+            "https://github.com/owner/repo/pull/7".parse().unwrap(),
+            "feature".into(),
+            None,
+            false,
+            sidebar::CheckStatus::Unknown,
+        );
+        let worktree = SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(),
+            "/repo/feature".into(),
+            Some("feature".into()),
+        );
+        let mut project = SidebarProject::new(
+            project,
+            crate::repository::RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            vec![worktree],
+            vec![row.clone()],
+        );
+        project.worktrees[0].set_pull_request(row);
+        app.sidebar_model.projects.push(project);
         app
+    }
+
+    #[test]
+    fn an_identical_completed_read_leaves_projects_and_presence_alone() {
+        let mut app = watching_one_repository();
+        app.complete_review_read_for_test(&[7]);
+        let project = &app.sidebar_model.projects[0];
+        assert!(project.pull_requests[0].needs_review);
+        assert!(project.worktrees[0].pull_request().unwrap().needs_review);
+        assert!(
+            app.notification_ui
+                .take_pending_presence_for_test()
+                .is_some()
+        );
+
+        let projects = app.sidebar_model.projects.clone();
+        let revision = app.refresh_ui.review_requests.revision();
+        app.complete_review_read_for_test(&[7]);
+        assert_eq!(app.refresh_ui.review_requests.revision(), revision);
+        assert_eq!(app.sidebar_model.projects, projects);
+        assert!(
+            app.notification_ui
+                .take_pending_presence_for_test()
+                .is_none(),
+            "a read that found nothing new is not republished"
+        );
+
+        app.complete_review_read_for_test(&[]);
+        assert!(!app.sidebar_model.projects[0].pull_requests[0].needs_review);
+        assert!(
+            app.notification_ui
+                .take_pending_presence_for_test()
+                .is_some()
+        );
     }
 
     #[test]
     fn an_unfocused_window_backs_off_even_when_the_daemon_is_healthy() {
         assert_eq!(review_interval(true, false), Duration::from_secs(10));
         assert_eq!(review_interval(true, true), Duration::from_secs(30));
-        assert_eq!(review_interval(false, false), BACKGROUND_INTERVAL);
-        assert_eq!(review_interval(false, true), BACKGROUND_INTERVAL);
-        assert!(BACKGROUND_INTERVAL >= Duration::from_secs(60));
+        assert_eq!(review_interval(false, false), Duration::from_secs(120));
+        assert_eq!(review_interval(false, true), Duration::from_secs(120));
     }
 
     #[test]
     fn a_tick_that_changes_nothing_does_not_republish_review_presence() {
         let mut app = watching_one_repository();
         drop(app.update_review_requests(Action::Tick));
-        assert!(app.refresh_ui.review_requests.reading());
         assert!(
-            app.notification_ui.take_pending_presence().is_some(),
+            app.refresh_ui
+                .review_requests
+                .in_flight_for_test()
+                .is_some()
+        );
+        assert!(
+            app.notification_ui
+                .take_pending_presence_for_test()
+                .is_some(),
             "a newly watched repository can change what a focused review names"
         );
         for _ in 0..3 {
             drop(app.update_review_requests(Action::Tick));
         }
-        assert!(app.notification_ui.take_pending_presence().is_none());
+        assert!(
+            app.notification_ui
+                .take_pending_presence_for_test()
+                .is_none()
+        );
     }
 
     #[test]
@@ -180,11 +286,19 @@ mod tests {
                 window, focused,
             ))));
             assert!(
-                !app.refresh_ui.review_requests.reading(),
+                !app.refresh_ui
+                    .review_requests
+                    .in_flight_for_test()
+                    .is_some(),
                 "only regaining focus starts a read"
             );
         }
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(main, true))));
-        assert!(app.refresh_ui.review_requests.reading());
+        assert!(
+            app.refresh_ui
+                .review_requests
+                .in_flight_for_test()
+                .is_some()
+        );
     }
 }

@@ -22,6 +22,27 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
 const PACE: Duration = Duration::from_secs(6);
 const BURST: u32 = 10;
 
+/// How long a shell's monitor may wait to start a read that has fallen due
+/// while its window is focused. A settled repository falls due once per
+/// [`REFRESH`] however often this ticks, and a tick with nothing due changes
+/// nothing.
+const FOCUSED_TICK: Duration = Duration::from_secs(10);
+/// Out of focus, discovery mostly serves the desktop alerts, which exist for
+/// someone looking elsewhere. Two minutes keeps those on a human timescale,
+/// twice [`REFRESH`], while waking the window a twelfth as often. A shell
+/// ticks once more when its window regains focus, so whatever fell due in
+/// the meantime is read at once.
+const BACKGROUND_TICK: Duration = Duration::from_secs(2 * 60);
+
+/// How often a shell should tick its monitor.
+pub fn tick_interval(focused: bool) -> Duration {
+    if focused {
+        FOCUSED_TICK
+    } else {
+        BACKGROUND_TICK
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
@@ -119,8 +140,18 @@ impl Monitor {
     }
 
     #[cfg(test)]
-    pub fn reading(&self) -> bool {
-        self.busy.is_some()
+    pub(crate) fn in_flight_for_test(&self) -> Option<&(GitHubRepoKey, u64)> {
+        self.busy.as_ref()
+    }
+
+    /// Makes every repository due, with the request budget refilled.
+    #[cfg(test)]
+    pub(crate) fn make_due_for_test(&mut self) {
+        let now = Instant::now();
+        for entry in self.entries.values_mut() {
+            entry.due = now;
+        }
+        self.paced = None;
     }
 
     pub fn snapshots(&self) -> impl Iterator<Item = (&GitHubRepoKey, &Arc<Snapshot>)> {
@@ -363,7 +394,11 @@ mod tests {
         let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
         let unwatched = monitor.revision();
         drop(monitor.update(Action::Tick, [repository.clone()]));
-        assert_ne!(monitor.revision(), unwatched, "a new repository is a change");
+        assert_ne!(
+            monitor.revision(),
+            unwatched,
+            "a new repository is a change"
+        );
         let read = |monitor: &mut Monitor, result: Result<Reply, String>| {
             monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
             monitor.paced = None;
@@ -459,7 +494,9 @@ mod tests {
                 },
                 [repository.clone()],
             ));
-            monitor.entries[&repository].due.saturating_duration_since(before)
+            monitor.entries[&repository]
+                .due
+                .saturating_duration_since(before)
         };
         drop(monitor.update(Action::Tick, [repository.clone()]));
         monitor.busy = None;
@@ -538,7 +575,9 @@ mod tests {
                 },
                 [repository.clone()],
             ));
-            let wait = monitor.entries[&repository].due.saturating_duration_since(before);
+            let wait = monitor.entries[&repository]
+                .due
+                .saturating_duration_since(before);
             (wait.as_secs_f64() / 60.0).round() as u64
         };
         let first = Work::Page { cursor: None };
@@ -558,8 +597,8 @@ mod tests {
     #[test]
     fn a_read_that_ends_an_outage_clears_every_backoff() {
         let mut monitor = Monitor::default();
-        let repositories = ["a", "b", "c"]
-            .map(|name| GitHubRepoKey::new("github.com", None, "o", name).unwrap());
+        let repositories =
+            ["a", "b", "c"].map(|name| GitHubRepoKey::new("github.com", None, "o", name).unwrap());
         drop(monitor.update(Action::Tick, repositories.clone()));
         monitor.busy = None;
         let load = |monitor: &mut Monitor, index: usize, result: Result<Reply, String>| {
