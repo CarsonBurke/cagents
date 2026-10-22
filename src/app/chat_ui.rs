@@ -1710,6 +1710,7 @@ pub(super) struct Runtime {
     pastes_pending: usize,
     attachment_bookmarks: HashMap<uuid::Uuid, attachment_draft::Bookmark>,
     attachment_jobs: HashMap<uuid::Uuid, attachment_draft::Lease>,
+    attachment_order: Vec<uuid::Uuid>,
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
@@ -1993,6 +1994,7 @@ impl Runtime {
             return None;
         };
         self.attachment_jobs.insert(ticket.id, lease);
+        self.attachment_order.push(ticket.id);
         self.attachment_bookmarks.insert(
             ticket.id,
             attachment_draft::Bookmark::capture(&self.composer),
@@ -2035,6 +2037,10 @@ impl Runtime {
             }
             other => self.composer.perform(other),
         }
+        self.cancel_invalid_attachment_jobs();
+    }
+
+    fn cancel_invalid_attachment_jobs(&mut self) {
         self.attachment_jobs.retain(|id, _| {
             self.attachment_bookmarks
                 .get(id)
@@ -2050,6 +2056,13 @@ impl Runtime {
         text: &str,
         attachments: Vec<Attachment>,
     ) -> bool {
+        let earlier = self
+            .attachment_order
+            .iter()
+            .take_while(|other| **other != id)
+            .copied()
+            .collect::<HashSet<_>>();
+        self.attachment_order.retain(|other| *other != id);
         self.attachment_jobs.remove(&id);
         let Some(bookmark) = self.attachment_bookmarks.remove(&id) else {
             return false;
@@ -2096,9 +2109,19 @@ impl Runtime {
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
             ) {
-                for other in self.attachment_bookmarks.values_mut() {
+                for (other_id, other) in &mut self.attachment_bookmarks {
+                    // Equal collapsed anchors follow paste initiation order,
+                    // independent of worker completion order. User caret
+                    // mapping retains its normal left affinity.
+                    let later_at_start = !earlier.contains(other_id)
+                        && other.cursor.selection.is_none()
+                        && other.cursor.position == change.start;
                     other.changed(&change);
+                    if later_at_start && other.valid {
+                        other.cursor.position = change.inserted_end();
+                    }
                 }
+                self.cancel_invalid_attachment_jobs();
                 if current != bookmark.cursor {
                     if let Some(mapped) = attachment_draft::mapped(current, &change) {
                         self.composer.move_to(mapped);
@@ -2116,6 +2139,7 @@ impl Runtime {
     }
 
     fn cancel_attachment_insert(&mut self, id: uuid::Uuid, error: Option<String>) {
+        self.attachment_order.retain(|other| *other != id);
         self.attachment_jobs.remove(&id);
         if self.attachment_bookmarks.remove(&id).is_some() {
             self.pastes_pending = self.pastes_pending.saturating_sub(1);
@@ -2126,8 +2150,12 @@ impl Runtime {
         }
     }
 
-    fn remove_image_token(&mut self, token: &str) {
+    fn remove_image_token(&mut self, token: &str) -> bool {
         let text = self.composer.text();
+        if text.contains(token) && !attachment_draft::Bookmark::capture(&self.composer).valid {
+            self.error = Some("The current text selection could not be preserved. Clear it before removing this image.".into());
+            return false;
+        }
         let excerpt = attachment_draft::excerpt(
             &self.composer,
             0,
@@ -2157,9 +2185,11 @@ impl Runtime {
                 }
             }
         }
+        self.cancel_invalid_attachment_jobs();
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
+        true
     }
 
     fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -2462,6 +2492,7 @@ impl Runtime {
     fn cancel_attachment_jobs(&mut self) {
         self.attachment_jobs.clear();
         self.attachment_bookmarks.clear();
+        self.attachment_order.clear();
         self.pastes_pending = 0;
         self.image_pastes_saving = 0;
         self.submit_after_paste = None;
@@ -2546,6 +2577,7 @@ impl Runtime {
             pastes_pending: 0,
             attachment_bookmarks: HashMap::new(),
             attachment_jobs: HashMap::new(),
+            attachment_order: Vec::new(),
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
@@ -9378,6 +9410,7 @@ impl Cagents {
                             attachment_draft::Bookmark::capture(&runtime.composer),
                         );
                         runtime.attachment_jobs.insert(id.id, lease);
+                        runtime.attachment_order.push(id.id);
                         runtime.pastes_pending += 1;
                         self.stage_chat_attachments(target, id, files)
                     }),
@@ -9387,10 +9420,16 @@ impl Cagents {
             Action::RemoveAttachment(target, index) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if index < runtime.attachments.len() {
-                        let removed = runtime.attachments.remove(index);
-                        if let Some(reference) = removed.reference {
-                            runtime.remove_image_token(&reference.token());
+                        let token = runtime.attachments[index]
+                            .reference
+                            .as_ref()
+                            .map(chat::ImageReference::token);
+                        if let Some(token) = token
+                            && !runtime.remove_image_token(&token)
+                        {
+                            return Task::none();
                         }
+                        runtime.attachments.remove(index);
                         runtime.thumbnails.sync(&runtime.attachments);
                         runtime.revision = runtime.revision.wrapping_add(1);
                     }
@@ -14854,8 +14893,129 @@ mod tests {
                     image.reference.as_ref().unwrap().token()
                 )
             );
-            runtime.remove_image_token(&image.reference.as_ref().unwrap().token());
+            assert!(runtime.remove_image_token(&image.reference.as_ref().unwrap().token()));
             assert_eq!(runtime.composer.selection().as_deref(), Some("middle"));
+        });
+    }
+
+    #[test]
+    fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata_or_text() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let token = image.reference.as_ref().unwrap().token();
+            let text = format!("{token} 中中中");
+            write(&mut app, card, &text);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.merge_attachments([image.clone()]);
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: token.len() + 1 + "中".len(),
+                },
+                selection: None,
+            });
+            runtime.composer.perform(text_editor::Action::SelectWord);
+            let selected = runtime.composer.selection().unwrap();
+            assert_eq!(
+                selected, "中中",
+                "native boundary-expanded selection is the ambiguity fixture"
+            );
+            assert!(!attachment_draft::Bookmark::capture(&runtime.composer).valid);
+            drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.attachments, [image.clone()]);
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(
+                runtime.composer.selection().as_deref(),
+                Some(selected.as_str())
+            );
+            assert!(
+                runtime
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Clear it before removing")
+            );
+        });
+    }
+
+    #[test]
+    fn same_caret_image_pastes_follow_initiation_order_in_both_completion_orders() {
+        chat::attachment_assets::with_test_image(|first| {
+            let second = chat::attachment_assets::test_image("second sequence image.png");
+            for second_finishes_first in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = draft_chat(&mut app);
+                let target = chat_runtime(&app, card).target;
+                write(&mut app, card, "tail");
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.composer.move_to(text_editor::Cursor {
+                    position: text_editor::Position { line: 0, column: 0 },
+                    selection: None,
+                });
+                let a = runtime.begin_attachment_insert();
+                let b = runtime.begin_attachment_insert();
+                if second_finishes_first {
+                    assert!(runtime.finish_attachment_insert(b.id, "", vec![second.clone()]));
+                    assert!(runtime.finish_attachment_insert(a.id, "", vec![first.clone()]));
+                } else {
+                    assert!(runtime.finish_attachment_insert(a.id, "", vec![first.clone()]));
+                    assert!(runtime.finish_attachment_insert(b.id, "", vec![second.clone()]));
+                }
+                assert_eq!(
+                    runtime.composer.text(),
+                    format!(
+                        "{} {} tail",
+                        first.reference.as_ref().unwrap().token(),
+                        second.reference.as_ref().unwrap().token()
+                    ),
+                    "completion order must not reverse paste initiation order"
+                );
+                assert_eq!(runtime.pastes_pending, 0);
+                assert!(runtime.attachment_order.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn completing_an_image_selection_cancels_an_overlapping_jobs_lease_before_its_io() {
+        chat::attachment_assets::with_test_image(|first| {
+            let second = chat::attachment_assets::test_image("overlapping second.png");
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, "alpha beta gamma");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: 0,
+                    column: 10,
+                },
+                selection: Some(text_editor::Position { line: 0, column: 6 }),
+            });
+            let a = runtime.begin_attachment_insert();
+            let b = runtime.begin_attachment_insert();
+            assert!(b.active());
+            assert!(runtime.finish_attachment_insert(a.id, "", vec![first.clone()]));
+            assert!(
+                !b.active(),
+                "overlap must cancel the actual worker lease, not only its eventual callback"
+            );
+            assert!(
+                clipboard_image::stage_file_active(
+                    PathBuf::from("/must-not-read-after-overlapping-paste.png"),
+                    u64::MAX,
+                    &b
+                )
+                .unwrap_err()
+                .contains("cancelled")
+            );
+            assert!(!runtime.finish_attachment_insert(b.id, "", vec![second]));
+            assert_eq!(runtime.attachments, [first]);
+            assert_eq!(runtime.pastes_pending, 0);
+            assert!(runtime.attachment_order.is_empty());
         });
     }
 
