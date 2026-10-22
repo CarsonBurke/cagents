@@ -14897,7 +14897,11 @@ impl Application for Cagents {
                         if !self.source_control_is_bound(&key) {
                             return Task::none();
                         }
-                        self.open_file_in_editor(key.canonical_path.join(path.as_path()), None, editor_id)
+                        self.open_file_in_editor(
+                            key.canonical_path.join(path.as_path()),
+                            None,
+                            editor_id,
+                        )
                     }
                     SidebarAction::OpenChange { key, path, area } => {
                         // The card has two diff bases. A conflict has no staged

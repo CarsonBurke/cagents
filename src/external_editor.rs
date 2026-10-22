@@ -153,9 +153,9 @@ fn desktop_icon(path: &Path) -> Option<String> {
 /// Where the caret sits in the file being opened, measured in every unit an
 /// editor's command line counts columns in.
 ///
-/// Lines are the ones external editors break on: `\n`, `\r\n` and a lone
-/// `\r`. That is how the built-in editor breaks them too, and not how
-/// [`crate::lsp`] does.
+/// Lines are counted as VS Code and Zed count them in the saved text: `\n`,
+/// `\r\n` and a lone `\r` each end one. Neither the built-in editor's lines
+/// nor [`crate::lsp`]'s are quite that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caret {
     /// Zero-based.
