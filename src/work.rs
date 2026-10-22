@@ -486,7 +486,7 @@ pub enum Review {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinearTicket {
-    /// Such as `MAIN-7552`. An explicit link stores only Linear's issue id, so
+    /// Such as `TEAM-123`. An explicit link stores only Linear's issue id, so
     /// its identifier is absent until the daemon has resolved it once.
     pub identifier: Option<String>,
     pub title: Option<String>,
@@ -632,7 +632,7 @@ pub fn sort(items: &mut [Item]) {
 }
 
 /// The Linear identifier a Linear-style branch name carries, such as
-/// `MAIN-7552` from `fix/main-7552-vimeo-display`. Only the start of the last
+/// `TEAM-123` from `fix/team-123-display`. Only the start of the last
 /// path segment is read, which is where Linear's suggested names put it, so a
 /// trailing date (`browser-20261019`) or a version (`v2-release`) is not one.
 pub fn ticket_from_branch(branch: &str) -> Option<String> {
@@ -906,12 +906,12 @@ mod tests {
     #[test]
     fn ticket_identifiers_are_read_only_from_linear_style_branch_names() {
         for (branch, expected) in [
-            ("fix/main-7552-vimeo-display", Some("MAIN-7552")),
-            ("carson/main-2267-archive-search-v3", Some("MAIN-2267")),
+            ("fix/team-123-display", Some("TEAM-123")),
+            ("developer/team-456-search", Some("TEAM-456")),
             ("eng-12", Some("ENG-12")),
-            ("fix/mailbox-stock-browser-20261019", None),
+            ("fix/browser-refresh-20261019", None),
             ("audit/v2-release-20261020", None),
-            ("feat/instagram-activity-comments", None),
+            ("feat/activity-comments", None),
             ("main", None),
             ("x-1-short-team", None),
             ("team-0123-leading-zero", None),
