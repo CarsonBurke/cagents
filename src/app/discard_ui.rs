@@ -499,7 +499,7 @@ impl State {
             for original in originals {
                 content.push(
                     widget::row::with_children(vec![
-                        design::body(display_path(original.path.as_path()))
+                        design::body(display_path(original.path.as_path()).into_owned())
                             .ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)))
                             .width(Length::Fill)
                             .into(),
