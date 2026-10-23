@@ -53,8 +53,13 @@ fn fixed_helper_refuses_device_selection_before_device_lookup_or_service_recover
         &["--json", "--device", "must-not-be-looked-up"],
     );
     assert_eq!(output.exit_code, Some(1));
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.stdout.is_empty());
+    let response: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(response["ok"], false);
     assert_eq!(response["error"]["kind"], "workspace_probe");
+    assert_eq!(
+        response["error"]["message"],
+        "The internal workspace probe is local only"
+    );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
