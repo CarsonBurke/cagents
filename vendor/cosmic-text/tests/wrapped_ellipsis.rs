@@ -181,3 +181,65 @@ fn an_overflowing_separator_stays_out_of_the_last_ellipsized_line() {
         }
     }
 }
+
+#[test]
+fn height_limited_ellipsis_keeps_wrapped_boundaries_in_both_text_directions() {
+    let mut fonts = font_system();
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    // Height limits take a separate admission path from line-count limits.
+    // Include overwide words in both congruent and reversed bidi spans, plus
+    // authored indentation that must remain on the first, unelided line.
+    for text in [
+        "   Supercalifragilisticexpialidocious and then more words that wrap across several lines",
+        "   שלוםשלוםשלוםשלוםשלוםשלום עולם ועוד מילים ועוד מילים ועוד מילים ועוד מילים",
+        "שלום Supercalifragilisticexpialidocious and then more words שלום עולם שלום עולם",
+    ] {
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        for wrap in [Wrap::Word, Wrap::WordOrGlyph] {
+            for width in [60.0, 110.0, 180.0] {
+                let ordinary = layout(&shaped, width, wrap, Ellipsize::None);
+                for count in [2, 3] {
+                    if ordinary.len() <= count {
+                        continue;
+                    }
+                    let limited = layout(
+                        &shaped,
+                        width,
+                        wrap,
+                        Ellipsize::End(EllipsizeHeightLimit::Height(18.0 * count as f32)),
+                    );
+                    assert_eq!(limited.len(), count);
+                    // Preceding rows have not been elided or re-ordered. Their
+                    // original source clusters and positions must be identical.
+                    for (actual, expected) in
+                        limited[..count - 1].iter().zip(&ordinary[..count - 1])
+                    {
+                        let geometry = |line: &LayoutLine| {
+                            line.glyphs
+                                .iter()
+                                .map(|glyph| (glyph.start, glyph.end, glyph.x, glyph.w))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(geometry(actual), geometry(expected));
+                    }
+                    let source_start = |line: &LayoutLine| {
+                        line.glyphs
+                            .iter()
+                            .filter(|glyph| glyph.start != glyph.end)
+                            .map(|glyph| glyph.start)
+                            .min()
+                            .expect("the fixture retains text before its ellipsis")
+                    };
+                    assert_eq!(
+                        source_start(&limited[count - 1]),
+                        source_start(&ordinary[count - 1]),
+                        "height-limited boundary: {wrap:?}, width {width}, count {count}: {text}"
+                    );
+                    assert!(limited.iter().flat_map(|line| &line.glyphs).all(|glyph| {
+                        glyph.x.is_finite() && glyph.y.is_finite() && glyph.w.is_finite()
+                    }));
+                }
+            }
+        }
+    }
+}

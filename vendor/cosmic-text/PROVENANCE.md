@@ -39,6 +39,9 @@ repeated-separator regression probes four widths (60, 88, 110 and 180). The
 overwide-word case fails with the upstream-only backport at Word/60/two lines
 (source byte34 rather than ordinary wrapping's35), and passes with the local
 boundary correction.
+The height-limit regression separately checks the same continuation boundary
+with overwide LTR, RTL, and mixed-direction text, while preserving the source
+clusters and geometry of preceding unelided rows.
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --locked -p cosmic-text --test wrapped_ellipsis
