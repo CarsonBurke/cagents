@@ -2977,6 +2977,7 @@ impl Cagents {
                         && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
                     let icon = match tab {
                         ContextTab::Files => Icon::Folder,
+                        ContextTab::Search => Icon::Search,
                         ContextTab::Changes => Icon::Changes,
                         ContextTab::PullRequest => Icon::PullRequest,
                         ContextTab::Details => Icon::Info,
@@ -3097,6 +3098,7 @@ impl Cagents {
                 .width(Length::Fill)
                 .into()
             }
+            ContextTab::Search => self.project_search_panel(),
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
                 &self.sidebar_state,

@@ -6509,6 +6509,81 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+    /// Open a repository-relative location, even before the directory listing
+    /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
+    /// The requested range is clamped when the asynchronous file read finishes.
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
+        let caret = text_editor::Position { line, column };
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
+        if self.selected_path() == Some(path.as_path())
+            && let DocumentState::Editable(document) = &mut self.document
+        {
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
+            self.source_surface = SourceSurface::Editor;
+            self.markdown_mode = MarkdownMode::Edit;
+            return self.focus_editor(card);
+        }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
+            self.open_file_entry(card, file)
+        };
+        if self.selected_path() != Some(path.as_path())
+            || !matches!(self.document, DocumentState::Loading)
+        {
+            return task;
+        }
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
+        task
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
@@ -11259,6 +11334,74 @@ mod tests {
         assert!(matches!(runtime.files, FileListState::Ready(_)));
         assert!(matches!(runtime.document, DocumentState::Editable(_)));
         assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "éλ hit\nsecond\n");
+        let path = runtime.selected_path().unwrap().to_path_buf();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
+        document.dirty = true;
+        let text = document.content.text();
+        drop(runtime.open_file_location(card, path.clone(), 0, 5, 3));
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(
+            navigation.caret,
+            crate::model::EditorPosition { line: 0, column: 5 }
+        );
+        assert_eq!(
+            navigation.selection,
+            Some(crate::model::EditorPosition { line: 0, column: 8 })
+        );
+        assert_eq!(runtime.editor_text().unwrap(), text);
+        assert_eq!(runtime.selected_text().as_deref(), Some("hit"));
+        assert!(runtime.is_dirty());
+        let before = runtime.navigation();
+        drop(runtime.open_file_location(card, "another.rs".into(), 0, 0, 1));
+        drop(runtime.open_file_location(card, "../outside.rs".into(), 0, 0, 1));
+        assert_eq!(runtime.navigation(), before);
+        assert_eq!(runtime.selected_path(), Some(path.as_path()));
+        assert!(runtime.pending_editor_navigation.is_none());
+        // A byte inside a multibyte scalar clamps to its original boundary.
+        drop(runtime.open_file_location(card, path, 0, 1, usize::MAX));
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(navigation.caret.column, 0);
+        assert_eq!(navigation.selection.unwrap().column, 8);
+    }
+
+    #[test]
+    fn deferred_search_location_applies_after_the_requested_loading_path() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "loading.rs");
+        drop(runtime.open_file_location(card, "loading.rs".into(), 1, 2, 3));
+        assert_eq!(
+            runtime.pending_editor_navigation.as_ref().unwrap().0,
+            Path::new("loading.rs")
+        );
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(LoadedFile {
+                source: "loading.rs".into(),
+                content: FileContent::Editable {
+                    text: "first\néhit!\n".into(),
+                    content_hash: blake3::hash("first\néhit!\n".as_bytes()),
+                    markdown: false,
+                },
+            }),
+        }));
+        assert!(runtime.pending_editor_navigation.is_none());
+        let navigation = runtime.navigation().unwrap().editor.unwrap();
+        assert_eq!(
+            navigation.caret,
+            crate::model::EditorPosition { line: 1, column: 2 }
+        );
+        assert_eq!(
+            navigation.selection,
+            Some(crate::model::EditorPosition { line: 1, column: 5 })
+        );
     }
 
     #[test]
