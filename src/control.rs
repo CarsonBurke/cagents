@@ -4054,7 +4054,7 @@ mod tests {
         }
         crate::device::save(crate::device::Device {
             name: "launch-test".into(),
-            host: "fw16".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         })
         .unwrap();

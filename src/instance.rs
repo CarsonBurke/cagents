@@ -2273,11 +2273,11 @@ mod tests {
     fn device_window_relaunch_retains_target_and_missing_identity_fails_closed() {
         let runtime = tempdir().unwrap();
         let device = crate::device::Device {
-            name: "fw16".into(),
-            host: "fw16".into(),
+            name: "build-host".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         };
-        let slot = crate::device::scoped_window_slot("fw16", "primary");
+        let slot = crate::device::scoped_window_slot("build-host", "primary");
         assert!(
             window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).is_err()
         );
@@ -2285,16 +2285,16 @@ mod tests {
             runtime
                 .path()
                 .join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
-            "fw16",
+            "build-host",
         )
         .unwrap();
         assert_eq!(
             window_device_identity(runtime.path(), &slot, std::slice::from_ref(&device)).unwrap(),
-            Some("fw16".into())
+            Some("build-host".into())
         );
         assert!(window_device_identity(runtime.path(), &slot, &[]).is_err());
         assert_eq!(
-            window_device_identity(runtime.path(), "fw16-primary", &[device]).unwrap(),
+            window_device_identity(runtime.path(), "build-host-primary", &[device]).unwrap(),
             None
         );
     }
