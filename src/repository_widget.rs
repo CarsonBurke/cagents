@@ -1460,6 +1460,72 @@ fn caret_position(
     })
 }
 
+/// The editor's caret as an external editor counts it.
+///
+/// VS Code and Zed read the saved text and break lines on `\n`, `\r\n` and
+/// a lone `\r`, one break each. This editor's lines carry the same
+/// characters but can split a `\r\n` across two terminators: the `\r` that
+/// ends one line and the `\n` that ends the empty line after it.
+///
+/// - `\n\r\n` loads as `\n\r` and then an empty line ending in `\n`.
+/// - Deleting the text of the line after a lone `\r` leaves that `\r`, then
+///   an empty line ending in `\n`.
+///
+/// Either way the saved text has one break where the terminators look like
+/// two.
+fn external_caret(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<crate::external_editor::Caret> {
+    let lines = content.line_count();
+    if caret.line >= lines {
+        return None;
+    }
+    // Whether the `\r` ending line `index` pairs with the `\n` that ends the
+    // empty line after it. That line exists whenever this is asked: it is at
+    // most the caret's.
+    let pairs_with_next = |index: usize| -> Option<bool> {
+        let ends_in_cr = content.with_line(index, |_, ending| {
+            terminator_str(ending, index + 1 == lines).ends_with('\r')
+        })?;
+        let next_is_newline = content.with_line(index + 1, |text, ending| {
+            text.is_empty() && terminator_str(ending, index + 2 == lines).starts_with('\n')
+        })?;
+        Some(ends_in_cr && next_is_newline)
+    };
+    let mut line = 0u32;
+    for index in 0..caret.line {
+        let ending = content.with_line(index, |_, ending| ending)?;
+        // Each terminator is one break and `\n\r` two; an unterminated line
+        // before the last is written with `\n`.
+        let mut breaks = if ending == text_editor::LineEnding::LfCr {
+            2
+        } else {
+            1
+        };
+        if pairs_with_next(index)? {
+            breaks -= 1;
+        }
+        line = line.saturating_add(breaks);
+    }
+    // A caret on the empty line between a paired `\r` and `\n` is inside a
+    // `\r\n`, where an external editor cannot put one. The nearest place is
+    // the end of the line that `\r\n` ends: after `\n\r` that is the empty
+    // line between them, which the caret's own empty line already gives;
+    // after a lone `\r` it is the previous line.
+    if let Some(previous) = caret.line.checked_sub(1)
+        && pairs_with_next(previous)?
+        && content.with_line(previous, |_, ending| ending == text_editor::LineEnding::Cr)?
+    {
+        return content.with_line(previous, |text, _| {
+            crate::external_editor::Caret::new(line, text)
+        });
+    }
+    content.with_line(caret.line, |text, _| {
+        crate::external_editor::Caret::new(line, &text[..char_boundary(text, caret.column)])
+    })
+}
+
 /// The editor-native caret for a protocol position, or `None` when it names a
 /// line the buffer does not have.
 ///
@@ -2882,7 +2948,17 @@ impl RepositoryRuntime {
                 .is_some_and(|navigation| navigation.selected_file.is_some()))
             && let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone())
         {
-            self.files = FileListState::Failed(error.to_string());
+            let path = self
+                .descriptor
+                .selected_file
+                .clone()
+                .or_else(|| {
+                    self.restored_navigation
+                        .as_ref()
+                        .and_then(|navigation| navigation.selected_file.clone())
+                })
+                .expect("the protected load has a selected file");
+            self.fail_file_open(card, path, &error);
             return Task::none();
         }
         if let Some(navigation) = self.restored_navigation.take() {
@@ -2937,19 +3013,30 @@ impl RepositoryRuntime {
         card: CardId,
         view: RepositoryView,
     ) -> Task<RepositoryAction> {
-        if self.descriptor.selected_file.is_none() || self.blocks_navigation() {
+        if self.descriptor.selected_file.is_none()
+            || view.selected_file.is_none()
+            || self.blocks_navigation()
+        {
             return Task::none();
         }
-        if let Err(error) = self.protect_editor_worktree(&view.worktree) {
-            self.files = FileListState::Failed(error.to_string());
-            return Task::none();
-        }
+        let protection = self.protect_editor_worktree(&view.worktree);
         if self.descriptor.worktree != view.worktree {
             self.original_editor_root = None;
             self.original_read_attested = false;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
+        if let Err(error) = protection {
+            self.fail_file_open(
+                card,
+                self.descriptor
+                    .selected_file
+                    .clone()
+                    .expect("a retargeted file pane has a selected file"),
+                &error,
+            );
+            return Task::none();
+        }
         self.initial_load(card)
     }
 
@@ -3111,6 +3198,24 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    /// The caret as an external editor counts it, so the selected file opens
+    /// there where the reader left it.
+    ///
+    /// `None` unless the selected file's own buffer is open. A buffer with
+    /// unsaved edits still reports its caret, although the external editor
+    /// opens the saved file: the position is then approximate, and VS Code
+    /// and Zed clamp a line or column past the end to the nearest place.
+    #[must_use]
+    pub fn external_caret(&self) -> Option<crate::external_editor::Caret> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        if self.selected_path() != Some(document.path.as_path()) {
+            return None;
+        }
+        external_caret(&document.content, document.content.cursor().position)
     }
 
     pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
@@ -5192,10 +5297,11 @@ impl RepositoryRuntime {
                         path: source,
                         reason,
                     },
-                    Err(error) => DocumentState::Failed {
-                        path: identity.path,
-                        message: error.to_string(),
-                    },
+                    Err(error) => {
+                        let path = identity.worktree.join(&identity.path);
+                        let message = local_file_error_detail(&path, &error);
+                        DocumentState::Failed { path, message }
+                    }
                 };
                 if let DocumentState::Editable(document) = &mut self.document {
                     if let Some((path, editor)) = self.pending_editor_navigation.take()
@@ -6428,7 +6534,7 @@ impl RepositoryRuntime {
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
         if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
-            self.files = FileListState::Failed(error.to_string());
+            self.fail_file_open(card, file.path, &error);
             return Task::none();
         }
         self.pending_fragment = None;
@@ -6479,6 +6585,51 @@ impl RepositoryRuntime {
             self.document_tone,
             self.original_editor_root.clone(),
         )
+    }
+
+    /// A refused explicit read is a failure of that file, even when acquiring
+    /// its directory lease failed before the read could start. Replace the
+    /// departing pixels and fence their callbacks without releasing its lease.
+    fn fail_file_open(&mut self, card: CardId, path: PathBuf, error: &std::io::Error) {
+        let absolute = self.descriptor.worktree.join(&path);
+        let message = local_file_error_detail(&absolute, error);
+        self.files = FileListState::Failed(message.clone());
+        // A refresh must never abandon a dirty buffer, recovery, or an
+        // outstanding save merely because its directory became unavailable.
+        if self.blocks_navigation() {
+            return;
+        }
+        self.push_lsp_close();
+        self.pending_fragment = None;
+        self.pending_editor_navigation = None;
+        self.pending_editor_focus = None;
+        self.restored_navigation = None;
+        self.committed_selection = None;
+        self.original_editor_root = None;
+        self.original_read_attested = false;
+        self.selected = Some(RepositoryFile {
+            path: path.clone(),
+            ..RepositoryFile::default()
+        });
+        if self.descriptor.selected_file.is_some() {
+            self.descriptor.selected_file = Some(path.clone());
+        }
+        self.document = DocumentState::Failed {
+            path: absolute,
+            message,
+        };
+        self.diffs.clear();
+        self.stale_diff = None;
+        self.basis_resolution = None;
+        self.source_surface = SourceSurface::Editor;
+        self.markdown_mode = MarkdownMode::Edit;
+        self.next_identity(card, path);
+        self.file_list_generation = self.file_list_generation.wrapping_add(1).max(1);
+        self.file_list_loading = false;
+        self.file_list_started = None;
+        self.file_list_refresh_queued = false;
+        self.background_file_refresh = false;
+        self.file_list_digest = None;
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -8326,6 +8477,10 @@ fn selected_file_view<'a>(
     }
 }
 
+fn local_file_error_detail(path: &Path, error: impl std::fmt::Display) -> String {
+    format!("{} on this device: {error}", path.display())
+}
+
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
     let content = match &runtime.document {
         DocumentState::None => information_state(
@@ -8334,7 +8489,11 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         ),
         DocumentState::Loading => loading(),
         DocumentState::Failed { path, message } => {
-            information_state(format!("Could not open {}", path.display()), message)
+            let name = path.file_name().unwrap_or(path.as_os_str());
+            information_state(
+                format!("Could not open {}", name.to_string_lossy()),
+                message,
+            )
         }
         DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
         DocumentState::Editable(document) => editable_document_view(card, runtime, document),
@@ -11261,6 +11420,182 @@ mod tests {
         drop(runtime.update(old));
         assert_eq!(runtime.editor_text().as_deref(), Some("new contents"));
         assert!(!runtime.inspector_context().can_back);
+    }
+
+    #[tokio::test]
+    async fn unavailable_explicit_file_protection_replaces_pixels_and_fences_old_reads() {
+        if super::retained_save_tests::isolated_test(
+            "repository_widget::tests::unavailable_explicit_file_protection_replaces_pixels_and_fences_old_reads",
+        ) {
+            return;
+        }
+        // Exercise production protection, which otherwise deliberately does
+        // nothing in an uninitialized UI unit-test process.
+        crate::worktree_cleanup::prepare_standalone_editor_protection();
+        assert!(crate::device::selected().is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([217, 0, 217, 255]))
+            .save(root.join("old.png"))
+            .unwrap();
+        let card = CardId::new();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: root.clone(),
+            worktree: root.clone(),
+            selected_file: Some("old.png".into()),
+        };
+        let mut runtime = RepositoryRuntime::new_directory(view.clone());
+        let task = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.document, DocumentState::Image { .. }));
+        assert!(runtime.original_read_attested);
+        assert_eq!(
+            runtime.worktree_protection.as_ref().unwrap().directory(),
+            root
+        );
+        let old_identity = runtime.current_identity(card, "old.png".into());
+        let old_read = crate::editor::read_file_at(
+            &root,
+            Path::new("old.png"),
+            crate::editor::PdfTone::Original,
+            None,
+        )
+        .unwrap();
+        let old_listing = AsyncIdentity {
+            card,
+            worktree: root.clone(),
+            path: ".".into(),
+            generation: runtime.file_list_generation,
+        };
+        assert!(runtime.accepts_selected(&old_identity));
+        assert!(runtime.accepts_file_list(&old_listing));
+        let missing = root.join("retired-history");
+        assert_eq!(
+            crate::worktree_cleanup::protect(&missing)
+                .err()
+                .expect("the real guard must fail")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let target = RepositoryView {
+            repository: missing.clone(),
+            worktree: missing.clone(),
+            selected_file: Some("image.png".into()),
+            ..view.clone()
+        };
+        let task = runtime.retarget_file(card, target.clone());
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(runtime.descriptor, target);
+        assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
+        let DocumentState::Failed { path, message } = &runtime.document else {
+            panic!("a refused file must replace the old image preview")
+        };
+        assert_eq!(*path, missing.join("image.png"));
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains("on this device"));
+        assert!(
+            message.contains(&std::io::Error::from(std::io::ErrorKind::NotFound).to_string())
+                || message.contains("os error 2")
+        );
+        let failure = message.clone();
+        // Failure retains the previous directory lease until the pane can
+        // acquire a replacement; it does not pretend the new lease succeeded.
+        assert_eq!(
+            runtime.worktree_protection.as_ref().unwrap().directory(),
+            root
+        );
+        assert!(!runtime.original_read_attested);
+        assert!(runtime.original_editor_root.is_none());
+        assert!(!runtime.accepts_selected(&old_identity));
+        assert!(!runtime.accepts_file_list(&old_listing));
+        drop(runtime.update(RepositoryAction::FileLoadedAt {
+            identity: old_identity,
+            result: Ok(old_read),
+        }));
+        assert_eq!(runtime.inspector_context().document_error, Some(failure));
+        assert!(matches!(runtime.document, DocumentState::Failed { .. }));
+
+        // Both a newly opened explicit pane and the folder-browser route
+        // present the same concrete failure before scheduling a payload read.
+        let mut fresh = RepositoryRuntime::new_directory(target.clone());
+        assert!(iced::runtime::task::into_stream(fresh.initial_load(card)).is_none());
+        assert!(matches!(&fresh.document, DocumentState::Failed { path, .. }
+            if *path == missing.join("image.png")));
+        let mut folder = RepositoryRuntime::new_directory(RepositoryView {
+            selected_file: None,
+            ..target.clone()
+        });
+        assert!(
+            iced::runtime::task::into_stream(folder.open_file(card, "image.png".into())).is_none()
+        );
+        assert!(
+            matches!(&folder.document, DocumentState::Failed { path, .. }
+            if *path == missing.join("image.png"))
+        );
+
+        // A normal retry acquires the actual new directory and reads its own
+        // image, rather than resurrecting the previous preview or root.
+        std::fs::create_dir(&missing).unwrap();
+        image::RgbaImage::from_pixel(3, 1, image::Rgba([0, 90, 0, 255]))
+            .save(missing.join("image.png"))
+            .unwrap();
+        let task = runtime.initial_load(card);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(
+            runtime.document,
+            DocumentState::Image {
+                width: 3,
+                height: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            runtime.worktree_protection.as_ref().unwrap().directory(),
+            missing
+        );
+        assert!(runtime.original_read_attested);
+
+        // The same error context applies when the directory lease succeeds
+        // but the requested file itself is absent.
+        let absent = RepositoryView {
+            selected_file: Some("absent.png".into()),
+            ..target
+        };
+        let task = runtime.retarget_file(card, absent);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(
+            matches!(&runtime.document, DocumentState::Failed { path, message }
+            if *path == missing.join("absent.png") && message.contains("on this device")
+                && message.contains("os error 2"))
+        );
+
+        // A failed new target cannot relax the existing unsaved-buffer fence.
+        std::fs::write(root.join("notes.txt"), "unsaved baseline").unwrap();
+        let text_view = RepositoryView {
+            selected_file: Some("notes.txt".into()),
+            ..view
+        };
+        let task = runtime.retarget_file(card, text_view.clone());
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
+        assert!(runtime.is_dirty());
+        let text = runtime.editor_text();
+        let task = runtime.retarget_file(
+            card,
+            RepositoryView {
+                worktree: root.join("another-missing-root"),
+                selected_file: Some("image.png".into()),
+                ..text_view.clone()
+            },
+        );
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert_eq!(runtime.descriptor, text_view);
+        assert_eq!(runtime.editor_text(), text);
+        assert!(runtime.is_dirty());
     }
     use std::collections::BTreeSet;
 
@@ -16221,6 +16556,131 @@ mod tests {
             !runtime.move_cursor_to(LspPosition::new(2, 0)),
             "the protocol sees two lines here, whatever the editor does"
         );
+    }
+
+    /// The external caret for the editor-native caret at `line` and byte
+    /// `column` in a fresh buffer holding `text`.
+    fn external_caret_at(
+        text: &str,
+        line: usize,
+        column: usize,
+    ) -> Option<crate::external_editor::Caret> {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", text);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line, column },
+            selection: None,
+        });
+        runtime.external_caret()
+    }
+
+    #[test]
+    fn the_external_caret_counts_lines_the_way_external_editors_break_them() {
+        use crate::external_editor::Caret;
+        // Every terminator the editor knows, one per line: `\n`, `\r\n`, a
+        // lone `\r`, and `\n\r`, which the built-in editor reads as one
+        // terminator and VS Code and Zed read as two line breaks.
+        let text = "one\ntwo\r\nold\rmac\n\rlast é→😀x\n";
+        assert_eq!(external_caret_at(text, 0, 2), Some(Caret::new(0, "on")));
+        assert_eq!(external_caret_at(text, 1, 3), Some(Caret::new(1, "two")));
+        assert_eq!(external_caret_at(text, 2, 0), Some(Caret::new(2, "")));
+        assert_eq!(external_caret_at(text, 3, 1), Some(Caret::new(3, "m")));
+        // The column is a byte offset into the editor line; this one is after
+        // the emoji.
+        assert_eq!(
+            external_caret_at(text, 4, "last é→😀".len()),
+            Some(Caret::new(5, "last é→😀"))
+        );
+        // A `\n\r` that ends the buffer is two breaks as well.
+        assert_eq!(external_caret_at("x\n\r", 1, 0), Some(Caret::new(2, "")));
+    }
+
+    /// The built-in editor reads `\n\r\n` as `\n\r` and then `\n`, leaving
+    /// an empty line between the `\r` and its `\n`. External editors read
+    /// `\n` and then `\r\n`: two breaks, not three.
+    #[test]
+    fn the_external_caret_reads_a_newline_before_crlf_as_two_breaks() {
+        use crate::external_editor::Caret;
+        let text = "a\n\r\nb\n";
+        assert_eq!(external_caret_at(text, 2, 1), Some(Caret::new(2, "b")));
+        // Between the `\r` and its `\n` is no place an external caret can
+        // be; the nearest is the start of the empty line before them.
+        assert_eq!(external_caret_at(text, 1, 0), Some(Caret::new(1, "")));
+        // `\n`, `\r\n`, then a lone `\r`.
+        assert_eq!(
+            external_caret_at("a\n\r\n\rb", 2, 1),
+            Some(Caret::new(3, "b"))
+        );
+    }
+
+    /// Editing can leave a lone `\r` followed by an empty line ending in
+    /// `\n`, which saves as `\r\n`: one break, not two.
+    #[test]
+    fn the_external_caret_pairs_a_lone_carriage_return_with_the_next_newline() {
+        use crate::external_editor::Caret;
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", "a\rx\nb");
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 1, column: 0 },
+            selection: None,
+        });
+        document
+            .content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+        assert_eq!(document.content.text(), "a\r\nb");
+        assert_eq!(
+            document
+                .content
+                .with_line(0, |text, ending| (text.to_owned(), ending)),
+            Some(("a".to_owned(), text_editor::LineEnding::Cr))
+        );
+        assert_eq!(
+            document
+                .content
+                .with_line(1, |text, ending| (text.to_owned(), ending)),
+            Some((String::new(), text_editor::LineEnding::Lf))
+        );
+        let mut caret_at = |line, column| {
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line, column },
+                selection: None,
+            });
+            runtime.external_caret()
+        };
+        assert_eq!(caret_at(2, 1), Some(Caret::new(1, "b")));
+        // Between the `\r` and the `\n`: the nearest external place is the
+        // end of `a`.
+        assert_eq!(caret_at(1, 0), Some(Caret::new(0, "a")));
+        assert_eq!(caret_at(0, 1), Some(Caret::new(0, "a")));
+    }
+
+    #[test]
+    fn there_is_no_external_caret_without_the_selected_file_open_as_text() {
+        let card = CardId::new();
+        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+        assert_eq!(runtime.external_caret(), None);
+    }
+
+    /// A caret in one file must never position another.
+    #[test]
+    fn there_is_no_external_caret_when_the_open_buffer_is_not_the_selected_file() {
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", "one\ntwo\n");
+        assert!(runtime.external_caret().is_some());
+        runtime
+            .selected
+            .as_mut()
+            .expect("the fixture selects its file")
+            .path = PathBuf::from("other.txt");
+        assert_eq!(runtime.external_caret(), None);
     }
 
     #[test]
