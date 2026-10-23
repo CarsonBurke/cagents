@@ -55,7 +55,7 @@ impl Args {
     }
 }
 
-fn parse_account(value: &str) -> Result<AccountId, String> {
+pub(super) fn parse_account(value: &str) -> Result<AccountId, String> {
     let account: AccountId = value.parse()?;
     if !account.as_str().starts_with("codex/") {
         return Err("Account checks currently support only an explicit Codex account".into());
@@ -63,7 +63,7 @@ fn parse_account(value: &str) -> Result<AccountId, String> {
     Ok(account)
 }
 
-fn parse_workspace(value: &str) -> Result<PathBuf, String> {
+pub(super) fn parse_workspace(value: &str) -> Result<PathBuf, String> {
     if value.is_empty()
         || value.chars().any(char::is_control)
         || !(Path::new(value).is_absolute()
@@ -77,7 +77,7 @@ fn parse_workspace(value: &str) -> Result<PathBuf, String> {
     Ok(value.into())
 }
 
-fn parse_email(value: &str) -> Result<String, String> {
+pub(super) fn parse_email(value: &str) -> Result<String, String> {
     let email = value.trim();
     let valid_parts = email.split_once('@').is_some_and(|(local, domain)| {
         !local.is_empty() && !domain.is_empty() && !domain.contains('@')
