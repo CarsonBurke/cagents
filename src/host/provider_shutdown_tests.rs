@@ -415,6 +415,20 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     let successor = host.lock().unwrap().terminals[&source.id].handle.clone();
     assert_eq!(successor.holder_identity(), Some(&original));
     assert!(original_root.live() && original_holder.live());
+    // Adoption restores the cached screen with a hidden worker. Follow the
+    // public Attach + Visible host path before requiring fresh PTY snapshots.
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        state.attach(1, source.id).unwrap();
+        state
+            .set_visibility(
+                1,
+                source.id,
+                crate::terminal_ipc::TerminalVisibility::Visible,
+            )
+            .unwrap();
+    }
     visible_text(&successor, "listener-ready");
     successor.input(b"after-bind\n".to_vec()).unwrap();
     visible_text(&successor, "continued:after-bind");
