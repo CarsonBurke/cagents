@@ -18572,6 +18572,9 @@ mod tests {
     #[test]
     fn a_metadata_only_disconnected_client_keeps_the_last_readable_runtime_body() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        // An empty headless Workspace starts at width zero. Establish a real
+        // visible pane before testing the App's durable exposure gate.
+        app.workspace.resize_viewport(1280.0);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let snapshot = Snapshot {
@@ -18633,9 +18636,16 @@ mod tests {
         assert!(runtime.snapshot.transcript_bytes() > 0);
         handle.disconnect_for_test();
 
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         preparation::retirement_barrier();
         let runtime = chat_runtime(&app, card);
+        assert!(!runtime.visible.load(Ordering::Relaxed));
         assert!(runtime.cache.is_empty());
         assert!(runtime.child_cache.is_empty());
         assert!(runtime.selection_document.borrow().is_none());
@@ -18653,7 +18663,13 @@ mod tests {
         assert_eq!(runtime.subagent_scroll["child"], scroll);
 
         app.set_workspace_surfaces_visible(true);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
         assert!(handle.resident_snapshot_with_clock().is_none());
         assert!(!handle.is_connected());
@@ -18688,6 +18704,9 @@ mod tests {
     #[test]
     fn a_disconnected_resident_client_can_still_release_and_restore_runtime_body() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
+        // An empty headless Workspace starts at width zero. Establish a real
+        // visible pane before testing the App's durable exposure gate.
+        app.workspace.resize_viewport(1280.0);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         show_chat_snapshot_for_test(
@@ -18708,13 +18727,26 @@ mod tests {
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
         handle.disconnect_for_test();
         assert!(handle.resident_snapshot_with_clock().is_some());
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         let runtime = chat_runtime(&app, card);
+        assert!(!runtime.visible.load(Ordering::Relaxed));
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert!(runtime.cache.is_empty());
         assert!(handle.snapshot().transcript_bytes() > 0);
         app.set_workspace_surfaces_visible(true);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
         assert!(!runtime.cache["resident-answer"].placeholder);
         assert!(shown(&runtime.cache["resident-answer"]).contains("Resident client answer"));
