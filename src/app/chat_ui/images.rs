@@ -812,6 +812,76 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+/// The exact decoded preview an interaction was rendered for. Retaining the
+/// existing immutable item keeps keys and queued actions cheap even for inline
+/// images; equality never compares their encoded payloads.
+#[derive(Clone)]
+pub(in crate::app) struct PreviewTarget {
+    runtime: Target,
+    item: Arc<chat::Item>,
+    revision: u64,
+    image: iced::advanced::image::Id,
+}
+impl PartialEq for PreviewTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.runtime == other.runtime
+            && Arc::ptr_eq(&self.item, &other.item)
+            && self.revision == other.revision
+            && self.image == other.image
+    }
+}
+impl Eq for PreviewTarget {}
+impl std::fmt::Debug for PreviewTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreviewTarget")
+            .field("runtime", &self.runtime)
+            .field("item_id", &self.item.id)
+            .field("revision", &self.revision)
+            .field("image", &self.image)
+            .finish()
+    }
+}
+impl PreviewTarget {
+    pub(super) fn capture(runtime: Target, item: &chat::Item, cached: &CachedItem) -> Option<Self> {
+        let source = cached.image_item.as_ref()?;
+        let image = cached.image.as_ref()?.id();
+        (source.id == item.id && matches!(source.content, ItemContent::Image { .. })).then(|| {
+            Self {
+                runtime,
+                item: source.clone(),
+                revision: cached.revision,
+                image,
+            }
+        })
+    }
+
+    pub(super) fn runtime(&self) -> Target {
+        self.runtime
+    }
+
+    #[cfg(test)]
+    pub(super) fn item_id(&self) -> &str {
+        &self.item.id
+    }
+
+    fn accepts(&self, runtime: &Runtime) -> bool {
+        runtime.target == self.runtime
+            && runtime.presentation_cache().get(&self.item.id).is_some_and(|cached| {
+                cached.revision == self.revision
+                    && cached.image.as_ref().is_some_and(|image| image.id() == self.image)
+                    && cached.image_item.as_ref().is_some_and(|item| Arc::ptr_eq(item, &self.item))
+            })
+            // A snapshot may change before cache preparation. Validate its
+            // actual source at dispatch, never borrow old cached pixels for a
+            // newly published same-ID item. Equivalent immutable snapshots are
+            // allowed without making this a deep per-frame/key comparison.
+            && items(runtime).iter().any(|item| {
+                item.id == self.item.id
+                    && (Arc::ptr_eq(item, &self.item) || item.content == self.item.content)
+            })
+    }
+}
+
 struct Entry {
     id: String,
     managed: bool,
@@ -819,10 +889,18 @@ struct Entry {
     label: String,
     handle: iced::widget::image::Handle,
 }
+/// The immutable gallery entry an external-open button was rendered for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) struct ExternalTarget {
+    publication: uuid::Uuid,
+    selected: usize,
+}
+
 pub(in crate::app) struct Gallery {
     entries: Vec<Entry>,
     selected: usize,
     remote: bool,
+    publication: uuid::Uuid,
     pub(super) reset: u64,
 }
 impl Gallery {
@@ -844,10 +922,18 @@ impl Gallery {
             }],
             selected: 0,
             remote: device.is_some(),
+            publication: uuid::Uuid::new_v4(),
             reset: 0,
         }
     }
-    pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
+    pub(super) fn from_preview(runtime: &Runtime, target: &PreviewTarget) -> Option<Self> {
+        target
+            .accepts(runtime)
+            .then(|| Self::new(runtime, &target.item.id))
+            .flatten()
+    }
+
+    fn new(runtime: &Runtime, id: &str) -> Option<Self> {
         let items = match runtime.selected_subagent.as_deref() {
             Some(agent) => {
                 &runtime
@@ -899,6 +985,7 @@ impl Gallery {
             entries,
             selected,
             remote: crate::device::is_remote(),
+            publication: uuid::Uuid::new_v4(),
             reset: 0,
         })
     }
@@ -910,6 +997,30 @@ impl Gallery {
         };
         self.reset = self.reset.wrapping_add(1);
     }
+    fn external_target(&self) -> ExternalTarget {
+        ExternalTarget {
+            publication: self.publication,
+            selected: self.selected,
+        }
+    }
+
+    pub(super) fn external_url(&self, target: ExternalTarget) -> Option<Url> {
+        (target == self.external_target())
+            .then(|| self.url())
+            .flatten()
+    }
+
+    fn external_button(&self) -> Element<'_, Message> {
+        let target = self.external_target();
+        crate::ui_controls::owned(
+            target,
+            crate::ui_controls::button::secondary("Open externally").on_press_maybe(
+                self.external_url(target)
+                    .map(|_| action(Action::ImageExternal(target))),
+            ),
+        )
+    }
+
     pub(super) fn url(&self) -> Option<Url> {
         let entry = &self.entries[self.selected];
         // Managed snapshot paths are non-authority hints. The in-app viewer
@@ -949,27 +1060,18 @@ impl Gallery {
             crate::ui_controls::button::secondary("Fit")
                 .on_press(action(Action::ImageFit))
                 .into(),
-            crate::ui_controls::button::secondary("Open externally")
-                .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
-                .into(),
+            self.external_button(),
             icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
         ])
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);
-        let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(entry.handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain)
-            .min_scale(0.1)
-            .max_scale(20.0)
-            .into();
-        let canvas = canvas::resettable(self.reset, viewer);
+        let canvas = self.canvas();
         dialog_ui::overlay(
             dialog_ui::surface(
                 widget::column::with_children(vec![
                     toolbar.into(),
                     design::caption(entry.label.as_str()).into(),
-                    canvas.into(),
+                    canvas,
                     design::caption("Scroll to zoom · Drag to pan · Left / Right to browse").into(),
                 ])
                 .spacing(step::GAP_S)
@@ -979,6 +1081,17 @@ impl Gallery {
             Some(action(Action::CloseImage)),
             1.0,
         )
+    }
+    fn canvas(&self) -> Element<'_, Message> {
+        let viewer: Element<'_, Message> =
+            iced::widget::image::Viewer::new(self.entries[self.selected].handle.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .min_scale(0.1)
+                .max_scale(20.0)
+                .into();
+        canvas::resettable(self.publication, self.reset, viewer)
     }
 }
 impl Runtime {
@@ -1021,17 +1134,23 @@ impl Runtime {
                 .into()
             };
         };
+        let Some(target) = PreviewTarget::capture(self.target, item, cached) else {
+            return design::caption(format!("{label} · Preview unavailable")).into();
+        };
         let preview = iced::widget::image(handle.clone())
             .width(Length::Fill)
             .height(280)
             .content_fit(iced::ContentFit::Contain);
+        let button = widget::button::custom(preview)
+            .class(crate::ui_controls::control_style(false, None))
+            .padding(0)
+            .on_press(action(Action::OpenImage(target.clone())))
+            .width(Length::Fill);
         widget::column::with_children(vec![
-            widget::button::custom(preview)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding(0)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone())))
-                .width(Length::Fill)
-                .into(),
+            // A retained transcript can rebuild this same position before an
+            // old press is released. Bind the button to the actual cached
+            // source and decoded pixels, including a ready-after-eviction race.
+            canvas::preview(target, button.into()),
             design::caption(format!("{label} · Click to enlarge")).into(),
         ])
         .spacing(step::GAP_XS)
@@ -1052,6 +1171,581 @@ pub(super) fn deferred_for_test() -> Loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_pointer_step(
+        gallery: &Gallery,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, layout};
+        use iced::{Event, Rectangle, Size, mouse};
+        let mut button = gallery.external_button();
+        tree.diff(button.as_widget_mut());
+        let node = button.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(500.0, 100.0)),
+        );
+        let bounds = node.bounds();
+        let mut messages = Vec::new();
+        button.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(bounds.center()),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(500.0, 100.0)),
+        );
+        messages
+    }
+
+    #[test]
+    fn external_image_press_keeps_its_gallery_entry_and_fresh_click_uses_the_new_one() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        use iced::widget::image::Handle;
+        let renderer = crate::app::tests::headless_renderer();
+        let handle = Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+        let mut gallery = Gallery::file("/fixture/first.png".into(), None, handle.clone());
+        gallery.entries.push(Entry {
+            id: "second".into(),
+            managed: false,
+            path: "/fixture/second.png".into(),
+            label: "Second".into(),
+            handle,
+        });
+        let held = gallery.external_target();
+        assert!(Action::ImageExternal(held).allowed_while_modal());
+        let mut tree = {
+            let button = gallery.external_button();
+            Tree::new(button.as_widget())
+        };
+        assert!(
+            external_pointer_step(
+                &gallery,
+                &mut tree,
+                &renderer,
+                Event::ButtonPressed(Button::Left)
+            )
+            .is_empty()
+        );
+        gallery.next(true);
+        assert!(
+            gallery.external_url(held).is_none(),
+            "an already queued old action must not open the new image"
+        );
+        assert!(
+            external_pointer_step(
+                &gallery,
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left)
+            )
+            .is_empty(),
+            "an old native press must not produce the replacement action"
+        );
+        assert!(
+            external_pointer_step(
+                &gallery,
+                &mut tree,
+                &renderer,
+                Event::ButtonPressed(Button::Left)
+            )
+            .is_empty()
+        );
+        let opened = external_pointer_step(
+            &gallery,
+            &mut tree,
+            &renderer,
+            Event::ButtonReleased(Button::Left),
+        );
+        let [Message::ChatUi(Action::ImageExternal(target))] = opened.as_slice() else {
+            panic!("a fresh click must emit one external-open action");
+        };
+        assert_eq!(
+            gallery
+                .external_url(*target)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            PathBuf::from("/fixture/second.png")
+        );
+
+        // An ordinary redraw of the same immutable entry keeps its press.
+        assert!(
+            external_pointer_step(
+                &gallery,
+                &mut tree,
+                &renderer,
+                Event::ButtonPressed(Button::Left)
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            external_pointer_step(
+                &gallery,
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left)
+            )
+            .as_slice(),
+            [Message::ChatUi(Action::ImageExternal(_))]
+        ));
+    }
+
+    #[test]
+    fn reopening_identical_gallery_pixels_rejects_an_old_external_open() {
+        use iced::widget::image::Handle;
+        let handle = Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+        let old = Gallery::file("/fixture/same.png".into(), None, handle.clone());
+        let target = old.external_target();
+        assert!(old.external_url(target).is_some());
+        let replacement = Gallery::file("/fixture/same.png".into(), None, handle);
+        assert!(replacement.external_url(target).is_none());
+        assert!(
+            replacement
+                .external_url(replacement.external_target())
+                .is_some()
+        );
+    }
+
+    fn preview_pointer_step(
+        runtime: &Runtime,
+        item: &chat::Item,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::{Event, Rectangle, Size, mouse};
+        struct Bounds(Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                assert!(self.0.replace(bounds).is_none(), "one real preview button");
+            }
+        }
+        let mut element = runtime.image_preview(item, &runtime.presentation_cache()[&item.id]);
+        tree.diff(element.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(600.0, 400.0));
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds(None);
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        let bounds = bounds.0.expect("the decoded preview is an actual button");
+        assert!(bounds.height >= 200.0);
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), tree, mouse::Cursor::Unavailable);
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| { node.node().role() == iced_accessibility::accesskit::Role::Button }),
+            "the identity wrapper preserves the real accessible button"
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(bounds.center()),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn a_preview_press_cannot_transfer_to_replaced_sources_or_republished_pixels() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let renderer = crate::app::tests::headless_renderer();
+        for change in 0..4 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some("/fixture/images".into())));
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                panic!("draft chat");
+            };
+            runtime.visible.store(true, Ordering::Relaxed);
+            let mut current = Arc::new(image_item("/fixture/a.png".into()));
+            let install = |runtime: &mut Runtime, item: &Arc<chat::Item>| {
+                let mut snapshot = (*runtime.snapshot).clone();
+                snapshot.items = vec![item.clone()];
+                runtime.snapshot = Arc::new(snapshot);
+                Runtime::prepare_items(
+                    &mut runtime.cache,
+                    std::slice::from_ref(item),
+                    false,
+                    &HashSet::new(),
+                    crate::settings::EditorSyntaxTheme::Auto,
+                    Provider::Codex,
+                );
+            };
+            install(runtime, &current);
+            let attempt = runtime.cache[&current.id].image_attempt;
+            complete(
+                runtime,
+                &current,
+                attempt,
+                Loaded::Ready(iced::widget::image::Handle::from_rgba(
+                    1,
+                    1,
+                    vec![255, 0, 0, 255],
+                )),
+            );
+            let original_handle = runtime.cache[&current.id].image.as_ref().unwrap().clone();
+            let presentation = runtime.cache[&current.id].revision;
+            let element = runtime.image_preview(&current, &runtime.cache[&current.id]);
+            let mut tree = Tree::new(element.as_widget());
+            drop(element);
+            assert!(
+                preview_pointer_step(
+                    runtime,
+                    &current,
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+
+            if change == 1 {
+                let old = current;
+                // Same id and equal-length path: neither an ordinal nor the
+                // transcript's cheap change token identifies these pixels.
+                current = Arc::new(image_item("/fixture/b.png".into()));
+                install(runtime, &current);
+                complete(
+                    runtime,
+                    &old,
+                    attempt,
+                    Loaded::Ready(iced::widget::image::Handle::from_rgba(
+                        1,
+                        1,
+                        vec![255, 0, 0, 255],
+                    )),
+                );
+                assert!(
+                    runtime.cache[&current.id].image.is_none(),
+                    "old read is rejected"
+                );
+                assert_ne!(runtime.cache[&current.id].revision, presentation);
+            } else if change == 2 {
+                // Retirement and ready completion may both occur before a
+                // frame ever renders the intermediate loading placeholder.
+                retire(runtime.cache.get_mut(&current.id).unwrap(), true);
+                request(runtime, &current.id);
+                assert_eq!(runtime.cache[&current.id].revision, presentation);
+            } else if change == 3 {
+                let mut replacement = (*current).clone();
+                replacement.id = "different-image-item".into();
+                current = Arc::new(replacement);
+                install(runtime, &current);
+                let attempt = runtime.cache[&current.id].image_attempt;
+                complete(
+                    runtime,
+                    &current,
+                    attempt,
+                    Loaded::Ready(original_handle.clone()),
+                );
+                assert_eq!(
+                    runtime.cache[&current.id].image.as_ref().unwrap().id(),
+                    original_handle.id()
+                );
+            }
+            if change == 1 || change == 2 {
+                let attempt = runtime.cache[&current.id].image_attempt;
+                complete(
+                    runtime,
+                    &current,
+                    attempt,
+                    Loaded::Ready(iced::widget::image::Handle::from_rgba(
+                        1,
+                        1,
+                        vec![0, 0, 255, 255],
+                    )),
+                );
+            }
+            let mut messages = preview_pointer_step(
+                runtime,
+                &current,
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            if change != 0 {
+                assert!(messages.is_empty(), "old press cannot open new pixels");
+                assert!(
+                    preview_pointer_step(
+                        runtime,
+                        &current,
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left)
+                    )
+                    .is_empty()
+                );
+                messages = preview_pointer_step(
+                    runtime,
+                    &current,
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                );
+            }
+            let [Message::ChatUi(Action::OpenImage(target))] = messages.as_slice() else {
+                panic!("fresh click or unchanged redraw must open its image");
+            };
+            assert_eq!(target.runtime(), runtime.target);
+            assert_eq!(target.item_id(), &current.id);
+            let Message::ChatUi(open) = messages.pop().unwrap() else {
+                unreachable!()
+            };
+            drop(app.handle_chat_ui(open));
+            let gallery = app
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .expect("actual gallery dispatch");
+            let iced::widget::image::Handle::Rgba { pixels, .. } = &gallery.entries[0].handle
+            else {
+                panic!("decoded cache pixels");
+            };
+            assert_eq!(
+                pixels.as_ref(),
+                if change == 0 || change == 3 {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 255, 255]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn queued_preview_actions_validate_publication_and_current_snapshot_before_opening() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        use iced::widget::image::Handle;
+        let renderer = crate::app::tests::headless_renderer();
+        for change in 0..6 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some("/fixture/images".into())));
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                panic!("draft chat");
+            };
+            runtime.visible.store(true, Ordering::Relaxed);
+            let install = |runtime: &mut Runtime, item: &Arc<chat::Item>| {
+                Arc::make_mut(&mut runtime.snapshot).items = vec![item.clone()];
+                Runtime::prepare_items(
+                    &mut runtime.cache,
+                    std::slice::from_ref(item),
+                    false,
+                    &HashSet::new(),
+                    runtime.syntax_theme,
+                    Provider::Codex,
+                );
+            };
+            let publish = |runtime: &mut Runtime, item: &Arc<chat::Item>, handle: Handle| {
+                let attempt = runtime.cache[&item.id].image_attempt;
+                complete(runtime, item, attempt, Loaded::Ready(handle));
+                assert!(runtime.cache[&item.id].image.is_some());
+            };
+            let original = Arc::new(image_item("/fixture/a.png".into()));
+            let red = Handle::from_rgba(1, 1, vec![255, 0, 0, 255]);
+            install(runtime, &original);
+            publish(runtime, &original, red.clone());
+            let mut tree = {
+                let preview = runtime.image_preview(&original, &runtime.cache[&original.id]);
+                Tree::new(preview.as_widget())
+            };
+            assert!(
+                preview_pointer_step(
+                    runtime,
+                    &original,
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            let mut queued = preview_pointer_step(
+                runtime,
+                &original,
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            let [Message::ChatUi(Action::OpenImage(held))] = queued.as_slice() else {
+                panic!("capture a real emitted preview action before replacement");
+            };
+            let held = held.clone();
+            assert!(
+                !format!("{held:?}").contains("/fixture/a.png"),
+                "target Debug must not expand the image source/payload"
+            );
+            let mut current = original.clone();
+            match change {
+                1 | 3 => {
+                    current = Arc::new(image_item("/fixture/b.png".into()));
+                    if change == 1 {
+                        install(runtime, &current);
+                        publish(
+                            runtime,
+                            &current,
+                            Handle::from_rgba(1, 1, vec![0, 0, 255, 255]),
+                        );
+                    } else {
+                        // Snapshot publication can precede preparation. The
+                        // old cache must not authorize this changed source.
+                        Arc::make_mut(&mut runtime.snapshot).items = vec![current.clone()];
+                        assert_eq!(runtime.cache[&current.id].revision, held.revision);
+                        assert_eq!(
+                            runtime.cache[&current.id].image.as_ref().unwrap().id(),
+                            held.image
+                        );
+                    }
+                }
+                2 => {
+                    retire(runtime.cache.get_mut(&current.id).unwrap(), true);
+                    request(runtime, &current.id);
+                    publish(
+                        runtime,
+                        &current,
+                        Handle::from_rgba(1, 1, vec![0, 0, 255, 255]),
+                    );
+                    assert_eq!(runtime.cache[&current.id].revision, held.revision);
+                    assert_ne!(
+                        runtime.cache[&current.id].image.as_ref().unwrap().id(),
+                        held.image
+                    );
+                }
+                4 => {
+                    let mut replacement = (*original).clone();
+                    replacement.id = "different-image-item".into();
+                    current = Arc::new(replacement);
+                    install(runtime, &current);
+                    publish(runtime, &current, red.clone());
+                    assert_eq!(
+                        runtime.cache[&current.id].image.as_ref().unwrap().id(),
+                        held.image,
+                        "different item IDs may share the exact same decoded handle"
+                    );
+                    // The native key must include the item, not just pixels.
+                    let fresh = PreviewTarget::capture(
+                        runtime.target,
+                        &current,
+                        &runtime.cache[&current.id],
+                    )
+                    .unwrap();
+                    assert_ne!(held, fresh);
+                }
+                5 => {
+                    // An equivalent snapshot Arc arriving before prepare is
+                    // still the same source for queued dispatch.
+                    current = Arc::new((*original).clone());
+                    Arc::make_mut(&mut runtime.snapshot).items = vec![current.clone()];
+                }
+                _ => {}
+            }
+            let runtime_target = runtime.target;
+            let unchanged = change == 0 || change == 5;
+            let Message::ChatUi(open) = queued.pop().unwrap() else {
+                unreachable!()
+            };
+            drop(app.handle_chat_ui(open));
+            assert_eq!(
+                app.chat_ui.image_viewer.is_some(),
+                unchanged,
+                "only the actual captured publication may open: case {change}"
+            );
+            if unchanged {
+                assert_eq!(
+                    app.chat_ui.image_viewer.as_ref().unwrap().entries[0]
+                        .handle
+                        .id(),
+                    held.image
+                );
+            } else {
+                // A stale queued action must also leave an already newer
+                // gallery intact instead of clearing or replacing it.
+                let newer = Gallery::file("/fixture/newer.png".into(), None, red.clone());
+                let publication = newer.publication;
+                app.chat_ui.image_viewer = Some(newer);
+                drop(app.handle_chat_ui(Action::OpenImage(held)));
+                assert_eq!(
+                    app.chat_ui.image_viewer.as_ref().unwrap().publication,
+                    publication
+                );
+            }
+            drop(app.handle_chat_ui(Action::CloseImage));
+            let runtime = app.chat_runtime_mut(runtime_target).unwrap();
+            if change == 3 {
+                install(runtime, &current);
+                publish(
+                    runtime,
+                    &current,
+                    Handle::from_rgba(1, 1, vec![0, 0, 255, 255]),
+                );
+            }
+            let expected = runtime.cache[&current.id].image.as_ref().unwrap().id();
+            assert!(
+                preview_pointer_step(
+                    runtime,
+                    &current,
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            let mut fresh = preview_pointer_step(
+                runtime,
+                &current,
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            let [Message::ChatUi(Action::OpenImage(target))] = fresh.as_slice() else {
+                panic!("a fresh native click still opens the current image");
+            };
+            assert_eq!(target.item_id(), current.id);
+            let Message::ChatUi(open) = fresh.pop().unwrap() else {
+                unreachable!()
+            };
+            drop(app.handle_chat_ui(open));
+            let gallery = app
+                .chat_ui
+                .image_viewer
+                .as_ref()
+                .expect("fresh action accepted");
+            assert_eq!(gallery.entries[gallery.selected].id, current.id);
+            assert_eq!(gallery.entries[gallery.selected].handle.id(), expected);
+        }
+    }
+
     #[test]
     fn image_headers_bound_pixel_memory_and_reject_invalid_data() {
         let mut bytes = Vec::new();
@@ -1687,6 +2381,7 @@ mod tests {
             entries: vec![entry("a"), entry("b")],
             selected: 0,
             remote: false,
+            publication: uuid::Uuid::new_v4(),
             reset: 0,
         };
         gallery.next(false);
