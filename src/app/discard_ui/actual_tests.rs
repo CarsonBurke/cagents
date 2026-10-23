@@ -197,7 +197,7 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
         sidebar::SidebarMode::Expanded,
         vec![sidebar::SidebarProject::new(
             key.project_id,
-            crate::model::RepositoryId::new(),
+            crate::repository::RepositoryId::new(),
             "Discard fixture".into(),
             root.clone(),
             vec![sidebar::SidebarWorktree::from_durable(
