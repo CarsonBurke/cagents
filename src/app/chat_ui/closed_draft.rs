@@ -113,7 +113,7 @@ impl Runtime {
             && self.queued.is_none()
             && self.followups.is_empty()
             && self.recalling.is_empty()
-            && !self.attachment_chooser_pending
+            && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0
             && self.image_pastes_saving == 0
     }

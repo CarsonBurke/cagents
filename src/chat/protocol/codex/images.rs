@@ -32,6 +32,7 @@ pub(super) fn tool_result(
         started_at: None,
         at: None,
         content: ItemContent::Image {
+            reference: None,
             path,
             description: "Tool image".into(),
         },
