@@ -12820,11 +12820,14 @@ pub(crate) mod tests {
         let mut row = worktree(11, branch, false);
         assert_eq!(&*row.chrome.label, branch);
         assert!(row.matches("developer/"));
+        assert!(row.matches("challenge"));
+        assert!(!row.matches("handling"));
         let mut pr = project().pull_requests.remove(0);
         pr.title = "Fix browser challenge handling".into();
         row.set_pull_request(pr);
         assert_eq!(&*row.chrome.label, branch);
         assert!(row.matches("challenge"));
+        assert!(row.matches("handling"));
         assert!(
             row.chrome
                 .tooltip
@@ -12833,7 +12836,8 @@ pub(crate) mod tests {
         assert!(row.chrome.tooltip.contains(branch));
         row.clear_pull_request();
         assert_eq!(&*row.chrome.label, branch);
-        assert!(!row.matches("challenge"));
+        assert!(row.matches("challenge"));
+        assert!(!row.matches("handling"));
         assert_eq!(row.branch.as_deref(), Some(branch));
     }
 
