@@ -103,6 +103,217 @@ fn git(root: &Path, arguments: &[&str]) {
 }
 
 #[test]
+fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo";
+    if isolated(NAME) {
+        return;
+    }
+    use cosmic::iced::{
+        Event, Point, Rectangle, Size,
+        advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree},
+    };
+
+    // Rebuild between every input, as the native runtime does. Derive the
+    // target from the actual laid-out accessible button, not a saved pixel.
+    fn click<'a>(
+        mut view: impl FnMut() -> Element<'a, Message>,
+        label: &str,
+        size: Size,
+        renderer: &cosmic::Renderer,
+    ) -> Vec<Message> {
+        let mut tree = Tree::empty();
+        let viewport = Rectangle::with_size(size);
+        let mut point = None;
+        let mut messages = Vec::new();
+        for phase in 0..3 {
+            let mut element = view();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let buttons = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 1, "one current actual {label} control");
+            let bounds = buttons[0].node().bounds().expect("button geometry");
+            let current = Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            assert!(viewport.contains(current), "{label} is within the viewport");
+            let at = *point.get_or_insert(current);
+            assert_eq!(current, at, "unchanged source keeps the press target");
+            let event = match phase {
+                0 => mouse::Event::CursorMoved { position: at },
+                1 => mouse::Event::ButtonPressed(mouse::Button::Left),
+                _ => mouse::Event::ButtonReleased(mouse::Button::Left),
+            };
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            if phase < 2 {
+                assert!(messages.is_empty(), "Discard is a release action");
+            }
+        }
+        messages
+    }
+
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("changed"), b"index baseline\n").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("changed"), b"original precious work\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
+    drop(app.update(loaded));
+    app.context_tab = ContextTab::Changes;
+    let original = app.discard_ui.source().unwrap().id;
+    let renderer = crate::app::tests::headless_renderer();
+    let mut requested = click(
+        || app.context_panel(None, 380.0),
+        "Discard all Unstaged",
+        Size::new(380.0, 900.0),
+        &renderer,
+    );
+    assert_eq!(requested.len(), 1);
+    assert!(
+        matches!(&requested[0], Message::SidebarSnapshot { source, action }
+        if *source == original && matches!(&**action, SidebarAction::ChangeGroup {
+            command: sidebar::ChangeGroupCommand::Discard, ..
+        }))
+    );
+    drop(app.update(requested.pop().unwrap()));
+    assert!(app.modal_is_open());
+    assert_eq!(app.discard_ui.intent_id(), Some(original));
+    assert_eq!(
+        fs::read(root.join("changed")).unwrap(),
+        b"original precious work\n"
+    );
+
+    let mut confirmed = click(
+        || app.dialog().expect("actual confirmation is mounted"),
+        "Discard",
+        Size::new(1280.0, 900.0),
+        &renderer,
+    );
+    assert_eq!(confirmed.len(), 1);
+    assert!(
+        matches!(&confirmed[0], Message::SidebarSnapshot { source, action }
+        if *source == original && matches!(&**action, SidebarAction::ConfirmDiscard { request, .. }
+            if request.confirmed && request.tracked.len() == 1 && request.untracked.is_empty()))
+    );
+    let task = app.update(confirmed.pop().unwrap());
+    assert!(!app.modal_is_open());
+    assert!(app.discard_ui.has_inflight());
+    let slot = app.discard_ui.slots[0].clone();
+    let finished = crate::app::tests::task_app_message(task);
+    drop(app.update(finished));
+    assert_eq!(fs::read(root.join("changed")).unwrap(), b"index baseline\n");
+    assert_eq!(slot.source_id(), original);
+    let receipt = slot.0.lock().unwrap().receipt.clone().unwrap();
+    assert_eq!(receipt.remaining_paths(), 1);
+    // A replaced source must refuse Undo without consuming the saved receipt
+    // or changing the replacement. Returning the exact original inode permits
+    // retry; copying baseline bytes into a new inode would not authorize it.
+    let parked = root.with_extension("original-source");
+    fs::rename(&root, &parked).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("changed"), b"replacement must survive\n").unwrap();
+    let task = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(
+        &finished,
+        Message::DiscardFinished {
+            report: Some(_),
+            ..
+        }
+    ));
+    drop(app.update(finished));
+    assert!(!app.discard_ui.has_inflight());
+    assert_eq!(receipt.remaining_paths(), 1);
+    assert!(receipt.can_undo());
+    assert!(app.discard_ui.slot(slot.id()).is_some());
+    assert_eq!(
+        fs::read(root.join("changed")).unwrap(),
+        b"replacement must survive\n"
+    );
+    assert_eq!(
+        fs::read(parked.join("changed")).unwrap(),
+        b"index baseline\n"
+    );
+    let foreign = root.with_extension("preserved-replacement");
+    fs::rename(&root, &foreign).unwrap();
+    fs::rename(&parked, &root).unwrap();
+    let other = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.with_file_name("other"),
+    };
+    app.discard_ui.select(Some(other.clone()));
+    app.sidebar_model.source_control = Some(SourceControlModel::loading(other.clone()));
+    let task = app.update(Message::DiscardUndo {
+        id: slot.id(),
+        resolve: false,
+    });
+    assert!(app.discard_ui.has_inflight());
+    let finished = crate::app::tests::task_app_message(task);
+    assert!(matches!(
+        &finished,
+        Message::DiscardFinished { report: None, .. }
+    ));
+    drop(app.update(finished));
+    assert_eq!(
+        app.sidebar_model.source_control.as_ref().unwrap().key,
+        other
+    );
+    assert_eq!(
+        fs::read(foreign.join("changed")).unwrap(),
+        b"replacement must survive\n"
+    );
+    assert_eq!(
+        fs::read(root.join("changed")).unwrap(),
+        b"original precious work\n"
+    );
+    assert_eq!(receipt.remaining_paths(), 0);
+    assert!(app.discard_ui.slot(slot.id()).is_none());
+    assert!(app.discard_ui.close_block_reason().is_none());
+}
+
+#[test]
 fn discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_actual_tasks_keep_original_receipt_across_navigation_and_restore_native_trash";
     if isolated(NAME) {
