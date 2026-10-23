@@ -18,10 +18,12 @@ mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
 mod changes;
+mod child_navigation;
 mod clipboard_image;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod failure;
 mod find;
 mod find_navigation;
 mod flow_layout;
@@ -247,6 +249,12 @@ pub enum Action {
     ToggleTurn(Target, String),
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
+    SubagentPicker(Target, bool),
+    SubagentQuery(Target, String),
+    ToggleFailure(Target, String),
+    CopyFailure(Target, String),
+    SubagentFilter(Target, child_navigation::Filter),
+    SubagentPage(Target, bool),
     /// Shows the whole of one folded part of a coordination card, addressed
     /// by the card's item id and the part's name, or folds it again.
     Unfold(Target, String),
@@ -1106,6 +1114,8 @@ struct CachedItem {
     item: Option<Arc<chat::Item>>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
+    diagnostic: bool,
+    report_expanded: Option<bool>,
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
@@ -1469,6 +1479,15 @@ impl CachedItem {
         let mut cached = Self {
             preparing: false,
             placeholder: false,
+            diagnostic: false,
+            report_expanded: matches!(
+                content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                }
+            )
+            .then_some(expanded),
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             prepared_tools,
@@ -1518,7 +1537,19 @@ impl CachedItem {
         }
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
-                if let Some(body) = Self::prose(content) {
+                // Reports stay wholly behind their disclosure, including a
+                // one-line API diagnostic. Keep large hidden reports out of
+                // Markdown preparation; Toggle and Find prepare the original
+                // body when they explicitly open it.
+                let hidden_report = !expanded
+                    && matches!(
+                        content,
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        }
+                    );
+                if !hidden_report && let Some(body) = Self::prose(content) {
                     cached.extend(body, growing, theme);
                 }
             }
@@ -2031,6 +2062,7 @@ pub(super) struct Runtime {
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
+    child_picker: Option<child_navigation::Picker>,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -2084,6 +2116,7 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
+    failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
     footer_picker: bool,
@@ -2945,6 +2978,7 @@ impl Runtime {
             selected_subagent: None,
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
+            child_picker: None,
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2973,6 +3007,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
             footer_picker: false,
@@ -3031,6 +3066,8 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.failure_ui = failure::State::default();
+        self.child_picker = None;
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -3057,6 +3094,7 @@ impl Runtime {
             self.failures.remove(0);
         }
         self.failures.push((anchor, notice));
+        self.refresh_failure_ui();
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
@@ -3418,7 +3456,73 @@ impl Runtime {
         for position in start..end {
             let index = if position == 0 { newest } else { position - 1 };
             let item = &items[index];
-            let growing = busy && index == newest;
+            let report = matches!(
+                &item.content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                }
+            );
+            // A Report is an immutable delivery publication, even while its
+            // parent or selected child is working. Its Ready must retire the
+            // worker owner instead of retaining a streaming canonical copy.
+            let growing = busy && index == newest && !report;
+            if cache.get(&item.id).is_some_and(|cached| {
+                cached.diagnostic
+                    && cached
+                        .item
+                        .as_ref()
+                        .is_some_and(|previous| Arc::ptr_eq(previous, item))
+            }) {
+                continue;
+            }
+            if failure::diagnostic_item(provider, item) {
+                let unchanged = cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.item.as_ref())
+                    .is_some_and(|previous| Arc::ptr_eq(previous, item));
+                if !unchanged {
+                    let placeholder = ItemContent::Text {
+                        text: String::new(),
+                        thinking: false,
+                        phase: chat::Phase::Commentary,
+                    };
+                    let mut cached =
+                        CachedItem::updated(&placeholder, theme, None, false, false, None);
+                    cached.token = ChangeToken::of(&item.content);
+                    cached.diagnostic = true;
+                    cached.item = Some(item.clone());
+                    cached.reader_memory = self.scroll_memory.clone();
+                    cached.reader_context.clone_from(&context);
+                    cache.insert(item.id.clone(), cached);
+                    presentation_changed = true;
+                }
+                continue;
+            }
+            if report && !expanded.contains(&item.id) {
+                let unchanged = cache.get(&item.id).is_some_and(|cached| {
+                    cached.report_expanded == Some(false)
+                        && cached
+                            .item
+                            .as_ref()
+                            .is_some_and(|old| Arc::ptr_eq(old, item))
+                });
+                if !unchanged {
+                    let previous = cache.remove(&item.id);
+                    let mut cached =
+                        CachedItem::updated(&item.content, theme, previous, false, false, None);
+                    cached.item = Some(item.clone());
+                    cached.reader_memory = self.scroll_memory.clone();
+                    cached.reader_context.clone_from(&context);
+                    cache.insert(item.id.clone(), cached);
+                    presentation_changed = true;
+                }
+                continue;
+            }
+            let report_reveal = report
+                && cache
+                    .get(&item.id)
+                    .is_none_or(|cached| cached.report_expanded != Some(true));
             let coordinated = chat::coordination::may_recognize(item, provider);
             let reader_only = !reader_proofs.is_empty()
                 && preparation::has_tool_reader_proofs(item, &reader_proofs);
@@ -3489,7 +3593,7 @@ impl Runtime {
                 // Bytes alone do not bound rich-block parsing or thousands
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
-                if !metadata_reused && (pending || !exact) {
+                if !metadata_reused && (pending || !exact || report_reveal) {
                     let replaced = self.preparation.stage(
                         item,
                         growing && (!reader_only || coordinated),
@@ -3519,6 +3623,12 @@ impl Runtime {
                         .entry(item.id.clone())
                         .or_insert_with(|| CachedItem::preparing(item, theme));
                     cached.preparing = true;
+                    if report {
+                        cached.report_expanded = Some(true);
+                        // A newly opened report has no authorized parsed body
+                        // until the admitted worker returns its exact DTO.
+                        cached.placeholder |= report_reveal;
+                    }
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.reader_context.clone_from(&context);
                     if self.preparation.was_deferred() {
@@ -3645,6 +3755,26 @@ impl Runtime {
         };
         let managed = self.preparation.contains(id);
         let expanded = self.item_expanded(id);
+        if self
+            .presentation_cache()
+            .get(id)
+            .is_some_and(|cached| cached.diagnostic)
+            || (!expanded
+                && matches!(
+                    &prepared.item().content,
+                    ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Report,
+                        ..
+                    }
+                ))
+        {
+            // Disclosure/source may change while a worker is running. Retire
+            // its owned output through the existing queue, never resurrect a
+            // closed report or overwrite an exact diagnostic placeholder.
+            prepared.discard();
+            self.resume_preparation();
+            return;
+        }
         let Some(cached) = self.presentation_cache_mut().get_mut(id) else {
             prepared.discard();
             return;
@@ -4119,6 +4249,7 @@ impl Runtime {
         drop(retired_metadata);
         self.presentation_evicted = false;
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_runtime", chat_id = %self.session.id, resident_bytes = self.snapshot.transcript_bytes(), cache_entries = self.cache.len(), exposed_presentation_bytes = self.cache.values().map(CachedItem::retained_bytes).sum::<usize>());
+        self.refresh_failure_ui();
         images::sync(self);
         self.refresh_find();
     }
@@ -4133,6 +4264,7 @@ impl Runtime {
     }
 
     fn restore_find_disclosures(&mut self) {
+        self.restore_failure_find();
         self.find_disclosure
             .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
@@ -4140,6 +4272,38 @@ impl Runtime {
                 self.child_expanded.entry(child.clone()).or_default(),
                 self.child_unfolded.entry(child).or_default(),
                 &mut HashMap::new(),
+            );
+        }
+        // A temporary Find reveal owns the report's parsed body too. Drop it
+        // again when search restores a collapsed report; manual disclosures
+        // retain both their state and their prepared body.
+        fn collapse_reports(
+            cache: &mut HashMap<String, CachedItem>,
+            expanded: &HashSet<String>,
+            theme: crate::settings::EditorSyntaxTheme,
+        ) {
+            let closed: Vec<_> = cache
+                .iter()
+                .filter_map(|(id, cached)| {
+                    (cached.report_expanded == Some(true) && !expanded.contains(id))
+                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
+                        .flatten()
+                })
+                .collect();
+            for (id, item) in closed {
+                let previous = cache.remove(&id);
+                let mut cached =
+                    CachedItem::updated(&item.content, theme, previous, false, false, None);
+                cached.item = Some(item);
+                cache.insert(id, cached);
+            }
+        }
+        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
+        if let Some(child) = &self.selected_subagent {
+            collapse_reports(
+                &mut self.child_cache,
+                self.child_expanded.entry(child.clone()).or_default(),
+                self.syntax_theme,
             );
         }
     }
@@ -4157,10 +4321,12 @@ impl Runtime {
     }
 
     fn reveal_child_find_match(&mut self, key: &str) {
+        self.reveal_failure_for_find(key);
         self.apply_find_plan(key);
     }
 
     fn refresh_find(&mut self) {
+        self.refresh_failure_previews();
         self.refresh_find_work();
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
@@ -4207,6 +4373,14 @@ impl Runtime {
         result
     }
     fn release_transcript_caches(&mut self) {
+        // Diagnostic metadata retains exact source Arcs. Release these while
+        // the snapshot still owns its items, keeping only small disclosure
+        // choices for the authoritative rehydration.
+        let expanded = std::mem::take(&mut self.failure_ui.expanded);
+        let find_expanded = std::mem::take(&mut self.failure_ui.find_expanded);
+        self.failure_ui = failure::State::default();
+        self.failure_ui.expanded = expanded;
+        self.failure_ui.find_expanded = find_expanded;
         self.provider_queue.borrow_mut().clear();
         if let Some(queued) = &mut self.queued {
             queued.presentation = prompt::LocalPresentation::default();
@@ -4260,7 +4434,9 @@ impl Runtime {
 
     /// The named control that should receive the keyboard for this card.
     pub(super) fn focus_control(&self) -> &'static str {
-        if self.model_picker.is_some() {
+        if self.child_picker.is_some() {
+            "chat-subagent-search"
+        } else if self.model_picker.is_some() {
             "chat-model-search"
         } else {
             "chat-composer"
@@ -7778,6 +7954,7 @@ impl Cagents {
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
+            | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
@@ -7785,7 +7962,9 @@ impl Cagents {
                 self.cards.get(&target.card).and_then(|card| match card {
                     CardRuntime::Chat(runtime)
                         if runtime.target == *target
-                            && (runtime.picker_keyboard || runtime.model_picker.is_some()) =>
+                            && (runtime.picker_keyboard
+                                || runtime.model_picker.is_some()
+                                || runtime.child_picker.is_some()) =>
                     {
                         Some(*target)
                     }
@@ -7795,6 +7974,7 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
         }
@@ -7812,6 +7992,16 @@ impl Cagents {
             ]);
         }
         task
+    }
+
+    pub(super) fn reconcile_chat_failure_presentations(&mut self) {
+        for card in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = card
+                && runtime.visible.load(Ordering::Relaxed)
+            {
+                runtime.reconcile_failure_ui();
+            }
+        }
     }
 
     fn stage_chat_attachments(
@@ -9673,6 +9863,7 @@ impl Cagents {
                     runtime.find_navigation.cancel_all();
                     runtime.restore_find_disclosures();
                     runtime.find = None;
+                    runtime.refresh_failure_previews();
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
                 }
@@ -9988,6 +10179,19 @@ impl Cagents {
                     if !expanded.remove(&id) {
                         expanded.insert(id.clone());
                     }
+                    if runtime.active_item(&id).is_some_and(|item| {
+                        matches!(
+                            &item.content,
+                            ItemContent::Delivery {
+                                kind: chat::DeliveryKind::Report,
+                                ..
+                            }
+                        )
+                    }) {
+                        let snapshot = runtime.snapshot.clone();
+                        runtime.prepare_transcript_cache(&snapshot);
+                        return Task::none();
+                    }
                     if let Some(item) = runtime.active_item(&id).cloned().filter(|item| {
                         CachedItem::prose(&item.content).is_none()
                             || runtime
@@ -10034,10 +10238,112 @@ impl Cagents {
                     }
                 }
             }
+            Action::ToggleFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime
+                        .failure_ui
+                        .incidents
+                        .iter()
+                        .any(|incident| incident.key == key)
+                {
+                    runtime.failure_ui.find_expanded.remove(&key);
+                    if !runtime.failure_ui.expanded.remove(&key) {
+                        runtime.failure_ui.expanded.insert(key.clone());
+                        runtime.cache_failure_preview(&key);
+                    }
+                }
+            }
+            Action::CopyFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(text) = runtime.failure_details(&key)
+                {
+                    text_copy::invalidate();
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_picker =
+                        open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+                    if open {
+                        return widget::text_input::focus(card_control_id(
+                            target.card,
+                            "chat-subagent-search",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        if runtime.snapshot.subagents.is_empty() {
+                            "chat-composer"
+                        } else {
+                            "chat-subagent-picker"
+                        },
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.query = query;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPage(target, next) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    let last = picker
+                        .rows(&runtime.snapshot.subagents)
+                        .len()
+                        .saturating_sub(1)
+                        / 24;
+                    picker.page = if next {
+                        picker.page.saturating_add(1).min(last)
+                    } else {
+                        picker.page.saturating_sub(1)
+                    };
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentFilter(target, filter) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.filter = filter;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
             Action::SelectSubagent(target, id) => {
                 text_copy::invalidate();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.find_navigation.cancel_all();
+                    runtime.child_picker = None;
                     let selected = id.filter(|id| {
                         runtime
                             .snapshot

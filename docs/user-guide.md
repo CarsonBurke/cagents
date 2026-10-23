@@ -589,12 +589,13 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**All run history** includes runs from removed definitions. It pages through
+**Run history** includes runs from removed definitions. It pages through
 their original names, times, outcomes, and bounded results. Opening history does
 not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. Completion alerts
-open this exact run history and survive provider cleanup. Removing a definition
-prevents future runs and retains its past runs.
+session; completed fresh sessions remain readable in history. A completion alert
+opens its run under **Automations**, with a trail back to the list, and
+survives provider cleanup. Removing a definition prevents future runs and
+retains its past runs.
 
 The same operations are available without a window:
 

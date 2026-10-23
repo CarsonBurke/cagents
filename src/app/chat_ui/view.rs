@@ -1132,9 +1132,9 @@ impl Runtime {
             .unwrap_or("Subagent")
     }
 
-    fn native_child_status(agent: &chat::Subagent) -> &'static str {
+    pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
         match agent.status {
-            chat::ToolStatus::Running if agent.waiting => "Waiting for you",
+            chat::ToolStatus::Running if agent.waiting => "Waiting",
             chat::ToolStatus::Running => "Working",
             chat::ToolStatus::Succeeded => "Finished",
             chat::ToolStatus::Failed => "Failed",
@@ -1143,7 +1143,7 @@ impl Runtime {
         }
     }
 
-    fn native_child_identity(&self, agent: &chat::Subagent) -> String {
+    pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
@@ -1168,9 +1168,96 @@ impl Runtime {
         identity
     }
 
-    /// Completion requires provider evidence; an idle, attached conversation
-    /// without that evidence is ready, while an unattached one is connecting.
-    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    /// Completion requires provider evidence. An unstarted conversation is a
+    /// draft; an idle attached one is ready, while an attachment is connecting.
+    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
+        let (glyph, label) = self.conversation_status_base(transitioning);
+        let snapshot = &self.snapshot;
+        if self.closed_elsewhere
+            || self.queued.is_some()
+            || transitioning
+            || self.attachment_chooser_pending.is_some()
+            || self.pending.is_some()
+            || self.disconnected
+            || snapshot.exited
+        {
+            return (glyph, label.to_owned());
+        }
+        let working = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
+            .count();
+        let waiting = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
+            .count();
+        let failed = snapshot
+            .subagents
+            .iter()
+            .filter(|child| {
+                matches!(
+                    child.status,
+                    chat::ToolStatus::Failed | chat::ToolStatus::Denied
+                )
+            })
+            .count();
+        let active = self
+            .error
+            .as_deref()
+            .into_iter()
+            .chain(snapshot.error.as_deref())
+            .find_map(|message| {
+                chat::failure::Failure::parse(self.session.launch.provider, message)
+            });
+        let failure_label = active.map(|failure| match failure.kind {
+            chat::failure::FailureKind::AccountLimit => "Account limit reached",
+            chat::failure::FailureKind::Authentication => "Sign-in required",
+            chat::failure::FailureKind::Capacity => "Provider at capacity",
+            chat::failure::FailureKind::Connection => "Connection interrupted",
+            chat::failure::FailureKind::Interrupted => "Interrupted",
+        });
+        let mut parts = Vec::new();
+        if let Some(label) = failure_label {
+            parts.push(label.to_owned());
+        } else if snapshot.busy
+            || snapshot.waiting
+            || !snapshot.requests.is_empty()
+            || (working == 0 && waiting == 0)
+        {
+            parts.push(Self::short_description(label, 72));
+        }
+        if failure_label.is_some()
+            || snapshot.subagents.len() > 1
+            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
+        {
+            if working > 0 {
+                parts.push(format!("{working} working"));
+            }
+            if waiting > 0 {
+                parts.push(format!("{waiting} waiting"));
+            }
+            if failed > 0 {
+                parts.push(format!("{failed} failed"));
+            }
+            if !parts.is_empty() {
+                return (
+                    if working > 0 || snapshot.busy {
+                        Some(Icon::AgentWorking)
+                    } else if failure_label.is_some() || failed > 0 {
+                        Some(Icon::Warning)
+                    } else {
+                        glyph
+                    },
+                    parts.join(" · "),
+                );
+            }
+        }
+        (glyph, Self::short_description(label, 100))
+    }
+
+    fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
             (
@@ -1202,6 +1289,10 @@ impl Runtime {
                 .subagents
                 .iter()
                 .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running)
+            && !snapshot
+                .subagents
+                .iter()
+                .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
         } else if snapshot.is_working() {
@@ -1274,11 +1365,34 @@ impl Runtime {
         opened.sort_unstable();
         opened.hash(&mut fingerprint);
         self.tool_groups_expanded.hash(&mut fingerprint);
-        self.failures.hash(&mut fingerprint);
-        self.error
-            .as_ref()
-            .or(self.snapshot.error.as_ref())
-            .hash(&mut fingerprint);
+        // Typed summaries/guidance are ordinary labels. Only an exposed,
+        // bounded diagnostic preview has a matching logical text widget.
+        // Never hash or index the hidden original request dump here; explicit
+        // CopyFailure resolves the complete originals independently.
+        for incident in &self.failure_ui.incidents {
+            let exposed = selected.map_or_else(
+                || {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && (incident.anchor.is_none()
+                            || self
+                                .turns
+                                .iter()
+                                .any(|turn| incident.anchor.as_ref() == Some(&turn.key)))
+                },
+                |agent| {
+                    self.incident_has_child_detail(incident, &agent.id)
+                        || agent.items.iter().any(|item| {
+                            self.failure_ui
+                                .child_item(&agent.id, &item.id)
+                                .is_some_and(|(found, _)| found.key == incident.key)
+                        })
+                },
+            );
+            if exposed && let Some(preview) = self.selection_failure_preview(incident) {
+                (preview, &incident.anchor).hash(&mut fingerprint);
+            }
+        }
         self.queued
             .as_ref()
             .map(|queued| (queued.source.id, queued.presentation.revision))
@@ -1290,18 +1404,34 @@ impl Runtime {
             .is_none_or(|(revision, _)| *revision != fingerprint)
         {
             let mut builder = selection::Catalog::builder();
-            if selected.is_some() {
+            if let Some(agent) = selected {
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    self.incident_has_child_detail(incident, &agent.id)
+                        && !agent.items.iter().any(|item| {
+                            self.failure_ui
+                                .child_item(&agent.id, &item.id)
+                                .is_some_and(|(found, _)| found.key == incident.key)
+                        })
+                }) {
+                    self.selection_failure(&mut builder, incident);
+                }
                 for item in items {
+                    if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id)
+                    {
+                        if first {
+                            self.selection_failure(&mut builder, incident);
+                        }
+                        continue;
+                    }
                     self.selection_item(&mut builder, item, turn::slot_of(item), true);
                 }
             } else {
-                for (anchor, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.is_none() && !self.active_auth_notice(anchor, error)
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && incident.anchor.is_none()
                 }) {
-                    builder.logical(
-                        notice_identity(anchor.as_deref(), error),
-                        Arc::from(error.as_str()),
-                    );
+                    self.selection_failure(&mut builder, incident);
                 }
                 for turn in &self.turns {
                     for index in &turn.prompt {
@@ -1326,14 +1456,12 @@ impl Runtime {
                             self.selection_item(&mut builder, item, placed.slot, true);
                         }
                     }
-                    for (anchor, error) in self.failures.iter().filter(|(anchor, error)| {
-                        anchor.as_ref() == Some(&turn.key)
-                            && !self.active_auth_notice(anchor, error)
+                    for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                        !incident.active_recovery
+                            && incident.child_scope.is_none()
+                            && incident.anchor.as_ref() == Some(&turn.key)
                     }) {
-                        builder.logical(
-                            notice_identity(anchor.as_deref(), error),
-                            Arc::from(error.as_str()),
-                        );
+                        self.selection_failure(&mut builder, incident);
                     }
                 }
                 if let Some(queued) = &self.queued
@@ -1346,12 +1474,6 @@ impl Runtime {
                         prepared.full.plain_prefixes(),
                     );
                 }
-            }
-            if let Some(error) = self.error.as_ref().or(self.snapshot.error.as_ref())
-                && !chat::requires_sign_in(self.session.launch.provider, error)
-                && !self.failures.iter().any(|(_, recorded)| recorded == error)
-            {
-                builder.logical(notice_identity(None, error), Arc::from(error.as_str()));
             }
             let catalog =
                 builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
@@ -1366,6 +1488,28 @@ impl Runtime {
             .or_insert_with(Default::default)
             .clone();
         (catalog, bookmark)
+    }
+
+    fn selection_failure_preview<'a>(
+        &'a self,
+        incident: &failure::Incident,
+    ) -> Option<(u64, &'a str)> {
+        self.failure_ui
+            .expanded
+            .contains(&incident.key)
+            .then_some(())?;
+        let (preview, _) = self.failure_preview(&incident.key)?;
+        Some((failure::diagnostic_preview_identity(&incident.key), preview))
+    }
+
+    fn selection_failure(
+        &self,
+        builder: &mut selection::DocumentBuilder,
+        incident: &failure::Incident,
+    ) {
+        if let Some((identity, preview)) = self.selection_failure_preview(incident) {
+            builder.logical(identity, Arc::from(preview));
+        }
     }
 
     fn selection_item(
@@ -1599,7 +1743,32 @@ impl Runtime {
                     target,
                 ));
             }
+            for incident in self
+                .failure_ui
+                .incidents
+                .iter()
+                .filter(|incident| self.incident_has_child_detail(incident, &agent.id))
+            {
+                let has_item = agent.items.iter().any(|item| {
+                    self.failure_ui
+                        .child_item(&agent.id, &item.id)
+                        .is_some_and(|(found, _)| found.key == incident.key)
+                });
+                if !has_item {
+                    transcript.push(self.failure_view(incident));
+                }
+            }
             for item in &agent.items {
+                if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
+                    if first {
+                        transcript.push(
+                            widget::container(self.failure_view(incident))
+                                .id(self.find_anchor(&item.id))
+                                .into(),
+                        );
+                    }
+                    continue;
+                }
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
@@ -1710,12 +1879,16 @@ impl Runtime {
                     .into(),
                 );
             }
-            for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                anchor.is_none()
-                    && !self.expected_remote_close_error(error)
-                    && !self.active_auth_notice(anchor, error)
+            for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.is_none()
             }) {
-                transcript.push(notice_entry(error, target, notice_identity(None, error)));
+                transcript.push(
+                    widget::container(self.failure_view(incident))
+                        .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                        .into(),
+                );
             }
             for turn in &self.turns {
                 use std::hash::{Hash, Hasher};
@@ -1762,16 +1935,16 @@ impl Runtime {
                     self.turn_trailing_footer(turn),
                     move || self.turn_view(turn, markdown_settings, dark),
                 );
-                for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.as_ref() == Some(&turn.key)
-                        && !self.expected_remote_close_error(error)
-                        && !self.active_auth_notice(anchor, error)
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && incident.anchor.as_ref() == Some(&turn.key)
                 }) {
-                    transcript.push(notice_entry(
-                        error,
-                        target,
-                        notice_identity(Some(&turn.key), error),
-                    ));
+                    transcript.push(
+                        widget::container(self.failure_view(incident))
+                            .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                            .into(),
+                    );
                 }
             }
             if !snapshot.has_later
@@ -1829,13 +2002,6 @@ impl Runtime {
         // entry in the transcript rather than a line pinned above the
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
-        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
-            && !self.expected_remote_close_error(error)
-            && !chat::requires_sign_in(self.session.launch.provider, error)
-            && !self.failures.iter().any(|(_, recorded)| recorded == error)
-        {
-            transcript.push(notice_entry(error, target, notice_identity(None, error)));
-        }
         content.extend(self.plan_view());
         if let Some(error) = self.preparation.error() {
             content.push(
@@ -1913,7 +2079,7 @@ impl Runtime {
                 .padding(iced::Padding::new(step::GAP_M))
                 .width(Length::Fill);
         let transcript_index = content.len();
-        content.push(if self.visible.load(Ordering::Relaxed) {
+        let transcript_layer = if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
             crate::ui_memory::gate(selection::transcript_virtualized(
                 scroll::transcript_observed(
@@ -2008,7 +2174,13 @@ impl Runtime {
                     .width(Length::Fill)
                     .height(Length::Fill),
             )
-        });
+        };
+        // Keep the transcript mounted in its original layer slot while the
+        // chooser is open, preserving its native scroll and selection state.
+        content.push(crate::interaction::exclusive_layer(
+            transcript_layer,
+            self.child_picker_view(),
+        ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
                 widget::button::custom(design::caption("↓ New activity"))
@@ -2166,60 +2338,7 @@ impl Runtime {
             );
         }
         if !snapshot.subagents.is_empty() {
-            let mut tabs = vec![crate::ui_controls::view_tab(
-                crate::ui_controls::ViewTab {
-                    label: "Conversation".into(),
-                    description: "Main conversation".into(),
-                    count: None,
-                    selected: selected.is_none(),
-                    id: None,
-                    on_press: Some(action(Action::SelectSubagent(target, None))),
-                },
-                true,
-                None,
-            )];
-            for agent in snapshot.subagents.iter().rev() {
-                let label = Self::native_child_name(agent);
-                let marker = if agent.status == chat::ToolStatus::Running && agent.waiting {
-                    crate::ui_controls::passive_icon(Icon::AgentWaiting, design::COMPACT_ICON_SIZE)
-                } else if agent.status == chat::ToolStatus::Running {
-                    crate::ui_controls::activity_spinner(
-                        f32::from(design::COMPACT_ICON_SIZE),
-                        design::accent_color,
-                    )
-                } else {
-                    crate::ui_controls::passive_icon(
-                        match agent.status {
-                            chat::ToolStatus::Succeeded => Icon::Check,
-                            chat::ToolStatus::Failed => Icon::Warning,
-                            _ => Icon::Cancel,
-                        },
-                        design::COMPACT_ICON_SIZE,
-                    )
-                };
-                tabs.push(crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: format!("Native · {}", Self::short_description(label, 48)).into(),
-                        description: self.native_child_identity(agent).into(),
-                        count: None,
-                        selected: selected.is_some_and(|active| active.id == agent.id),
-                        id: None,
-                        on_press: Some(action(Action::SelectSubagent(
-                            target,
-                            Some(agent.id.clone()),
-                        ))),
-                    },
-                    true,
-                    Some(marker),
-                ));
-            }
-            let height = crate::ui_controls::view_tab_height(true);
-            content.push(crate::tab_strip::horizontal(
-                widget::Id::new(format!("chat.subagents.{}", target.card)),
-                tabs,
-                height,
-                height + design::BORDER_WIDTH,
-            ));
+            content.push(self.child_navigation(content_width));
         }
         if let Some(identity) = selected_identity {
             content.push(
@@ -2771,7 +2890,7 @@ impl Runtime {
                         cosmic::theme::Text::default()
                     },
                 )
-                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Shrink)
                 .into(),
             );
         }
@@ -3668,7 +3787,19 @@ impl Runtime {
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        (
+            self.target,
+            dark,
+            self.syntax_theme as u8,
+            self.failure_ui.revision,
+        )
+            .hash(&mut hasher);
+        for incident in &self.failure_ui.incidents {
+            self.failure_ui
+                .expanded
+                .contains(&incident.key)
+                .hash(&mut hasher);
+        }
         (
             &turn.key,
             &turn.summary,
@@ -3851,11 +3982,16 @@ impl Runtime {
                 );
             }
         }
-        if !turn.steps.is_empty() {
+        if turn.steps.iter().any(|placed| {
+            items
+                .get(placed.index)
+                .is_some_and(|item| self.failure_ui.item(&item.id).is_none())
+        }) {
             let mut strip = self.step_strip(turn, || {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
+                    .filter(|(item, _)| self.failure_ui.item(&item.id).is_none())
                     .map(|(item, cached)| {
                         let key = selection::logical_identity(&item.id, &[9]);
                         let revision = cached.revision;
@@ -3892,6 +4028,9 @@ impl Runtime {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
             };
+            if self.failure_ui.item(&item.id).is_some() {
+                continue;
+            }
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
@@ -4304,6 +4443,13 @@ impl Runtime {
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
     fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
+        if let ItemContent::Image {
+            reference: Some(reference),
+            ..
+        } = &item.content
+        {
+            return (reference.label(), true, false);
+        }
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
@@ -4342,26 +4488,44 @@ impl Runtime {
             start: 0,
         };
         let body: Element<'static, Message> = if attachment {
-            widget::row::with_children(vec![
-                widget::icon(Icon::Attachment.handle()).size(12).into(),
-                if let Some(text) = image_text {
-                    prose::paragraph(
-                        design::markdown_settings(&cosmic::theme::active(), design::TEXT_CAPTION),
-                        text,
-                        self.target,
-                        None,
-                        Some(logical),
-                        self.presentation_cache()
-                            .get(&item.id)
-                            .map(|cached| &cached.flow_cache),
-                    )
-                } else {
-                    design::caption("Loading attachment…").into()
-                },
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .into()
+            // Empty unowned paths also represent documents and refused image
+            // receipts. Keep their descriptor instead of a generic read error.
+            if let Some(cached) = self.presentation_cache().get(&item.id)
+                && matches!(&item.content, ItemContent::Image { path, reference, .. }
+                    if reference.is_some() || !path.is_empty())
+            {
+                self.image_preview(item, cached)
+            } else {
+                widget::row::with_children(vec![
+                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    if let Some(text) = image_text {
+                        prose::paragraph(
+                            design::markdown_settings(
+                                &cosmic::theme::active(),
+                                design::TEXT_CAPTION,
+                            ),
+                            text,
+                            self.target,
+                            None,
+                            Some(logical),
+                            self.presentation_cache()
+                                .get(&item.id)
+                                .map(|cached| &cached.flow_cache),
+                        )
+                    } else if let ItemContent::Image {
+                        reference: Some(reference),
+                        ..
+                    } = &item.content
+                    {
+                        design::caption(reference.label()).into()
+                    } else {
+                        design::caption("Loading attachment…").into()
+                    },
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+            }
         } else {
             let text = if let Some(prompt) = prepared {
                 let text = prompt.shown(expanded);
@@ -4477,6 +4641,83 @@ impl Runtime {
                 })))
                 .into()
         };
+        if *kind == chat::DeliveryKind::Report {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // Preserve an explicit task outcome even when its name needs to
+            // shorten. This is report presentation, not failure inference:
+            // arbitrary report prose never becomes a parent account error.
+            let short = [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|ending| {
+                    heading
+                        .strip_suffix(ending)
+                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
+                })
+                .unwrap_or_else(|| Self::short_description(&heading, 96));
+            let disclosure = widget::button::custom(design::caption(if expanded {
+                "Hide details"
+            } else {
+                "Details"
+            }))
+            .name(format!(
+                "{} report details: {heading}",
+                if expanded { "Hide" } else { "Show" }
+            ))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(action(Action::Toggle(self.target, item.id.clone())));
+            let copy = widget::button::custom(design::caption("Copy report"))
+                .name(format!("Copy original report: {heading}"))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Copy(
+                    self.target,
+                    item.id.clone(),
+                    CopyPart::Text,
+                )));
+            let mut rows = vec![
+                widget::row::with_children(vec![
+                    glyph(Icon::Chat),
+                    crate::interaction::tooltip(
+                        design::caption(short).width(Length::Fill),
+                        heading.clone(),
+                    )
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+                widget::row::with_children(vec![disclosure.into(), copy.into()])
+                    .spacing(step::GAP_S)
+                    .into(),
+            ];
+            if expanded {
+                if !sender.is_empty() && !heading.contains(sender) {
+                    rows.push(selectable_prose::plain(
+                        format!("Sender: {sender}"),
+                        design::TEXT_CAPTION,
+                        iced::Font::MONOSPACE,
+                        self.target,
+                    ));
+                }
+                rows.push(selectable_prose::plain(
+                    heading,
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+                if !body.is_empty() {
+                    rows.push(prose::view(
+                        cached,
+                        settings,
+                        self.target,
+                        self.find.as_deref(),
+                    ));
+                }
+            }
+            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+                .max_width(design::READABLE_MEASURE)
+                .width(Length::Fill)
+                .into();
+        }
         if *kind == chat::DeliveryKind::Notice {
             let Some(notice) = self
                 .prepared_literal(item)
@@ -5403,6 +5644,11 @@ fn model_list<'a>(
 
 #[cfg(test)]
 mod frame_cost;
+#[cfg(test)]
+mod issue1506_tests;
+
+#[cfg(test)]
+mod user_image_preview_tests;
 
 #[cfg(test)]
 pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
@@ -6324,7 +6570,7 @@ mod tests {
             assert!(draft.handle().is_none());
             assert!(draft.queued.is_none());
             assert!(!draft.snapshot.ready);
-            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+            assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
 
             draft
                 .composer
@@ -6334,12 +6580,12 @@ mod tests {
             assert_eq!(draft.composer.text(), "Unsent local draft");
             assert!(draft.handle().is_none());
             assert!(draft.queued.is_none());
-            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+            assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
             assert_eq!(draft.conversation_status(true).1, "Switching session");
             draft.error = Some("Local attachment could not be read".into());
             assert_eq!(
                 draft.conversation_status(false),
-                (Some(Icon::Warning), "Error")
+                (Some(Icon::Warning), "Error".into())
             );
 
             let connecting = Runtime::new(
@@ -6353,13 +6599,13 @@ mod tests {
             assert!(connecting.handle().is_none());
             assert_eq!(
                 connecting.conversation_status(false),
-                (Some(Icon::AgentWorking), "Connecting")
+                (Some(Icon::AgentWorking), "Connecting".into())
             );
         }
         let (live, _handle) = frame_cost::live_runtime(&[]);
         assert!(!live.is_draft());
         assert!(live.handle().is_some());
-        assert_eq!(live.conversation_status(false), (None, "Ready"));
+        assert_eq!(live.conversation_status(false), (None, "Ready".into()));
     }
 
     #[test]
@@ -7532,7 +7778,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_native_child_renders_identity_channel_and_distinct_tab() {
+    fn selected_native_child_renders_identity_channel_and_bounded_selector() {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         let mut child = native_child_fixture();
@@ -7586,7 +7832,8 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label.contains("Native · Inspect repository")),
+                .any(|label| label.starts_with("Choose subagent:")
+                    && label.contains("Inspect repository")),
             "{labels:?}"
         );
         assert!(
@@ -9082,7 +9329,8 @@ mod tests {
     }
 
     #[test]
-    fn native_child_tabs_select_both_transcripts_through_real_runtime_rebuild_with_approval() {
+    fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebuild_with_approval()
+     {
         use iced::advanced::clipboard;
         use iced::runtime::user_interface::{Cache, UserInterface};
         fn runtime(app: &Cagents, target: Target) -> &Runtime {
@@ -9097,7 +9345,7 @@ mod tests {
                 false,
                 true,
                 &app.settings.keyboard_shortcuts,
-                620.0,
+                360.0,
                 Place {
                     name: "native-fixture".into(),
                     branch: None,
@@ -9131,7 +9379,6 @@ mod tests {
         child.waiting = true;
         child.model = Some("gpt-fixture-mini".into());
         child.detail = "Waiting for your approval".into();
-        let child_name = live.native_child_identity(&child);
         let snapshot = Arc::make_mut(&mut live.snapshot);
         snapshot.busy = true;
         snapshot.subagents.push(child);
@@ -9158,12 +9405,9 @@ mod tests {
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(live)));
         let mut renderer = crate::app::tests::headless_renderer();
-        let size = iced::Size::new(620.0, 720.0);
+        let size = iced::Size::new(360.0, 720.0);
         let mut cache = Cache::new();
-        for (name, selected) in [
-            (child_name.as_str(), Some("native-child")),
-            ("Main conversation", None),
-        ] {
+        for step in 0..3 {
             let mut ui = UserInterface::build(view(&app, target), size, cache, &mut renderer);
             let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
             let bounds = accessible
@@ -9172,10 +9416,33 @@ mod tests {
                 .chain(accessible.children())
                 .find(|node| {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
-                        && node.node().label() == Some(name)
+                        && node.node().label().is_some_and(|label| match step {
+                            0 => label.starts_with("Choose subagent:"),
+                            1 => {
+                                label.contains("Inspect repository")
+                                    && label.ends_with(" · native-child")
+                            }
+                            _ => label == "Main conversation",
+                        })
                 })
                 .and_then(|node| node.node().bounds())
-                .expect("the transcript tab is mounted");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "chooser step {step}: {:?}",
+                        accessible
+                            .root()
+                            .iter()
+                            .chain(accessible.children())
+                            .filter_map(|node| node.node().label())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            if step == 1 {
+                assert!(
+                    bounds.x0 >= 0.0 && bounds.x1 <= f64::from(size.width),
+                    "actual chooser bounds {bounds:?} must fit the narrow pane"
+                );
+            }
             let pointer = iced::Point::new(
                 (bounds.x0 + bounds.x1) as f32 / 2.0,
                 (bounds.y0 + bounds.y1) as f32 / 2.0,
@@ -9215,14 +9482,29 @@ mod tests {
             let selection = messages
                 .into_iter()
                 .find_map(|message| match message {
-                    Message::ChatUi(action @ Action::SelectSubagent(..)) => Some(action),
+                    Message::ChatUi(
+                        action @ (Action::SelectSubagent(..) | Action::SubagentPicker(..)),
+                    ) => Some(action),
                     _ => None,
                 })
                 .expect(
-                    "native transcript tab publishes selection through the full chat hierarchy",
+                    "native selector and chooser publish actions through the full chat hierarchy",
                 );
             drop(app.handle_chat_ui(selection));
-            assert_eq!(runtime(&app, target).selected_subagent.as_deref(), selected);
+            if step == 0 {
+                assert!(runtime(&app, target).child_picker.is_some());
+                assert!(runtime(&app, target).selected_subagent.is_none());
+            } else {
+                assert_eq!(
+                    runtime(&app, target).selected_subagent.as_deref(),
+                    if step == 1 {
+                        Some("native-child")
+                    } else {
+                        None
+                    }
+                );
+                assert!(runtime(&app, target).child_picker.is_none());
+            }
         }
     }
 
@@ -10416,26 +10698,94 @@ mod tests {
         assert_eq!(runtime.turns.len(), 2);
         let first = runtime.turns[0].key.clone();
         let second = runtime.turns[1].key.clone();
+        let raw = format!(
+            "Repeated failure\n{}\nHIDDEN_DIAGNOSTIC_END",
+            "original raw bytes ".repeat(8192)
+        );
         runtime.failures = vec![
-            (Some(first.clone()), "Repeated failure".into()),
-            (Some(second.clone()), "Repeated failure".into()),
+            (Some(first.clone()), raw.clone()),
+            (Some(second.clone()), raw.clone()),
         ];
         runtime.error = Some("Current failure".into());
+        runtime.refresh_failure_ui();
+        let keys: Vec<_> = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .map(|incident| incident.key.clone())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            3,
+            "different prompt scopes retain distinct incidents"
+        );
+        let (collapsed, _) = runtime.selection_document();
+        assert!(
+            !collapsed
+                .search_blocks()
+                .iter()
+                .any(|(_, text)| text.contains("Repeated failure")
+                    || text.contains("Current failure"))
+        );
+        for key in &keys {
+            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.cache_failure_preview(key);
+        }
         let (catalog, _) = runtime.selection_document();
         let blocks = catalog.search_blocks();
-        let identities: Vec<_> = blocks.iter().map(|(identity, _)| *identity).collect();
         let position = |identity| {
-            identities
+            blocks
                 .iter()
-                .position(|candidate| *candidate == identity)
+                .position(|(candidate, _)| *candidate == identity)
                 .unwrap()
         };
-        let first_notice = position(notice_identity(Some(&first), "Repeated failure"));
-        let second_notice = position(notice_identity(Some(&second), "Repeated failure"));
+        let first_notice = position(failure::diagnostic_preview_identity(&keys[0]));
+        let second_notice = position(failure::diagnostic_preview_identity(&keys[1]));
         let second_prompt = &items[runtime.turns[1].prompt[0]];
         assert!(first_notice < position(selection::logical_identity(&second_prompt.id, &[2])));
         assert!(second_notice > first_notice);
         assert_eq!(blocks.last().unwrap().1.as_ref(), "Current failure");
+        assert_eq!(blocks[first_notice].1.len(), 8192);
+        assert_eq!(blocks[second_notice].1.len(), 8192);
+        assert!(
+            !blocks
+                .iter()
+                .any(|(_, text)| text.contains("HIDDEN_DIAGNOSTIC_END"))
+        );
+        assert_eq!(
+            runtime.failure_details(&keys[0]).as_deref(),
+            Some(raw.as_str())
+        );
+        assert_eq!(
+            runtime.failure_details(&keys[1]).as_deref(),
+            Some(raw.as_str())
+        );
+        // A same-anchor source replacement must retire the old preview and
+        // its catalog identity, rather than keep invisible original bytes.
+        runtime.failures[0].1 = "Replacement failure at the original first prompt".into();
+        runtime.refresh_failure_ui();
+        let (replacement, _) = runtime.selection_document();
+        assert!(
+            replacement
+                .text(failure::diagnostic_preview_identity(&keys[0]))
+                .is_none()
+        );
+        assert_eq!(
+            replacement
+                .text(failure::diagnostic_preview_identity(&keys[1]))
+                .unwrap()
+                .len(),
+            8192
+        );
+        assert!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .any(|incident| incident.anchor.as_ref() == Some(&first)
+                    && runtime.failure_details(&incident.key).as_deref()
+                        == Some(runtime.failures[0].1.as_str()))
+        );
     }
 
     fn web_search_selection_fixture() -> (Runtime, Arc<ClientHandle>, chat::Item, String) {

@@ -38,7 +38,7 @@ impl Drop for EvidenceDirectory {
     }
 }
 
-fn private_runtime() -> Option<PathBuf> {
+fn private_runtime(test: &str, retained_actor: bool) -> Option<PathBuf> {
     if let Some(root) = std::env::var_os(ROOT) {
         let expected = match std::env::var(INHERITED_SCOPE).as_deref() {
             Ok("present") => true,
@@ -75,7 +75,7 @@ fn private_runtime() -> Option<PathBuf> {
         }
     }
     command = command
-        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .cwd(&root)
         .env(ROOT, &root)
         .env(
@@ -97,6 +97,16 @@ fn private_runtime() -> Option<PathBuf> {
         .env("PATH", "/usr/bin:/bin")
         .timeout(Duration::from_secs(40))
         .output_limits(256 * 1024, 256 * 1024);
+    if retained_actor {
+        command = command
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .timeout(Duration::from_secs(90));
+    }
     let result = SystemProcessExecutor.execute(&command, &CancellationToken::new());
     let (stdout, stderr) = match &result {
         Ok(output) => (&output.stdout, &output.stderr),
@@ -125,7 +135,7 @@ fn private_runtime() -> Option<PathBuf> {
     });
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.contains(&format!("test {TEST} ... ok")),
+        stdout.contains(&format!("test {test} ... ok")),
         "wrong test output: {stdout}"
     );
     assert!(
@@ -257,7 +267,7 @@ fn terminal(root: &Path) -> TerminalSession {
 
 #[test]
 fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
-    let Some(root) = private_runtime() else {
+    let Some(root) = private_runtime(TEST, false) else {
         return;
     };
     let proof = HostSessionProof {
@@ -400,5 +410,261 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     failed.close().unwrap();
     assert!(failed.is_completed());
     failed_pin.assert_reaped();
+    drop(cleanup);
+}
+
+#[test]
+fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor() {
+    ordinary_retained_shutdown(
+        "host::provider_shutdown_tests::ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor",
+        false,
+    );
+}
+
+#[test]
+fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners() {
+    ordinary_retained_shutdown(
+        "host::provider_shutdown_tests::ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners",
+        true,
+    );
+}
+
+fn ordinary_retained_shutdown(test: &str, fail_commit: bool) {
+    use crate::{agent::Provider, model::ProjectKind, workspace_model::ModelEdit};
+
+    let Some(root) = private_runtime(test, true) else {
+        return;
+    };
+    // The actual same-head cagentsd helper execs this private SDK carrier. It
+    // finishes one genuine protocol turn and exits before ordinary shutdown.
+    // The gate puts final outcomes after graceful_shutdown stops new broker
+    // work. An already admitted drain may finish, so success checks the actual
+    // journal clock rather than assuming a pending page cannot be consumed.
+    for name in ["bin", "project", "home/.claude"] {
+        fs::create_dir_all(root.join(name)).unwrap();
+    }
+    let provider = root.join("bin/claude");
+    fs::write(
+        &provider,
+        r#"#!/usr/bin/python3
+import json, os, pathlib, sys, time
+root = pathlib.Path(__file__).resolve().parent.parent
+(root / 'provider-pid').write_text(str(os.getpid()))
+session = next((v.split('=', 1)[1] for v in sys.argv[1:] if v.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+def send(value): print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame.get('type') == 'control_request':
+        send({'type':'control_response', 'response':{'subtype':'success', 'request_id':frame['request_id'], 'response':{}}})
+    elif frame.get('type') == 'user':
+        (root / 'provider-received').write_text('received')
+        deadline = time.monotonic() + 15
+        while not (root / 'release-final').exists():
+            if time.monotonic() >= deadline: raise RuntimeError('final-outcome gate timed out')
+            time.sleep(0.01)
+        received = frame['uuid']
+        send({'type':'user', 'uuid':received, 'session_id':session, 'message':{'role':'user', 'content':[{'type':'text', 'text':'One final ordinary shutdown turn'}]}})
+        send({'type':'assistant', 'uuid':'final-answer', 'session_id':session, 'message':{'role':'assistant', 'content':[{'type':'text', 'text':'Final ordinary shutdown answer'}]}})
+        send({'type':'result', 'uuid':'final-result', 'subtype':'success', 'is_error':False, 'session_id':session})
+        (root / 'provider-done').write_text('done')
+        break
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("ordinary-retained-shutdown"),
+        boot_id: daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("ordinary-retained-shutdown"),
+    };
+    let paths = daemon::RuntimePaths::discover().unwrap();
+    let _lease = daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let registry_path = root.join("registry.sqlite3");
+    let mut registry = model::Registry::at(&registry_path).unwrap();
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: root.join("project"),
+            name: "Ordinary retained shutdown".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    let notifications =
+        notifications::Broker::start(&host, crate::notifications::Application::Cagents).unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let source = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::from_uuid(Uuid::from_u128(1)),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = source.id;
+    super::chat::start_execution(
+        &host,
+        0,
+        source,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    // Cleanup retries the same semantic path after removing only the injected
+    // private Store fault. The external guardian still owns failure-family
+    // settlement; this never treats a pidfd kill as a successful retirement.
+    struct Cleanup {
+        host: SharedHost,
+        root: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::write(self.root.join("release-final"), b"release");
+            if let Ok(db) = rusqlite::Connection::open(self.root.join("registry.sqlite3")) {
+                let _ = db.execute_batch("DROP TRIGGER IF EXISTS fail_shutdown_commit;");
+            }
+            let _ = finish_chat_shutdown(&self.host);
+        }
+    }
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().expect("real retained actor");
+    let helper_pin = ProcessPin::capture(identity.record.holder.clone());
+    let provider_pin = ProcessPin::capture(identity.record.root.clone());
+    let cleanup = Cleanup {
+        host: host.clone(),
+        root: root.clone(),
+    };
+    assert!(helper_pin.live() && provider_pin.live());
+    let wait = |condition: &mut dyn FnMut() -> bool, reason: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{reason}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait(&mut || handle.update_activity().1, "SDK did not initialize");
+    assert_eq!(
+        fs::read_to_string(root.join("provider-pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap(),
+        identity.record.root.pid
+    );
+    handle
+        .command(chat::Command::Prompt {
+            text: "One final ordinary shutdown turn".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait(
+        &mut || root.join("provider-received").exists(),
+        "SDK did not consume the prompt",
+    );
+    let healthy = quiet_chat(&root);
+    let mut healthy_source = host.lock().unwrap().chats[&id].session.clone();
+    healthy_source.id = TerminalId::from_uuid(Uuid::from_u128(2));
+    assert!(
+        id < healthy_source.id,
+        "healthy owner must follow the refused owner"
+    );
+    healthy_source.launch.provider = Provider::Omp;
+    healthy_source.launch.recipe.program = "/bin/cat".into();
+    healthy_source.launch.recipe.arguments.clear();
+    healthy_source.launch.session_id = None;
+    healthy_source.native_continuity = Default::default();
+    {
+        let mut state = host.lock().unwrap();
+        state
+            .chats
+            .insert(healthy_source.id, record(healthy_source, healthy.clone()));
+        state.graceful_shutdown();
+    }
+    let registry = agent_execution::registry(&host).unwrap();
+    let committed_before = registry
+        .lock()
+        .unwrap()
+        .native_actor_committed_through(identity.instance, &identity.record)
+        .unwrap();
+    let fault = rusqlite::Connection::open(&registry_path).unwrap();
+    if fail_commit {
+        fault.execute_batch("CREATE TRIGGER fail_shutdown_commit BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture final Store failure'); END;").unwrap();
+    }
+    fs::write(root.join("release-final"), b"release").unwrap();
+    wait(
+        &mut || {
+            root.join("provider-done").exists()
+                && handle
+                    .retained_outcome_clock_until(Instant::now() + Duration::from_secs(2))
+                    .is_ok_and(|(_, latest)| latest > committed_before)
+                && !provider_pin.live()
+                && !identity.record.root.is_current()
+        },
+        "completed SDK did not journal its real final outcomes",
+    );
+    provider_pin.assert_reaped();
+    let (_, final_sequence) = handle
+        .retained_outcome_clock_until(Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    assert!(final_sequence > committed_before);
+    if fail_commit {
+        let pending = handle.uncommitted_outcomes().unwrap();
+        assert!(pending.iter().any(|entry| matches!(
+            &entry.update,
+            chat::runtime::Update::Attention(_) | chat::runtime::Update::AttentionContext { .. }
+        )));
+        let error = finish_chat_shutdown(&host).unwrap_err();
+        assert!(error.contains("fixture final Store failure"), "{error}");
+        assert!(helper_pin.live(), "failed commit must retain the helper");
+        assert!(healthy.is_completed(), "healthy owner was skipped");
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_committed_through(identity.instance, &identity.record)
+                .unwrap(),
+            committed_before
+        );
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .native_actor_retirement(identity.instance)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!handle.uncommitted_outcomes().unwrap().is_empty());
+        fault
+            .execute_batch("DROP TRIGGER fail_shutdown_commit;")
+            .unwrap();
+    }
+    finish_chat_shutdown(&host).unwrap();
+    assert!(healthy.is_completed());
+    let registry = registry.lock().unwrap();
+    assert!(
+        registry
+            .native_actor_committed_through(identity.instance, &identity.record)
+            .unwrap()
+            >= final_sequence
+    );
+    let retired = registry
+        .native_actor_retirement(identity.instance)
+        .unwrap()
+        .expect("durable exact semantic retirement");
+    assert_eq!(retired.actor(), identity.instance);
+    assert_eq!(retired.owner(), &identity.record);
+    assert_eq!(retired.source().id, id);
+    assert!(retired.confirmed_session().is_some());
+    drop(registry);
+    wait(
+        &mut || !helper_pin.live() && !identity.record.holder.is_current(),
+        "semantically retired helper did not exit and reap",
+    );
+    helper_pin.assert_reaped();
+    let directory = registry::directory(Kind::Native).unwrap();
+    assert!(
+        registry::discover(&directory, &proof.boot_id, Kind::Native)
+            .unwrap()
+            .is_empty()
+    );
     drop(cleanup);
 }

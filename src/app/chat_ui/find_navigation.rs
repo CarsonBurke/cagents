@@ -184,7 +184,7 @@ impl Cagents {
             action(Action::FindExpired(target, expiry))
         })
         .abortable();
-        let anchor = key.as_ref().map(|key| runtime.find_anchor(key));
+        let anchor = key.as_ref().map(|key| runtime.find_plan_anchor(key));
         runtime.find_navigation.pending = Some(Pending {
             intent: intent.clone(),
             context: runtime.selected_subagent.clone(),
@@ -253,7 +253,7 @@ impl Cagents {
             runtime.find_index = (runtime.find_index + 1) % runtime.find_matches.len();
             let key = runtime.find_matches[runtime.find_index].clone();
             runtime.apply_find_plan(&key);
-            let anchor = runtime.find_anchor(&key);
+            let anchor = runtime.find_plan_anchor(&key);
             pending.key = Some(key);
             if pending.passes >= 16 {
                 runtime.find_navigation.cancel_navigation();
@@ -1005,6 +1005,34 @@ impl Runtime {
             }
         }
     }
+    // The raw worker has already matched these exact immutable sources. Use
+    // its plans to choose the typed diagnostic's actual mounted anchor.
+    fn find_plan_anchor(&mut self, key: &str) -> iced::advanced::widget::Id {
+        let plans = self
+            .find_navigation
+            .raw
+            .accepted
+            .as_ref()
+            .and_then(|result| result.groups.iter().find(|(group, _)| group == key))
+            .map(|(_, plans)| plans.clone())
+            .unwrap_or_default();
+        for plan in plans.iter() {
+            if !self
+                .active_item(&plan.id)
+                .is_some_and(|item| plan.source.as_ptr() == Arc::as_ptr(item))
+            {
+                continue;
+            }
+            if self.selected_subagent.is_some() {
+                if let Some(anchor) = self.reveal_failure_for_find(&plan.id) {
+                    return self.find_anchor(&anchor);
+                }
+            } else if let Some(incident) = self.failure_ui.item(&plan.id) {
+                return self.find_anchor(&format!("failure:{}", incident.key));
+            }
+        }
+        self.find_anchor(key)
+    }
     pub(super) fn apply_find_plan(&mut self, key: &str) {
         let plans = self
             .find_navigation
@@ -1018,6 +1046,7 @@ impl Runtime {
         if child.is_none() {
             self.find_disclosure.turn(key, &mut self.opened);
         }
+        let mut prepare_reports = false;
         for plan in plans.iter() {
             if !plan_in_group(self, key, plan) {
                 continue;
@@ -1029,6 +1058,9 @@ impl Runtime {
             else {
                 continue;
             };
+            if self.reveal_failure_for_find(&plan.id).is_some() {
+                continue;
+            }
             let changed = if let Some(child) = &child {
                 let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
                 for part in &plan.parts {
@@ -1045,6 +1077,18 @@ impl Runtime {
                 }
                 plan.expand && self.find_disclosure.item(&plan.id, &mut self.expanded)
             };
+            if changed
+                && matches!(
+                    &item.content,
+                    ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Report,
+                        ..
+                    }
+                )
+            {
+                prepare_reports = true;
+                continue;
+            }
             if changed
                 && !self
                     .presentation_cache()
@@ -1064,6 +1108,10 @@ impl Runtime {
                     CachedItem::updated(&item.content, theme, previous, true, false, None),
                 );
             }
+        }
+        if prepare_reports {
+            let snapshot = self.snapshot.clone();
+            self.prepare_transcript_cache(&snapshot);
         }
     }
 }
@@ -1190,7 +1238,14 @@ fn raw_scan_inner(
                         raw.raw_disclosure
                     }
                 });
-            let delivery = matches!(&item.content, ItemContent::Delivery{body,..} if matches_checked(body,&pattern,current)?);
+            let delivery = match &item.content {
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                } => matched,
+                ItemContent::Delivery { body, .. } => matches_checked(body, &pattern, current)?,
+                _ => false,
+            };
             if matched || !parts.is_empty() {
                 plans.push(ItemPlan {
                     id: item.id.clone(),
@@ -2030,6 +2085,108 @@ mod tests {
             panic!("admitted Catalog/Highlight returns its typed completion")
         })
     }
+    #[test]
+    fn typed_failure_find_uses_its_real_anchor_and_keeps_child_context_guard() {
+        let (mut app, target, handle) = runtime("unrelated original text");
+        let mut error = chat::Item {
+            id: "diagnostic-same-id".into(),
+            role: chat::Role::System,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "You've hit your limit · resets 1:30pm\nPARENT_TYPED_NEEDLE".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        assert!(chat::failure::mark_provider_error(
+            Provider::Claude,
+            &mut error
+        ));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.items = vec![Arc::new(error.clone())];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(find_for_test(
+            &mut app,
+            target,
+            "PARENT_TYPED_NEEDLE".into(),
+        ));
+        let live = app.chat_runtime_mut(target).unwrap();
+        let group = live.find_matches[0].clone();
+        let incident = live.failure_ui.incidents[0].key.clone();
+        assert_eq!(
+            live.find_plan_anchor(&group),
+            live.find_anchor(&format!("failure:{incident}"))
+        );
+        assert!(live.failure_ui.expanded.contains(&incident));
+        assert!(
+            live.failure_preview(&incident)
+                .unwrap()
+                .0
+                .contains("PARENT_TYPED_NEEDLE")
+        );
+        let (parent_catalog, _) = live.selection_document();
+        assert!(
+            parent_catalog
+                .text(failure::diagnostic_preview_identity(&incident))
+                .unwrap()
+                .contains("PARENT_TYPED_NEEDLE")
+        );
+        let old_intent = live.find_navigation.guard();
+        let mut child_error = error;
+        let ItemContent::Delivery { body, .. } = &mut child_error.content else {
+            panic!("actual provider marker retains its typed delivery carrier");
+        };
+        *body = "You've hit your limit · resets 2:30pm\nCHILD_TYPED_NEEDLE".into();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![chat::Subagent {
+            id: "typed-child".into(),
+            kind: "reviewer".into(),
+            description: "Scoped child".into(),
+            status: chat::ToolStatus::Failed,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![Arc::new(child_error)],
+        }];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("typed-child".into()))));
+        assert!(
+            !old_intent.current(),
+            "old parent navigation cannot apply inside the child"
+        );
+        drop(find_for_test(&mut app, target, "CHILD_TYPED_NEEDLE".into()));
+        let live = app.chat_runtime_mut(target).unwrap();
+        let group = live.find_matches[0].clone();
+        assert_eq!(
+            live.find_plan_anchor(&group),
+            live.find_anchor("diagnostic-same-id")
+        );
+        let (incident, _) = live
+            .failure_ui
+            .child_item("typed-child", "diagnostic-same-id")
+            .unwrap();
+        assert!(live.failure_ui.expanded.contains(&incident.key));
+        assert!(
+            live.failure_preview(&incident.key)
+                .unwrap()
+                .0
+                .contains("CHILD_TYPED_NEEDLE")
+        );
+        let (child_catalog, _) = live.selection_document();
+        let child_preview = child_catalog
+            .text(failure::diagnostic_preview_identity(&incident.key))
+            .unwrap();
+        assert!(child_preview.contains("CHILD_TYPED_NEEDLE"));
+        assert!(!child_preview.contains("PARENT_TYPED_NEEDLE"));
+        assert!(!Arc::ptr_eq(&parent_catalog, &child_catalog));
+    }
+
     #[test]
     fn catalog_attempt_survives_queued_ready_and_rejects_old_none_and_duplicate_some_after_rewrite()
     {
