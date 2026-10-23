@@ -1042,7 +1042,8 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
+                "DROP TABLE automation_lifecycle;
+                 ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();
         drop(registry);

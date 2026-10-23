@@ -135,6 +135,7 @@ pub enum AutomationCommand {
         /// Continue before the sequence returned as next by the previous page.
         #[arg(long)]
         before: Option<u64>,
+        /// Maximum page size (1 through 100); larger values are refused.
         #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
         limit: usize,
     },
