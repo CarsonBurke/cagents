@@ -627,6 +627,7 @@ fn line<'a>(
     account: Element<'a, Message>,
     cells: Vec<(f32, Element<'a, Message>)>,
     actions: Element<'a, Message>,
+    actions_width: Length,
     height: f32,
 ) -> Element<'a, Message> {
     let mut items: Vec<Element<'a, Message>> = vec![
@@ -643,7 +644,7 @@ fn line<'a>(
     }));
     items.push(
         widget::container(actions)
-            .width(ACTIONS_WIDTH)
+            .width(actions_width)
             .align_x(iced::alignment::Horizontal::Right)
             .center_y(Length::Fill)
             .into(),
@@ -671,6 +672,7 @@ fn column_titles<'a>(layout: &Layout) -> Element<'a, Message> {
             })
             .collect(),
         iced::widget::Space::new().into(),
+        Length::Fixed(ACTIONS_WIDTH),
         design::ROW_HEIGHT,
     )
 }
@@ -759,6 +761,7 @@ fn row<'a>(
         account_cell(app, account, project),
         cells,
         actions(app, account, now, project),
+        Length::Fixed(ACTIONS_WIDTH),
         ROW_HEIGHT,
     )
 }
@@ -777,7 +780,13 @@ fn stacked_row<'a>(
             .into()
     });
     widget::column::with_children(vec![
-        line(account, Vec::new(), actions, ROW_HEIGHT),
+        line(
+            account,
+            Vec::new(),
+            actions,
+            Length::Fixed(ACTIONS_WIDTH),
+            ROW_HEIGHT,
+        ),
         widget::container(
             widget::row::with_children(figures.collect::<Vec<_>>()).spacing(COLUMN_SPACING),
         )
@@ -1264,7 +1273,9 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     } else {
         iced::widget::Space::new().into()
     };
-    line(account, Vec::new(), cancel, ROW_HEIGHT)
+    // A pending login has a text action as well as an icon; it must not be
+    // squeezed into the ordinary rows' two-icon column.
+    line(account, Vec::new(), cancel, Length::Shrink, ROW_HEIGHT)
 }
 
 #[cfg(test)]
@@ -1274,13 +1285,21 @@ mod tests {
     // Dispatch through the actual row, so a leftover generic Add callback
     // cannot pass a reducer-only test of the new key-bearing action.
     fn click_login_row(login: &Login, label: &str) -> Vec<Message> {
+        click_login_row_at_width(login, label, 1000.0).0
+    }
+
+    fn click_login_row_at_width(
+        login: &Login,
+        label: &str,
+        width: f32,
+    ) -> (Vec<Message>, [iced::Rectangle; 2]) {
         use iced::advanced::{Layout, clipboard, layout, widget::Tree};
         use iced::runtime::{UserInterface, user_interface::Cache};
-        use iced::{Event, Point, Size, mouse};
+        use iced::{Event, Rectangle, Size, mouse};
 
         let mut element = login_row(login);
         let mut renderer = crate::app::tests::headless_renderer();
-        let size = Size::new(1000.0, 200.0);
+        let size = Size::new(width, 200.0);
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
@@ -1291,19 +1310,44 @@ mod tests {
             element
                 .as_widget()
                 .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-        let bounds = nodes
-            .root()
-            .iter()
-            .chain(nodes.children())
-            .find(|node| node.node().label() == Some(label))
-            .unwrap_or_else(|| panic!("missing actual login control: {label}"))
-            .node()
-            .bounds()
-            .unwrap();
-        let point = Point::new(
-            ((bounds.x0 + bounds.x1) / 2.0) as f32,
-            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        let labels = ["Use code", "Dismiss failed sign-in"];
+        let controls = labels.map(|label| {
+            let bounds = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(label))
+                .unwrap_or_else(|| panic!("missing actual login control: {label}"))
+                .node()
+                .bounds()
+                .unwrap();
+            Rectangle {
+                x: bounds.x0 as f32,
+                y: bounds.y0 as f32,
+                width: (bounds.x1 - bounds.x0) as f32,
+                height: (bounds.y1 - bounds.y0) as f32,
+            }
+        });
+        let row = node.bounds();
+        for (name, bounds) in labels.iter().zip(controls) {
+            assert!(
+                bounds.width > 0.0 && bounds.height > 0.0,
+                "{name} needs a hit target at width {width}: {bounds:?}, row {row:?}"
+            );
+            assert!(
+                bounds.x >= row.x
+                    && bounds.y >= row.y
+                    && bounds.x + bounds.width <= row.x + row.width + 0.5
+                    && bounds.y + bounds.height <= row.y + row.height + 0.5,
+                "{name} must stay in its row at width {width}: {bounds:?}, row {row:?}"
+            );
+        }
+        assert!(
+            controls[0].x + controls[0].width <= controls[1].x,
+            "the actual login controls must not overlap at width {width}: {controls:?}"
         );
+        let bounds = controls[labels.iter().position(|name| *name == label).unwrap()];
+        let point = bounds.center();
         let mut ui = UserInterface::build(element, size, Cache::new(), &mut renderer);
         let mut messages = Vec::new();
         let _ = ui.update(
@@ -1317,8 +1361,11 @@ mod tests {
             &mut clipboard::Null,
             &mut messages,
         );
-        assert!(!messages.is_empty(), "actual control did not dispatch");
-        messages
+        assert!(
+            !messages.is_empty(),
+            "actual {label} did not dispatch at width {width}: {bounds:?}, point {point:?}, row {row:?}, both {controls:?}"
+        );
+        (messages, controls)
     }
 
     fn blocked_login(key: u128) -> Login {
@@ -1343,6 +1390,32 @@ mod tests {
                 drop(app.update_account_ui(action));
             }
         }
+    }
+
+    #[test]
+    fn blocked_login_text_and_dismiss_controls_fit_and_dispatch_at_narrow_and_wide_widths() {
+        let login = blocked_login(145900);
+        let mut narrow = None;
+        for width in [300.0, 1000.0] {
+            let (code, bounds) = click_login_row_at_width(&login, "Use code", width);
+            assert!(matches!(code.as_slice(),
+                [Message::AccountUi(Action::UseCodeForBlockedLogin(key))] if *key == login.key));
+            let (dismiss, other_bounds) =
+                click_login_row_at_width(&login, "Dismiss failed sign-in", width);
+            assert_eq!(bounds, other_bounds);
+            assert!(matches!(dismiss.as_slice(),
+                [Message::AccountUi(Action::CancelLogin(key))] if *key == login.key));
+            let sizes = bounds.map(|bounds| bounds.size());
+            if let Some(narrow) = narrow {
+                assert_eq!(
+                    sizes, narrow,
+                    "narrow rows must not compress either control to make room for account text"
+                );
+            } else {
+                narrow = Some(sizes);
+            }
+        }
+        // Messages were captured, not applied: no login/discovery task runs.
     }
 
     #[test]
