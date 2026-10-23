@@ -131,12 +131,14 @@ def main():
     cli = build_product("cagents", identity, native)
     daemon = build_product("cagentsd", identity + ",host", native)
     ui_features = "hot-reload" if args.browserless else "hot-reload,integrated-browser"
-    build_product("cagents-ui-hot", ui_features, native)
-    # Use Cargo's resolved artifact path: respects configured target directory.
+    # Resolve and fetch the selected UI graph before cargo-hot builds offline.
+    # cargo-hot builds its specialized executable instead of using an ordinary UI artifact.
+    # Full metadata also supplies Cargo's configured target directory.
     # cargo-hot always selects host triple but puts its runnable bundle here,
     # independently of the ordinary artifact's optional triple subdirectory.
     metadata = subprocess.check_output(sandbox([
-        "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"
+        "cargo", "metadata", "--locked", "--no-default-features", "--features", ui_features,
+        "--filter-platform", native, "--format-version", "1"
     ]), text=True)
     target = Path(json.loads(metadata)["target_directory"])
     bundle = target / "cargo-hot" / "cagents-ui-hot" / "dev-runtime"
@@ -144,7 +146,7 @@ def main():
     for product in (cli, daemon):
         stage_product(product, bundle / product.name)
     # cargo-hot owns its specialized fat binary. Never overwrite it with the
-    # ordinary preflight artifact: a fresh cached fat build would not recopy it.
+    # ordinary build artifact: a fresh cached fat build would not recopy it.
     alias = bundle / "cagents-ui"
     if alias.is_symlink() and os.readlink(alias) == "cagents-ui-hot":
         pass
