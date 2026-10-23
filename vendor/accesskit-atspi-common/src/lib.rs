@@ -3,6 +3,9 @@
 // the LICENSE-APACHE file) or the MIT license (found in
 // the LICENSE-MIT file), at your option.
 
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 mod action;
 mod adapter;
 mod callback;

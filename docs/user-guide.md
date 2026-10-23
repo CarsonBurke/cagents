@@ -50,6 +50,14 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
+- Drag a pane's tab title onto a channel in the same project to move it there.
+  Eligible channel rows highlight while dragging. The existing terminal or chat
+  session keeps running; opening the destination channel shows the same pane.
+  The pane stays in its source until the move succeeds. If the destination no
+  longer exists, the source stays open and the app shows the refusal.
+  The tab's context menu also lists eligible channels; with many destinations,
+  **Move to channel…** opens a searchable picker. The command palette lists
+  the focused pane's channel destinations too.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
@@ -383,9 +391,12 @@ Agents should read them as context and follow only the user's authorized scope.
 When creating a worktree, enter a branch name, a Linear issue ID such as
 `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
 the issue ID and title slug without fetching Linear metadata. New worktrees go
-under `worktrees/` in the repository by default; Settings accepts an absolute
+under `.worktrees/` in the repository by default; Settings accepts an absolute
 or repository-relative parent, and the creation dialog accepts an explicit
-destination.
+destination. Creation adds a clone-local Git exclude rule when needed, leaving
+tracked `.gitignore` unchanged. Existing worktrees under `worktrees/` stay in
+place and are excluded on the next creation. An explicitly configured parent
+keeps its location.
 
 Worktree creation is journaled: a versioned request and an exclusive mutation
 identity are recorded before any directory or Git effects, and progress stays
@@ -396,6 +407,128 @@ leases, Git locks, checkout identity, and completion evidence are checked. Only
 a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
+
+## Work board
+
+The Work board answers "what was I working on?" across every open project. The
+daemon keeps one card per worktree or branch in progress. The **Work board**
+button in the sidebar opens it as a pane, and `cagents work` reads it from the
+command line.
+
+The pane shows one column per state below, or every card in one list newest
+first. The scope menu narrows it to one project, and search matches branches,
+projects, worktree paths, pull request titles and numbers, and Linear tickets.
+The daemon pushes each changed board to open panes, so a commit, an edited file
+or a merged pull request moves its card without a refresh. Refresh rescans
+every project and polls GitHub at once. Clicking a card opens its worktree, or
+its pull request when it has no worktree. Its menu, also on right-click, opens
+either one or its Linear issue, copies the branch, and pins or unpins the card.
+A pin shows at once. A card's sessions are buttons that focus the session in
+whichever window shows it.
+
+```sh
+cagents work ls                      # every open project, newest activity first
+cagents work ls --project redact     # one project, by name or path
+cagents work ls --column in-review   # one column
+cagents work ls --fresh              # rescan and poll GitHub first, up to 20 s
+cagents work ls --json               # the full board
+```
+
+Every linked worktree has a card, and so does the primary checkout while it is
+dirty, ahead of the default branch or has an agent session. A branch without a
+worktree has one while the user has an open pull request or a closed draft for
+it, and so does an open pull request of theirs whose branch exists only on
+GitHub. A branch whose pull request merged or closed is history, and a branch
+with neither a worktree nor a pull request is not work in progress; neither has
+a card.
+
+A card's last activity is the newest of its own head commit (a branch still at
+its base has none of its own), its newest changed file and the last time an
+agent worked in it; cards sort by it, newest first. Ahead and behind counts
+compare against the repository's default branch, not the branch's upstream:
+what `upstream/HEAD` (a fork's parent) or else `origin/HEAD` points at, falling
+back to `origin/main`, `origin/master` or a local `main` or `master`. Its column
+is the first of these that applies:
+
+| Column | When |
+| --- | --- |
+| **Active** | An agent there is working or waiting |
+| **Landed** | Its pull request merged and nothing local remains beyond it: its status read clean, and it is at the merged head, behind it, or already in the default branch. A candidate for removal |
+| **Active** | The last local activity was within three hours |
+| **Stale** | No activity for `work_stale_after_days` days (default 7) |
+| **In review** | An open pull request that is not a draft; the card shows its checks and review |
+| **In progress** | Everything else: commits, changes, drafts and closed drafts |
+
+`cagents work pin BRANCH in-review` overrides the derived column until
+`cagents work unpin BRANCH`; a worktree path names a card too. A branch's pin
+follows it between worktrees and is forgotten once the branch is gone or its
+pull request has merged or closed, at the next scan that Git and GitHub both
+answer; a worktree's pin is forgotten with the worktree.
+
+### Removing a worktree
+
+`cagents work rm` removes a card's worktree and keeps its branch. It first
+judges what removal would lose:
+
+- **Landed**: the commits and any uncommitted changes are already in the
+  default branch, or the branch's merged pull request is at this exact commit.
+  Squash and rebase merges count. The branch may be deleted too.
+- **Commits kept**: nothing uncommitted would be lost, and a branch or tag
+  still holds the commits.
+- **Unsaved**: changes that are in no landing target, or commits that no
+  branch or tag holds. Removal needs `--snapshot` or `--discard`.
+- **Refused**: for example, the primary or a locked worktree, a merge or
+  rebase in progress, a submodule with untracked files, another file system
+  mounted inside it, or more than 1 GiB of untracked files.
+
+Ignored files, such as `node_modules` and `.env`, are always deleted with the
+worktree; the plan lists them. A snapshot cannot keep files that a clean
+filter changes on their way into Git, nor repositories nested inside the
+worktree. When those are present, only `--discard` removes it. `--discard`
+deletes everything the worktree alone holds, including commits that no branch
+or tag holds. `--snapshot` makes no snapshot when nothing is unsaved.
+
+```sh
+cagents work rm fix/login --dry-run          # the plan; removes nothing
+cagents work rm fix/login --yes              # remove when nothing would be lost
+cagents work rm fix/login --snapshot --yes   # keep unsaved changes first
+cagents work rm fix/login --discard --yes    # delete unsaved changes
+cagents work rm fix/login --delete-branch --yes  # landed work only
+cagents work rm fix/login --fetch --dry-run  # fetch remotes before judging
+cagents work snapshots                       # what earlier removals kept
+```
+
+A snapshot is a stash-shaped commit under `refs/cagents/snapshots/`. Restore
+one with `git stash apply --index REF` in any worktree of the project. The
+plan is bound to the content it judged. `--dry-run --json` returns its token,
+and `--token` makes the removal refuse if anything changed since that plan.
+
+While a removal runs, no session can start inside the worktree. It is refused
+when a terminal, chat or agent works there, an automation run is in progress
+there, or any process of yours has its working directory or an open file
+inside it, the shell running `cagents work rm` included. Processes in
+containers are not seen; stop them first. Sessions in other worktrees keep
+running, and the daemon refuses to upgrade or shut down until the removal
+finishes. Agents may read plans, but only you can remove a worktree.
+
+The daemon watches each project's Git metadata and, within its watch budget,
+the tracked directories of its worktrees. Projects beyond the budget are
+polled, every 15 seconds after recent activity and every two minutes
+otherwise; ignored trees such as `node_modules` are never walked. A commit or
+fetch re-reads only the worktrees whose head it moved.
+
+GitHub is read with `gh`: two `gh pr list` calls per repository, plus a cached
+lookup for a checked-out branch whose pull request someone else opened. While
+a board is being read, listings refresh every 30 seconds; otherwise every 10
+minutes, enough to keep merges and pins current. Failures back off, and a
+project without a GitHub remote is asked again hourly. `--fresh` reuses a scan
+or listing from the last five seconds.
+
+A worktree's `cagents linear link` names its ticket. Otherwise a Linear-style
+branch name such as `fix/main-123-title` names one once Linear confirms an
+issue with that identifier, for display only; `test/discard-1117` does not. Tickets are
+looked up with your Linear credentials, and only while a board is being read.
+Without a usable key the board says so under its cards and asks again hourly.
 
 ## Windows
 
@@ -446,17 +579,23 @@ active precheck, with at most four prechecks at once.
 
 A fresh conversation closes the automation's idle provider after its result is
 durable. **Reuse this automation’s idle agent** keeps its own verified idle conversation for the
-next occurrence. If you take over the conversation, automatic cleanup and reuse
+next occurrence. A ready provider still finishing ordinary work retains the run’s
+slot until verified idle. The schedule stays enabled, overlapping occurrences
+are skipped, and the finished prompt is never resent. History shows “session
+release pending” during cleanup. Explicitly pausing the schedule stays effective
+after cleanup. Permission requests and uncertain ownership still require attention.
+If you take over the conversation, automatic cleanup and reuse
 stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**All run history** includes runs from removed definitions. It pages through
+**Run history** includes runs from removed definitions. It pages through
 their original names, times, outcomes, and bounded results. Opening history does
 not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. Completion alerts
-open this exact run history and survive provider cleanup. Removing a definition
-prevents future runs and retains its past runs.
+session; completed fresh sessions remain readable in history. A completion alert
+opens its run under **Automations**, with a trail back to the list, and
+survives provider cleanup. Removing a definition prevents future runs and
+retains its past runs.
 
 The same operations are available without a window:
 
@@ -568,10 +707,15 @@ account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify while focused** is enabled. They name the provider and
-folder, without copying prompts or output. **Send test notification** reports
+unless **Notify while focused** is enabled. By default, they name the provider and
+folder without copying prompts or output. **Show message previews** optionally
+adds bounded message context. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
+
+Clicking an alert selects its conversation or request. Your desktop decides
+whether to bring the window to the front. If it remains behind another window,
+select cagents with your desktop's window switcher.
 
 If the daemon stops replying, a persistent banner shows when the interruption
 began and how long the reply was allowed to take. Repeated transport notices
@@ -662,6 +806,40 @@ Saved Codex conversations reconnect to their retained owner when it exists.
 After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
+
+### Image references and local image storage
+
+Pasted and selected images receive stable **Image N** labels. Their inline
+`[Image N]` references stay with the actual image through edits, queued message
+revision, retry and supported provider history. Removing an attachment does not
+silently attach another image with the same display number. A prompt with
+managed images explains when an attached image's inline reference is missing
+before sending. Text may also refer to earlier images by label; a label alone
+does not select or attach an image.
+
+Owned image assets persist separately from disposable preview caches. The
+physical-device store is bounded to 4096 images and 2 GiB; accepted images and
+persisted drafts are not silently removed to admit new images. Preview memory
+and provider-specific input limits still apply.
+
+Inspect safe image receipt metadata from the user's CLI on the device holding
+the images. These commands work without a daemon and reject hosted-agent or
+remote-device authority:
+
+```sh
+cagents chat image-assets list
+cagents --json chat image-assets list
+cagents chat image-assets remove UUID --sha256 EXACT_SHA256 --acknowledge-history-loss
+```
+
+Use the exact UUID and SHA-256 shown by `list` to remove one image. Removal is
+explicit and can make that image unavailable in drafts and saved history; it
+does not delete the conversation or reuse its image number. A stale digest is
+refused. The inventory prints labels, UUIDs, hashes and byte counts, without
+image bytes, original filenames or private source paths. Omit `--device`, or
+use `--device local`; the command always addresses this physical device.
+Provider history that does not retain verifiable image data cannot reconstruct
+a trusted reference from its label alone.
 
 ### Messages, branches, and child agents
 
@@ -847,6 +1025,27 @@ advertised capabilities, and image attachments need an image-capable model.
 Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
+
+When asking for feedback on generated artifacts, agents should provide one
+explicit Markdown link per artifact, such as `[Expanded](docs/tree-expanded.png)`,
+including the path relative to the producing
+conversation's working directory (or an absolute path on that conversation's
+device). Shell shorthand such as `tree-real-*.png` or
+`tree-fixture-dark-{collapsed,expanded}.png` remains literal text; it does not
+select or attach multiple images. Claude's `AskUserQuestion` question and option
+text also supplies no image attachments. Native questions offer **Open artifact**
+controls for up to 16 explicit concrete links, without changing question or
+answer text. Bare paths and unresolved shell patterns stay text. For more
+artifacts, put the concrete links in the preceding transcript message. Encode
+literal filename metacharacters in file URLs, for example `%2A` for `*`.
+An image attachment is a separate
+provider image block or a file explicitly selected in the composer. For remote
+conversations, local paths belong to the selected device; a matching filename
+on the UI computer does not identify the same artifact.
+Concrete remote image links open a read-only gallery on the selected device's
+bytes. Loading can be cancelled, and remote files cannot be opened in a local
+external viewer. Missing files and preview-capacity errors report the device
+and path so the producer can supply a concrete supported image.
 
 - Drag across prompts, answers, code, and tool output and press `Ctrl+C` to
   copy the selected text. Double-click selects a word; triple-click selects

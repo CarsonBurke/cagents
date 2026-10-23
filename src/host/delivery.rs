@@ -108,6 +108,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatTextCopy { .. }
         }
     )
 }
@@ -526,6 +527,54 @@ mod tests {
 
     /// A client severed for backpressure must be able to report why, so the
     /// last frame it receives names the cause instead of being an EOF.
+    #[test]
+    fn text_copy_pages_share_bulk_backpressure_and_release_credit_when_drained() {
+        let queue = DeliveryQueue::new(7, DEFAULT_CLIENT_QUEUE_CAPACITY);
+        let chat_id = TerminalId::new();
+        let source = crate::chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: crate::chat::TextCopyScope::Conversation,
+            token: 1,
+            revision: 1,
+            bytes: (4 * crate::chat::TEXT_COPY_PAGE_BYTES) as u64,
+        };
+        let page = |request| {
+            let mut envelope = redraw(chat_id, 0);
+            envelope.request_id = Some(request);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::ChatTextCopy {
+                    chat_id,
+                    page: crate::chat::TextCopyPage {
+                        source: source.clone(),
+                        offset: (request - 1) * crate::chat::TEXT_COPY_PAGE_BYTES as u64,
+                        text: "x".repeat(crate::chat::TEXT_COPY_PAGE_BYTES),
+                        done: request == 4,
+                    },
+                },
+            };
+            envelope
+        };
+        queue.push(page(1)).unwrap();
+        queue.push(page(2)).unwrap();
+        let first = queue.pop().unwrap();
+        assert_eq!(first.request_id, Some(1));
+        assert!(matches!(first.message, ServerMessage::Response {
+            response: ServerResponse::ChatTextCopy { page, .. }
+        } if page.offset == 0 && page.text.len() == crate::chat::TEXT_COPY_PAGE_BYTES));
+        // Draining one page admits the next; a third retained page must still
+        // fail at the bulk limit, well before the ordinary 512-frame capacity.
+        queue.push(page(3)).unwrap();
+        assert_eq!(queue.push(page(4)), Err(DeliveryError::Full));
+        assert_eq!(queue.push(page(4)), Err(DeliveryError::Closed));
+        let delivered = queue.pop().unwrap();
+        let ServerMessage::Error(error) = delivered.message else {
+            panic!("a stalled text-copy peer was not told why");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::QueueFull);
+        assert!(error.retryable);
+        assert!(queue.pop().is_none());
+    }
+
     #[test]
     fn overflow_reports_backpressure_on_the_wire_then_closes() {
         let queue = DeliveryQueue::new(7, 1);

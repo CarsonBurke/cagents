@@ -1113,6 +1113,12 @@ impl HostedTerminalHandle {
         self.inner.published.desired_visibility()
     }
 
+    /// Ends the connection for good, as giving up on a lost daemon does.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.inner.stop.request();
+    }
+
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();
@@ -1363,7 +1369,8 @@ fn daemon_launch_command(
         .process_group(0)
         // A scope executes locally, preserving this exact sanitized environment
         // instead of inheriting stale variables from the user service manager.
-        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
+        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV);
     command
 }
 
@@ -3140,6 +3147,7 @@ mod tests {
                 agent_activity: None,
                 upgrade_sources: Vec::new(),
                 upgrade_relaunches: Vec::new(),
+                title: None,
                 oldest_event_sequence: 1,
                 attached: true,
                 transcript: None,
@@ -3213,6 +3221,7 @@ mod tests {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
             oldest_event_sequence: 1,
             attached: true,
             transcript: None,
@@ -3453,6 +3462,7 @@ mod tests {
                                 agent_activity: None,
                                 upgrade_sources: Vec::new(),
                                 upgrade_relaunches: Vec::new(),
+                                title: None,
                             },
                         },
                     },
@@ -4025,6 +4035,7 @@ mod tests {
                         agent_activity: None,
                         upgrade_sources: Vec::new(),
                         upgrade_relaunches: Vec::new(),
+                        title: None,
                         oldest_event_sequence: 1,
                         attached: true,
                         transcript: None,

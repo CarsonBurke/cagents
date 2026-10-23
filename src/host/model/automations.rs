@@ -11,10 +11,9 @@ use crate::automations::{
     Occurrence, Summary,
 };
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    db.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS automations (
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automations (
              id TEXT PRIMARY KEY,
              repository TEXT NOT NULL,
              revision INTEGER NOT NULL,
@@ -52,9 +51,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS automation_history ON automation_firings(automation, created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_all_history ON automation_firings(created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_active ON automation_firings(state);
-         CREATE UNIQUE INDEX IF NOT EXISTS automation_run ON automation_firings(run_id) WHERE run_id IS NOT NULL;
-         PRAGMA user_version = 2;
-         COMMIT;"
+         CREATE UNIQUE INDEX IF NOT EXISTS automation_run ON automation_firings(run_id) WHERE run_id IS NOT NULL;"
     ).map_err(|error| error.to_string())
 }
 
@@ -336,6 +333,27 @@ impl Registry {
         rows.into_iter().map(|record| decode(&record)).collect()
     }
 
+    /// Target directories of automations with a firing in progress, including
+    /// one still in its precheck that has no agent yet.
+    pub(crate) fn active_automation_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self
+            .db
+            .prepare("SELECT record FROM automations WHERE active_firing IS NOT NULL")
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records
+            .iter()
+            .map(|record| {
+                decode::<Automation>(record)
+                    .map(|automation| automation.definition.agent.target.directory)
+            })
+            .collect()
+    }
+
     /// Precheck-only ownership has no hosted session in ordinary update
     /// inventory. Include uncertain cleanup until its exact receipt releases
     /// the active slot. Caller queries outside HostState under the update gate.
@@ -435,7 +453,7 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if &agent != expected
+        if !super::execution::same_dispatch_agent(&agent, expected)
             || firing.agent != Some(agent.id)
             || firing.run.map(|id| id.to_string()).as_deref() != Some(latest.as_str())
             || automation.active_firing != Some(firing.id)
@@ -515,6 +533,7 @@ impl Registry {
     pub(super) fn automation_dispatch_allowed_in(
         tx: &Transaction<'_>,
         accepted: &crate::agent_execution::Accepted,
+        current_agent: &crate::agent_execution::Agent,
         now_ms: u64,
     ) -> Result<bool, String> {
         let crate::agent_execution::Origin::Automation { id } = &accepted.agent.origin else {
@@ -562,8 +581,8 @@ impl Registry {
                 params![run.id.to_string(), run.revision, encode(&run)?],
             )
             .map_err(|error| error.to_string())?;
-            if accepted.agent.session.is_none() {
-                let mut agent = accepted.agent.clone();
+            if current_agent.session.is_none() {
+                let mut agent = current_agent.clone();
                 agent.closed = true;
                 tx.execute(
                     "UPDATE agents SET closed=1,record=?2 WHERE id=?1",
@@ -1391,6 +1410,7 @@ fn accept_firing(
         }
         Destination::New(spec)
     };
+    let creates_agent = matches!(&destination, Destination::New(_));
     let request = Submit {
         name: None,
         destination,
@@ -1410,7 +1430,8 @@ fn accept_firing(
     );
     match accepted {
         Ok(accepted) => {
-            if automation.channel.is_none()
+            if creates_agent
+                && automation.channel.is_none()
                 && let Some(channel) = accepted.agent.channel()
             {
                 // Naming is a user choice, independent of the execution prompt.
@@ -1431,7 +1452,9 @@ fn accept_firing(
             firing.agent = Some(accepted.agent.id);
             firing.run = Some(accepted.run.id);
             firing.state = FiringState::Accepted;
-            automation.channel = accepted.agent.channel();
+            if creates_agent {
+                automation.channel = accepted.agent.channel();
+            }
             if definition.session_mode == SessionMode::Reuse {
                 automation.reuse_agent = Some(accepted.agent.id);
             }
@@ -2207,6 +2230,26 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
+        // Placement may advance after acceptance; cancellation must preserve
+        // the current record rather than copying the acceptance snapshot back.
+        let destination = crate::model::ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: destination,
+                repository: accepted.agent.spec.target.repository.clone(),
+                title: "moved".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let mut current = registry.agent(accepted.agent.id).unwrap();
+        current.placement = crate::agent_execution::Placement::Channel(destination);
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![current.id.to_string(), encode(&current).unwrap()],
+            )
+            .unwrap();
         registry
             .set_automation_enabled(automation.id, 1, None, false, 201)
             .unwrap();
@@ -2216,6 +2259,10 @@ mod tests {
             crate::agent_execution::State::Cancelled
         );
         assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().placement,
+            current.placement
+        );
         assert!(
             registry
                 .automation(automation.id)
@@ -2660,13 +2707,20 @@ mod tests {
             )
             .unwrap();
         let accepted = claim.accepted.unwrap();
-        let session = crate::chat::fresh_session(
+        let mut session = crate::chat::fresh_session(
             Provider::Claude,
             crate::model::TerminalId::new(),
             automation.definition.agent.target.directory.clone(),
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
+        // A completed hosted run has an authenticated live descriptor, unlike
+        // the pre-host recipe returned by fresh_session.
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("automation-fixture"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("host"),
+        });
         let agent = registry
             .bind_agent(accepted.agent.id, None, HostedSession::Chat(session))
             .unwrap();
@@ -2903,6 +2957,143 @@ mod tests {
                 assert_eq!(channel.title, expected_title);
                 assert_eq!(channel.title_source, ChannelTitleSource::Manual);
             }
+        }
+    }
+
+    #[test]
+    fn moving_a_reused_agent_keeps_the_automations_channel_for_future_agents() {
+        use crate::{
+            agent_execution::{HostedSession, Placement, State, Update},
+            model::{CardId, CardKind, ChannelId},
+            workspace_model::views::{Change, Pane},
+        };
+        for move_to_worktree in [false, true] {
+            let (mut registry, directory, definition) = fixture();
+            let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+            let owned_channel = agent.channel().unwrap();
+            let destination = if move_to_worktree {
+                Placement::Worktree {
+                    repository: directory.path().into(),
+                    path: directory.path().into(),
+                }
+            } else {
+                let id = ChannelId::new();
+                registry
+                    .apply(&ModelEdit::CreateChannel {
+                        id,
+                        repository: directory.path().into(),
+                        title: "User channel".into(),
+                        title_source: Default::default(),
+                    })
+                    .unwrap();
+                Placement::Channel(id)
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: destination.clone(),
+                    panes: vec![],
+                    closed: vec![],
+                })
+                .unwrap();
+            let pane = Pane {
+                id: CardId::from_uuid(agent.id.as_uuid()),
+                title: "Reusable agent".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                scope: None,
+                kind: CardKind::Chat(match agent.session.clone().unwrap() {
+                    HostedSession::Chat(session) => session,
+                    _ => unreachable!(),
+                }),
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: agent.placement.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    expected_revision: registry.view_revision(&agent.placement).unwrap(),
+                    scope: agent.placement.clone(),
+                    operation: Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: destination.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            // A user move may race the scheduler's idle proof. Only placement
+            // differs from that exact session proof; release must retain it.
+            registry
+                .finish_automation_release(firing.id, &agent, 230)
+                .unwrap();
+            let claim = |registry: &mut Registry, now| {
+                registry
+                    .claim_automation(
+                        automation.id,
+                        automation.execution_revision,
+                        None,
+                        crate::automations::Trigger::Manual {
+                            request: Uuid::new_v4(),
+                        },
+                        None,
+                        true,
+                        now,
+                    )
+                    .unwrap()
+            };
+            let next = claim(&mut registry, 300).accepted.unwrap();
+            assert_eq!(next.agent.id, agent.id);
+            assert_eq!(next.agent.placement, destination);
+            assert_eq!(
+                registry.automation(automation.id).unwrap().channel,
+                Some(owned_channel)
+            );
+            let started = registry
+                .update_agent_run(
+                    next.run.id,
+                    next.run.revision,
+                    Update::Started {
+                        provider_key: "second-turn".into(),
+                    },
+                    305,
+                )
+                .unwrap();
+            registry
+                .update_agent_run(
+                    next.run.id,
+                    started.revision,
+                    Update::Finished {
+                        state: State::Succeeded,
+                        result: Default::default(),
+                    },
+                    310,
+                )
+                .unwrap();
+            let firing = registry
+                .reconcile_automation_run(next.run.id, 320)
+                .unwrap()
+                .unwrap();
+            let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+            registry
+                .finish_automation_release(firing.id, &closed, 330)
+                .unwrap();
+            let fresh = claim(&mut registry, 400).accepted.unwrap();
+            assert_ne!(fresh.agent.id, agent.id);
+            assert_eq!(fresh.agent.channel(), Some(owned_channel));
+            assert_eq!(
+                registry
+                    .model()
+                    .unwrap()
+                    .channel(owned_channel)
+                    .unwrap()
+                    .title,
+                "Review daily"
+            );
         }
     }
 

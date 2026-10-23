@@ -9,7 +9,7 @@ Install matching `cagents` and `cagentsd` executables on both computers. The rem
 machine does not need a display or `cagents-ui`. Set up ordinary SSH access first:
 
 ```console
-ssh fw16 hostname
+ssh build-host hostname
 ```
 
 SSH host aliases, ProxyCommand, Tailscale, keys, host verification, and agent
@@ -29,9 +29,9 @@ its own configuration directory):
 {
   "devices": [
     {
-      "name": "fw16",
-      "host": "fw16",
-      "executable": "/home/marvin/.local/bin/cagents"
+      "name": "build-host",
+      "host": "build-host",
+      "executable": "/home/user/.local/bin/cagents"
     }
   ]
 }
@@ -43,10 +43,10 @@ digits, hyphens, or underscores. `local` is reserved for this computer.
 
 ```console
 cagents ui
-cagents --device fw16 ui
-cagents --device fw16 ui --window work
-cagents --device fw16 terminal list
-cagents --device fw16 terminal spawn --cwd /home/marvin/Documents/repositories/cagents
+cagents --device build-host ui
+cagents --device build-host ui --window work
+cagents --device build-host terminal list
+cagents --device build-host terminal spawn --cwd /home/user/projects/example
 ```
 
 Choosing a device from the status-bar menu switches the current client after the
@@ -57,8 +57,9 @@ Named windows are scoped to their device; the internal `device-` namespace is re
 **Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
 and runs Git status, unstaged/staged diff, stage, unstage, and commit on the device.
 It can also list worktrees, create a branch and worktree under `.worktrees/`, and
-remove a clean worktree without forcing deletion. `.worktrees/` must be ignored
-in `.gitignore` or `.git/info/exclude` before creation.
+remove a clean worktree without forcing deletion. Creation adds a clone-local
+`/.worktrees/` rule to Git's common `info/exclude` when needed, matching local
+creation without editing tracked `.gitignore`.
 **Use directory** selects the working directory for new remote terminals and
 conversations and publishes the project to the remote daemon. Saves compare the
 loaded content and serialize with other cagents saves; a changed file requires a
@@ -106,7 +107,7 @@ Per-pane device switching is tracked separately in [#687](https://github.com/Car
 Choose a device from the bottom-right device menu to switch the current window.
 The replacement connects successfully before the current client closes; daemon
 jobs continue. Save or discard editor changes before switching. Each device row
-also has an **Open in another window** action, so a desktop window and an fw16
+also has an **Open in another window** action, so a desktop window and a build-host
 window can stay open together.
 
 Clients on the same device and repository view (channel or worktree) share ordered pane IDs, titles, widths,

@@ -46,6 +46,7 @@ const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
 mod notification_ui;
+mod operation_recovery_ui;
 
 #[derive(Clone)]
 pub struct Flags {
@@ -199,6 +200,7 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     FileRevealed(Result<cagents::file_manager::RevealOutcome, String>),
     Lsp(u64, Option<LspEvent>),
+    OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
     Completion(CardId, usize),
@@ -499,6 +501,7 @@ pub struct Editor {
     lsp: LspManager,
     language_server_assistance: bool,
     next_document: u64,
+    operation_recovery: cagents::operation_recovery::Shared,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -678,12 +681,14 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::RetainedSaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::DiagramsRendered { .. }
             | RepositoryAction::MarkdownDue { .. }
@@ -2046,6 +2051,14 @@ impl Editor {
     }
 
     fn continue_exit(&mut self) -> Task<Message> {
+        if self.operation_recovery_pending() {
+            self.exiting = false;
+            self.notice = Some(
+                "Finish or resolve retained file operations before closing this window.".into(),
+            );
+            return Task::none();
+        }
+
         if let Some(tab) = self.tabs.first() {
             return self.request_close(tab.id);
         }
@@ -2279,6 +2292,44 @@ impl Editor {
         Task::batch([files, review, self.refresh_snapshot(id, false)])
     }
 
+    fn watches_review_requests(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.review.review_request_repository().is_some())
+    }
+
+    /// The review tick slows while the window is in the background, and
+    /// `time::every` waits a full interval before its first tick, so a
+    /// returning user gets one read pass now instead of after the next tick.
+    fn review_requests_focus_regained(&mut self) -> Task<Message> {
+        if !self.watches_review_requests() {
+            return Task::none();
+        }
+        self.update_review_requests(pull_request_review::request_ui::monitor::Action::Tick)
+    }
+
+    fn update_review_requests(
+        &mut self,
+        action: pull_request_review::request_ui::monitor::Action,
+    ) -> Task<Message> {
+        let repositories = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.review.review_request_repository().cloned())
+            .collect::<Vec<_>>();
+        let task = self
+            .review_requests
+            .update(action, repositories)
+            .map(Message::ReviewRequests)
+            .map(cosmic::Action::App);
+        let report = self.report_review_requests();
+        for tab in &mut self.tabs {
+            tab.review
+                .sync_review_requests(self.review_requests.snapshots());
+        }
+        Task::batch([task, report])
+    }
+
     fn refresh(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -2363,11 +2414,13 @@ impl Editor {
     /// re-sourcing a snapshot triggers, so nothing waits in the outbox for
     /// the next keystroke.
     fn apply_review_effects(&mut self, id: CardId) -> Task<Message> {
+        self.invalidate_stale_checkout();
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
         let mut tasks = Vec::new();
         let mut checkout_target = None;
+        let mut checkout_open = None;
         for effect in tab.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -2405,10 +2458,15 @@ impl Editor {
                 // selection has nothing to update here.
                 pull_request_review::Effect::SelectionChanged(_) => {}
                 pull_request_review::Effect::Checkout(target) => checkout_target = Some(target),
+                pull_request_review::Effect::OpenCheckout(path) => checkout_open = Some(path),
             }
         }
         if let Some(target) = checkout_target {
-            self.begin_checkout(target);
+            self.begin_review_checkout(id, target);
+        }
+        if let Some(path) = checkout_open {
+            self.selection_epoch = self.selection_epoch.wrapping_add(1);
+            tasks.push(Self::open(path, self.selection_epoch));
         }
         Task::batch(tasks)
     }
@@ -2967,6 +3025,7 @@ impl Application for Editor {
             lsp,
             language_server_assistance,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
@@ -3035,6 +3094,9 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Repository(action) = &message {
+            self.retain_repository_operation(action);
+        }
         if let Some(notice) = cagents::diagnostics::take_notice() {
             self.notice = Some(match self.notice.take() {
                 Some(previous) => format!("{previous}\n{notice}"),
@@ -3153,13 +3215,18 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::WindowFocused(window, focused) => {
+                    let mut review_requests = Task::none();
                     if self.core.main_window_id() == Some(window) {
+                        let regained = focused && !self.window_focused;
                         self.window_focused = focused;
                         if !focused {
                             self.tab_history.finish(self.active);
                         }
+                        if regained {
+                            review_requests = self.review_requests_focus_regained();
+                        }
                     }
-                    self.notification_focus()
+                    Task::batch([self.notification_focus(), review_requests])
                 }
                 Message::RefreshVisible => {
                     // A colour-only theme change reaches the hook but not the
@@ -3304,6 +3371,10 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    if self.operation_recovery_pending() {
+                        self.notice = Some("Finish or resolve retained file operations before closing this window.".into());
+                        return Task::none();
+                    }
                     if self
                         .checkout_dialog
                         .as_ref()
@@ -3394,7 +3465,43 @@ impl Application for Editor {
                 Message::Repository(RepositoryAction::Review { card, action }) => {
                     self.handle_review(card, action)
                 }
+                Message::OperationRecovery(action) => {
+                    let task = self
+                        .operation_recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .update(action);
+
+                    let mut tasks = vec![
+                        task.map(Message::OperationRecovery)
+                            .map(cosmic::Action::App),
+                    ];
+                    for tab in &mut self.tabs {
+                        tasks.push(repository_task(
+                            tab.runtime.reconcile_operation_recovery(tab.id),
+                        ));
+                    }
+                    Task::batch(tasks)
+                }
                 Message::Repository(action) => {
+                    if matches!(
+                        &action,
+                        RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }
+                    ) && !self.prepare_editor_save(action.card())
+                    {
+                        if let RepositoryAction::AutoSaveDue {
+                            identity,
+                            revision,
+                            ticket,
+                        } = &action
+                            && let Some(tab) = self.tab_mut(identity.card)
+                        {
+                            tab.runtime
+                                .retire_auto_save_due(identity, *revision, *ticket);
+                        }
+                        return Task::none();
+                    }
+
                     if let RepositoryAction::DiffAnnotations {
                         identity,
                         review_revision,
@@ -3503,10 +3610,16 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
-                        && self.active == Some(id)
+                    let focus_loaded = matches!(
+                        action,
+                        RepositoryAction::FileLoaded { .. } | RepositoryAction::FileLoadedAt { .. }
+                    ) && self.active == Some(id)
                         && !self.modal_open();
-                    let saved = matches!(action, RepositoryAction::SaveFinished { .. });
+                    let saved = matches!(
+                        action,
+                        RepositoryAction::SaveFinished { .. }
+                            | RepositoryAction::RetainedSaveFinished { .. }
+                    );
                     let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
@@ -3873,26 +3986,7 @@ impl Application for Editor {
                     task
                 }
                 Message::PullRequestReview(id, action) => self.handle_review(id, action),
-                Message::ReviewRequests(action) => {
-                    let repositories = self
-                        .tabs
-                        .iter()
-                        .filter_map(|tab| tab.review.review_request_repository().cloned())
-                        .collect::<Vec<_>>();
-                    let task = self
-                        .review_requests
-                        .update(action, repositories)
-                        .map(Message::ReviewRequests)
-                        .map(cosmic::Action::App);
-                    let report = self.report_review_requests();
-                    for tab in &mut self.tabs {
-                        tab.review.clear_external_review_requests();
-                        for (repository, snapshot) in self.review_requests.snapshots() {
-                            tab.review.apply_review_requests(repository, snapshot);
-                        }
-                    }
-                    Task::batch([task, report])
-                }
+                Message::ReviewRequests(action) => self.update_review_requests(action),
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
                         if !tab.snapshot_loading {
@@ -4513,12 +4607,11 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        let review_requests = if self
-            .tabs
-            .iter()
-            .any(|tab| tab.review.review_request_repository().is_some())
-        {
-            iced::time::every(Duration::from_secs(10)).map(|_| {
+        let review_requests = if self.watches_review_requests() {
+            iced::time::every(pull_request_review::request_ui::monitor::tick_interval(
+                self.window_focused,
+            ))
+            .map(|_| {
                 Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::Tick)
             })
         } else {
@@ -4565,6 +4658,13 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
+        body.push(
+            self.operation_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .view()
+                .map(Message::OperationRecovery),
+        );
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
@@ -5350,11 +5450,11 @@ mod tests {
         let task = app.load_checkout_journal();
         run_tasks(&mut app, task);
         assert!(app.checkout_journal.is_some(), "{:?}", app.notice);
-        app.begin_checkout(CheckoutTarget {
-            repository: root.to_path_buf(),
-            number: 17,
-            head: cagents::repository::Oid::parse(&original).unwrap(),
-        });
+        app.begin_checkout(CheckoutTarget::read_only(
+            root.to_path_buf(),
+            17,
+            cagents::repository::Oid::parse(&original).unwrap(),
+        ));
         drop(app.update(Message::Checkout(checkout::Action::Destination(
             destination.display().to_string(),
         ))));
@@ -5407,6 +5507,241 @@ mod tests {
     }
 
     #[test]
+    fn ceditor_checkout_rejects_inflight_same_head_review_identity_changes() {
+        use cagents::{
+            github::{GitHubRepoKey, PullRequestKey},
+            repository::{
+                ExistingPrCheckoutRequest, Oid, PrCheckoutTracking, PullRequestRange,
+                ValidatedBranchName, ValidatedRefName,
+            },
+        };
+        let directory = git_fixture();
+        let root = directory.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        let head = Oid::parse(&git(&root, &["rev-parse", "HEAD"])).unwrap();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        let pr: cagents::github::PullRequest = serde_json::from_value(serde_json::json!({
+            "id":"PR_7", "number":7, "title":"Change", "state":"OPEN",
+            "headRefName":"main", "headRefOid":head.as_str(), "baseRefName":"main",
+            "headRepository":{"name":"r"}, "headRepositoryOwner":{"login":"o"},
+            "updatedAt":"2026-01-01T00:00:00Z", "url":"https://github.com/o/r/pull/7"
+        }))
+        .unwrap();
+        let target = pull_request_review::CheckoutTarget {
+            repository: root.clone(),
+            number: 7,
+            head: head.clone(),
+            pull_request: Some(PullRequestKey::new(repository.clone(), 7).unwrap()),
+            head_ref_name: "main".into(),
+            head_repository: Some(repository.clone()),
+        };
+        let loaded = pull_request_review::Loaded {
+            pull_request: pr.clone(),
+            context: cagents::github::ReviewContext {
+                pull_request_id: "PR_7".into(),
+                head_oid: head.as_str().into(),
+                base_oid: head.as_str().into(),
+                viewer: "fixture".into(),
+                viewer_is_author: false,
+                pending: None,
+            },
+            files: Default::default(),
+            next_file_cursor: None,
+            range: PullRequestRange {
+                number: 7,
+                base_branch: ValidatedBranchName::parse("main").unwrap(),
+                head_mirror: ValidatedRefName::parse("refs/cagents/pull/7/head").unwrap(),
+                base_mirror: ValidatedRefName::parse("refs/cagents/pull/7/base").unwrap(),
+                head: head.clone(),
+                base_tip: head.clone(),
+                merge_base: head.clone(),
+            },
+            entries: Vec::new(),
+        };
+        let service = RepositoryService::system("git");
+        let plan = service
+            .prepare_existing_pr_checkout(
+                &ExistingPrCheckoutRequest {
+                    repository: root.clone(),
+                    worktree: root.clone(),
+                    branch: ValidatedBranchName::parse("main").unwrap(),
+                    head_repository: repository.clone(),
+                    head_branch: ValidatedBranchName::parse("main").unwrap(),
+                    expected_head: head.clone(),
+                    remote: "origin".into(),
+                    tracking: PrCheckoutTracking::ReadOnly,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            plan.disposition(),
+            cagents::repository::PrCheckoutDisposition::AlreadyCurrent
+        );
+        // Only GitHub preparation is replaced: the backend plan/receipt and all
+        // owning-tab Loaded/confirm/open reducers below are their real paths.
+        let mut prepared = pull_request_review::checkout::prepare(
+            &pull_request_review::CheckoutTarget::read_only(root.clone(), 7, head.clone()),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        prepared.reconciliation = Some(plan.clone());
+        prepared.existing_worktree = Some(root.clone());
+        for changed_source in [false, true] {
+            for phase in 0..5 {
+                let mut app = editor();
+                let card = add(&mut app, root.to_str().unwrap(), None);
+                app.tab_mut(card).unwrap().review = pull_request_review::State::new(
+                    Arc::new(GitHubService::system("gh")),
+                    RepositoryService::system("git"),
+                );
+                let owner = pull_request_review::ReviewTarget {
+                    repository: repository.clone(),
+                    worktree: root.clone(),
+                    pull_request: Arc::new(pr.clone()),
+                };
+                drop(app.update(Message::PullRequestReview(
+                    card,
+                    pull_request_review::Action::Open(owner),
+                )));
+                let generation = app.tab(card).unwrap().review.selection_generation();
+                drop(app.update(Message::PullRequestReview(
+                    card,
+                    pull_request_review::Action::Loaded {
+                        generation,
+                        load: 1,
+                        result: Ok(Arc::new(loaded.clone())),
+                    },
+                )));
+                // This request is already in flight before the checkout modal.
+                drop(app.update(Message::PullRequestReview(
+                    card,
+                    pull_request_review::Action::Refresh,
+                )));
+                app.begin_review_checkout(card, target.clone());
+                let id = app
+                    .checkout_dialog
+                    .as_mut()
+                    .unwrap()
+                    .fixture_prepared(prepared.clone());
+                let mut pending = None;
+                if phase == 1 {
+                    pending =
+                        Some(app.update(Message::Checkout(checkout::Action::ReconcileExisting)));
+                }
+                if phase == 2 {
+                    let task = app.update(Message::Checkout(checkout::Action::ReconcileExisting));
+                    run_tasks(&mut app, task);
+                    assert_eq!(
+                        app.checkout_dialog.as_ref().unwrap().completed_for_test(),
+                        Some(root.as_path())
+                    );
+                }
+                let completed_receipt = if phase == 4 {
+                    app.checkout_dialog
+                        .as_mut()
+                        .unwrap()
+                        .fixture_pending_existing();
+                    Some(
+                        service
+                            .reconcile_existing_pr_checkout(&plan, &CancellationToken::new())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let token = app
+                    .checkout_dialog
+                    .as_ref()
+                    .unwrap()
+                    .cancellation_for_test();
+                let mut refreshed = loaded.clone();
+                if changed_source {
+                    refreshed
+                        .pull_request
+                        .head_repository_owner
+                        .as_mut()
+                        .unwrap()
+                        .login = "other".into();
+                } else {
+                    refreshed.pull_request.head_ref_name = "renamed".into();
+                }
+                drop(app.update(Message::PullRequestReview(
+                    card,
+                    pull_request_review::Action::Loaded {
+                        generation,
+                        load: 2,
+                        result: Ok(Arc::new(refreshed)),
+                    },
+                )));
+                let current = app.tab(card).unwrap().review.target().unwrap();
+                assert_eq!(current.pull_request.head_ref_oid, head.as_str());
+                assert!(
+                    if changed_source {
+                        current
+                            .pull_request
+                            .head_repository_owner
+                            .as_ref()
+                            .unwrap()
+                            .login
+                            == "other"
+                    } else {
+                        current.pull_request.head_ref_name == "renamed"
+                    },
+                    "in-flight Loaded must actually adopt metadata behind the modal"
+                );
+                if let Some(token) = token {
+                    assert!(token.is_cancelled());
+                }
+                match phase {
+                    0 => {
+                        let task =
+                            app.update(Message::Checkout(checkout::Action::ReconcileExisting));
+                        run_tasks(&mut app, task);
+                    }
+                    1 => run_tasks(&mut app, pending.take().unwrap()),
+                    2 => {
+                        let task =
+                            app.update(Message::Checkout(checkout::Action::Open(root.clone())));
+                        run_tasks(&mut app, task);
+                    }
+                    3 => {
+                        let task = app.update(Message::Checkout(checkout::Action::Prepared(
+                            id,
+                            Ok(prepared.clone()),
+                        )));
+                        run_tasks(&mut app, task);
+                    }
+                    _ => {
+                        let task = app.update(Message::Checkout(
+                            checkout::Action::ExistingFinished(id, Ok(completed_receipt.unwrap())),
+                        ));
+                        run_tasks(&mut app, task);
+                    }
+                }
+                let dialog = app
+                    .checkout_dialog
+                    .as_ref()
+                    .expect("stale owner must not open/close checkout");
+                if phase == 4 {
+                    assert_eq!(
+                        dialog.retained_receipt_for_test().unwrap().path(),
+                        root.as_path()
+                    );
+                }
+                assert!(!dialog.busy());
+                assert!(dialog.completed_for_test().is_none());
+                assert!(dialog.error_for_test().is_some());
+                assert_eq!(app.tabs.len(), 1);
+                assert_eq!(git(&root, &["rev-parse", "HEAD"]), head.as_str());
+            }
+        }
+    }
+
+    #[test]
     fn checkout_journal_failure_remains_visible_in_the_dialog() {
         let mut app = editor();
         drop(
@@ -5414,11 +5749,11 @@ mod tests {
                 "journal path is not writable".into(),
             )))),
         );
-        app.begin_checkout(cagents::pull_request_review::CheckoutTarget {
-            repository: PathBuf::from("/review"),
-            number: 1,
-            head: cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
-        });
+        app.begin_checkout(cagents::pull_request_review::CheckoutTarget::read_only(
+            PathBuf::from("/review"),
+            1,
+            cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
+        ));
         assert_eq!(
             app.checkout_error.as_deref(),
             Some("journal path is not writable")
@@ -5894,6 +6229,7 @@ mod tests {
             lsp: LspManager::new(Vec::new()),
             language_server_assistance: false,
             next_document: 1,
+            operation_recovery: Default::default(),
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
@@ -5956,6 +6292,58 @@ mod tests {
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
         );
+    }
+
+    #[test]
+    fn review_discovery_catches_up_only_when_the_main_window_regains_focus() {
+        let mut app = editor();
+        let main = window::Id::RESERVED;
+        let other = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.window_focused = true;
+        let watch = |app: &mut Editor, root: &str, repository: &str| {
+            let tab = add(app, root, None);
+            drop(
+                app.tab_mut(tab).unwrap().review.set_source(Some(
+                    pull_request_review::ReviewSource {
+                        repository: cagents::github::GitHubRepoKey::new(
+                            "github.com",
+                            None,
+                            "owner",
+                            repository,
+                        )
+                        .unwrap(),
+                        worktree: root.into(),
+                    },
+                )),
+            );
+        };
+        watch(&mut app, "/first", "first");
+        for (window, focused) in [(other, false), (other, true), (main, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert!(app.window_focused);
+            assert_eq!(app.review_requests.snapshots().count(), 0);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        assert!(!app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 0);
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert!(app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 1);
+
+        // A newly bound repository exposes a second, observable catch-up
+        // pass: duplicate focus events must not start discovery again.
+        watch(&mut app, "/second", "second");
+        let revision = app.review_requests.revision();
+        for (window, focused) in [(main, true), (other, false), (other, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert_eq!(app.review_requests.revision(), revision);
+            assert_eq!(app.review_requests.snapshots().count(), 1);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert_eq!(app.review_requests.snapshots().count(), 2);
+        assert_ne!(app.review_requests.revision(), revision);
     }
 
     #[test]

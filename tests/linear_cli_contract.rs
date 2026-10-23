@@ -28,6 +28,11 @@ impl Fixture {
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
+        // Missing-key behavior must not depend on a CI host's Secret Service
+        // installation or desktop environment. Specific keyring tests replace it.
+        let keyring = root.path().join("bin/secret-tool");
+        fs::write(&keyring, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&keyring, fs::Permissions::from_mode(0o700)).unwrap();
         let f = Self { root };
         let output = Command::new("git")
             .args(["init", "-q"])
@@ -63,8 +68,14 @@ impl Fixture {
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_cagents"));
-        c.env_clear()
-            .env("HOME", self.path())
+        // Preserve delegation while isolating credentials, paths and tools.
+        // The fixture curl/keyring and private HOME still own every request.
+        for (name, _) in std::env::vars_os() {
+            if name != std::ffi::OsStr::new(cagents::agent_execution::AUTHORITY_ENV) {
+                c.env_remove(name);
+            }
+        }
+        c.env("HOME", self.path())
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.path().join("bin").display()),
@@ -135,6 +146,14 @@ fn issue_reads_link_current_and_unlink_need_no_daemon() {
     );
     assert_eq!(f.calls(), calls);
     f.success(&["linear", "unlink"]);
+    let tombstone: Value =
+        serde_json::from_slice(&fs::read(f.path().join(".git/cagents-linear.json")).unwrap())
+            .unwrap();
+    assert_eq!(tombstone["version"], 2);
+    assert!(
+        tombstone["issue"].is_null(),
+        "explicit unlink must remain distinguishable from pristine absence during creator recovery"
+    );
     assert_eq!(
         f.failure(&["linear", "issue", "--current"])["kind"],
         "linear_issue_required"
@@ -343,4 +362,230 @@ fn uncertain_relation_deletion_identifies_relation_without_mistaking_it_for_issu
     assert_eq!(error["details"]["writeContext"]["objectId"], TEAM_ID);
     assert!(error["details"]["writeContext"]["issueId"].is_null());
     assert!(error["message"].as_str().unwrap().contains(TEAM_ID));
+}
+
+#[test]
+fn stored_key_authenticates_without_shell_environment_and_environment_overrides_it() {
+    let f = Fixture::new();
+    let helper = f.path().join("bin/secret-tool");
+    fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LINEAR_FIXTURE/keyring-argv\"\nprintf '%s' 'fixture-keyring-secret'\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        f.request()
+            .contains("Authorization: fixture-keyring-secret")
+    );
+    let keyring_args = fs::read_to_string(f.path().join("keyring-argv")).unwrap();
+    assert!(keyring_args.contains("com.carson.cagents.linear"));
+    assert!(keyring_args.contains("default"));
+    assert!(!keyring_args.contains("fixture-keyring-secret"));
+    fs::remove_file(f.path().join("keyring-argv")).unwrap();
+    f.success(&["linear", "issue", "ENG-12"]);
+    assert!(f.request().contains(&format!("Authorization: {KEY}")));
+    assert!(
+        !f.path().join("keyring-argv").exists(),
+        "environment override avoids the keyring entirely"
+    );
+}
+
+#[test]
+fn team_and_state_names_use_filtered_connections_without_metadata_scans() {
+    let f = Fixture::new();
+    f.read(json!({"teams":{"nodes":[{"id":TEAM_ID,"name":"Engineering","key":"ENG"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}));
+    fs::write(f.path().join("mutation"), "{}").unwrap();
+    f.failure(&[
+        "linear",
+        "create",
+        "--team",
+        "engineering",
+        "--title",
+        "New",
+    ]);
+    assert_eq!(
+        f.calls(),
+        2,
+        "one filtered lookup and one attempted mutation"
+    );
+    // The fixture keeps every request, making the actual transport contract visible.
+    let history = fs::read_to_string(f.path().join("requests")).unwrap();
+    assert!(history.contains("$filter:TeamFilter!"));
+    assert!(history.contains("eqIgnoreCase"));
+    assert!(history.contains("engineering"));
+    let f = Fixture::new();
+    f.read(json!({
+        "issue":{"id":ISSUE_ID,"team":{"id":TEAM_ID}},
+        "workflowStates":{"nodes":[{"id":ISSUE_ID,"name":"In Progress","team":{"id":TEAM_ID}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+    }));
+    f.success(&["linear", "set", "--id", "ENG-12", "status", "In Progress"]);
+    assert_eq!(
+        f.calls(),
+        3,
+        "one issue read, one filtered state lookup, one mutation"
+    );
+    let history = fs::read_to_string(f.path().join("requests")).unwrap();
+    assert!(history.contains("$filter:WorkflowStateFilter!"));
+    assert!(history.contains("eqIgnoreCase"));
+}
+
+#[test]
+fn unavailable_keyring_helper_reports_the_install_and_unlock_action() {
+    let f = Fixture::new();
+    let missing = f.path().join("missing-bin");
+    fs::create_dir(&missing).unwrap();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .env("PATH", &missing)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(error["message"].as_str().unwrap().contains("secret-tool"));
+    assert!(error["message"].as_str().unwrap().contains("unlock"));
+    assert_eq!(f.calls(), 0);
+}
+
+#[test]
+fn keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostics() {
+    let f = Fixture::new();
+    let helper = f.path().join("bin/secret-tool");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s' 'private-fixture-diagnostic' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(error["message"].as_str().unwrap().contains("unlock"));
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(!diagnostics.contains("private-fixture-diagnostic"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(f.calls(), 0);
+
+    // Genuine absence retains the normal credential fallback rather than
+    // reporting the private service as unavailable.
+    fs::write(&helper, "#!/bin/sh\nexit 1\n").unwrap();
+    let missing = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let error = serde_json::from_slice::<Value>(&missing.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_auth_required");
+    assert_eq!(f.calls(), 0);
+}
+
+#[test]
+fn keyring_stderr_writer_cannot_extend_the_original_helper_deadline() {
+    use std::{
+        process::Child,
+        time::{Duration, Instant},
+    };
+
+    // The fixture owns this original holder throughout. Transfer just stderr's
+    // write descriptor rather than launching an unowned background descendant.
+    struct Holder(Child);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let f = Fixture::new();
+    let script = r#"import array, os, pathlib, select, socket, sys
+root = pathlib.Path(sys.argv[1])
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(str(root / 'stderr-socket'))
+    server.listen(1)
+    server.settimeout(5)
+    (root / 'stderr-ready').write_text('ready')
+    connection, _ = server.accept()
+    with connection:
+        connection.settimeout(5)
+        _, ancillary, _, _ = connection.recvmsg(1, socket.CMSG_SPACE(4))
+    assert len(ancillary) == 1
+    level, kind, payload = ancillary[0]
+    assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+    descriptors = array.array('i')
+    descriptors.frombytes(payload)
+    assert len(descriptors) == 1
+    try:
+        (root / 'stderr-held').write_text('held')
+        select.select([sys.stdin], [], [], 25)
+    finally:
+        os.close(descriptors[0])
+"#;
+    let mut holder = Holder(
+        Command::new("/usr/bin/python3")
+            .args(["-c", script])
+            .arg(f.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let ready_by = Instant::now() + Duration::from_secs(5);
+    while !f.path().join("stderr-ready").exists() {
+        assert!(
+            Instant::now() < ready_by,
+            "private stderr holder did not start"
+        );
+        assert!(holder.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(
+        f.path().join("bin/secret-tool"),
+        r#"#!/usr/bin/python3
+import array, os, socket
+with socket.socket(socket.AF_UNIX) as client:
+    client.connect(os.path.join(os.environ['LINEAR_FIXTURE'], 'stderr-socket'))
+    client.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [2]))])
+raise SystemExit(1)
+"#,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let output = f
+        .command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        f.path().join("stderr-held").exists(),
+        "actual stderr descriptor was not held"
+    );
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "holder must still own the open writer"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "stderr outlived helper deadline: {elapsed:?}"
+    );
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(output.stdout.is_empty());
+    assert_eq!(f.calls(), 0);
+    drop(holder.0.stdin.take());
+    assert!(holder.0.wait().unwrap().success());
 }

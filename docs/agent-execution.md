@@ -72,6 +72,18 @@ If a daemon restart loses proof of an accepted prompt's outcome, the run becomes
 ## Reading context and account budgets
 
 ```sh
+cagents account list
+cagents account list --provider codex --json
+```
+
+`account list` reads active accounts and any retained caller account from the
+selected daemon. Its table shows stable account IDs, names, defaults, current
+caller selection and archived status. JSON projects those metadata fields with
+lowercase provider names; it omits usage bodies and launch recipes. This request
+does not probe a provider CLI. A default marker describes saved preferences,
+not a guarantee that the account is currently available for new work.
+
+```sh
 cagents account info --json
 cagents account info --provider claude --json
 cagents account info --account claude/system --refresh --json
@@ -173,7 +185,7 @@ Fresh hosted sessions receive a daemon-issued, session-bound capability in `CAGE
 A session's children belong to its lineage, not to its process. A successor joins the lineage and keeps control of the children when the session is relaunched in its card, recovered after a crash, reopened after its native owner's close was proved, recovered under another account, or converted between chat and terminal. It joins only if no other session of that lineage is still running, which account recovery, reopening and conversion prove for the session they replace by stopping it first; otherwise, as with a rival relaunch of a live session, it starts a lineage of its own, and the daemon logs a warning. Each successor joins the lineage of the exact session it replaces, so a rival's own agents pass to its successors in turn; a relaunch that failed to start passes on the lineage of the chain's first session. Resuming a closed conversation from history, branching a conversation, or cloning a pane starts a new lineage, except that a Codex conversation kept by its native server keeps its lineage. The lineage is recorded before the successor starts and never changes afterwards. Every live session of a lineage controls its children; the check above keeps that to one session at a time. A delegated agent's `owner` names its lineage, which is the ID of the session that began it and may no longer be live. Chats replaced before this release cannot be traced to their original lineage. The daemon registry records lineages from schema version 4, and the application state records each relaunched terminal's predecessor from schema version 11; an older cagents refuses to open either.
 
 
-The service limits each parent lineage to 64 open children, 8 concurrent/uncertain runs, a maximum delegation depth of 8, and 32 concurrent/uncertain runs globally. Close finished conversations when they are no longer needed. Explicit retirement revokes the issuing capability; proof-changing adoption must validate the retained exact session lineage.
+The service limits each parent lineage and each automation to 64 open children. That child quota does not limit conversations started directly by the user. Every origin, including the user, is limited to 8 concurrent/uncertain runs, with 32 concurrent/uncertain runs globally and a maximum delegation depth of 8. Close finished conversations when they are no longer needed. Explicit retirement revokes the issuing capability; proof-changing adoption must validate the retained exact session lineage.
 
 The packaged `cagents` skill teaches this CLI workflow, and when to prefer the provider's own subagents and tasks over a separate hosted session. Before a new provider/terminal process starts, cagents installs it without replacing user content and prepends the matched CLI directory to that child's PATH. Claude uses the selected `CLAUDE_CONFIG_DIR/skills` (or `HOME/.claude/skills`); Codex and OMP use `HOME/.agents/skills`. Installation occurs under the account launch lease and never recreates a removed selected home.
 
@@ -200,3 +212,56 @@ If the deadline expires before a run’s first status arrives, `agent wait` keep
 any statuses already received and reports the unread IDs in `data.unresolved_runs`.
 Spawn/send retain their durable acceptance when that first status is unavailable.
 No run outcome is invented from missing status evidence.
+
+## Reads without startup
+
+Add the global `--no-start` flag, or set `CAGENTS_NO_START=1`, when a read should
+connect only to an already-running daemon. Missing local and selected-device
+daemons produce a `daemon_not_running` error instead of starting services.
+Transport failures remain errors and are distinguished from daemon absence.
+
+`cagents daemon stop` never starts a daemon. When the selected daemon is absent,
+it exits successfully; JSON output contains `data.state = "already_stopped"`.
+
+## Shell completions
+
+Generate completions from the installed command grammar. This does not contact
+or start a daemon:
+
+```sh
+cagents completions bash > ~/.local/share/bash-completion/completions/cagents
+cagents completions zsh > ~/.zfunc/_cagents
+cagents completions fish > ~/.config/fish/completions/cagents.fish
+```
+
+Create the destination directory first. Bash and fish load their completion files
+through the usual shell setup; add `~/.zfunc` to zsh's `fpath` before `compinit`.
+Elvish and PowerShell scripts are available with `completions elvish` and
+`completions powershell`. Regenerate after upgrading the CLI.
+
+Automation definition and history pages accept `--limit` from 1 through 100;
+values outside that range are refused. For definitions, pass the last returned
+UUID as `--after` to request the next page.
+
+Linear collection commands use the same plain tables and explicit empty states.
+Their `--json` payloads retain the original API fields and pagination metadata.
+Human pages indicate when more results are available; use `--after` to continue.
+Comments appear in a single table row; use JSON to preserve Markdown line breaks.
+
+Session directory tables keep full session IDs, lineage, view and delegation
+context. Session and whoami JSON retain their original directory metadata.
+
+## Terminal inventory output
+
+`cagents terminal list` shows running terminals with a header, observed native
+terminal titles and working directories. `--all` includes retained non-running
+entries; `--exited` selects entries with a recorded exit. Missing exit evidence
+is shown as “relaunch available”, not inferred to mean hibernated or successful.
+Titles stay unknown until the daemon observes a terminal title event.
+
+List JSON now uses a metadata-only `data.terminals` array with `id`, `state`,
+`title`, `attached`, `program`, `working_directory` and `exit` fields, plus the
+sampled daemon `proof` once at the top level. State names are snake_case.
+Scripts that previously read `data.terminals[].session.id` should read
+`data.terminals[].id`. Full launch environments and recovery descriptors remain
+available through `cagents terminal show ID --json`; list output omits them.

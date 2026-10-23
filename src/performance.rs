@@ -1,5 +1,8 @@
 //! Requested state commit -> matching view's first RedrawRequested.
 //! This is redraw scheduling, NOT submission, presentation, or scanout.
+
+#[cfg(feature = "ui")]
+pub mod chat_stage;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

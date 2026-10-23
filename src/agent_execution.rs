@@ -283,22 +283,27 @@ pub enum HostedSession {
 }
 
 impl HostedSession {
+    /// Equality alone also compares absent proofs. Explicit live activation
+    /// requires a complete issued proof before comparing current descriptors.
+    pub(crate) fn has_complete_proof(&self) -> bool {
+        match self {
+            Self::Chat(session) => session
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete),
+            Self::Terminal(session) => session
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete()),
+        }
+    }
+
     /// Runtime ownership excludes mutable conversation/presentation metadata.
     /// A successor proof or different launch never identifies this process.
     pub(crate) fn same_process(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Chat(a), Self::Chat(b)) => {
-                a.id == b.id
-                    && a.proof == b.proof
-                    && a.launch.provider == b.launch.provider
-                    && a.launch.recipe == b.launch.recipe
-            }
-            (Self::Terminal(a), Self::Terminal(b)) => {
-                a.id == b.id
-                    && a.launch == b.launch
-                    && a.continuity.live_proof().is_some()
-                    && a.continuity.live_proof() == b.continuity.live_proof()
-            }
+            (Self::Chat(a), Self::Chat(b)) => same_chat_process(a, b),
+            (Self::Terminal(a), Self::Terminal(b)) => same_terminal_process(a, b),
             _ => false,
         }
     }
@@ -309,6 +314,21 @@ impl HostedSession {
             Self::Terminal(session) => session.id,
         }
     }
+}
+
+/// Mutable thread and presentation metadata do not change runtime ownership.
+pub(crate) fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
+    a.id == b.id
+        && a.proof == b.proof
+        && a.launch.provider == b.launch.provider
+        && a.launch.recipe == b.launch.recipe
+}
+
+pub(crate) fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
+    a.id == b.id
+        && a.launch == b.launch
+        && a.continuity.live_proof().is_some()
+        && a.continuity.live_proof() == b.continuity.live_proof()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,7 +552,7 @@ pub enum Reply {
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
 /// outcome must never be assigned to the agent's currently active run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
     Started { provider_key: String },
     Waiting,
