@@ -3350,6 +3350,53 @@ mod tests {
     }
 
     #[test]
+    fn move_palette_keeps_selected_destination_across_live_ranking_changes() {
+        for query in [false, true] {
+            let (mut app, source, destination, pane) = channel_move_fixture();
+            app.workspace_model
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .title = "Other needle destination".into();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+            if query {
+                drop(app.update_palette(super::super::palette_ui::Action::Query("needle".into())));
+            }
+            let mut stronger = app.workspace_model.channel(destination).unwrap().clone();
+            stronger.id = ChannelId::new();
+            stronger.title = "needle first".into();
+            stronger.ordinal += 1;
+            app.workspace_model.channels.push(stronger);
+            drop(app.update_palette(super::super::palette_ui::Action::Submit));
+            assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+                scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
+            } if from == source && id == pane.id && to == destination));
+            assert!(app.pane_transfer_pending(pane.id));
+        }
+    }
+
+    #[test]
+    fn move_palette_does_not_substitute_another_live_destination_when_selected_one_disappears() {
+        let (mut app, _, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+        let mut replacement = app.workspace_model.channel(destination).unwrap().clone();
+        replacement.id = ChannelId::new();
+        app.workspace_model
+            .channels
+            .retain(|channel| channel.id != destination);
+        app.workspace_model.channels.push(replacement);
+        drop(app.update_palette(super::super::palette_ui::Action::Submit));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert!(app.palette.is_open());
+    }
+
+    #[test]
     fn a_queued_channel_drop_from_an_old_workspace_is_ignored() {
         let (mut app, _, destination, pane) = channel_move_fixture();
         let (tx, rx) = async_channel::unbounded();
