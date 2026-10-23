@@ -544,6 +544,13 @@ impl Handle {
             Ok(agent_execution::Reconciliation::Idle) => {
                 registry.finish_automation_release(firing.id, &agent, now)
             }
+            Ok(agent_execution::Reconciliation::Busy) => {
+                // No cleanup receipt yet. Keep both the exact owner and the
+                // existing schedule; later deadlines skip overlap normally.
+                // Retry on the ordinary scheduler cadence without replaying
+                // this run or undoing an explicit disable.
+                return Ok(false);
+            }
             Ok(agent_execution::Reconciliation::UserOwned) => {
                 registry.block_automation_release(
                     firing.id,
@@ -736,6 +743,255 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
 mod tests {
     use super::*;
     use crate::host::state::HostState;
+
+    #[test]
+    fn busy_cleanup_preserves_schedule_and_never_reenables_explicit_pause() {
+        use crate::{
+            agent_execution::{Destination, State, Update},
+            automations::{Definition, Schedule, SchedulePattern, SkipReason},
+            host::agent_execution::{
+                self,
+                tests::{fixture, isolated},
+            },
+        };
+        if isolated("host::automations::broker::tests::busy_cleanup_preserves_schedule_and_never_reenables_explicit_pause").is_some() {
+            return;
+        }
+        let (host, request, path) = fixture();
+        let Destination::New(spec) = request.destination else {
+            unreachable!()
+        };
+        let registry = agent_execution::registry(&host).unwrap();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: path.parent().unwrap().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+        }));
+        // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
+        // a real offline native actor held busy beyond the cleanup grace.
+        for mode in [SessionMode::Fresh, SessionMode::Reuse] {
+            for pause in [false, true] {
+                let root = path.parent().unwrap();
+                let _ = std::fs::remove_file(root.join("cleanup-release"));
+                let _ = std::fs::remove_file(root.join("cleanup-busy"));
+                let automation = service::create(
+                    &host,
+                    Definition {
+                        name: "Busy cleanup fixture".into(),
+                        prompt: "HOLD_CLEANUP_BUSY".into(),
+                        agent: spec.clone(),
+                        schedule: Schedule {
+                            pattern: SchedulePattern::Hourly { minute: 0 },
+                            timezone: "UTC".into(),
+                        },
+                        session_mode: mode,
+                        precheck: None,
+                    },
+                )
+                .unwrap();
+                let due = crate::automations::Occurrence {
+                    due_ms: 300,
+                    local: "fixture".into(),
+                };
+                let enabled = registry
+                    .lock()
+                    .unwrap()
+                    .set_automation_enabled(
+                        automation.id,
+                        automation.revision,
+                        Some(due.clone()),
+                        true,
+                        100,
+                    )
+                    .unwrap();
+                let claim = registry
+                    .lock()
+                    .unwrap()
+                    .claim_automation(
+                        enabled.id,
+                        enabled.execution_revision,
+                        None,
+                        Trigger::Manual {
+                            request: Uuid::new_v4(),
+                        },
+                        None,
+                        true,
+                        200,
+                    )
+                    .unwrap();
+                let accepted = claim.accepted.unwrap();
+                agent_execution::dispatch_accepted(&host, accepted.clone()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !root.join("cleanup-busy").exists() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // A terminal execution result does not prove its native actor
+                // is idle. Keep that distinction explicit at the model seam.
+                let current = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
+                registry
+                    .lock()
+                    .unwrap()
+                    .update_agent_run(
+                        current.id,
+                        current.revision,
+                        Update::Finished {
+                            state: State::Failed,
+                            result: Default::default(),
+                        },
+                        210,
+                    )
+                    .unwrap();
+                let firing = registry
+                    .lock()
+                    .unwrap()
+                    .reconcile_automation_run(current.id, 220)
+                    .unwrap()
+                    .unwrap();
+                let prompts = std::fs::read_to_string(root.join("prompts")).unwrap();
+                assert!(!handle.release_run(&host, &firing, 10_000).unwrap());
+                let retained = registry.lock().unwrap().automation(automation.id).unwrap();
+                assert!(retained.enabled);
+                assert_eq!(retained.next, Some(due.clone()));
+                assert_eq!(retained.active_firing, Some(firing.id));
+                assert!(retained.blocked.is_none());
+                let next = crate::automations::Occurrence {
+                    due_ms: 400,
+                    local: "next".into(),
+                };
+                let overlap = registry
+                    .lock()
+                    .unwrap()
+                    .claim_automation(
+                        enabled.id,
+                        enabled.execution_revision,
+                        Some(&due),
+                        Trigger::Scheduled {
+                            occurrence: due.clone(),
+                        },
+                        Some(next.clone()),
+                        false,
+                        300,
+                    )
+                    .unwrap();
+                assert_eq!(overlap.firing.skip, Some(SkipReason::Overlap));
+                assert!(overlap.accepted.is_none());
+                if pause {
+                    registry
+                        .lock()
+                        .unwrap()
+                        .set_automation_enabled(enabled.id, enabled.revision, None, false, 310)
+                        .unwrap();
+                    assert!(!handle.release_run(&host, &firing, 10_001).unwrap());
+                    assert!(
+                        !registry
+                            .lock()
+                            .unwrap()
+                            .automation(enabled.id)
+                            .unwrap()
+                            .enabled
+                    );
+                }
+                std::fs::write(root.join("cleanup-release"), "release").unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    handle.release_run(&host, &firing, 10_002).unwrap();
+                    let observed = registry.lock().unwrap().automation(enabled.id).unwrap();
+                    assert!(
+                        pause || observed.enabled,
+                        "cleanup unexpectedly paused {mode:?}: {observed:?}"
+                    );
+                    if registry
+                        .lock()
+                        .unwrap()
+                        .automation(enabled.id)
+                        .unwrap()
+                        .active_firing
+                        .is_none()
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "idle actor did not release"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let finished = registry.lock().unwrap().automation(enabled.id).unwrap();
+                assert_eq!(finished.enabled, !pause);
+                assert_eq!(finished.next, if pause { None } else { Some(next) });
+                let history = registry
+                    .lock()
+                    .unwrap()
+                    .automation_firing(firing.id)
+                    .unwrap();
+                assert_eq!(history.state, FiringState::Failed);
+                assert!(!history.release_pending);
+                assert_eq!(
+                    std::fs::read_to_string(root.join("prompts")).unwrap(),
+                    prompts
+                );
+                if !pause {
+                    let next = finished.next.as_ref().unwrap();
+                    let resumed = registry
+                        .lock()
+                        .unwrap()
+                        .claim_automation(
+                            finished.id,
+                            finished.execution_revision,
+                            Some(next),
+                            Trigger::Scheduled {
+                                occurrence: next.clone(),
+                            },
+                            Some(crate::automations::Occurrence {
+                                due_ms: 500,
+                                local: "later".into(),
+                            }),
+                            false,
+                            400,
+                        )
+                        .unwrap()
+                        .accepted
+                        .expect("future schedule should remain runnable");
+                    assert_eq!(
+                        resumed.agent.id == accepted.agent.id,
+                        mode == SessionMode::Reuse
+                    );
+                    agent_execution::dispatch_accepted(&host, resumed.clone()).unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let run = registry.lock().unwrap().agent_run(resumed.run.id).unwrap();
+                        if run.state.is_terminal() {
+                            assert_eq!(run.state, State::Succeeded);
+                            break;
+                        }
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("prompts")).unwrap(),
+                        format!("{prompts}prompt\n")
+                    );
+                    let latest = registry
+                        .lock()
+                        .unwrap()
+                        .latest_agent_run(resumed.agent.id)
+                        .unwrap();
+                    agent_execution::reconcile_agent_run(&host, &latest, true).unwrap();
+                }
+                let latest = registry
+                    .lock()
+                    .unwrap()
+                    .latest_agent_run(accepted.agent.id)
+                    .unwrap();
+                agent_execution::reconcile_agent_run(&host, &latest, true).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn scheduler_retries_a_panicked_tick_and_stops() {

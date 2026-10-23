@@ -30,9 +30,25 @@ struct Entry {
     last_full_scan: Instant,
 }
 
+/// The window's watcher and the channel its wakes arrive on.
+struct Watch {
+    monitor: git_watch::Monitor,
+    receiver: async_channel::Receiver<()>,
+}
+
+impl Watch {
+    fn start() -> std::io::Result<Self> {
+        let (wake, receiver) = async_channel::bounded(1);
+        let monitor = git_watch::Monitor::start(move || {
+            let _ = wake.try_send(());
+        })?;
+        Ok(Self { monitor, receiver })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
-    monitor: Option<git_watch::Monitor>,
+    watch: Option<Watch>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
 }
@@ -74,8 +90,8 @@ impl State {
     }
 
     fn configure(&self) {
-        if let Some(monitor) = &self.monitor {
-            monitor.configure(
+        if let Some(watch) = &self.watch {
+            watch.monitor.configure(
                 self.entries
                     .values()
                     .filter_map(|entry| entry.plan.clone())
@@ -94,7 +110,11 @@ impl State {
         if let Some(error) = &change.error {
             entry.fallback = Some(error.clone());
         }
-        if change.worktrees.is_empty() && !change.topology && !change.membership {
+        if change.worktrees.is_empty()
+            && !change.references
+            && !change.topology
+            && !change.membership
+        {
             return;
         }
         entry.pending.merge(change);
@@ -154,10 +174,10 @@ impl Cagents {
                 ));
             }
         }
-        let failure = if state.monitor.is_none() {
-            match git_watch::Monitor::start() {
-                Ok(monitor) => {
-                    state.monitor = Some(monitor);
+        let failure = if state.watch.is_none() {
+            match Watch::start() {
+                Ok(watch) => {
+                    state.watch = Some(watch);
                     None
                 }
                 Err(error) => Some(error.to_string()),
@@ -198,20 +218,20 @@ impl Cagents {
     pub(super) fn git_subscription(&self) -> Subscription<Message> {
         self.refresh_ui
             .git
-            .monitor
+            .watch
             .as_ref()
-            .map_or_else(Subscription::none, |monitor| {
-                Subscription::run_with(Source(monitor.receiver.clone()), stream)
+            .map_or_else(Subscription::none, |watch| {
+                Subscription::run_with(Source(watch.receiver.clone()), stream)
                     .map(|()| Message::GitUi(Action::Changed))
             })
     }
 
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
-        if self.refresh_ui.git.monitor.is_none()
+        if self.refresh_ui.git.watch.is_none()
             && !self.refresh_ui.git.entries.is_empty()
-            && let Ok(monitor) = git_watch::Monitor::start()
+            && let Ok(watch) = Watch::start()
         {
-            self.refresh_ui.git.monitor = Some(monitor);
+            self.refresh_ui.git.watch = Some(watch);
             self.refresh_ui.git.configure();
         }
         let open = self
@@ -328,9 +348,9 @@ impl Cagents {
                 let changes = self
                     .refresh_ui
                     .git
-                    .monitor
+                    .watch
                     .as_ref()
-                    .map(git_watch::Monitor::drain)
+                    .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
                 for (project, change) in changes {
                     if let Some(error) = &change.error
@@ -512,7 +532,10 @@ fn read_local_with_plan(
     }
     let mut vanished = HashSet::new();
     for (record, status) in &mut snapshot.worktrees {
-        if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
+        // Shared refs move every worktree's upstream comparison.
+        if record.bare
+            || (!change.topology && !change.references && !change.worktrees.contains(&record.id))
+        {
             continue;
         }
         let current = match git.status_with_untracked(&record.path, false, &cancellation) {

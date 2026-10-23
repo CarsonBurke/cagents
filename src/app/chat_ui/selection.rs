@@ -1073,6 +1073,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 if let Some(ranges) = &ranges {
                     let text = read.copy(ranges);
                     if !text.is_empty() {
+                        super::text_copy::invalidate();
                         clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
                         captured = true;
                     }

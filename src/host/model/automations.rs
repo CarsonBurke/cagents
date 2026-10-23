@@ -333,6 +333,27 @@ impl Registry {
         rows.into_iter().map(|record| decode(&record)).collect()
     }
 
+    /// Target directories of automations with a firing in progress, including
+    /// one still in its precheck that has no agent yet.
+    pub(crate) fn active_automation_directories(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let mut query = self
+            .db
+            .prepare("SELECT record FROM automations WHERE active_firing IS NOT NULL")
+            .map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        records
+            .iter()
+            .map(|record| {
+                decode::<Automation>(record)
+                    .map(|automation| automation.definition.agent.target.directory)
+            })
+            .collect()
+    }
+
     /// Precheck-only ownership has no hosted session in ordinary update
     /// inventory. Include uncertain cleanup until its exact receipt releases
     /// the active slot. Caller queries outside HostState under the update gate.

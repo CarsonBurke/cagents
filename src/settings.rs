@@ -681,6 +681,10 @@ const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
 
+const fn default_work_stale_after_days() -> u16 {
+    crate::work::DEFAULT_STALE_AFTER_DAYS
+}
+
 const fn default_check_for_updates() -> bool {
     true
 }
@@ -905,6 +909,10 @@ pub struct AppSettings {
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// Days without activity after which a Work board card is stale. The
+    /// daemon reads it from this file too; see `crate::work::stale_after_days`.
+    #[serde(default = "default_work_stale_after_days")]
+    pub work_stale_after_days: u16,
     /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
     /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
     /// without it is read as revision 1, and loading records the revision it
@@ -988,6 +996,7 @@ impl Default for AppSettings {
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
+            work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
             lsp_max_sessions: default_lsp_max_sessions(),
@@ -1654,6 +1663,11 @@ impl AppSettings {
         if self.hibernation_delay_ms > MAX_TOML_INTEGER {
             return Err(SettingsError::Invalid(
                 "hibernation_delay_ms must not exceed 9223372036854775807",
+            ));
+        }
+        if !(1..=crate::work::MAX_STALE_AFTER_DAYS).contains(&self.work_stale_after_days) {
+            return Err(SettingsError::Invalid(
+                "work_stale_after_days must be between 1 and 365",
             ));
         }
         if !(0.8..=1.5).contains(&self.ui_scale) {

@@ -80,7 +80,7 @@ dependencies = [
  "futures-lite",
  "serde",
  "tokio",
- "tokio-stream",
+ "tracing",
  "zbus 5.19.0",
 ]
 
@@ -1181,6 +1181,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cagents"
 version = "0.1.3"
 dependencies = [
+ "accesskit_unix",
  "arc-swap",
  "ashpd 0.12.3",
  "async-channel",
@@ -4525,6 +4526,7 @@ name = "iced_winit"
 version = "0.14.0"
 dependencies = [
  "build_helpers",
+ "clipboard_x11",
  "cosmic-client-toolkit",
  "cursor-icon",
  "dnd",
@@ -4548,6 +4550,7 @@ dependencies = [
  "window_clipboard",
  "winit",
  "winit-core",
+ "x11rb",
  "xkbcommon 0.7.0",
  "xkbcommon-dl",
  "xkeysym",
@@ -10326,7 +10329,6 @@ dependencies = [
 [[package]]
 name = "smithay-clipboard"
 version = "0.8.0"
-source = "git+https://github.com/pop-os/smithay-clipboard?tag=sctk-0.20#859b02c88f45c554049a67c6ddeec1692ce0e20b"
 dependencies = [
  "libc",
  "raw-window-handle",

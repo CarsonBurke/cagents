@@ -155,7 +155,27 @@ use crate::{
 /// Version 98 combines notification context with account-default selection.
 /// Version 99 preserves version 98 and adds the version 96 terminal-title
 /// descriptor layout, requiring matched positional postcard peers.
-pub const PROTOCOL_VERSION: u16 = 99;
+/// Version 100 appends native chat capacity and guarded release controls.
+/// Version 101 requires atomic adoption of recovered native identities into
+/// managed panes and shared admission. The updater must replace older hosts
+/// even though the read-only inventory DTO layout remains unchanged.
+/// Version 102 preserves version 101 and adds immutable native text-copy
+/// sidecars to Snapshot and a requester-specific paged reply. The three
+/// executables require this matched positional postcard layout; JSON defaults
+/// do not preserve binary compatibility.
+/// Version 103 adds retained Claude actor continuity to native descriptors and
+/// snapshots. Private actor protocol 2 has a separate authenticated namespace.
+/// Version 104 preserves version 103 and appends the Work board request and
+/// its response. The Work board subscription - `ClientRequest::WatchWork`,
+/// `work::Response::Watching` and `ServerMessage::WorkBoard` - deliberately
+/// does not move it, for the reasons terminal-inventory observation did not:
+/// each is appended, and none reaches a peer that cannot issue the request.
+/// Worktree removal - `work::Request::{RemovalPlan, Remove, Snapshots}` and
+/// their responses - is appended under the same policy.
+/// Version 105 adds immutable image-reference metadata to Attachment and
+/// ItemContent::Image. These are positional postcard fields, so all three
+/// executables must be replaced together; JSON omission alone is compatible.
+pub const PROTOCOL_VERSION: u16 = 105;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -486,6 +506,25 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Resident native handles; this is independent of provider usage quotas.
+    ChatCapacityInspect,
+    ChatCapacitySet {
+        limit: u32,
+    },
+    ChatReleaseInspect {
+        chat_id: TerminalId,
+    },
+    /// Revalidate the exact inspected actor before releasing its resident handle.
+    ChatRelease {
+        proof: ChatReleaseProof,
+        dry_run: bool,
+    },
+    /// Reads the Work board or pins one of its cards.
+    Work(crate::work::Request),
+    /// Subscribes this connection to the whole Work board and returns it in
+    /// the same response, as [`crate::work::Response::Watching`]. Each later
+    /// change arrives as [`ServerMessage::WorkBoard`].
+    WatchWork,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,6 +730,14 @@ pub enum ServerMessage {
     NotificationActivated {
         target: crate::notifications::Target,
     },
+    /// The whole Work board after a change, delivered only to a connection
+    /// that subscribed with [`ClientRequest::WatchWork`]. `revision` grows with
+    /// every board the daemon sends, so a receiver keeps the newest of a board
+    /// pushed while its subscription was being answered and the answer.
+    WorkBoard {
+        revision: u64,
+        board: Box<crate::work::Board>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -793,6 +840,59 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ChatCapacity {
+        capacity: ChatCapacity,
+        persistence_warning: Option<String>,
+    },
+    ChatReleaseInspected {
+        inspection: ChatReleaseInspection,
+    },
+    ChatReleased {
+        inspection: ChatReleaseInspection,
+        dry_run: bool,
+    },
+    ChatTextCopy {
+        chat_id: TerminalId,
+        page: crate::chat::TextCopyPage,
+    },
+    Work(crate::work::Response),
+}
+
+/// Maximum compact inventory rows in one capacity response.
+pub const MAX_CHAT_CAPACITY_ROWS: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacity {
+    /// Distinct admission slots; recovery can reserve an already resident ID.
+    pub used: u32,
+    pub resident: u32,
+    pub spawning: u32,
+    pub limit: u32,
+    pub residents: Vec<ChatCapacityResident>,
+    pub omitted_residents: u32,
+}
+
+/// Cheap resident inventory; eligibility still requires a per-ID inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacityResident {
+    pub chat_id: TerminalId,
+    pub provider: crate::agent::Provider,
+    pub status: String,
+    /// None means verification is still required, never permission to release.
+    pub release_blocked: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseProof {
+    pub session: crate::chat::Session,
+    pub execution_instance: uuid::Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseInspection {
+    pub proof: ChatReleaseProof,
+    pub release_blocked: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -894,6 +994,7 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+    ChatCapacity,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1871,6 +1972,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes)).unwrap(),
+            Some(response)
+        );
+        let mut legacy = serde_json::to_value(crate::chat::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("native_continuity");
+        let legacy: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.native_continuity,
+            crate::chat::NativeContinuity::ReconnectOnly
+        );
+    }
+
+    #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
         struct TimeoutReader {
             bytes: Vec<u8>,
@@ -2139,6 +2266,99 @@ mod tests {
     }
 
     #[test]
+    fn managed_image_identity_roundtrips_prompt_and_snapshot_with_json_legacy_defaults() {
+        let reference = crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 19,
+            device: uuid::Uuid::new_v4(),
+            name: "literal *.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        let attachment = crate::chat::Attachment {
+            path: "/private/image.png".into(),
+            reference: Some(reference.clone()),
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id: TerminalId::new(),
+            command: crate::chat::Command::Prompt {
+                text: format!("Inspect {}", reference.token()),
+                attachments: vec![attachment.clone()],
+                mode: crate::chat::PromptMode::Send,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(
+            read_frame::<ClientRequest>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            request
+        );
+        let image = crate::chat::ItemContent::Image {
+            path: attachment.path.to_str().unwrap().into(),
+            description: reference.label(),
+            reference: Some(reference.clone()),
+        };
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                items: vec![Arc::new(crate::chat::Item {
+                    id: "image".into(),
+                    role: crate::chat::Role::User,
+                    content: image.clone(),
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            response
+        );
+        let legacy = serde_json::json!({"path":"/legacy.png"});
+        assert_eq!(
+            serde_json::from_value::<crate::chat::Attachment>(legacy)
+                .unwrap()
+                .reference,
+            None
+        );
+        let mut legacy_image = serde_json::to_value(image).unwrap();
+        legacy_image["Image"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reference");
+        assert!(matches!(
+            serde_json::from_value::<crate::chat::ItemContent>(legacy_image).unwrap(),
+            crate::chat::ItemContent::Image {
+                reference: None,
+                ..
+            }
+        ));
+        #[derive(serde::Serialize)]
+        struct LegacyAttachment {
+            path: PathBuf,
+        }
+        let legacy = postcard::to_stdvec(&LegacyAttachment {
+            path: "/legacy.png".into(),
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
+            "JSON defaults cannot repair positional postcard layout"
+        );
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
+    }
+
+    #[test]
     fn chat_fast_mode_and_estimate_round_trip_with_legacy_json_defaults() {
         let snapshot = crate::chat::Snapshot {
             fast_mode: Some(crate::chat::FastMode {
@@ -2238,6 +2458,47 @@ mod tests {
         let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.prompt_suggestion, None);
         assert_eq!(restored.turn_generation, 7);
+    }
+
+    #[test]
+    fn chat_text_copy_request_and_reply_preserve_exact_source_and_raw_text() {
+        use crate::chat::{Command, TextCopyPage, TextCopyScope, TextCopySource};
+        let chat_id = TerminalId::new();
+        let source = TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: TextCopyScope::Subagent {
+                id: "same#opaque-id".into(),
+            },
+            token: 17,
+            revision: 29,
+            bytes: 9,
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id,
+            command: Command::ReadTextCopy {
+                source: source.clone(),
+                offset: 3,
+            },
+        };
+        let encoded = postcard::to_allocvec(&request).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&encoded).unwrap(),
+            request
+        );
+        let response = ServerResponse::ChatTextCopy {
+            chat_id,
+            page: TextCopyPage {
+                source,
+                offset: 3,
+                text: "猫\r\n ".into(),
+                done: true,
+            },
+        };
+        let encoded = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

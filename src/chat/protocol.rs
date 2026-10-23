@@ -8,6 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 mod claude_titles;
 pub mod codex;
+mod image_references;
 pub mod omp;
 mod terminal_output;
 
@@ -36,7 +37,7 @@ pub struct ProcessSpec {
     /// Recognizes the messages the daemon delivered among the prompts the
     /// transcript records, so they are shown as messages rather than as the
     /// user's own words.
-    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -97,9 +98,46 @@ pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let directory = if relative.as_os_str().is_empty() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")
+                .map_err(|error| error.to_string())
+        } else {
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin the selected provider directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if !directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            return Err("The selected provider directory is not a folder".into());
+        }
+        let context = Self::new(Some(std::sync::Arc::new(directory)));
+        context.verify_directory(path)?;
+        Ok(context)
+    }
+
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
@@ -126,6 +164,9 @@ impl ExecutionContext {
                 .map_err(|error| error.to_string()),
             None => Ok(self.expected_directory),
         }
+    }
+    pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.directory.clone()
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
@@ -172,6 +213,36 @@ impl ExecutionContext {
         }
         Ok(state.outcome)
     }
+    /// Minted only after typed preparation has pinned the private launch and
+    /// updated the adapter before initialize. A process cwd alone is no proof
+    /// of a resumed provider thread's operational directory.
+    pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.directory_descriptor().is_none() {
+            return Err("Provider scope requires its admitted directory descriptor".into());
+        }
+        self.verify_directory(path)?;
+        *self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
+        Ok(())
+    }
+    pub(crate) fn provider_directory_observed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        if self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            != Some(path)
+        {
+            return Ok(false);
+        }
+        self.verify_directory(path)?;
+        Ok(true)
+    }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
             return Ok(());
@@ -217,6 +288,11 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Private launch selection, distinct from a provider-confirmed session.
+    /// Only a provider with a retained bootstrap contract supplies this value.
+    fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {
+        None
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
@@ -241,6 +317,17 @@ pub trait Adapter: Send {
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
+}
+
+/// Reconstruct a saved reader without granting permission to launch a provider.
+/// Support is deliberately limited to adapters with a local history transport.
+pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    match launch.provider {
+        crate::agent::Provider::Claude => claude::create_history(launch),
+        _ => {
+            Err("This provider does not support restoring a local read-only history reader".into())
+        }
+    }
 }
 
 /// Record a provider-confirmed conversation rotation in the launch recipe.
@@ -278,6 +365,56 @@ mod launch_tests {
         fn cleanup(&self) -> Result<LaunchOutcome, String> {
             Ok(*self.0.lock().unwrap())
         }
+    }
+
+    #[test]
+    fn provider_directory_observation_requires_a_pinned_exact_launch_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let other = root.path().join("other");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let context = ExecutionContext::capture(&original).unwrap();
+        let identity = context.directory_identity().unwrap().unwrap();
+        assert!(!context.provider_directory_observed(&original).unwrap());
+        assert!(context.observe_provider_directory(&other).is_err());
+        assert!(!context.provider_directory_observed(&other).unwrap());
+        context.observe_provider_directory(&original).unwrap();
+        assert!(context.provider_directory_observed(&original).unwrap());
+        assert!(!context.provider_directory_observed(&other).unwrap());
+        assert!(
+            ExecutionContext::default()
+                .observe_provider_directory(&original)
+                .is_err()
+        );
+        assert!(
+            ExecutionContext::restored(identity)
+                .observe_provider_directory(&original)
+                .is_err()
+        );
+
+        // Renaming preserves the retained descriptor but never grants authority
+        // to the replacement at the original spelling or observes a new path.
+        let moved = root.path().join("moved");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert_eq!(context.directory_identity().unwrap(), Some(identity));
+        assert!(context.provider_directory_observed(&original).is_err());
+        assert!(!context.provider_directory_observed(&moved).unwrap());
+    }
+
+    #[test]
+    fn execution_directory_capture_refuses_relative_paths_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"fixture").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+        assert!(ExecutionContext::capture(std::path::Path::new("relative")).is_err());
+        assert!(ExecutionContext::capture(&file).is_err());
+        assert!(ExecutionContext::capture(&alias).is_err());
+        assert!(ExecutionContext::capture(&alias.join("file")).is_err());
+        assert!(ExecutionContext::capture(std::path::Path::new("/")).is_ok());
     }
 
     #[test]

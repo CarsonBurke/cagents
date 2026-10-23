@@ -28,14 +28,19 @@ mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
+pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+mod native_actor;
+mod native_actor_retirement;
+pub(super) use native_actor::NativeActorEvent;
+pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod navigation;
 mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 15;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -574,6 +579,14 @@ fn migrate_through(
     if version < 13 && target >= 13 {
         views::migrate_terminal_sources(tx)?;
         schema::migration_checkpoint(13)?;
+    }
+    if version < 14 && target >= 14 {
+        native_actor::migrate(tx)?;
+        schema::migration_checkpoint(14)?;
+    }
+    if version < 15 && target >= 15 {
+        native_actor_retirement::migrate(tx)?;
+        schema::migration_checkpoint(15)?;
     }
     Ok(())
 }

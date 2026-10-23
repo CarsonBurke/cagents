@@ -581,27 +581,35 @@ impl SidebarProject {
             crate::github::review_requests::scan::Requested,
         >,
     ) {
-        let apply = |row: &mut SidebarPullRequest| {
-            let request = requested.get(&row.number);
-            row.needs_review = request.is_some();
-            row.review_requested_again = request.is_some_and(|request| {
-                request.history == crate::github::review_requests::scan::History::ReRequested
-            });
+        let flags = |number: u64| {
+            let request = requested.get(&number);
+            (
+                request.is_some(),
+                request.is_some_and(|request| {
+                    request.history == crate::github::review_requests::scan::History::ReRequested
+                }),
+            )
         };
         for row in &mut self.pull_requests {
-            apply(row);
+            (row.needs_review, row.review_requested_again) = flags(row.number);
         }
         if let Some(cached) = &mut self.cached_display {
             for row in &mut cached.rows {
-                apply(row);
+                (row.needs_review, row.review_requested_again) = flags(row.number);
             }
         }
+        // Discovery reapplies the same requests on nearly every pass, and a
+        // worktree's row can only be replaced whole, so it is cloned only
+        // when its flags actually differ.
         for worktree in &mut self.worktrees {
-            if let Some(mut row) = worktree.pull_request().cloned() {
-                apply(&mut row);
-                if worktree.pull_request() != Some(&row) {
-                    worktree.set_pull_request(row);
-                }
+            let Some(row) = worktree.pull_request() else {
+                continue;
+            };
+            let flags = flags(row.number);
+            if flags != (row.needs_review, row.review_requested_again) {
+                let mut row = row.clone();
+                (row.needs_review, row.review_requested_again) = flags;
+                worktree.set_pull_request(row);
             }
         }
     }
@@ -3413,6 +3421,7 @@ impl SidebarState {
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
             | SidebarAction::OpenAutomations
+            | SidebarAction::OpenWork
             | SidebarAction::Stage { .. }
             | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
@@ -3578,6 +3587,8 @@ pub enum SidebarAction {
     },
     OpenSettings,
     OpenAutomations,
+    /// Opens the window's Work board.
+    OpenWork,
 
     OpenCommit {
         key: ActiveWorktreeKey,
@@ -4213,9 +4224,9 @@ fn utilities<'a>(
     .on_press_maybe(gated(SidebarAction::ToggleProjects, modal_open))
     .id(Id::new("command.toggle-projects"))
     .into();
-    let [settings, automations] = utility_controls(modal_open, Some(shortcuts));
+    let [settings, automations, work] = utility_controls(modal_open, Some(shortcuts));
     if compact {
-        let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
+        let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations, work];
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(space::XS)
@@ -4227,6 +4238,7 @@ fn utilities<'a>(
         widget::row::with_children(vec![
             settings,
             automations,
+            work,
             cosmic::iced::widget::Space::new()
                 .width(Length::Fill)
                 .into(),
@@ -4243,7 +4255,7 @@ fn utilities<'a>(
 fn utility_controls<'a>(
     modal_open: bool,
     shortcuts: Option<&crate::settings::KeyboardShortcuts>,
-) -> [Element<'a, SidebarAction>; 2] {
+) -> [Element<'a, SidebarAction>; 3] {
     let label = shortcuts.map_or_else(
         || "Settings".to_owned(),
         |shortcuts| {
@@ -4262,21 +4274,25 @@ fn utility_controls<'a>(
         .on_press_maybe(gated(SidebarAction::OpenAutomations, modal_open))
         .id(stable_id("automations"))
         .into();
-    [settings, automations]
+    let work = crate::ui_controls::icon_button(Icon::Board, "Work board")
+        .on_press_maybe(gated(SidebarAction::OpenWork, modal_open))
+        .id(stable_id("work"))
+        .into();
+    [settings, automations, work]
 }
 
 // The standalone editor still mounts its utility controls below its file pane.
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
-    let [settings, automations] = utility_controls(modal_open, None);
+    let [settings, automations, work] = utility_controls(modal_open, None);
     if compact {
-        widget::column::with_children(vec![automations, settings])
+        widget::column::with_children(vec![work, automations, settings])
             .align_x(Alignment::Center)
             .spacing(space::XS)
             .padding(space::XS)
             .width(Length::Fill)
             .into()
     } else {
-        widget::row::with_children(vec![automations, settings])
+        widget::row::with_children(vec![work, automations, settings])
             .align_y(Alignment::Center)
             .padding(space::XS)
             .width(Length::Fill)
@@ -9313,18 +9329,14 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             design::caption("Discarded work is not recoverable from Git.").into(),
-            widget::row::with_children(vec![
+            crate::app::dialog_ui::confirmation_actions(
                 crate::ui_controls::button::secondary("Cancel")
                     .id(discard_cancel_id())
-                    .on_press(SidebarAction::CancelDiscard)
-                    .into(),
+                    .on_press(SidebarAction::CancelDiscard),
                 crate::ui_controls::button::destructive("Discard")
                     .id(discard_confirm_id())
-                    .on_press(pending.confirm_action())
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
+                    .on_press(pending.confirm_action()),
+            ),
         ])
         .spacing(space::M),
         520.0,
@@ -12457,10 +12469,10 @@ pub(crate) mod tests {
 
     #[test]
     fn worktree_labels_keep_literal_branches_through_pr_lifecycle() {
-        let branch = "CarsonBurke/claws-turnstile-fix";
+        let branch = "Developer/browser-challenge-fix";
         let mut row = worktree(11, branch, false);
         assert_eq!(&*row.chrome.label, branch);
-        assert!(row.matches("carsonburke/"));
+        assert!(row.matches("developer/"));
         let mut pr = project().pull_requests.remove(0);
         pr.title = "Fix browser challenge handling".into();
         row.set_pull_request(pr);

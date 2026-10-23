@@ -15,6 +15,9 @@ pub(crate) struct Detached {
     pub record: Record,
     pub source: super::super::Session,
     pub proof: HostSessionProof,
+    pub(crate) original_role: Option<registry::OriginalRole>,
+    /// The receipt keeps its publishing lease; current cleanup authority is separate.
+    pub(super) receipt_proof: HostSessionProof,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +93,28 @@ fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
 }
 
 impl Detached {
+    /// Used only after find_source has authenticated the exact durable receipt
+    /// and full issued-source digest; never from an untrusted candidate record.
+    pub(crate) fn from_receipt(
+        record: Record,
+        source: crate::chat::Session,
+        proof: HostSessionProof,
+    ) -> Result<Self, String> {
+        let receipt =
+            find_source(&source, &proof)?.ok_or("The native cleanup receipt is unavailable")?;
+        if receipt.record != record {
+            return Err("Native cleanup receipt changed".into());
+        }
+        let original_role = registry::OriginalRole::authenticated(&record, &receipt.proof, &proof)?;
+        Ok(Self {
+            record,
+            source,
+            proof,
+            original_role,
+            receipt_proof: receipt.proof,
+        })
+    }
+
     pub fn close(&self) -> Result<(), String> {
         self.close_inner(false)
     }
@@ -123,12 +148,22 @@ impl Detached {
         self.receipt(false)
     }
 
+    fn matches_receipt(&self, receipt: &Receipt) -> bool {
+        receipt.record == self.record
+            && receipt.proof == self.receipt_proof
+            && (receipt.record.application == crate::instance::APPLICATION_ID
+                || self
+                    .original_role
+                    .as_ref()
+                    .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
+    }
+
     pub(super) fn receipt(&self, retain: bool) -> Result<bool, String> {
         consume(
             self.record.terminal,
             &self.record.holder,
             retain,
-            |receipt| receipt.record == self.record && receipt.proof == self.proof,
+            |receipt| self.matches_receipt(receipt),
         )
     }
 }
@@ -236,7 +271,8 @@ fn find_source(
         return Err("Native cleanup caller does not own the daemon lease".into());
     }
     let directory = registry::directory(Kind::Native)?;
-    let current = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?;
+    let current =
+        registry::recovery_candidate(&registry::socket(&directory, source.id), Kind::Native)?;
     let digest = source_digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
@@ -267,7 +303,15 @@ fn find_source(
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && (receipt.record.application == crate::instance::APPLICATION_ID
+                    || (source.proof.as_ref().is_some_and(|issued| {
+                        issued.is_complete() && issued.boot_id == receipt.record.boot
+                    }) && registry::OriginalRole::authenticated(
+                        &receipt.record,
+                        &receipt.proof,
+                        proof,
+                    )
+                    .is_ok()))
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()
@@ -286,4 +330,54 @@ fn find_source(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_receipt_keeps_publishing_proof_separate_from_successor_authority() {
+        // Pure receipt matcher: actual construction still requires find_source's
+        // exact digest, current lease, dead owner and discovery-retirement checks.
+        let source = super::super::tests::recovery().source;
+        let original = source.proof.clone().unwrap();
+        let mut successor = original.clone();
+        successor.host_incarnation = "successor-cleanup".into();
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: original.boot_id.clone(),
+            terminal: source.id,
+            holder: Process { pid: 42, start: 1 },
+            root: Process { pid: 43, start: 2 },
+        };
+        let receipt = Receipt {
+            record: record.clone(),
+            proof: original.clone(),
+            sources: vec![source_digest(&source).unwrap()],
+            paired_closed: true,
+            paired_holder: None,
+        };
+        let detached = Detached {
+            record,
+            source,
+            proof: successor.clone(),
+            original_role: None,
+            receipt_proof: original,
+        };
+        assert_ne!(detached.proof, detached.receipt_proof);
+        assert!(detached.matches_receipt(&receipt));
+        let mut changed = receipt.clone();
+        changed.proof = successor;
+        assert!(!detached.matches_receipt(&changed));
+        changed = receipt.clone();
+        changed.record.holder.start += 1;
+        assert!(!detached.matches_receipt(&changed));
+        changed = receipt;
+        changed.record.application = "another.installation".into();
+        assert!(!detached.matches_receipt(&changed));
+    }
 }

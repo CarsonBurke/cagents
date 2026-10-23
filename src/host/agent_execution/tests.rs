@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+#[cfg(target_os = "linux")]
+mod retained_automation;
 
 use super::*;
 use crate::{
@@ -13,9 +15,24 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 
 // Environment isolation also proves the service does not depend on any user's
 // account, project, provider installation, or running daemon.
-fn isolated(name: &str) -> Option<tempfile::TempDir> {
+pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
+    const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        // Only this helper sets the presence marker. The separate owned-late-
+        // decision controller also uses CHILD, without this helper's spawn.
+        if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
+            let expected = match expected.as_str() {
+                "present" => true,
+                "absent" => false,
+                _ => panic!("invalid fixture authority presence marker"),
+            };
+            assert_eq!(
+                Authority::from_environment() != Authority::default(),
+                expected,
+                "isolated child lost its inherited authority scope"
+            );
+        }
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
@@ -34,14 +51,33 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Keep the caller's delegation inherited unchanged, without inspecting or
+    // copying its value. Every other environment input is fixture-owned.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+            command.env_remove(name);
+        }
+    }
+    let result = command
         .args([
             "--exact",
-            &format!("host::agent_execution::tests::{name}"),
+            &if name.contains("::") {
+                name.to_owned()
+            } else {
+                format!("host::agent_execution::tests::{name}")
+            },
             "--nocapture",
         ])
-        .env_clear()
         .env(CHILD, name)
+        .env(
+            INHERITED_SCOPE,
+            if Authority::from_environment() != Authority::default() {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .env("CAGENTS_EXECUTION_FIXTURE", root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -103,6 +139,15 @@ while IFS= read -r frame; do
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
       case "$frame" in
+        *HOLD_CLEANUP_BUSY*)
+          : > "$HOME/../cleanup-busy"
+          attempts=0
+          while [ ! -e "$HOME/../cleanup-release" ]; do
+            attempts=$((attempts + 1))
+            [ "$attempts" -lt 1000 ] || exit 1
+            sleep 0.01
+          done
+          ;;
         *COURIER_BACKGROUND*)
           printf '{"type":"assistant","uuid":"launch-child","message":{"id":"launch-child","role":"assistant","content":[{"type":"tool_use","id":"courier-child","name":"Agent","input":{"run_in_background":true}}]}}\n'
           printf '{"type":"user","uuid":"child-launch-result","tool_use_result":{"status":"async_launched","agentId":"courier-agent"},"message":{"content":[{"type":"tool_result","tool_use_id":"courier-child","content":"Launched"}]}}\n'
@@ -135,6 +180,440 @@ while IFS= read -r frame; do
 done
 "#).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn owning_close_retires_a_restored_chat_without_a_ui_subscriber() {
+    if isolated("owning_close_retires_a_restored_chat_without_a_ui_subscriber").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(model_source) = agent.session.unwrap() else {
+        panic!("fixture did not create a native chat");
+    };
+    // The fake provider confirms its selected UUID only after the first user
+    // frame, after the fresh launch descriptor has been bound in the model.
+    assert_eq!(model_source.launch.session_id, None);
+    let id = model_source.id;
+    let handle = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        // Startup restoration has no UI attachment. In particular, execution
+        // ownership is not represented by a synthetic client-zero subscriber.
+        record.subscribers.clear();
+        let confirmed = record
+            .handle
+            .confirmed_session_id()
+            .expect("settled provider UUID");
+        record.session.launch.session_id = Some(confirmed);
+        assert_ne!(
+            record.session.launch.session_id,
+            model_source.launch.session_id
+        );
+        assert!(crate::agent_execution::same_chat_process(
+            &record.session,
+            &model_source
+        ));
+        record.handle.clone()
+    };
+    let refusal = super::super::chat::process(&host, 0, ClientRequest::ChatClose { chat_id: id })
+        .expect_err("unattached UI close unexpectedly succeeded");
+    assert_eq!(
+        refusal.code,
+        crate::terminal_ipc::ProtocolErrorCode::PermissionDenied
+    );
+    assert!(refusal.message.contains("not attached"), "{refusal:?}");
+    assert!(!handle.is_completed());
+    assert!(host.lock().unwrap().chats[&id].subscribers.is_empty());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+
+    let reply = process(
+        &host,
+        Authority::default(),
+        Operation::Close(accepted.agent.id),
+    )
+    .expect("authenticated owning Close must not require UI subscription");
+    let Reply::Closed(closed) = reply else {
+        panic!("unexpected close reply: {reply:?}")
+    };
+    assert!(closed.closed);
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!host.lock().unwrap().chats.contains_key(&id));
+    assert!(
+        handle.is_completed(),
+        "owning Close did not retire the exact provider"
+    );
+}
+
+#[test]
+fn owning_close_refuses_a_current_chat_outside_the_model_process_identity() {
+    if isolated("owning_close_refuses_a_current_chat_outside_the_model_process_identity").is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let id = agent.session.unwrap().id();
+    let (original, handle) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&id).unwrap();
+        record.subscribers.clear();
+        let original = record.session.clone();
+        record
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_FIXTURE_CHANGED_OWNER".into(), "different".into());
+        (original, record.handle.clone())
+    };
+    let error = process(
+        &host,
+        Authority::default(),
+        Operation::Close(accepted.agent.id),
+    )
+    .unwrap_err();
+    assert!(error.contains("ownership changed"), "{error}");
+    assert!(!handle.is_completed());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(host.lock().unwrap().chats.contains_key(&id));
+    handle.command(Command::Refresh).unwrap();
+    host.lock().unwrap().chats.get_mut(&id).unwrap().session = original;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+}
+
+#[test]
+fn captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor() {
+    if isolated("captured_owning_close_refuses_a_distinct_proxy_for_the_same_retained_actor")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (first, second) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    assert!(first.same_actor(&second));
+    assert_eq!(first.actor_identity(), second.actor_identity());
+    assert!(!first.same_attachment(&second));
+    let (target, real_handle, session, instance) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source.id).unwrap();
+        let real_handle = std::mem::replace(&mut record.handle, first);
+        let session = record.session.clone();
+        let instance = record.execution_instance;
+        let target = super::super::chat::CloseTarget::for_execution(
+            &state,
+            &state.chats[&source.id],
+            &source,
+        )
+        .unwrap();
+        (target, real_handle, session, instance)
+    };
+    // This is an owning-entry counterfactual, not an actual helper adoption:
+    // replacing only Arc allocation must revoke the captured close capability.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .handle = second.clone();
+    let error = super::super::chat::close_captured(&host, target).unwrap_err();
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
+    {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        assert_eq!(record.session, session);
+        assert_eq!(record.execution_instance, instance);
+        assert!(record.handle.same_attachment(&second));
+    }
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!real_handle.is_completed());
+    real_handle.command(Command::Refresh).unwrap();
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .handle = real_handle.clone();
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+    assert!(real_handle.is_completed());
+}
+
+#[test]
+fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join() {
+    if isolated("blocking_owning_close_preserves_a_replacement_installed_during_provider_join")
+        .is_some()
+    {
+        return;
+    }
+    use chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+    struct BlockingDrop {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Adapter for BlockingDrop {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            // A disconnected test owner cancels this barrier. The deadline
+            // also bounds cleanup if an assertion unwinds inside thread::scope.
+            if self.entered.send(()).is_ok() {
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }
+    struct ReleaseOnDrop(Option<std::sync::mpsc::SyncSender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let spec = ProcessSpec {
+        execution: None,
+        messages: None,
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: path.parent().unwrap().join("project"),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let mut initial = Step::default();
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let blocking = chat::runtime::Handle::start(
+        spec,
+        Box::new(BlockingDrop {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+        initial,
+        store,
+        None,
+        |_| {},
+    )
+    .unwrap();
+    let (target, successor, original_source, original_instance) = {
+        let mut state = host.lock().unwrap();
+        let record = state.chats.get_mut(&source.id).unwrap();
+        let successor = std::mem::replace(&mut record.handle, blocking.clone());
+        let original_source = record.session.clone();
+        let original_instance = record.execution_instance;
+        let target = super::super::chat::CloseTarget::for_execution(
+            &state,
+            &state.chats[&source.id],
+            &source,
+        )
+        .unwrap();
+        (target, successor, original_source, original_instance)
+    };
+    let replacement_instance = uuid::Uuid::new_v4();
+    std::thread::scope(|scope| {
+        // This guard drops on every assertion/receive failure before scope
+        // joins its worker, so teardown need not wait for the fallback timeout.
+        let mut release = ReleaseOnDrop(Some(release_tx));
+        let worker = scope.spawn(|| super::super::chat::close_captured(&host, target));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actor worker never entered adapter Drop during close join");
+        assert!(
+            !worker.is_finished(),
+            "close returned before its actor worker joined"
+        );
+        assert!(
+            blocking.is_completed(),
+            "old actor did not finish its actual process teardown"
+        );
+        {
+            let mut state = host.lock().unwrap();
+            let record = state.chats.get_mut(&source.id).unwrap();
+            record.handle = successor.clone();
+            record.execution_instance = replacement_instance;
+        }
+        release.0.take().unwrap().send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.message.contains("thread changed"), "{error:?}");
+    });
+    {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        assert_eq!(record.session, original_source);
+        assert_eq!(record.execution_instance, replacement_instance);
+        assert!(record.handle.same_attachment(&successor));
+    }
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!successor.is_completed());
+    successor.command(Command::Refresh).unwrap();
+    // Restore the fixture generation solely for its normal authenticated cleanup.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = original_instance;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
+    assert!(successor.is_completed());
+}
+
+#[test]
+fn captured_owning_close_refuses_a_replaced_host_execution_instance() {
+    if isolated("captured_owning_close_refuses_a_replaced_host_execution_instance").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let HostedSession::Chat(source) = agent.session.unwrap() else {
+        panic!("not a chat")
+    };
+    let (target, handle, original_instance) = {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&source.id];
+        (
+            super::super::chat::CloseTarget::for_execution(&state, record, &source).unwrap(),
+            record.handle.clone(),
+            record.execution_instance,
+        )
+    };
+    // A deterministic generation cutpoint: keep the same ID and attachment so
+    // the execution-instance fence, independently, must reject this capability.
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = uuid::Uuid::new_v4();
+    let error = super::super::chat::close_captured(&host, target).unwrap_err();
+    assert_eq!(
+        error.code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+        "{error:?}"
+    );
+    assert!(!handle.is_completed());
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    handle.command(Command::Refresh).unwrap();
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&source.id)
+        .unwrap()
+        .execution_instance = original_instance;
+    assert!(
+        matches!(process(&host, Authority::default(), Operation::Close(accepted.agent.id)).unwrap(), Reply::Closed(agent) if agent.closed)
+    );
 }
 
 #[test]
@@ -421,7 +900,22 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     {
         return;
     }
-    let (host, request, _) = fixture();
+    let (host, request, path) = fixture();
+    // Observe consumption of the actual refresh response, not just command
+    // admission: pending transport must still refuse an idle close.
+    let provider = path.parent().unwrap().join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let refreshed = r#"      case "$frame" in
+        *'"subtype":"get_context_usage"'*)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":424242,"maxTokens":1000000}}}\n' "$id"
+          ;;
+        *)
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+          ;;
+      esac"#;
+    assert_eq!(script.matches(original).count(), 1);
+    std::fs::write(provider, script.replace(original, refreshed)).unwrap();
     let automation = automation_fixture(&host, &request);
     let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
@@ -437,12 +931,22 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
         .id();
     let handle = host.lock().unwrap().chats[&session_id].handle.clone();
     let stale = handle.snapshot(None).unwrap().generation;
+    assert_ne!(handle.usage().context_tokens, 424242);
     handle.command(Command::Refresh).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if handle.usage().context_tokens == 424242
+            && handle.check_update_readiness().unwrap()
+                == crate::chat::runtime::UpdateReadiness::Idle
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture refresh did not settle");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(
-        handle
-            .close_if_idle(stale)
-            .unwrap_err()
-            .contains("state changed")
+        !handle.try_close_if_idle(stale).unwrap(),
+        "idle metadata drift must defer without stopping the actor"
     );
     assert!(!handle.is_completed());
     assert_eq!(
@@ -838,7 +1342,7 @@ fn release_fixture(host: &SharedHost, run: &Run) {
         .unwrap();
 }
 
-fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
+pub(in crate::host) fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
     let path = root.join("registry.sqlite3");
     let mut registry = Registry::at(&path).unwrap();
@@ -2428,6 +2932,23 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         "the decision outlives the turn"
     );
 
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session].handle.clone();
+    let stale = handle.snapshot(None).unwrap().generation.wrapping_sub(1);
+    assert!(
+        handle.try_close_if_idle(stale).is_err(),
+        "stale generation must not hide a pending permission request"
+    );
+    assert!(!handle.is_completed());
+
     let error = control(answer(&asked.id, "allow")).unwrap_err();
     assert!(error.contains("only decline"), "{error}");
     let error = control(Control::Interrupt {
@@ -3138,7 +3659,11 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
             chat::ItemContent::Delivery { body, .. } if body == &sent.message.body)
             })
             .count();
-        if deliveries == 1 && handle.is_idle() {
+        let provider_prompts = std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count();
+        if deliveries == 1 && provider_prompts == 2 && handle.is_idle() {
             assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
             assert_eq!(
                 snapshot
@@ -3646,4 +4171,17 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         )
         .unwrap();
     }
+}
+
+#[test]
+fn unavailable_retained_startup_snapshot_preserves_owner_and_returns_interrupted() {
+    let (handle, _) = chat::runtime::Handle::fixture_remote_attachment_pair();
+    let identity = handle.actor_identity().unwrap();
+    let result = provider_launch_snapshot(&handle);
+    assert!(
+        matches!(result, Err((State::Interrupted, reason)) if reason.contains("ownership was preserved"))
+    );
+    assert_eq!(handle.actor_identity(), Some(identity));
+    assert!(handle.owns_work());
+    assert!(!handle.is_completed());
 }

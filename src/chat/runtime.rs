@@ -15,22 +15,34 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
 mod execution;
+mod handle;
+pub use handle::Handle;
+#[cfg(test)]
+pub(crate) use handle::RetainedInputOutcome;
+pub(crate) use retained_actor::transport::{
+    ActorIdentity, RetirementInspection, VerifiedRetirement,
+};
+mod retained_actor;
 mod store;
 mod websocket;
-use store::Store;
+pub(crate) use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// Pipe EOF may precede the kernel's child-exit publication. Do not turn that
+// short interval into an uncertain provider owner, or wait for a live writer.
+const PROTOCOL_EXIT_GRACE: Duration = Duration::from_millis(100);
 const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 /// Frames parsed per poll iteration: bounded so a provider flood cannot starve
 /// the stdin writer or queued UI commands.
@@ -38,6 +50,12 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    RetainedProvider {
+        run: Option<crate::model::RunId>,
+        command: Command,
+        decline_only: bool,
+        effects: Arc<AtomicU8>,
+    },
     UpdateSource(
         super::Session,
         Option<crate::model::LaunchRecipe>,
@@ -52,6 +70,7 @@ enum ActorCommand {
     IdlePrompt(String),
     CloseIfIdle {
         generation: u64,
+        closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     Interrupt {
@@ -59,6 +78,24 @@ enum ActorCommand {
         including_subagents: bool,
     },
 }
+/// A refusal before a Step is prepared proves no provider effects; after a
+/// Step is admitted, an uncertain acknowledgement never authorizes replay.
+struct InputEffects(Option<Arc<AtomicU8>>);
+impl InputEffects {
+    fn possible(&self) {
+        if let Some(effects) = &self.0 {
+            effects.store(2, Ordering::Release);
+        }
+    }
+}
+impl Drop for InputEffects {
+    fn drop(&mut self) {
+        if let Some(effects) = &self.0 {
+            let _ = effects.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
 /// Why a provider command may not have taken effect.
@@ -79,15 +116,17 @@ impl From<Rejection> for String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum UpdateReadiness {
     Idle,
     Busy,
     Unready,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Update {
+    /// Helper outbox has uncommitted semantic evidence; wake the host broker.
+    RetainedOutcomes,
     Execution {
         run: crate::model::RunId,
         update: crate::agent_execution::Update,
@@ -122,7 +161,7 @@ pub(crate) enum Update {
 }
 
 #[derive(Clone)]
-pub struct Handle(Arc<Inner>);
+struct LocalHandle(Arc<Inner>);
 
 struct OwnedSocket(std::path::PathBuf);
 impl Drop for OwnedSocket {
@@ -134,7 +173,7 @@ impl Drop for OwnedSocket {
     }
 }
 
-impl Handle {
+impl LocalHandle {
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -168,6 +207,8 @@ struct Inner {
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
+    launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
 }
 
 enum NativeOwnership {
@@ -177,7 +218,7 @@ enum NativeOwnership {
         crate::daemon::holder_registry::Process,
     ),
 }
-impl Handle {
+impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,
@@ -253,12 +294,56 @@ impl Handle {
     }
 
     fn start_inner(
+        spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        session_id: Option<String>,
+        ownership: Option<NativeOwnership>,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::start_with_scope(
+            spec, adapter, initial, store, session_id, ownership, None, notify,
+        )
+    }
+
+    /// The helper captures its immutable physical account before spawning.
+    pub(super) fn start_retained(
+        spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        source: super::Session,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        if source.launch.provider != crate::agent::Provider::Claude {
+            return Err("Retained stream actors require Claude".into());
+        }
+        let scope = crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider,
+            &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        )?;
+        Self::start_with_scope(
+            spec,
+            adapter,
+            initial,
+            store,
+            source.launch.session_id,
+            None,
+            Some(scope),
+            notify,
+        )
+    }
+
+    fn start_with_scope(
         mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
+        launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -306,6 +391,7 @@ impl Handle {
         };
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
+        let provider_process = Arc::new(Mutex::new(None));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -362,6 +448,10 @@ impl Handle {
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
+            provider_process: provider_process.clone(),
+            launch_account_scope: launch_account_scope
+                .clone()
+                .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -372,6 +462,7 @@ impl Handle {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
+                    launch_account_scope,
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
@@ -428,6 +519,17 @@ impl Handle {
                         } else {
                             spawn_provider(&spec, &actor.stop)
                         };
+                        let child = child.and_then(|child| {
+                            if let Some(child) = &child {
+                                *provider_process.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+                                    crate::daemon::holder_registry::Process::read(
+                                        child.child.id() as i32
+                                    )
+                                    .map_err(|error| error.to_string())?,
+                                );
+                            }
+                            Ok(child)
+                        });
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {
@@ -567,11 +669,46 @@ impl Handle {
         }
         Ok(handle)
     }
+    pub(super) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
+        self.0
+            .provider_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+    pub(super) fn launch_account_scope(
+        &self,
+    ) -> Result<&crate::account::scope::LaunchAccountScope, &str> {
+        self.0.launch_account_scope.as_ref().map_err(String::as_str)
+    }
+    /// Queue admission is bounded; only the helper owns waiting and receipts.
+    pub(super) fn enqueue_actor(
+        &self,
+        command: ActorCommand,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        if self.is_completed()
+            || self.0.draining.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+        {
+            return Err("Provider actor is no longer accepting commands".into());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0
+            .commands
+            .try_send((command, reply))
+            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+        self.wake();
+        Ok(response)
+    }
+
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command, false)
             .map_err(String::from)
     }
 
+    pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
+        self.submit_command(None, command, false)
+    }
     /// Rechecks courier eligibility on the actor, immediately before preparing
     /// the prompt. A caller's earlier idle observation is only a hint. Refusal
     /// permits retry; an unacknowledged command may already have run.
@@ -602,7 +739,9 @@ impl Handle {
     ) -> Result<(), Rejection> {
         if matches!(
             &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
+            Command::LoadFileChanges { .. }
+                | Command::LoadFileChangePatches { .. }
+                | Command::ReadTextCopy { .. }
         ) {
             return Err(Rejection::Refused(
                 "File cache reads require a requester-specific reply".into(),
@@ -680,9 +819,23 @@ impl Handle {
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
     }
 
-    pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
-        self.close()
+    fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
+        let (closed, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseIfIdle { generation, closed })?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Provider idle close was not acknowledged: {error}"))
+    }
+
+    /// False proves the actor was idle but its generation changed. No close
+    /// occurred; the caller may take a new snapshot and retry its exact owner.
+    /// Nonidle state and uncertain acknowledgement remain errors.
+    pub(crate) fn try_close_if_idle(&self, generation: u64) -> Result<bool, String> {
+        if !self.claim_idle_close(generation)? {
+            return Ok(false);
+        }
+        self.close()?;
+        Ok(true)
     }
 
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
@@ -694,7 +847,9 @@ impl Handle {
         ) {
             self.0.retain_cleanup_receipt.store(true, Ordering::Release);
         }
-        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        if !self.claim_idle_close(generation)? {
+            return Err("Provider state changed before conditional idle close".into());
+        }
         self.close_for_resume()
     }
 
@@ -783,6 +938,25 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
+    pub(crate) fn text_copy(
+        &self,
+        source: &super::TextCopySource,
+        offset: u64,
+    ) -> Result<super::TextCopyPage, String> {
+        match &source.scope {
+            super::TextCopyScope::Conversation => self
+                .0
+                .store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .text_copy(source, offset),
+            super::TextCopyScope::Subagent { .. } => child_text_copy::read(
+                &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
+                source,
+                offset,
+            ),
+        }
+    }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
         self.0
@@ -827,6 +1001,7 @@ impl Handle {
             }
         }
         if refresh_publication {
+            store.publish_copy_sources(&mut state);
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
                 state.file_changes.revision,
@@ -876,6 +1051,7 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            store.publish_copy_sources(&mut state);
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
@@ -1020,6 +1196,18 @@ impl Handle {
             .error
             .clone()
     }
+    pub(crate) fn history_is_covered_by(&self, reloaded: &Store) -> Result<bool, String> {
+        self.0
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_covered_by(reloaded)
+    }
+
+    pub(crate) fn is_read_only_history(&self) -> bool {
+        self.0.history_only
+    }
+
     pub fn owns_work(&self) -> bool {
         !self.0.history_only
             && (!self.is_completed()
@@ -1336,7 +1524,7 @@ impl Drop for Inner {
         }
     }
 }
-impl super::protocol::LaunchCleanup for Handle {
+impl super::protocol::LaunchCleanup for LocalHandle {
     fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
@@ -1429,6 +1617,45 @@ struct ChildGuard {
     terminated: bool,
 }
 impl ChildGuard {
+    /// Wait on the original child capability without reaping it or releasing
+    /// the process-group identity needed by teardown.
+    fn observe_exit_within(
+        &self,
+        grace: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + grace;
+        loop {
+            if let Some(status) = self.observed_exit_status()? {
+                return Ok(Some(status));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.identity.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32;
+            // SAFETY: descriptor points to one initialized pollfd and the
+            // owned pidfd stays open throughout this non-reaping observation.
+            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+                return Err(std::io::Error::other(
+                    "Provider exit capability became unavailable",
+                ));
+            }
+        }
+    }
+
     /// Capture immediately after spawn, before any code can reap this child.
     fn new(mut child: Child) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
@@ -1580,6 +1807,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
@@ -1844,7 +2072,7 @@ impl Actor {
                     .child
                     .as_mut()
                     .ok_or("Provider process unavailable")?
-                    .observed_exit_status()
+                    .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
                     if status.success() {
@@ -1991,11 +2219,31 @@ impl Actor {
             let Ok((command, reply)) = self.incoming.try_recv() else {
                 break;
             };
+            let (command, effects) = match command {
+                ActorCommand::RetainedProvider {
+                    run,
+                    command,
+                    decline_only,
+                    effects,
+                } => (
+                    ActorCommand::Provider {
+                        run,
+                        command,
+                        decline_only,
+                    },
+                    Some(effects),
+                ),
+                command => (command, None),
+            };
+            let effects = InputEffects(effects);
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
             }
             let (run, command) = match command {
+                ActorCommand::RetainedProvider { .. } => {
+                    unreachable!("retained inputs normalized above")
+                }
                 ActorCommand::Provider {
                     run,
                     command,
@@ -2087,18 +2335,23 @@ impl Actor {
                     }
                     (None, Command::Interrupt)
                 }
-                ActorCommand::CloseIfIdle { generation } => {
+                ActorCommand::CloseIfIdle { generation, closed } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let idle = state.generation == generation
-                        && self.update_readiness(&state) == UpdateReadiness::Idle;
-                    if idle {
+                    // A stale generation must never hide new requests, child
+                    // work or pending transport. Only a proved idle actor can
+                    // return the retryable generation-change receipt.
+                    if self.update_readiness(&state) != UpdateReadiness::Idle {
+                        let _ = reply.send(Err(
+                            "Provider state changed before conditional idle close".into(),
+                        ));
+                        continue;
+                    }
+                    let unchanged = state.generation == generation;
+                    if unchanged {
                         self.stop.store(true, Ordering::Release);
                     }
-                    let _ = reply.send(if idle {
-                        Ok(())
-                    } else {
-                        Err("Provider state changed before conditional idle close".into())
-                    });
+                    let _ = closed.send(unchanged);
+                    let _ = reply.send(Ok(()));
                     continue;
                 }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
@@ -2176,12 +2429,20 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            if authorizes_work
+                && let Some(scope) = &self.launch_account_scope
+                && let Err(error) = scope.revalidate()
+            {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
             };
             match prepared {
                 Ok(step) => {
+                    effects.possible();
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
                     }
@@ -2761,6 +3022,7 @@ fn apply_projected_event(
     if !preview_observed {
         Arc::make_mut(&mut state.notification_preview).observe(&event);
     }
+    let child_copy_update = child_text_copy::prepare(state, &event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -3218,6 +3480,7 @@ fn apply_projected_event(
     if child_changed {
         trim_subagents(state);
     }
+    child_text_copy::finish(state, child_copy_update);
 }
 
 /// Running task identities authorize interruption and idle waits. Retiring
@@ -3363,7 +3626,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
     let (send, receive) = crossbeam_channel::bounded(64);
-    let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
         if let Update::AttentionContext { evidence, content } = update {
             let _ = send.try_send((
                 evidence,
@@ -3499,7 +3762,7 @@ mod tests {
         let store = preflight(&spec, &mut initial).unwrap();
         let updates = Arc::new(Mutex::new(Vec::new()));
         let observed = updates.clone();
-        let handle = Handle::start(
+        let handle = LocalHandle::start(
             spec,
             Box::new(adapter),
             initial,
@@ -3681,7 +3944,7 @@ mod tests {
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
             let (send, receive) = crossbeam_channel::bounded(8);
-            let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
                 if let Update::AttentionContext { evidence, content } = update {
                     let _ = send.try_send((evidence, content));
                 }
@@ -3830,7 +4093,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = updates.send(update);
         })
         .unwrap();
@@ -3937,7 +4200,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
         let state = handle.0.state.lock().unwrap();
         let probe = handle.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4158,7 +4422,7 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(
+        let handle = LocalHandle::start(
             spec,
             Box::new(GatedPrompt {
                 entered: entered_tx,
@@ -4250,7 +4514,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
         assert_eq!(
             context.reconcile_cleanup().unwrap(),
@@ -4477,7 +4742,8 @@ mod tests {
         };
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
         assert_eq!(
             handle.check_update_readiness().unwrap(),
             UpdateReadiness::Idle
@@ -5319,7 +5585,7 @@ mod tests {
             let mut adapter: Box<dyn Adapter> = Box::new(HistoryFixture { attempts: 0 });
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
-            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
             until(&handle, |snapshot| snapshot.ready);
             for _ in 0..2 {
                 handle.command(Command::LoadEarlier).unwrap();
@@ -5385,7 +5651,7 @@ mod tests {
             })
         }
     }
-    fn until(handle: &Handle, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    fn until(handle: &LocalHandle, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let snapshot = handle.snapshot(None).unwrap();
@@ -5457,7 +5723,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(CompletionFixture(0));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.ready);
         handle.command(Command::Refresh).unwrap();
         let working = handle.snapshot(None).unwrap();
@@ -5590,7 +5856,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(NotificationFixture(0));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.ready);
         handle.command(Command::Refresh).unwrap();
         let response = handle.notification_content(crate::notifications::Kind::Succeeded);
@@ -5706,7 +5972,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (send, receive) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             if let Update::AttentionContext { evidence, .. } = update {
                 let _ = send.try_send(evidence);
             }
@@ -5780,7 +6046,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Updates);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let baseline = until(&handle, |snapshot| snapshot.ready);
         let fixed = baseline.items[0].clone();
         let id = crate::model::TerminalId::new();
@@ -5849,7 +6115,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         let ItemContent::Text { text, .. } = &snapshot.items[0].content else {
             panic!("environment fixture did not return text");
@@ -5879,7 +6145,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         assert!(
             matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
@@ -5940,7 +6206,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
         assert!(
             matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
@@ -5979,7 +6245,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(
             snapshot
@@ -6035,7 +6302,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Reporter);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let generation = |handle: &Handle| {
+        let generation = |handle: &LocalHandle| {
             handle
                 .0
                 .state
@@ -6044,7 +6311,7 @@ mod tests {
                 .generation
         };
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6118,9 +6385,9 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(WholeTurn(crate::model::RunId::new()));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let (started, actor) = crossbeam_channel::bounded::<Handle>(1);
+        let (started, actor) = crossbeam_channel::bounded::<LocalHandle>(1);
         let (observe, observed) = crossbeam_channel::bounded(1);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             if let Update::Execution {
                 update: crate::agent_execution::Update::Finished { .. },
                 ..
@@ -6157,7 +6424,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6346,7 +6613,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = notify.try_send(update);
         })
         .unwrap();
@@ -6383,6 +6650,7 @@ mod tests {
                 | Update::AttentionContext { .. }
                 | Update::Ready
                 | Update::PromptAvailable
+                | Update::RetainedOutcomes
                 | Update::Execution { .. } => None,
             })
             .collect();
@@ -6443,7 +6711,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(snapshot.error.is_some());
         assert!(snapshot.items.is_empty());
@@ -6472,7 +6740,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(
             snapshot
@@ -6505,7 +6774,8 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.exited);
         handle.close().unwrap();
         // Model a panic after the worker published completion, such as a
@@ -6808,6 +7078,58 @@ mod tests {
     }
 
     #[test]
+    fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
+        for (tail, expected) in [
+            ("sleep 0.02; exit 0", None),
+            ("sleep 0.02; exit 7", Some("Provider exited with")),
+            ("sleep 5", Some("unobservable writer")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), format!("read -r init; exec 1>&-; {tail}")],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = handle.is_completed();
+            let failure = handle.failure();
+            // Join and reap the owned actor before checking any failure path.
+            handle.close().unwrap();
+            assert!(completed, "EOF classification exceeded its bound: {tail}");
+            match expected {
+                None => {
+                    assert_eq!(failure, None);
+                    assert!(!handle.owns_work());
+                }
+                Some(message) => {
+                    assert!(
+                        failure
+                            .as_deref()
+                            .is_some_and(|error| error.contains(message)),
+                        "{tail}: {failure:?}"
+                    );
+                    assert!(
+                        handle.owns_work(),
+                        "uncertain/failed writer must remain protected"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn direct_provider_non_reaping_observation_preserves_exit_status() {
         for script in ["exit 7", "kill -TERM $$"] {
             let child = Process::new("/bin/sh")
@@ -6869,6 +7191,126 @@ mod tests {
     }
 
     #[test]
+    fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after_exit() {
+        struct CopyFixture;
+        let body = format!("{}{}", "a".repeat(128 * 1024 - 1), "🦀界".repeat(30_000));
+        fn message(text: &str) -> Item {
+            Item {
+                id: "same".into(),
+                role: super::super::Role::Assistant,
+                at: None,
+                started_at: None,
+                content: ItemContent::Text {
+                    text: text.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+            }
+        }
+        impl Adapter for CopyFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                panic!("copy reached provider")
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/true".into(),
+            arguments: vec![],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![
+                Event::Item(message("parent")),
+                Event::SubagentItem {
+                    id: "child".into(),
+                    item: message("complete child 🦀"),
+                },
+                Event::SubagentItem {
+                    id: "trimmed".into(),
+                    item: message(&body),
+                },
+            ],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(CopyFixture), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let child = snapshot
+            .subagents
+            .iter()
+            .find(|child| child.id == "child")
+            .unwrap();
+        assert_eq!(child.items[0].content, message("complete child 🦀").content);
+        let trimmed = snapshot
+            .subagents
+            .iter()
+            .find(|child| child.id == "trimmed")
+            .unwrap();
+        assert!(trimmed.items[0].content.byte_len() < 64 * 1024);
+        assert_ne!(trimmed.items[0].content, message(&body).content);
+        assert!(
+            snapshot.text_copy_sources.children["trimmed"][0].is_none(),
+            "a presentation placeholder is not complete text"
+        );
+        let parent_source = snapshot.text_copy_sources.conversation[0].as_ref().unwrap();
+        let child_source = snapshot.text_copy_sources.children["child"][0]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            parent_source.scope,
+            super::super::TextCopyScope::Conversation
+        );
+        assert_eq!(
+            child_source.scope,
+            super::super::TextCopyScope::Subagent { id: "child".into() }
+        );
+        for (source, expected) in [
+            (parent_source, "parent"),
+            (child_source, "complete child 🦀"),
+        ] {
+            let mut copied = String::new();
+            loop {
+                let page = handle.text_copy(source, copied.len() as u64).unwrap();
+                copied.push_str(&page.text);
+                if page.done {
+                    break;
+                }
+            }
+            assert_eq!(copied.as_bytes(), expected.as_bytes());
+        }
+        let mut unavailable = child_source.clone();
+        unavailable.scope = super::super::TextCopyScope::Subagent {
+            id: "trimmed".into(),
+        };
+        assert!(handle.text_copy(&unavailable, 0).is_err());
+        assert!(
+            handle
+                .command(Command::ReadTextCopy {
+                    source: child_source.clone(),
+                    offset: 0
+                })
+                .unwrap_err()
+                .contains("requester-specific")
+        );
+    }
+
+    #[test]
     fn file_changes_cache_queries_remain_available_after_provider_exit() {
         struct CacheFixture;
         impl Adapter for CacheFixture {
@@ -6911,7 +7353,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(CacheFixture);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.exited);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
@@ -7056,4 +7498,9 @@ mod tests {
         assert_eq!(state.error, None);
         assert_eq!(state.items, retained);
     }
+}
+
+/// Explicit retained-helper dispatch after Rust runtime initialization.
+pub(crate) fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
+    retained_actor::transport::run_helper_if_requested()
 }

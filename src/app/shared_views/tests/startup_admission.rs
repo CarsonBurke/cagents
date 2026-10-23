@@ -59,21 +59,38 @@ fn isolated(name: &str) -> bool {
     true
 }
 
+#[derive(Clone)]
+struct UpgradeScript {
+    source: Session,
+    canonical: Session,
+    refuse_lineage: bool,
+}
+
 struct ScriptedDaemon {
     providers: Arc<Mutex<Vec<Session>>>,
+    resolutions: Arc<Mutex<Vec<Session>>>,
+    connections: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     stopped: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ScriptedDaemon {
     fn start() -> Self {
+        Self::with_upgrade(None)
+    }
+
+    fn with_upgrade(upgrade: Option<UpgradeScript>) -> Self {
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let providers = Arc::new(Mutex::new(Vec::new()));
+        let resolutions = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let recorded = providers.clone();
+        let resolved = resolutions.clone();
+        let sockets = connections.clone();
         let stop = stopped.clone();
         let worker = std::thread::spawn(move || {
             let proof = HostSessionProof {
@@ -81,6 +98,7 @@ impl ScriptedDaemon {
                 boot_id: "boot".into(),
                 host_incarnation: "live-incarnation".into(),
             };
+            let mut clients = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -90,55 +108,140 @@ impl ScriptedDaemon {
                     }
                     Err(error) => panic!("scripted daemon accept: {error}"),
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
-                    let message = match request.request {
-                        ClientRequest::Connect { .. } => ServerMessage::Response {
-                            response: ServerResponse::Connected {
-                                proof: proof.clone(),
-                                resumed: Vec::new(),
-                            },
-                        },
-                        ClientRequest::ResolveUpgradeChat { .. } => {
-                            ServerMessage::Error(ProtocolError::new(
-                                ProtocolErrorCode::TerminalUnavailable,
-                                "No upgrade lineage in this fixture",
-                                false,
-                            ))
-                        }
-                        ClientRequest::ChatStart { session, .. }
-                        | ClientRequest::ChatAttach { session } => {
-                            recorded.lock().unwrap().push(session);
-                            // Record actual provider admission on the wire, but
-                            // never start a provider or create a reader worker.
-                            ServerMessage::Error(ProtocolError::new(
-                                ProtocolErrorCode::TerminalUnavailable,
-                                "Scripted provider admission recorded",
-                                false,
-                            ))
-                        }
-                        other => panic!("unexpected startup request: {other:?}"),
-                    };
-                    write_frame(
-                        &mut stream,
-                        &ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: Some(request.request_id),
-                            proof: proof.clone(),
-                            message,
-                        },
-                    )
-                    .unwrap();
+                // Register cancellation under the same lock used by Drop.
+                // A successful attachment stays alive until the test ends.
+                let mut held = sockets.lock().unwrap();
+                if stop.load(Ordering::Acquire) {
+                    break;
                 }
+                held.push(stream.try_clone().unwrap());
+                drop(held);
+                let recorded = recorded.clone();
+                let resolved = resolved.clone();
+                let proof = proof.clone();
+                let upgrade = upgrade.clone();
+                let stop = stop.clone();
+                clients.push(std::thread::spawn(move || {
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    loop {
+                        let request = match read_frame::<ClientEnvelope>(&mut stream) {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break,
+                            Err(_) if stop.load(Ordering::Acquire) => break,
+                            Err(error) => panic!("scripted client read: {error}"),
+                        };
+                        let message = match request.request {
+                            ClientRequest::Connect { .. } => ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            },
+                            ClientRequest::ResolveUpgradeChat { source } => {
+                                resolved.lock().unwrap().push(source.clone());
+                                if let Some(script) = &upgrade {
+                                    assert_eq!(source, script.source);
+                                    if !script.refuse_lineage {
+                                        ServerMessage::Response {
+                                            response: ServerResponse::UpgradeChatResolved {
+                                                session: script.canonical.clone(),
+                                            },
+                                        }
+                                    } else {
+                                        ServerMessage::Error(ProtocolError::new(
+                                            ProtocolErrorCode::TerminalUnavailable,
+                                            "No upgrade lineage in this fixture",
+                                            false,
+                                        ))
+                                    }
+                                } else {
+                                    ServerMessage::Error(ProtocolError::new(
+                                        ProtocolErrorCode::TerminalUnavailable,
+                                        "No upgrade lineage in this fixture",
+                                        false,
+                                    ))
+                                }
+                            }
+                            ClientRequest::ChatStart { session, .. } => {
+                                assert!(
+                                    upgrade.is_none(),
+                                    "strict upgrade cannot start a provider"
+                                );
+                                recorded.lock().unwrap().push(session);
+                                ServerMessage::Error(ProtocolError::new(
+                                    ProtocolErrorCode::TerminalUnavailable,
+                                    "Scripted provider admission recorded",
+                                    false,
+                                ))
+                            }
+                            ClientRequest::ChatAttach { session } => {
+                                recorded.lock().unwrap().push(session.clone());
+                                if let Some(script) = &upgrade {
+                                    assert_eq!(session, script.canonical);
+                                    ServerMessage::Response {
+                                        response: ServerResponse::ChatAttached {
+                                            snapshot: crate::chat::Snapshot {
+                                                session_id: session.launch.session_id.clone(),
+                                                ready: true,
+                                                ..Default::default()
+                                            },
+                                            session,
+                                        },
+                                    }
+                                } else {
+                                    ServerMessage::Error(ProtocolError::new(
+                                        ProtocolErrorCode::TerminalUnavailable,
+                                        "Scripted provider admission recorded",
+                                        false,
+                                    ))
+                                }
+                            }
+                            ClientRequest::ChatRead { chat_id, .. } if upgrade.is_some() => {
+                                ServerMessage::Response {
+                                    response: ServerResponse::ChatSnapshot {
+                                        chat_id,
+                                        snapshot: None,
+                                    },
+                                }
+                            }
+                            ClientRequest::ChatVisibility { .. }
+                            | ClientRequest::ChatAcknowledge { .. }
+                            | ClientRequest::ChatDetach { .. }
+                                if upgrade.is_some() =>
+                            {
+                                ServerMessage::Response {
+                                    response: ServerResponse::Accepted,
+                                }
+                            }
+                            other => panic!("unexpected startup request: {other:?}"),
+                        };
+                        if let Err(error) = write_frame(
+                            &mut stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: proof.clone(),
+                                message,
+                            },
+                        ) {
+                            if stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            panic!("scripted client write: {error}");
+                        }
+                    }
+                }));
+            }
+            for client in clients {
+                client.join().unwrap();
             }
         });
         Self {
             providers,
+            resolutions,
+            connections,
             stopped,
             worker: Some(worker),
         }
@@ -147,11 +250,18 @@ impl ScriptedDaemon {
     fn requests(&self) -> Vec<Session> {
         self.providers.lock().unwrap().clone()
     }
+
+    fn resolutions(&self) -> Vec<Session> {
+        self.resolutions.lock().unwrap().clone()
+    }
 }
 
 impl Drop for ScriptedDaemon {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        for stream in self.connections.lock().unwrap().iter() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         self.worker.take().unwrap().join().unwrap();
     }
 }
@@ -736,4 +846,481 @@ fn history_picker_does_not_focus_retained_unadmitted_cache() {
             .values()
             .any(|text| text == "Retained source draft")
     );
+}
+
+#[test]
+fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
+    if isolated("startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment") {
+        return;
+    }
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    assert!(daemon.requests().is_empty());
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let authoritative = model(identity, active, hidden, view);
+    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
+    settle(&mut app, connected);
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "Connected is not SeedView admission"
+    );
+    assert!(daemon.requests().is_empty());
+    let first = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(active),
+        operation: None,
+        model: authoritative.clone(),
+    });
+    settle(&mut app, first);
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "hidden scope must also acknowledge"
+    );
+    assert!(daemon.requests().is_empty());
+    let hidden_ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(hidden),
+        operation: None,
+        model: authoritative,
+    });
+    settle(&mut app, hidden_ack);
+    let CardKind::Chat(expected) = pane.kind else {
+        unreachable!()
+    };
+    assert_eq!(daemon.requests().len(), 1);
+    assert_eq!(daemon.requests()[0].launch, expected.launch);
+    assert_eq!(daemon.requests()[0].id, expected.id);
+    assert_eq!(app.durable.active_channel, Some(active));
+    assert!(
+        app.startup_pane_check().is_err(),
+        "a refused offscreen attachment cannot qualify"
+    );
+    app.cards.remove(&pane.id);
+    assert_eq!(
+        app.startup_pane_check(),
+        Ok(false),
+        "a missing required runtime cannot qualify"
+    );
+}
+
+#[test]
+fn exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver() {
+    if isolated("exact_retained_saved_text_is_data_after_scope_admission_not_a_hosted_waiver") {
+        return;
+    }
+    let daemon = ScriptedDaemon::start();
+    let (mut app, active, hidden, pane, identity) = cached_chat();
+    let CardKind::Chat(source) = &pane.kind else {
+        unreachable!()
+    };
+    let source = source.clone();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.local_only_cards.insert(pane.id);
+    durable
+        .pending_chat_admissions
+        .insert(pane.id, source.clone());
+    app.shared_views = State::for_workspace(&app.durable);
+    app.chat_ui =
+        chat_ui::State::with_drafts(HashMap::from([(pane.id, "Saved data only  ".into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    assert_eq!(app.startup_pane_check(), Ok(false));
+    let mut view = View::empty(hidden);
+    view.retired.push(pane.id);
+    admit(
+        &mut app,
+        active,
+        hidden,
+        model(identity, active, hidden, view),
+    );
+    assert!(daemon.requests().is_empty());
+    assert_eq!(app.startup_pane_check(), Ok(true));
+    let saved = app.persistent_workspace();
+    assert_eq!(saved.pending_chat_admissions.get(&pane.id), Some(&source));
+    assert_eq!(
+        saved.chat_drafts.get(&pane.id).map(String::as_str),
+        Some("Saved data only  ")
+    );
+    assert_eq!(
+        app.card_state(pane.id).unwrap().kind,
+        CardKind::Chat(source.clone())
+    );
+    assert!(visible_text(&app, pane.id).contains("Saved data only  "));
+    Arc::make_mut(&mut app.durable)
+        .local_only_cards
+        .remove(&pane.id);
+    assert!(
+        app.startup_pane_check().is_err(),
+        "a pending marker alone cannot waive a hosted pane"
+    );
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.local_only_cards.insert(pane.id);
+    let mut wrong = source;
+    wrong.launch.session_id = Some("another-source".into());
+    durable.pending_chat_admissions.insert(pane.id, wrong);
+    assert!(
+        app.startup_pane_check().is_err(),
+        "another source's marker cannot waive readiness"
+    );
+    assert!(daemon.requests().is_empty());
+}
+
+fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut pane, identity) = cached_chat();
+    let CardKind::Chat(source) = &pane.kind else {
+        unreachable!()
+    };
+    let source = source.clone();
+    let mut canonical = source.clone();
+    canonical.proof = Some(HostSessionProof {
+        host_session_id: "live-host".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "live-incarnation".into(),
+    });
+    let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: source.clone(),
+        canonical: canonical.clone(),
+        refuse_lineage,
+    }));
+    let text = "Draft stays here  ";
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
+    let disk = tempfile::tempdir().unwrap();
+    let (writer, _) = crate::session::SessionRuntime::open(
+        disk.path().join("upgrade.sqlite"),
+        crate::model::BootId::new("boot"),
+    )
+    .unwrap();
+    app.session = Some(writer);
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let (target, allocation) = match app.cards.get(&pane.id).unwrap() {
+        CardRuntime::Chat(runtime) => (
+            runtime.target,
+            &**runtime as *const chat_ui::Runtime as usize,
+        ),
+        _ => panic!("saved source must have inert Content"),
+    };
+    let cursor = app.handle_chat_ui(chat_ui::Action::ComposerCursor(
+        target,
+        cosmic::iced::widget::text_editor::Cursor {
+            position: cosmic::iced::widget::text_editor::Position { line: 0, column: 6 },
+            selection: None,
+        },
+    ));
+    settle(&mut app, cursor);
+    pane.kind = CardKind::Chat(canonical.clone());
+    let mut view = View::empty(hidden);
+    view.panes.push(pane.clone());
+    let authoritative = model(identity, active, hidden, view);
+    let connected = app.apply_workspace_model_update(ModelUpdate::Connected(authoritative.clone()));
+    settle(&mut app, connected);
+    let first = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(active),
+        operation: None,
+        model: authoritative.clone(),
+    });
+    settle(&mut app, first);
+    let admission = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+        scope: Scope::Channel(hidden),
+        operation: None,
+        model: authoritative,
+    });
+    if !refuse_lineage && !retire_before_ready {
+        let before = app.persistent_workspace();
+        assert_eq!(
+            before
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone()),
+            "projection cannot snapshot canonical ownership before lineage and writer receipt"
+        );
+        assert_eq!(
+            before.chat_drafts.get(&pane.id).map(String::as_str),
+            Some(text)
+        );
+    }
+    if retire_before_ready {
+        let mut retired = View::empty(hidden);
+        retired.retired.push(pane.id);
+        let mut newer = model(identity, active, hidden, retired);
+        newer.sequence = 2;
+        let projection = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+            scope: Scope::Channel(hidden),
+            operation: None,
+            model: newer,
+        });
+        settle(&mut app, projection);
+        assert!(!app.chat_start_pending(pane.id));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    }
+    let mut ready_seen = false;
+    let mut receipt_seen = false;
+    settle_observing(&mut app, admission, |app, message| {
+        if matches!(&message, Message::ChatUi(chat_ui::Action::Ready(..))) && !ready_seen {
+            ready_seen = true;
+            if !refuse_lineage && !retire_before_ready {
+                assert_eq!(
+                    app.persistent_workspace()
+                        .cards
+                        .iter()
+                        .find(|card| card.id == pane.id)
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(source.clone())
+                );
+            }
+        }
+        if let Message::ChatUi(chat_ui::Action::UpgradeCommitted(_, _, result)) = &message {
+            assert!(
+                result.is_ok(),
+                "actual session writer must acknowledge: {result:?}"
+            );
+            receipt_seen = true;
+        }
+        Some(message)
+    });
+    assert!(ready_seen);
+    assert_eq!(daemon.resolutions(), vec![source.clone()]);
+    assert_eq!(
+        daemon.requests(),
+        if refuse_lineage {
+            Vec::new()
+        } else {
+            vec![canonical.clone()]
+        },
+        "refused lineage cannot fall back to provider activation"
+    );
+    assert!(!app.chat_start_pending(pane.id));
+    let saved = app.persistent_workspace();
+    if retire_before_ready {
+        assert!(
+            !receipt_seen,
+            "a stale Ready cannot authorize a writer rebind"
+        );
+        let copy = *saved
+            .chat_drafts
+            .iter()
+            .find(|(_, draft)| draft.as_str() == text)
+            .unwrap()
+            .0;
+        assert_ne!(copy, pane.id);
+        assert!(app.chat_awaiting_admission(copy));
+        assert_eq!(
+            app.card_state(copy).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        let CardRuntime::Chat(runtime) = app.cards.get(&copy).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            &**runtime as *const chat_ui::Runtime as usize, allocation,
+            "retirement must move the full original Content owner before the late Ready"
+        );
+        assert_eq!(saved.pending_chat_admissions.get(&copy), Some(&source));
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let loaded = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(saved.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded
+                .cards
+                .iter()
+                .find(|card| card.id == copy)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(loaded.pending_chat_admissions.get(&copy), Some(&source));
+        assert_eq!(
+            loaded.chat_drafts.get(&copy).map(String::as_str),
+            Some(text)
+        );
+        assert!(
+            !loaded
+                .cards
+                .iter()
+                .find(|card| card.id == pane.id)
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        return;
+    }
+    if refuse_lineage {
+        assert!(
+            !receipt_seen,
+            "refused lineage cannot receive a writer rebind receipt"
+        );
+        let copy = *saved
+            .chat_drafts
+            .iter()
+            .find(|(_, draft)| draft.as_str() == text)
+            .unwrap()
+            .0;
+        assert_ne!(copy, pane.id);
+        assert!(app.chat_awaiting_admission(copy));
+        assert_eq!(
+            app.card_state(copy).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(
+            saved.pending_chat_admissions.get(&copy),
+            match &app.card_state(copy).unwrap().kind {
+                CardKind::Chat(session) => Some(session),
+                _ => None,
+            }
+        );
+        assert!(!saved.chat_drafts.contains_key(&pane.id));
+        assert!(matches!(
+            app.cards.get(&pane.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        assert!(
+            app.startup_pane_check().is_err(),
+            "required canonical recovery remains incomplete"
+        );
+    } else {
+        assert!(
+            receipt_seen,
+            "strict wire proof must pass through the actual durable receipt"
+        );
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .count(),
+            1
+        );
+        assert_eq!(
+            saved.chat_drafts.get(&pane.id).map(String::as_str),
+            Some(text)
+        );
+        assert!(saved.pending_chat_admissions.is_empty());
+        let runtime = match app.cards.get(&pane.id).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => panic!("canonical chat must be attached"),
+        };
+        assert_eq!(
+            &**runtime as *const chat_ui::Runtime as usize, allocation,
+            "retain the original Content owner"
+        );
+        let target = runtime.target;
+        let edit = app.handle_chat_ui(chat_ui::Action::Composer(
+            target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("X".into())),
+            ),
+        ));
+        settle(&mut app, edit);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some("Draft Xstays here  "),
+            "an actual editor edit must use the pre-upgrade caret"
+        );
+    }
+    if !refuse_lineage {
+        assert_eq!(app.startup_pane_check(), Ok(true));
+    }
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let stored = app
+        .session
+        .as_ref()
+        .unwrap()
+        .operation_store()
+        .load_card(pane.id, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.kind, CardKind::Chat(canonical));
+    if refuse_lineage {
+        let loaded = app
+            .session
+            .as_ref()
+            .unwrap()
+            .operation_store()
+            .load_workspace(saved.id, None)
+            .unwrap()
+            .unwrap();
+        let copy = *loaded
+            .chat_drafts
+            .iter()
+            .find(|(_, draft)| draft.as_str() == text)
+            .unwrap()
+            .0;
+        assert_ne!(copy, pane.id);
+        assert_eq!(
+            loaded
+                .cards
+                .iter()
+                .find(|card| card.id == copy)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(loaded.pending_chat_admissions.get(&copy), Some(&source));
+    }
+    assert!(app.card_state(pane.id).unwrap().existence.is_open());
+}
+
+#[test]
+fn canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt() {
+    if isolated(
+        "canonical_upgrade_authenticates_lineage_and_preserves_original_content_through_writer_receipt",
+    ) {
+        return;
+    }
+    exercise_canonical_upgrade(false, false);
+}
+
+#[test]
+fn refused_canonical_upgrade_preserves_source_draft_without_provider_activation() {
+    if isolated("refused_canonical_upgrade_preserves_source_draft_without_provider_activation") {
+        return;
+    }
+    exercise_canonical_upgrade(true, false);
+}
+
+#[test]
+fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment()
+{
+    if isolated(
+        "canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignores_late_attachment",
+    ) {
+        return;
+    }
+    exercise_canonical_upgrade(false, true);
 }

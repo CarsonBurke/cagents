@@ -38,6 +38,68 @@ const MODES: &[&str] = &[
 ];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None, false)
+}
+
+pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None, true)
+}
+
+/// Transient identity selected by the original adapter during preparation.
+/// A fresh UUID is not provider confirmation or a disk-resume descriptor.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedIdentity {
+    session_id: String,
+    resumed: bool,
+}
+impl PreparedIdentity {
+    fn validate(&self, launch: &Launch) -> Result<(), String> {
+        validate_id(&self.session_id)?;
+        if self.resumed != launch.session_id.is_some()
+            || launch
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != self.session_id)
+        {
+            return Err(
+                "Retained Claude identity differs from its issued launch mode or session".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn create_prepared(
+    launch: &Launch,
+    identity: PreparedIdentity,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    identity.validate(launch)?;
+    create_inner(launch, Some(identity), false)
+}
+
+fn create_inner(
+    launch: &Launch,
+    prepared: Option<PreparedIdentity>,
+    forced_history: bool,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    if forced_history
+        && (launch
+            .session_id
+            .as_deref()
+            .is_none_or(|id| id.len() != 36 || uuid::Uuid::parse_str(id).is_err())
+            || !launch.recipe.working_directory.is_absolute()
+            || launch.recipe.working_directory.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            }))
+    {
+        return Err(
+            "Read-only history requires an exact saved conversation and absolute working directory"
+                .into(),
+        );
+    }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.arguments = arguments(launch)?;
     let history = launch
@@ -45,13 +107,13 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .as_deref()
         .map(|id| History::open(launch, id))
         .transpose()?;
-    let history_only = launch.needs_read_only_history();
+    let history_only = forced_history || launch.needs_read_only_history();
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
-    let session_id = launch
-        .session_id
-        .clone()
+    let session_id = prepared
+        .map(|identity| identity.session_id)
+        .or_else(|| launch.session_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if launch.session_id.is_none() {
         spec.arguments.push(format!("--session-id={session_id}"));
@@ -59,9 +121,14 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     Ok((
         spec,
         Box::new(Claude {
+            prepared_identity: Some(PreparedIdentity {
+                session_id: session_id.clone(),
+                resumed: launch.session_id.is_some(),
+            }),
             session_id: Some(session_id),
             resumed: launch.session_id.is_some(),
             history_only,
+            forced_history,
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
@@ -317,6 +384,7 @@ enum ReportTask {
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
+    prepared_identity: Option<PreparedIdentity>,
     titles: Option<super::claude_titles::ClaudeTitles>,
     /// Whether this process was launched to resume `session_id`, as opposed
     /// to being handed a new one that names nothing until its first prompt.
@@ -418,6 +486,7 @@ struct Claude {
     history: Option<History>,
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
+    forced_history: bool,
 }
 impl Claude {
     fn observe_title(&mut self, step: &mut Step) {
@@ -643,13 +712,28 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in &attachments {
+        for attachment in super::image_references::ordered(&text, &attachments)? {
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
                 return Err(
                     "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
                 );
+            }
+            if let Some(reference) = &attachment.reference {
+                if block["type"] != "image" {
+                    return Err("An image reference must accompany an actual image".into());
+                }
+                let marker =
+                    json!({"type":"text", "text":super::image_references::marker(reference)?});
+                payload_size = payload_size.saturating_add(encoded_len(&marker)? + 1);
+                if payload_size >= MAX_PAYLOAD {
+                    return Err(
+                        "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
+                    );
+                }
+                content.push(marker);
             }
             content.push(block);
         }
@@ -683,6 +767,9 @@ impl Claude {
         } else {
             0
         };
+        for attachment in &attachments {
+            crate::chat::attachment_assets::retain(attachment)?;
+        }
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
@@ -1192,7 +1279,35 @@ impl Claude {
                     }
                 }
             }
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
+            if role == Role::User {
+                for (index, pair) in content.windows(2).enumerate() {
+                    let marker = string(&pair[0], "text");
+                    if string(&pair[0], "type") == "text"
+                        && string(&pair[1], "type") == "image"
+                        && let ItemContent::Image { path, .. } = image_content(&pair[1])
+                        && super::image_references::claims_reference(marker)
+                    {
+                        if let Some(reference) = super::image_references::restore(marker, &path) {
+                            synthetic.insert(index);
+                            references.insert(index + 1, reference);
+                        } else if !path.starts_with("data:image/") {
+                            // A structured owned-image claim cannot authorize
+                            // a coincident local path after receipt failure.
+                            // Self-contained actual inline pixels remain safe.
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        }
+                    }
+                }
+            }
             for (index, block) in content.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
+                let reference = references.get(&index).cloned();
+                let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
                 let index = self
                     .blocks
@@ -1410,7 +1525,25 @@ impl Claude {
                     "image" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
                         role,
-                        content: image_content(block),
+                        content: match image_content(block) {
+                            ItemContent::Image {
+                                path, description, ..
+                            } => ItemContent::Image {
+                                path: if unavailable.is_some() {
+                                    String::new()
+                                } else {
+                                    path
+                                },
+                                description: unavailable.cloned().unwrap_or_else(|| {
+                                    reference
+                                        .as_ref()
+                                        .map(|reference| reference.label())
+                                        .unwrap_or(description)
+                                }),
+                                reference,
+                            },
+                            content => content,
+                        },
                         started_at: None,
                         at: None,
                     })),
@@ -1418,6 +1551,7 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: ItemContent::Image {
+                            reference: None,
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
@@ -1635,6 +1769,10 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn prepared_launch_identity(&self) -> Option<PreparedIdentity> {
+        self.prepared_identity.clone()
+    }
+
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -1765,10 +1903,14 @@ impl Adapter for Claude {
         }
         if self.history_only {
             self.observe_title(&mut step);
-            let reason = format!(
-                "The saved working directory {} is unavailable. Conversation history is read-only.",
-                self.cwd.display()
-            );
+            let reason = if self.forced_history {
+                "Saved conversation history is read-only; no provider was started.".to_owned()
+            } else {
+                format!(
+                    "The saved working directory {} is unavailable. Conversation history is read-only.",
+                    self.cwd.display()
+                )
+            };
             step.events.push(Event::ReadOnlyHistory {
                 reason: reason.clone(),
             });
@@ -1787,10 +1929,11 @@ impl Adapter for Claude {
             match command {
                 Command::LoadEarlier => {}
                 Command::Refresh => return Ok(Step::default()),
-                _ => return Err(
-                    "The saved working directory is unavailable; this conversation is read-only"
-                        .into(),
-                ),
+                _ => {
+                    return Err(
+                        "This saved conversation is read-only; no provider was started".into(),
+                    );
+                }
             }
         }
         match command {
@@ -1949,6 +2092,9 @@ impl Adapter for Claude {
                     vec![],
                     PromptMode::Send,
                 )
+            }
+            Command::ReadTextCopy { .. } => {
+                return Err("Text copies are served by the transcript cache".into());
             }
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
                 return Err("File changes are served by the transcript cache".into());
@@ -3503,6 +3649,7 @@ fn image_content(block: &Value) -> ItemContent {
         _ => String::new(),
     };
     ItemContent::Image {
+        reference: None,
         path,
         description: "Claude image attachment".into(),
     }
@@ -3531,6 +3678,9 @@ fn content_text(value: &Value) -> String {
         value.to_string()
     }
 }
+// Question and option strings are provider-authored text, not attachment
+// descriptors. Preserve them verbatim: they also serve as answer-map keys.
+// A filename or shell pattern in a question does not authorize a file read.
 fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
     let questions = input["questions"]
         .as_array()
@@ -5199,6 +5349,285 @@ mod history_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.as_ref().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            let image_items = |frame: &Value| {
+                let mut step = Step::default();
+                Claude::default().message(frame, &mut step).unwrap();
+                step.events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for failure in 0..3 {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let mut frame = json!({"type":"user", "uuid":"unverified-image-history", "message":{"role":"user", "content":[
+                    {"type":"text", "text":marker},
+                    {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+                ]}});
+                let items = image_items(&frame);
+                assert_eq!(items.len(), 2, "unverified marker must remain literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference:None, description } if path.is_empty() && description.contains("originating device")),
+                    "a real coincident local PNG is not preview authority"
+                );
+                // The foreign claim still cannot create trusted metadata, but
+                // actual self-contained history pixels need no local path.
+                frame["message"]["content"][1]["source"] = json!({"type":"base64", "media_type":"image/png", "data":STANDARD.encode(&bytes)});
+                let inline = image_items(&frame);
+                assert!(
+                    matches!(&inline[1].content, ItemContent::Image { path, reference:None, .. } if path.starts_with("data:image/png;base64,"))
+                );
+            }
+            let legacy = json!({"type":"user", "uuid":"legacy-url", "message":{"role":"user", "content":[
+                {"type":"text", "text":"ordinary earlier [Image 77777] prose"},
+                {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+            ]}});
+            let items = image_items(&legacy);
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { path, reference:None, .. } if path == image.path.to_str().unwrap()),
+                "unclaimed legacy URL behavior stays unchanged"
+            );
+            assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let reference = attachment.reference.clone().unwrap();
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(text.clone(), vec![hinted.clone()], PromptMode::Queue)
+                .unwrap();
+            let frame = &submitted.writes[0];
+            let content = frame["message"]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 3);
+            assert_eq!(content[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(content[2]["source"]["type"], "base64");
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let queued = &adapter.queued[0];
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [hinted]);
+            assert!(queued.editable);
+            let mut retry = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let resent = retry
+                .send_prompt(
+                    queued.text.clone(),
+                    queued.attachments.clone(),
+                    PromptMode::Send,
+                )
+                .unwrap();
+            assert_eq!(
+                resent.writes[0]["message"]["content"],
+                frame["message"]["content"]
+            );
+            // A newly attached adapter parses the actual persisted provider
+            // frame, not a fabricated local image item.
+            let mut restored = Claude::default();
+            let mut history = Step::default();
+            restored.message(frame, &mut history).unwrap();
+            let items = history
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path.starts_with("data:image/png;base64,") && description == &reference.label())
+            );
+            assert!(
+                items[1].id.ends_with(":2"),
+                "stripping a marker never shifts provider block indices"
+            );
+
+            let mut foreign = frame.clone();
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            foreign["uuid"] = json!("forged-image-history");
+            foreign["message"]["content"][1]["text"] =
+                json!(super::super::image_references::marker(&forged).unwrap());
+            let mut visible = Step::default();
+            Claude::default().message(&foreign, &mut visible).unwrap();
+            assert_eq!(
+                visible
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Item(_)))
+                    .count(),
+                3
+            );
+            assert!(visible.events.iter().any(|event| matches!(
+                event,
+                Event::Item(Item {
+                    content: ItemContent::Image {
+                        reference: None,
+                        ..
+                    },
+                    ..
+                })
+            )));
+        });
+    }
+
+    #[test]
+    fn multiple_referenced_images_keep_caret_mapping_and_base64_order() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!("Use {} before {}", second_ref.token(), first_ref.token());
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(
+                    text.clone(),
+                    vec![first.clone(), second.clone()],
+                    PromptMode::Send,
+                )
+                .unwrap();
+            let content = &submitted.writes[0]["message"]["content"];
+            assert_eq!(content[0]["text"], text);
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(
+                content[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(content[4]["type"], "image");
+            let first_bytes = std::fs::read(&first.path).unwrap();
+            let second_bytes = std::fs::read(&second.path).unwrap();
+            assert_ne!(
+                first_bytes, second_bytes,
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                second_bytes
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[4]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                first_bytes
+            );
+            let mut restored = Step::default();
+            Claude::default()
+                .message(&submitted.writes[0], &mut restored)
+                .unwrap();
+            let identities = restored
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(Item {
+                        content:
+                            ItemContent::Image {
+                                reference: Some(reference),
+                                ..
+                            },
+                        ..
+                    }) => Some(reference.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(identities, [second_ref.id, first_ref.id]);
+        });
+    }
+
+    #[test]
+    fn referenced_image_only_and_foreign_attachment_failures_preserve_transport_rules() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(String::new(), vec![attachment.clone()], PromptMode::Send)
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["message"]["content"][2]["type"],
+                "image"
+            );
+            let mut foreign = attachment;
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            assert!(
+                adapter
+                    .send_prompt("compare".into(), vec![foreign], PromptMode::Send)
+                    .is_err()
+            );
+            assert!(adapter.submissions.is_empty());
+            assert!(!adapter.busy);
+        });
+    }
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
@@ -6331,6 +6760,7 @@ mod tests {
             .send_prompt(
                 text.clone(),
                 vec![Attachment {
+                    reference: None,
                     path: attachment.clone(),
                 }],
                 PromptMode::Queue,
@@ -6349,7 +6779,7 @@ mod tests {
             Event::QueueChanged(messages)
                 if messages.len() == 1
                     && !messages[0].editable
-                    && messages[0].attachments == [Attachment { path: attachment.clone() }]
+                    && messages[0].attachments == [Attachment { path: attachment.clone(), reference: None }]
         )));
         let frame = submitted.writes[0].clone();
         let id = frame["uuid"].clone();
@@ -6669,6 +7099,55 @@ mod tests {
             step.writes,
             vec![reply(
                 "q1",
+                json!({"behavior":"allow","updatedInput":expected})
+            )]
+        );
+    }
+
+    #[test]
+    fn question_artifact_shorthand_remains_text_and_round_trips_exactly() {
+        let question = "Compare .worktrees/v2review-related-sites-redesign/docs/local/v2review/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png and tree-real-*.png";
+        let description = "Inspect [expanded](docs/local/v2review/tree-fixture-dark-expanded.png)";
+        let input = json!({"questions":[{
+            "question":question,
+            "header":"Artifacts",
+            "options":[
+                {"label":"Use fixtures", "description":description},
+                {"label":"Use tree-real-*.png", "description":"Keep the literal filename"}
+            ]
+        }]});
+        let mut adapter = Claude::default();
+        let requested = adapter
+            .receive(approval("artifacts", "AskUserQuestion", input.clone()))
+            .unwrap();
+        // The request supplies no image blocks. In particular, neither the
+        // question nor an option description becomes a filesystem attachment.
+        assert!(requested.writes.is_empty());
+        assert_eq!(requested.events.len(), 1);
+        let Event::Request(request) = &requested.events[0] else {
+            panic!("question request");
+        };
+        assert_eq!(request.fields[0].id, question);
+        assert_eq!(request.fields[0].label, question);
+        assert_eq!(request.fields[0].choices[0].description, description);
+        assert_eq!(request.fields[0].choices[1].id, "Use tree-real-*.png");
+
+        let answered = adapter
+            .answer(
+                "artifacts".into(),
+                "allow".into(),
+                vec![Answer {
+                    field: question.into(),
+                    values: vec!["Use tree-real-*.png".into()],
+                }],
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({question:"Use tree-real-*.png"});
+        assert_eq!(
+            answered.writes,
+            vec![reply(
+                "artifacts",
                 json!({"behavior":"allow","updatedInput":expected})
             )]
         );
@@ -10090,6 +10569,46 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
+        );
+    }
+
+    #[test]
+    fn attachment_paths_are_exact_and_relative_to_the_provider_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_cwd = directory.path().join("child-worktree");
+        std::fs::create_dir(&provider_cwd).unwrap();
+        std::fs::write(
+            directory.path().join("tree-real-expanded.png"),
+            "wrong root",
+        )
+        .unwrap();
+        std::fs::write(
+            provider_cwd.join("tree-real-expanded.png"),
+            b"\x89PNG\r\n\x1a\nchild image",
+        )
+        .unwrap();
+        let concrete =
+            attachment_block(&provider_cwd, Path::new("tree-real-expanded.png")).unwrap();
+        assert_eq!(concrete["type"], "image");
+        assert_eq!(
+            concrete["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nchild image")
+        );
+        for shorthand in ["tree-real-*.png", "tree-real-{expanded,collapsed}.png"] {
+            let error = attachment_block(&provider_cwd, Path::new(shorthand)).unwrap_err();
+            assert!(error.contains(&provider_cwd.join(shorthand).display().to_string()));
+        }
+        // Pattern characters can be valid literal filenames. Do not reject or
+        // expand them when an explicitly selected attachment exists verbatim.
+        std::fs::write(
+            provider_cwd.join("tree-real-*.png"),
+            b"\x89PNG\r\n\x1a\nliteral image",
+        )
+        .unwrap();
+        let literal = attachment_block(&provider_cwd, Path::new("tree-real-*.png")).unwrap();
+        assert_eq!(
+            literal["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nliteral image")
         );
     }
 

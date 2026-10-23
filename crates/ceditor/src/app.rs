@@ -2303,6 +2303,44 @@ impl Editor {
         Task::batch([files, review, self.refresh_snapshot(id, false)])
     }
 
+    fn watches_review_requests(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|tab| tab.review.review_request_repository().is_some())
+    }
+
+    /// The review tick slows while the window is in the background, and
+    /// `time::every` waits a full interval before its first tick, so a
+    /// returning user gets one read pass now instead of after the next tick.
+    fn review_requests_focus_regained(&mut self) -> Task<Message> {
+        if !self.watches_review_requests() {
+            return Task::none();
+        }
+        self.update_review_requests(pull_request_review::request_ui::monitor::Action::Tick)
+    }
+
+    fn update_review_requests(
+        &mut self,
+        action: pull_request_review::request_ui::monitor::Action,
+    ) -> Task<Message> {
+        let repositories = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.review.review_request_repository().cloned())
+            .collect::<Vec<_>>();
+        let task = self
+            .review_requests
+            .update(action, repositories)
+            .map(Message::ReviewRequests)
+            .map(cosmic::Action::App);
+        let report = self.report_review_requests();
+        for tab in &mut self.tabs {
+            tab.review
+                .sync_review_requests(self.review_requests.snapshots());
+        }
+        Task::batch([task, report])
+    }
+
     fn refresh(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -3146,13 +3184,18 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::WindowFocused(window, focused) => {
+                    let mut review_requests = Task::none();
                     if self.core.main_window_id() == Some(window) {
+                        let regained = focused && !self.window_focused;
                         self.window_focused = focused;
                         if !focused {
                             self.tab_history.finish(self.active);
                         }
+                        if regained {
+                            review_requests = self.review_requests_focus_regained();
+                        }
                     }
-                    self.notification_focus()
+                    Task::batch([self.notification_focus(), review_requests])
                 }
                 Message::RefreshVisible => {
                     // A colour-only theme change reaches the hook but not the
@@ -3929,26 +3972,7 @@ impl Application for Editor {
                     task
                 }
                 Message::PullRequestReview(id, action) => self.handle_review(id, action),
-                Message::ReviewRequests(action) => {
-                    let repositories = self
-                        .tabs
-                        .iter()
-                        .filter_map(|tab| tab.review.review_request_repository().cloned())
-                        .collect::<Vec<_>>();
-                    let task = self
-                        .review_requests
-                        .update(action, repositories)
-                        .map(Message::ReviewRequests)
-                        .map(cosmic::Action::App);
-                    let report = self.report_review_requests();
-                    for tab in &mut self.tabs {
-                        tab.review.clear_external_review_requests();
-                        for (repository, snapshot) in self.review_requests.snapshots() {
-                            tab.review.apply_review_requests(repository, snapshot);
-                        }
-                    }
-                    Task::batch([task, report])
-                }
+                Message::ReviewRequests(action) => self.update_review_requests(action),
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
                         if !tab.snapshot_loading {
@@ -4576,12 +4600,11 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        let review_requests = if self
-            .tabs
-            .iter()
-            .any(|tab| tab.review.review_request_repository().is_some())
-        {
-            iced::time::every(Duration::from_secs(10)).map(|_| {
+        let review_requests = if self.watches_review_requests() {
+            iced::time::every(pull_request_review::request_ui::monitor::tick_interval(
+                self.window_focused,
+            ))
+            .map(|_| {
                 Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::Tick)
             })
         } else {
@@ -6302,6 +6325,58 @@ mod tests {
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
         );
+    }
+
+    #[test]
+    fn review_discovery_catches_up_only_when_the_main_window_regains_focus() {
+        let mut app = editor();
+        let main = window::Id::RESERVED;
+        let other = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.window_focused = true;
+        let watch = |app: &mut Editor, root: &str, repository: &str| {
+            let tab = add(app, root, None);
+            drop(
+                app.tab_mut(tab).unwrap().review.set_source(Some(
+                    pull_request_review::ReviewSource {
+                        repository: cagents::github::GitHubRepoKey::new(
+                            "github.com",
+                            None,
+                            "owner",
+                            repository,
+                        )
+                        .unwrap(),
+                        worktree: root.into(),
+                    },
+                )),
+            );
+        };
+        watch(&mut app, "/first", "first");
+        for (window, focused) in [(other, false), (other, true), (main, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert!(app.window_focused);
+            assert_eq!(app.review_requests.snapshots().count(), 0);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        assert!(!app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 0);
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert!(app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 1);
+
+        // A newly bound repository exposes a second, observable catch-up
+        // pass: duplicate focus events must not start discovery again.
+        watch(&mut app, "/second", "second");
+        let revision = app.review_requests.revision();
+        for (window, focused) in [(main, true), (other, false), (other, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert_eq!(app.review_requests.revision(), revision);
+            assert_eq!(app.review_requests.snapshots().count(), 1);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert_eq!(app.review_requests.snapshots().count(), 2);
+        assert_ne!(app.review_requests.revision(), revision);
     }
 
     #[test]

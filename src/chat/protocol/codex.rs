@@ -61,25 +61,81 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
-const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
+// Reserve for every possible byte count, leaving the rest for real output.
+const OUTPUT_MARKER_BYTES: usize =
+    "\n[...  bytes omitted ...]\n".len() + usize::MAX.ilog10() as usize + 1;
+/// Output keeps its first quarter and a rolling tail, with accounting kept
+/// separately from provider text so marker-like output cannot forge omission.
+#[derive(Default)]
+struct OutputWindow {
+    omitted: usize,
+    head: usize,
+}
 
-fn append_display_output(output: &mut String, delta: &str, limit: usize) -> bool {
-    if (output.ends_with(OUTPUT_TRUNCATED) && output.len().saturating_add(3) >= limit)
-        || delta.is_empty()
-    {
+fn append_display_output(
+    output: &mut String,
+    delta: &str,
+    limit: usize,
+    window: &mut OutputWindow,
+) -> bool {
+    if delta.is_empty() {
         return false;
     }
-    if output.len().saturating_add(delta.len()) <= limit {
+    if limit < OUTPUT_MARKER_BYTES + 4 {
+        // Large command identity fields can leave very little output budget.
+        // Preserve the newest UTF-8-safe suffix even when no marker fits.
+        if delta.len() >= limit {
+            *output = delta[delta.ceil_char_boundary(delta.len().saturating_sub(limit))..].into();
+        } else {
+            let keep = limit - delta.len();
+            let start = output.ceil_char_boundary(output.len().saturating_sub(keep));
+            output.drain(..start);
+            output.push_str(delta);
+        }
+        window.omitted = 0;
+        window.head = 0;
+        return true;
+    }
+    if window.omitted == 0 && output.len().saturating_add(delta.len()) <= limit {
         output.push_str(delta);
         return true;
     }
-    let budget = limit.saturating_sub(OUTPUT_TRUNCATED.len());
-    let end = output.floor_char_boundary(budget.min(output.len()));
-    output.truncate(end);
-    let end = delta.floor_char_boundary(budget.saturating_sub(output.len()).min(delta.len()));
-    output.push_str(&delta[..end]);
-    if limit >= OUTPUT_TRUNCATED.len() {
-        output.push_str(OUTPUT_TRUNCATED);
+    // Reserve enough space for the largest usize count and marker punctuation.
+    let budget = limit.saturating_sub(OUTPUT_MARKER_BYTES);
+    let (head, tail) = if window.omitted == 0 {
+        let mut whole = std::mem::take(output);
+        whole.push_str(delta);
+        let mut head = whole.floor_char_boundary((budget / 4).min(whole.len()));
+        if let Some(line) = whole[..head].rfind('\n') {
+            head = line + 1;
+        }
+        (whole[..head].to_owned(), whole[head..].to_owned())
+    } else {
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        let mut tail = output[window.head + marker.len()..].to_owned();
+        tail.push_str(delta);
+        (output[..window.head].to_owned(), tail)
+    };
+    let tail_budget = budget.saturating_sub(head.len());
+    let mut start = tail.ceil_char_boundary(tail.len().saturating_sub(tail_budget));
+    // A rolling tail begins on a complete line where possible. For long
+    // single-line output preserve a UTF-8-safe suffix instead.
+    if start > 0
+        && let Some(line) = tail[start..].find('\n')
+    {
+        if start + line + 1 < tail.len() {
+            start += line + 1;
+        }
+    }
+    window.omitted = window.omitted.saturating_add(start);
+    window.head = head.len();
+    *output = head;
+    let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+    if marker.len() <= limit.saturating_sub(output.len()) {
+        output.push_str(&marker);
+        output.push_str(&tail[start..]);
+    } else {
+        output.truncate(output.floor_char_boundary(limit));
     }
     true
 }
@@ -359,6 +415,7 @@ fn create_inner(
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: Vec::new(),
             listing: Vec::new(),
             modalities: BTreeMap::new(),
@@ -506,6 +563,7 @@ struct Codex {
     /// start of an escape sequence the next delta finishes. An entry exists
     /// only for an item in `active_items`, and goes when the item does.
     output_streams: BTreeMap<String, super::terminal_output::Stream>,
+    output_windows: BTreeMap<String, OutputWindow>,
     models: Vec<Model>,
     /// The pages of a model listing still under way. The listing is
     /// reported whole, since a model missing from part of it reads as one
@@ -833,12 +891,41 @@ impl Codex {
             let inputs = array(entry, "input")?;
             let mut parts = Vec::new();
             let mut attachments = Vec::new();
-            for input in inputs {
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashSet::new();
+            for (index, pair) in inputs.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && pair[1]["type"] == "localImage"
+                    && let (Some(marker), Some(path)) =
+                        (pair[0]["text"].as_str(), pair[1]["path"].as_str())
+                    && super::image_references::claims_reference(marker)
+                {
+                    if let Some(reference) = super::image_references::restore(marker, path) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else {
+                        // A canonical owned-image claim is not a legacy local
+                        // file. On another device the same path can mean
+                        // different pixels; never offer it for edit/replay.
+                        unverified.insert(index + 1);
+                    }
+                }
+            }
+            for (index, input) in inputs.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 parts.push(match input["type"].as_str() {
                     Some("text") => string(input, "text")?.to_owned(),
                     Some("localImage") => {
                         attachments.push(chat::Attachment {
-                            path: string(input, "path")?.into(),
+                            path: if unverified.contains(&index) {
+                                std::path::PathBuf::new()
+                            } else {
+                                string(input, "path")?.into()
+                            },
+                            reference: references.remove(&index),
                         });
                         continue;
                     }
@@ -859,14 +946,17 @@ impl Codex {
             // sent, and local images.
             let texts = inputs
                 .iter()
-                .filter(|input| input["type"] == "text")
+                .enumerate()
+                .filter(|(index, input)| input["type"] == "text" && !synthetic.contains(index))
+                .map(|(_, input)| input)
                 .collect::<Vec<_>>();
             let named = texts
                 .first()
                 .and_then(|input| input["text"].as_str())
                 .map(|text| self.named_skills(text))
                 .unwrap_or_default();
-            message.editable &= texts.len() <= 1
+            message.editable &= unverified.is_empty()
+                && texts.len() <= 1
                 && inputs.iter().all(|input| match input["type"].as_str() {
                     Some("text" | "localImage") => true,
                     Some("skill") => named.iter().any(|(name, path)| {
@@ -1065,6 +1155,38 @@ impl Codex {
             && (self.active_items.len() < MAX_ACTIVE_ITEMS
                 || self.active_items.contains_key(&item.id))
     }
+    /// A native snapshot and its clipping/terminal decoder state have the same
+    /// owner. Replacement starts a new decoder and installs the window produced
+    /// by parsing THAT snapshot. History only seeds an absent active item.
+    fn track_snapshot_item(
+        &mut self,
+        value: &Value,
+        item: &Item,
+        window: Option<OutputWindow>,
+        replace: bool,
+    ) {
+        if self.tracks(value, item) {
+            if replace || !self.active_items.contains_key(&item.id) {
+                self.output_streams.remove(&item.id);
+                self.output_windows.remove(&item.id);
+                if value["type"] == "commandExecution" {
+                    let raw = value["aggregatedOutput"].as_str().unwrap_or_default();
+                    self.output_streams.insert(
+                        item.id.clone(),
+                        super::terminal_output::Stream::from_snapshot(raw),
+                    );
+                }
+                if let Some(window) = window {
+                    self.output_windows.insert(item.id.clone(), window);
+                }
+                self.active_items.insert(item.id.clone(), item.clone());
+            }
+        } else {
+            self.active_items.remove(&item.id);
+            self.output_streams.remove(&item.id);
+            self.output_windows.remove(&item.id);
+        }
+    }
     /// An idle thread says nothing about whether its last turn succeeded.
     /// Recover that outcome from the latest page, never an older page or while
     /// live work is running. Buffered live notifications are replayed afterward.
@@ -1145,18 +1267,15 @@ impl Codex {
                         self.discover_child(id, &metadata, step)?;
                     }
                 }
-                for item in parse_item(value, !active, turn_id)? {
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(value, !active, turn_id, |id, window| {
+                    windows.insert(id.to_owned(), window);
+                })?;
+                for item in parsed {
                     if active && self.busy {
-                        if self.tracks(value, &item) {
-                            self.active_items
-                                .entry(item.id.clone())
-                                .or_insert_with(|| item.clone());
-                        } else {
-                            // The page is newer than a completion this
-                            // adapter missed while it was not reading.
-                            self.active_items.remove(&item.id);
-                            self.output_streams.remove(&item.id);
-                        }
+                        // Completed history releases an unseen completion;
+                        // live history cannot replace a more recent stream.
+                        self.track_snapshot_item(value, &item, windows.remove(&item.id), false);
                     }
                     items.push(item);
                 }
@@ -1192,6 +1311,7 @@ impl Codex {
         // Each skill the text names goes with it as an input of its own, as
         // Codex's own composer sends one: the text names a skill only by its
         // name, which loads nothing when two skills share it.
+        let attachments = super::image_references::ordered(&text, &attachments)?;
         let skills = self.named_skills(&text);
         if !text.is_empty() {
             input.push(json!({"type":"text","text":text}));
@@ -1202,19 +1322,25 @@ impl Codex {
                 .map(|(name, path)| json!({"type":"skill","name":name,"path":path})),
         );
         for attachment in attachments {
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             if !self.capabilities().attachments {
                 return Err("The selected Codex model does not advertise image input".into());
             }
             let path = if attachment.path.is_absolute() {
-                attachment.path
+                attachment.path.clone()
             } else {
-                self.cwd.join(attachment.path)
+                self.cwd.join(&attachment.path)
             };
             if !crate::chat::is_image_path(&path) {
                 return Err("Codex native attachments support local images (PNG/JPEG/GIF/WebP), not arbitrary files".into());
             }
             if !path.is_file() {
                 return Err(format!("Attachment is not a file: {}", path.display()));
+            }
+            if let Some(reference) = &attachment.reference {
+                input.push(
+                    json!({"type":"text","text":super::image_references::marker(reference)?}),
+                );
             }
             input.push(json!({"type":"localImage","path":path.to_str().ok_or("Attachment path is not UTF-8")?}));
         }
@@ -1585,7 +1711,13 @@ impl Adapter for Codex {
         match command {
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
-                let input = self.input(text, attachments)?;
+                let input = self.input(text, attachments.clone())?;
+                match mode {
+                    PromptMode::Send if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) => return Err("A Codex turn is active; explicitly steer or queue instead".into()),
+                    PromptMode::Steer if self.turn.is_none() => return Err("There is no known active Codex turn to steer".into()),
+                    _ => {}
+                }
+                for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
@@ -1704,6 +1836,8 @@ impl Adapter for Codex {
                 // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
+            Command::ReadTextCopy { .. } =>
+                return Err("Text copies are served by the transcript cache".into()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
@@ -2756,10 +2890,18 @@ impl Adapter for Codex {
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
                 for value in array(turn, "items")? {
-                    for item in parse_item(value, method == "turn/completed", string(turn, "id")?)?
-                    {
-                        if method == "turn/started" && self.tracks(value, &item) {
-                            self.active_items.insert(item.id.clone(), item.clone());
+                    let mut windows = BTreeMap::new();
+                    let parsed = parse_item_with_windows(
+                        value,
+                        method == "turn/completed",
+                        turn_id,
+                        |id, window| {
+                            windows.insert(id.to_owned(), window);
+                        },
+                    )?;
+                    for item in parsed {
+                        if method == "turn/started" {
+                            self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
                         }
                         step.events.push(Event::Item(item));
                     }
@@ -2770,6 +2912,7 @@ impl Adapter for Codex {
                     if !self.busy {
                         self.active_items.clear();
                         self.output_streams.clear();
+                        self.output_windows.clear();
                     }
                     step.events.push(Event::Status {
                         busy: self.busy,
@@ -2826,12 +2969,27 @@ impl Adapter for Codex {
                         self.discover_child(id, &value["agentsStates"][id], &mut step)?;
                     }
                 }
-                for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(
+                    &params["item"],
+                    done,
+                    string(params, "turnId")?,
+                    |id, window| {
+                        windows.insert(id.to_owned(), window);
+                    },
+                )?;
+                for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
-                    } else if self.tracks(&params["item"], &item) {
-                        self.active_items.insert(item.id.clone(), item.clone());
+                        self.output_windows.remove(&item.id);
+                    } else {
+                        self.track_snapshot_item(
+                            &params["item"],
+                            &item,
+                            windows.remove(&item.id),
+                            true,
+                        );
                     }
                     step.events.push(Event::Item(item));
                 }
@@ -2904,9 +3062,10 @@ impl Adapter for Codex {
                         let limit =
                             MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                         let offset = output.len();
-                        let preserves_prefix = offset.saturating_add(delta.len()) <= limit
-                            || offset <= limit.saturating_sub(OUTPUT_TRUNCATED.len());
-                        if append_display_output(output, delta, limit) {
+                        let window = self.output_windows.entry(id.clone()).or_default();
+                        let preserves_prefix =
+                            window.omitted == 0 && offset.saturating_add(delta.len()) <= limit;
+                        if append_display_output(output, delta, limit, window) {
                             if preserves_prefix {
                                 step.events.push(Event::OutputDelta {
                                     id,
@@ -3382,6 +3541,14 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     Ok(changes)
 }
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
+    parse_item_with_windows(value, done, turn, |_, _| {})
+}
+fn parse_item_with_windows(
+    value: &Value,
+    done: bool,
+    turn: &str,
+    mut parsed_window: impl FnMut(&str, OutputWindow),
+) -> Result<Vec<Item>, String> {
     let scoped_id = item_key(turn, string(value, "id")?);
     let id = scoped_id.as_str();
     let kind = string(value, "type")?;
@@ -3442,7 +3609,33 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         }],
         "userMessage" => {
             let mut items = Vec::new();
-            for (index, content) in array(value, "content")?.iter().enumerate() {
+            let contents = array(value, "content")?;
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
+            for (index, pair) in contents.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && matches!(pair[1]["type"].as_str(), Some("localImage" | "image"))
+                    && let (Some(marker), Some(source)) = (
+                        pair[0]["text"].as_str(),
+                        pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
+                    )
+                    && super::image_references::claims_reference(marker)
+                {
+                    if let Some(reference) = super::image_references::restore(marker, source) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else if !source.starts_with("data:image/") {
+                        // Keep the literal marker visible, but do not read a
+                        // possibly foreign device's coincident absolute path.
+                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                    }
+                }
+            }
+            for (index, content) in contents.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 let part_id = format!("{id}/input/{index}");
                 match content["type"].as_str().unwrap_or_default() {
                     "text" => items.push(text(
@@ -3455,12 +3648,22 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         id: part_id,
                         role: Role::User,
                         content: ItemContent::Image {
-                            path: content["path"]
-                                .as_str()
-                                .or_else(|| content["url"].as_str())
-                                .ok_or("Missing image path")?
-                                .into(),
-                            description: "User attachment".into(),
+                            reference: references.get(&index).cloned(),
+                            path: if unverified.contains_key(&index) {
+                                String::new()
+                            } else {
+                                content["path"]
+                                    .as_str()
+                                    .or_else(|| content["url"].as_str())
+                                    .ok_or("Missing image path")?
+                                    .into()
+                            },
+                            description: unverified.get(&index).cloned().unwrap_or_else(|| {
+                                references
+                                    .get(&index)
+                                    .map(|reference| reference.label())
+                                    .unwrap_or_else(|| "User attachment".into())
+                            }),
                         },
                         started_at: None,
                         at: None,
@@ -3589,6 +3792,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             id: id.into(),
             role: Role::Assistant,
             content: ItemContent::Image {
+                reference: None,
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
@@ -3623,6 +3827,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         started_at: None,
                         at: None,
                         content: ItemContent::Image {
+                            reference: None,
                             path,
                             description: "Generated image".into(),
                         },
@@ -3660,6 +3865,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         other => tool(other.into(), String::new(), value.to_string()),
     };
     for item in &mut items {
+        let mut window = OutputWindow::default();
         let bytes = item.content.byte_len();
         let limit = if matches!(&item.content, ItemContent::Image { path, .. } if path.starts_with("data:image/"))
         {
@@ -3674,11 +3880,17 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                 // Completed items replace streamed items, so apply the same bound.
                 let full = std::mem::take(output);
-                append_display_output(output, &full, limit);
+                append_display_output(output, &full, limit, &mut window);
             }
         }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());
+        }
+        if matches!(
+            &item.content,
+            ItemContent::Tool { .. } | ItemContent::Command { .. }
+        ) {
+            parsed_window(&item.id, window);
         }
     }
     Ok(items)
@@ -3904,6 +4116,452 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.clone().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            for failure in [0, 1, 2] {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let inputs = json!([
+                    {"type":"text","text":marker},
+                    {"type":"localImage","path":image.path.to_str().unwrap()}
+                ]);
+                let items = parse_item(
+                    &json!({"type":"userMessage","id":"foreign","content":inputs}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert_eq!(items.len(), 2, "unverified marker remains literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference: None, description } if path.is_empty() && description.contains("originating device")),
+                    "even a real coincident local file is not preview authority"
+                );
+                let mut step = Step::default();
+                adapter().queue_page(&json!({"data":[{"id":"foreign-image-only","input":inputs}],"nextCursor":null}), &mut step).unwrap();
+                let queued = step
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(messages) => messages.first(),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    !queued.editable,
+                    "image-only canonical marker cannot become legacy path replay"
+                );
+                assert!(queued.attachments[0].path.as_os_str().is_empty());
+                assert!(queued.attachments[0].reference.is_none());
+                assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+                let inline = format!(
+                    "data:image/png;base64,{}",
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                );
+                let inline_items = parse_item(
+                    &json!({"type":"userMessage","id":"inline","content":[
+                        {"type":"text","text":marker}, {"type":"image","url":inline}
+                    ]}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert!(
+                    matches!(&inline_items[1].content, ItemContent::Image { path, reference: None, .. } if path == &inline),
+                    "self-contained real image bytes remain viewable without borrowing image authority"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn referenced_image_is_real_provider_input_and_survives_history_and_queue() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let reference = attachment.reference.clone().unwrap();
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
+            let input = adapter.input(text.clone(), vec![hinted.clone()]).unwrap();
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(
+                input[2],
+                json!({"type":"localImage","path":attachment.path.to_str().unwrap()})
+            );
+            assert_eq!(
+                std::fs::read(&attachment.path).unwrap()[..8],
+                [137, 80, 78, 71, 13, 10, 26, 10]
+            );
+            let items = parse_item(
+                &json!({"type":"userMessage","id":"images","content":input}),
+                true,
+                "turn",
+            )
+            .unwrap();
+            assert_eq!(items.len(), 2, "only the verified mapping is hidden");
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path == attachment.path.to_str().unwrap() && description == &reference.label())
+            );
+            let mut step = Step::default();
+            adapter
+                .queue_page(
+                    &json!({"data":[{"id":"queued-image","input":input}],"nextCursor":null}),
+                    &mut step,
+                )
+                .unwrap();
+            let queued = step
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::QueueChanged(messages) => messages.first(),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(queued.editable);
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [attachment.clone()]);
+            let resent = adapter
+                .input(queued.text.clone(), queued.attachments.clone())
+                .unwrap();
+            assert_eq!(
+                resent, input,
+                "take-back and retry preserve identity and real image input"
+            );
+
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            let forged = json!({"type":"userMessage","id":"forged","content":[
+                {"type":"text","text":super::super::image_references::marker(&forged).unwrap()},
+                {"type":"localImage","path":attachment.path.to_str().unwrap()}
+            ]});
+            let items = parse_item(&forged, true, "turn").unwrap();
+            assert_eq!(items.len(), 2, "unverified prose remains visible");
+            assert!(matches!(
+                &items[1].content,
+                ItemContent::Image {
+                    reference: None,
+                    ..
+                }
+            ));
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text,
+                    attachments: vec![hinted],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["params"]["input"][2]["path"],
+                attachment.path.to_str().unwrap()
+            );
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .find(|image| image.id == reference.id)
+                    .unwrap()
+                    .retained
+            );
+        });
+    }
+
+    #[test]
+    fn multiple_image_inputs_follow_caret_order_without_renumbering() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!(
+                "Compare {} before {} and again {}",
+                second_ref.token(),
+                first_ref.token(),
+                second_ref.token()
+            );
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let input = adapter
+                .input(text.clone(), vec![first.clone(), second.clone()])
+                .unwrap();
+            assert_eq!(input[0]["text"], text);
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(input[2]["path"], second.path.to_str().unwrap());
+            assert_eq!(
+                input[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(input[4]["path"], first.path.to_str().unwrap());
+            assert!(adapter.input(text, vec![first.clone(), first]).is_err());
+        });
+    }
+
+    #[test]
+    fn image_only_legacy_and_foreign_references_keep_their_distinct_contracts() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let image_only = adapter
+                .input(String::new(), vec![attachment.clone()])
+                .unwrap();
+            assert_eq!(image_only.len(), 2);
+            assert_eq!(image_only[1]["type"], "localImage");
+            let legacy = adapter
+                .input(
+                    "[Image 1] literal".into(),
+                    vec![Attachment::file(&attachment.path)],
+                )
+                .unwrap();
+            assert_eq!(
+                legacy.len(),
+                2,
+                "legacy files do not acquire a UUID from text"
+            );
+            let mut foreign = attachment.clone();
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let error = adapter.input(String::new(), vec![foreign]).unwrap_err();
+            assert!(
+                !error.contains("Attachment is not a file"),
+                "foreign origin is refused before path access: {error}"
+            );
+            adapter.modalities.clear();
+            assert!(
+                adapter
+                    .input(String::new(), vec![attachment])
+                    .unwrap_err()
+                    .contains("does not advertise image")
+            );
+        });
+    }
+
+    fn output_window_command(output: &str) -> Value {
+        json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
+    }
+    fn output_window_started(output: &str) -> Value {
+        json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"window-turn","item":output_window_command(output)}})
+    }
+    fn output_window_delta(delta: &str) -> Value {
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"window-turn","itemId":"window-cmd","delta":delta}})
+    }
+    fn large_window_output() -> String {
+        format!(
+            "first🦀\n{}last🦀\n",
+            "middle🦀\n".repeat(MAX_ITEM_BYTES / 8)
+        )
+    }
+    fn assert_window_accounting(adapter: &Codex, source: &str) {
+        let key = item_key("window-turn", "window-cmd");
+        let item = adapter.active_items.get(&key).unwrap();
+        let ItemContent::Command { output, .. } = &item.content else {
+            panic!("missing command");
+        };
+        let window = adapter.output_windows.get(&key).unwrap();
+        assert!(window.omitted > 0);
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert!(output.starts_with("first🦀\n"));
+        assert!(source.ends_with(output.rsplit_once(&marker).unwrap().1));
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
+    }
+    #[test]
+    fn snapshot_output_preserves_its_partial_terminal_state_for_the_next_delta() {
+        for snapshot in ["item", "turn", "history"] {
+            for (raw, suffix, expected) in [
+                ("before🦀\u{1b}[", "31m-tail", "before🦀-tail"),
+                (
+                    "before🦀\u{1b}]8;;https://example.test/",
+                    "\u{7}tail",
+                    "before🦀tail",
+                ),
+                ("before🦀\u{1b}Ppayload\u{1b}", "\\tail", "before🦀tail"),
+                ("before🦀\r", "after", "before🦀\nafter"),
+            ] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                adapter.receive(output_window_started("")).unwrap();
+                adapter.receive(output_window_delta("old\u{1b}[")).unwrap();
+                match snapshot {
+                    "item" => {
+                        adapter.receive(output_window_started(raw)).unwrap();
+                    }
+                    "turn" => {
+                        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}}})).unwrap();
+                    }
+                    "history" => {
+                        let key = item_key("window-turn", "window-cmd");
+                        adapter.active_items.remove(&key);
+                        adapter.output_streams.remove(&key);
+                        adapter.output_windows.remove(&key);
+                        adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}],"nextCursor":null}), &mut Step::default(), false).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                adapter.receive(output_window_delta(suffix)).unwrap();
+                let key = item_key("window-turn", "window-cmd");
+                let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                else {
+                    panic!("command output");
+                };
+                assert_eq!(
+                    output, expected,
+                    "{snapshot} snapshot must seed its own terminal continuation, not the old stream or default grammar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_marker_budgets_still_retain_the_latest_complete_utf8_tail() {
+        let source = format!("first🦀\n{}LAST🦀\n", "numbered🦀\n".repeat(100));
+        for limit in 64..=96 {
+            let mut output = String::new();
+            let mut window = OutputWindow::default();
+            append_display_output(&mut output, &source, limit, &mut window);
+            assert!(output.len() <= limit);
+            assert!(
+                output.ends_with("LAST🦀\n"),
+                "a {limit}-byte window has room for its marker and newest line"
+            );
+            let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+            assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        }
+    }
+
+    #[test]
+    fn repeated_native_started_replaces_clipped_window_and_partial_decoder_together() {
+        for whole_turn in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            adapter.receive(output_window_started("")).unwrap();
+            let source = large_window_output();
+            adapter.receive(output_window_delta(&source)).unwrap();
+            assert_window_accounting(&adapter, &source);
+            adapter.receive(output_window_delta("\u{1b}[")).unwrap();
+            let key = item_key("window-turn", "window-cmd");
+            assert!(adapter.output_streams.contains_key(&key));
+            let replacement = "short🦀";
+            let frame = if whole_turn {
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(replacement)]}}})
+            } else {
+                output_window_started(replacement)
+            };
+            adapter.receive(frame).unwrap();
+            let window = adapter.output_windows.get(&key).unwrap();
+            assert_eq!((window.omitted, window.head), (0, 0));
+            let delta = "31m-tail🦀";
+            let step = adapter.receive(output_window_delta(delta)).unwrap();
+            assert!(step.events.iter().any(|event|matches!(event,Event::OutputDelta {offset,delta:seen,..} if *offset==replacement.len() && seen==delta)));
+            assert!(
+                matches!(&adapter.active_items[&key].content,ItemContent::Command {output,..} if output==&format!("{replacement}{delta}"))
+            );
+        }
+    }
+    #[test]
+    fn native_started_snapshot_retains_original_clipping_accounting_for_next_delta() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut source = large_window_output();
+        adapter.receive(output_window_started(&source)).unwrap();
+        assert_window_accounting(&adapter, &source);
+        let delta = "new-tail🦀\n";
+        source.push_str(delta);
+        adapter.receive(output_window_delta(delta)).unwrap();
+        assert_window_accounting(&adapter, &source);
+    }
+    #[test]
+    fn active_history_hydration_retains_clipping_window_without_replacing_live_owner() {
+        for existing in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            let mut source = large_window_output();
+            if existing {
+                adapter.receive(output_window_started("")).unwrap();
+                adapter.receive(output_window_delta(&source)).unwrap();
+            }
+            let mut step = Step::default();
+            let page_output = if existing {
+                "older page must not replace the current stream"
+            } else {
+                &source
+            };
+            adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(page_output)]}],"nextCursor":null}),&mut step,false).unwrap();
+            assert_window_accounting(&adapter, &source);
+            let delta = "history-followed-by-tail🦀\n";
+            source.push_str(delta);
+            adapter.receive(output_window_delta(delta)).unwrap();
+            assert_window_accounting(&adapter, &source);
+        }
+    }
+
+    #[test]
+    fn rolling_output_preserves_first_last_lines_and_exact_omission_bytes() {
+        let source = (1..=200000)
+            .map(|line| format!("{line}:🦀\n"))
+            .collect::<String>();
+        let mut output = String::new();
+        let mut window = OutputWindow::default();
+        let mut start = 0;
+        while start < source.len() {
+            let end = source.floor_char_boundary((start + 1024).min(source.len()));
+            append_display_output(
+                &mut output,
+                &source[start..end],
+                MAX_ITEM_BYTES,
+                &mut window,
+            );
+            assert!(output.len() <= MAX_ITEM_BYTES);
+            start = end;
+        }
+        assert!(output.starts_with("1:🦀\n"));
+        assert!(output.ends_with("200000:🦀\n"));
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+    }
 
     #[test]
     fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts() {
@@ -4753,7 +5411,7 @@ mod tests {
         );
         assert_eq!(page.writes[0]["params"]["cursor"], "page2");
         let last = adapter.receive(json!({"id":page.writes[0]["id"],"result":{"data":[{"id":"q2","input":[{"type":"localImage","path":"/fixture/image.png"}]}],"nextCursor":null}})).unwrap();
-        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into() }])));
+        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into(), reference: None }])));
         let changed = adapter
             .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
             .unwrap();
@@ -5014,6 +5672,7 @@ mod tests {
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: vec![Model {
                 id: "model".into(),
                 label: "Model".into(),
@@ -7098,17 +7757,15 @@ mod tests {
         adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
         let delta = "🦀".repeat(MAX_ITEM_BYTES);
         let streamed = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"large","delta":delta}})).unwrap();
-        let Event::OutputDelta {
-            offset,
-            delta: suffix,
-            ..
-        } = &streamed.events[0]
-        else {
-            panic!("missing streamed append")
+        let Event::Item(streamed) = &streamed.events[0] else {
+            panic!("missing bounded output window")
         };
-        assert_eq!(*offset, 0);
+        let ItemContent::Command { output: suffix, .. } = &streamed.content else {
+            panic!("missing command")
+        };
         assert!(suffix.len() <= MAX_ITEM_BYTES);
-        assert!(suffix.ends_with(OUTPUT_TRUNCATED));
+        assert!(suffix.contains("bytes omitted"));
+        assert!(suffix.ends_with("🦀"));
         item["status"] = json!("completed");
         item["aggregatedOutput"] = json!(delta);
         let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();

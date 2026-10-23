@@ -253,6 +253,11 @@ impl Cagents {
             "Search saved native chats".into(),
             Message::ResumeConversation(resume_ui::Action::Open),
         ));
+        entries.push((
+            "Open Work board".into(),
+            "Every worktree and branch in progress".into(),
+            Message::Sidebar(SidebarAction::OpenWork),
+        ));
         for id in self.workspace.order() {
             if let Some(card) = self.card_state(id) {
                 entries.push((

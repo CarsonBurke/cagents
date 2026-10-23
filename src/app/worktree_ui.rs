@@ -100,9 +100,11 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
         CardKind::PullRequests(view) => Some(&view.repository),
-        CardKind::Browser(_) | CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
-            None
-        }
+        CardKind::Browser(_)
+        | CardKind::Settings
+        | CardKind::Accounts
+        | CardKind::Automations
+        | CardKind::Work => None,
     }
 }
 
@@ -190,6 +192,7 @@ fn scope_descriptor(
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
+        chat_draft_attachments: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),

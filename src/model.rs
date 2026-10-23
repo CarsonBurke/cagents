@@ -218,6 +218,8 @@ pub enum CardKind {
     Accounts,
     /// Daemon-owned schedules and their durable execution history.
     Automations,
+    /// The daemon's Work board of every worktree and branch in progress.
+    Work,
 }
 
 impl CardKind {
@@ -225,7 +227,10 @@ impl CardKind {
     /// show application state rather than a session, file or page, so a
     /// window holds at most one of each and they never hibernate.
     pub fn is_utility(&self) -> bool {
-        matches!(self, Self::Settings | Self::Accounts | Self::Automations)
+        matches!(
+            self,
+            Self::Settings | Self::Accounts | Self::Automations | Self::Work
+        )
     }
 }
 
@@ -1221,6 +1226,8 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    #[serde(default)]
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1267,6 +1274,7 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

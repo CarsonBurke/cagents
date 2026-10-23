@@ -9,7 +9,7 @@ pub(in crate::host) fn inspect(
     policy: Policy,
     fence_actors: bool,
 ) -> Result<DaemonImpact, ProtocolError> {
-    let (registry, handles) = {
+    let (registry, handles, migrations) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
             state.execution_registry.clone(),
@@ -19,6 +19,26 @@ pub(in crate::host) fn inspect(
                 // An actor that already stopped admits nothing left to fence.
                 .filter(|(_, record)| record.handle.owns_work() && !record.handle.is_completed())
                 .map(|(&id, record)| (id, record.handle.clone()))
+                .collect::<Vec<_>>(),
+            state
+                .chats
+                .iter()
+                .filter_map(|(id, record)| {
+                    if !record.handle.owns_work() || record.handle.is_completed() {
+                        return None;
+                    }
+                    let mut source = record.session.clone();
+                    source.native_continuity = record.handle.native_continuity();
+                    let mut launch = source.launch.clone();
+                    launch.session_id = record.handle.confirmed_session_id();
+                    crate::chat::protocol::align_resume_identity(&mut launch).ok()?;
+                    crate::upgrade::handoff::validate_chat_source(&source, &launch).ok()?;
+                    Some(crate::upgrade::handoff::Chat {
+                        source,
+                        launch,
+                        previous_sources: state.upgrade_chats.get(id).cloned().unwrap_or_default(),
+                    })
+                })
                 .collect::<Vec<_>>(),
         )
     };
@@ -31,6 +51,13 @@ pub(in crate::host) fn inspect(
                 .automation_update_blockers()
                 .map_err(upgrade_error)?,
         );
+    }
+    if let Some(store) = crate::upgrade::handoff::Store::existing().map_err(upgrade_error)?
+        && let Err(reason) = store.preflight_recovered(&migrations)
+    {
+        blockers.push(format!(
+            "Upgrade recovery evidence cannot be retained: {reason}"
+        ));
     }
     if fence_actors {
         for (id, handle) in handles {
@@ -196,6 +223,7 @@ impl HostState {
                 hosted_source,
                 &record.handle,
             );
+            let migration = crate::upgrade::handoff::validate_chat_source(&record.session, &launch);
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
@@ -211,6 +239,8 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider stopped but may still hold unfinished work. Close this conversation to release it.",
                 )
+            } else if let Err(reason) = &migration {
+                (Disposition::Blocked, reason.as_str())
             } else if let Err(reason) = &environment {
                 (Disposition::Blocked, reason.as_str())
             } else if !ready {

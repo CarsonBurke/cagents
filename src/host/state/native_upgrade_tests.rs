@@ -180,6 +180,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             *cleanup_proof.lock().unwrap() = next.clone();
             let mut state = HostState::new(next);
             state.install_model(crate::host::model::Registry::at(&ownership_path).unwrap());
+            state.register_client(0);
             let successor = Arc::new(crate::host::state::HostLock::new(state));
             // Startup discovery failed before the UI asked for an upgrade
             // mapping. Preserve the precise refusal for every issued alias.
@@ -756,6 +757,7 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         .record_unattached(std::slice::from_ref(&departed), &[])
         .unwrap();
     let rollback = replace_daemon("rollback");
+    rollback.lock().unwrap().register_client(0);
     let refused = restore_upgrade_from(&rollback, store(), &empty_proc, Some(&holders)).unwrap();
     assert_eq!(
         refused,

@@ -555,6 +555,7 @@ mod tests {
                     relaunches: Vec::new(),
                     options: Default::default(),
                     execution_environment: None,
+                    execution_recipe: None,
                 }),
                 ..Default::default()
             },

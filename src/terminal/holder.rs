@@ -33,6 +33,10 @@ pub struct Recovery {
     pub relaunches: Vec<super::ipc::UpgradeRelaunch>,
     pub options: super::TerminalSpawnOptions,
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
+    /// The actual restart recipe retained by this original holder. It must
+    /// survive adoption even when the published source is a fresh/shell tuple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_recipe: Option<crate::model::LaunchRecipe>,
 }
 
 impl Recovery {
@@ -54,6 +58,11 @@ impl Recovery {
             })
         {
             return Err("holder has inconsistent terminal lineage".into());
+        }
+        if let Some(recipe) = &self.execution_recipe
+            && crate::upgrade::exact_conversation(recipe).is_none()
+        {
+            return Err("holder has inconsistent exact restart execution".into());
         }
         Ok(())
     }

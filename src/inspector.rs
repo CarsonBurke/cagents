@@ -523,6 +523,7 @@ pub fn model_for_card(
         CardKind::Settings => "Settings",
         CardKind::Accounts => "Accounts",
         CardKind::Automations => "Automations",
+        CardKind::Work => "Work",
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
@@ -866,7 +867,7 @@ pub fn model_for_card(
         }
         // Utility panes show application state, which the pane itself lays
         // out; the inspector has nothing to add beyond its status.
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => {}
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {}
     }
 
     sections.push(Section::new(
@@ -1398,7 +1399,7 @@ fn repository_context<'a>(
                     .first()
                     .map(|worktree| (project, worktree))
             }),
-        CardKind::Settings | CardKind::Accounts | CardKind::Automations => None,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => None,
     }
 }
 
