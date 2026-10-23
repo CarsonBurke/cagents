@@ -62,6 +62,7 @@ pub enum Refusal {
     SharedConfig,
     CensusUnavailable,
     CensusLimit,
+    HomeWritableByOthers,
 }
 impl Refusal {
     /// Safe product copy, independent of filesystem paths or OS diagnostics.
@@ -86,6 +87,9 @@ impl Refusal {
             }
             Self::CensusUnavailable => "Account configuration independence could not be confirmed",
             Self::CensusLimit => "Too many account paths are involved to confirm independence",
+            Self::HomeWritableByOthers => {
+                "Other users can change this account directory; choose a private account home"
+            }
             Self::HomeUnavailable => "The selected account home is unavailable or changed",
             Self::ExistingConfiguration => "A configuration entry already exists; it was preserved",
             Self::PresenceUnknown => "Configuration absence could not be confirmed",
@@ -172,6 +176,9 @@ fn owned_directory(root: &Root) -> Result<Identity, Refusal> {
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_dir() || metadata.uid() != uid || metadata.nlink() == 0 {
         return Err(Refusal::HomeUnavailable);
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(Refusal::HomeWritableByOthers);
     }
     Ok(Identity::of(&metadata))
 }
@@ -270,8 +277,10 @@ impl Prepared {
         publish: impl FnOnce(&Root, &File) -> Result<(), fs_safety::ResolveError>,
         sync: impl FnOnce(&Root) -> io::Result<()>,
     ) -> Outcome {
-        if owned_directory(&self.root) != Ok(self.home) {
-            return Outcome::NotCreated(Refusal::HomeUnavailable);
+        match owned_directory(&self.root) {
+            Ok(home) if home == self.home => {}
+            Ok(_) => return Outcome::NotCreated(Refusal::HomeUnavailable),
+            Err(reason) => return Outcome::NotCreated(reason),
         }
         if let Err(reason) = verify(&mut self.file, self.expected, 0) {
             return Outcome::NotCreated(reason);
@@ -283,6 +292,13 @@ impl Prepared {
         }
         if !revalidate() {
             return Outcome::NotCreated(Refusal::ContextChanged);
+        }
+        // Revalidation itself may observe concurrent directory changes. Check
+        // the actual destination again at the ensuing publication boundary.
+        match owned_directory(&self.root) {
+            Ok(home) if home == self.home => {}
+            Ok(_) => return Outcome::NotCreated(Refusal::HomeUnavailable),
+            Err(reason) => return Outcome::NotCreated(reason),
         }
         if let Err(error) = publish(&self.root, &self.file) {
             return Outcome::NotCreated(if error.is_already_exists() {
@@ -337,6 +353,84 @@ mod tests {
             not_found: false,
             already_exists: false,
             write_refused: false,
+        }
+    }
+
+    #[test]
+    fn a_home_writable_by_others_refuses_staging_without_changing_its_permissions() {
+        for mode in [0o770, 0o777, 0o702] {
+            let (directory, root) = fixture();
+            let marker = directory.path().join("preserved");
+            fs::write(&marker, b"private fixture preimage").unwrap();
+            fs::set_permissions(directory.path(), Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                prepare_with(&root, false, |_| panic!("unsafe home must not stage")),
+                Err(Refusal::HomeWritableByOthers)
+            ));
+            assert_eq!(
+                fs::metadata(directory.path()).unwrap().mode() & 0o7777,
+                mode
+            );
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+            assert_eq!(fs::read(marker).unwrap(), b"private fixture preimage");
+            assert!(!directory.path().join(NAME).exists());
+        }
+        // Read/search permission alone does not allow another uid to replace
+        // an entry. A conventional owned0755 home remains supported.
+        let (directory, root) = fixture();
+        fs::set_permissions(directory.path(), Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            prepare(&root, false).unwrap().publish(|| true),
+            Outcome::Created
+        );
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join(NAME)).unwrap().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn writable_home_drift_before_link_refuses_and_after_link_remains_uncertain() {
+        for after_link in [false, true] {
+            let (directory, root) = fixture();
+            let prepared = prepare(&root, false).unwrap();
+            let mut checks = 0;
+            let mut publications = 0;
+            let outcome = prepared.publish_with(
+                || {
+                    checks += 1;
+                    if checks == if after_link { 2 } else { 1 } {
+                        fs::set_permissions(directory.path(), Permissions::from_mode(0o770))
+                            .unwrap();
+                    }
+                    true
+                },
+                |root, file| {
+                    publications += 1;
+                    fs_safety::link_anonymous_new(root, file, OsStr::new(NAME))
+                },
+                fs_safety::sync_directory,
+            );
+            assert_eq!(
+                fs::metadata(directory.path()).unwrap().mode() & 0o7777,
+                0o770
+            );
+            if after_link {
+                assert_eq!(
+                    outcome,
+                    Outcome::CreationUncertain(Uncertainty::ContextChanged)
+                );
+                assert_eq!(publications, 1);
+                assert_eq!(fs::read(directory.path().join(NAME)).unwrap(), OFFLINE);
+            } else {
+                assert_eq!(outcome, Outcome::NotCreated(Refusal::HomeWritableByOthers));
+                assert_eq!(publications, 0);
+                assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+            }
         }
     }
 

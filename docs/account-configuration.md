@@ -260,6 +260,8 @@ This creates an independent file on the selected device. Existing entries,
 System accounts and homes or configuration targets shared with another account
 are preserved. Busy accounts and uncertain independence refuse creation. No
 registration, account default, credential or existing conversation is changed.
+Setup also refuses a directory writable by other users; it does not change
+the directory's permissions.
 
 The configuration applies to new Codex processes. Run **Check** again to measure
 actual access; creation alone does not prove execution or network readiness.
