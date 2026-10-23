@@ -263,9 +263,9 @@ pub enum Action {
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
-    ImageNext(bool),
-    ImageFit,
-    ImageExternal(images::ExternalTarget),
+    ImageNext(images::ControlTarget, bool),
+    ImageFit(images::ControlTarget),
+    ImageExternal(images::GalleryTarget),
     CopyLiteral(String),
     Latest(Target),
     /// Takes a waiting message back into the composer to be revised: the one
@@ -383,8 +383,8 @@ impl Action {
                 | Self::Tick
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
-                | Self::ImageNext(_)
-                | Self::ImageFit
+                | Self::ImageNext(..)
+                | Self::ImageFit(_)
                 | Self::ImageExternal(_)
         )
     }
@@ -9542,13 +9542,17 @@ impl Cagents {
                 }
             }
             Action::CloseImage => self.chat_ui.image_viewer = None,
-            Action::ImageNext(forward) => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+            Action::ImageNext(target, forward) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer
+                    && gallery.accepts_control(target)
+                {
                     gallery.next(forward);
                 }
             }
-            Action::ImageFit => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+            Action::ImageFit(target) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer
+                    && gallery.accepts_control(target)
+                {
                     gallery.reset = gallery.reset.wrapping_add(1);
                 }
             }
@@ -10736,7 +10740,13 @@ mod tests {
         let before = app.context_inspector_open;
         drop(app.update(Message::ToggleContextInspector));
         assert_eq!(app.context_inspector_open, before);
-        assert!(Action::ImageNext(true).allowed_while_modal());
+        assert!(
+            Action::ImageNext(
+                app.chat_ui.image_viewer.as_ref().unwrap().control_target(),
+                true,
+            )
+            .allowed_while_modal()
+        );
         assert!(!Action::OpenImage(target).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));
         assert!(!app.modal_is_open());

@@ -889,11 +889,19 @@ struct Entry {
     label: String,
     handle: iced::widget::image::Handle,
 }
-/// The immutable gallery entry an external-open button was rendered for.
+/// The immutable gallery entry a toolbar interaction was rendered for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::app) struct ExternalTarget {
+pub(in crate::app) struct GalleryTarget {
     publication: uuid::Uuid,
     selected: usize,
+}
+
+/// Navigation and Fit belong to the view intent, including A→B→A. External
+/// opening still names just its immutable entry and survives Fit on that entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) struct ControlTarget {
+    entry: GalleryTarget,
+    reset: u64,
 }
 
 pub(in crate::app) struct Gallery {
@@ -997,21 +1005,34 @@ impl Gallery {
         };
         self.reset = self.reset.wrapping_add(1);
     }
-    fn external_target(&self) -> ExternalTarget {
-        ExternalTarget {
+    pub(super) fn target(&self) -> GalleryTarget {
+        GalleryTarget {
             publication: self.publication,
             selected: self.selected,
         }
     }
 
-    pub(super) fn external_url(&self, target: ExternalTarget) -> Option<Url> {
-        (target == self.external_target())
-            .then(|| self.url())
-            .flatten()
+    pub(super) fn control_target(&self) -> ControlTarget {
+        ControlTarget {
+            entry: self.target(),
+            reset: self.reset,
+        }
+    }
+
+    pub(super) fn accepts_control(&self, target: ControlTarget) -> bool {
+        target == self.control_target()
+    }
+
+    pub(super) fn accepts(&self, target: GalleryTarget) -> bool {
+        target == self.target()
+    }
+
+    pub(super) fn external_url(&self, target: GalleryTarget) -> Option<Url> {
+        self.accepts(target).then(|| self.url()).flatten()
     }
 
     fn external_button(&self) -> Element<'_, Message> {
-        let target = self.external_target();
+        let target = self.target();
         crate::ui_controls::owned(
             target,
             crate::ui_controls::button::secondary("Open externally").on_press_maybe(
@@ -1039,27 +1060,43 @@ impl Gallery {
             })
         }
     }
+    fn navigation_button(&self, forward: bool) -> Element<'_, Message> {
+        let target = self.control_target();
+        crate::ui_controls::owned(
+            target,
+            icon(
+                if forward {
+                    Icon::ChevronRight
+                } else {
+                    Icon::ChevronLeft
+                },
+                if forward {
+                    "Next image (Right)"
+                } else {
+                    "Previous image (Left)"
+                },
+                self.entries.len() > 1,
+                Action::ImageNext(target, forward),
+            ),
+        )
+    }
+
+    fn fit_button(&self) -> Element<'_, Message> {
+        let target = self.control_target();
+        crate::ui_controls::owned(
+            target,
+            crate::ui_controls::button::secondary("Fit").on_press(action(Action::ImageFit(target))),
+        )
+    }
+
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
         let entry = &self.entries[self.selected];
-        let navigation = self.entries.len() > 1;
         let toolbar = widget::row::with_children(vec![
-            icon(
-                Icon::ChevronLeft,
-                "Previous image (Left)",
-                navigation,
-                Action::ImageNext(false),
-            ),
+            self.navigation_button(false),
             design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
-            icon(
-                Icon::ChevronRight,
-                "Next image (Right)",
-                navigation,
-                Action::ImageNext(true),
-            ),
+            self.navigation_button(true),
             iced::widget::Space::new().width(Length::Fill).into(),
-            crate::ui_controls::button::secondary("Fit")
-                .on_press(action(Action::ImageFit))
-                .into(),
+            self.fit_button(),
             self.external_button(),
             icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
         ])
@@ -1178,9 +1215,17 @@ mod tests {
         renderer: &cosmic::Renderer,
         event: iced::mouse::Event,
     ) -> Vec<Message> {
+        button_pointer_step(gallery.external_button(), tree, renderer, event)
+    }
+
+    fn button_pointer_step(
+        mut button: Element<'_, Message>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<Message> {
         use iced::advanced::{Layout, Shell, layout};
         use iced::{Event, Rectangle, Size, mouse};
-        let mut button = gallery.external_button();
         tree.diff(button.as_widget_mut());
         let node = button.as_widget_mut().layout(
             tree,
@@ -1203,6 +1248,159 @@ mod tests {
     }
 
     #[test]
+    fn gallery_fit_and_navigation_keep_native_and_queued_intents_with_their_entry() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        use iced::widget::image::{Handle, viewer};
+        let renderer = crate::app::tests::headless_renderer();
+        fn control(gallery: &Gallery, forward: Option<bool>) -> Element<'_, Message> {
+            match forward {
+                Some(forward) => gallery.navigation_button(forward),
+                None => gallery.fit_button(),
+            }
+        }
+        for forward in [None, Some(false), Some(true)] {
+            for round_trip in [false, true] {
+                let handle = Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+                let mut gallery = Gallery::file("/fixture/first.png".into(), None, handle.clone());
+                gallery.entries.push(Entry {
+                    id: "second".into(),
+                    managed: false,
+                    path: "/fixture/second.png".into(),
+                    label: "Second".into(),
+                    handle,
+                });
+                let mut tree = Tree::new(control(&gallery, forward).as_widget());
+                assert!(
+                    button_pointer_step(
+                        control(&gallery, forward),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left),
+                    )
+                    .is_empty()
+                );
+
+                // Ordinary zoom and redraw do not replace a toolbar owner.
+                // Drive the actual Viewer state while the control is held.
+                let canvas = gallery.canvas();
+                let mut canvas_tree = Tree::new(canvas.as_widget());
+                drop(canvas);
+                assert!(
+                    button_pointer_step(
+                        gallery.canvas(),
+                        &mut canvas_tree,
+                        &renderer,
+                        Event::WheelScrolled {
+                            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+                        },
+                    )
+                    .is_empty()
+                );
+                let zoomed = viewer::scaled_image_size(
+                    &renderer,
+                    &gallery.entries[0].handle,
+                    canvas_tree.children[0]
+                        .state
+                        .downcast_ref::<viewer::State>(),
+                    iced::Size::new(500.0, 100.0),
+                    iced::ContentFit::Contain,
+                );
+                assert!(zoomed.height > 100.0);
+                let mut redraw = gallery.canvas();
+                canvas_tree.diff(redraw.as_widget_mut());
+                assert_eq!(
+                    viewer::scaled_image_size(
+                        &renderer,
+                        &gallery.entries[0].handle,
+                        canvas_tree.children[0]
+                            .state
+                            .downcast_ref::<viewer::State>(),
+                        iced::Size::new(500.0, 100.0),
+                        iced::ContentFit::Contain,
+                    ),
+                    zoomed
+                );
+                let mut queued = button_pointer_step(
+                    control(&gallery, forward),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                );
+                assert_eq!(queued.len(), 1, "same-entry redraw/zoom retains the press");
+                assert!(
+                    button_pointer_step(
+                        control(&gallery, forward),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left),
+                    )
+                    .is_empty()
+                );
+                // This is the exact state transition used by the image-modal
+                // Right key, including an ABA with no intermediate diff.
+                gallery.next(true);
+                if round_trip {
+                    gallery.next(false);
+                }
+                assert!(
+                    button_pointer_step(
+                        control(&gallery, forward),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonReleased(Button::Left),
+                    )
+                    .is_empty(),
+                    "an old press cannot select a replacement entry/intent"
+                );
+                assert!(
+                    button_pointer_step(
+                        control(&gallery, forward),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left),
+                    )
+                    .is_empty()
+                );
+                let mut fresh = button_pointer_step(
+                    control(&gallery, forward),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                );
+                assert_eq!(fresh.len(), 1);
+
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let selected = gallery.selected;
+                let reset = gallery.reset;
+                let publication = gallery.publication;
+                app.chat_ui.image_viewer = Some(gallery);
+                // The old action was genuinely emitted by the production
+                // button before navigation, and now passes the real modal
+                // dispatcher. It must preserve the new current view.
+                drop(app.update(queued.pop().unwrap()));
+                let current = app.chat_ui.image_viewer.as_ref().unwrap();
+                assert_eq!(
+                    (current.publication, current.selected, current.reset),
+                    (publication, selected, reset)
+                );
+                drop(app.update(fresh.pop().unwrap()));
+                let current = app.chat_ui.image_viewer.as_ref().unwrap();
+                assert_eq!(current.publication, publication);
+                assert_eq!(current.reset, reset + 1);
+                assert_eq!(
+                    current.selected,
+                    if forward.is_some() {
+                        1 - selected
+                    } else {
+                        selected
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn external_image_press_keeps_its_gallery_entry_and_fresh_click_uses_the_new_one() {
         use iced::advanced::widget::Tree;
         use iced::mouse::{Button, Event};
@@ -1217,7 +1415,7 @@ mod tests {
             label: "Second".into(),
             handle,
         });
-        let held = gallery.external_target();
+        let held = gallery.target();
         assert!(Action::ImageExternal(held).allowed_while_modal());
         let mut tree = {
             let button = gallery.external_button();
@@ -1301,15 +1499,11 @@ mod tests {
         use iced::widget::image::Handle;
         let handle = Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
         let old = Gallery::file("/fixture/same.png".into(), None, handle.clone());
-        let target = old.external_target();
+        let target = old.target();
         assert!(old.external_url(target).is_some());
         let replacement = Gallery::file("/fixture/same.png".into(), None, handle);
         assert!(replacement.external_url(target).is_none());
-        assert!(
-            replacement
-                .external_url(replacement.external_target())
-                .is_some()
-        );
+        assert!(replacement.external_url(replacement.target()).is_some());
     }
 
     fn preview_pointer_step(
