@@ -6,6 +6,7 @@ mod close_tests;
 #[cfg(test)]
 mod event_dispatch_tests;
 pub(crate) mod holder;
+mod joins;
 #[cfg(test)]
 mod pty_reader_tests;
 
@@ -70,6 +71,8 @@ const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
 const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 /// Total budget for hangup, escalation and an authoritative holder exit report.
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for the PTY reader to leave its blocking read
 /// before abandoning the thread. Closing its wake pipe releases the read
 /// immediately in every case we can construct; this only bounds the ones we
@@ -407,6 +410,36 @@ struct PublishedState {
 }
 
 impl PublishedState {
+    fn has_retained_holder(&self) -> bool {
+        self.retained_holder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    fn publish_released_archive_if_available(&self) {
+        let archive = match self.archive.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut archive) = archive {
+            *archive = ArchivePhase::Released;
+            self.archive_ready.notify_all();
+        }
+    }
+
+    fn release_completed_holder(&self) {
+        *self.archive.lock().unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
+        self.archive_ready.notify_all();
+        let holder = self
+            .retained_holder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        drop(holder);
+    }
+
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
@@ -464,6 +497,9 @@ impl PublishedState {
     }
 
     fn archived_command(self: &Arc<Self>, command: Command) -> Result<(), TerminalSendError> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(TerminalSendError::Closed);
+        }
         if let Command::HostVisibility(visibility) = &command {
             // HostState already offers this retained generation when a view
             // becomes visible. Calling its wake callback here would reenter
@@ -691,18 +727,15 @@ struct HandleInner {
     commands: Sender<Command>,
     events: Receiver<TerminalEvent>,
     published: Arc<PublishedState>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Arc<joins::JoinOwner>,
 }
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
         self.published.request_shutdown();
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
+        // The body can be this very thread or blocked in a callback/TLS.
+        // Pending custody outlives this handle; destruction never joins here.
+        joins::request(&self.worker, true, true);
     }
 }
 
@@ -738,8 +771,8 @@ impl RenderStreamFixture {
                 inner: Arc::new(HandleInner {
                     commands,
                     events: received,
-                    published,
-                    worker: Mutex::new(None),
+                    published: published.clone(),
+                    worker: joins::JoinOwner::empty(published),
                 }),
             },
             events,
@@ -778,6 +811,7 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    pub(crate) const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
@@ -818,12 +852,20 @@ impl TerminalHandle {
             config.initially_visible,
             Arc::new(wake),
         ));
+        // Cleanup capacity/service failure refuses before any actual worker,
+        // holder or provider exists. A retired screen does not retain admission.
+        let join_owner = joins::JoinOwner::new(
+            published.clone(),
+            joins::reserve().map_err(TerminalStartError::Worker)?,
+        );
+        let worker_owner = join_owner.clone();
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
 
         let worker = thread::Builder::new()
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
+                let _body = joins::BodyCompletion(worker_owner);
                 let completion = Arc::clone(&worker_published);
                 let result = Worker::start(
                     session,
@@ -845,6 +887,7 @@ impl TerminalHandle {
                 }
             })
             .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
+        join_owner.install(worker);
 
         match startup_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -852,15 +895,25 @@ impl TerminalHandle {
                     commands: command_tx,
                     events: event_rx,
                     published,
-                    worker: Mutex::new(Some(worker)),
+                    worker: join_owner,
                 }),
             }),
             Ok(Err(error)) => {
-                let _ = worker.join();
+                joins::request(&join_owner, true, true);
+                let _ = joins::wait_until(
+                    &join_owner,
+                    Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT),
+                    true,
+                );
                 Err(TerminalStartError::Worker(error))
             }
             Err(_) => {
-                let _ = worker.join();
+                joins::request(&join_owner, true, true);
+                let _ = joins::wait_until(
+                    &join_owner,
+                    Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT),
+                    true,
+                );
                 Err(TerminalStartError::WorkerExited)
             }
         }
@@ -977,13 +1030,126 @@ impl TerminalHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn spawn_with_wedged_worker_for_test() -> (Self, Sender<()>) {
+        Self::spawn_with_blocked_worker_for_test(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_panicking_worker_for_test() -> (Self, Sender<()>) {
+        Self::spawn_with_blocked_worker_for_test(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_blocked_tls_for_test() -> (Self, Sender<()>, Receiver<()>) {
+        struct TlsWait {
+            blocked: Receiver<()>,
+            entered: Sender<()>,
+        }
+        impl Drop for TlsWait {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.blocked.recv();
+            }
+        }
+        std::thread_local! {
+            static BLOCK: RefCell<Option<TlsWait>> = const { RefCell::new(None) };
+        }
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(
+            published.clone(),
+            joins::reserve().expect("test TLS cleanup admission"),
+        );
+        let worker_owner = owner.clone();
+        let worker_published = published.clone();
+        let (commands, inbox) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        let (entered, observed) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let _inbox = inbox;
+            let _events = events;
+            BLOCK.with(|slot| *slot.borrow_mut() = Some(TlsWait { blocked, entered }));
+            // This control models a completed process/body publication, not a
+            // real PTY. The OS thread is still alive in its actual TLS destructor.
+            worker_published.completed.store(true, Ordering::Release);
+        });
+        owner.install(worker);
+        (
+            Self {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    events: event_receiver,
+                    published,
+                    worker: owner,
+                }),
+            },
+            release,
+            observed,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_with_blocked_worker_for_test(panic_after_release: bool) -> (Self, Sender<()>) {
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let owner = joins::JoinOwner::new(
+            published.clone(),
+            joins::reserve().expect("test worker cleanup admission"),
+        );
+        let worker_owner = owner.clone();
+        let (commands, inbox) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
+            let _inbox = inbox;
+            let _events = events;
+            let _ = blocked.recv();
+            assert!(!panic_after_release, "real terminal-worker panic fixture");
+        });
+        owner.install(worker);
+        (
+            Self {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    events: event_receiver,
+                    published,
+                    worker: owner,
+                }),
+            },
+            release,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_joined_for_test(&self) -> bool {
+        self.inner.worker.joined()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_worker_joins_for_test() -> usize {
+        joins::reserved()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_join_capacity_for_test() -> usize {
+        joins::CAPACITY
+    }
+
+    #[cfg(test)]
     pub(crate) fn spawn_with_missing_exit_report_for_test(session: TerminalSession) -> Self {
         let (commands, receiver) = command_channel(1);
         let (events, event_receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let join_owner = joins::JoinOwner::new(
+            published.clone(),
+            joins::reserve().expect("test worker cleanup admission"),
+        );
+        let worker_owner = join_owner.clone();
         let worker_published = Arc::clone(&published);
         let (ready, initialized) = crossbeam_channel::bounded(1);
         let worker = thread::spawn(move || {
+            let _body = joins::BodyCompletion(worker_owner);
             let mut worker = Worker::start(
                 session,
                 TerminalConfig::default(),
@@ -1003,8 +1169,10 @@ impl TerminalHandle {
             let _ = ready.send(());
             worker.run();
         });
+        join_owner.install(worker);
         if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
             published.request_shutdown();
+            joins::request(&join_owner, true, true);
             panic!("test terminal initialization did not finish: {error}");
         }
         Self {
@@ -1012,7 +1180,7 @@ impl TerminalHandle {
                 commands,
                 events: event_receiver,
                 published,
-                worker: Mutex::new(Some(worker)),
+                worker: join_owner,
             }),
         }
     }
@@ -1255,8 +1423,7 @@ impl TerminalHandle {
     /// terminal's processes. On failure its processes stay here, though a
     /// full-screen program's display may need redrawing.
     ///
-    /// This waits for the worker's answer however long it takes, as shutdown
-    /// does: every step of a carry is bounded, and a caller that stopped
+    /// This waits for the worker's answer however long it takes: a caller that stopped
     /// waiting could not tell a terminal left here from one already carried.
     pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
         let (reply, result) = crossbeam_channel::bounded(1);
@@ -1265,10 +1432,9 @@ impl TerminalHandle {
         let carried = result
             .recv()
             .map_err(|_| "the terminal ended before it could be carried".to_owned())??;
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
+        joins::request(&self.inner.worker, false, false);
+        if !joins::wait_until(&self.inner.worker, None, false) {
+            return Err("Terminal worker failed while completing its carry".into());
         }
         Ok(carried)
     }
@@ -1277,8 +1443,10 @@ impl TerminalHandle {
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
         if self.is_completed() {
-            self.release_completed_holder();
-            return TerminalCloseResult::Closed;
+            return match self.shutdown() {
+                Ok(()) => TerminalCloseResult::Closed,
+                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+            };
         }
         let (reply, result) = crossbeam_channel::bounded(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1326,19 +1494,21 @@ impl TerminalHandle {
         }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
-            match self.inner.worker.lock() {
-                Ok(mut worker) => {
-                    if let Some(worker) = worker.take() {
-                        if worker.join().is_err() {
-                            return TerminalCloseResult::Unknown(
-                                "Terminal worker failed during close".into(),
-                            );
-                        }
-                    }
-                }
-                Err(_) => {
-                    return TerminalCloseResult::Unknown("Terminal worker unavailable".into());
-                }
+            self.request_shutdown();
+            if !joins::wait_until(
+                &self.inner.worker,
+                Some(std::time::Instant::now() + WORKER_JOIN_TIMEOUT),
+                true,
+            ) {
+                return TerminalCloseResult::Unknown(
+                    "Terminal worker join remains unconfirmed; its original owner is retained"
+                        .into(),
+                );
+            }
+            if !self.is_completed() {
+                return TerminalCloseResult::Unknown(
+                    "Terminal process cleanup remains unconfirmed".into(),
+                );
             }
         }
         outcome
@@ -1348,18 +1518,22 @@ impl TerminalHandle {
     /// terminals lets all roots handle their hangups concurrently.
     pub(crate) fn request_shutdown(&self) {
         self.inner.published.request_shutdown();
+        joins::request(&self.inner.worker, true, false);
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
+        self.shutdown_until(std::time::Instant::now() + WORKER_JOIN_TIMEOUT)
+    }
+
+    pub(crate) fn shutdown_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), TerminalSendError> {
         self.request_shutdown();
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
+        if !joins::wait_until(&self.inner.worker, Some(deadline), true) {
+            return Err(TerminalSendError::Closed);
         }
         if self.is_completed() {
-            self.release_completed_holder();
             Ok(())
         } else {
             Err(TerminalSendError::Closed)
@@ -1399,24 +1573,6 @@ impl TerminalHandle {
         }
     }
 
-    fn release_completed_holder(&self) {
-        *self
-            .inner
-            .published
-            .archive
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
-        self.inner.published.archive_ready.notify_all();
-        let holder = self
-            .inner
-            .published
-            .retained_holder
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        drop(holder);
-    }
-
     pub(crate) fn preserve_completed_for_restart(&self) {
         let holder = self
             .inner
@@ -1428,6 +1584,7 @@ impl TerminalHandle {
         if let Some(mut holder) = holder {
             holder.leave_for_successor();
         }
+        joins::settled(&self.inner.worker);
     }
 
     /// Failed checkpoint restoration must never release an adopted registered
@@ -1442,18 +1599,25 @@ impl TerminalHandle {
         {
             result?;
         }
-        if let Ok(mut worker) = self.inner.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            worker
-                .join()
-                .map_err(|_| "terminal worker failed while preserving its holder")?;
+        joins::request(&self.inner.worker, false, false);
+        if !joins::wait_until(&self.inner.worker, None, false) {
+            return Err("terminal worker failed while preserving its holder".into());
         }
         self.preserve_completed_for_restart();
         Ok(())
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        // Stop closes admission even when an existing cached reader holds the
+        // archive lock. Natural completion alone leaves read-only commands live.
+        if self
+            .inner
+            .published
+            .shutdown_requested
+            .load(Ordering::Acquire)
+        {
+            return Err(TerminalSendError::Closed);
+        }
         // Enqueue and archive preparation share this lock. No accepted query
         // can land between the final drain and worker teardown.
         let published = &self.inner.published;
@@ -4305,6 +4469,48 @@ mod tests {
     }
 
     #[test]
+    fn late_stop_after_actual_join_does_not_wait_for_cached_archive_metadata() {
+        use super::super::ipc::TerminalCloseResult;
+
+        let (handle, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(handle.is_completed());
+        assert!(!handle.worker_joined_for_test());
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.inner.worker.native_settled_for_test() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !handle
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        );
+
+        thread::scope(|scope| {
+            // The guard drops before scope joins if an assertion unwinds.
+            // Keep it held through both public operations to prove neither
+            // native Stop proof nor later command admission waits on it.
+            let archive = handle.inner.published.archive.lock().unwrap();
+            let other = handle.clone();
+            let (sent, received) = crossbeam_channel::bounded(1);
+            scope.spawn(move || {
+                let closed = other.close_checked(true);
+                let search = other.search(9, "cached".into(), false);
+                let _ = sent.send((closed, search));
+            });
+            let (closed, search) = received.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(matches!(closed, TerminalCloseResult::Closed), "{closed:?}");
+            assert_eq!(search, Err(TerminalSendError::Closed));
+            assert!(handle.worker_joined_for_test());
+            drop(archive);
+        });
+    }
+
+    #[test]
     fn completed_pty_retains_search_copy_scroll_theme_and_resize_without_a_worker() {
         let handle = TerminalHandle::spawn(shell_session("i=0; while [ $i -lt 80 ]; do printf 'row%03d\\r\\n' \"$i\"; i=$((i+1)); done; printf '\\033[?2027h👩‍💻hit É Straße'; exit 7"), TerminalConfig { columns: 32, rows: 3, ..TerminalConfig::default() }, |_| {}).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4312,16 +4518,12 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(
-            handle
-                .inner
-                .worker
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_finished()
-        );
+        // Natural body completion automatically admits its actual OS join,
+        // without requesting Stop or releasing the archived read-only view.
+        while !handle.worker_joined_for_test() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
         let events = handle.events();
         assert_eq!(
             events
@@ -5831,7 +6033,7 @@ mod tests {
                 commands,
                 events,
                 published: Arc::clone(&worker.published),
-                worker: Mutex::new(None),
+                worker: joins::JoinOwner::empty(Arc::clone(&worker.published)),
             }),
         };
         assert!(handle.inner.commands.is_full());
