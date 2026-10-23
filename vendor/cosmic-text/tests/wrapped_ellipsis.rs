@@ -235,6 +235,13 @@ fn height_limited_ellipsis_keeps_wrapped_boundaries_in_both_text_directions() {
                         source_start(&ordinary[count - 1]),
                         "height-limited boundary: {wrap:?}, width {width}, count {count}: {text}"
                     );
+                    assert!(
+                        limited[count - 1]
+                            .glyphs
+                            .iter()
+                            .any(|glyph| glyph.start == glyph.end),
+                        "height-limited fixture must show an ellipsis"
+                    );
                     assert!(limited.iter().flat_map(|line| &line.glyphs).all(|glyph| {
                         glyph.x.is_finite() && glyph.y.is_finite() && glyph.w.is_finite()
                     }));
