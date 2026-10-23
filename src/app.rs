@@ -14054,7 +14054,11 @@ impl Application for Cagents {
             Message::HostedTerminalsObserved(terminals) => {
                 self.observe_hosted_descriptors(terminals)
             }
-            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
+            Message::WorkspaceModelObserved(update) => {
+                let (task, changed) = self.apply_workspace_model_update_effect(update);
+                terminal_metadata_unchanged = !changed;
+                task
+            }
             Message::TerminalStarted {
                 card,
                 terminal,

@@ -1,4 +1,5 @@
 //! Real hosted-client delivery into Application::update; no daemon or PTY.
+use super::worktree_ui::card_directory;
 use super::*;
 use crate::terminal::{
     RenderSnapshot,
@@ -440,4 +441,421 @@ fn confirmed_host_proof_refreshes_uncertain_terminal_metadata() {
     reset();
     apply(&mut app, card, &mut peer, None);
     assert_eq!(counts(), (0, 0));
+}
+
+#[test]
+fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing() {
+    use crate::{
+        agent::{Activity, ActivityState, Provider},
+        model::{ProjectKind, WorktreeId},
+        repository::RepositoryId,
+        sidebar::{SidebarProject, SidebarWorktree},
+    };
+    let mut app = super::tests::context_inspector_test_app(true);
+    let card = app.workspace.focused().unwrap();
+    let root = card_directory(app.card_state(card).unwrap())
+        .unwrap()
+        .to_path_buf();
+    let nested = root.join("nested-owner");
+    let first = ProjectId::new();
+    let second = ProjectId::new();
+    let first_row = WorktreeId::new();
+    let second_row = WorktreeId::new();
+    let nested_row = WorktreeId::new();
+    fn row(id: WorktreeId, path: PathBuf) -> SidebarWorktree {
+        SidebarWorktree::new(id, path, None, false, false, None, None, None)
+    }
+    app.sidebar_model.projects = vec![
+        SidebarProject::new(
+            first,
+            RepositoryId::new(),
+            "Folder".into(),
+            root.clone(),
+            vec![row(first_row, root.clone())],
+            vec![],
+        )
+        .with_kind(ProjectKind::Folder),
+        SidebarProject::new(
+            second,
+            RepositoryId::new(),
+            "Repository".into(),
+            root.clone(),
+            vec![
+                row(second_row, root.clone()),
+                row(nested_row, nested.clone()),
+            ],
+            vec![],
+        ),
+    ];
+    let folder = app.sidebar_model.projects[0].folder_key().unwrap();
+    let working = Activity {
+        provider: Provider::Claude,
+        state: ActivityState::Working,
+    };
+    app.sidebar_state.set_card_activity(card, working);
+    app.sidebar_state.observe_card_update(card);
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        Some(ActivityState::Working)
+    );
+    assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
+    assert_eq!(app.sidebar_state.agent_activity(second, second_row), None);
+    assert!(app.sidebar_state.worktree_has_panes(first, first_row));
+    assert!(app.sidebar_state.worktree_has_panes(second, second_row));
+    app.worktree_owners.insert(card, nested.clone());
+    Arc::make_mut(&mut app.durable)
+        .card_scopes
+        .insert(card, root.clone());
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None
+    );
+    assert_eq!(
+        app.sidebar_state.agent_activity(second, nested_row),
+        None,
+        "ambiguous durable filing retains the current conversation projection policy"
+    );
+    assert!(!app.sidebar_state.worktree_has_panes(first, first_row));
+    assert!(app.sidebar_state.worktree_has_panes(second, nested_row));
+    Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.sidebar_state.agent_activity(second, nested_row),
+        Some(ActivityState::Working)
+    );
+    assert!(app.sidebar_state.has_agent_update(second, nested_row));
+    assert!(!app.sidebar_state.worktree_has_panes(first, first_row));
+    assert!(app.sidebar_state.worktree_has_panes(second, nested_row));
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: second,
+            title: "Channeled".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert!(!app.sidebar_state.worktree_has_panes(second, nested_row));
+    assert_eq!(app.sidebar_state.agent_activity(second, nested_row), None);
+    assert!(app.sidebar_state.has_card_update(card));
+    Arc::make_mut(&mut app.durable).channels.clear();
+    app.worktree_owners.remove(&card);
+    Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
+    app.known_worktree_roots.clear();
+    for project in &mut app.sidebar_model.projects {
+        project.worktrees.clear();
+    }
+    if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
+        session.launch.working_directory = root.join("unregistered-child");
+    }
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, folder.worktree_id),
+        None,
+        "an exact folder key is not a newly discovered ancestor root"
+    );
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+}
+
+#[test]
+fn equal_full_reads_and_view_acknowledgements_reconcile_but_stale_reads_do_not() {
+    use crate::workspace_model::{WorkspaceModel, views::Scope};
+    let mut app = super::tests::context_inspector_test_app(false);
+    let model = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 3,
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Connected(model.clone()),
+    )));
+    reset();
+    let durable = Arc::clone(&app.durable);
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(model.clone()),
+    )));
+    assert_eq!(counts(), (1, 1), "equal models can repair local projection");
+    assert_eq!(durable.channels, app.durable.channels);
+    reset();
+    let mut stale = model.clone();
+    stale.sequence -= 1;
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(stale),
+    )));
+    assert_eq!(counts(), (0, 0));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::ViewApplied {
+            scope: Scope::Channel(crate::model::ChannelId::new()),
+            operation: Some(uuid::Uuid::new_v4()),
+            model,
+        },
+    )));
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "equal contents cannot suppress the acknowledgement handler"
+    );
+}
+
+#[test]
+fn a_folded_agents_edge_does_not_hide_the_same_sequence_full_inventory() {
+    use crate::{
+        agent::Provider,
+        agent_execution::{Agent, Origin, Spec, Surface, Target},
+        workspace_model::{ModelEdit, WorkspaceModel, views::Scope},
+    };
+    let mut app = super::tests::context_inspector_test_app(false);
+    let model = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 3,
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Connected(model),
+    )));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Edited {
+            sequence: 4,
+            edit: ModelEdit::AgentsChanged,
+        },
+    )));
+    assert_eq!(app.workspace_model.sequence, 4);
+    assert!(app.workspace_model.agents.is_empty());
+    let mut full = app.workspace_model.clone();
+    let path = PathBuf::from("/inventory-fixture");
+    full.agents.push(Agent {
+        id: crate::model::AgentId::new(),
+        name: None,
+        origin: Origin::User,
+        spec: Spec {
+            provider: Provider::Claude,
+            account: None,
+            target: Target {
+                repository: path.clone(),
+                directory: path.clone(),
+                placement: None,
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        },
+        placement: Scope::Worktree {
+            repository: path.clone(),
+            path,
+        },
+        session: None,
+        console: None,
+        created_ms: 0,
+        closed: true,
+    });
+    reset();
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(full.clone()),
+    )));
+    assert_eq!(app.workspace_model, full);
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "folding the edge did not provide its inventory"
+    );
+    reset();
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(full),
+    )));
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "equal inventory still reconciles local state"
+    );
+}
+
+#[test]
+fn older_complete_inventory_after_newer_metadata_edge_still_projects() {
+    use crate::workspace_model::{
+        ModelEdit, WorkspaceModel,
+        views::{Scope, View},
+    };
+    let mut app = super::tests::context_inspector_test_app(false);
+    let initial = WorkspaceModel {
+        identity: uuid::Uuid::new_v4(),
+        sequence: 3,
+        ..WorkspaceModel::default()
+    };
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Connected(initial.clone()),
+    )));
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Edited {
+            sequence: 5,
+            edit: ModelEdit::AgentsChanged,
+        },
+    )));
+    let mut inventory = initial;
+    inventory.sequence = 4;
+    inventory
+        .views
+        .push(View::empty(Scope::Channel(crate::model::ChannelId::new())));
+    reset();
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(inventory.clone()),
+    )));
+    assert_eq!(app.workspace_model.sequence, 5);
+    assert_eq!(app.workspace_model.views, inventory.views);
+    assert_eq!(app.shared_views.snapshot_sequence, 4);
+    assert_eq!(
+        counts(),
+        (1, 1),
+        "new collection evidence must reach projection"
+    );
+    reset();
+    inventory.sequence = 3;
+    inventory.views.clear();
+    drop(app.update(Message::WorkspaceModelObserved(
+        workspace_model_sync::ModelUpdate::Read(inventory),
+    )));
+    assert_eq!(app.workspace_model.views.len(), 1);
+    assert_eq!(
+        counts(),
+        (0, 0),
+        "inventory older than the complete snapshot is stale"
+    );
+}
+
+#[test]
+fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
+    use crate::{
+        model::{ChannelId, ChannelTitleSource, ProjectChannel},
+        repository::RepositoryId,
+        sidebar::SidebarProject,
+        workspace_model::{
+            ModelChannel, WorkspaceModel,
+            views::{Pane, Scope, View},
+        },
+    };
+
+    // Also cover a source-only upgrade: equal captions do not make an invalid
+    // Provider attribution authoritative after a refused suggestion.
+    for suggested in ["Refused provider title", "Original prompt title"] {
+        let mut app = super::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        let repository = PathBuf::from("/title-refusal-fixture/.git");
+        let mut chat = app.durable.cards[0].clone();
+        chat.id = CardId::new();
+        chat.exposure = Exposure::Offscreen;
+        chat.residency = Residency::Cold;
+        chat.kind = CardKind::Chat(crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: crate::model::LaunchRecipe {
+                    unset_environment: Default::default(),
+                    program: "/bin/sh".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/title-refusal-fixture".into(),
+                    environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        });
+        let pane = Pane::from_card(&chat, Some(repository.clone())).unwrap();
+        let card = chat.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(chat);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Original prompt title".into(),
+            title_source: ChannelTitleSource::Prompt,
+            ordinal: 1,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Title refusal fixture".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let authoritative = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 3,
+            channels: vec![ModelChannel {
+                id: channel,
+                repository,
+                title: "Original prompt title".into(),
+                title_source: ChannelTitleSource::Prompt,
+                ordinal: 1,
+            }],
+            views: vec![View {
+                scope: Scope::Channel(channel),
+                revision: 1,
+                panes: vec![pane],
+                retired: Vec::new(),
+            }],
+            ..WorkspaceModel::default()
+        };
+        app.workspace_model = authoritative.clone();
+        app.shared_views.snapshot_sequence = authoritative.sequence;
+        app.refresh_sidebar_channels();
+
+        // Use the actual optimistic production path, including its persist and
+        // row refresh, then deliver the publisher's refusal Read via App update.
+        assert!(app.suggest_channel_title(card, suggested.into(), ChannelTitleSource::Provider));
+        assert_eq!(app.workspace_model, authoritative);
+        assert_eq!(app.durable.channels[0].title, suggested);
+        assert_eq!(
+            app.durable.channels[0].title_source,
+            ChannelTitleSource::Provider
+        );
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, suggested);
+        let optimistic = app.persistent_workspace();
+        assert_eq!(optimistic.channels[0].title, suggested);
+        assert_eq!(
+            optimistic.channels[0].title_source,
+            ChannelTitleSource::Provider
+        );
+
+        reset();
+        drop(app.update(Message::WorkspaceModelObserved(
+            workspace_model_sync::ModelUpdate::Read(authoritative.clone()),
+        )));
+        assert_eq!(counts(), (1, 1), "equal Read must repair local optimism");
+        assert_eq!(app.workspace_model, authoritative);
+        assert_eq!(app.durable.channels[0].title, "Original prompt title");
+        assert_eq!(
+            app.durable.channels[0].title_source,
+            ChannelTitleSource::Prompt
+        );
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0].title,
+            "Original prompt title"
+        );
+        let restored = app.persistent_workspace();
+        assert_eq!(restored.channels[0].title, "Original prompt title");
+        assert_eq!(
+            restored.channels[0].title_source,
+            ChannelTitleSource::Prompt
+        );
+        assert!(!Arc::ptr_eq(&optimistic, &restored));
+        assert_eq!(
+            optimistic.channels[0].title_source,
+            ChannelTitleSource::Provider
+        );
+    }
 }
