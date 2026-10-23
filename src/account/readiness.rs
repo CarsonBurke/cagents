@@ -108,6 +108,58 @@ pub enum CheckReason {
     GitHubNetworkFailed,
 }
 
+impl CheckReason {
+    /// Human explanations are fixed product copy. Serialized reason codes
+    /// remain stable and never include provider output or configuration.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::NotRequested => "This check was not requested",
+            Self::NotChecked => "This check has not run",
+            Self::InvalidRequest => "The account check request is invalid",
+            Self::UnsupportedProvider => "This check supports Codex accounts",
+            Self::AccountMismatch => "The selected account context could not be confirmed",
+            Self::HomeUnavailable => "The selected account home is unavailable or changed",
+            Self::ProviderMissing => "Codex is unavailable on the selected device",
+            Self::ProbeBusy => "Another probe is using this account; try again after it finishes",
+            Self::ProbeUnavailable => "The account probe could not be prepared",
+            Self::ProviderStartFailed => "Codex could not start for this check",
+            Self::ProviderTimeout => "Codex did not finish the check before its deadline",
+            Self::ProviderProtocol => "Codex did not return a valid response for this check",
+            Self::UnsupportedMethod => "This Codex version does not support the requested check",
+            Self::SignedOut => "Codex needs the selected account to sign in",
+            Self::NotSubscription => "Codex did not report a ChatGPT subscription login",
+            Self::IdentityUnavailable => "Codex did not report an identity this check can verify",
+            Self::IdentityMismatch => "The observed login does not match the expected account",
+            Self::IdentityConfirmed => "The observed login matches the expected account",
+            Self::PolicyReported => "Codex resolved an explicitly configured execution policy",
+            Self::ImplicitPolicy => "The provider reported no explicit policy source",
+            Self::PolicyUnrecognized => "Codex reported a policy this check cannot identify",
+            Self::PolicyChanged => "Codex configuration changed during the check; check it again",
+            Self::SandboxSetupFailed => "Codex could not prepare its sandbox",
+            Self::SandboxDenied => "The execution environment denied the requested operation",
+            Self::CommandFailed => "The check command did not complete successfully",
+            Self::InvalidCommandReceipt => "The command did not return a verifiable check result",
+            Self::WorkspaceChanged => "The selected workspace changed during the check",
+            Self::WorkspaceRoundTrip => "The workspace write, read and removal were confirmed",
+            Self::WorkspaceCleanupUnconfirmed => {
+                "Scratch cleanup was not confirmed; inspect the scoped workspace"
+            }
+            Self::ProviderExecutableChanged => {
+                "The Codex executable changed during the check; check it again"
+            }
+            Self::GitHubRepositoryAccess => "GitHub repository read access was confirmed",
+            Self::GitHubRepositoryDenied => "The requested GitHub repository could not be read",
+            Self::GitHubUnavailable => {
+                "The GitHub CLI is unavailable in this execution environment"
+            }
+            Self::GitHubAuthenticationFailed => {
+                "GitHub authentication was unavailable in this execution environment"
+            }
+            Self::GitHubNetworkFailed => "The check could not reach GitHub",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measurement {
     pub status: CheckStatus,
