@@ -300,7 +300,9 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             .into(),
         );
     }
-    if let Some((provider, path)) = &state.table.link {
+    if let Some(form) = check::view(app) {
+        sections.push(form);
+    } else if let Some((provider, path)) = &state.table.link {
         sections.push(link_form(state, *provider, path));
     }
     for provider in Account::REPORTED {
@@ -1046,7 +1048,7 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
     }
 }
 
-fn menu<'a>(
+pub(super) fn menu<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
     project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
@@ -1085,6 +1087,17 @@ fn menu<'a>(
         .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
+        if account.account.provider == Provider::Codex {
+            items.push(
+                crate::ui_controls::popover_item(
+                    Icon::Check,
+                    "Check coding access",
+                    "Observe this account's identity and default execution policy",
+                    action(Action::Check(check::Action::Open(id.clone()))),
+                )
+                .into(),
+            );
+        }
         if state.login_conflict(account).is_none() && !state.registry.is_default(&account.account) {
             items.push(
                 crate::ui_controls::popover_item(
