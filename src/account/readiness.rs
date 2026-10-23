@@ -312,7 +312,7 @@ impl CheckReport {
             return false;
         }
         if self.authentication.status == CheckStatus::Passed
-            && !report
+            && !self
                 .observed_identity
                 .as_ref()
                 .and_then(|identity| identity.email.as_deref())
@@ -322,7 +322,7 @@ impl CheckReport {
         }
         if self.workspace_write.status == CheckStatus::Passed
             && (self.workspace_cleanup != Some(super::workspace_probe::Cleanup::Removed)
-                || !report
+                || !self
                     .workspace_receipt
                     .as_ref()
                     .is_some_and(|receipt| receipt.is_verified()))
