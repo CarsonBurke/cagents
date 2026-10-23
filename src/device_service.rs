@@ -74,6 +74,11 @@ pub enum Operation {
         root: PathBuf,
         path: PathBuf,
     },
+    /// Resolve immutable image identity in this backend's owned store. The
+    /// displaying computer supplies no filesystem path. Appended wire tag.
+    ReadImageAsset {
+        reference: crate::chat::ImageReference,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -325,6 +330,10 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
         }
         Operation::ReadImage { root, path } => {
             read_image_file(&root, &path, MAX_DEVICE_IMAGE_BYTES).map(Reply::Image)
+        }
+        Operation::ReadImageAsset { reference } => {
+            crate::chat::attachment_assets::read(&reference, MAX_DEVICE_IMAGE_BYTES)
+                .map(Reply::Image)
         }
         Operation::Write {
             root,
@@ -754,6 +763,87 @@ fn unstage_command(
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn image_asset_operation_reads_backend_receipts_and_refuses_foreign_or_missing_identity() {
+        crate::chat::attachment_assets::with_test_image(|backend| {
+            let reference = backend.reference.as_ref().unwrap();
+            let expected = std::fs::read(&backend.path).unwrap();
+            assert_eq!(
+                execute(Operation::ReadImageAsset {
+                    reference: reference.clone()
+                })
+                .unwrap(),
+                Reply::Image(expected)
+            );
+            let mut missing = reference.clone();
+            missing.id = uuid::Uuid::new_v4();
+            assert!(
+                execute(Operation::ReadImageAsset { reference: missing })
+                    .unwrap_err()
+                    .contains("unavailable")
+            );
+            crate::chat::attachment_assets::with_test_image(|other| {
+                assert_ne!(reference.device, other.reference.as_ref().unwrap().device);
+                assert!(
+                    execute(Operation::ReadImageAsset {
+                        reference: reference.clone()
+                    })
+                    .unwrap_err()
+                    .contains("another device")
+                );
+            });
+            let operation = Operation::ReadImageAsset {
+                reference: reference.clone(),
+            };
+            let encoded = postcard::to_allocvec(&operation).unwrap();
+            assert_eq!(
+                encoded[0], 17,
+                "new operation appends after ReadImage's existing tag16"
+            );
+            assert_eq!(
+                postcard::from_bytes::<Operation>(&encoded).unwrap(),
+                operation
+            );
+            assert_eq!(
+                postcard::to_allocvec(&Operation::ReadImage {
+                    root: "/backend".into(),
+                    path: "image.png".into()
+                })
+                .unwrap()[0],
+                16
+            );
+            let envelope = crate::terminal::ipc::ServerEnvelope {
+                version: crate::terminal::ipc::PROTOCOL_VERSION,
+                request_id: Some(u64::MAX),
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                    boot_id: crate::model::BootId::new(uuid::Uuid::new_v4().to_string()),
+                    host_incarnation: crate::model::HostIncarnation::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                },
+                message: crate::terminal::ipc::ServerMessage::Response {
+                    response: crate::terminal::ipc::ServerResponse::DeviceOperation {
+                        reply: Reply::Image(vec![0; MAX_DEVICE_IMAGE_BYTES]),
+                    },
+                },
+            };
+            let mut frame = Vec::new();
+            crate::terminal::ipc::write_frame(&mut frame, &envelope).unwrap();
+            assert!(frame.len() <= crate::terminal::ipc::MAX_FRAME_BYTES);
+            assert_eq!(
+                crate::terminal::ipc::read_frame::<crate::terminal::ipc::ServerEnvelope>(
+                    &mut std::io::Cursor::new(frame)
+                )
+                .unwrap()
+                .unwrap(),
+                envelope
+            );
+        });
+    }
+
     #[test]
     fn image_read_returns_literal_binary_files_on_the_selected_device() {
         let device = tempfile::tempdir().unwrap();

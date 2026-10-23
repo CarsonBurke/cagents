@@ -676,7 +676,9 @@ impl Runtime {
                     ));
                 }
             }
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 if let Some(handle) = &cached.image {
                     rows.push(
                         iced::widget::image(handle.clone())
