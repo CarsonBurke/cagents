@@ -43,11 +43,11 @@ pub mod readiness;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod remote;
-pub mod workspace_probe;
 pub mod routing;
 pub mod schedule;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod scope;
+pub mod workspace_probe;
 
 /// A used fraction past which an account is reported as approaching its
 /// limit. It is the same point past which the shell draws a budget in its
