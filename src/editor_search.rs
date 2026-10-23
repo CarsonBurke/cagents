@@ -256,12 +256,16 @@ fn convert_case(replacement: &str, case: ReplacementCase) -> String {
         // final Sigma before case-ignorable combining marks.
         ReplacementCase::Lower => replacement.to_lowercase(),
         ReplacementCase::Title => {
-            let mut result = String::with_capacity(replacement.len());
-            let mut characters = replacement.chars();
-            if let Some(first) = characters.next() {
-                result.extend(first.to_uppercase());
+            // Lower the whole string before replacing its initial mapping:
+            // the tail needs the original prefix for contextual final Sigma.
+            let mut result = replacement.to_lowercase();
+            if let Some(first) = replacement.chars().next() {
+                // Contextual Sigma changes neither the initial mapping's
+                // scalar count nor its UTF-8 length. Include every byte when
+                // the initial lowercase mapping expands (for example İ).
+                let prefix_bytes = first.to_lowercase().map(char::len_utf8).sum();
+                result.replace_range(..prefix_bytes, &first.to_uppercase().to_string());
             }
-            result.extend(characters.flat_map(char::to_lowercase));
             result
         }
         ReplacementCase::Unchanged => replacement.into(),
@@ -590,6 +594,64 @@ mod tests {
         }
         assert_eq!(preserve_case("FOO", "ος"), "ΟΣ");
         assert_eq!(preserve_case("fOo", "ΟΣ"), "ΟΣ");
+    }
+
+    #[test]
+    fn preserved_titlecase_keeps_contextual_sigma_and_reuses_its_variant() {
+        for (text, expected) in [
+            ("ΟΣ", "Ος"),
+            ("ΟΣ\u{301}", "Ος\u{301}"),
+            ("İΣ", "İς"),
+            ("ßΟΣ", "SSος"),
+            ("", ""),
+        ] {
+            assert_eq!(preserve_case("Foo", text), expected);
+            let replacement = Replacement::new("foo", text, FindOptions::default(), true).unwrap();
+            let mut output = String::new();
+            replacement.append("Foo Foo", 0, 3, &mut output).unwrap();
+            let allocation = replacement.titlecase.get().unwrap().as_ptr();
+            output.push(' ');
+            replacement.append("Foo Foo", 4, 7, &mut output).unwrap();
+            assert_eq!(output, format!("{expected} {expected}"));
+            assert_eq!(replacement.titlecase.get().unwrap().as_ptr(), allocation);
+            assert!(replacement.uppercase.get().is_none());
+            assert!(replacement.lowercase.get().is_none());
+        }
+    }
+
+    #[test]
+    fn contextual_titlecase_checks_exact_budget_before_caching_or_appending() {
+        for (text, expected) in [
+            ("ΟΣ", "Ος"),
+            ("ΟΣ\u{301}", "Ος\u{301}"),
+            ("İΣ", "İς"),
+            ("ßΟΣ", "SSος"),
+        ] {
+            let replacement = Replacement::new("foo", text, FindOptions::default(), true).unwrap();
+            let mut output = "prefix".to_owned();
+            let limit = output.len() + expected.len();
+            assert!(
+                replacement
+                    .append_bounded("Foo", 0, 3, &mut output, limit - 1)
+                    .unwrap_err()
+                    .contains("result size limit")
+            );
+            assert_eq!(output, "prefix");
+            assert!(replacement.titlecase.get().is_none());
+            replacement
+                .append_bounded("Foo", 0, 3, &mut output, limit)
+                .unwrap();
+            assert_eq!(output, format!("prefix{expected}"));
+            let allocation = replacement.titlecase.get().unwrap().as_ptr();
+            let before = output.clone();
+            assert!(
+                replacement
+                    .append_bounded("Foo", 0, 3, &mut output, limit)
+                    .is_err()
+            );
+            assert_eq!(output, before);
+            assert_eq!(replacement.titlecase.get().unwrap().as_ptr(), allocation);
+        }
     }
 
     #[test]
