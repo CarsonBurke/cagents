@@ -491,6 +491,15 @@ fn results(report: &CheckReport, now_ms: Millis) -> Element<'_, Message> {
             .into(),
         );
     }
+    rows.push(
+        design::caption(if report.provider_cleanup_confirmed {
+            "Provider cleanup: confirmed"
+        } else {
+            "Provider cleanup: not confirmed"
+        })
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .into(),
+    );
     if let Some(push) = report.github_push_allowed {
         rows.push(
             design::caption(format!(
@@ -1019,6 +1028,71 @@ mod tests {
         let messages = click(view(&app).unwrap(), "Close");
         apply(&mut app, messages);
         assert!(app.account_ui.check.form.is_none());
+    }
+
+    #[test]
+    fn rendered_provider_cleanup_stays_separate_from_verified_scratch_removal() {
+        use crate::account::workspace_probe::{Receipt, Status};
+        use iced::advanced::{Layout, layout, widget::Tree};
+        for confirmed in [false, true] {
+            let (mut app, first, _) = fixture();
+            open(&mut app, &first);
+            let sequence = app.account_ui.check.form.as_ref().unwrap().sequence;
+            drop(app.update_account_check(Action::Write(sequence, true)));
+            drop(app.update_account_check(Action::Run(sequence)));
+            let pending = app.account_ui.check.pending.as_ref().unwrap().clone();
+            let mut returned = report(&pending.request);
+            returned.workspace_write =
+                Measurement::new(CheckStatus::Passed, CheckReason::WorkspaceRoundTrip);
+            returned.workspace_cleanup = Some(Cleanup::Removed);
+            returned.workspace_receipt = Some(Receipt {
+                nonce: uuid::Uuid::new_v4(),
+                created: true,
+                read_match: true,
+                removed: true,
+                status: Status::Verified,
+                cleanup: Cleanup::Removed,
+            });
+            returned.provider_cleanup_confirmed = confirmed;
+            drop(app.update_account_check(Action::Finished {
+                sequence: pending.sequence,
+                result: Ok(returned),
+            }));
+
+            let renderer = crate::app::tests::headless_renderer();
+            let mut element = view(&app).expect("the finished check remains visible");
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 1600.0)),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let labels: Vec<_> = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| node.node().label())
+                .collect();
+            assert!(labels.contains(&"Scratch cleanup: removed"));
+            assert!(labels.contains(&"Workspace write, read and removal · Passed"));
+            let confirmed_caption = "Provider cleanup: confirmed";
+            let unconfirmed_caption = "Provider cleanup: not confirmed";
+            assert!(labels.contains(&if confirmed {
+                confirmed_caption
+            } else {
+                unconfirmed_caption
+            }));
+            assert!(!labels.contains(&if confirmed {
+                unconfirmed_caption
+            } else {
+                confirmed_caption
+            }));
+        }
     }
 
     #[test]
