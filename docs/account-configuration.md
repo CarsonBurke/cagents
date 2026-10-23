@@ -248,6 +248,25 @@ defaults unchanged, so the default-policy check can still report read-only.
 Existing conversations and network access have separate policies; this choice
 does not configure unattended agents.
 
+## Creating missing coding defaults
+
+An imported home can authenticate successfully while having no `config.toml`.
+After **Check coding access** confirms the selected login and provider cleanup,
+choose **Inspect coding defaults**. If that registered Codex home's configuration
+is absent, **Create coding defaults** offers workspace write with on-request
+approvals. Network access starts unchecked and requires an explicit choice.
+
+This creates an independent file on the selected device. Existing entries,
+System accounts and homes or configuration targets shared with another account
+are preserved. Busy accounts and uncertain independence refuse creation. No
+registration, account default, credential or existing conversation is changed.
+
+The configuration applies to new Codex processes. Run **Check** again to measure
+actual access; creation alone does not prove execution or network readiness.
+Closing the form leaves an outstanding request running and its result appears
+in a notice. If creation cannot be confirmed, inspect the account configuration
+before another request. Cagents does not retry or roll back an uncertain creation.
+
 ## Removing a linked account registration
 
 Use the stable account ID from `cagents account list` on the selected device:

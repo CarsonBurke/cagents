@@ -7,12 +7,15 @@ use crate::account::{
 };
 use crate::model::HostSessionProof;
 
+mod coding_config;
+
 #[derive(Default)]
 pub(super) struct State {
     next: u64,
     form: Option<Form>,
     // Independent of visibility: Close/reopen cannot dispatch a competing check.
     pending: Option<Pending>,
+    coding_config: coding_config::State,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -145,6 +148,7 @@ pub enum Action {
         sequence: u64,
         result: Result<CheckReport, Failure>,
     },
+    CodingConfig(coding_config::Action),
 }
 impl Action {
     fn form_sequence(&self) -> Option<u64> {
@@ -156,13 +160,21 @@ impl Action {
             | Self::GitHub(sequence, _)
             | Self::Repository(sequence, _)
             | Self::Run(sequence) => Some(*sequence),
-            Self::Open(_) | Self::Prepared { .. } | Self::Finished { .. } => None,
+            Self::Open(_)
+            | Self::Prepared { .. }
+            | Self::Finished { .. }
+            | Self::CodingConfig(_) => None,
         }
     }
     pub(super) fn blocked_while_modal(&self) -> bool {
         !matches!(
             self,
-            Self::Close(_) | Self::Prepared { .. } | Self::Finished { .. }
+            Self::Close(_)
+                | Self::Prepared { .. }
+                | Self::Finished { .. }
+                | Self::CodingConfig(
+                    coding_config::Action::Inspected { .. } | coding_config::Action::Created { .. }
+                )
         )
     }
 }
@@ -207,6 +219,9 @@ fn run(target: Target, request: CheckRequest) -> Result<CheckReport, Failure> {
 
 impl Cagents {
     pub(super) fn update_account_check(&mut self, action: Action) -> Task<Message> {
+        if let Action::CodingConfig(action) = action {
+            return coding_config::update(self, action);
+        }
         // Native callbacks can remain queued across Close/reopen and a repaint.
         // They must act on the form that rendered them, including Run and Close.
         if let Some(sequence) = action.form_sequence()
@@ -335,7 +350,9 @@ impl Cagents {
                 Task::none()
             }
             Action::Run(_) => {
-                if self.account_ui.check.pending.is_some() {
+                if self.account_ui.check.pending.is_some()
+                    || self.account_ui.check.coding_config.pending()
+                {
                     return Task::none();
                 }
                 let Some(form) = &self.account_ui.check.form else {
@@ -386,7 +403,9 @@ impl Cagents {
                 )
             }
             input => {
-                if self.account_ui.check.pending.is_some() {
+                if self.account_ui.check.pending.is_some()
+                    || self.account_ui.check.coding_config.pending()
+                {
                     return Task::none();
                 }
                 if let Some(form) = &mut self.account_ui.check.form {
@@ -533,8 +552,9 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
     let form = state.form.as_ref()?;
     let sequence = form.sequence;
     let pending = state.pending.is_some();
+    let configuring = state.coding_config.pending();
     let current = form.fence.matches(&app.account_ui);
-    let editable = !pending && current;
+    let editable = !pending && !configuring && current;
     let mut rows: Vec<Element<'_, Message>> = vec![
         design::heading("Check coding access").into(),
         design::body(format!("{} · {}", form.name, form.device)).wrapping(iced::widget::text::Wrapping::Word).into(),
@@ -601,6 +621,9 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
     if current && let Some(report) = &form.report {
         rows.push(results(report, app.account_ui.now_ms));
     }
+    if let Some(configuration) = coding_config::view(app) {
+        rows.push(configuration);
+    }
     rows.push(
         widget::row::with_children(vec![
             crate::ui_controls::button::secondary("Close")
@@ -654,14 +677,14 @@ mod tests {
             proof: proof("device-a"),
         }
     }
-    fn fixture() -> (Cagents, AccountId, AccountId) {
+    pub(super) fn fixture() -> (Cagents, AccountId, AccountId) {
         let mut app = context_inspector_test_app(false);
         let first = app.account_ui.add_managed_fixture(Provider::Codex, 145901);
         let second = app.account_ui.add_managed_fixture(Provider::Codex, 145902);
         app.active_workspace = Some("~/selected-worktree".into());
         (app, first, second)
     }
-    fn open(app: &mut Cagents, id: &AccountId) {
+    pub(super) fn open(app: &mut Cagents, id: &AccountId) {
         drop(app.update_account_check(Action::Open(id.clone())));
         let form = app.account_ui.check.form.as_ref().unwrap().sequence;
         drop(app.update_account_check(Action::Prepared {
@@ -669,7 +692,7 @@ mod tests {
             result: Ok(target()),
         }));
     }
-    fn report(request: &CheckRequest) -> CheckReport {
+    pub(super) fn report(request: &CheckRequest) -> CheckReport {
         let mut report = CheckReport::new(request);
         report.workspace = "/destination/selected-worktree".into();
         report.host = Some(proof("device-a"));
@@ -698,7 +721,7 @@ mod tests {
 
     // Exercise the real retained widget composition and pointer dispatch, rather
     // than call a button's reducer action and assume the control exists.
-    fn click(mut element: Element<'_, Message>, label: &str) -> Vec<Message> {
+    pub(super) fn click(mut element: Element<'_, Message>, label: &str) -> Vec<Message> {
         use iced::advanced::{Layout, clipboard, layout, widget::Tree};
         use iced::runtime::{UserInterface, user_interface::Cache};
         use iced::{Event, Point, Size, mouse};
@@ -742,7 +765,7 @@ mod tests {
         );
         messages
     }
-    fn apply(app: &mut Cagents, messages: Vec<Message>) {
+    pub(super) fn apply(app: &mut Cagents, messages: Vec<Message>) {
         for message in messages {
             if let Message::AccountUi(super::super::Action::Check(action)) = message {
                 drop(app.update_account_check(action));
