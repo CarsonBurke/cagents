@@ -149,8 +149,9 @@ impl crate::account::probe::SpawnOwner for Owner {
         crate::account::probe::spawn_authorized(command)
     }
 
-    fn preserve_unconfirmed(&self, child: tokio::process::Child) {
-        self._lease.retain_unconfirmed(child);
+    fn preserve_unconfirmed(&self, child: tokio::process::Child, group_signal_confirmed: bool) {
+        self._lease
+            .retain_unconfirmed(child, group_signal_confirmed);
     }
 }
 
@@ -537,7 +538,9 @@ mod tests {
             .current_dir(&working.canonical);
         let mut child = owner.spawn(&mut command).unwrap().unwrap();
         let input = child.stdin.take().unwrap();
-        owner.preserve_unconfirmed(child);
+        // This HOST fixture supplies the signal-confirmed custody case; real
+        // Group signaling and failure classification belong to probe fixtures.
+        owner.preserve_unconfirmed(child, true);
         drop(owner);
         assert!(ensure_idle(&host).is_err());
         assert!(ensure_unused(&host, &working.canonical).is_err());
