@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::overrides::OverrideBuilder;
 use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 
@@ -163,27 +163,25 @@ pub fn search(
             return;
         }
     };
-    let filter = policy.clone();
-    let mut walker = WalkBuilder::new(root);
-    walker
-        // All automatic ignore loaders are disabled. The descriptor-fed
-        // policy below preserves their precedence without FIFO/pathname reads.
-        .standard_filters(false)
-        .follow_links(false)
-        // Sorting makes walkdir collect every sibling before yielding to our
-        // cancellation check. Stream entries as the filesystem provides them.
-        .filter_entry(move |entry| {
-            filter
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .allows(entry)
-        });
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut total = 0;
     let mut skipped = 0;
     let mut last_batch = Instant::now();
     let mut bytes = Vec::with_capacity(SEARCH_BLOCK_BYTES);
-    for entry in walker.build() {
+    if cancellation.is_cancelled() {
+        return;
+    }
+    // Keep each ancestor iterator open rather than collecting its remaining
+    // siblings when descending. ReadDir/kernel buffering is implementation
+    // dependent; live directory handles grow with depth, not sibling count.
+    let mut directories = match std::fs::read_dir(root) {
+        Ok(directory) => vec![directory],
+        Err(_) => {
+            skipped += 1;
+            Vec::new()
+        }
+    };
+    loop {
         if cancellation.is_cancelled() {
             return;
         }
@@ -195,23 +193,52 @@ pub fn search(
             publish(Progress::Error(error));
             return;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
+        let Some(directory) = directories.last_mut() else {
+            break;
+        };
+        let entry = match directory.next() {
+            Some(Ok(entry)) => entry,
+            Some(Err(_)) => {
+                skipped += 1;
+                continue;
+            }
+            None => {
+                directories.pop();
+                continue;
+            }
+        };
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
             Err(_) => {
                 skipped += 1;
                 continue;
             }
         };
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+        let path = entry.path();
+        if !policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .allows(&path, kind)
+        {
             continue;
         }
-        // Apply include/exclude patterns after the ignore-aware walk. Putting
-        // whitelist overrides on WalkBuilder would silently re-include ignored
-        // files whenever an include glob matched them.
-        if overrides.matched(entry.path(), false).is_ignore() {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        if kind.is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(directory) => directories.push(directory),
+                Err(_) => skipped += 1,
+            }
             continue;
         }
-        let Ok(path) = entry.path().strip_prefix(root) else {
+        // Apply include/exclude patterns after the ignore-aware walk. A file
+        // include must not silently re-include an ignored file or prune a
+        // directory that may contain a matching descendant.
+        if overrides.matched(&path, false).is_ignore() {
+            continue;
+        }
+        let Ok(path) = path.strip_prefix(root) else {
             skipped += 1;
             continue;
         };
@@ -683,6 +710,150 @@ mod tests {
             started.elapsed().as_millis()
         );
         assert_eq!(delivered, RESULT_LIMIT);
+    }
+
+    #[test]
+    fn deep_directory_search_preserves_ignore_glob_and_symlink_membership() {
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "depth_marker\n").unwrap();
+        std::fs::write(fixture.path().join(".gitignore"), "*.ignored\n").unwrap();
+        std::fs::write(fixture.path().join(".ignore"), "!keep.ignored\n").unwrap();
+        std::fs::write(fixture.path().join("scoped.txt"), "depth_marker\n").unwrap();
+        let mut expected = vec![PathBuf::from("scoped.txt")];
+        let mut relative = PathBuf::new();
+        // Exceed WalkDir's old ten-open-directory threshold, with siblings at
+        // every ancestor. Membership must not depend on filesystem order.
+        for depth in 0..=16 {
+            let directory = fixture.path().join(&relative);
+            std::fs::create_dir_all(&directory).unwrap();
+            for sibling in 0..24 {
+                std::fs::write(directory.join(format!("sibling-{sibling}.txt")), "other\n")
+                    .unwrap();
+            }
+            for name in [
+                "keep.ignored",
+                "drop.ignored",
+                "glob.skip.txt",
+                ".hidden.txt",
+            ] {
+                std::fs::write(directory.join(name), "depth_marker\n").unwrap();
+            }
+            expected.push(relative.join("keep.ignored"));
+            if depth < 16 {
+                relative.push("deeper");
+            }
+        }
+        let deepest = fixture.path().join(&relative);
+        // These local rules must not leak into the root sibling on unwind.
+        std::fs::write(deepest.join(".ignore"), "scoped.txt\n").unwrap();
+        std::fs::write(deepest.join("scoped.txt"), "depth_marker\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), deepest.join("linked-directory")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.txt"),
+            deepest.join("linked-file.txt"),
+        )
+        .unwrap();
+        let mut opts = options("depth_marker");
+        opts.include = "*.txt,*.ignored".into();
+        opts.exclude = "*.skip.txt".into();
+        let events = run(fixture.path(), opts.clone());
+        assert!(matches!(
+            events.last(),
+            Some(Progress::Finished {
+                capped: false,
+                skipped: 0
+            })
+        ));
+        let mut found = matches(events)
+            .into_iter()
+            .map(|matched| matched.path)
+            .collect::<Vec<_>>();
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        opts.include_ignored = true;
+        opts.include_hidden = true;
+        let all = matches(run(fixture.path(), opts));
+        assert_eq!(all.len(), 17 * 3 + 2);
+        assert!(
+            all.iter()
+                .any(|matched| matched.path == relative.join("scoped.txt"))
+        );
+        assert!(
+            all.iter()
+                .any(|matched| matched.path == Path::new(".hidden.txt"))
+        );
+        assert!(all.iter().all(|matched| {
+            !matched.path.starts_with(&relative.join("linked-directory"))
+                && matched.path != relative.join("linked-file.txt")
+                && !matched.path.ends_with("glob.skip.txt")
+        }));
+    }
+
+    #[test]
+    fn deep_wide_search_stops_on_first_delivery_cancellation_or_refusal() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in 0..16 {
+            let directory = fixture.path().join(&relative);
+            std::fs::create_dir_all(&directory).unwrap();
+            for sibling in 0..32 {
+                std::fs::write(directory.join(format!("sibling-{sibling}.txt")), "other\n")
+                    .unwrap();
+            }
+            relative.push("deeper");
+        }
+        let deepest = fixture.path().join(&relative);
+        std::fs::create_dir_all(&deepest).unwrap();
+        let target = relative.join("matches.txt");
+        std::fs::write(
+            fixture.path().join(&target),
+            "λ marker\n".repeat(BATCH_SIZE * 3),
+        )
+        .unwrap();
+        for cancel_token in [false, true] {
+            let token = CancellationToken::default();
+            let mut events = Vec::new();
+            search(fixture.path(), &options("marker"), &token, |event| {
+                assert!(matches!(&event, Progress::Batch(_)), "{event:?}");
+                events.push(event);
+                if cancel_token {
+                    token.cancel();
+                }
+                cancel_token
+            });
+            assert_eq!(token.is_cancelled(), cancel_token);
+            assert_eq!(
+                events.len(),
+                1,
+                "stopped delivery cannot finish or publish again"
+            );
+            let delivered = matches(events);
+            assert!(!delivered.is_empty() && delivered.len() <= BATCH_SIZE);
+            for matched in delivered {
+                assert_eq!(matched.path, target);
+                assert_eq!((matched.column, matched.length), (3, 6));
+                assert!(matched.line_identity.matches("λ marker"));
+            }
+        }
+    }
+
+    #[test]
+    fn deep_ignore_error_terminates_without_a_finished_event() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut directory = fixture.path().to_path_buf();
+        for _ in 0..16 {
+            directory.push("deeper");
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(".ignore"), b"invalid \xff").unwrap();
+        std::fs::write(directory.join("matches.txt"), "marker\n").unwrap();
+        let events = run(fixture.path(), options("marker"));
+        assert!(
+            matches!(events.as_slice(), [Progress::Error(error)] if error.contains("not UTF-8"))
+        );
     }
 
     #[test]

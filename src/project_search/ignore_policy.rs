@@ -2,12 +2,9 @@
 //! default pathname loaders can block forever on a FIFO before yielding an
 //! entry, so cancellation cannot make those loaders safe.
 use crate::{fs_safety::Root, process::CancellationToken};
-use ignore::{
-    DirEntry,
-    gitignore::{Gitignore, GitignoreBuilder},
-};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, FileType, OpenOptions},
     io::{self, Read},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -170,21 +167,20 @@ impl Policy {
             bytes: a + b + c,
         })
     }
-    pub(super) fn allows(&mut self, entry: &DirEntry) -> bool {
-        // Walk filters internally before yielding. Give the caller its next
-        // entry so its cancellation/error guard can stop immediately instead
-        // of filtering every remaining sibling without returning control.
+    pub(super) fn allows(&mut self, path: &Path, kind: FileType) -> bool {
+        // The caller checks cancellation/errors before enumerating each entry.
+        // Also stop policy work if cancellation arrives during enumeration.
         if self.cancel.is_cancelled() || self.error.is_some() {
             return true;
         }
-        if entry.file_name() == ".git" {
+        if path.file_name().is_some_and(|name| name == ".git") {
             return false;
         }
-        if entry.path() == self.root.path() {
+        if path == self.root.path() {
             return true;
         }
-        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-        if !is_dir && !entry.file_type().is_some_and(|kind| kind.is_file()) {
+        let is_dir = kind.is_dir();
+        if !is_dir && !kind.is_file() {
             return false;
         }
         let ignored = if self.include_ignored {
@@ -193,7 +189,7 @@ impl Policy {
             while self
                 .stack
                 .last()
-                .is_some_and(|node| Some(node.directory.as_path()) != entry.path().parent())
+                .is_some_and(|node| Some(node.directory.as_path()) != path.parent())
             {
                 self.stack.pop();
             }
@@ -203,7 +199,7 @@ impl Policy {
                 .stack
                 .iter()
                 .rev()
-                .map(|node| node.ordinary.matched(entry.path(), is_dir))
+                .map(|node| node.ordinary.matched(path, is_dir))
                 .find(|matched| !matched.is_none());
             if let Some(matched) = ordinary {
                 Some(matched.is_ignore())
@@ -217,7 +213,7 @@ impl Policy {
                             return None;
                         }
                         *stopped = node.has_git;
-                        Some(node.git.matched(entry.path(), is_dir))
+                        Some(node.git.matched(path, is_dir))
                     })
                     .find(|matched| !matched.is_none());
                 if let Some(matched) = git {
@@ -232,11 +228,11 @@ impl Policy {
                                 return None;
                             }
                             *stopped = node.has_git;
-                            Some(node.exclude.matched(entry.path(), is_dir))
+                            Some(node.exclude.matched(path, is_dir))
                         })
                         .find(|matched| !matched.is_none());
                     exclude.map(|matched| matched.is_ignore()).or_else(|| {
-                        let matched = self.global.matched(entry.path(), is_dir);
+                        let matched = self.global.matched(path, is_dir);
                         (!matched.is_none()).then(|| matched.is_ignore())
                     })
                 }
@@ -245,15 +241,14 @@ impl Policy {
         if ignored == Some(true)
             || (ignored.is_none()
                 && !self.include_hidden
-                && entry.file_name().as_encoded_bytes().starts_with(b"."))
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().starts_with(b".")))
         {
             return false;
         }
         if is_dir && !self.include_ignored {
-            match self
-                .node(entry.path().into())
-                .and_then(|node| self.push(node))
-            {
+            match self.node(path.into()).and_then(|node| self.push(node)) {
                 Ok(()) => {}
                 Err(error) => {
                     self.error = Some(error);
@@ -444,7 +439,10 @@ mod tests {
                 visits.fetch_add(1, Ordering::Relaxed);
                 token.cancel();
             }
-            policy.lock().unwrap().allows(entry)
+            policy
+                .lock()
+                .unwrap()
+                .allows(entry.path(), entry.file_type().unwrap())
         });
         for entry in walker.build() {
             // Same admission ordering as the actual search worker: canceled
