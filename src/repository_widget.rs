@@ -415,6 +415,13 @@ struct EditorLanguageState {
     hover_at: Option<text_editor::Position>,
 }
 
+impl EditorLanguageState {
+    fn retire_completions(&mut self, intent: &mut u64) {
+        *intent = intent.wrapping_add(1);
+        self.completions.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
     Review {
@@ -2190,6 +2197,8 @@ pub struct RepositoryRuntime {
     selected: Option<RepositoryFile>,
     document: DocumentState,
     search_mode: bool,
+    /// Accepted caret/selection intent, independent of text version and response epoch.
+    completion_intent: u64,
     editor_font: Font,
     editor_font_size: f32,
     find_open: bool,
@@ -2398,6 +2407,7 @@ impl RepositoryRuntime {
             files: FileListState::Loading,
             selected: None,
             search_mode: false,
+            completion_intent: 0,
             editor_font: Font::MONOSPACE,
             editor_font_size: 14.0,
             find_open: false,
@@ -3556,8 +3566,15 @@ impl RepositoryRuntime {
         });
     }
 
+    /// Changes even for an accepted no-op caret action or a Find round trip.
+    /// Controllers use it to retire pending answers without changing text versions.
+    pub fn editor_completion_intent(&self) -> u64 {
+        self.completion_intent
+    }
+
     pub fn dismiss_editor_results(&mut self) {
-        self.language.completions.clear();
+        self.language
+            .retire_completions(&mut self.completion_intent);
         self.language.hover.clear();
         self.language.hover_diagnostic = None;
         self.language.hover_at = None;
@@ -3572,11 +3589,17 @@ impl RepositoryRuntime {
     /// carries UTF-16 code units, and this runtime has no way to tell the two
     /// apart from an [`LspPosition`] alone.
     pub fn move_cursor_to(&mut self, at: LspPosition) -> bool {
-        let DocumentState::Editable(document) = &mut self.document else {
+        let position = match &self.document {
+            DocumentState::Editable(document) => caret_for_position(&document.content, at),
+            _ => None,
+        };
+        let Some(position) = position else {
             return false;
         };
-        let Some(position) = caret_for_position(&document.content, at) else {
-            return false;
+        self.language
+            .retire_completions(&mut self.completion_intent);
+        let DocumentState::Editable(document) = &mut self.document else {
+            unreachable!("the validated editor remains mounted");
         };
         // Typing after a jump is a new undo step, like typing after a click.
         document.history.seal();
@@ -3658,8 +3681,13 @@ impl RepositoryRuntime {
     }
 
     fn select_cached_match(&mut self, occurrence: usize) -> Option<usize> {
-        let DocumentState::Editable(document) = &mut self.document else {
+        if !self.editable_surface_visible() {
             return None;
+        }
+        self.language
+            .retire_completions(&mut self.completion_intent);
+        let DocumentState::Editable(document) = &mut self.document else {
+            unreachable!("the validated editor remains mounted");
         };
         document.history.seal();
         let total = self.find_matches.len();
@@ -4011,7 +4039,7 @@ impl RepositoryRuntime {
             self.find_index
         };
         self.find_origin = None;
-        if std::mem::take(&mut self.find_select_on_finish) {
+        if std::mem::take(&mut self.find_select_on_finish) && self.editable_surface_visible() {
             self.select_find_match(occurrence);
         } else {
             self.find_total = self.find_matches.len();
@@ -4113,6 +4141,8 @@ impl RepositoryRuntime {
                     }
                 }
             };
+            self.language
+                .retire_completions(&mut self.completion_intent);
             document.content.perform(text_editor::Action::SelectAll);
             if let Applied::Changed(protocol) =
                 document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(text)))
@@ -4148,6 +4178,8 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
             };
+            self.language
+                .retire_completions(&mut self.completion_intent);
             document.content.move_to(text_editor::Cursor {
                 position: end,
                 selection: Some(start),
@@ -6294,7 +6326,7 @@ impl RepositoryRuntime {
                 // No buffer is mounted outside Edit, so an action arriving
                 // from any other surface is a stale message about a surface
                 // that has already been replaced.
-                if self.source_surface != SourceSurface::Editor {
+                if !self.editable_surface_visible() {
                     return Task::none();
                 }
                 if !matches!(action, text_editor::Action::Scroll { .. }) {

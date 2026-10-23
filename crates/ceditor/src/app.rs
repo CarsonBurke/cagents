@@ -2,7 +2,9 @@ use cagents::settings_widgets::{Setting, field as settings_field, group as setti
 use cagents::{
     design,
     github::GitHubService,
-    lsp::{LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspStatus},
+    lsp::{
+        LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspRequestId, LspStatus,
+    },
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     pull_request_review::{self, ReviewSource},
     repository::{
@@ -83,6 +85,8 @@ struct Tab {
     /// replace it only when their version still matches that manager state.
     diagnostics_version: Option<i32>,
     completions: Vec<CompletionTarget>,
+    completion_request: Option<(LspRequestId, LspPosition)>,
+    completion_intent: u64,
     hover: Option<String>,
     lsp_error: Option<String>,
     mutation: Option<MutationKind>,
@@ -1486,6 +1490,8 @@ impl Editor {
             diagnostics: Vec::new(),
             diagnostics_version: None,
             completions: Vec::new(),
+            completion_request: None,
+            completion_intent: 0,
             hover: None,
             lsp_error: None,
             mutation,
@@ -1890,7 +1896,23 @@ impl Editor {
         cosmic::task::future(async move { Message::Lsp(generation, events.recv().await.ok()) })
     }
 
+    fn reconcile_completion_intent(&mut self, id: CardId) {
+        let pending = self.tab_mut(id).and_then(|tab| {
+            let intent = tab.runtime.editor_completion_intent();
+            if tab.completion_intent == intent {
+                return None;
+            }
+            tab.completion_intent = intent;
+            tab.completions.clear();
+            tab.completion_request.take()
+        });
+        if let Some((request, _)) = pending {
+            self.lsp.cancel(request);
+        }
+    }
+
     fn drain(&mut self, id: CardId) -> Task<Message> {
+        self.reconcile_completion_intent(id);
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
@@ -1962,7 +1984,7 @@ impl Editor {
                         .tab(id)
                         .and_then(|tab| tab.runtime.lsp_document())
                         .and_then(|doc| self.lsp.document_version(doc));
-                    if let Some(tab) = self.tab_mut(id) {
+                    let pending = if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
                         if !edits.is_empty()
@@ -1976,6 +1998,12 @@ impl Editor {
                             // or the native marks used by F8 navigation.
                             tab.set_diagnostics(Vec::new(), None);
                         }
+                        tab.completion_request.take()
+                    } else {
+                        None
+                    };
+                    if let Some((request, _)) = pending {
+                        self.lsp.cancel(request);
                     }
                 }
                 LspIntent::Save { text } => {
@@ -1997,6 +2025,7 @@ impl Editor {
             tab.runtime.set_lsp_document(None);
             tab.set_diagnostics(Vec::new(), None);
             tab.completions.clear();
+            tab.completion_request = None;
             tab.hover = None;
         }
     }
@@ -4403,6 +4432,14 @@ impl Application for Editor {
                             | LspEvent::DocumentDesynced { doc, .. } => *doc,
                         };
                         let current_version = self.lsp.document_version(doc);
+                        if let Some(id) = self
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                            .map(|tab| tab.id)
+                        {
+                            self.reconcile_completion_intent(id);
+                        }
                         if let Some(tab) = self
                             .tabs
                             .iter_mut()
@@ -4414,9 +4451,16 @@ impl Application for Editor {
                                 {
                                     tab.set_diagnostics(items, Some(version));
                                 }
-                                LspEvent::Completion { items, .. } => {
-                                    tab.runtime.set_editor_completion_list(items);
-                                    tab.completions = tab.runtime.editor_completion_targets(tab.id);
+                                LspEvent::Completion { request, items, .. } => {
+                                    if tab.completion_request.is_some_and(|(expected, at)| {
+                                        request == expected
+                                            && tab.runtime.cursor_position() == Some(at)
+                                    }) {
+                                        tab.completion_request = None;
+                                        tab.runtime.set_editor_completion_list(items);
+                                        tab.completions =
+                                            tab.runtime.editor_completion_targets(tab.id);
+                                    }
                                 }
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
                                 LspEvent::Status { status, .. } => {
@@ -4447,15 +4491,22 @@ impl Application for Editor {
                     if self.modal_open() {
                         return Task::none();
                     }
-                    if let Some(tab) = self.current() {
-                        if let (Some(doc), Some(at)) =
-                            (tab.runtime.lsp_document(), tab.runtime.cursor_position())
-                        {
-                            if matches!(message, Message::Complete) {
-                                self.lsp.request_completion(doc, at);
-                            } else {
-                                self.lsp.request_hover(doc, at);
+                    let target = self.current().and_then(|tab| {
+                        Some((
+                            tab.id,
+                            tab.runtime.lsp_document()?,
+                            tab.runtime.cursor_position()?,
+                        ))
+                    });
+                    if let Some((id, doc, at)) = target {
+                        self.reconcile_completion_intent(id);
+                        if matches!(message, Message::Complete) {
+                            let request = self.lsp.request_completion(doc, at);
+                            if let Some(tab) = self.tab_mut(id) {
+                                tab.completion_request = Some((request, at));
                             }
+                        } else {
+                            self.lsp.request_hover(doc, at);
                         }
                     }
                     Task::none()
@@ -4487,7 +4538,9 @@ impl Application for Editor {
                     }
                     if let Some(tab) = self.tab_mut(id) {
                         tab.runtime.move_cursor_to(at);
-                        return tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        self.reconcile_completion_intent(id);
+                        return focus;
                     }
                     Task::none()
                 }
@@ -7088,6 +7141,334 @@ mod tests {
                 .map(|pending| pending.path.clone()),
             Some(selected),
         );
+    }
+
+    fn completion_find_fixture() -> (Editor, tempfile::TempDir, CardId, LspDocumentId) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("code.rs"), "tail tail\n").unwrap();
+        let mut app = editor();
+        let card = add(
+            &mut app,
+            directory.path().to_str().unwrap(),
+            Some("code.rs"),
+        );
+        load_selected(&mut app, card);
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        app.language_server_assistance = true;
+        app.tab_mut(card).unwrap().runtime.resync_lsp();
+        drop(app.drain(card));
+        let doc = app.tab(card).unwrap().runtime.lsp_document().unwrap();
+        assert!(app.lsp.document_version(doc).is_some());
+        (app, directory, card, doc)
+    }
+
+    fn completion_item_for_find(label: &str) -> cagents::lsp::LspCompletionItem {
+        cagents::lsp::LspCompletionItem {
+            label: label.into(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            preselect: false,
+            deprecated: false,
+            edit: cagents::lsp::LspCompletionEdit {
+                range: cagents::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                replace_range: None,
+                new_text: label.into(),
+                snippet: None,
+            },
+            additional_edits: Vec::new(),
+        }
+    }
+
+    fn request_completion_for_find(app: &mut Editor, card: CardId) -> (LspRequestId, LspPosition) {
+        drop(app.update(Message::Complete));
+        app.tab(card).unwrap().completion_request.unwrap()
+    }
+
+    fn completion_reply_for_find(
+        app: &mut Editor,
+        doc: LspDocumentId,
+        request: LspRequestId,
+        label: &str,
+    ) {
+        drop(app.update(Message::Lsp(
+            app.lsp.generation(),
+            Some(LspEvent::Completion {
+                request,
+                doc,
+                items: vec![completion_item_for_find(label)],
+            }),
+        )));
+    }
+
+    fn navigate_find_key(app: &mut Editor, backwards: bool) {
+        let key = keyboard::Key::Named(keyboard::key::Named::F3);
+        drop(app.update(Message::Key(
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F3),
+                location: keyboard::Location::Standard,
+                modifiers: if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: None,
+                repeat: false,
+            },
+            false,
+        )));
+    }
+
+    #[test]
+    fn standalone_find_round_trip_refuses_old_completion_and_preserves_fresh_scroll_application() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, _directory, card, doc) = completion_find_fixture();
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            })),
+        );
+        let shown = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, shown.0, "shown");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        let old = request_completion_for_find(&mut app, card);
+        let version = app.lsp.document_version(doc);
+        navigate_find_key(&mut app, false);
+        assert_ne!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(old.1)
+        );
+        assert!(app.tab(card).unwrap().completion_request.is_none());
+        assert!(app.tab(card).unwrap().completions.is_empty());
+        navigate_find_key(&mut app, true);
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(old.1)
+        );
+        assert_eq!(app.lsp.document_version(doc), version);
+        completion_reply_for_find(&mut app, doc, old.0, "late");
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("tail tail\n")
+        );
+        assert!(app.tab(card).unwrap().completions.is_empty());
+
+        let superseded = request_completion_for_find(&mut app, card);
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, superseded.0, "older");
+        assert_eq!(app.tab(card).unwrap().completion_request, Some(fresh));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Scroll { lines: 2 },
+            })),
+        );
+        assert_eq!(app.tab(card).unwrap().completion_request, Some(fresh));
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Scroll { lines: 2 },
+            })),
+        );
+        assert_eq!(app.tab(card).unwrap().completions, vec![target.clone()]);
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshtail tail\n")
+        );
+    }
+
+    #[test]
+    fn standalone_history_change_retires_queued_completion_at_the_same_caret() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, _directory, card, doc) = completion_find_fixture();
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Edit(widget::text_editor::Edit::Paste(Arc::new(
+                    "head".into(),
+                ))),
+            })),
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("head tail\n")
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(0, 4))
+        );
+        for (action, text, dirty) in [
+            (RepositoryAction::Undo { card }, "tail tail\n", false),
+            (RepositoryAction::Redo { card }, "head tail\n", true),
+        ] {
+            let pending = request_completion_for_find(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            let intent = app.tab(card).unwrap().runtime.editor_completion_intent();
+            // This answer was already queued against the pre-history version.
+            // The manager has no version proof in Completion itself.
+            let queued = Message::Lsp(
+                app.lsp.generation(),
+                Some(LspEvent::Completion {
+                    request: pending.0,
+                    doc,
+                    items: vec![completion_item_for_find("old-version")],
+                }),
+            );
+            drop(app.update(Message::Repository(action)));
+            let tab = app.tab(card).unwrap();
+            assert_eq!(tab.runtime.editor_text().as_deref(), Some(text));
+            assert_eq!(tab.runtime.cursor_position(), Some(pending.1));
+            assert_eq!(tab.runtime.is_dirty(), dirty);
+            assert_eq!(tab.runtime.editor_completion_intent(), intent);
+            assert!(app.lsp.document_version(doc) > version);
+            assert!(tab.completion_request.is_none());
+            drop(app.update(queued));
+            assert!(app.tab(card).unwrap().completions.is_empty());
+            assert_eq!(
+                app.tab(card).unwrap().runtime.editor_text().as_deref(),
+                Some(text)
+            );
+        }
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshhead tail\n")
+        );
+    }
+
+    #[test]
+    fn standalone_deferred_find_admission_preserves_rejected_callbacks_and_retires_real_selection()
+    {
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for hidden in [false, true] {
+            let (mut app, _directory, card, doc) = completion_find_fixture();
+            drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+                    card,
+                    option: cagents::ui_controls::FindOption::Regex,
+                    enabled: true,
+                })),
+            );
+            let shown = request_completion_for_find(&mut app, card);
+            completion_reply_for_find(&mut app, doc, shown.0, "shown");
+            let targets = app.tab(card).unwrap().completions.clone();
+            let pending = request_completion_for_find(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            app.settings_open = true;
+            assert!(app.modal_open());
+            drop(app.update(Message::Repository(RepositoryAction::FindNext { card })));
+            app.settings_open = false;
+            assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+            let task =
+                app.tab_mut(card)
+                    .unwrap()
+                    .runtime
+                    .update(RepositoryAction::FindQueryChanged {
+                        card,
+                        query: "tail".into(),
+                    });
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("real deferred regex worker");
+            // Only the Find future is polled; manager tasks remain on the
+            // entered but undriven runtime, with no server process execution.
+            let result = block_on(async {
+                loop {
+                    let event = stream.next().await.expect("Find produces its callback");
+                    if let iced::runtime::Action::Output(
+                        result @ RepositoryAction::FindLoaded { .. },
+                    ) = event
+                    {
+                        break result;
+                    }
+                }
+            });
+            let mut stale = result.clone();
+            let RepositoryAction::FindLoaded { ticket, .. } = &mut stale else {
+                unreachable!()
+            };
+            *ticket = Default::default();
+            drop(app.update(Message::Repository(stale)));
+            let mut foreign = result.clone();
+            let RepositoryAction::FindLoaded { card, .. } = &mut foreign else {
+                unreachable!()
+            };
+            *card = CardId::new();
+            drop(app.update(Message::Repository(foreign)));
+            assert_eq!(app.tab(card).unwrap().completions, targets);
+            assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+            if hidden {
+                drop(app.tab_mut(card).unwrap().runtime.update(
+                    RepositoryAction::ApplyMarkdownMode {
+                        card,
+                        preview: true,
+                    },
+                ));
+                assert!(
+                    app.tab(card)
+                        .unwrap()
+                        .runtime
+                        .editor_focus_target(card)
+                        .is_none()
+                );
+            }
+            drop(app.update(Message::Repository(result)));
+            assert_eq!(
+                app.tab(card).unwrap().runtime.editor_text().as_deref(),
+                Some("tail tail\n")
+            );
+            assert_eq!(app.lsp.document_version(doc), version);
+            if hidden {
+                assert_eq!(
+                    app.tab(card).unwrap().runtime.cursor_position(),
+                    Some(pending.1)
+                );
+                assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+                assert_eq!(app.tab(card).unwrap().completions, targets);
+            } else {
+                assert_ne!(
+                    app.tab(card).unwrap().runtime.cursor_position(),
+                    Some(pending.1)
+                );
+                assert!(app.tab(card).unwrap().completion_request.is_none());
+                assert!(app.tab(card).unwrap().completions.is_empty());
+                completion_reply_for_find(&mut app, doc, pending.0, "late");
+                assert!(app.tab(card).unwrap().completions.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -4982,6 +4982,8 @@ struct LspInspectorState {
     /// The server's current progress report, if it is still working.
     progress: Option<String>,
     completion_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
+    /// Last observed runtime intent; a request is captured against this value.
+    completion_intent: u64,
     editor_hover_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
     editor_navigation: Option<crate::lsp::LspRequestId>,
 }
@@ -10837,6 +10839,24 @@ impl Cagents {
         overlay.chain(task)
     }
 
+    fn reconcile_completion_intent(&mut self, card: CardId) {
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return;
+        };
+        let intent = runtime.editor_completion_intent();
+        let pending = self.lsp_contexts.get_mut(&card).and_then(|state| {
+            if state.completion_intent == intent {
+                return None;
+            }
+            state.completion_intent = intent;
+            state.context.completions.clear();
+            state.completion_request.take()
+        });
+        if let Some((request, _)) = pending {
+            self.lsp.cancel(request);
+        }
+    }
+
     /// Hands the card's buffer lifecycle to the language-server manager.
     ///
     /// The widget records what happened to the buffer; nothing in it can talk
@@ -10845,6 +10865,7 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
+        self.reconcile_completion_intent(card);
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
                 let intents = runtime.take_lsp_intents();
@@ -11082,6 +11103,7 @@ impl Cagents {
                 .then(|| runtime.focus_editor(card)),
             _ => None,
         };
+        self.reconcile_completion_intent(card);
         focus.unwrap_or_else(|| {
             self.status = Some(TransientNotice::warning(format!(
                 "line {} is not in this file any more",
@@ -11137,6 +11159,7 @@ impl Cagents {
         let Some(&card) = self.lsp_documents.get(&doc) else {
             return;
         };
+        self.reconcile_completion_intent(card);
         let Some(state) = self.lsp_contexts.get_mut(&card) else {
             return;
         };
@@ -11441,6 +11464,7 @@ impl Cagents {
     }
 
     fn request_lsp(&mut self, card: CardId, kind: LspRequestKind) -> Task<Message> {
+        self.reconcile_completion_intent(card);
         let Some(doc) = self.lsp_document(card) else {
             return Task::none();
         };
@@ -14891,22 +14915,6 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                if matches!(&action, RepositoryAction::EditorAction { action, .. }
-                    if !matches!(action, repository_widget::EditorAction::Scroll { .. }))
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                        if runtime.editable_surface_visible())
-                {
-                    // A caret action retires results even when it changes no
-                    // text. Returning to the old caret must not revive an
-                    // answer queued before that intervening editor intent.
-                    let pending = self.lsp_contexts.get_mut(&card).and_then(|state| {
-                        state.context.completions.clear();
-                        state.completion_request.take()
-                    });
-                    if let Some((request, _)) = pending {
-                        self.lsp.cancel(request);
-                    }
-                }
                 let find_preferences_changed = matches!(
                     &action,
                     RepositoryAction::FindOptionsChanged { .. }
@@ -26015,7 +26023,10 @@ mod tests {
             !targets.is_empty(),
             "the fixture has a registered editable document"
         );
-        lsp_state(app, card).context.completions = targets.clone();
+        let intent = runtime.editor_completion_intent();
+        let state = lsp_state(app, card);
+        state.completion_intent = intent;
+        state.context.completions = targets.clone();
         targets
     }
 
@@ -26023,10 +26034,25 @@ mod tests {
     // Registration has a real manager version/request ID, while discovery and
     // server tasks cannot run; response injection exercises App admission only.
     fn completion_intent_fixture() -> (Cagents, CardId, LspDocumentId) {
-        let mut app = lsp_test_app();
+        completion_intent_fixture_text("tail\n", false)
+    }
+
+    fn completion_intent_fixture_text(
+        text: &str,
+        focused: bool,
+    ) -> (Cagents, CardId, LspDocumentId) {
+        let mut app = if focused {
+            context_inspector_test_app(true)
+        } else {
+            lsp_test_app()
+        };
         app.lsp = LspManager::new(AppSettings::default().language_servers);
-        let card = repository_card(&mut app, "/repo");
-        let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "tail\n");
+        let card = if focused {
+            app.workspace.focused().unwrap()
+        } else {
+            repository_card(&mut app, "/repo")
+        };
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", text);
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         drop(app.drain_lsp_intents(card));
@@ -26043,6 +26069,265 @@ mod tests {
     ) -> (crate::lsp::LspRequestId, LspPosition) {
         drop(app.request_lsp(card, LspRequestKind::Completion));
         app.lsp_contexts[&card].completion_request.unwrap()
+    }
+
+    fn navigate_find_key(app: &mut Cagents, backwards: bool) {
+        let key = keyboard::Key::Named(keyboard::key::Named::F3);
+        let action = task_app_message(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F3),
+                location: keyboard::Location::Standard,
+                modifiers: if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(matches!(
+            &action,
+            Message::Repository(
+                RepositoryAction::FindNext { .. } | RepositoryAction::FindPrevious { .. }
+            )
+        ));
+        drop(app.update(action));
+    }
+
+    #[test]
+    fn find_navigation_retires_shown_and_pending_completion_across_caret_round_trip() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, card, doc) = completion_intent_fixture_text("tail tail\n", true);
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            })),
+        );
+        let shown =
+            publish_test_completions(&mut app, card, vec![completion_item("shown")]).remove(0);
+        let pending = request_test_completion(&mut app, card);
+        let version = app.lsp.document_version(doc);
+        navigate_find_key(&mut app, false);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_ne!(runtime.cursor_position(), Some(pending.1));
+        assert!(runtime.editor_completion_targets(card).is_empty());
+        assert!(app.lsp_contexts[&card].completion_request.is_none());
+        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        navigate_find_key(&mut app, true);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.cursor_position(), Some(pending.1));
+        assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
+        assert_eq!(app.lsp.document_version(doc), version);
+        app.apply_lsp_event(LspEvent::Completion {
+            request: pending.0,
+            doc,
+            items: vec![completion_item("late")],
+        });
+        drop(app.update(Message::ContextInspector(
+            InspectorAction::ApplyLspCompletion {
+                card,
+                index: 0,
+                target: shown,
+            },
+        )));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
+        assert!(runtime.editor_completion_targets(card).is_empty());
+
+        let fresh = request_test_completion(&mut app, card);
+        app.apply_lsp_event(LspEvent::Completion {
+            request: pending.0,
+            doc,
+            items: vec![completion_item("late")],
+        });
+        assert_eq!(app.lsp_contexts[&card].completion_request, Some(fresh));
+        app.apply_lsp_event(LspEvent::Completion {
+            request: fresh.0,
+            doc,
+            items: vec![completion_item("fresh")],
+        });
+        let target = app.lsp_contexts[&card].context.completions[0].clone();
+        drop(app.update(Message::ContextInspector(
+            InspectorAction::ApplyLspCompletion {
+                card,
+                index: 0,
+                target,
+            },
+        )));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some("freshtail tail\n"));
+    }
+
+    #[test]
+    fn same_text_find_replacement_retires_completion_without_advancing_text_version() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for all in [false, true] {
+            let (mut app, card, doc) = completion_intent_fixture_text("tail tail\n", true);
+            drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                    card,
+                    query: "tail".into(),
+                })),
+            );
+            drop(
+                app.update(Message::Repository(RepositoryAction::ReplaceQueryChanged {
+                    card,
+                    query: "tail".into(),
+                })),
+            );
+            let shown = publish_test_completions(&mut app, card, vec![completion_item("shown")]);
+            let pending = request_test_completion(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.selected_text().as_deref(), Some("tail"));
+            let dirty = runtime.is_dirty();
+            drop(
+                app.update(Message::Repository(RepositoryAction::ReplaceMatch {
+                    card,
+                    all,
+                })),
+            );
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
+            assert!(runtime.selected_text().is_none());
+            assert_eq!(runtime.is_dirty(), dirty);
+            assert_eq!(app.lsp.document_version(doc), version);
+            assert!(runtime.editor_completion_targets(card).is_empty());
+            assert!(app.lsp_contexts[&card].completion_request.is_none());
+            assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            app.apply_lsp_event(LspEvent::Completion {
+                request: pending.0,
+                doc,
+                items: vec![completion_item("late")],
+            });
+            drop(app.update(Message::ContextInspector(
+                InspectorAction::ApplyLspCompletion {
+                    card,
+                    index: 0,
+                    target: shown[0].clone(),
+                },
+            )));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
+        }
+    }
+
+    #[test]
+    fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback() {
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for hidden in [false, true] {
+            let (mut app, card, doc) = completion_intent_fixture_text("tail tail\n", true);
+            drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+                    card,
+                    option: crate::ui_controls::FindOption::Regex,
+                    enabled: true,
+                })),
+            );
+            let shown = publish_test_completions(&mut app, card, vec![completion_item("shown")]);
+            let pending = request_test_completion(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
+            let task = runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            });
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("regex Find uses its real worker");
+            // Poll only the Find future. The entered manager runtime is never
+            // driven, so no discovery/server tasks can execute in this fixture.
+            let result = block_on(async {
+                loop {
+                    let event = stream.next().await.expect("Find produces a callback");
+                    if let iced::runtime::Action::Output(
+                        result @ RepositoryAction::FindLoaded { .. },
+                    ) = event
+                    {
+                        break result;
+                    }
+                }
+            });
+            let mut stale = result.clone();
+            let RepositoryAction::FindLoaded { ticket, .. } = &mut stale else {
+                unreachable!()
+            };
+            *ticket = uuid::Uuid::new_v4();
+            drop(app.update(Message::Repository(stale)));
+            let mut foreign = result.clone();
+            let RepositoryAction::FindLoaded { card, .. } = &mut foreign else {
+                unreachable!()
+            };
+            *card = CardId::new();
+            drop(app.update(Message::Repository(foreign)));
+            assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+            assert_eq!(app.lsp_contexts[&card].context.completions, shown);
+            if hidden {
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+                assert!(!runtime.editable_surface_visible());
+            }
+            drop(app.update(Message::Repository(result)));
+            assert_eq!(app.lsp.document_version(doc), version);
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
+            if hidden {
+                assert_eq!(runtime.cursor_position(), Some(pending.1));
+                assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+                assert_eq!(app.lsp_contexts[&card].context.completions, shown);
+            } else {
+                assert_ne!(runtime.cursor_position(), Some(pending.1));
+                assert!(runtime.editor_completion_targets(card).is_empty());
+                assert!(app.lsp_contexts[&card].completion_request.is_none());
+                assert!(app.lsp_contexts[&card].context.completions.is_empty());
+                app.apply_lsp_event(LspEvent::Completion {
+                    request: pending.0,
+                    doc,
+                    items: vec![completion_item("late")],
+                });
+                assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            }
+        }
     }
 
     #[test]
