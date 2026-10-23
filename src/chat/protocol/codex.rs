@@ -180,6 +180,17 @@ pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    let bytes = socket.as_os_str().as_encoded_bytes();
+    // Match the actual platform Unix address before any provider can start.
+    // All sockaddr_un fields are integers, so its all-zero value is valid.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= capacity {
+        return Err(format!(
+            "Owned Codex listener requires a nonempty, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter temporary directory"
+        ));
+    }
     create_inner(launch, Some(socket), None)
 }
 
@@ -4116,6 +4127,132 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
+        Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: home
+                    .join("never-executed-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+                arguments: vec!["--remote".into(), "unix://".into()],
+                working_directory: home.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    home.to_string_lossy().into_owned(),
+                )]),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_rejects_unusable_unix_addresses_before_preparation_or_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::new(),
+            PathBuf::from("/nul\0socket"),
+            PathBuf::from(format!("/{}", "x".repeat(107))),
+            PathBuf::from(format!("/{}", "x".repeat(108))),
+            PathBuf::from(format!("/{}x", "λ".repeat(53))),
+        ] {
+            let failure = create_with_listener(&launch, socket)
+                .err()
+                .expect("invalid address must fail before returning a spawn specification");
+            assert!(failure.contains("Owned Codex listener"), "{failure}");
+            assert!(failure.contains("shorter than 108 bytes"), "{failure}");
+            assert_eq!(launch.recipe, before);
+            assert_eq!(
+                std::fs::read_dir(home.path()).unwrap().count(),
+                0,
+                "invalid owned addresses must not create endpoint directories or execute the provider"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_accepts_107_actual_bytes_without_changing_launch_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::from(format!("/{}", "x".repeat(106))),
+            PathBuf::from(format!("/{}", "λ".repeat(53))),
+        ] {
+            assert_eq!(socket.as_os_str().as_encoded_bytes().len(), 107);
+            let (spec, _adapter) = create_with_listener(&launch, socket.clone()).unwrap();
+            assert!(
+                matches!(&spec.transport, TransportSpec::OwnedUnixWebSocket { socket: actual } if actual == &socket)
+            );
+            assert_eq!(
+                spec.arguments,
+                [
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    format!("unix://{}", socket.display())
+                ]
+            );
+            assert_eq!(spec.program, launch.recipe.program);
+            assert_eq!(spec.working_directory, launch.recipe.working_directory);
+            assert_eq!(spec.environment, launch.recipe.environment);
+            assert_eq!(launch.recipe, before);
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_long_listener_keeps_its_existing_verified_alias_and_never_launches() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let original = std::fs::metadata(&socket).unwrap();
+        let long = home
+            .path()
+            .join("long-exact-socket-".to_owned() + &"x".repeat(108));
+        symlink(&socket, &long).unwrap();
+        assert!(long.as_os_str().as_encoded_bytes().len() >= 108);
+        let mut launch = owned_listener_test_launch(home.path());
+        launch.recipe.arguments = vec!["--remote".into(), format!("unix://{}", long.display())];
+        let before = launch.recipe.clone();
+        let (spec, adapter) = create(&launch).unwrap();
+        let TransportSpec::UnixWebSocket {
+            socket: alias,
+            device,
+            inode,
+        } = &spec.transport
+        else {
+            panic!(
+                "shared listener must remain a verified existing connection, never an owned launch"
+            );
+        };
+        assert!(alias.as_os_str().as_encoded_bytes().len() < 108);
+        assert_ne!(alias, &long);
+        assert_eq!((*device, *inode), (original.dev(), original.ino()));
+        let aliased = std::fs::metadata(alias).unwrap();
+        assert_eq!(
+            (aliased.dev(), aliased.ino()),
+            (original.dev(), original.ino())
+        );
+        assert!(spec.arguments.is_empty());
+        assert_eq!(launch.recipe, before);
+        let alias = alias.clone();
+        drop(adapter);
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+        assert!(std::fs::metadata(&long).is_ok());
+        let unchanged = std::fs::metadata(&socket).unwrap();
+        assert_eq!(
+            (unchanged.dev(), unchanged.ino()),
+            (original.dev(), original.ino())
+        );
+    }
 
     #[test]
     fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_path() {
