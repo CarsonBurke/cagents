@@ -2517,6 +2517,12 @@ mod tests {
             bytes.len() < 4096,
             "the small fixture contains compressed metadata"
         );
+        let mut chunk = 8; // Skip the PNG signature, then follow chunk lengths.
+        while &bytes[chunk + 4..chunk + 8] != b"IDAT" {
+            let length = u32::from_be_bytes(bytes[chunk..chunk + 4].try_into().unwrap()) as usize;
+            chunk += length + 12;
+        }
+        let truncated_metadata = bytes[..chunk].to_vec();
         let budget = Budget::new(bytes.len(), 4);
         for remaining in [0, 16] {
             let busy = budget
@@ -2532,12 +2538,25 @@ mod tests {
                 Loaded::Deferred(pressure)
                     if !pressure.retained && pressure.permits as usize <= DECODE_BUDGET
             ));
+            // Without admission, even malformed metadata must wait rather
+            // than constructing a decoder merely to reject its missing IDAT.
+            assert!(matches!(
+                bounded_handle(truncated_metadata.clone(), &budget),
+                Loaded::Deferred(_)
+            ));
             assert_eq!(budget.encoded.available_permits(), bytes.len());
             assert_eq!(budget.pixels.available_permits(), 4);
             assert_eq!(budget.decode.available_permits(), remaining);
             drop(busy);
             assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
         }
+        assert!(matches!(
+            bounded_handle(truncated_metadata, &budget),
+            Loaded::Unavailable
+        ));
+        assert_eq!(budget.encoded.available_permits(), bytes.len());
+        assert_eq!(budget.decode.available_permits(), DECODE_BUDGET);
+        assert_eq!(budget.pixels.available_permits(), 4);
         let Loaded::Ready(handle) = bounded_handle(bytes.clone(), &budget) else {
             panic!("the admitted tiny image with metadata must still decode");
         };
@@ -2560,11 +2579,6 @@ mod tests {
 
         // Corrupt the IDAT stream after its metadata. Construction is admitted
         // and the later decode error must release every transient/retained lease.
-        let mut chunk = 8; // Skip the PNG signature, then follow chunk lengths.
-        while &bytes[chunk + 4..chunk + 8] != b"IDAT" {
-            let length = u32::from_be_bytes(bytes[chunk..chunk + 4].try_into().unwrap()) as usize;
-            chunk += length + 12;
-        }
         let mut damaged = bytes.clone();
         damaged[chunk + 8] ^= 0xff;
         assert!(matches!(
