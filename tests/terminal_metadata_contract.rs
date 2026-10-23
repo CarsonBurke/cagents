@@ -46,7 +46,6 @@ fn hosted_bell_storm_preserves_attention_input_and_completion() {
     let log = directory.path().join("daemon.log");
     let mut daemon = PrivateDaemon(
         Command::new(env!("CARGO_BIN_EXE_cagentsd"))
-            .env_remove("CAGENTS_AGENT_AUTHORITY")
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", directory.path().join("state"))
