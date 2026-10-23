@@ -714,9 +714,11 @@ impl State {
             .padding(space::S)
             .width(Length::Fill)
             .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
+        crate::ui_controls::owned(
+            card.clone(),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::Menu(Some(card))),
+        )
     }
 
     /// A list row: the same facts as a card, on one line where they fit.
@@ -790,9 +792,11 @@ impl State {
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
             .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
-            .into()
+        crate::ui_controls::owned(
+            card.clone(),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::Menu(Some(card))),
+        )
     }
 
     /// The pills that say what is true of a card now.
@@ -1447,6 +1451,264 @@ mod tests {
         // A card that comes back does not reopen its menu.
         watched(&mut state, 4, board(vec![item("feat/board", "cagents")]));
         assert_eq!(state.menu, None);
+    }
+
+    // Keep the actual UserInterface cache across accepted watch updates. A
+    // new Tree for each click cannot expose a held press moving with a slot.
+    fn cached_work_ui<'a>(
+        state: &'a State,
+        cache: iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+        let element = match state.layout {
+            Layout::Board => state.board_view(1600.0),
+            Layout::List => state.list_view(),
+        };
+        let mut ui = iced::runtime::UserInterface::build(
+            element,
+            iced::Size::new(1600.0, 900.0),
+            cache,
+            renderer,
+        );
+        draw_work_ui(&mut ui, renderer);
+        ui
+    }
+
+    fn draw_work_ui(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+    ) {
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn first_open_bounds(
+        ui: &iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        label: &str,
+    ) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let mut bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| node.node().label() == Some(label))
+            .map(|node| {
+                let b = node.node().bounds().unwrap();
+                iced::Rectangle {
+                    x: b.x0 as f32,
+                    y: b.y0 as f32,
+                    width: (b.x1 - b.x0) as f32,
+                    height: (b.y1 - b.y0) as f32,
+                }
+            })
+            .collect::<Vec<_>>();
+        bounds.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        let bounds = *bounds
+            .first()
+            .unwrap_or_else(|| panic!("missing actual card button {label}"));
+        assert!(
+            bounds.width > 0.0 && bounds.height > 0.0,
+            "{label}: {bounds:?}"
+        );
+        bounds
+    }
+
+    fn retained_work_events(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+        buttons: &[iced::mouse::Event],
+    ) -> Vec<Action> {
+        let events = std::iter::once(iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        }))
+        .chain(buttons.iter().cloned().map(iced::Event::Mouse))
+        .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        draw_work_ui(ui, renderer);
+        messages
+    }
+
+    fn native_work_item(branch: &str, project: &str) -> Item {
+        let mut value = item(branch, project);
+        value.worktree = Some(crate::work::Worktree {
+            path: PathBuf::from(format!("/fixture/{project}/{branch}")),
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        value
+    }
+
+    fn assert_native_open(state: &mut State, messages: Vec<Action>, expected: &Item) {
+        assert!(
+            matches!(messages.as_slice(), [Action::Open(card)] if card == &CardRef::of(expected)),
+            "expected current card, received {messages:?}"
+        );
+        let effect = state.update(messages.into_iter().next().unwrap());
+        assert!(
+            matches!(effect, Some(Effect::OpenWorktree{project,path}) if project == expected.project && path == expected.worktree.as_ref().unwrap().path)
+        );
+        // Inspect the reducer effect only; never open a real project or terminal.
+    }
+
+    #[test]
+    fn reordered_board_and_list_cards_cannot_adopt_another_cards_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let a = native_work_item("branch-a", "workspace");
+            let b = native_work_item("branch-b", "workspace");
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open branch-a").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b.clone(), a]));
+            assert_eq!(state.visible().next().unwrap().key, b.key);
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(
+                first_open_bounds(&ui, "Open branch-b").contains(point),
+                "replacement must occupy the held hit area in {layout:?}"
+            );
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(
+                release.is_empty(),
+                "held A must not open B in {layout:?}: {release:?}"
+            );
+            let fresh = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            drop(ui);
+            assert_native_open(&mut state, fresh, &b);
+        }
+    }
+
+    #[test]
+    fn stable_board_and_list_card_identity_keeps_its_native_press_on_refresh() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let a = native_work_item("branch-a", "workspace");
+            let b = native_work_item("branch-b", "workspace");
+            let mut refreshed = a.clone();
+            refreshed.comparison.as_mut().unwrap().ahead = 2;
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open branch-a").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![refreshed.clone(), b]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(first_open_bounds(&ui, "Open branch-a").contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            drop(ui);
+            assert_native_open(&mut state, release, &refreshed);
+        }
+    }
+
+    #[test]
+    fn equal_work_labels_in_different_projects_do_not_share_a_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for layout in [Layout::Board, Layout::List] {
+            let mut a = native_work_item("shared", "project-a");
+            let mut b = native_work_item("shared", "project-b");
+            a.project_name = "Same name".into();
+            b.project_name = a.project_name.clone();
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.label(), b.label());
+            assert_ne!(CardRef::of(&a), CardRef::of(&b));
+            let mut state = State::default();
+            state.update(Action::Layout(layout));
+            watched(&mut state, 1, board(vec![a.clone(), b.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached_work_ui(&state, Cache::new(), &mut renderer);
+            let point = first_open_bounds(&ui, "Open shared").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            watched(&mut state, 2, board(vec![b.clone(), a]));
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            assert!(first_open_bounds(&ui, "Open shared").contains(point));
+            let release = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(
+                release.is_empty(),
+                "same labels must not transfer A's press to B in {layout:?}: {release:?}"
+            );
+            let fresh = retained_work_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            drop(ui);
+            assert_native_open(&mut state, fresh, &b);
+        }
     }
 
     #[test]
