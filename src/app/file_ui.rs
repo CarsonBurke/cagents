@@ -36,16 +36,33 @@ impl Cagents {
                     .or(self.active_workspace.as_deref())
                     .map(|directory| directory.join(".link"))
             });
+        self.open_document_link_from(source, document.as_deref(), target)
+    }
+
+    /// A chat renderer captures its own origin before dispatching a click.
+    /// A child with no verified cwd must not borrow its parent's directory.
+    pub(super) fn open_document_link_from(
+        &mut self,
+        source: Option<CardId>,
+        document: Option<&Path>,
+        target: &str,
+    ) -> Task<Message> {
+        if source.is_some_and(|card| self.workspace.card(card).is_none()) {
+            return Task::none();
+        }
         // Chat paths use the conversation's working directory; document
         // paths use the open file's directory. Explicit file URLs work in both.
         let (target, position) = document_link::file_position(target);
         let resolved = if document.is_none()
+            && !Path::new(target).is_absolute()
             && !Url::parse(target)
                 .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
         {
-            Err("This link needs an absolute HTTP, HTTPS, or local file URL".into())
+            Err(format!(
+                "Cannot open {target:?}: this source has no verified working directory. Ask for an absolute file link."
+            ))
         } else {
-            document_link::resolve(document.as_deref().unwrap_or(Path::new("/")), target)
+            document_link::resolve(document.unwrap_or(Path::new("/")), target)
         };
         match resolved {
             Ok(DocumentLink::Local { path, fragment }) => {
@@ -335,6 +352,151 @@ mod tests {
             panic!("expected editor")
         };
         runtime
+    }
+
+    #[tokio::test]
+    async fn missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error() {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::file_ui::tests::missing_known_source_directory_retargets_the_file_pane_to_a_contextual_error",
+        ) {
+            return;
+        }
+        let mut app = app();
+        crate::worktree_cleanup::prepare_standalone_editor_protection();
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([217, 0, 217, 255]))
+            .save(&old)
+            .unwrap();
+        let task = app.open_document_link(None, old.to_str().unwrap());
+        settle(&mut app, task).await;
+        let card = app.workspace.focused().unwrap();
+        assert_eq!(
+            runtime(&app, card).inspector_context().document,
+            "Image preview"
+        );
+        assert_eq!(app.card_state(card).unwrap().title, "old.png");
+        let before = app.workspace.order().count();
+
+        // A known but unavailable source directory is different from an
+        // unverified child cwd: resolve the former exactly, then show its own
+        // failure. Neither route may borrow another repository's image.
+        let missing = directory.path().join("retired-history");
+        assert!(!missing.exists());
+        let document = missing.join(".chat");
+        let task = app.open_document_link_from(Some(card), Some(&document), "./image.png");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.workspace.order().count(), before);
+        assert_eq!(app.card_state(card).unwrap().title, "image.png");
+        let runtime = runtime(&app, card);
+        assert_eq!(runtime.descriptor.worktree, missing);
+        assert_eq!(runtime.selected_path(), Some(Path::new("image.png")));
+        let context = runtime.inspector_context();
+        assert_eq!(context.document, "Unavailable");
+        let error = context.document_error.expect("explicit-file error");
+        assert!(error.contains(&missing.join("image.png").display().to_string()));
+        assert!(error.contains("on this device"));
+        assert!(error.contains("os error 2"));
+        assert!(runtime.editor_text().is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_image_links_keep_the_rendered_worktree_after_project_and_launch_changes() {
+        use super::super::chat_ui::{Action, Target};
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktree = repository.join(".worktrees/review");
+        let selected = directory.path().join("other-project");
+        std::fs::create_dir_all(worktree.join("docs/screens")).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        for path in [
+            worktree.join("image.png"),
+            worktree.join("docs/screens/image.png"),
+            worktree.parent().unwrap().join("parent.png"),
+            worktree.join("docs/screens/été 界 #1%25.png"),
+            worktree.join("docs/screens/literal * {one,two}.png"),
+        ] {
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([7, 23, 42, 255]))
+                .save(path)
+                .unwrap();
+        }
+        for (link, expected) in [
+            ("./image.png", worktree.join("image.png")),
+            (
+                "docs/screens/image.png",
+                worktree.join("docs/screens/image.png"),
+            ),
+            (
+                "../parent.png",
+                worktree.parent().unwrap().join("parent.png"),
+            ),
+            (
+                "docs/screens/été%20界%20%231%2525.png",
+                worktree.join("docs/screens/été 界 #1%25.png"),
+            ),
+            (
+                "docs/screens/literal%20*%20%7Bone,two%7D.png",
+                worktree.join("docs/screens/literal * {one,two}.png"),
+            ),
+        ] {
+            let mut app = app();
+            drop(app.new_native_chat(crate::agent::Provider::Codex, Some(worktree.clone())));
+            let source = app.workspace.focused().unwrap();
+            let target: Target = match app.cards.get_mut(&source).unwrap() {
+                CardRuntime::Chat(runtime) => {
+                    // Simulate a later selection/launch change after rendering.
+                    runtime.session.launch.recipe.working_directory = selected.clone();
+                    runtime.target
+                }
+                _ => panic!("draft chat"),
+            };
+            app.active_workspace = Some(selected.clone());
+            let click = Action::OpenDocumentFrom(target, Some(worktree.join(".chat")), link.into());
+            let task = app.handle_chat_ui(click);
+            settle(&mut app, task).await;
+            let file = runtime(&app, app.workspace.focused().unwrap());
+            assert_eq!(
+                file.descriptor.worktree.join(file.selected_path().unwrap()),
+                expected
+            );
+            assert_eq!(
+                image::open(expected).unwrap().width(),
+                2,
+                "real PNG fixture"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_child_directory_refuses_relative_links_without_reading_parent_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("image.png"),
+            "parent's unrelated file",
+        )
+        .unwrap();
+        let mut app = app();
+        let source = app.workspace.focused().unwrap();
+        let before = app.workspace.cards().len();
+        let task = app.open_document_link_from(Some(source), None, "image.png");
+        settle(&mut app, task).await;
+        assert_eq!(app.workspace.cards().len(), before);
+        assert_eq!(app.workspace.focused(), Some(source));
+        assert!(app.status.as_ref().is_some_and(|notice| {
+            notice.message.contains("image.png")
+                && notice.message.contains("verified working directory")
+        }));
+        let absolute = directory.path().join("absolute.txt");
+        std::fs::write(&absolute, "explicit child artifact").unwrap();
+        let task = app.open_document_link_from(Some(source), None, absolute.to_str().unwrap());
+        settle(&mut app, task).await;
+        assert_eq!(
+            runtime(&app, app.workspace.focused().unwrap())
+                .editor_text()
+                .as_deref(),
+            Some("explicit child artifact")
+        );
     }
 
     #[tokio::test]
