@@ -275,7 +275,7 @@ impl Cagents {
                             result,
                         }
                     },
-                    message,
+                    |action| cosmic::Action::App(message(action)),
                 )
             }
             Action::Close(_) => {
@@ -382,7 +382,7 @@ impl Cagents {
                             .unwrap_or(Err(Failure::CheckUnavailable));
                         Action::Finished { sequence, result }
                     },
-                    message,
+                    |action| cosmic::Action::App(message(action)),
                 )
             }
             input => {
