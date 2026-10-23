@@ -15,6 +15,7 @@ pub mod schedule;
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
+pub const MAX_LIFECYCLE_EVENTS: usize = 256;
 pub const MAX_CONCURRENT_PRECHECKS: usize = 4;
 pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;
@@ -91,6 +92,12 @@ pub enum Request {
         revision: u64,
         approved: bool,
     },
+    /// Read bounded lifecycle receipts, independently of provider outcomes.
+    Audit {
+        id: Uuid,
+        before: Option<u64>,
+        limit: usize,
+    },
 }
 
 impl Request {
@@ -100,6 +107,7 @@ impl Request {
             Self::List { .. }
                 | Self::Show { .. }
                 | Self::History { .. }
+                | Self::Audit { .. }
                 | Self::ShowFiring { .. }
                 | Self::ShowRun { .. }
                 | Self::Propose { .. }
@@ -119,6 +127,105 @@ pub enum Response {
     CancellationRequested,
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
+    Audit(LifecyclePage),
+}
+
+/// Actor classes describe the admitted operation, never a guessed person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleActor {
+    UserManagement,
+    System,
+}
+
+impl LifecycleActor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UserManagement => "User management",
+            Self::System => "System",
+        }
+    }
+}
+
+/// Fixed causes exclude prompt bodies, launch environment and provider diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleCause {
+    Created,
+    Edited,
+    Enabled,
+    Disabled,
+    Removed,
+    ProjectClosed,
+    StartPaused,
+    PrecheckInterrupted,
+    PrecheckRecovered,
+    PrecheckPaused,
+    ProjectUnavailable,
+    ReleaseBlocked,
+    RunInterrupted,
+    ReleaseRecovered,
+}
+
+impl LifecycleCause {
+    pub fn actor(self) -> LifecycleActor {
+        match self {
+            Self::Created | Self::Edited | Self::Enabled | Self::Disabled | Self::Removed => {
+                LifecycleActor::UserManagement
+            }
+            Self::ProjectClosed
+            | Self::StartPaused
+            | Self::PrecheckInterrupted
+            | Self::PrecheckRecovered
+            | Self::PrecheckPaused
+            | Self::ProjectUnavailable
+            | Self::ReleaseBlocked
+            | Self::RunInterrupted
+            | Self::ReleaseRecovered => LifecycleActor::System,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Edited => "Definition edited",
+            Self::Enabled => "Enabled",
+            Self::Disabled => "Disabled",
+            Self::Removed => "Removed",
+            Self::ProjectClosed => "Project closed",
+            Self::StartPaused => "Paused before launch",
+            Self::PrecheckInterrupted => "Precheck interrupted",
+            Self::PrecheckRecovered => "Precheck cleanup recovered",
+            Self::PrecheckPaused => "Paused after precheck",
+            Self::ProjectUnavailable => "Paused because project is unavailable",
+            Self::ReleaseBlocked => "Session cleanup blocked",
+            Self::RunInterrupted => "Run interrupted",
+            Self::ReleaseRecovered => "Session cleanup recovered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub sequence: u64,
+    pub automation: Uuid,
+    pub revision: u64,
+    pub occurred_ms: u64,
+    pub cause: LifecycleCause,
+    pub actor: LifecycleActor,
+    pub enabled: bool,
+    pub blocked: bool,
+    pub firing: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecyclePage {
+    pub events: Vec<LifecycleEvent>,
+    /// Continue before this monotonic receipt sequence, independent of wall time.
+    pub next: Option<u64>,
+    /// Earlier events were never recorded or have left the bounded retention.
+    /// Their actor and cause cannot be reconstructed from current state.
+    pub earlier_events_unavailable: bool,
 }
 
 /// A saved execution configuration, separate from active scheduler records.
@@ -448,6 +555,43 @@ mod tests {
         assert_eq!(
             postcard::from_bytes::<(Schedule, Trigger)>(&bytes).unwrap(),
             (schedule, trigger)
+        );
+    }
+
+    #[test]
+    fn lifecycle_audit_roundtrips_nonempty_receipts_and_cursor_on_shared_wire() {
+        let id = Uuid::new_v4();
+        let request = Request::Audit {
+            id,
+            before: Some(42),
+            limit: 37,
+        };
+        assert_eq!(
+            postcard::from_bytes::<Request>(&postcard::to_allocvec(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Response::Audit(LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 41,
+                automation: id,
+                revision: 7,
+                occurred_ms: 100,
+                cause: LifecycleCause::ReleaseBlocked,
+                actor: LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: Some(Uuid::new_v4()),
+            }],
+            next: Some(41),
+            earlier_events_unavailable: true,
+        });
+        assert_eq!(
+            postcard::from_bytes::<Response>(&postcard::to_allocvec(&response).unwrap()).unwrap(),
+            response
+        );
+        assert_eq!(
+            serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(),
+            response
         );
     }
 
