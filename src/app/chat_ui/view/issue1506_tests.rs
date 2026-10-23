@@ -509,6 +509,90 @@ fn manually_expanded_details_survive_find_query_changes_and_close_without_new_pu
 }
 
 #[test]
+fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked() {
+    let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.subagents = vec![child("only-worker", ToolStatus::Running, false)];
+    let mut publish = |snapshot: &mut chat::Snapshot| {
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        runtime.conversation_status(false)
+    };
+    assert_eq!(
+        publish(&mut snapshot),
+        (Some(Icon::AgentWorking), "Subagents working".into())
+    );
+
+    snapshot.waiting = true;
+    let parent_and_child = (
+        Some(Icon::AgentWorking),
+        "Waiting for you · 1 working".to_owned(),
+    );
+    assert_eq!(publish(&mut snapshot), parent_and_child);
+    snapshot.detail = "Background command completed".into();
+    assert_eq!(publish(&mut snapshot), parent_and_child);
+
+    // A provider question can be present without setting the parent scalar.
+    snapshot.waiting = false;
+    snapshot.requests.push(chat::Request {
+        kind: chat::RequestKind::Question,
+        id: "parent-question".into(),
+        title: "Choose the next step".into(),
+        description: "The child is independently still working".into(),
+        fields: Vec::new(),
+        actions: Vec::new(),
+    });
+    assert_eq!(publish(&mut snapshot), parent_and_child);
+
+    snapshot.error = Some(quota("1:30pm", "single-child-parent"));
+    assert_eq!(
+        publish(&mut snapshot),
+        (
+            Some(Icon::AgentWorking),
+            "Account limit reached · 1 working".into(),
+        )
+    );
+    snapshot.subagents[0].waiting = true;
+    assert_eq!(
+        publish(&mut snapshot),
+        (
+            Some(Icon::Warning),
+            "Account limit reached · 1 waiting".into(),
+        )
+    );
+    snapshot.subagents[0].status = ToolStatus::Succeeded;
+    snapshot.subagents[0].waiting = false;
+    assert_eq!(
+        publish(&mut snapshot),
+        (Some(Icon::Warning), "Account limit reached".into())
+    );
+    snapshot.error = None;
+    for status in [
+        ToolStatus::Succeeded,
+        ToolStatus::Failed,
+        ToolStatus::Stopped,
+    ] {
+        snapshot.subagents[0].status = status;
+        assert_eq!(
+            publish(&mut snapshot),
+            (Some(Icon::AgentWaiting), "Waiting for you".into())
+        );
+    }
+    snapshot.subagents[0].status = ToolStatus::Running;
+    snapshot.subagents[0].waiting = true;
+    assert_eq!(
+        publish(&mut snapshot),
+        (Some(Icon::AgentWaiting), "Waiting for you".into())
+    );
+    snapshot.requests.clear();
+    assert_eq!(
+        publish(&mut snapshot),
+        (Some(Icon::AgentWaiting), "Subagents waiting".into())
+    );
+}
+
+#[test]
 fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_parent_failure() {
     let (mut runtime, handle) = frame_cost::live_runtime(&[]);
     let mut snapshot = runtime.snapshot.as_ref().clone();

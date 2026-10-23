@@ -1141,7 +1141,10 @@ impl Runtime {
         {
             parts.push(Self::short_description(label, 72));
         }
-        if failure_label.is_some() || snapshot.subagents.len() > 1 {
+        if failure_label.is_some()
+            || snapshot.subagents.len() > 1
+            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
+        {
             if working > 0 {
                 parts.push(format!("{working} working"));
             }
