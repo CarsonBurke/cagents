@@ -129,14 +129,106 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
     };
     use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
 
-    // Use the complete App view and its real UI cache, with no pointer hover.
+    const DRAFT: &str = "Unsent Codex draft must survive the inspector action";
+
+    // Use the complete App view, mounted focused chat and its real UI cache,
+    // with no pointer hover. No provider/daemon task is polled in this fixture.
     // The event uses Winit's numeric conversion of the CURRENT emitted node;
     // an AT-SPI global object-path number is not a local AccessKit node ID.
-    fn frame(app: &Cagents, cache: Cache, click: bool) -> (Cache, NodeId, Vec<Message>) {
+    fn frame(
+        app: &Cagents,
+        cache: Cache,
+        click: bool,
+        chat: CardId,
+        original_draft: &str,
+    ) -> (Cache, NodeId, Vec<Message>) {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+
+        struct ComposerFocus {
+            id: widget::Id,
+            found: usize,
+            focused: bool,
+        }
+        impl Operation for ComposerFocus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _bounds: cosmic::iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    self.found += 1;
+                    self.focused = state.is_focused();
+                }
+            }
+        }
+
+        assert_eq!(app.workspace.focused(), Some(chat));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&chat) else {
+            panic!("the focused center pane must be a mounted chat");
+        };
+        assert_eq!(
+            runtime.session.launch.provider,
+            crate::agent::Provider::Codex
+        );
+        assert_eq!(runtime.unsent_text(), original_draft);
+        assert!(!app.chat_start_pending(chat));
         let mut renderer = crate::app::tests::headless_renderer();
         let mut ui =
             UserInterface::build(app.view(), Size::new(1280.0, 900.0), cache, &mut renderer);
+        let composer_id = card_control_id(chat, "chat-composer");
+        if !click {
+            // Install native widget focus once; later cached rebuilds must
+            // preserve it without re-focusing or bypassing the mounted pane.
+            ui.operate(
+                &renderer,
+                &mut operation::focusable::focus::<()>(composer_id.clone()),
+            );
+        }
+        let mut focus = ComposerFocus {
+            id: composer_id,
+            found: 0,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        assert_eq!(focus.found, 1, "one real mounted composer focus owner");
+        assert!(focus.focused, "the real composer owns keyboard focus");
         let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let composers = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| node.node().role() == Role::MultilineTextInput)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            composers.len(),
+            1,
+            "the chat composer is exported by App.view"
+        );
+        assert!(!composers[0].node().is_disabled());
+        let composer_bounds = composers[0]
+            .node()
+            .bounds()
+            .expect("mounted composer geometry");
+        assert!(composer_bounds.x0 >= 0.0 && composer_bounds.x1 <= 1280.0);
+        assert!(composer_bounds.y0 >= 0.0 && composer_bounds.y1 <= 900.0);
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| {
+                    node.node().role() == Role::TextRun
+                        && node
+                            .node()
+                            .value()
+                            .is_some_and(|value| value.trim_end() == DRAFT)
+                }),
+            "the actual composer exports its unchanged nonempty draft"
+        );
         let buttons = accessible
             .root()
             .iter()
@@ -152,6 +244,11 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
         assert!(bounds.x0 >= 0.0 && bounds.x1 <= 1280.0);
         assert!(bounds.y0 >= 0.0 && bounds.y1 <= 900.0);
         let target_node = NodeId::from(buttons[0].id().clone());
+        assert_ne!(target_node, NodeId::from(composers[0].id().clone()));
+        assert!(
+            composer_bounds.x1 <= bounds.x0,
+            "the focused composer is left of the inspector control"
+        );
         let mut emitted = Vec::new();
         if click {
             let event = Event::A11y(
@@ -171,6 +268,14 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
                 &mut emitted,
             );
             assert_eq!(statuses, vec![cosmic::iced::event::Status::Captured]);
+            focus.found = 0;
+            focus.focused = false;
+            ui.operate(&renderer, &mut focus);
+            assert_eq!(focus.found, 1);
+            assert!(
+                focus.focused,
+                "a foreign AX Click must not take composer focus"
+            );
         }
         (ui.into_cache(), target_node, emitted)
     }
@@ -259,6 +364,59 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
             worktree: root.clone()
         }
     ));
+    // Model the native failure's nonempty center pane through the existing
+    // public App insertion/Ready path. The asynchronous start task is dropped,
+    // and Ready uses the existing in-process ClientHandle socket fixture.
+    app.workspace.resize_viewport(540.0);
+    let session = crate::chat::Session {
+        id: crate::model::TerminalId::new(),
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: root.clone(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: Some("a11y-mounted-codex-thread".into()),
+        },
+        proof: None,
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+    };
+    drop(app.insert_chat_card(session, None, None));
+    let chat = app.workspace.focused().expect("inserted chat is focused");
+    assert!(app.chat_start_pending(chat));
+    let ready = crate::app::chat_ui::ready_message_for_pending_switch(
+        &app,
+        chat,
+        crate::chat::Snapshot {
+            ready: true,
+            session_id: Some("a11y-mounted-codex-thread".into()),
+            ..crate::chat::Snapshot::default()
+        },
+    );
+    drop(app.update(ready));
+    assert!(!app.chat_start_pending(chat));
+    let target = match app.cards.get(&chat).expect("ready chat runtime") {
+        CardRuntime::Chat(runtime) => runtime.target,
+        _ => panic!("Ready must install the actual chat runtime"),
+    };
+    drop(
+        app.update(Message::ChatUi(crate::app::chat_ui::Action::Composer(
+            target,
+            cosmic::widget::text_editor::Action::Edit(cosmic::widget::text_editor::Edit::Paste(
+                Arc::new(DRAFT.to_owned()),
+            )),
+        ))),
+    );
+    let original_draft = match app.cards.get(&chat).expect("typed chat runtime") {
+        CardRuntime::Chat(runtime) => runtime.unsent_text(),
+        _ => unreachable!(),
+    };
+    assert_eq!(original_draft.trim_end(), DRAFT);
     app.context_tab = ContextTab::Changes;
     let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
     assert!(matches!(
@@ -285,7 +443,7 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
             .len(),
         1
     );
-    let (cache, first_id, empty) = frame(&app, Cache::new(), false);
+    let (cache, first_id, empty) = frame(&app, Cache::new(), false, chat, &original_draft);
     assert!(empty.is_empty());
     // Periodic Git refresh uses this same real worker/completion boundary.
     // A refresh of the same binding must not retire the rendered actor.
@@ -296,7 +454,7 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
     );
     drop(app.update(loaded));
     assert_eq!(app.discard_ui.source().unwrap().id, original);
-    let (cache, rebuilt_id, emitted) = frame(&app, cache, true);
+    let (cache, rebuilt_id, emitted) = frame(&app, cache, true, chat, &original_draft);
     assert_eq!(
         rebuilt_id, first_id,
         "the cached current button retains its native target"
@@ -320,7 +478,7 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
     assert!(app.sidebar_state.pending_discard().is_none());
     assert_eq!(app.discard_ui.source().unwrap().id, current);
 
-    let (_, _, emitted) = frame(&app, cache, true);
+    let (_, _, emitted) = frame(&app, cache, true, chat, &original_draft);
     let current_message = discard_message(&mut app, emitted, current, &key);
     drop(app.update(current_message));
     assert!(app.modal_is_open());
@@ -406,6 +564,12 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
         (untracked_identity.dev(), untracked_identity.ino())
     );
     assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+    assert_eq!(app.workspace.focused(), Some(chat));
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&chat) else {
+        panic!("confirmation must retain the same center chat");
+    };
+    assert_eq!(runtime.target, target);
+    assert_eq!(runtime.unsent_text(), original_draft);
 }
 
 #[test]
