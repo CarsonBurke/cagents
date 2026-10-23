@@ -5,7 +5,7 @@
 
 use crate::{
     atspi::{ObjectId, interfaces::*},
-    context::get_or_init_app_context,
+    context::{REQUEST_TIMEOUT, get_or_init_app_context},
     executor::{Executor, Task},
 };
 use accesskit_atspi_common::{
@@ -41,6 +41,7 @@ impl Bus {
         };
         let address: Address = address.as_str().try_into()?;
         let conn = Builder::address(address)?
+            .method_timeout(REQUEST_TIMEOUT)
             .internal_executor(false)
             .build()
             .await?;
@@ -61,6 +62,15 @@ impl Bus {
         };
         bus.register_root_node().await?;
         Ok(bus)
+    }
+
+    /// Resolves once the connection to the AT-SPI bus is closed.
+    pub(crate) async fn closed(&self) {
+        self.conn.closed().await
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.conn.is_closed()
     }
 
     fn unique_name(&self) -> &OwnedUniqueName {
