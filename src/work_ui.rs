@@ -5,7 +5,11 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use cosmic::{
     Element, Theme,
@@ -53,6 +57,31 @@ impl CardRef {
     }
 }
 
+/// Local callback ownership, not a backend ordering or mutation permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinTicket {
+    lifetime: uuid::Uuid,
+    operation: uuid::Uuid,
+    card: CardRef,
+}
+
+#[derive(Debug)]
+struct Pins {
+    lifetime: uuid::Uuid,
+    latest: HashMap<CardRef, uuid::Uuid>,
+    error: Option<String>,
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Self {
+            lifetime: uuid::Uuid::new_v4(),
+            latest: HashMap::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
     /// Columns of cards, one per [`Column`].
@@ -94,7 +123,10 @@ pub enum Action {
     Menu(Option<CardRef>),
     /// Pins a card to a column, or unpins it with `None`.
     Pin(CardRef, Option<Column>),
-    Pinned(Result<(), String>),
+    Pinned {
+        ticket: PinTicket,
+        result: Result<(), String>,
+    },
 }
 
 impl Action {
@@ -103,7 +135,7 @@ impl Action {
     pub fn background(&self) -> bool {
         matches!(
             self,
-            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned(_)
+            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned { .. }
         )
     }
 }
@@ -206,6 +238,7 @@ impl Activation {
 pub enum Effect {
     Refresh,
     Pin {
+        ticket: PinTicket,
         project: PathBuf,
         item: String,
         column: Option<Column>,
@@ -230,7 +263,7 @@ pub struct State {
     lifetime: ActivationLifetime,
     /// The board shown: the daemon's, with the pins not yet confirmed.
     board: Option<Arc<Board>>,
-    /// The daemon's last board, which a refused pin reverts to.
+    /// The daemon's last board, from which one unconfirmed pin is restored.
     confirmed: Option<Arc<Board>>,
     /// Each card's searchable text, lowercase, in board order.
     search: Vec<String>,
@@ -243,8 +276,9 @@ pub struct State {
     layout: Layout,
     menu: Option<CardRef>,
     refreshing: bool,
-    /// The last refresh or pin that failed.
+    /// The last refresh that failed, independent of pin feedback.
     error: Option<String>,
+    pins: Pins,
     now_unix_ms: u64,
 }
 
@@ -271,6 +305,23 @@ impl State {
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
+                    if first {
+                        // A new watch connection owns a fresh callback lifetime.
+                        // This neither cancels nor resends earlier server work.
+                        self.pins = Pins::default();
+                    }
+                    if !self.pins.latest.is_empty() {
+                        // A removed card can later reuse its branch key. Its
+                        // earlier request must not acquire that new lifetime.
+                        let present: HashSet<_> = board
+                            .items
+                            .iter()
+                            .map(|item| (&item.project, &item.key))
+                            .collect();
+                        self.pins
+                            .latest
+                            .retain(|card, _| present.contains(&(&card.project, &card.key)));
+                    }
                     self.revision = revision;
                     self.now_unix_ms = board.generated_at_unix_ms.max(now_unix_ms());
                     self.search = board.items.iter().map(search_text).collect();
@@ -296,6 +347,7 @@ impl State {
                 None
             }
             Action::Watched(Watch::Lost(error)) => {
+                self.pins = Pins::default();
                 self.lost = Some(error);
                 None
             }
@@ -352,18 +404,48 @@ impl State {
                 let stale_after_days = board.stale_after_days;
                 let item = board.items.iter_mut().find(|item| card.names(item))?;
                 crate::work::place(item, column, self.now_unix_ms, stale_after_days);
+                let ticket = PinTicket {
+                    lifetime: self.pins.lifetime,
+                    operation: uuid::Uuid::new_v4(),
+                    card: card.clone(),
+                };
+                self.pins.latest.insert(card.clone(), ticket.operation);
+                self.pins.error = None;
                 Some(Effect::Pin {
+                    ticket,
                     project: card.project,
                     item: card.key.storage_key(),
                     column,
                 })
             }
-            Action::Pinned(result) => {
-                // A pin the daemon took arrives with its next board; one it
-                // refused changed nothing there, so no board will undo it.
+            Action::Pinned { ticket, result } => {
+                if ticket.lifetime != self.pins.lifetime
+                    || self.pins.latest.get(&ticket.card) != Some(&ticket.operation)
+                {
+                    return None;
+                }
+                self.pins.latest.remove(&ticket.card);
                 if let Err(error) = result {
-                    self.board = self.confirmed.clone();
-                    self.error = Some(error);
+                    // Transport loss need not mean the daemon changed nothing.
+                    // Restore only this card's placement from the latest
+                    // observation, preserving other pending pins and new facts.
+                    let (column, derived, pinned) = self
+                        .confirmed
+                        .as_ref()?
+                        .items
+                        .iter()
+                        .find(|item| ticket.card.names(item))
+                        .map(|item| (item.column, item.derived, item.pinned))?;
+                    let board = Arc::make_mut(self.board.as_mut()?);
+                    let item = board
+                        .items
+                        .iter_mut()
+                        .find(|item| ticket.card.names(item))?;
+                    item.column = column;
+                    item.derived = derived;
+                    item.pinned = pinned;
+                    self.pins.error =
+                        Some(format!("Pin not confirmed for {}: {error}", item.label()));
                 }
                 None
             }
@@ -579,6 +661,9 @@ impl State {
             parts.push(warning(format!("Disconnected: {error}")));
         }
         if let Some(error) = &self.error {
+            parts.push(warning(error.clone()));
+        }
+        if let Some(error) = &self.pins.error {
             parts.push(warning(error.clone()));
         }
         let projects = board.projects.iter().filter(|project| {
@@ -1163,7 +1248,13 @@ impl State {
                     "Pin here"
                 };
                 items.push(crate::ui_controls::owned(
-                    (self.lifetime, card.clone(), Some(column), !current),
+                    (
+                        self.lifetime,
+                        self.pins.lifetime,
+                        card.clone(),
+                        Some(column),
+                        !current,
+                    ),
                     popover_item(
                         if current {
                             Icon::Check.handle()
@@ -1179,7 +1270,13 @@ impl State {
             }
             if item.pinned {
                 items.push(crate::ui_controls::owned(
-                    (self.lifetime, card.clone(), None::<Column>, true),
+                    (
+                        self.lifetime,
+                        self.pins.lifetime,
+                        card.clone(),
+                        None::<Column>,
+                        true,
+                    ),
                     popover_item(
                         Icon::Undo.handle(),
                         "Unpin",
@@ -1595,13 +1692,262 @@ mod tests {
         let mut state = State::default();
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));
         let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
-        state.update(Action::Pin(card.clone(), Some(Column::Stale)));
-        state.update(Action::Pinned(Err(
-            "the Work board store is unavailable".into()
-        )));
+        let ticket = pin(&mut state, &card, Some(Column::Stale));
+        state.update(Action::Pinned {
+            ticket,
+            result: Err("the Work board store is unavailable".into()),
+        });
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::InProgress, false));
-        assert!(state.error.is_some());
+        assert!(state.pins.error.is_some());
+    }
+
+    fn pin(state: &mut State, card: &CardRef, column: Option<Column>) -> PinTicket {
+        let Some(Effect::Pin {
+            ticket,
+            project,
+            item,
+            column: actual,
+        }) = state.update(Action::Pin(card.clone(), column))
+        else {
+            panic!("the current card must emit a pin request")
+        };
+        assert_eq!(project, card.project);
+        assert_eq!(item, card.key.storage_key());
+        assert_eq!(actual, column);
+        ticket
+    }
+
+    fn pin_board() -> (State, CardRef, CardRef) {
+        let a = item("first", "cagents");
+        let b = item("second", "cagents");
+        let cards = (CardRef::of(&a), CardRef::of(&b));
+        let mut state = State::default();
+        connected(&mut state, 1, board(vec![a, b]));
+        (state, cards.0, cards.1)
+    }
+
+    fn complete_pin(state: &mut State, ticket: PinTicket, result: Result<(), String>) {
+        let action = Action::Pinned { ticket, result };
+        assert!(
+            action.background(),
+            "a modal cannot strand an issued completion"
+        );
+        assert!(
+            state.update(action).is_none(),
+            "completion must not issue or retry a request"
+        );
+    }
+
+    #[test]
+    fn a_pin_failure_preserves_other_cards_even_when_their_success_arrives_first() {
+        for success_first in [false, true] {
+            let (mut state, a, b) = pin_board();
+            state.update(Action::Refreshed(Err("current refresh failure".into())));
+            let first = pin(&mut state, &a, Some(Column::Stale));
+            let second = pin(&mut state, &b, Some(Column::Active));
+            if success_first {
+                complete_pin(&mut state, second.clone(), Ok(()));
+            }
+            complete_pin(&mut state, first, Err("first pin unavailable".into()));
+            let shown_a = state.item(&a).unwrap();
+            assert_eq!(
+                (shown_a.column, shown_a.pinned),
+                (Column::InProgress, false)
+            );
+            let shown_b = state.item(&b).unwrap();
+            assert_eq!((shown_b.column, shown_b.pinned), (Column::Active, true));
+            if !success_first {
+                complete_pin(&mut state, second, Ok(()));
+            }
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.as_deref().unwrap().contains("first"));
+            assert_eq!(state.error.as_deref(), Some("current refresh failure"));
+            let next = pin(&mut state, &a, Some(Column::Landed));
+            assert!(
+                state.pins.error.is_none(),
+                "a new pin clears only old pin feedback"
+            );
+            assert_eq!(state.error.as_deref(), Some("current refresh failure"));
+            complete_pin(&mut state, next, Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_pin_failure_uses_current_placement_and_keeps_new_board_facts() {
+        let (mut state, a, b) = pin_board();
+        let first = pin(&mut state, &a, Some(Column::Stale));
+        let mut newer_a = item("first", "cagents");
+        newer_a.project_name = "Fresh project name".into();
+        newer_a.comparison.as_mut().unwrap().ahead = 9;
+        newer_a.column = Column::InReview;
+        newer_a.derived = Column::Active;
+        newer_a.pinned = true;
+        let authoritative = board(vec![newer_a.clone(), item("second", "cagents")]);
+        watched(&mut state, 2, authoritative.clone());
+        assert_eq!(
+            state.board.as_deref(),
+            Some(authoritative.as_ref()),
+            "watcher state wins without replaying old optimistic intent"
+        );
+        let second = pin(&mut state, &b, Some(Column::Landed));
+        complete_pin(&mut state, first, Err("response missing".into()));
+        assert_eq!(
+            state.item(&a),
+            Some(&newer_a),
+            "restore current placement without copying old facts"
+        );
+        assert_eq!(state.item(&b).unwrap().column, Column::Landed);
+        assert_eq!(state.confirmed.as_deref(), Some(authoritative.as_ref()));
+        let new_pin = pin(&mut state, &a, Some(Column::Stale));
+        assert_ne!(state.item(&a).unwrap().derived, newer_a.derived);
+        complete_pin(&mut state, new_pin, Err("new response missing".into()));
+        assert_eq!(
+            state.item(&a),
+            Some(&newer_a),
+            "all three placement fields return to the current observation"
+        );
+        complete_pin(&mut state, second, Err("second response missing".into()));
+        assert_eq!(state.board.as_deref(), Some(authoritative.as_ref()));
+    }
+
+    #[test]
+    fn old_pin_completions_do_not_cross_reset_loss_or_watch_connection_lifetimes() {
+        for boundary in ["reset", "lost", "reconnect"] {
+            let (mut state, a, b) = pin_board();
+            let old = pin(&mut state, &a, Some(Column::Stale));
+            match boundary {
+                "reset" => state.reset(),
+                "lost" => {
+                    state.update(Action::Watched(Watch::Lost("disconnected".into())));
+                }
+                "reconnect" => connected(
+                    &mut state,
+                    1,
+                    board(vec![item("first", "cagents"), item("second", "cagents")]),
+                ),
+                _ => unreachable!(),
+            }
+            complete_pin(&mut state, old.clone(), Err("old request failure".into()));
+            assert!(state.pins.error.is_none());
+            if boundary == "reset" {
+                assert!(
+                    state.board.is_none(),
+                    "completion cannot reopen the closed board"
+                );
+            }
+            if boundary != "reconnect" {
+                connected(
+                    &mut state,
+                    1,
+                    board(vec![item("first", "cagents"), item("second", "cagents")]),
+                );
+            }
+            state.update(Action::Refreshed(Err("new refresh failure".into())));
+            let current = pin(&mut state, &b, Some(Column::Active));
+            complete_pin(&mut state, old.clone(), Err("late old failure".into()));
+            complete_pin(&mut state, old, Ok(()));
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            assert_eq!(state.error.as_deref(), Some("new refresh failure"));
+            complete_pin(&mut state, current, Err("current request missing".into()));
+            assert!(
+                state
+                    .pins
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("current request missing"),
+                "the current lifetime still accepts its matching callback"
+            );
+            connected(
+                &mut state,
+                1,
+                board(vec![item("first", "cagents"), item("second", "cagents")]),
+            );
+            assert!(
+                state.pins.error.is_none(),
+                "new watch lifetime clears only pin feedback"
+            );
+            assert_eq!(state.error.as_deref(), Some("new refresh failure"));
+        }
+    }
+
+    #[test]
+    fn superseded_pin_completions_cannot_undo_or_retire_the_latest_same_card_request() {
+        for latest_succeeds in [false, true] {
+            let (mut state, a, _) = pin_board();
+            let old = pin(&mut state, &a, Some(Column::Stale));
+            let latest = pin(&mut state, &a, Some(Column::Active));
+            complete_pin(&mut state, old.clone(), Err("superseded failure".into()));
+            complete_pin(&mut state, old.clone(), Ok(()));
+            assert_eq!(state.item(&a).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            complete_pin(
+                &mut state,
+                latest,
+                if latest_succeeds {
+                    Ok(())
+                } else {
+                    Err("latest failure".into())
+                },
+            );
+            let expected = if latest_succeeds {
+                Column::Active
+            } else {
+                Column::InProgress
+            };
+            assert_eq!(state.item(&a).unwrap().column, expected);
+            let feedback = state.pins.error.clone();
+            complete_pin(
+                &mut state,
+                old,
+                Err("superseded failure after latest".into()),
+            );
+            assert_eq!(state.item(&a).unwrap().column, expected);
+            assert_eq!(state.pins.error, feedback);
+        }
+    }
+
+    #[test]
+    fn a_missing_pinned_card_is_not_resurrected_by_its_late_failure() {
+        for reappears in [false, true] {
+            let (mut state, a, b) = pin_board();
+            let removed = pin(&mut state, &a, Some(Column::Stale));
+            watched(&mut state, 2, board(vec![item("second", "cagents")]));
+            if reappears {
+                let mut replacement = item("first", "cagents");
+                replacement.head = Some(crate::work::Head {
+                    oid: "replacement-head".into(),
+                    committed_at_unix_ms: None,
+                });
+                watched(
+                    &mut state,
+                    3,
+                    board(vec![replacement, item("second", "cagents")]),
+                );
+            }
+            let before_a = state.item(&a).cloned();
+            let retained = pin(&mut state, &b, Some(Column::Active));
+            complete_pin(&mut state, removed, Err("removed card failure".into()));
+            assert_eq!(
+                state.item(&a),
+                before_a.as_ref(),
+                "no resurrection or adoption by a reappeared card"
+            );
+            assert_eq!(state.item(&b).unwrap().column, Column::Active);
+            assert!(state.pins.error.is_none());
+            complete_pin(&mut state, retained, Err("retained card failure".into()));
+            assert_eq!(state.item(&b).unwrap().column, Column::InProgress);
+            assert!(
+                state
+                    .pins
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("retained card failure")
+            );
+        }
     }
 
     #[test]
@@ -2387,64 +2733,101 @@ mod tests {
     #[test]
     fn inserted_menu_rows_cannot_transfer_a_native_pin_to_another_column() {
         use iced::mouse::{Button, Event};
-        let a = native_work_item("same-branch", "workspace");
-        let mut b = a.clone();
-        b.pull_request = Some(request(42));
-        let mut state = State::default();
-        state.update(Action::Layout(Layout::List));
-        watched(&mut state, 1, board(vec![a]));
-        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let cache = open_native_menu(&mut state, &mut renderer);
-        let mut ui = cached_work_ui(&state, cache, &mut renderer);
-        let point = popup_button_bounds(&mut ui, &renderer, "In review").center();
-        assert!(
-            retained_work_events(
+        for change in ["insert row", "reconnect", "lost", "metadata"] {
+            let a = native_work_item("same-branch", "workspace");
+            let mut b = a.clone();
+            if change == "insert row" {
+                b.pull_request = Some(request(42));
+            }
+            if change == "metadata" {
+                b.comparison.as_mut().unwrap().ahead += 1;
+            }
+            let mut state = State::default();
+            state.update(Action::Layout(Layout::List));
+            watched(&mut state, 1, board(vec![a]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let cache = open_native_menu(&mut state, &mut renderer);
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let point = popup_button_bounds(&mut ui, &renderer, "In review").center();
+            assert!(
+                retained_work_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)]
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let activation_lifetime = state.lifetime;
+            let pin_lifetime = state.pins.lifetime;
+            if change == "lost" {
+                state.update(Action::Watched(Watch::Lost("fixture watch lost".into())));
+            }
+            if change == "reconnect" {
+                connected(&mut state, 1, board(vec![b.clone()]));
+            } else {
+                watched(&mut state, 2, board(vec![b.clone()]));
+            }
+            assert_eq!(
+                state.lifetime, activation_lifetime,
+                "watch changes do not retire destination activations"
+            );
+            if matches!(change, "reconnect" | "lost") {
+                assert_ne!(state.pins.lifetime, pin_lifetime);
+            } else {
+                assert_eq!(state.pins.lifetime, pin_lifetime);
+            }
+            let mut ui = cached_work_ui(&state, cache, &mut renderer);
+            let replacement_column = if change == "insert row" {
+                Column::InProgress
+            } else {
+                Column::InReview
+            };
+            let replacement = popup_button_bounds(&mut ui, &renderer, replacement_column.label());
+            assert!(
+                replacement.contains(point),
+                "{change}: actual replacement must remain at oldpoint: {replacement:?} {point:?}"
+            );
+            let release = retained_work_events(
                 &mut ui,
                 &mut renderer,
                 point,
-                &[Event::ButtonPressed(Button::Left)]
-            )
-            .is_empty()
-        );
-        let cache = ui.into_cache();
-        watched(&mut state, 2, board(vec![b.clone()]));
-        let mut ui = cached_work_ui(&state, cache, &mut renderer);
-        let replacement = popup_button_bounds(&mut ui, &renderer, "In progress");
-        assert!(
-            replacement.contains(point),
-            "inserted PR must put the different actual pin button at oldpoint: {replacement:?} {point:?}"
-        );
-        let release = retained_work_events(
-            &mut ui,
-            &mut renderer,
-            point,
-            &[Event::ButtonReleased(Button::Left)],
-        );
-        assert!(
-            release.is_empty(),
-            "held InReview migrated to InProgress: {release:?}"
-        );
-        let fresh_replacement = click_work(&mut ui, &mut renderer, point);
-        assert!(
-            matches!(fresh_replacement.as_slice(), [Action::Pin(card, Some(Column::InProgress))] if card == &CardRef::of(&b)),
-            "{fresh_replacement:?}"
-        );
-        let intended = popup_button_bounds(&mut ui, &renderer, "In review").center();
-        let fresh = click_work(&mut ui, &mut renderer, intended);
-        drop(ui);
-        assert!(
-            matches!(fresh.as_slice(), [Action::Pin(card, Some(Column::InReview))] if card == &CardRef::of(&b)),
-            "{fresh:?}"
-        );
-        assert!(matches!(
-            state.update(fresh.into_iter().next().unwrap()),
-            Some(Effect::Pin {
-                column: Some(Column::InReview),
-                ..
-            })
-        ));
-        // The existing Pin callback/reducer is unchanged; no queued-Pin or
-        // server ordering/confirmation guarantee is introduced here.
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            if change == "metadata" {
+                assert!(
+                    matches!(release.as_slice(), [Action::Pin(card, Some(Column::InReview))] if card == &CardRef::of(&b)),
+                    "ordinary same-owner metadata Watch must keep held positive: {release:?}"
+                );
+            } else {
+                assert!(
+                    release.is_empty(),
+                    "{change}: retired pin native owner adopted press: {release:?}"
+                );
+            }
+            let fresh_replacement = click_work(&mut ui, &mut renderer, point);
+            assert!(
+                matches!(fresh_replacement.as_slice(), [Action::Pin(card, Some(column))] if card == &CardRef::of(&b) && *column == replacement_column),
+                "{fresh_replacement:?}"
+            );
+            let intended = popup_button_bounds(&mut ui, &renderer, "In review").center();
+            let fresh = click_work(&mut ui, &mut renderer, intended);
+            drop(ui);
+            assert!(
+                matches!(fresh.as_slice(), [Action::Pin(card, Some(Column::InReview))] if card == &CardRef::of(&b)),
+                "{fresh:?}"
+            );
+            assert!(matches!(
+                state.update(fresh.into_iter().next().unwrap()),
+                Some(Effect::Pin {
+                    column: Some(Column::InReview),
+                    ..
+                })
+            ));
+            // Existing Pin callbacks/reducer are unchanged. This checks local
+            // native ownership only, not queued Pin or server request ordering.
+        }
     }
 
     #[test]

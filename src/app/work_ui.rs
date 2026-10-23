@@ -38,12 +38,13 @@ impl Cagents {
                 |result| Action::Refreshed(result),
             ),
             Effect::Pin {
+                ticket,
                 project,
                 item,
                 column,
             } => control(
                 move |client| client.pin_work_card(project, item, column),
-                |result| Action::Pinned(result),
+                move |result| Action::Pinned { ticket, result },
             ),
             Effect::OpenWorktree { project, path } => {
                 let opened = self
