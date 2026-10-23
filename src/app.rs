@@ -11137,7 +11137,19 @@ impl Cagents {
                 {
                     // A shared session can retire after its last routing document
                     // closed. Refresh every attachment before resolving that identity.
-                    state.context.status = Some(self.lsp.status(doc));
+                    let status = self.lsp.status(doc);
+                    // Admission can retain a document without a backend (for
+                    // example at the session cap). Resource telemetry cannot
+                    // replace that actionable refusal with "not configured".
+                    let retained_refusal = matches!(status, LspStatus::Disabled)
+                        && matches!(
+                            state.context.status.as_ref(),
+                            Some(LspStatus::Unavailable { .. })
+                        )
+                        && self.lsp.document_version(doc).is_some();
+                    if !retained_refusal {
+                        state.context.status = Some(status);
+                    }
                 }
             }
         }
@@ -25978,6 +25990,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn resource_updates_clear_refusals_without_a_registered_document() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        let doc = LspDocumentId(1);
+        let state = lsp_state(&mut app, card);
+        state.document = Some(doc);
+        state.context.status = Some(LspStatus::Unavailable {
+            reason: "admission refused before document registration".into(),
+        });
+        app.lsp_documents.insert(doc, card);
+        assert_eq!(app.lsp.document_version(doc), None);
+        app.apply_lsp_event(LspEvent::Resources { doc });
+        assert_eq!(
+            app.lsp_context(card).unwrap().status,
+            Some(LspStatus::Disabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_updates_preserve_cap_refusal_and_retry_after_edit_and_holder_close() {
+        let (manager, holder) = crate::lsp::tests::progress_fixture().await;
+        let mut app = lsp_test_app();
+        app.lsp = manager.with_lifecycle(600, 1);
+        app.settings.language_servers = app.lsp.servers().to_vec();
+        app.settings.lsp_max_sessions = 1;
+        app.next_lsp_document = holder.doc.0 + 1;
+        let holder_card = repository_card(&mut app, "/holder");
+        lsp_state(&mut app, holder_card).document = Some(holder.doc);
+        app.lsp_documents.insert(holder.doc, holder_card);
+        assert!(app.lsp.event_is_current(&holder.ready));
+        app.apply_lsp_event(holder.ready.clone());
+        assert_eq!(
+            app.lsp_context(holder_card).unwrap().status,
+            Some(LspStatus::Ready)
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"cap-refused\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/main.rs"), "before\n").unwrap();
+        let card = repository_card(&mut app, root.to_str().unwrap());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        drop(runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: "src/main.rs".into(),
+        }));
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity: repository_widget::AsyncIdentity {
+                card,
+                worktree: root.to_owned(),
+                path: "src/main.rs".into(),
+                generation: 1,
+            },
+            result: crate::editor::load_file(
+                root,
+                Path::new("src/main.rs"),
+                crate::editor::PdfTone::Original,
+            ),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("before\n"));
+        drop(app.drain_lsp_intents(card));
+        let doc = app.lsp_document(card).unwrap();
+        let events = app.lsp.events();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                app.apply_lsp_event(events.recv().await.unwrap());
+                if matches!(
+                    app.lsp_context(card).unwrap().status,
+                    Some(LspStatus::Unavailable { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let refusal = app.lsp_context(card).unwrap().status.clone();
+        assert!(matches!(&refusal, Some(LspStatus::Unavailable { reason })
+            if reason.contains("limit (1) reached")));
+        assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
+        assert_eq!(app.lsp.document_version(doc), Some(1));
+        let restart_action = |app: &Cagents| {
+            inspector::with_lsp(
+                inspector::InspectorModel {
+                    card_id: card,
+                    title: "Refused editor".into(),
+                    kind: "Repository",
+                    sections: Vec::new(),
+                    actions: Vec::new(),
+                },
+                card,
+                app.lsp_context(card).unwrap(),
+            )
+            .actions
+            .into_iter()
+            .find(|action| action.message == InspectorAction::RestartLanguageServer(card))
+            .map(|action| action.message)
+        };
+        // The first telemetry refresh occurs before any edit in the native
+        // failure: another live server must not erase this document's refusal.
+        app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
+        assert_eq!(app.lsp_context(card).unwrap().status, refusal);
+        assert!(restart_action(&app).is_some());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(Arc::new(
+                "🌲".into(),
+            ))),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("🌲before\n"));
+        drop(app.drain_lsp_intents(card));
+        app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
+        assert_eq!(app.lsp_context(card).unwrap().status, refusal);
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        assert_eq!(
+            app.lsp
+                .scalar_position(doc, LspPosition::new(0, 2))
+                .unwrap(),
+            LspPosition::new(0, 1)
+        );
+        app.close_lsp_document(holder_card);
+        // Even telemetry routed through the now-closed last holder must keep
+        // the refused editor's ordinary inspector action available.
+        app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
+        let restart = restart_action(&app).expect("retained refusal offers ordinary Retry");
+        drop(app.update(Message::ContextInspector(restart)));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                app.apply_lsp_event(events.recv().await.unwrap());
+                if app.lsp_context(card).unwrap().status == Some(LspStatus::Ready) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.lsp.status(doc), LspStatus::Ready);
+        assert_eq!(
+            app.lsp
+                .scalar_position(doc, LspPosition::new(0, 2))
+                .unwrap(),
+            LspPosition::new(0, 1)
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some("🌲before\n"));
+
+        app.settings.language_servers.clear();
+        drop(app.synchronize_language_servers());
+        assert!(app.lsp_document(card).is_none());
+        assert_eq!(
+            app.lsp_context(card).unwrap().status,
+            Some(LspStatus::Disabled)
+        );
+        assert!(restart_action(&app).is_none());
+        app.close_lsp_document(card);
+        app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
+        assert!(app.lsp_context(card).unwrap().status.is_none());
+        assert!(restart_action(&app).is_none());
+        drop(app.open_lsp_document(
+            card,
+            &root.join("notes.txt"),
+            root,
+            1,
+            &repository_widget::LspChangeText::Text("plain".into()),
+        ));
+        app.apply_lsp_event(LspEvent::Resources { doc: holder.doc });
+        assert_eq!(
+            app.lsp_context(card).unwrap().status,
+            Some(LspStatus::Disabled)
+        );
+        assert!(restart_action(&app).is_none());
+        app.lsp.begin_shutdown().await;
     }
 
     /// The jump arm must consult that predicate rather than jumping blind.
