@@ -4520,6 +4520,8 @@ impl Application for Editor {
                             && tab.runtime.apply_completion_target(id, &target)
                         {
                             tab.completions.clear();
+                            let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                            return Task::batch([self.drain(id), focus]);
                         }
                     }
                     self.drain(id)
