@@ -991,6 +991,27 @@ Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
 
+When asking for feedback on generated artifacts, agents should provide one
+explicit Markdown link per artifact, such as `[Expanded](docs/tree-expanded.png)`,
+including the path relative to the producing
+conversation's working directory (or an absolute path on that conversation's
+device). Shell shorthand such as `tree-real-*.png` or
+`tree-fixture-dark-{collapsed,expanded}.png` remains literal text; it does not
+select or attach multiple images. Claude's `AskUserQuestion` question and option
+text also supplies no image attachments. Native questions offer **Open artifact**
+controls for up to 16 explicit concrete links, without changing question or
+answer text. Bare paths and unresolved shell patterns stay text. For more
+artifacts, put the concrete links in the preceding transcript message. Encode
+literal filename metacharacters in file URLs, for example `%2A` for `*`.
+An image attachment is a separate
+provider image block or a file explicitly selected in the composer. For remote
+conversations, local paths belong to the selected device; a matching filename
+on the UI computer does not identify the same artifact.
+Concrete remote image links open a read-only gallery on the selected device's
+bytes. Loading can be cancelled, and remote files cannot be opened in a local
+external viewer. Missing files and preview-capacity errors report the device
+and path so the producer can supply a concrete supported image.
+
 - Drag across prompts, answers, code, and tool output and press `Ctrl+C` to
   copy the selected text. Double-click selects a word; triple-click selects
   a paragraph. Shift-click extends the selection, and dragging beyond the
