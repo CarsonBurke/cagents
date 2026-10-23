@@ -803,10 +803,10 @@ impl DefaultPane {
 /// and a build never saves over a newer schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
+    pub schema_version: u32,
     /// Stable palette entry keys, newest first. Old settings default to empty.
     #[serde(default)]
     pub palette_recents: Vec<String>,
-    pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     #[serde(default = "default_focus_follows_mouse")]
@@ -947,9 +947,9 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            palette_recents: Vec::new(),
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
+            palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
