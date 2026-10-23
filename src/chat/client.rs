@@ -2552,22 +2552,44 @@ impl ClientHandle {
                         .checked_add(1)
                         .expect("chat body-policy revision exhausted");
                 }
-                let old = if !retain_body {
-                    current
-                        .hidden
-                        .as_ref()
-                        .map(|metadata| self.inner.publication.current.swap(metadata.clone()))
+                let (old, published_resident, published_generation) = if !retain_body {
+                    match current.hidden.as_ref() {
+                        Some(metadata) => (
+                            Some(self.inner.publication.current.swap(metadata.clone())),
+                            metadata.resident,
+                            metadata.snapshot.generation,
+                        ),
+                        None => (None, current.resident, current.snapshot.generation),
+                    }
                 } else {
-                    None
+                    (None, current.resident, current.snapshot.generation)
                 };
-                (old, current, Ok(body_changed))
+                let observation = (
+                    *revision,
+                    published_resident,
+                    published_generation,
+                    old.is_some(),
+                );
+                (old, current, Ok((body_changed, observation)))
             }
         };
         // No retry, allocation, Snapshot/lineage cloning or destruction under
         // the gate. Show keeps the body-free node until fresh hydration arrives.
         drop(old);
         drop(current);
-        let body_changed = result.map_err(str::to_owned)?;
+        let (
+            body_changed,
+            (revision, published_resident, published_generation, metadata_installed),
+        ) = result.map_err(str::to_owned)?;
+        if changed || body_changed {
+            // This is the publication installed by this policy transaction,
+            // not a receipt for other aliases or retirement-queue completion.
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(),
+                owner = "chat_client_policy", chat_id = %self.inner.id,
+                requested_interested = interested, requested_retain_body = retain_body,
+                policy_revision = revision, published_generation, published_resident,
+                metadata_installed);
+        }
         if interested && (changed || body_changed) {
             // Controls can use retained metadata immediately. The visibility
             // notification triggers an unconditional read for evicted history,
@@ -6728,6 +6750,142 @@ mod tests {
         let (completed, completion) = std::sync::mpsc::channel();
         *publication.retirement_complete.lock().unwrap() = Some(completed);
         (publication, snapshot, completion)
+    }
+
+    #[test]
+    fn an_idle_hide_reports_the_installed_policy_without_another_source_frame() {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, serde_json::Value>);
+        impl Visit for Fields {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().into(), format!("{value:?}").into());
+            }
+        }
+        struct Observe {
+            client: std::sync::Weak<Inner>,
+            rows: Arc<Mutex<Vec<BTreeMap<String, serde_json::Value>>>>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Observe {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if fields.0.get("owner") != Some(&serde_json::json!("chat_client_policy")) {
+                    return;
+                }
+                let client = self.client.upgrade().expect("caller still owns the client");
+                let _gate = client.publication.commit.try_lock().expect(
+                    "diagnostic subscriber must run after the publication gate is unlocked",
+                );
+                self.rows.lock().unwrap().push(fields.0);
+            }
+        }
+
+        let session = omp_card(None, None);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = request.request else {
+                panic!("expected real client attachment")
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(request.request_id),
+                &handoff_proof(),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 41,
+                            items: vec![retirement_text("idle body".repeat(128 * 1024))],
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            // Keep the real reader idle: never send an ACK, snapshot, update or
+            // other frame after attachment. Drain visibility only until Drop.
+            while codec.read::<ClientEnvelope>(&mut server).unwrap().is_some() {}
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let body = Arc::downgrade(&handle.snapshot().items[0]);
+        let installed = handle.inner.publication.current.load_full();
+        let (released, completion) = std::sync::mpsc::channel();
+        *installed.retirement_complete.lock().unwrap() = Some(released);
+        drop(installed);
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Observe {
+            client: Arc::downgrade(&handle.inner),
+            rows: rows.clone(),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            handle.set_visible(false).unwrap();
+            handle.set_visible(false).unwrap();
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            assert_eq!(handle.snapshot().generation, 41);
+            handle.set_visible(true).unwrap();
+            // A show requests hydration; it must not claim the old body became
+            // resident merely because interest changed while the source is idle.
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            handle.set_visible(true).unwrap();
+        });
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(body.upgrade().is_none());
+        let observed = rows.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "unchanged calls must not spam policy events"
+        );
+        for (row, revision, requested, swapped) in [
+            (&observed[0], 1, false, true),
+            (&observed[1], 2, true, false),
+        ] {
+            assert_eq!(row["policy_revision"], revision);
+            assert_eq!(row["published_generation"], 41);
+            assert_eq!(row["published_resident"], false);
+            assert_eq!(row["metadata_installed"], swapped);
+            assert_eq!(row["requested_interested"], requested);
+            assert_eq!(row["requested_retain_body"], requested);
+            assert!(!row.contains_key("resident_bytes"));
+            assert!(!row.contains_key("released"));
+        }
+        drop(observed);
+        drop(handle);
+        worker.join().unwrap();
     }
 
     #[test]
