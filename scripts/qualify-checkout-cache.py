@@ -98,7 +98,13 @@ qualification-dependency={path="../dependency"}
 ''')
     build = (ROOT / "build.rs").read_text()
     if not fixed:
+        build = build.replace(ANCHOR, "")
         build = build.replace(f'    println!("cargo:rerun-if-env-changed={IDENTITY}");\n', "")
+    # Vary the actual stamp-producing script body independently of its runtime
+    # Git lookup. A rerun in B can report B's dirty state using A's stale body.
+    directive = 'println!("cargo:rustc-env=CAGENTS_VERSION={version}");'
+    assert build.count(directive) == 1
+    build = build.replace(directive, directive.replace("{version}", "{version}.body-A"))
     write(checkout_a / "build.rs", build)
     anchor = ANCHOR if fixed else ""
     write(checkout_a / "src/lib.rs", anchor + '''pub const VERSION: &str = env!("CAGENTS_VERSION");
@@ -166,7 +172,7 @@ pub fn generated() -> &'static str { GENERATED }
     run("git", "worktree", "add", "--detach", str(checkout_b), "HEAD", cwd=checkout_a)
     # Both worktrees have the same HEAD. Only B's dirty source differs, and its
     # timestamps intentionally cannot invalidate A's newer cached compilation.
-    for relative in ("src/lib.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+    for relative in ("build.rs", "src/lib.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
                      "vendor/plain/src/lib.rs", "vendor/generated/src/lib.rs", "vendor/generated/input.txt"):
         path = checkout_b / relative
         path.write_text(path.read_text().replace("-A", "-B"))
@@ -232,7 +238,7 @@ pub fn generated() -> &'static str { GENERATED }
         if generated_directives is None:
             generated_directives = directives[0]
         assert all(value == generated_directives for value in directives), "generator directives changed"
-        stamp = expected_stamp + (".dirty" if step == 1 else "")
+        stamp = expected_stamp + (".dirty" if step == 1 else "") + f".body-{letter}"
         expected = (f"{stamp}|root-{letter}|import-{letter}|dependency", f"{stamp}|editor-{letter}")
         actual = (root, editor)
         if step < 3:
@@ -419,7 +425,10 @@ def main():
         assert (ROOT / source).read_text().splitlines().count(
             'include!("modules.rs");'
         ) == 1, source
-    for source in ("src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs"):
+    for source in (
+        "build.rs", "src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+        "crates/iced-contracts/src/lib.rs",
+    ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
     guard_vendor_hooks()
     if args.evidence:
