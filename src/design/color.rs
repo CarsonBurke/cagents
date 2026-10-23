@@ -187,6 +187,13 @@ pub fn muted_color(theme: &Theme) -> Color {
     color
 }
 
+/// The ink of a control that cannot be used now: mixed toward its surface
+/// rather than faded, so it stays legible yet reads apart from muted labels.
+pub fn disabled_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.42)
+}
+
 fn ink(color: Color) -> text::Style {
     text::Style {
         color: Some(color),

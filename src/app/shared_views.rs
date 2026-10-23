@@ -2105,6 +2105,35 @@ mod tests {
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId, ProjectChannel, ProjectId,
     };
+    /// A report that a pane's conversation could not be reopened goes with
+    /// the pane, whichever path removes it; here, another client closing it.
+    #[test]
+    fn a_pane_closed_elsewhere_takes_its_reopen_failure_with_it() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let report = |card: CardId| {
+            TransientNotice::error("Could not reopen a conversation.")
+                .with_details(format!("{card:?}"))
+                .with_key(NoticeKey::ChatAttach(card))
+        };
+        app.notices.record(report(card));
+        app.notices.record(report(CardId::new()));
+        // Any message will do: every update ends by checking.
+        let _ = app.update(Message::DismissNotice(u64::MAX));
+        assert_eq!(
+            app.notices
+                .recent()
+                .map(|entry| entry.notice.key)
+                .collect::<Vec<_>>(),
+            [Some(NoticeKey::ChatAttach(card))],
+            "an open pane keeps its report; one that is gone has none"
+        );
+
+        app.detach_shared_pane(card);
+        let _ = app.update(Message::DismissNotice(u64::MAX));
+        assert!(app.notices.is_empty());
+    }
+
     fn fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let a = ChannelId::new();

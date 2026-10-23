@@ -18,10 +18,12 @@ mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
 mod changes;
+mod child_navigation;
 mod clipboard_image;
 mod closed_draft;
 mod completion;
 mod coordination;
+mod failure;
 mod find;
 mod fold;
 mod hover;
@@ -230,6 +232,12 @@ pub enum Action {
     ToggleTurn(Target, String),
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
+    SubagentPicker(Target, bool),
+    SubagentQuery(Target, String),
+    ToggleFailure(Target, String),
+    CopyFailure(Target, String),
+    SubagentFilter(Target, child_navigation::Filter),
+    SubagentPage(Target, bool),
     /// Shows the whole of one folded part of a coordination card, addressed
     /// by the card's item id and the part's name, or folds it again.
     Unfold(Target, String),
@@ -445,6 +453,9 @@ struct AccountRecovery {
 
 struct Attempt {
     target: Target,
+    /// Whether this begins the launch or puts a saved conversation back,
+    /// which decides whether a failure is reported as a start or a reopen.
+    intent: chat::Intent,
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
@@ -1027,6 +1038,8 @@ struct CachedItem {
     item: Option<Arc<chat::Item>>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
+    diagnostic: bool,
+    report_expanded: Option<bool>,
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
@@ -1172,6 +1185,15 @@ impl CachedItem {
             _ => (None, None),
         };
         let mut cached = Self {
+            diagnostic: false,
+            report_expanded: matches!(
+                content,
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    ..
+                }
+            )
+            .then_some(expanded),
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             tool_output,
@@ -1202,7 +1224,19 @@ impl CachedItem {
         }
         match content {
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
-                if let Some(body) = Self::prose(content) {
+                // Reports stay wholly behind their disclosure, including a
+                // one-line API diagnostic. Keep large hidden reports out of
+                // Markdown preparation; Toggle and Find prepare the original
+                // body when they explicitly open it.
+                let hidden_report = !expanded
+                    && matches!(
+                        content,
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        }
+                    );
+                if !hidden_report && let Some(body) = Self::prose(content) {
                     cached.extend(body, growing, theme);
                 }
             }
@@ -1679,6 +1713,7 @@ pub(super) struct Runtime {
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
     selected_subagent: Option<String>,
+    child_picker: Option<child_navigation::Picker>,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -1732,6 +1767,7 @@ pub(super) struct Runtime {
     capacity_refused: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
+    failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
     footer_picker: bool,
@@ -2574,6 +2610,7 @@ impl Runtime {
             syntax_theme,
             turns: Vec::new(),
             selected_subagent: None,
+            child_picker: None,
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -2602,6 +2639,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             failures: Vec::new(),
+            failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
             footer_picker: false,
@@ -2650,6 +2688,8 @@ impl Runtime {
         self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
+        self.failure_ui = failure::State::default();
+        self.child_picker = None;
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -2676,6 +2716,7 @@ impl Runtime {
             self.failures.remove(0);
         }
         self.failures.push((anchor, notice));
+        self.refresh_failure_ui();
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
@@ -2836,6 +2877,35 @@ impl Runtime {
             .enumerate()
             .map(|(index, item)| (item, busy && index == newest));
         for (item, growing) in growing_items {
+            if cache.get(&item.id).is_some_and(|cached| {
+                cached.diagnostic
+                    && cached
+                        .item
+                        .as_ref()
+                        .is_some_and(|previous| Arc::ptr_eq(previous, item))
+            }) {
+                continue;
+            }
+            if failure::diagnostic_item(provider, item) {
+                let unchanged = cache
+                    .get(&item.id)
+                    .and_then(|cached| cached.item.as_ref())
+                    .is_some_and(|previous| Arc::ptr_eq(previous, item));
+                if !unchanged {
+                    let placeholder = ItemContent::Text {
+                        text: String::new(),
+                        thinking: false,
+                        phase: chat::Phase::Commentary,
+                    };
+                    let mut cached =
+                        CachedItem::updated(&placeholder, theme, None, false, false, None);
+                    cached.token = ChangeToken::of(&item.content);
+                    cached.diagnostic = true;
+                    cached.item = Some(item.clone());
+                    cache.insert(item.id.clone(), cached);
+                }
+                continue;
+            }
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             if let Some(cached) = cache.get_mut(&item.id) {
@@ -3238,6 +3308,7 @@ impl Runtime {
             self.interrupt_armed = None;
         }
         self.snapshot = snapshot;
+        self.refresh_failure_ui();
         images::sync(self);
         self.refresh_find();
     }
@@ -3252,6 +3323,7 @@ impl Runtime {
     }
 
     fn restore_find_disclosures(&mut self) {
+        self.restore_failure_find();
         self.find_disclosure
             .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
@@ -3259,6 +3331,38 @@ impl Runtime {
                 self.child_expanded.entry(child.clone()).or_default(),
                 self.child_unfolded.entry(child).or_default(),
                 &mut HashMap::new(),
+            );
+        }
+        // A temporary Find reveal owns the report's parsed body too. Drop it
+        // again when search restores a collapsed report; manual disclosures
+        // retain both their state and their prepared body.
+        fn collapse_reports(
+            cache: &mut HashMap<String, CachedItem>,
+            expanded: &HashSet<String>,
+            theme: crate::settings::EditorSyntaxTheme,
+        ) {
+            let closed: Vec<_> = cache
+                .iter()
+                .filter_map(|(id, cached)| {
+                    (cached.report_expanded == Some(true) && !expanded.contains(id))
+                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
+                        .flatten()
+                })
+                .collect();
+            for (id, item) in closed {
+                let previous = cache.remove(&id);
+                let mut cached =
+                    CachedItem::updated(&item.content, theme, previous, false, false, None);
+                cached.item = Some(item);
+                cache.insert(id, cached);
+            }
+        }
+        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
+        if let Some(child) = &self.selected_subagent {
+            collapse_reports(
+                &mut self.child_cache,
+                self.child_expanded.entry(child.clone()).or_default(),
+                self.syntax_theme,
             );
         }
     }
@@ -3276,6 +3380,9 @@ impl Runtime {
     }
 
     fn reveal_child_find_match(&mut self, key: &str) {
+        if self.reveal_failure_for_find(key).is_some() {
+            return;
+        }
         let Some(child) = self.selected_subagent.clone() else {
             return;
         };
@@ -3303,7 +3410,14 @@ impl Runtime {
                         && matches!(item.content, ItemContent::Text { .. }))
             }
         };
-        let delivery = matches!(&item.content, ItemContent::Delivery { body, .. } if find::contains(body, query));
+        let delivery = match &item.content {
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                ..
+            } => contains_text(&item.content, query),
+            ItemContent::Delivery { body, .. } => find::contains(body, query),
+            _ => false,
+        };
         let expand = (raw && contains_text(&item.content, query)) || delivery;
         let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
         for part in parts {
@@ -3326,6 +3440,7 @@ impl Runtime {
     }
 
     fn refresh_find(&mut self) {
+        self.refresh_failure_previews();
         let previous = self.find_matches.get(self.find_index).cloned();
         let query = self.find.as_deref().unwrap_or_default();
         self.find_matches = if let Some(child) = self.selected_subagent.as_ref() {
@@ -3411,12 +3526,23 @@ impl Runtime {
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
+    ///
+    /// A connection already lost has nothing to tell: the pane reports the
+    /// disconnection itself, and the handle that replaces it is shown with the
+    /// visibility recorded here.
     fn present(&self) -> Result<(), String> {
         let visible = self.visible.load(Ordering::Relaxed)
             || self.queued.is_some()
             || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        match self.handle() {
+            Some(handle) if handle.is_connected() => match handle.set_visible(visible) {
+                // The connection can drop between the check and the call, and
+                // is then as lost as one found lost: not this pass's to report.
+                Err(_) if !handle.is_connected() => Ok(()),
+                result => result,
+            },
+            _ => Ok(()),
+        }
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -3429,7 +3555,9 @@ impl Runtime {
 
     /// The named control that should receive the keyboard for this card.
     pub(super) fn focus_control(&self) -> &'static str {
-        if self.model_picker.is_some() {
+        if self.child_picker.is_some() {
+            "chat-subagent-search"
+        } else if self.model_picker.is_some() {
             "chat-model-search"
         } else {
             "chat-composer"
@@ -4285,20 +4413,45 @@ impl Cagents {
         };
         let key = runtime.find_matches[runtime.find_index].clone();
         if runtime.selected_subagent.is_some() {
+            let anchor = runtime
+                .reveal_failure_for_find(&key)
+                .unwrap_or_else(|| key.clone());
             runtime.reveal_child_find_match(&key);
             return crate::document_link::scroll_to_heading_anchored(
                 card_control_id(target.card, "chat-transcript"),
-                runtime.find_anchor(&key),
+                runtime.find_anchor(&anchor),
                 true,
             );
         }
+        let mut diagnostic_anchor = None;
         if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
             runtime.find_disclosure.turn(&key, &mut runtime.opened);
             let query = runtime.find.as_deref().unwrap_or_default();
-            for placed in turn.steps.iter().chain(&turn.prose) {
-                let Some(item) = runtime.snapshot.items.get(placed.index) else {
+            let placed_items: Vec<_> = turn
+                .steps
+                .iter()
+                .chain(&turn.prose)
+                .filter_map(|placed| {
+                    runtime
+                        .snapshot
+                        .items
+                        .get(placed.index)
+                        .map(|item| (placed.clone(), item.clone(), turn.steps.contains(placed)))
+                })
+                .collect();
+            let prompt_indices = turn.prompt.clone();
+            let query = query.to_owned();
+            for (placed, item, is_step) in placed_items {
+                let query = query.as_str();
+                if contains_text(&item.content, query)
+                    && let Some(incident) = runtime.failure_ui.item(&item.id)
+                {
+                    let anchor = format!("failure:{}", incident.key);
+                    runtime.reveal_failure_for_find(&item.id);
+                    diagnostic_anchor.get_or_insert(anchor);
                     continue;
-                };
+                }
+                let item = item.as_ref();
                 // A card's message or prompt, or a message a step read, may
                 // be folded to its opening.
                 let coordinated = runtime
@@ -4321,7 +4474,7 @@ impl Cagents {
                 // match is only in the command or output it was read from.
                 let raw = match coordinated {
                     Some(coordinated) if coordinated.is_card() => !unfolded,
-                    _ => turn.steps.contains(placed) || placed.slot == turn::Slot::Thinking,
+                    _ => is_step || placed.slot == turn::Slot::Thinking,
                 };
                 if raw
                     && contains_text(&item.content, query)
@@ -4345,23 +4498,48 @@ impl Cagents {
             }
             // Both long user prompts and deliveries may hide their matching
             // body beneath an opening. Search owns only its temporary reveal.
-            for index in &turn.prompt {
+            for index in &prompt_indices {
                 if let Some(item) = runtime.snapshot.items.get(*index)
                     && match &item.content {
-                        ItemContent::Text { text, .. } => find::contains(text, query),
-                        ItemContent::Delivery { body, .. } => find::contains(body, query),
+                        ItemContent::Text { text, .. } => find::contains(text, &query),
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        } => contains_text(&item.content, &query),
+                        ItemContent::Delivery { body, .. } => find::contains(body, &query),
                         _ => false,
                     }
                 {
-                    runtime
+                    let changed = runtime
                         .find_disclosure
                         .item(&item.id, &mut runtime.expanded);
+                    if changed
+                        && matches!(
+                            item.content,
+                            ItemContent::Delivery {
+                                kind: chat::DeliveryKind::Report,
+                                ..
+                            }
+                        )
+                    {
+                        let previous = runtime.cache.remove(&item.id);
+                        let mut cached = CachedItem::updated(
+                            &item.content,
+                            runtime.syntax_theme,
+                            previous,
+                            true,
+                            false,
+                            None,
+                        );
+                        cached.item = Some(item.clone());
+                        runtime.cache.insert(item.id.clone(), cached);
+                    }
                 }
             }
         }
         crate::document_link::scroll_to_heading_anchored(
             card_control_id(target.card, "chat-transcript"),
-            iced::advanced::widget::Id::new(format!("chat-turn-{}-{key}", target.card)),
+            runtime.find_anchor(diagnostic_anchor.as_deref().unwrap_or(&key)),
             true,
         )
     }
@@ -4698,6 +4876,7 @@ impl Cagents {
             card,
             Phase::Starting(Attempt {
                 target,
+                intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
                 upgrade_admission: None,
@@ -6182,6 +6361,7 @@ impl Cagents {
             card,
             Phase::Starting(Attempt {
                 target,
+                intent,
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
@@ -6944,6 +7124,7 @@ impl Cagents {
             | Action::PermissionPicker(target, false)
             | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
+            | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
@@ -6951,7 +7132,9 @@ impl Cagents {
                 self.cards.get(&target.card).and_then(|card| match card {
                     CardRuntime::Chat(runtime)
                         if runtime.target == *target
-                            && (runtime.picker_keyboard || runtime.model_picker.is_some()) =>
+                            && (runtime.picker_keyboard
+                                || runtime.model_picker.is_some()
+                                || runtime.child_picker.is_some()) =>
                     {
                         Some(*target)
                     }
@@ -6961,6 +7144,7 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
         }
@@ -6978,6 +7162,14 @@ impl Cagents {
             ]);
         }
         task
+    }
+
+    pub(super) fn reconcile_chat_failure_presentations(&mut self) {
+        for card in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = card {
+                runtime.reconcile_failure_ui();
+            }
+        }
     }
 
     fn stage_chat_attachments(
@@ -7633,6 +7825,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
+                        self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         if account_source.is_some() || attempt.upgrade_admission.is_some() {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
@@ -7719,6 +7912,9 @@ impl Cagents {
                         // if nothing had started it. Chats opened before a
                         // first message started anything come back this way
                         // after an update.
+                        // Nothing is left to reopen, so an earlier report
+                        // that reopening failed no longer applies.
+                        self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         let mut draft = attempt.session.clone();
                         draft.reset_owned_codex_listener();
                         draft.proof = None;
@@ -7765,12 +7961,40 @@ impl Cagents {
                                 self.chat_ui.capacity_offers.remove(&target.card);
                             }
                             self.fail_runtime(target.card, failure.message.clone());
-                            self.status = Some(TransientNotice::error(failure.message));
+                            // The notice says what the reader lost in their
+                            // terms; the pane keeps the daemon's reason, and
+                            // the attempt that succeeds withdraws the notice.
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a conversation".to_owned());
+                            // A launch that names no conversation had none to
+                            // reopen: starting it is what failed.
+                            let verb = if attempt.intent == chat::Intent::Start
+                                && attempt.session.launch.session_id.is_none()
+                            {
+                                "start"
+                            } else {
+                                "reopen"
+                            };
+                            self.status = Some(
+                                TransientNotice::error(format!("Could not {verb} {pane}."))
+                                    .with_details(failure.message)
+                                    .with_key(NoticeKey::ChatAttach(target.card)),
+                            );
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error(failure.message));
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a terminal".to_owned());
+                            self.status = Some(
+                                TransientNotice::error(format!(
+                                    "Could not switch {pane} to native chat."
+                                ))
+                                .with_details(failure.message)
+                                .with_key(NoticeKey::ChatAttach(target.card)),
+                            );
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -8695,6 +8919,7 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.restore_find_disclosures();
                     runtime.find = None;
+                    runtime.refresh_failure_previews();
                     runtime.find_focused = false;
                     runtime.find_matches.clear();
                 }
@@ -9033,9 +9258,111 @@ impl Cagents {
                     }
                 }
             }
+            Action::ToggleFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime
+                        .failure_ui
+                        .incidents
+                        .iter()
+                        .any(|incident| incident.key == key)
+                {
+                    runtime.failure_ui.find_expanded.remove(&key);
+                    if !runtime.failure_ui.expanded.remove(&key) {
+                        runtime.failure_ui.expanded.insert(key.clone());
+                        runtime.cache_failure_preview(&key);
+                    }
+                }
+            }
+            Action::CopyFailure(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(text) = runtime.failure_details(&key)
+                {
+                    text_copy::invalidate();
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_picker =
+                        open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+                    if open {
+                        return widget::text_input::focus(card_control_id(
+                            target.card,
+                            "chat-subagent-search",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        if runtime.snapshot.subagents.is_empty() {
+                            "chat-composer"
+                        } else {
+                            "chat-subagent-picker"
+                        },
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.query = query;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentPage(target, next) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    let last = picker
+                        .rows(&runtime.snapshot.subagents)
+                        .len()
+                        .saturating_sub(1)
+                        / 24;
+                    picker.page = if next {
+                        picker.page.saturating_add(1).min(last)
+                    } else {
+                        picker.page.saturating_sub(1)
+                    };
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::SubagentFilter(target, filter) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(picker) = runtime.child_picker.as_mut()
+                {
+                    picker.filter = filter;
+                    picker.page = 0;
+                    return iced::widget::scrollable::scroll_to(
+                        card_control_id(target.card, "chat-subagent-list"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: Some(0.0),
+                            y: Some(0.0),
+                        },
+                    )
+                    .map(cosmic::Action::App);
+                }
+            }
             Action::SelectSubagent(target, id) => {
                 text_copy::invalidate();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_picker = None;
                     let selected = id.filter(|id| {
                         runtime
                             .snapshot
@@ -16593,6 +16920,111 @@ mod tests {
         }
     }
 
+    /// A restored conversation that cannot be reopened says so in the reader's
+    /// terms, keeps the daemon's reason as detail, and stops saying it once a
+    /// retry has reopened it.
+    #[test]
+    fn a_successful_retry_clears_the_failed_reopen_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let reason = "Exact native chat not found; no replacement process was spawned";
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(reason)));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(reason));
+
+        // A retry that fails for another reason replaces the notice rather
+        // than adding one beside it.
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let later = "fixture: executable unavailable";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(later)));
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(later));
+
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, attempt, Ok(handle));
+        assert!(chat_runtime(&app, card).connected());
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// Starting over is a start, not a reopen, and says so when it fails. A
+    /// conversation that turns out never to have been named opens as a draft,
+    /// with nothing left to reopen, so its failure notice goes too.
+    #[test]
+    fn a_fresh_start_reports_a_start_and_a_draft_withdraws_the_failure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let attempt = chat_runtime_attempt(&app, card);
+        let gone = "the provider no longer has this conversation";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+        assert!(app.chat_offers_fresh_conversation(card));
+
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = chat_runtime_attempt(&app, card);
+        let unavailable = "fixture: executable unavailable";
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry(unavailable)),
+        );
+        assert_eq!(errors(&app), [format!("Could not start {pane}.")]);
+        assert_eq!(
+            attach_failure_details(&app, card).as_deref(),
+            Some(unavailable)
+        );
+
+        // Restored later, the never-named conversation turns out to be gone.
+        let Some(CardKind::Chat(unnamed)) = app.card_state(card).map(|state| state.kind.clone())
+        else {
+            unreachable!();
+        };
+        assert_eq!(unnamed.launch.session_id, None);
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, unnamed, chat::Intent::Restore);
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+        );
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// A conversation whose connection is gone already says so in its pane,
+    /// and reattaching presents its visibility afresh, so telling it whether
+    /// it is on screen cannot fail in a way worth a notice.
+    #[test]
+    fn a_disconnected_chat_raises_no_visibility_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        chat_runtime(&app, card)
+            .handle()
+            .unwrap()
+            .disconnect_for_test();
+        app.set_workspace_surfaces_visible(false);
+        app.set_workspace_surfaces_visible(true);
+        assert!(
+            app.status.is_none(),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+    }
+
     #[test]
     fn failed_retry_adapter_cannot_acknowledge_retained_native_cleanup() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -16748,6 +17180,14 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// The reason recorded beneath `card`'s failure to open its conversation.
+    fn attach_failure_details(app: &Cagents, card: CardId) -> Option<String> {
+        app.notices
+            .recent()
+            .find(|entry| entry.notice.key == Some(crate::app::NoticeKey::ChatAttach(card)))
+            .and_then(|entry| entry.notice.details.clone())
     }
 
     /// The errors the shell has recorded. `status` is drained into the notice
@@ -19239,6 +19679,7 @@ mod tests {
                 card,
                 Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
@@ -19296,6 +19737,7 @@ mod tests {
                     card,
                     Phase::Starting(Attempt {
                         target: next,
+                        intent: chat::Intent::Restore,
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
@@ -20164,7 +20606,20 @@ mod tests {
             app.chat_switch_ready(id),
             "a failed attachment can be retried"
         );
-        assert_eq!(errors(&app), [reason]);
+        // Named as its tab names it.
+        let tab = app
+            .repository_chrome(app.card_state(id).unwrap())
+            .0
+            .into_owned();
+        assert_eq!(
+            errors(&app),
+            [format!("Could not switch “{tab}” to native chat.")]
+        );
+        assert_eq!(
+            attach_failure_details(&app, id).as_deref(),
+            Some(reason),
+            "the reason stays readable beneath it"
+        );
         assert!(
             matches!(
                 crate::app::tests::task_app_message(task),
@@ -22557,6 +23012,7 @@ mod tests {
             let phase = match owner {
                 "account" => Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: f.source.clone(),
                     recovery: Some(AccountRecovery {
                         source: f.source.clone(),
@@ -22577,6 +23033,7 @@ mod tests {
                     other.launch.recipe.arguments.push("--other-start".into());
                     Phase::Starting(Attempt {
                         target,
+                        intent: chat::Intent::Restore,
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
@@ -22860,6 +23317,7 @@ mod tests {
                 card,
                 Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
@@ -22937,6 +23395,7 @@ mod tests {
                     card,
                     Phase::Starting(Attempt {
                         target: next,
+                        intent: chat::Intent::Restore,
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
