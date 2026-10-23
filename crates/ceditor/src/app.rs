@@ -6295,6 +6295,58 @@ mod tests {
     }
 
     #[test]
+    fn review_discovery_catches_up_only_when_the_main_window_regains_focus() {
+        let mut app = editor();
+        let main = window::Id::RESERVED;
+        let other = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.window_focused = true;
+        let watch = |app: &mut Editor, root: &str, repository: &str| {
+            let tab = add(app, root, None);
+            drop(
+                app.tab_mut(tab).unwrap().review.set_source(Some(
+                    pull_request_review::ReviewSource {
+                        repository: cagents::github::GitHubRepoKey::new(
+                            "github.com",
+                            None,
+                            "owner",
+                            repository,
+                        )
+                        .unwrap(),
+                        worktree: root.into(),
+                    },
+                )),
+            );
+        };
+        watch(&mut app, "/first", "first");
+        for (window, focused) in [(other, false), (other, true), (main, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert!(app.window_focused);
+            assert_eq!(app.review_requests.snapshots().count(), 0);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        assert!(!app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 0);
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert!(app.window_focused);
+        assert_eq!(app.review_requests.snapshots().count(), 1);
+
+        // A newly bound repository exposes a second, observable catch-up
+        // pass: duplicate focus events must not start discovery again.
+        watch(&mut app, "/second", "second");
+        let revision = app.review_requests.revision();
+        for (window, focused) in [(main, true), (other, false), (other, true)] {
+            drop(app.update(Message::WindowFocused(window, focused)));
+            assert_eq!(app.review_requests.revision(), revision);
+            assert_eq!(app.review_requests.snapshots().count(), 1);
+        }
+        drop(app.update(Message::WindowFocused(main, false)));
+        drop(app.update(Message::WindowFocused(main, true)));
+        assert_eq!(app.review_requests.snapshots().count(), 2);
+        assert_ne!(app.review_requests.revision(), revision);
+    }
+
+    #[test]
     fn control_tab_navigates_history_and_focus_loss_commits_it() {
         let mut app = editor();
         app.core.set_main_window_id(Some(window::Id::RESERVED));
