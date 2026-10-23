@@ -134,6 +134,7 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
         let viewport = Rectangle::with_size(size);
         let mut point = None;
         let mut messages = Vec::new();
+        let commit_message = app.sidebar_state.commit_message().to_owned();
         for phase in 0..3 {
             let mut element = if confirmation {
                 app.dialog().expect("actual confirmation is mounted")
@@ -187,6 +188,33 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
             );
             drop(element);
             for message in emitted {
+                if let Message::SidebarSnapshot { source, action } = &message
+                    && let (SidebarAction::CommitSubjectEditorAction {
+                        key: observed,
+                        action: widget::text_editor::Action::ClearSelection,
+                    }
+                    | SidebarAction::CommitEditorAction {
+                        key: observed,
+                        action: widget::text_editor::Action::ClearSelection,
+                    }) = &**action
+                {
+                    // The real commit editors clear their selection on an
+                    // outside press. Apply that exact native callback before
+                    // rebuilding; it is neither an edit nor a discard.
+                    assert!(!confirmation, "no commit editor is mounted in the dialog");
+                    assert_eq!(phase, 1, "only the outside press clears selection");
+                    assert_eq!(*source, original, "phase {phase}: {message:?}");
+                    assert_eq!(observed, key, "phase {phase}: {message:?}");
+                    let task = app.update(message);
+                    assert!(
+                        iced::runtime::task::into_stream(task).is_none(),
+                        "editor selection bookkeeping must not discard asynchronous App work"
+                    );
+                    assert_eq!(app.sidebar_state.commit_message(), commit_message);
+                    assert!(!app.modal_is_open());
+                    assert_eq!(app.discard_ui.source().unwrap().id, original);
+                    continue;
+                }
                 if let Message::SidebarSnapshot { source, action } = &message
                     && let SidebarAction::ChangeViewport {
                         key: observed,
