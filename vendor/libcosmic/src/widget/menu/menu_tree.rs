@@ -38,6 +38,9 @@ pub struct MenuTree<Message> {
     pub(crate) width: Option<u16>,
     /// The height of the menu tree
     pub(crate) height: Option<u16>,
+    /// The same action as the generated button, for keyboard activation.
+    /// Custom widgets, disabled items and separators have no implicit action.
+    pub(crate) keyboard_action: Option<Rc<Message>>,
 }
 
 impl<Message: Clone + 'static> MenuTree<Message> {
@@ -49,6 +52,7 @@ impl<Message: Clone + 'static> MenuTree<Message> {
             children: Vec::new(),
             width: None,
             height: None,
+            keyboard_action: None,
         }
     }
 
@@ -63,12 +67,17 @@ impl<Message: Clone + 'static> MenuTree<Message> {
             children: children.into_iter().map(Into::into).collect(),
             width: None,
             height: None,
+            keyboard_action: None,
         }
     }
 
     /// Preferred width used by context-menu placement.
     pub fn preferred_width(&self) -> u16 {
         self.width.unwrap_or(240)
+    }
+
+    pub(crate) fn keyboard_selectable(&self) -> bool {
+        self.keyboard_action.is_some() || !self.children.is_empty()
     }
 
     /// Sets the width of the menu tree.
@@ -288,9 +297,12 @@ pub fn menu_items<
                         );
                     }
 
-                    let menu_button = menu_button(items).on_press(action.message());
-
-                    trees.push(MenuTree::<Message>::from(Element::from(menu_button)).width(width));
+                    let message = action.message();
+                    let menu_button = menu_button(items).on_press(message.clone());
+                    let mut tree =
+                        MenuTree::<Message>::from(Element::from(menu_button)).width(width);
+                    tree.keyboard_action = Some(Rc::new(message));
+                    trees.push(tree);
                 }
                 MenuItem::ButtonDisabled(label, icon, action) => {
                     let l: Cow<'static, str> = label.into();
@@ -375,9 +387,11 @@ pub fn menu_items<
                         items.insert(2, widget::icon::icon(icon).size(14).into());
                     }
 
-                    trees.push(MenuTree::from(Element::from(
-                        menu_button(items).on_press(action.message()),
-                    )));
+                    let message = action.message();
+                    let mut tree =
+                        MenuTree::from(Element::from(menu_button(items).on_press(message.clone())));
+                    tree.keyboard_action = Some(Rc::new(message));
+                    trees.push(tree);
                 }
                 MenuItem::Folder(label, children) => {
                     let l: Cow<'static, str> = label.into();

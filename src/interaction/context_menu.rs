@@ -359,6 +359,265 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_menu_selects_enabled_actions_without_pointer_motion() {
+        use cosmic::iced::keyboard::{self, key::Named};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let window = Size::new(900.0, 300.0);
+        let viewport = Rectangle::with_size(window);
+        let anchor = mouse::Cursor::Available(Point::new(850.0, 250.0));
+        let ordinary = || {
+            let mut rows = widget::menu::items(
+                &std::collections::HashMap::new(),
+                vec![
+                    widget::menu::Item::ButtonDisabled("Disabled".to_owned(), None, RowAction(90)),
+                    widget::menu::Item::Divider,
+                    widget::menu::Item::Folder("Empty".to_owned(), Vec::new()),
+                    widget::menu::Item::Button("First".to_owned(), None, RowAction(1)),
+                    widget::menu::Item::ButtonDisabled(
+                        "Disabled again".to_owned(),
+                        None,
+                        RowAction(91),
+                    ),
+                    widget::menu::Item::Button("Second".to_owned(), None, RowAction(2)),
+                ],
+            );
+            rows.insert(
+                0,
+                widget::menu::Tree::from(Element::from(widget::text("Explanation"))),
+            );
+            rows
+        };
+        let submenu = widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![widget::menu::Item::Folder(
+                "Folder".to_owned(),
+                vec![
+                    widget::menu::Item::ButtonDisabled("Disabled".to_owned(), None, RowAction(90)),
+                    widget::menu::Item::Divider,
+                    widget::menu::Item::Button("Child first".to_owned(), None, RowAction(3)),
+                    widget::menu::Item::Button("Child second".to_owned(), None, RowAction(4)),
+                ],
+            )],
+        );
+        let tall = widget::menu::items(
+            &std::collections::HashMap::new(),
+            (0..40)
+                .map(|i| widget::menu::Item::Button(format!("Action {i}"), None, RowAction(i)))
+                .collect(),
+        );
+        let checkbox = widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![widget::menu::Item::CheckBox(
+                "Check".to_owned(),
+                None,
+                false,
+                RowAction(5),
+            )],
+        );
+        let inert = widget::menu::items(
+            &std::collections::HashMap::new(),
+            vec![
+                widget::menu::Item::ButtonDisabled("Disabled".to_owned(), None, RowAction(90)),
+                widget::menu::Item::Divider,
+                widget::menu::Item::Folder("Empty".to_owned(), Vec::new()),
+            ],
+        );
+        for (rows, keys, expected, visible) in [
+            (
+                ordinary(),
+                vec![Named::ArrowDown, Named::Enter],
+                vec![1],
+                Some("First"),
+            ),
+            (
+                ordinary(),
+                vec![Named::ArrowDown, Named::ArrowDown, Named::Enter],
+                vec![2],
+                Some("Second"),
+            ),
+            (
+                ordinary(),
+                vec![Named::ArrowUp, Named::Enter],
+                vec![2],
+                Some("Second"),
+            ),
+            (
+                checkbox,
+                vec![Named::ArrowDown, Named::Space],
+                vec![5],
+                Some("Check"),
+            ),
+            (
+                submenu,
+                vec![
+                    Named::ArrowDown,
+                    Named::ArrowRight,
+                    Named::ArrowDown,
+                    Named::ArrowLeft,
+                    Named::ArrowRight,
+                    Named::Enter,
+                ],
+                vec![3],
+                Some("Child first"),
+            ),
+            (
+                tall,
+                vec![Named::End, Named::Enter],
+                vec![39],
+                Some("Action 39"),
+            ),
+            (
+                ordinary(),
+                vec![Named::End, Named::ArrowDown, Named::Enter],
+                vec![1],
+                Some("First"),
+            ),
+            (
+                ordinary(),
+                vec![Named::End, Named::Home, Named::Enter],
+                vec![1],
+                Some("First"),
+            ),
+            (
+                inert,
+                vec![Named::ArrowDown, Named::ArrowUp, Named::Enter],
+                Vec::new(),
+                None,
+            ),
+        ] {
+            let mut element = surface(rows);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(window, window),
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                Layout::new(&node),
+                anchor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let mut popup = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("right click opens the real menu");
+            let mut measured = popup.as_overlay_mut().layout(&renderer, window);
+            popup.as_overlay_mut().update(
+                &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                Layout::new(&measured),
+                anchor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
+            measured = popup.as_overlay_mut().layout(&renderer, window);
+            for key in keys {
+                if let Some(visible) =
+                    visible.filter(|_| matches!(key, Named::Enter | Named::Space))
+                {
+                    #[derive(Default)]
+                    struct Texts(Vec<String>);
+                    impl Operation for Texts {
+                        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                            visit(self);
+                        }
+                        fn text(&mut self, _: Option<&Id>, _: Rectangle, value: &str) {
+                            self.0.push(value.to_owned());
+                        }
+                    }
+                    let mut texts = Texts::default();
+                    popup
+                        .as_overlay_mut()
+                        .operate(Layout::new(&measured), &renderer, &mut texts);
+                    assert!(
+                        texts.0.iter().any(|text| text == visible),
+                        "selected action must be in the visible slice: {:?}",
+                        texts.0
+                    );
+                }
+                let key = keyboard::Key::Named(key);
+                let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut shell = Shell::new(&mut messages);
+                popup.as_overlay_mut().update(
+                    &event,
+                    Layout::new(&measured),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                );
+                assert!(
+                    shell.is_event_captured(),
+                    "menu navigation must not reach the workspace"
+                );
+                measured = popup.as_overlay_mut().layout(&renderer, window);
+            }
+            drop(popup);
+            assert_eq!(messages, expected);
+            // An inert menu cannot activate anything, but Escape still closes
+            // it through the unchanged native ContextMenu event path.
+            if expected.is_empty() {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(Named::Escape),
+                        modified_key: keyboard::Key::Named(Named::Escape),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert!(messages.is_empty());
+            }
+            assert!(
+                element
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .is_none(),
+                "keyboard activation closes the menu"
+            );
+        }
+    }
+
+    #[test]
     fn resized_window_dismisses_old_geometry_and_reopens_a_reachable_action() {
         let renderer = tokio::runtime::Builder::new_current_thread()
             .enable_all()
