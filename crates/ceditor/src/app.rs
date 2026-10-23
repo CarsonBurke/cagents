@@ -7423,10 +7423,13 @@ mod tests {
             *ticket = Default::default();
             drop(app.update(Message::Repository(stale)));
             let mut foreign = result.clone();
-            let RepositoryAction::FindLoaded { card, .. } = &mut foreign else {
+            let RepositoryAction::FindLoaded {
+                card: foreign_card, ..
+            } = &mut foreign
+            else {
                 unreachable!()
             };
-            *card = CardId::new();
+            *foreign_card = CardId::new();
             drop(app.update(Message::Repository(foreign)));
             assert_eq!(app.tab(card).unwrap().completions, targets);
             assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
