@@ -14,7 +14,8 @@ struct Revision {
 }
 
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
-    let provider = crate::control::agents::parse_provider(value)?;
+    let provider = crate::control::agents::parse_provider(value)
+        .map_err(|_| "Choose claude or codex".to_owned())?;
     if !crate::account::Account::PROVIDERS.contains(&provider) {
         return Err("Omp manages its own logins; link supports claude and codex".into());
     }
