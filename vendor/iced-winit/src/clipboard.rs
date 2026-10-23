@@ -4,6 +4,7 @@
     feature = "x11",
     unix,
     not(any(
+        target_family = "wasm",
         target_os = "redox",
         target_os = "android",
         target_vendor = "apple"
@@ -59,6 +60,7 @@ enum State {
             feature = "x11",
             unix,
             not(any(
+                target_family = "wasm",
                 target_os = "redox",
                 target_os = "android",
                 target_vendor = "apple"
@@ -105,6 +107,7 @@ impl Clipboard {
             feature = "x11",
             unix,
             not(any(
+                target_family = "wasm",
                 target_os = "redox",
                 target_os = "android",
                 target_vendor = "apple"
@@ -125,6 +128,7 @@ impl Clipboard {
                         feature = "x11",
                         unix,
                         not(any(
+                            target_family = "wasm",
                             target_os = "redox",
                             target_os = "android",
                             target_vendor = "apple"
@@ -239,6 +243,7 @@ impl Clipboard {
             feature = "x11",
             unix,
             not(any(
+                target_family = "wasm",
                 target_os = "redox",
                 target_os = "android",
                 target_vendor = "apple"
