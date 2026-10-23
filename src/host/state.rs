@@ -2697,7 +2697,7 @@ fn apply_size(
     options.theme = theme;
 }
 
-/// Runs while HostLease is held, before binding the public listener.
+/// Runs while HostLease is held, before accepting clients on the public listener.
 /// Returns the retained native conversations this restore left unattached:
 /// their reattachment was just refused, so startup must not retry it at once.
 pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
