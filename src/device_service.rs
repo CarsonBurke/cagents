@@ -134,7 +134,7 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
-    AccountCheck(crate::account::readiness::CheckReport),
+    AccountCheck(Box<crate::account::readiness::CheckReport>),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -1929,7 +1929,7 @@ mod wire_tests {
             Measurement::new(CheckStatus::Passed, CheckReason::IdentityConfirmed);
         report.workspace_write = Measurement::unknown(CheckReason::SandboxSetupFailed);
         roundtrip(&Operation::AccountCheck(request));
-        roundtrip(&Reply::AccountCheck(report));
+        roundtrip(&Reply::AccountCheck(Box::new(report)));
     }
 
     #[test]

@@ -383,7 +383,7 @@ pub(super) fn process_request(
         let report = super::account_readiness::check(host, check.clone())?;
         return Ok((
             ServerResponse::DeviceOperation {
-                reply: crate::device_service::Reply::AccountCheck(report),
+                reply: crate::device_service::Reply::AccountCheck(Box::new(report)),
             },
             Vec::new(),
             false,
