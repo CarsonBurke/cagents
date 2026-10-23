@@ -78,6 +78,7 @@ pub enum Progress {
 /// Search one local root. Returning false from `publish` cancels delivery.
 /// Symlinks are never followed, binary and oversized files are skipped, and
 /// each line is bounded independently to avoid an unbounded allocation.
+/// Files stream in filesystem order; matches within each file stay in line order.
 pub fn search(
     root: &Path,
     options: &Options,
@@ -169,9 +170,8 @@ pub fn search(
         // policy below preserves their precedence without FIFO/pathname reads.
         .standard_filters(false)
         .follow_links(false)
-        // Stable file order makes initial delivery independent of filesystem
-        // insertion order (which can defer source files behind large trees).
-        .sort_by_file_name(|left, right| left.cmp(right))
+        // Sorting makes walkdir collect every sibling before yielding to our
+        // cancellation check. Stream entries as the filesystem provides them.
         .filter_entry(move |entry| {
             filter
                 .lock()
