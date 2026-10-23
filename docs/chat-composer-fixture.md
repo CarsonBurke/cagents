@@ -74,3 +74,19 @@ Open the resulting chat in the UI and check:
 Store screenshots under `docs/screenshots/` for PR evidence. Stop the owned
 nested session, close its synthetic agent, and stop only its isolated daemon
 when finished. The fixture directory can then be removed.
+
+For tool disclosure checks, set `CAGENTS_FIXTURE_VERBOSITY=1` in the same
+fixture environment before starting the runner and daemon. Each turn emits a
+streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
+multiline Bash command. It records complete tool inputs and results in the
+synthetic provider history, so the same transcript can be reopened.
+
+In the native chat, expand the activity group and check that the closed MCP
+row says `src/app.rs`, the Skill row says `writing-copy`, and neither shows
+internal framing. The failed `private.txt` step must retain `Permission denied`.
+The shell preview must show `cat <<EOF` without its heredoc payload. Expand
+individual steps and verify their complete Input/Output remains selectable
+and copyable. Collapse them while the first turn is still busy, stop that
+turn, and reopen the saved chat; compare the completed and restored content.
+The fixture represents a reproducible payload path, not a captured user
+conversation or evidence about the provider's answer prose.

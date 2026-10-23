@@ -1,3 +1,6 @@
+// Track the build-script compilation as well as its runtime rerun watch.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 use std::env;
 use std::path::Path;
 
@@ -36,10 +39,12 @@ fn copy_bindings<T: AsRef<Path>>(dir: &str, bindgen_name: &str, out_path: T) {
     } else {
         format!("{dir}/{bindgen_name}.rs")
     };
+    println!("cargo:rerun-if-changed={from}");
     std::fs::copy(from, out_path).expect("Could not copy bindings to output directory");
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {
@@ -117,7 +122,8 @@ mod build_bundled {
         {
             super::copy_bindings(lib_name, "bindgen_bundled_version", out_path);
         }
-        println!("cargo:include={}/{lib_name}", env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        println!("cargo:include={}", manifest_dir.join(lib_name).display());
         println!("cargo:rerun-if-changed={lib_name}/sqlite3.c");
         println!("cargo:rerun-if-changed=sqlite3/wasm32-wasi-vfs.c");
         let mut cfg = cc::Build::new();

@@ -11,6 +11,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(test)]
+pub(crate) use tests::TestService;
+
 const CAPACITY: usize = 4096;
 static SERVICE: OnceLock<Result<Arc<Service>, String>> = OnceLock::new();
 
@@ -78,6 +81,16 @@ pub(crate) fn has_retained_ownership() -> bool {
     match SERVICE.get() {
         Some(Ok(service)) => service.has_retained_ownership(),
         None | Some(Err(_)) => false,
+    }
+}
+
+/// Report only retained ownership faults. This observes an existing service;
+/// healthy preservation and initialization failures with no children are not
+/// shutdown errors, and this query never initializes, retries or waits.
+pub(crate) fn retained_custody_error() -> Option<String> {
+    match SERVICE.get() {
+        Some(Ok(service)) => service.retained_custody_error(),
+        None | Some(Err(_)) => None,
     }
 }
 
@@ -216,6 +229,23 @@ impl Service {
     fn has_retained_ownership(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.entries.iter().any(Option::is_some) || state.quarantined.iter().any(Option::is_some)
+    }
+
+    fn retained_custody_error(&self) -> Option<String> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let owns_children = state.entries.iter().any(Option::is_some)
+            || state.quarantined.iter().any(Option::is_some);
+        if !owns_children {
+            return None;
+        }
+        let suspended = state.entries.iter().flatten().any(|entry| entry.suspended);
+        if suspended || state.fatal || !state.worker_alive || state.failure.is_some() {
+            Some(state.failure.clone().unwrap_or_else(|| {
+                "Retained exact-child custody is suspended or its worker is unavailable".into()
+            }))
+        } else {
+            None
+        }
     }
 
     fn start(capacity: usize) -> io::Result<(Arc<Self>, JoinHandle<()>)> {
@@ -533,22 +563,22 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    struct TestService {
+    pub(crate) struct TestService {
         service: Arc<Service>,
         worker: Option<JoinHandle<()>>,
     }
     impl TestService {
-        fn new(capacity: usize) -> Self {
+        pub(crate) fn new(capacity: usize) -> Self {
             let (service, worker) = Service::start(capacity).unwrap();
             Self {
                 service,
                 worker: Some(worker),
             }
         }
-        fn free(&self) -> usize {
+        pub(crate) fn free(&self) -> usize {
             self.service.state.lock().unwrap().free.len()
         }
-        fn await_free(&self, expected: usize) {
+        pub(crate) fn await_free(&self, expected: usize) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.free() != expected {
                 assert!(
@@ -557,6 +587,30 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(2));
             }
+        }
+    }
+    impl TestService {
+        pub(crate) fn reserve(&self) -> io::Result<Reservation> {
+            self.service.reserve()
+        }
+        pub(crate) fn fail_wake(&self, fail: bool) {
+            self.service.fail_wake.store(fail, Ordering::Release);
+        }
+        pub(crate) fn is_suspended(&self, pid: u32) -> bool {
+            self.service
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .flatten()
+                .any(|entry| entry.child.id() == pid && entry.suspended)
+        }
+        pub(crate) fn retry_preserved(&self) -> io::Result<RetryReport> {
+            self.service.retry_preserved()
+        }
+        pub(crate) fn retained_custody_error(&self) -> Option<String> {
+            self.service.retained_custody_error()
         }
     }
     impl Drop for TestService {
@@ -679,6 +733,19 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    #[test]
+    fn failed_worker_without_retained_custody_is_not_a_shutdown_ownership_error() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.reserve().unwrap();
+        reaper
+            .service
+            .fail("fixture failed worker without retained child");
+        // An ordinary spawn credit alone is not retained child custody.
+        assert_eq!(reaper.retained_custody_error(), None);
+        drop(reservation);
+        assert_eq!(reaper.retained_custody_error(), None);
     }
 
     #[test]

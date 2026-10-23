@@ -220,7 +220,8 @@ fn render_with_helper(
         // This process may itself have been started with the UI launch
         // handshake set. Inheriting it would let the helper put a readiness
         // line on the stdout the frame is read from.
-        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
+        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV);
     // SAFETY: the hook performs only the close_range syscall before exec.
     unsafe {
         command.pre_exec(crate::daemon::seal_inherited_descriptors);

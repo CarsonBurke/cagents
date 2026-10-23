@@ -2314,19 +2314,31 @@ fn bare_refs(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
-/// Keeps the unused-import warning honest: `OsString` is only needed when this
-/// test inspects raw arguments, which the pathspec test does.
+/// Pathspec magic, whitespace, newlines and leading dashes remain literal
+/// paths in the NUL-delimited stdin protocol rather than becoming arguments.
 #[test]
-fn command_arguments_keep_pathspecs_as_single_arguments() {
+fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
     let service: RepositoryService<IsolatedExecutor> =
         RepositoryService::new("git", Arc::new(IsolatedExecutor(SystemProcessExecutor)));
     let command = service
-        .stage_command(Path::new("/repo"), &[path(":(top)magic.txt")])
+        .stage_command(
+            Path::new("/repo"),
+            &[
+                path(":(top)magic.txt"),
+                path("space name.txt"),
+                path("line\nbreak.txt"),
+                path("-leading.txt"),
+            ],
+        )
         .expect("stage command");
     assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
     assert_eq!(
-        command.arguments.last(),
-        Some(&OsString::from(":(top)magic.txt"))
+        &command.arguments[command.arguments.len() - 4..],
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from)
+    );
+    assert_eq!(
+        command.stdin.as_deref(),
+        Some(b":(top)magic.txt\0space name.txt\0line\nbreak.txt\0-leading.txt\0".as_slice())
     );
 }
 

@@ -243,7 +243,42 @@ then the actual configuration and build script follow A → B → A with the sam
 commit, different dirty sources, and old timestamps. It also verifies that an
 unchanged dependency remains cached. Pass `--evidence PATH` to retain the
 fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
-workloads.
+workloads. Its historical-producer control also demonstrates the supported
+package bootstrap below and checks that unrelated dependency bytes and mtimes
+remain unchanged.
+
+A historical checkout without the compile-time checkout anchor can replace a
+shared build-script executable. Returning to an anchored checkout can then
+rerun that historical body without recompiling it, even though relative inputs
+and the runtime manifest path are correct. The checkout identity does not
+retroactively repair that missing compiler dependency.
+
+If a selected package demonstrably lacks that anchor, or a source/body
+qualification shows this mismatch, explicitly admit a bootstrap for that
+package before trusting its generated output. First record the selected
+checkout commit and dirty diff, package name/version, Cargo version, effective
+`CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` (including Cargo config), exact
+isolated command and the mismatching observation. Stop other writers using
+those same build directories. From the selected checkout, run a package-scoped
+clean, then immediately repeat the **same isolated command** with the **same
+Cargo environment, profile, target and build directories**. For example, after
+identifying `libsqlite3-sys` as the affected package in a browserless UI check:
+
+```sh
+# Explicit maintenance operation: only after evidence identifies this package.
+cargo clean --package libsqlite3-sys
+CARGO_BUILD_JOBS=2 cargo check --locked --no-default-features --features ui --bin cagents-ui
+```
+
+Use `name@version` if the package name is ambiguous. Preserve the clean output,
+complete check output and the source/stamp or generated-body observation that
+originally detected the mismatch. A successful check alone does not prove that
+the expected source body or native behavior was selected. Recheck that same
+observation before using the artifacts, and retain the original failed result.
+This is an opt-in recovery for an identified package; do not add a global cache
+clean, change source mtimes, switch build directories during recovery, or
+infer a historical producer from timestamps. Other cached packages remain
+available, though Cargo may rebuild dependents of the selected package.
 
 ```sh
 # Reduce compilation concurrency further on a memory-constrained host.
@@ -275,6 +310,30 @@ Lowering Cargo concurrency does not reclaim memory held by other workloads or
 guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
+
+### Process scope isolation
+
+Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
+namespace. Before submitting one, the daemon connects to the fixed
+`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
+peer pidfd and active PID namespace to match this caller. The proof retains the
+connection, pidfd and namespace descriptor through the existing user-bus
+request. It does not infer the manager's identity from a bus broker, a nonzero
+peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+
+This relies on the existing trusted OS manager and its well-known user-bus
+service routing; it does not protect against a hostile same-user replacement
+of those OS services. The request's routing and launch authority are unchanged.
+If the peer, namespace ioctl or required access cannot be proved, no scope
+request is attempted and ordinary launch is retained without claiming separate
+OOM isolation. An actual request or membership failure in a proved context
+still reports failure. Scope-dependent tests report unqualified isolation when
+that same proof is unavailable, and keep their strict membership assertions
+when it is available. Kernel-peer regressions use private Unix sockets without
+submitting requests to the OS manager.
+
+See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
 
 ## Testing
 
@@ -354,11 +413,19 @@ built executable.
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session
 bus and receives clicks as `org.freedesktop.Application.ActivateAction` calls
-carrying the notification server's activation token, so the compositor raises
-the window. The portal only accepts IDs with an installed desktop entry; without
+carrying the notification server's activation token, which the compositor
+validates before granting foreground activation. The portal only accepts IDs with an installed desktop entry; without
 `dev.cagents.Cagents.Development.desktop`, development alerts fall back to the
 portal's `ActionInvoked` signal, which still selects the pane but may carry no
 token, and Wayland compositors such as niri then leave the window unraised.
+
+Successful registration and action routing do not guarantee foreground activation.
+Native validation with KWin 6.4.4 and COSMIC Notifications alpha 7 observed the
+correct conversation and acknowledgment while the notification service returned
+a refused activation token and ordinary X11 activation requests left the window
+behind the active window. The existing-window X11 path does not yet propagate an
+X11 startup-notification ID; granted foreground activation on this combination
+remains unverified. Focus remains subject to the compositor's policy.
 
 Standalone Ceditor review alerts use the shared daemon notification broker. The
 `--review-alerts` runner builds the CLI, daemon, and editor in separate feature

@@ -38,6 +38,7 @@ host = [
     "dep:imara-diff",
     "dep:ksni",
     "dep:libghostty-vt",
+    "dep:notify",
     "dep:portable-pty",
     "dep:rusqlite",
     "dep:tokio",
@@ -77,7 +78,6 @@ ui = [
     "dep:unicode-linebreak",
     "dep:unicode-casefold",
     "dep:yaml-rust",
-    "dep:unicode-width",
     "dep:unicode-segmentation",
 ]
 integrated-browser = [
@@ -135,7 +135,7 @@ cagents-browser-import = { path = "crates/browser-import", features = ["desktop-
 cookie = { version = "0.18", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
-unicode-width = { version = "0.2.2", optional = true }
+unicode-width = "0.2.2"
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
@@ -184,6 +184,8 @@ portable-pty = { version = "0.9", features = ["serde_support"], optional = true 
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Shared bounded notification excerpts use the same CommonMark parser as the UI.
+pulldown-cmark = { version = "0.12.2", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }
@@ -280,3 +282,7 @@ harfrust = { path = "vendor/harfrust" }
 [patch."https://github.com/wash2/accesskit"]
 accesskit_unix = { path = "vendor/accesskit-unix" }
 accesskit_atspi_common = { path = "vendor/accesskit-atspi-common" }
+
+# Keep the clipboard worker alive when an input device is removed (#1464).
+[patch."https://github.com/pop-os/smithay-clipboard"]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }

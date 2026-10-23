@@ -1,5 +1,6 @@
 //! Retained, selectable read-only tool content. Copy always uses the snapshot.
 use super::*;
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Language {
@@ -55,6 +56,46 @@ pub(super) struct Preview {
     theme: crate::settings::EditorSyntaxTheme,
 }
 
+/// A tool's short target when the input supplies one; otherwise describe
+/// the disclosure without promoting arbitrary payload text into the transcript.
+fn tool_preview(input: &str) -> String {
+    // Bound all inspection, including trimming a whitespace-only JSON prefix
+    // that Claude can publish before the rest of its streamed input arrives.
+    if input.len() > CachedItem::HIGHLIGHT_LIMIT {
+        return "Input available".into();
+    }
+    if input.trim().is_empty() {
+        return String::new();
+    }
+    let object = serde_json::from_str::<serde_json::Value>(input).ok();
+    let Some(object) = object.as_ref().and_then(serde_json::Value::as_object) else {
+        return "Input available".into();
+    };
+    for key in [
+        "file_path",
+        "path",
+        "url",
+        "query",
+        "pattern",
+        "skill",
+        "subject",
+    ] {
+        if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
+            let value = value.trim();
+            // Long prose and multiline documents are detail, even when a
+            // provider uses a familiar target field for them.
+            if !value.is_empty() && value.chars().count() <= 120 && !value.contains(['\n', '\r']) {
+                return value.to_owned();
+            }
+        }
+    }
+    match object.len() {
+        0 => String::new(),
+        1 => "1 input field".into(),
+        count => format!("{count} input fields"),
+    }
+}
+
 impl Preview {
     pub(super) fn update(
         previous: Option<Self>,
@@ -70,24 +111,52 @@ impl Preview {
                 action: chat::CommandAction::Run,
                 output,
                 ..
-            } if label.is_empty() || label == command => {
-                (turn::first_line(command), Language::Shell, output.as_str())
-            }
+            } if label.is_empty() || label == command => (
+                Cow::Borrowed(turn::first_line(command)),
+                Language::Shell,
+                output.as_str(),
+            ),
             ItemContent::Command {
                 action: chat::CommandAction::Run,
                 output,
                 ..
-            } => (turn::step_label(content), Language::Plain, output.as_str()),
+            } => (
+                Cow::Borrowed(turn::step_label(content)),
+                Language::Plain,
+                output.as_str(),
+            ),
             // The last line of a file that was read, or of a search's
             // matches, says nothing about how the step went.
-            ItemContent::Command { .. } => (turn::step_label(content), Language::Plain, ""),
-            // The row already names the tool, so its second line is what
-            // the tool was called with. That stays once there is output: a
-            // name alone does not tell one call of a tool from the next.
-            ItemContent::Tool { input, output, .. } => {
-                (input.as_str(), Language::structured(input), output.as_str())
-            }
-            _ => (turn::step_label(content), Language::Plain, ""),
+            ItemContent::Command { .. } => (
+                Cow::Borrowed(turn::step_label(content)),
+                Language::Plain,
+                "",
+            ),
+            // Unknown tools can carry prompts, entire documents, and protocol
+            // framing. Their raw arguments and successful output belong to
+            // the explicit Input/Output disclosure, not the closed row.
+            ItemContent::Tool {
+                input,
+                output,
+                status,
+                ..
+            } => (
+                Cow::Owned(tool_preview(input)),
+                Language::Plain,
+                if matches!(
+                    status,
+                    chat::ToolStatus::Failed | chat::ToolStatus::Denied | chat::ToolStatus::Stopped
+                ) {
+                    output.as_str()
+                } else {
+                    ""
+                },
+            ),
+            _ => (
+                Cow::Borrowed(turn::step_label(content)),
+                Language::Plain,
+                "",
+            ),
         };
         // Bound preview work independently of the complete source kept for
         // expansion and copying. Layout also caps wrapped text at two rows.
@@ -99,7 +168,7 @@ impl Preview {
             }
             text
         };
-        let text = bounded(source);
+        let text = bounded(&source);
         let tail = bounded(
             output
                 .rsplit('\n')
@@ -545,12 +614,7 @@ mod tests {
                 Language::Plain,
                 "",
             ),
-            (
-                tool("{\"query\":\"x\"}"),
-                "{\"query\":\"x\"}",
-                Language::Json,
-                "",
-            ),
+            (tool("{\"query\":\"x\"}"), "x", Language::Plain, ""),
         ] {
             let preview = Preview::update(None, &content, theme);
             assert_eq!(
@@ -568,7 +632,7 @@ mod tests {
         if let ItemContent::Tool { output, .. } = &mut finished {
             *output = "first\nlast\n".into();
         }
-        // A finished tool is still the call it was, with its output under it.
+        // Successful generic output stays in the explicit disclosure.
         let preview = Preview::update(None, &finished, theme);
         assert_eq!(
             (
@@ -576,7 +640,7 @@ mod tests {
                 preview.language,
                 preview.tail.as_str()
             ),
-            ("{\"query\":\"x\"}", Language::Json, "last")
+            ("x", Language::Plain, "")
         );
         // New output moves the tail and leaves the highlighted command alone.
         let before = Preview::update(None, &command("", "cargo test", Run, "one\n"), theme);
@@ -588,6 +652,84 @@ mod tests {
         );
         assert_eq!(after.tail, "two");
         assert!(Arc::ptr_eq(&spans, after.block.spans(true)));
+    }
+
+    #[test]
+    fn generic_tool_payloads_stay_in_disclosure_across_streaming_and_completion() {
+        let theme = crate::settings::EditorSyntaxTheme::Auto;
+        let input = serde_json::json!({
+            "path": "src/app.rs",
+            "prompt": "Internal framing\n".repeat(600),
+        })
+        .to_string();
+        let output = "Complete document\nInternal protocol framing";
+        let mut content = tool(&input);
+        for status in [chat::ToolStatus::Running, chat::ToolStatus::Succeeded] {
+            if let ItemContent::Tool {
+                status: current,
+                output: body,
+                ..
+            } = &mut content
+            {
+                *current = status;
+                *body = output.into();
+            }
+            let preview = Preview::update(None, &content, theme);
+            assert_eq!(preview.text, "src/app.rs");
+            assert!(preview.tail.is_empty());
+            let closed = CachedItem::updated(&content, theme, None, false, false, None);
+            assert!(closed.tool_input.is_none());
+            let open = CachedItem::updated(&content, theme, Some(closed), true, false, None);
+            assert_eq!(open.tool_input.as_ref().unwrap().text.as_ref(), input);
+            assert_eq!(open.tool_output.as_ref().unwrap().text.as_ref(), output);
+            assert_eq!(
+                copy_text(CopyPart::Input, &content).as_deref(),
+                Some(input.as_str())
+            );
+            assert_eq!(
+                copy_text(CopyPart::Output, &content).as_deref(),
+                Some(output)
+            );
+        }
+        // An incomplete JSON prefix never flashes its prompt onto the row.
+        let prefix = tool(r#"{"prompt":"Internal framing"#);
+        assert_eq!(
+            Preview::update(None, &prefix, theme).text,
+            "Input available"
+        );
+        // Unknown fields and multiline values disclose their structure only.
+        for (input, expected) in [
+            (
+                r#"{"prompt":"Internal framing","body":"document"}"#,
+                "2 input fields",
+            ),
+            (r#"{"query":"first\nsecond"}"#, "1 input field"),
+            (
+                r#"{"skill":"writing-copy","args":"Internal framing"}"#,
+                "writing-copy",
+            ),
+        ] {
+            assert_eq!(Preview::update(None, &tool(input), theme).text, expected);
+        }
+    }
+
+    #[test]
+    fn generic_tool_failures_keep_actionable_output_visible() {
+        for status in [
+            chat::ToolStatus::Failed,
+            chat::ToolStatus::Denied,
+            chat::ToolStatus::Stopped,
+        ] {
+            let content = ItemContent::Tool {
+                name: "mcp__fixture__inspect".into(),
+                input: r#"{"path":"src/app.rs","prompt":"internal framing"}"#.into(),
+                output: "Attempted read\nPermission denied\n".into(),
+                status,
+            };
+            let preview = Preview::update(None, &content, crate::settings::EditorSyntaxTheme::Auto);
+            assert_eq!(preview.text, "src/app.rs");
+            assert_eq!(preview.tail, "Permission denied");
+        }
     }
 
     #[test]
@@ -691,18 +833,38 @@ mod tests {
             &tool(&large),
             crate::settings::EditorSyntaxTheme::Auto,
         );
-        assert_eq!(preview.text.chars().count(), 513);
-        assert!(preview.text.ends_with('…'));
+        assert_eq!(preview.text, "Input available");
+        // A partial JSON stream can consist entirely of whitespace; it is
+        // still bounded before inspecting any of those bytes.
+        let whitespace = " ".repeat(CachedItem::HIGHLIGHT_LIMIT + 1);
+        assert_eq!(
+            Preview::update(
+                None,
+                &tool(&whitespace),
+                crate::settings::EditorSyntaxTheme::Auto
+            )
+            .text,
+            "Input available"
+        );
+        assert!(
+            Preview::update(
+                None,
+                &tool(" \n\t"),
+                crate::settings::EditorSyntaxTheme::Auto
+            )
+            .text
+            .is_empty()
+        );
     }
 
     #[test]
-    fn structured_preview_has_syntax_in_both_palettes_and_rethemes() {
+    fn shell_preview_has_syntax_in_both_palettes_and_rethemes() {
         let mut preview = Preview::update(
             None,
-            &tool("{\"message\":\"hello\",\"count\":42}"),
+            &command("", "cargo test --locked", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::InspiredGitHub,
         );
-        assert_eq!(preview.language, Language::Json);
+        assert_eq!(preview.language, Language::Shell);
         for dark in [false, true] {
             assert!(preview.block.spans(dark).len() > 1);
         }
@@ -724,9 +886,15 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .expect("headless renderer");
-        for text in ["longword".repeat(100), "one\ntwo\nthree\nfour".into()] {
-            let preview =
-                Preview::update(None, &tool(&text), crate::settings::EditorSyntaxTheme::Auto);
+        for text in [
+            "longword".repeat(100),
+            "one two three four five six seven eight nine ten".into(),
+        ] {
+            let preview = Preview::update(
+                None,
+                &command("", &text, chat::CommandAction::Run, ""),
+                crate::settings::EditorSyntaxTheme::Auto,
+            );
             let mut element = preview.view();
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -743,7 +911,7 @@ mod tests {
         }
         let preview = Preview::update(
             None,
-            &tool("short"),
+            &command("", "short", chat::CommandAction::Run, ""),
             crate::settings::EditorSyntaxTheme::Auto,
         );
         let mut element = preview.view();

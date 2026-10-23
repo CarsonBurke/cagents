@@ -385,6 +385,7 @@ struct PublishedState {
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
     transcript_location: OnceLock<crate::transcript_location::ValidatedTranscript>,
@@ -429,6 +430,7 @@ impl PublishedState {
             shutdown_requested: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
@@ -793,6 +795,17 @@ impl TerminalHandle {
         config: TerminalConfig,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_with_execution(session, config, None, wake)
+    }
+
+    /// Only validated checkpoint/holder callers can separate the issued
+    /// descriptor from the exact recipe the worker must execute and track.
+    pub(crate) fn spawn_with_execution(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
         super::reactor::runtime().map_err(TerminalStartError::Worker)?;
@@ -812,7 +825,14 @@ impl TerminalHandle {
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(session, config, command_rx, event_tx, worker_published);
+                let result = Worker::start(
+                    session,
+                    config,
+                    execution_recipe,
+                    command_rx,
+                    event_tx,
+                    worker_published,
+                );
                 match result {
                     Ok(worker) => {
                         let _ = startup_tx.send(Ok(()));
@@ -967,6 +987,7 @@ impl TerminalHandle {
             let mut worker = Worker::start(
                 session,
                 TerminalConfig::default(),
+                None,
                 receiver,
                 events,
                 worker_published,
@@ -1363,7 +1384,12 @@ impl TerminalHandle {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if super::holder::cleanup::confirmed(source, expected, proof)? {
+            if super::holder::cleanup::confirmed_with_role(
+                source,
+                expected,
+                proof,
+                self.inner.published.original_holder_role.get(),
+            )? {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -1650,10 +1676,18 @@ impl Worker {
     fn start(
         session: TerminalSession,
         config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
         commands: Receiver<Command>,
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
     ) -> Result<Self, String> {
+        if config
+            .holder_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.execution_recipe.as_ref() != execution_recipe.as_ref())
+        {
+            return Err("Terminal execution does not match its retained holder context".into());
+        }
         let current_size = TerminalSize {
             columns: config.columns.max(1),
             rows: config.rows.max(1),
@@ -1708,22 +1742,25 @@ impl Worker {
             })
             .map_err(|error| format!("register working directory effect: {error}"))?;
 
+        let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
             Some(environment) => {
-                let mut command = CommandBuilder::new(&session.launch.program);
-                command.args(&session.launch.arguments);
-                command.cwd(&session.launch.working_directory);
+                let mut command = CommandBuilder::new(&execution.program);
+                command.args(&execution.arguments);
+                command.cwd(&execution.working_directory);
                 command.env_clear();
                 for (name, value) in &environment.0 {
-                    command.env(name, value);
+                    if !execution.unset_environment.contains(name) {
+                        command.env(name, value);
+                    }
                 }
                 scrub_inherited_markers(&mut command);
                 terminal_environment(&mut command);
                 command
             }
-            None => command_from_recipe(&session.launch),
+            None => command_from_recipe(&execution),
         };
-        for name in crate::account::launch_credential_overrides(&session.launch) {
+        for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
@@ -1743,7 +1780,7 @@ impl Worker {
             "CAGENTS_RECOVERY_ORIGIN",
             session.recovery_origin.unwrap_or(session.id).to_string(),
         );
-        let executable = interactive_shell_launch(&session.launch)
+        let executable = interactive_shell_launch(&execution)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
@@ -1785,9 +1822,9 @@ impl Worker {
                     skill_environment.insert("HOME".into(), home.into());
                 }
                 crate::agent_execution::bundled::install(
-                    crate::agent::Provider::from_program(&session.launch.program),
+                    crate::agent::Provider::from_program(&execution.program),
                     &skill_environment,
-                    &session.launch.working_directory,
+                    &execution.working_directory,
                 );
                 if let Some(path) = crate::agent_execution::bundled::matched_path(
                     command.get_env("PATH").and_then(|value| value.to_str()),
@@ -1853,6 +1890,9 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
         held.holder.commit_adoption()?;
+        if let Some(role) = held.holder.original_role() {
+            let _ = published.original_holder_role.set(role.clone());
+        }
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }
@@ -1863,7 +1903,7 @@ impl Worker {
 
         Ok(Self {
             terminal_id: session.id,
-            resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
+            resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&execution),
             resume_foreground: None,
             foreground_poll: FOREGROUND_POLL_MIN,
             last_foreground_observation: std::time::Instant::now(),
@@ -1872,7 +1912,7 @@ impl Worker {
             display_title: String::new(),
             agent_exited: false,
             root_exit: None,
-            launch: session.launch,
+            launch: execution,
             terminal,
             theme,
             key_encoder,
@@ -1937,6 +1977,7 @@ impl Worker {
     fn run_to_completion(mut self) -> WorkerCompletion {
         // An adopted terminal's title, set by drawing its screen again.
         self.drain_effects();
+        self.publish_fallback_title();
         if self.visibility == Visibility::Visible {
             self.publish_snapshot(true);
         }
@@ -2826,9 +2867,10 @@ impl Worker {
                 }
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
-                    let path = working_directory_path(raw, local_host_name());
+                    let path = working_directory_path(raw, crate::file_url::host_name);
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
+                        self.publish_fallback_title();
                     }
                 }
                 Effect::Title(title) => {
@@ -2884,6 +2926,27 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    /// OSC titles win. Shells that do not publish one still expose the
+    /// foreground command through the PTY owner's existing observation timer.
+    fn publish_fallback_title(&mut self) {
+        if self
+            .terminal
+            .title()
+            .is_ok_and(|title| !title.trim().is_empty())
+        {
+            return;
+        }
+        let group = self.foreground_group();
+        let title = foreground_process_title(group, &self.launch);
+        if self.foreground_group() != group {
+            return;
+        }
+        if title != self.display_title {
+            self.display_title = title.clone();
+            self.emit(TerminalEvent::TitleChanged(title));
         }
     }
 
@@ -3044,6 +3107,7 @@ impl Worker {
             self.foreground_poll = (self.foreground_poll * 2).min(FOREGROUND_POLL_MAX);
         }
         self.refresh_resume_hint(true);
+        self.publish_fallback_title();
         if self.visibility != Visibility::Visible {
             self.foreground_poll = FOREGROUND_POLL_MAX;
         }
@@ -3122,6 +3186,42 @@ impl Worker {
         self.set_agent_activity(None);
         self.emit(TerminalEvent::Error { operation, message });
     }
+}
+
+fn foreground_process_title(group: Option<libc::pid_t>, launch: &LaunchRecipe) -> String {
+    #[cfg(target_os = "linux")]
+    let (process, directory) = match group.filter(|group| *group > 0) {
+        Some(group) => {
+            // The group comes from this PTY's tcgetpgrp. Two bounded reads
+            // avoid a process-tree scan for ordinary shells.
+            let process = std::fs::read_to_string(format!("/proc/{group}/comm"))
+                .ok()
+                .and_then(|name| crate::names::normalize_card_name(name.trim()));
+            (
+                process,
+                std::fs::read_link(format!("/proc/{group}/cwd")).ok(),
+            )
+        }
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (process, directory): (Option<String>, Option<PathBuf>) = {
+        let _ = group;
+        (None, None)
+    };
+    let process = process.unwrap_or_else(|| {
+        std::path::Path::new(&launch.program)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let directory = directory.as_deref().unwrap_or(&launch.working_directory);
+    let basename = directory
+        .file_name()
+        .unwrap_or(directory.as_os_str())
+        .to_string_lossy();
+    format!("{process} · {basename}")
 }
 
 fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) -> String {
@@ -3999,39 +4099,17 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
     }
 }
 
-fn local_host_name() -> Option<&'static str> {
-    static NAME: OnceLock<Option<String>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let mut buffer = [0u8; 256];
-        // SAFETY: gethostname receives a valid writable buffer and its size.
-        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-            return None;
-        }
-        // An unterminated truncated hostname must not match a different host.
-        std::ffi::CStr::from_bytes_until_nul(&buffer)
-            .ok()?
-            .to_str()
-            .ok()
-            .map(str::to_owned)
-    })
-    .as_deref()
-}
-
-fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf> {
-    if let Ok(uri) = url::Url::parse(raw) {
+/// `local_host` is asked only when the URL names a host; see
+/// [`crate::file_url::localize`].
+fn working_directory_path<S: AsRef<str>>(
+    raw: &str,
+    local_host: impl FnOnce() -> Option<S>,
+) -> Option<PathBuf> {
+    if let Ok(mut uri) = url::Url::parse(raw) {
         if uri.scheme() != "file" {
             return None;
         }
-        if uri
-            .host_str()
-            .zip(local_host)
-            .is_some_and(|(host, local)| host.eq_ignore_ascii_case(local))
-        {
-            return url::Url::parse(&format!("file://{}", uri.path()))
-                .ok()?
-                .to_file_path()
-                .ok();
-        }
+        crate::file_url::localize(&mut uri, local_host);
         uri.to_file_path().ok()
     } else {
         let path = PathBuf::from(raw);
@@ -4054,6 +4132,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn fallback_process_title_uses_launch_when_foreground_is_unavailable() {
+        let mut launch = LaunchRecipe::shell(PathBuf::from("/repo/alpha")).unwrap();
+        launch.program = "/usr/bin/fish".into();
+        assert_eq!(
+            super::foreground_process_title(None, &launch),
+            "fish · alpha"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_process_title_tracks_foreground_process_directory() {
+        use std::os::unix::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let foreground_directory = directory.path().join("alpha");
+        std::fs::create_dir(&foreground_directory).unwrap();
+        let mut launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        launch.program = "/bin/false".into();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .current_dir(&foreground_directory)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let title = super::foreground_process_title(Some(child.id() as libc::pid_t), &launch);
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert_eq!(title, "sleep · alpha");
+    }
 
     #[test]
     fn a_second_search_window_cannot_cancel_the_first_windows_query() {
@@ -4084,19 +4193,25 @@ mod tests {
             "file://workstation/tmp/my%20project"
         );
         assert_eq!(
-            working_directory_path(terminal.pwd().unwrap(), Some("WORKSTATION")),
+            working_directory_path(terminal.pwd().unwrap(), || Some("WORKSTATION")),
             Some(PathBuf::from("/tmp/my project"))
         );
         assert_eq!(
-            working_directory_path("file://remote/tmp/project", Some("workstation")),
+            working_directory_path("file://remote/tmp/project", || Some("workstation")),
             None
         );
+        // Only a directory named by host needs this machine's name.
+        let unasked = || -> Option<&str> { panic!("no host to compare") };
         assert_eq!(
-            working_directory_path("file://localhost/tmp/project", None),
+            working_directory_path("file://localhost/tmp/project", unasked),
             Some(PathBuf::from("/tmp/project"))
         );
         assert_eq!(
-            working_directory_path("/tmp/project", None),
+            working_directory_path("file:///tmp/project", unasked),
+            Some(PathBuf::from("/tmp/project"))
+        );
+        assert_eq!(
+            working_directory_path("/tmp/project", unasked),
             Some(PathBuf::from("/tmp/project"))
         );
     }
@@ -4512,6 +4627,7 @@ mod tests {
                         relaunches: Vec::new(),
                         options: crate::terminal::TerminalSpawnOptions::default(),
                         execution_environment: None,
+                        execution_recipe: None,
                     },
                     None,
                 )
@@ -4850,7 +4966,7 @@ mod tests {
         let (events, receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         (
-            Worker::start(session, config, commands, events, published).unwrap(),
+            Worker::start(session, config, None, commands, events, published).unwrap(),
             receiver,
         )
     }
@@ -6669,7 +6785,7 @@ mod tests {
         let (_tx, commands) = command_channel(1);
         let (events, _receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
-        let failure = Worker::start(session, config, commands, events, published)
+        let failure = Worker::start(session, config, None, commands, events, published)
             .err()
             .expect("removed account blocks PTY creation");
         assert!(failure.contains("removed"), "{failure}");

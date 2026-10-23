@@ -442,6 +442,10 @@ impl Cagents {
     }
 
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
+        if self.operation_recovery_pending() {
+            return Some("Finish or resolve retained file operations before updating this window.");
+        }
+
         if self.other_modal_is_open()
             || self.has_active_worktree_operations()
             || self.project_ui.deletion_running()
@@ -466,6 +470,11 @@ impl Cagents {
                 }
                 CardRuntime::Chat(chat) => {
                     if let Some(reason) = chat.restart_blocker() {
+                        return Some(reason);
+                    }
+                }
+                CardRuntime::PullRequests(pane) => {
+                    if let Some(reason) = pane.review.restart_blocker() {
                         return Some(reason);
                     }
                 }
@@ -754,13 +763,15 @@ impl Cagents {
                     channel.map_or_else(Task::none, |channel| self.select_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
             }
-            Action::CopyDetails => self
-                .update_ui
-                .confirmation
-                .as_ref()
-                .map_or_else(Task::none, |confirmation| {
-                    iced::clipboard::write(preview_details(&confirmation.preview))
-                }),
+            Action::CopyDetails => {
+                self.update_ui
+                    .confirmation
+                    .as_ref()
+                    .map_or_else(Task::none, |confirmation| {
+                        chat_ui::invalidate_copy_intent();
+                        iced::clipboard::write(preview_details(&confirmation.preview))
+                    })
+            }
             Action::ReviewJob => {
                 self.update_ui.set_aside = None;
                 if !self.other_modal_is_open() {

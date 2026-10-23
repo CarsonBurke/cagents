@@ -90,6 +90,14 @@ pub struct ManagedDisplay {
     pub pane: Option<Pane>,
 }
 
+/// Exact surface selected for explicit user activation. The daemon's primary
+/// session owns first display; saved canonical membership owns later display.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivationDisplay {
+    pub display: ManagedDisplay,
+    pub session: crate::agent_execution::HostedSession,
+}
+
 /// Resolve against the incoming authoritative snapshot, before local adoption.
 /// Canonical identity bounds the lookup; legacy inventory aliases are reconciled
 /// separately. A removed, replaced or ambiguous pane grants no fallback authority.
@@ -172,7 +180,114 @@ impl<'a> ManagedDisplayIndex<'a> {
         Some(ManagedDisplay { scope, pane })
     }
 
+    /// Explicit activation supplies an exact current proved counterpart. Saved
+    /// membership still owns the surface; an unpublished actor uses this typed
+    /// request rather than inferring a session from its original launch surface.
+    pub fn resolve_activation(
+        &self,
+        agent: &crate::agent_execution::Agent,
+        requested: &crate::agent_execution::HostedSession,
+    ) -> Option<ManagedDisplay> {
+        use crate::agent_execution::HostedSession;
+        if agent.closed || !requested.has_complete_proof() {
+            return None;
+        }
+        let owned = agent
+            .session
+            .as_ref()
+            .is_some_and(|current| current.same_process(requested))
+            || agent.console.as_ref().is_some_and(|current| {
+                HostedSession::Terminal(current.clone()).same_process(requested)
+            });
+        if !owned {
+            return None;
+        }
+        let resource = match requested {
+            HostedSession::Chat(session) => (0, session.id),
+            HostedSession::Terminal(session) => (1, session.id),
+        };
+        let scope = self.scope_with_resource(agent, Some(resource))?.clone();
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let pane = self
+            .owners
+            .get(&id)
+            .and_then(Option::as_ref)
+            .map(|(_, pane)| (*pane).clone());
+        Some(ManagedDisplay { scope, pane })
+    }
+
+    /// Resolve an untyped notification UUID without guessing a surface from a
+    /// launch preference. Both descriptors of a live pair must remain proved.
+    pub fn activation_display(
+        &self,
+        agent: &crate::agent_execution::Agent,
+        requested_id: crate::model::TerminalId,
+    ) -> Option<ActivationDisplay> {
+        use crate::agent_execution::HostedSession;
+        let console = agent.console.clone().map(HostedSession::Terminal);
+        if agent
+            .session
+            .iter()
+            .chain(console.iter())
+            .any(|owner| !owner.has_complete_proof())
+        {
+            return None;
+        }
+        let requested = agent
+            .session
+            .iter()
+            .chain(console.iter())
+            .find(|owner| owner.id() == requested_id)?;
+        let display = self.resolve_activation(agent, requested)?;
+        let session = match display.pane.as_ref().map(|pane| &pane.kind) {
+            Some(CardKind::Chat(session)) => HostedSession::Chat(session.clone()),
+            Some(CardKind::Terminal(session)) => HostedSession::Terminal(session.clone()),
+            Some(_) => return None,
+            None => agent.session.as_ref().or(console.as_ref())?.clone(),
+        };
+        if !session.has_complete_proof() {
+            return None;
+        }
+        if display.pane.is_none() {
+            // A secondary console can already be shown under an inventory
+            // alias even when the requested UUID selects the primary chat.
+            // Leave every owned typed alias to shared reconciliation before
+            // treating this actor as unpublished. Saved canonical panes above
+            // retain authority over their actual surface.
+            let canonical = CardId::from_uuid(agent.id.as_uuid());
+            for owner in agent.session.iter().chain(console.iter()) {
+                let resource = match owner {
+                    HostedSession::Chat(session) => (0, session.id),
+                    HostedSession::Terminal(session) => (1, session.id),
+                };
+                if self
+                    .resources
+                    .get(&resource)
+                    .is_some_and(|cards| cards.iter().any(|card| *card != canonical))
+                {
+                    return None;
+                }
+            }
+            let primary = self.resolve_activation(agent, &session)?;
+            if primary.scope != display.scope || primary.pane.is_some() {
+                return None;
+            }
+        }
+        Some(ActivationDisplay { display, session })
+    }
+
     pub fn scope<'b>(&self, agent: &'b crate::agent_execution::Agent) -> Option<&'b Scope>
+    where
+        'a: 'b,
+    {
+        self.scope_with_resource(agent, None)
+    }
+
+    fn scope_with_resource<'b>(
+        &self,
+        agent: &'b crate::agent_execution::Agent,
+        requested: Option<(u8, crate::model::TerminalId)>,
+    ) -> Option<&'b Scope>
     where
         'a: 'b,
     {
@@ -184,6 +299,8 @@ impl<'a> ManagedDisplayIndex<'a> {
         };
         let resource = if let Some((_, pane)) = owner {
             pane_resource(&pane.kind)?
+        } else if let Some(requested) = requested {
+            requested
         } else if agent.spec.surface == Surface::Terminal {
             (1, agent.console.as_ref()?.id)
         } else {
@@ -343,6 +460,14 @@ pub enum Change {
 }
 
 impl View {
+    /// Stable conversation identity: utilities never displace the first chat.
+    pub fn primary_chat(&self) -> Option<CardId> {
+        self.panes
+            .iter()
+            .find(|pane| matches!(pane.kind, CardKind::Chat(_)) && !self.retired.contains(&pane.id))
+            .map(|pane| pane.id)
+    }
+
     pub fn empty(scope: impl Into<Scope>) -> Self {
         Self {
             scope: scope.into(),
@@ -546,6 +671,7 @@ mod wire_kind {
         Settings,
         Accounts,
         Automations,
+        Work,
     }
     pub(super) fn serialize<S: serde::Serializer>(
         kind: &CardKind,
@@ -573,6 +699,7 @@ mod wire_kind {
             CardKind::Settings => Kind::Settings,
             CardKind::Accounts => Kind::Accounts,
             CardKind::Automations => Kind::Automations,
+            CardKind::Work => Kind::Work,
         };
         kind.serialize(serializer)
     }
@@ -611,6 +738,7 @@ mod wire_kind {
             Kind::Settings => CardKind::Settings,
             Kind::Accounts => CardKind::Accounts,
             Kind::Automations => CardKind::Automations,
+            Kind::Work => CardKind::Work,
         })
     }
 }
@@ -833,6 +961,264 @@ mod managed_display_tests {
                     "display resolution cannot rewrite accepted execution ownership"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn attention_explicit_counterpart_activation_preserves_saved_surface_and_proof_fences() {
+        let (agent, native, terminal) = fixture();
+        let current_native = agent.session.clone().unwrap();
+        let current_console = HostedSession::Terminal(agent.console.clone().unwrap());
+        for pane in [native.clone(), terminal.clone()] {
+            let scope = Scope::Channel(ChannelId::new());
+            let mut model = super::super::WorkspaceModel {
+                views: vec![View {
+                    scope: scope.clone(),
+                    revision: 1,
+                    panes: vec![pane.clone()],
+                    retired: vec![],
+                }],
+                ..Default::default()
+            };
+            for requested in [&current_native, &current_console] {
+                let display = ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, requested)
+                    .unwrap();
+                assert_eq!(display.scope, scope);
+                assert_eq!(
+                    display.pane.as_ref(),
+                    Some(&pane),
+                    "a current counterpart cannot change the saved surface"
+                );
+            }
+            let mut stale = current_native.clone();
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof.as_mut().unwrap().host_incarnation =
+                    HostIncarnation::new("stale-owner");
+            }
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, &stale)
+                    .is_none()
+            );
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof = None;
+            }
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, &stale)
+                    .is_none()
+            );
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof = Some(HostSessionProof {
+                    host_session_id: HostSessionId::new(""),
+                    boot_id: BootId::new(""),
+                    host_incarnation: HostIncarnation::new(""),
+                });
+            }
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, &stale)
+                    .is_none()
+            );
+            let mut unproved_agent = agent.clone();
+            unproved_agent.session = Some(stale.clone());
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&unproved_agent, &stale)
+                    .is_none(),
+                "matching empty current and requested proofs cannot authorize the proved console pane"
+            );
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof = None;
+            }
+            unproved_agent.session = Some(stale.clone());
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&unproved_agent, &stale)
+                    .is_none(),
+                "matching absent proofs are equality, not issued live ownership"
+            );
+            model.views.push(model.views[0].clone());
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, &current_native)
+                    .is_none()
+            );
+            model.views.truncate(1);
+            model.views[0].panes.clear();
+            model.views[0].retired.push(pane.id);
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .resolve_activation(&agent, &current_console)
+                    .is_none()
+            );
+        }
+        let empty = super::super::WorkspaceModel::default();
+        let mut native_only = agent.clone();
+        native_only.spec.surface = Surface::Terminal;
+        native_only.console = None;
+        let display = ManagedDisplayIndex::new(&empty)
+            .resolve_activation(&native_only, &current_native)
+            .unwrap();
+        assert_eq!(display.scope, agent.placement);
+        assert!(
+            display.pane.is_none(),
+            "unpublished activation uses exact current request, not historical spec.surface"
+        );
+        let mut alias = terminal;
+        alias.id = CardId::new();
+        let aliases = super::super::WorkspaceModel {
+            views: vec![View {
+                scope: Scope::Channel(ChannelId::new()),
+                revision: 1,
+                panes: vec![alias],
+                retired: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            ManagedDisplayIndex::new(&aliases)
+                .resolve_activation(&agent, &current_console)
+                .is_none(),
+            "an unpublished explicit counterpart cannot duplicate an existing inventory alias"
+        );
+    }
+
+    #[test]
+    fn attention_initial_activation_uses_proved_primary_and_preserves_saved_console() {
+        let (mut agent, native, terminal) = fixture();
+        agent.spec.surface = Surface::Terminal;
+        let original = agent.clone();
+        let model = super::super::WorkspaceModel::default();
+        let id = agent.session.as_ref().unwrap().id();
+        let resolved = ManagedDisplayIndex::new(&model)
+            .activation_display(&agent, id)
+            .unwrap();
+        assert!(resolved.display.pane.is_none());
+        assert_eq!(
+            resolved.session,
+            agent.session.clone().unwrap(),
+            "typed primary beats historical surface preference and secondary console"
+        );
+        assert_eq!(agent, original);
+        let saved = super::super::WorkspaceModel {
+            views: vec![View {
+                scope: agent.placement.clone(),
+                revision: 1,
+                panes: vec![terminal.clone()],
+                retired: vec![],
+            }],
+            ..Default::default()
+        };
+        let resolved = ManagedDisplayIndex::new(&saved)
+            .activation_display(&agent, id)
+            .unwrap();
+        assert_eq!(resolved.display.pane, Some(terminal.clone()));
+        assert_eq!(
+            resolved.session,
+            HostedSession::Terminal(agent.console.clone().unwrap())
+        );
+        for incomplete_primary in [true, false] {
+            let mut invalid = agent.clone();
+            if incomplete_primary {
+                if let Some(HostedSession::Chat(session)) = &mut invalid.session {
+                    session.proof = None;
+                }
+            } else {
+                let console = invalid.console.as_mut().unwrap();
+                console.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: console.launch.clone(),
+                    last_exit: None,
+                };
+            }
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .activation_display(&invalid, id)
+                    .is_none()
+            );
+            assert!(
+                ManagedDisplayIndex::new(&saved)
+                    .activation_display(&invalid, id)
+                    .is_none()
+            );
+        }
+        let retired = super::super::WorkspaceModel {
+            views: vec![View {
+                scope: agent.placement.clone(),
+                revision: 2,
+                panes: vec![],
+                retired: vec![native.id],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            ManagedDisplayIndex::new(&retired)
+                .activation_display(&agent, id)
+                .is_none()
+        );
+        let mut alias = native;
+        alias.id = CardId::new();
+        let aliases = super::super::WorkspaceModel {
+            views: vec![View {
+                scope: agent.placement.clone(),
+                revision: 1,
+                panes: vec![alias],
+                retired: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            ManagedDisplayIndex::new(&aliases)
+                .activation_display(&agent, id)
+                .is_none()
+        );
+        let mut console_only = agent;
+        console_only.session = None;
+        assert_eq!(
+            ManagedDisplayIndex::new(&model)
+                .activation_display(&console_only, id)
+                .unwrap()
+                .session,
+            HostedSession::Terminal(console_only.console.unwrap()),
+            "only an actually absent primary permits the console-only legacy fallback"
+        );
+    }
+
+    #[test]
+    fn attention_initial_activation_defers_aliases_of_either_shared_uuid_surface() {
+        let (agent, native, console) = fixture();
+        let requested = agent.session.as_ref().unwrap().id();
+        for (mut alias, canonical) in [
+            (native.clone(), console.clone()),
+            (console.clone(), native.clone()),
+        ] {
+            alias.id = CardId::new();
+            let mut model = super::super::WorkspaceModel {
+                views: vec![View {
+                    scope: agent.placement.clone(),
+                    revision: 1,
+                    panes: vec![alias],
+                    retired: vec![],
+                }],
+                ..Default::default()
+            };
+            assert!(
+                ManagedDisplayIndex::new(&model)
+                    .activation_display(&agent, requested)
+                    .is_none(),
+                "an existing secondary alias cannot be treated as an unpublished actor"
+            );
+            model.views[0].panes.push(canonical.clone());
+            assert_eq!(
+                ManagedDisplayIndex::new(&model)
+                    .activation_display(&agent, requested)
+                    .unwrap()
+                    .display
+                    .pane,
+                Some(canonical),
+                "the exact canonical surface retains authority beside its counterpart alias"
+            );
         }
     }
 

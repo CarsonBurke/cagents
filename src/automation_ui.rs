@@ -711,8 +711,9 @@ impl State {
     }
 
     fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
-        let index =
-            (from..self.history.len()).find(|&index| self.history[index].state.is_active())?;
+        let index = (from..self.history.len()).find(|&index| {
+            self.history[index].state.is_active() || self.history[index].release_pending
+        })?;
         self.request(
             Pending::HistoryRun { index },
             Request::ShowFiring {
@@ -1597,11 +1598,16 @@ impl State {
                         };
                         content = content.push(button_owned(
                             format!(
-                                "{} · {} · {} · {}",
+                                "{} · {} · {} · {}{}",
                                 firing.name,
                                 timestamp(firing.created_ms),
                                 origin,
-                                state_label(firing.state)
+                                state_label(firing.state),
+                                if firing.release_pending {
+                                    " · Session release pending"
+                                } else {
+                                    ""
+                                }
                             ),
                             Action::Run(firing.id),
                             !busy,
@@ -1629,6 +1635,11 @@ impl State {
                         "Finished: {}",
                         timestamp(finished)
                     )));
+                }
+                if run.firing.release_pending {
+                    content = content.push(crate::design::body(
+                        "Session release pending. New runs cannot start until cleanup finishes.",
+                    ));
                 }
                 if let Some(diagnostic) = &run.firing.diagnostic {
                     content = content.push(crate::design::body(diagnostic));
@@ -2771,58 +2782,80 @@ mod tests {
     #[test]
     fn background_history_refresh_preserves_older_pages_and_updates_active_rows() {
         use crate::automations::{FiringState, HistoryPage};
-        let newest = history_firing(100, FiringState::Running);
-        let older = history_firing(1, FiringState::Running);
-        let cursor = HistoryCursor {
-            created_ms: 1,
-            id: older.id,
-        };
-        let mut state = State {
-            all_history: true,
-            history: vec![newest.clone(), older.clone()],
-            history_next: Some(cursor.clone()),
-            history_status: HistoryStatus::Loaded,
-            ..Default::default()
-        };
-        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
-            panic!("history poll expected");
-        };
-        let mut completed = newest.clone();
-        completed.state = FiringState::Succeeded;
-        let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
-            sequence,
-            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                firings: vec![completed],
-                next: None,
-            }))),
-        }) else {
-            panic!("active older firing poll expected");
-        };
-        assert!(matches!(request, Request::ShowFiring { id } if id == older.id));
-        assert_eq!(state.history.len(), 2);
-        assert_eq!(state.history_next, Some(cursor));
-        let mut completed = older;
-        completed.state = FiringState::Succeeded;
-        state.update(Action::Received {
-            sequence,
-            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                definition: automation().definition,
-                firing: completed,
-                agent: None,
-                run: None,
-            }))),
-        });
-        assert!(
-            state
-                .history
-                .iter()
-                .all(|firing| firing.state == FiringState::Succeeded)
-        );
-        assert!(
-            state.run.is_none(),
-            "background polling must not open run detail"
-        );
-        assert!(state.pending.is_none());
+        for terminal_pending in [false, true] {
+            let newest = history_firing(100, FiringState::Running);
+            let mut older = history_firing(
+                1,
+                if terminal_pending {
+                    FiringState::Failed
+                } else {
+                    FiringState::Running
+                },
+            );
+            older.release_pending = terminal_pending;
+            let cursor = HistoryCursor {
+                created_ms: 1,
+                id: older.id,
+            };
+            let mut state = State {
+                all_history: true,
+                history: vec![newest.clone(), older.clone()],
+                history_next: Some(cursor.clone()),
+                history_status: HistoryStatus::Loaded,
+                ..Default::default()
+            };
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!("history poll expected");
+            };
+            let mut completed = newest.clone();
+            completed.state = FiringState::Succeeded;
+            let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: vec![completed],
+                    next: None,
+                }))),
+            }) else {
+                panic!("active older firing poll expected");
+            };
+            assert!(matches!(request, Request::ShowFiring { id } if id == older.id));
+            assert_eq!(state.history.len(), 2);
+            assert_eq!(state.history_next, Some(cursor));
+            let mut completed = older;
+            completed.state = if terminal_pending {
+                FiringState::Failed
+            } else {
+                FiringState::Succeeded
+            };
+            completed.release_pending = false;
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
+                    definition: automation().definition,
+                    firing: completed,
+                    agent: None,
+                    run: None,
+                }))),
+            });
+            assert_eq!(state.history[0].state, FiringState::Succeeded);
+            assert_eq!(
+                state.history[1].state,
+                if terminal_pending {
+                    FiringState::Failed
+                } else {
+                    FiringState::Succeeded
+                }
+            );
+            assert!(
+                !state.history[1].release_pending,
+                "older terminal rows must lose stale pending badges"
+            );
+            assert!(
+                state.run.is_none(),
+                "background polling must not open run detail"
+            );
+            assert!(state.pending.is_none());
+        }
     }
 
     #[test]

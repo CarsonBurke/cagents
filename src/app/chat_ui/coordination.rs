@@ -954,7 +954,7 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
-        let open = self.unfolded.contains(&key);
+        let open = self.part_unfolded(&key);
         let toggle =
             widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
                 .class(crate::ui_controls::control_style(false, None))
@@ -1070,7 +1070,7 @@ impl Runtime {
                 .into(),
             );
         }
-        let open = self.expanded.contains(&item.id);
+        let open = self.item_expanded(&item.id);
         let source = match &item.content {
             ItemContent::Command { .. } => "command",
             _ => "tool call",

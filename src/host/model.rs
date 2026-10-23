@@ -28,14 +28,19 @@ mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
+pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
+mod native_actor;
+mod native_actor_retirement;
+pub(super) use native_actor::NativeActorEvent;
+pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod navigation;
 mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 15;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -374,6 +379,19 @@ impl Registry {
                     params![id.to_string(), title, *source as i64],
                 ).map_err(|error| error.to_string())? > 0
             }
+            ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
+                if *source == ChannelTitleSource::Manual || title.is_empty() {
+                    return Err("channel title suggestions require a nonempty inferred title".into());
+                }
+                let view = views::read(&transaction, &crate::workspace_model::views::Scope::Channel(*id))?;
+                if view.revision != *expected_revision || view.primary_chat() != Some(*card) {
+                    return Err("The channel's primary conversation changed; title suggestion refused".into());
+                }
+                transaction.execute(
+                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",
+                    params![id.to_string(), title, *source as i64],
+                ).map_err(|error| error.to_string())? > 0
+            }
             ModelEdit::DeleteChannel { id } => {
                 transaction
                     .execute(
@@ -561,6 +579,14 @@ fn migrate_through(
     if version < 13 && target >= 13 {
         views::migrate_terminal_sources(tx)?;
         schema::migration_checkpoint(13)?;
+    }
+    if version < 14 && target >= 14 {
+        native_actor::migrate(tx)?;
+        schema::migration_checkpoint(14)?;
+    }
+    if version < 15 && target >= 15 {
+        native_actor_retirement::migrate(tx)?;
+        schema::migration_checkpoint(15)?;
     }
     Ok(())
 }
@@ -828,6 +854,170 @@ mod tests {
                 .apply(&suggest("Do not resurrect", ChannelTitleSource::Provider))
                 .unwrap()
                 .changed
+        );
+    }
+
+    #[test]
+    fn conversation_title_refresh_is_bound_to_current_primary_view_and_manual_names() {
+        use crate::model::{CardId, CardKind, TerminalId};
+        use crate::workspace_model::views::{Change, Pane, Scope};
+        let (mut registry, directory) = registry();
+        registry.apply(&open("/project")).unwrap();
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: "/project".into(),
+                title: String::new(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let chat = || Pane {
+            id: CardId::new(),
+            title: "Chat".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: Some("/project".into()),
+            kind: CardKind::Chat(crate::chat::Session {
+                id: TerminalId::new(),
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                proof: None,
+                terminal: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                        working_directory: "/project".into(),
+                    },
+                },
+            }),
+        };
+        let a = chat();
+        let b = chat();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Scope::Channel(id),
+                panes: vec![a.clone(), b.clone()],
+                closed: Vec::new(),
+            })
+            .unwrap();
+        let revision = registry.model().unwrap().views[0].revision;
+        let suggest = |card, expected_revision, title: &str| ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title: title.into(),
+            source: ChannelTitleSource::Provider,
+        };
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Bundle encryption"))
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Encryption and performance audit"))
+                .unwrap()
+                .changed
+        );
+        let before = registry.model().unwrap().sequence;
+        assert!(
+            !registry
+                .apply(&suggest(a.id, revision, "Encryption and performance audit"))
+                .unwrap()
+                .changed
+        );
+        assert_eq!(registry.model().unwrap().sequence, before);
+        assert!(
+            registry
+                .apply(&suggest(b.id, revision, "Sibling must not rename"))
+                .is_err()
+        );
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: Scope::Channel(id),
+                expected_revision: revision,
+                operation: Uuid::new_v4(),
+                change: Change::Move {
+                    id: b.id,
+                    before: Some(a.id),
+                },
+            })
+            .unwrap();
+        let current = registry.model().unwrap().views[0].revision;
+        assert!(
+            registry
+                .apply(&suggest(a.id, revision, "Delayed old primary"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .apply(&suggest(b.id, revision, "Old view revision"))
+                .is_err()
+        );
+        assert_eq!(registry.model().unwrap().channels[0].title, "");
+        assert!(
+            registry
+                .apply(&ModelEdit::SuggestConversationTitle {
+                    id,
+                    card: b.id,
+                    expected_revision: current,
+                    title: "Review another task".into(),
+                    source: ChannelTitleSource::Prompt
+                })
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&suggest(b.id, current, "New primary conversation"))
+                .unwrap()
+                .changed
+        );
+        registry
+            .apply(&ModelEdit::RetitleChannel {
+                id,
+                title: "My encrypted bundle project".into(),
+            })
+            .unwrap();
+        assert!(
+            !registry
+                .apply(&suggest(b.id, current, "Late provider name"))
+                .unwrap()
+                .changed
+        );
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: Scope::Channel(id),
+                expected_revision: current,
+                operation: Uuid::new_v4(),
+                change: Change::Move {
+                    id: a.id,
+                    before: Some(b.id),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            registry.model().unwrap().channels[0].title,
+            "My encrypted bundle project"
+        );
+
+        drop(registry);
+        let restored = Registry::at(&directory.path().join("model.sqlite3"))
+            .unwrap()
+            .model()
+            .unwrap();
+        assert_eq!(restored.channels[0].title, "My encrypted bundle project");
+        assert_eq!(
+            restored.channels[0].title_source,
+            ChannelTitleSource::Manual
         );
     }
 

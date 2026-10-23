@@ -434,7 +434,7 @@ impl Runtime {
         cached: &'a CachedItem,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
-        let open = self.expanded.contains(&item.id);
+        let open = self.item_expanded(&item.id);
         let header = self.step_header(item, cached, open);
         if !open {
             return header;

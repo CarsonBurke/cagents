@@ -94,7 +94,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     let mut reader = connect(path, true)?;
     let pin = reader.transaction().map_err(|e| e.to_string())?;
     let inspected = inspect(&pin)?;
-    // Published twelve remains an exact input format after thirteen.
+    // Every admitted published layout remains exact after later migrations.
     // Refuse damage before opening a writer can recreate missing objects.
     if inspected.version >= 12 {
         require_open_layout(&pin, inspected.version)?;
@@ -221,10 +221,14 @@ fn inspect(db: &Connection) -> Result<Inspection, String> {
 type Layout = Vec<(String, String, String, Vec<String>)>;
 fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> {
     static TWELVE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
-    static CURRENT: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static FOURTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static FIFTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
-        SCHEMA_VERSION => &CURRENT,
+        13 => &THIRTEEN,
+        14 => &FOURTEEN,
+        15 => &FIFTEEN,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -572,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn published_twelve_migrates_to_thirteen_without_historical_terminal_proof() {
+    fn published_twelve_migrates_to_current_without_historical_terminal_proof() {
         use crate::model::{
             CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalExit, TerminalId,
             TerminalSession,
@@ -672,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn current_thirteen_missing_provenance_is_not_recreated() {
+    fn published_thirteen_missing_provenance_is_not_recreated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("damaged13.sqlite3");
         legacy(&path, 13);
@@ -689,6 +693,118 @@ mod tests {
         );
         assert_eq!(bytes(&path), before);
         assert!(!wal(&path).exists());
+    }
+
+    #[test]
+    fn published_native_actor_layout_damage_refuses_before_writable_admission() {
+        let _clear = Clear;
+        for (version, damage) in [
+            (14, "DROP TABLE native_actor_cursors;"),
+            (
+                14,
+                "ALTER TABLE native_actor_cursors RENAME COLUMN digest TO changed_digest;",
+            ),
+            (15, "DROP TABLE native_actor_retirements;"),
+            (
+                15,
+                "ALTER TABLE native_actor_ownerships ADD COLUMN foreign_payload TEXT;",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("damaged-native-actor.sqlite3");
+            legacy(&path, version);
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(damage)
+                .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let before = bytes(&path);
+            let reached = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&reached);
+            hook(move |_| {
+                observed.set(true);
+                Ok(())
+            });
+            let error = Registry::at(&path)
+                .err()
+                .expect("damaged published layout must refuse");
+            HOOK.with(|h| *h.borrow_mut() = None);
+            assert!(
+                error.contains(&format!("published schema {version}")),
+                "{error}"
+            );
+            assert!(!reached.get(), "damage reached writable admission");
+            assert_eq!(bytes(&path), before);
+            assert!(!wal(&path).exists());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
+        for version in [13, 14, 15] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("native-actor-generations.sqlite3");
+            legacy(&path, version);
+            let db = Connection::open(&path).unwrap();
+            let tables = inspect(&db).unwrap().objects;
+            assert_eq!(
+                tables
+                    .iter()
+                    .any(|object| object.1 == "native_actor_cursors"),
+                version >= 14
+            );
+            assert_eq!(
+                tables
+                    .iter()
+                    .any(|object| object.1 == "native_actor_ownerships"),
+                version >= 15
+            );
+            assert_eq!(
+                tables
+                    .iter()
+                    .any(|object| object.1 == "native_actor_retirements"),
+                version >= 15
+            );
+            if version >= 14 {
+                db.execute(
+                    "INSERT INTO native_actor_cursors VALUES('actor','original owner',9,x'0001ff')",
+                    [],
+                )
+                .unwrap();
+            }
+            if version >= 15 {
+                db.execute(
+                    "INSERT INTO native_actor_ownerships VALUES('actor','original ownership')",
+                    [],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO native_actor_retirements VALUES('actor','original retirement')",
+                    [],
+                )
+                .unwrap();
+            }
+            drop(db);
+            for _ in 0..2 {
+                let registry = Registry::at(&path).unwrap();
+                require_current(&registry.db).unwrap();
+                if version >= 14 {
+                    let receipt: (String, u64, Vec<u8>) = registry.db.query_row("SELECT owner,sequence,digest FROM native_actor_cursors WHERE actor='actor'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+                    assert_eq!(receipt, ("original owner".into(), 9, vec![0, 1, 255]));
+                }
+                if version >= 15 {
+                    let receipts: (String, String) = registry.db.query_row("SELECT ownership,receipt FROM native_actor_ownerships JOIN native_actor_retirements USING(actor) WHERE actor='actor'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                    assert_eq!(
+                        receipts,
+                        ("original ownership".into(), "original retirement".into())
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -842,7 +958,7 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13] {
+        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
@@ -887,9 +1003,10 @@ mod tests {
         let registry = Registry::at(&path).unwrap();
         let writer = connect(&path, false).unwrap();
         writer
-            .execute_batch(
-                "PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');",
-            )
+            .execute_batch(&format!(
+                "PRAGMA user_version={}; INSERT INTO projects VALUES('/future','Future',1,'git');",
+                SCHEMA_VERSION + 1
+            ))
             .unwrap();
         drop(registry);
         drop(writer);
@@ -905,8 +1022,8 @@ mod tests {
     fn authoritative_writer_rejects_concurrent_header_and_layout_changes() {
         let _clear = Clear;
         for change in [
-            "PRAGMA user_version=14;",
-            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
+            format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
+            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("stale-wal.sqlite3");
@@ -917,7 +1034,7 @@ mod tests {
             hook(move |stage| {
                 if stage == "inspected" {
                     let writer = connect(&target, false)?;
-                    writer.execute_batch(change).map_err(|e| e.to_string())?;
+                    writer.execute_batch(&change).map_err(|e| e.to_string())?;
                     drop(writer);
                     *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
                 }
@@ -953,7 +1070,7 @@ mod tests {
                     .busy_timeout(Duration::ZERO)
                     .map_err(|e| e.to_string())?;
                 let error = writer
-                    .execute_batch("PRAGMA user_version=14;")
+                    .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
                     .expect_err("future writer must remain excluded after COMMIT");
                 assert!(
                     matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
@@ -1006,7 +1123,7 @@ mod tests {
         hook(move |stage| {
             if stage == "committed" {
                 let writer = connect(&target, false)?;
-                writer.execute_batch("PRAGMA user_version=14; INSERT INTO projects VALUES('/future','Future',1,'git');").map_err(|e|e.to_string())?;
+                writer.execute_batch(&format!("PRAGMA user_version={}; INSERT INTO projects VALUES('/future','Future',1,'git');", SCHEMA_VERSION + 1)).map_err(|e|e.to_string())?;
                 drop(writer);
                 *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
             }
@@ -1034,15 +1151,15 @@ mod tests {
     #[test]
     fn retained_outer_edits_refuse_future_or_unknown_layout_before_dml() {
         for change in [
-            "PRAGMA user_version=14;",
-            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;",
+            format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
+            "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("outer.sqlite3");
             let (_, channel) = legacy(&path, 12);
             let mut registry = Registry::at(&path).unwrap();
             let other = connect(&path, false).unwrap();
-            other.execute_batch(change).unwrap();
+            other.execute_batch(&change).unwrap();
             let edits = [
                 ModelEdit::OpenProject {
                     repository: "/new".into(),
@@ -1340,7 +1457,7 @@ mod tests {
             0o700
         );
         let db = Connection::open(root.join("hot.sqlite3")).unwrap();
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version=14; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);").unwrap();
+        db.execute_batch(&format!("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE future_payload(value BLOB); INSERT INTO future_payload VALUES(zeroblob(1048576)); PRAGMA user_version={}; PRAGMA cache_size=4; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE future_payload SET value=randomblob(1048576);", SCHEMA_VERSION + 1)).unwrap();
         assert!(root.join("hot.sqlite3-journal").is_file());
         // The bounded original-child executor owns this exact process and its
         // wait/cleanup. No numeric PID lookup or fixture killing Drop exists.

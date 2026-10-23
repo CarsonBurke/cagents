@@ -95,8 +95,10 @@ impl RestoreFixture {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            agent_updates: BTreeMap::new(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
+            pending_chat_admissions: Default::default(),
             pending_terminal_creations: Default::default(),
             workspace_model_identity: None,
             cards: vec![

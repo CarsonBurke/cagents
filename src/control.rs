@@ -21,22 +21,31 @@ mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
 mod channels;
+mod chat;
+pub use chat::ChatCommand;
+mod format;
 pub use agents::AgentCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
+mod terminal_list;
 pub use sessions::SessionsArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
 pub use linear::LinearCommand;
+mod work;
+pub use work::WorkCommand;
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
 use crate::{
     agent_execution::Authority,
-    instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
+    instance::{
+        self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY,
+        UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX, UI_LAUNCH_RECOVERY_PROGRESS_PREFIX,
+    },
     model::{
         ChannelId, HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
     },
@@ -118,6 +127,11 @@ pub enum TopCommand {
     /// List live agent sessions in this project, whoever started them.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
+    /// Inspect native resident capacity and explicitly release completed handles.
+    Chat {
+        #[command(subcommand)]
+        command: ChatCommand,
+    },
     /// Message another session; a live conversation receives it once idle.
     Send(SendArgs),
     /// Message another session and wait for its reply.
@@ -126,6 +140,11 @@ pub enum TopCommand {
     Reply(ReplyArgs),
     /// Read the messages left for this session.
     Inbox(InboxArgs),
+    /// Show every worktree and branch in progress, newest activity first.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
     Automation {
@@ -292,8 +311,20 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
-    /// List terminal descriptors known to the daemon.
-    List,
+    /// List running terminals with their observed state and title.
+    List {
+        /// Include retained terminals that are not running.
+        #[arg(long, conflicts_with = "exited")]
+        all: bool,
+        /// Show only terminals with a recorded process exit.
+        #[arg(long)]
+        exited: bool,
+    },
+    /// Read one terminal's full descriptor, including launch and recovery details.
+    Show {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Spawn a terminal with an optional argv-based command.
     Spawn {
         /// Working directory for the terminal (defaults to the current directory).
@@ -483,6 +514,15 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+/// Ends a [`ControlClient`]'s connection from another thread.
+pub struct Hangup(UnixStream);
+
+impl Hangup {
+    pub fn hang_up(&self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -498,6 +538,9 @@ pub struct ControlClient {
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
     observed_notifications: VecDeque<crate::notifications::Update>,
+    /// The newest Work board pushed while a correlated response was pending.
+    /// Each carries the whole board, so only the newest matters.
+    observed_work: Option<(u64, Box<crate::work::Board>)>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -509,7 +552,7 @@ pub struct ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -588,6 +631,20 @@ impl ControlClient {
     }
 
     pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, None)
+    }
+
+    pub(crate) fn from_stream_with_deadline(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
+        Self::from_stream_inner(stream, Some(deadline))
+    }
+
+    fn from_stream_inner(
+        stream: UnixStream,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(if crate::device::is_remote() {
                 Duration::from_secs(30)
@@ -602,7 +659,7 @@ impl ControlClient {
             stream,
             next_request_id: 1,
         };
-        let proof = client.handshake()?;
+        let proof = client.handshake(deadline)?;
         client
             .stream
             .set_read_timeout(Some(IO_TIMEOUT))
@@ -614,6 +671,7 @@ impl ControlClient {
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
+            observed_work: None,
             attached_chats: BTreeSet::new(),
         })
     }
@@ -623,7 +681,7 @@ impl ControlClient {
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
     pub(crate) fn commit_terminal_handoff(
         &mut self,
         terminal_id: TerminalId,
@@ -697,6 +755,15 @@ impl ControlClient {
                 _ => {}
             }
         }
+    }
+
+    /// A handle that ends this connection from another thread, so a read
+    /// blocked in one of the `next_*` calls returns a closed connection.
+    pub fn hangup(&self) -> Result<Hangup, ControlError> {
+        self.stream
+            .try_clone()
+            .map(Hangup)
+            .map_err(ControlError::Configure)
     }
 
     /// Subscribes to shared-model edges and returns the model in one round trip.
@@ -1455,6 +1522,15 @@ impl ControlClient {
         }
     }
 
+    /// Exercises the public control wire in host integration fixtures.
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_request(
+        &mut self,
+        request: ClientRequest,
+    ) -> Result<ServerResponse, ControlError> {
+        self.request_strict(request)
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -1606,6 +1682,15 @@ impl ControlClient {
                         .push_back(crate::notifications::Update::Activated(target));
                 }
             }
+            ServerMessage::WorkBoard { revision, board } => {
+                if self
+                    .observed_work
+                    .as_ref()
+                    .is_none_or(|(observed, _)| *observed < revision)
+                {
+                    self.observed_work = Some((revision, board));
+                }
+            }
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
@@ -1704,25 +1789,38 @@ struct HandshakeClient {
 }
 
 impl HandshakeClient {
-    fn handshake(&mut self) -> Result<HostSessionProof, ControlError> {
+    fn handshake(&mut self, deadline: Option<Instant>) -> Result<HostSessionProof, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        write_frame(
-            &mut self.stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id,
-                proof: None,
-                request: ClientRequest::Connect {
-                    expected_host: None,
-                    resume: Vec::new(),
-                },
+        let request = ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id,
+            proof: None,
+            request: ClientRequest::Connect {
+                expected_host: None,
+                resume: Vec::new(),
             },
-        )?;
+        };
+        match deadline {
+            Some(deadline) => write_frame(
+                &mut DeadlineWriter {
+                    stream: &mut self.stream,
+                    deadline,
+                },
+                &request,
+            )?,
+            None => write_frame(&mut self.stream, &request)?,
+        }
         let timeout = self.stream.read_timeout().ok().flatten();
-        let envelope: ServerEnvelope = read_frame(&mut self.stream)
-            .map_err(|error| reply_error(error, timeout))?
-            .ok_or(ControlError::ConnectionClosed)?;
+        let envelope: ServerEnvelope = match deadline {
+            Some(deadline) => read_frame(&mut DeadlineReader {
+                stream: &mut self.stream,
+                deadline,
+            }),
+            None => read_frame(&mut self.stream),
+        }
+        .map_err(|error| reply_error(error, timeout))?
+        .ok_or(ControlError::ConnectionClosed)?;
         if envelope.version != PROTOCOL_VERSION {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
@@ -1809,6 +1907,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
         | ServerMessage::NotificationActivated { .. }
+        | ServerMessage::WorkBoard { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -1831,6 +1930,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
+        ServerMessage::WorkBoard { .. } => "work_board",
     }
 }
 
@@ -1855,6 +1955,9 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatAttached { .. } => "chat_attached",
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
+        ServerResponse::ChatCapacity { .. } => "chat_capacity",
+        ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
+        ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
         ServerResponse::ChatPreviewed { .. } => "chat_previewed",
@@ -1868,6 +1971,8 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
+        ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
+        ServerResponse::Work(_) => "work",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -2211,7 +2316,9 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Project { .. }
         | TopCommand::Channel { .. }
         | TopCommand::Automation { .. }
+        | TopCommand::Work { .. }
         | TopCommand::Account { .. }
+        | TopCommand::Chat { .. }
         | TopCommand::Whoami
         | TopCommand::Sessions(_)
         | TopCommand::Send(_)
@@ -2272,9 +2379,11 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         }
         TopCommand::Linear(command) => linear::execute(command),
         TopCommand::Automation { command } => automations::execute(command),
+        TopCommand::Work { command } => work::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Whoami => sessions::whoami(),
         TopCommand::Account { command } => accounts::execute(command),
+        TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
@@ -2440,6 +2549,7 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
+        .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2449,12 +2559,47 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     let mut child = command.spawn()?;
-    let result = child
-        .stdout
-        .take()
+    let mut stdout = child.stdout.take();
+    let result = stdout
+        .as_mut()
         .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
-        .and_then(|mut stdout| read_ui_launch_handshake(&mut stdout, timeout));
+        .and_then(|stdout| read_ui_launch_handshake(stdout, timeout));
+    finish_ui_launch(child, result, stdout)
+}
+
+fn finish_ui_launch(
+    mut child: std::process::Child,
+    result: io::Result<()>,
+    stdout: Option<ChildStdout>,
+) -> io::Result<()> {
     if let Err(error) = result {
+        if error
+            .to_string()
+            .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+        {
+            // A visible window can still offer exact-session recovery. Keep its
+            // drafts and controls available while the updater reports failure.
+            thread::spawn(move || {
+                // A late final acknowledgement must not hit BrokenPipe and
+                // turn an otherwise usable recovery window into a failed UI.
+                if let Some(mut stdout) = stdout {
+                    let mut buffer = [0; 256];
+                    loop {
+                        match stdout.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(100))
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let _ = child.wait();
+            });
+            return Err(error);
+        }
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
@@ -2489,7 +2634,9 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
         return Err(io::Error::last_os_error());
     }
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut deadline = started + timeout;
+    let mut recovery_announced = false;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
@@ -2508,8 +2655,26 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
                         "cagents-ui startup response was too large",
                     ));
                 }
-                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                while let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    let remaining = response.split_off(newline + 1);
                     response.truncate(newline);
+                    if let Some(items) = parse_ui_recovery_progress(&response)? {
+                        if recovery_announced {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "cagents-ui announced recovery inventory more than once",
+                            ));
+                        }
+                        recovery_announced = true;
+                        // The daemon may have consumed the checkpoint before
+                        // this window starts. Its saved-pane inventory supplies
+                        // one bounded allowance, never an endless keepalive.
+                        deadline = deadline.max(
+                            started + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(30 * items),
+                        );
+                        response = remaining;
+                        continue;
+                    }
                     return parse_ui_launch_handshake(&response);
                 }
             }
@@ -2517,7 +2682,15 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("cagents-ui did not acknowledge initialization within {timeout:?}"),
+                        if recovery_announced {
+                            format!(
+                                "{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}Saved conversations are still recovering. The window was kept open; inspect its recovery notices before retrying the update"
+                            )
+                        } else {
+                            format!(
+                                "cagents-ui did not acknowledge initialization within {timeout:?}"
+                            )
+                        },
                     ));
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -2526,6 +2699,26 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
             Err(error) => return Err(error),
         }
     }
+}
+
+fn parse_ui_recovery_progress(response: &[u8]) -> io::Result<Option<u64>> {
+    let response = std::str::from_utf8(response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let Some(count) = response.strip_prefix(UI_LAUNCH_RECOVERY_PROGRESS_PREFIX) else {
+        return Ok(None);
+    };
+    // Use the same inventory bound as the durable handoff.
+    let count = count
+        .parse::<u64>()
+        .ok()
+        .filter(|count| *count <= crate::upgrade::handoff::MAX_SESSIONS as u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cagents-ui reported an invalid recovery inventory",
+            )
+        })?;
+    Ok(Some(count))
 }
 
 fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
@@ -3041,18 +3234,19 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         client.authenticate(authority).map_err(protocol_error)?;
     }
     match command {
-        TerminalCommand::List => {
+        TerminalCommand::List { all, exited } => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
+            Ok(terminal_list::list(&terminals, client.proof(), all, exited))
+        }
+        TerminalCommand::Show { terminal_id } => {
+            let terminals = client.list().map_err(protocol_error)?;
+            let terminal = terminals
                 .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(CommandOutput {
-                command: "terminal.list",
-                data: json!({ "terminals": terminals }),
-                human,
-            })
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("not_found", format!("Unknown terminal {terminal_id}"))
+                })?;
+            Ok(terminal_list::show(terminal, client.proof()))
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3509,11 +3703,7 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = channels
-                .iter()
-                .map(|channel| channel_line(channel))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = channel_list_human(&channels);
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3531,6 +3721,23 @@ fn channel_output(
             })
         }
     }
+}
+
+fn channel_list_human(channels: &[&ModelChannel]) -> String {
+    format::table(
+        ["CHANNEL", "REPOSITORY", "TITLE"],
+        channels
+            .iter()
+            .map(|channel| {
+                [
+                    channel.id.to_string(),
+                    channel.repository.display().to_string(),
+                    channel.title.clone(),
+                ]
+            })
+            .collect(),
+        "No channels",
+    )
 }
 
 /// One channel per line: id, repository, title.
@@ -3739,6 +3946,33 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn readable_channel_list_has_headers_and_a_plain_empty_state() {
+        assert_eq!(channel_list_human(&[]), "No channels");
+        let channel = ModelChannel {
+            id: ChannelId::new(),
+            repository: "/repo/.git".into(),
+            title: "Build\nlogs".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        };
+        let human = channel_list_human(&[&channel]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["CHANNEL", "REPOSITORY", "TITLE"]
+        );
+        assert!(human.ends_with("Build logs"));
+        assert!(human.contains(&channel.id.to_string()));
+        // Channel repository identity is retained; it is not asserted to be a checkout path.
+        assert!(human.contains("/repo/.git"));
+    }
+
+    #[test]
     fn rebuild_stop_requires_explicit_permission_before_touching_a_daemon() {
         let error = execute_daemon(DaemonCommand::StopForRebuild {
             including_subagents: false,
@@ -3789,7 +4023,7 @@ mod tests {
         }
         crate::device::save(crate::device::Device {
             name: "launch-test".into(),
-            host: "fw16".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         })
         .unwrap();
@@ -5628,6 +5862,136 @@ mod tests {
             })
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ui_launcher_advertises_recovery_progress_support() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "test \"$CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS\" = 1 || exit 94; printf 'ready\\n'",
+            ])
+            .env_remove("CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS");
+        spawn_ui_process(&mut command).unwrap();
+    }
+
+    #[test]
+    fn ui_launch_handshake_waits_for_saved_pane_recovery() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'recovering: 1\\n'; sleep 0.1; printf 'ready\\n'",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let result = read_ui_launch_handshake(&mut stdout, Duration::from_millis(20));
+        child.wait().unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn ui_launch_recovery_inventory_is_bounded_and_announced_once() {
+        assert_eq!(
+            parse_ui_recovery_progress(b"recovering: 5120").unwrap(),
+            Some(5120)
+        );
+        assert_eq!(parse_ui_recovery_progress(b"ready").unwrap(), None);
+        for invalid in ["recovering: 5121", "recovering: -1", "recovering: unknown"] {
+            assert_eq!(
+                parse_ui_recovery_progress(invalid.as_bytes())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for (response, valid) in [
+            ("recovering: 0\\nready\\n", true),
+            ("recovering: 0\\nrecovering: 0\\nready\\n", false),
+        ] {
+            let mut child = Command::new("printf")
+                .arg(response)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+            child.wait().unwrap();
+            assert_eq!(result.is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn ui_launch_recovery_keeps_the_pipe_for_a_late_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("late-ready-written");
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'recovering: 1\\nerror: recovery-incomplete: still reconnecting\\n'; sleep 0.1; printf 'ready\\n' || exit 44; printf usable > \"$1\"", "fixture"])
+            .arg(&marker)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+        );
+        finish_ui_launch(child, result, Some(stdout)).unwrap_err();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            marker.is_file(),
+            "the late final receipt must retain a reader"
+        );
+    }
+
+    #[test]
+    fn incomplete_pane_recovery_keeps_the_window_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("window-still-usable");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.1; printf usable > \"$1\"", "fixture"])
+            .arg(&marker)
+            .spawn()
+            .unwrap();
+        let error = finish_ui_launch(
+            child,
+            Err(io::Error::other(format!(
+                "{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}one pane unavailable"
+            ))),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("one pane unavailable"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            marker.is_file(),
+            "the recovery window must survive the launcher's error"
+        );
+
+        let failed_marker = directory.path().join("initialization-failed");
+        let child = Command::new("sh")
+            .args(["-c", "sleep 0.1; printf invalid > \"$1\"", "fixture"])
+            .arg(&failed_marker)
+            .spawn()
+            .unwrap();
+        finish_ui_launch(child, Err(io::Error::other("initialization failed")), None).unwrap_err();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !failed_marker.exists(),
+            "ordinary failed initialization still terminates its child"
+        );
     }
 
     #[test]

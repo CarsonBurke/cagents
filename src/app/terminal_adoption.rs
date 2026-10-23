@@ -88,7 +88,8 @@ fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
         | CardKind::Repository(_)
         | CardKind::Settings
         | CardKind::Accounts
-        | CardKind::Automations => false,
+        | CardKind::Automations
+        | CardKind::Work => false,
     }
 }
 
