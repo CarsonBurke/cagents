@@ -1,9 +1,9 @@
 use super::*;
 use iced::advanced::{
     Layout, Shell, clipboard, layout, mouse,
-    widget::{Operation, Tree},
+    widget::{Operation, Tree, operation::Focusable},
 };
-use iced::{Event, Point, Rectangle, Size};
+use iced::{Event, Rectangle, Size};
 
 fn image(id: &str, number: u64) -> chat::Item {
     chat::Item {
@@ -38,25 +38,32 @@ fn ready(cached: &mut CachedItem) {
 }
 
 /// Lay out the actual prompt widget, inspect its displayed text and
-/// click its real non-copy controls using their accessibility bounds.
+/// click its actual image button using its rendered focusable bounds. The
+/// pinned Iced hover wrapper forwards operations/input, but not accessibility.
 fn click_prompt(
     renderer: &cosmic::Renderer,
     runtime: &Runtime,
     item: &chat::Item,
 ) -> (Vec<String>, Vec<Message>) {
     #[derive(Default)]
-    struct Texts(Vec<String>);
-    impl Operation for Texts {
+    struct Prompt {
+        texts: Vec<String>,
+        controls: Vec<Rectangle>,
+    }
+    impl Operation for Prompt {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
         }
         fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
-            self.0.push(text.to_owned());
+            self.texts.push(text.to_owned());
         }
         fn custom(&mut self, _: Option<&widget::Id>, _: Rectangle, state: &mut dyn std::any::Any) {
             if let Some(prose) = state.downcast_ref::<selectable_prose::State>() {
-                self.0.push(prose.plain.to_string());
+                self.texts.push(prose.plain.to_string());
             }
+        }
+        fn focusable(&mut self, _: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            self.controls.push(bounds);
         }
     }
     let mut element = runtime.prompt_view(item);
@@ -67,33 +74,23 @@ fn click_prompt(
         renderer,
         &layout::Limits::new(Size::ZERO, viewport.size()),
     );
-    let mut texts = Texts::default();
+    let mut prompt = Prompt::default();
     element
         .as_widget_mut()
-        .operate(&mut tree, Layout::new(&node), renderer, &mut texts);
-    let accessible =
-        element
-            .as_widget()
-            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    let controls: Vec<_> = accessible
-        .root()
+        .operate(&mut tree, Layout::new(&node), renderer, &mut prompt);
+    // The preview occupies its rendered image area (280 logical pixels tall).
+    // The message-copy footer is a compact icon button outside that area.
+    let previews: Vec<_> = prompt
+        .controls
         .iter()
-        .chain(accessible.children())
-        .filter(|node| {
-            node.node().role() == iced_accessibility::accesskit::Role::Button
-                && node.node().label() != Some("Copy this message")
-        })
-        .filter_map(|node| node.node().bounds())
-        .map(|bounds| {
-            Point::new(
-                ((bounds.x0 + bounds.x1) / 2.0) as f32,
-                ((bounds.y0 + bounds.y1) / 2.0) as f32,
-            )
-        })
+        .filter(|bounds| bounds.height >= 200.0)
+        .copied()
         .collect();
     let mut messages = Vec::new();
-    for point in controls {
+    for bounds in &previews {
+        let point = bounds.center();
         for event in [
+            mouse::Event::CursorMoved { position: point },
             mouse::Event::ButtonPressed(mouse::Button::Left),
             mouse::Event::ButtonReleased(mouse::Button::Left),
         ] {
@@ -109,7 +106,23 @@ fn click_prompt(
             );
         }
     }
-    (texts.0, messages)
+    let actions: Vec<_> = messages
+        .iter()
+        .map(|message| match message {
+            Message::ChatUi(Action::OpenImage(target, id)) => {
+                format!("OpenImage({target:?}, {id})")
+            }
+            Message::ChatUi(Action::LoadImage(target, id)) => {
+                format!("LoadImage({target:?}, {id})")
+            }
+            message => format!("{message:?}"),
+        })
+        .collect();
+    eprintln!(
+        "rendered prompt {:?}: controls={:?}, preview bounds={previews:?}, actions={actions:?}",
+        item.id, prompt.controls
+    );
+    (prompt.texts, messages)
 }
 
 #[test]
@@ -189,6 +202,7 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
             .iter()
             .any(|text| text.contains("does not provide an image file path"))
     );
+    assert!(!texts.iter().any(|text| text == "Load preview"));
 }
 
 #[test]
@@ -224,6 +238,7 @@ fn claude_document_placeholder_keeps_its_title_without_image_actions() {
             .iter()
             .any(|text| text.contains("does not provide an image file path"))
     );
+    assert!(!texts.iter().any(|text| text == "Load preview"));
     assert!(!messages.iter().any(|message| matches!(
         message,
         Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
