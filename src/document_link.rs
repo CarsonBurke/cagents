@@ -11,9 +11,13 @@ pub enum DocumentLink {
     },
 }
 
-/// Parse the file coordinates emitted by coding agents, preserving URL ports.
+/// Parse coding-agent coordinates on bare paths, preserving URI query and fragment data.
 pub fn file_position(target: &str) -> (&str, Option<String>) {
-    if target.contains("://") || target.starts_with("mailto:") {
+    if target.contains("://")
+        || target.starts_with("mailto:")
+        || target.contains('#')
+        || target.contains('?')
+    {
         return (target, None);
     }
     let Some((prefix, last)) = target.rsplit_once(':') else {
@@ -90,11 +94,33 @@ mod tests {
         }
     }
     #[test]
+    fn coding_agent_coordinates_preserve_uri_query_and_fragment_boundaries() {
+        for target in [
+            "src/main.rs#L12:3",
+            "/repo/src/main.rs#L12:3",
+            "#L12:3",
+            "src/main.rs?revision=7:3",
+            "src/main.rs?revision=7:3#L12:3",
+            "file:///repo/src/main.rs#L12:3",
+            "https://localhost:3000/src/main.rs?revision=7:3#L12:3",
+        ] {
+            assert_eq!(file_position(target), (target, None), "{target}");
+        }
+        // Encoded delimiter bytes belong to the filename, so they do not
+        // prevent a bare-path suffix from supplying coordinates.
+        for (target, path) in [
+            ("src/a%23b.rs:12:3", "src/a%23b.rs"),
+            ("src/a%3Fb.rs:12:3", "src/a%3Fb.rs"),
+        ] {
+            assert_eq!(file_position(target), (path, Some("L12:3".into())));
+        }
+    }
+
+    #[test]
     fn heading_fragments_preserve_duplicate_and_explicit_suffix_collisions() {
-        let items: Vec<_> = markdown::parse(
-            "# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n",
-        )
-        .collect();
+        let items: Vec<_> =
+            markdown::parse("# Repeated\n# Repeated-1\n# Repeated\n# Repeated-1\n# Repeated\n")
+                .collect();
         for (fragment, index) in [
             ("repeated", 0),
             ("repeated-1", 1),
