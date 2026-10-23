@@ -514,7 +514,8 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE automation_run_attention;
+                 DROP TABLE automation_lifecycle;
                  DROP TABLE session_lineages; PRAGMA user_version = 3;",
             )
             .unwrap();

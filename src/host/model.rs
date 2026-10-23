@@ -24,7 +24,9 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automation_attention;
 mod automation_audit;
+pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -41,7 +43,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -593,6 +595,10 @@ fn migrate_through(
         automation_audit::migrate(tx)?;
         schema::migration_checkpoint(16)?;
     }
+    if version < 17 && target >= 17 {
+        automation_attention::migrate(tx)?;
+        schema::migration_checkpoint(17)?;
+    }
     Ok(())
 }
 
@@ -1042,7 +1048,8 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE automation_run_attention;
+                 DROP TABLE automation_lifecycle;
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
             .unwrap();
