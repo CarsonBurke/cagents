@@ -1460,6 +1460,72 @@ fn caret_position(
     })
 }
 
+/// The editor's caret as an external editor counts it.
+///
+/// VS Code and Zed read the saved text and break lines on `\n`, `\r\n` and
+/// a lone `\r`, one break each. This editor's lines carry the same
+/// characters but can split a `\r\n` across two terminators: the `\r` that
+/// ends one line and the `\n` that ends the empty line after it.
+///
+/// - `\n\r\n` loads as `\n\r` and then an empty line ending in `\n`.
+/// - Deleting the text of the line after a lone `\r` leaves that `\r`, then
+///   an empty line ending in `\n`.
+///
+/// Either way the saved text has one break where the terminators look like
+/// two.
+fn external_caret(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<crate::external_editor::Caret> {
+    let lines = content.line_count();
+    if caret.line >= lines {
+        return None;
+    }
+    // Whether the `\r` ending line `index` pairs with the `\n` that ends the
+    // empty line after it. That line exists whenever this is asked: it is at
+    // most the caret's.
+    let pairs_with_next = |index: usize| -> Option<bool> {
+        let ends_in_cr = content.with_line(index, |_, ending| {
+            terminator_str(ending, index + 1 == lines).ends_with('\r')
+        })?;
+        let next_is_newline = content.with_line(index + 1, |text, ending| {
+            text.is_empty() && terminator_str(ending, index + 2 == lines).starts_with('\n')
+        })?;
+        Some(ends_in_cr && next_is_newline)
+    };
+    let mut line = 0u32;
+    for index in 0..caret.line {
+        let ending = content.with_line(index, |_, ending| ending)?;
+        // Each terminator is one break and `\n\r` two; an unterminated line
+        // before the last is written with `\n`.
+        let mut breaks = if ending == text_editor::LineEnding::LfCr {
+            2
+        } else {
+            1
+        };
+        if pairs_with_next(index)? {
+            breaks -= 1;
+        }
+        line = line.saturating_add(breaks);
+    }
+    // A caret on the empty line between a paired `\r` and `\n` is inside a
+    // `\r\n`, where an external editor cannot put one. The nearest place is
+    // the end of the line that `\r\n` ends: after `\n\r` that is the empty
+    // line between them, which the caret's own empty line already gives;
+    // after a lone `\r` it is the previous line.
+    if let Some(previous) = caret.line.checked_sub(1)
+        && pairs_with_next(previous)?
+        && content.with_line(previous, |_, ending| ending == text_editor::LineEnding::Cr)?
+    {
+        return content.with_line(previous, |text, _| {
+            crate::external_editor::Caret::new(line, text)
+        });
+    }
+    content.with_line(caret.line, |text, _| {
+        crate::external_editor::Caret::new(line, &text[..char_boundary(text, caret.column)])
+    })
+}
+
 /// The editor-native caret for a protocol position, or `None` when it names a
 /// line the buffer does not have.
 ///
@@ -3132,6 +3198,24 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    /// The caret as an external editor counts it, so the selected file opens
+    /// there where the reader left it.
+    ///
+    /// `None` unless the selected file's own buffer is open. A buffer with
+    /// unsaved edits still reports its caret, although the external editor
+    /// opens the saved file: the position is then approximate, and VS Code
+    /// and Zed clamp a line or column past the end to the nearest place.
+    #[must_use]
+    pub fn external_caret(&self) -> Option<crate::external_editor::Caret> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        if self.selected_path() != Some(document.path.as_path()) {
+            return None;
+        }
+        external_caret(&document.content, document.content.cursor().position)
     }
 
     pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
@@ -16472,6 +16556,131 @@ mod tests {
             !runtime.move_cursor_to(LspPosition::new(2, 0)),
             "the protocol sees two lines here, whatever the editor does"
         );
+    }
+
+    /// The external caret for the editor-native caret at `line` and byte
+    /// `column` in a fresh buffer holding `text`.
+    fn external_caret_at(
+        text: &str,
+        line: usize,
+        column: usize,
+    ) -> Option<crate::external_editor::Caret> {
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", text);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line, column },
+            selection: None,
+        });
+        runtime.external_caret()
+    }
+
+    #[test]
+    fn the_external_caret_counts_lines_the_way_external_editors_break_them() {
+        use crate::external_editor::Caret;
+        // Every terminator the editor knows, one per line: `\n`, `\r\n`, a
+        // lone `\r`, and `\n\r`, which the built-in editor reads as one
+        // terminator and VS Code and Zed read as two line breaks.
+        let text = "one\ntwo\r\nold\rmac\n\rlast é→😀x\n";
+        assert_eq!(external_caret_at(text, 0, 2), Some(Caret::new(0, "on")));
+        assert_eq!(external_caret_at(text, 1, 3), Some(Caret::new(1, "two")));
+        assert_eq!(external_caret_at(text, 2, 0), Some(Caret::new(2, "")));
+        assert_eq!(external_caret_at(text, 3, 1), Some(Caret::new(3, "m")));
+        // The column is a byte offset into the editor line; this one is after
+        // the emoji.
+        assert_eq!(
+            external_caret_at(text, 4, "last é→😀".len()),
+            Some(Caret::new(5, "last é→😀"))
+        );
+        // A `\n\r` that ends the buffer is two breaks as well.
+        assert_eq!(external_caret_at("x\n\r", 1, 0), Some(Caret::new(2, "")));
+    }
+
+    /// The built-in editor reads `\n\r\n` as `\n\r` and then `\n`, leaving
+    /// an empty line between the `\r` and its `\n`. External editors read
+    /// `\n` and then `\r\n`: two breaks, not three.
+    #[test]
+    fn the_external_caret_reads_a_newline_before_crlf_as_two_breaks() {
+        use crate::external_editor::Caret;
+        let text = "a\n\r\nb\n";
+        assert_eq!(external_caret_at(text, 2, 1), Some(Caret::new(2, "b")));
+        // Between the `\r` and its `\n` is no place an external caret can
+        // be; the nearest is the start of the empty line before them.
+        assert_eq!(external_caret_at(text, 1, 0), Some(Caret::new(1, "")));
+        // `\n`, `\r\n`, then a lone `\r`.
+        assert_eq!(
+            external_caret_at("a\n\r\n\rb", 2, 1),
+            Some(Caret::new(3, "b"))
+        );
+    }
+
+    /// Editing can leave a lone `\r` followed by an empty line ending in
+    /// `\n`, which saves as `\r\n`: one break, not two.
+    #[test]
+    fn the_external_caret_pairs_a_lone_carriage_return_with_the_next_newline() {
+        use crate::external_editor::Caret;
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", "a\rx\nb");
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 1, column: 0 },
+            selection: None,
+        });
+        document
+            .content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+        assert_eq!(document.content.text(), "a\r\nb");
+        assert_eq!(
+            document
+                .content
+                .with_line(0, |text, ending| (text.to_owned(), ending)),
+            Some(("a".to_owned(), text_editor::LineEnding::Cr))
+        );
+        assert_eq!(
+            document
+                .content
+                .with_line(1, |text, ending| (text.to_owned(), ending)),
+            Some((String::new(), text_editor::LineEnding::Lf))
+        );
+        let mut caret_at = |line, column| {
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                unreachable!();
+            };
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line, column },
+                selection: None,
+            });
+            runtime.external_caret()
+        };
+        assert_eq!(caret_at(2, 1), Some(Caret::new(1, "b")));
+        // Between the `\r` and the `\n`: the nearest external place is the
+        // end of `a`.
+        assert_eq!(caret_at(1, 0), Some(Caret::new(0, "a")));
+        assert_eq!(caret_at(0, 1), Some(Caret::new(0, "a")));
+    }
+
+    #[test]
+    fn there_is_no_external_caret_without_the_selected_file_open_as_text() {
+        let card = CardId::new();
+        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+        assert_eq!(runtime.external_caret(), None);
+    }
+
+    /// A caret in one file must never position another.
+    #[test]
+    fn there_is_no_external_caret_when_the_open_buffer_is_not_the_selected_file() {
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(CardId::new(), "notes.txt", "one\ntwo\n");
+        assert!(runtime.external_caret().is_some());
+        runtime
+            .selected
+            .as_mut()
+            .expect("the fixture selects its file")
+            .path = PathBuf::from("other.txt");
+        assert_eq!(runtime.external_caret(), None);
     }
 
     #[test]
