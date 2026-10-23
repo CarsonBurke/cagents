@@ -14891,6 +14891,22 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                if matches!(&action, RepositoryAction::EditorAction { action, .. }
+                    if !matches!(action, repository_widget::EditorAction::Scroll { .. }))
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                        if runtime.editable_surface_visible())
+                {
+                    // A caret action retires results even when it changes no
+                    // text. Returning to the old caret must not revive an
+                    // answer queued before that intervening editor intent.
+                    let pending = self.lsp_contexts.get_mut(&card).and_then(|state| {
+                        state.context.completions.clear();
+                        state.completion_request.take()
+                    });
+                    if let Some((request, _)) = pending {
+                        self.lsp.cancel(request);
+                    }
+                }
                 let find_preferences_changed = matches!(
                     &action,
                     RepositoryAction::FindOptionsChanged { .. }
@@ -26001,6 +26017,260 @@ mod tests {
         );
         lsp_state(app, card).context.completions = targets.clone();
         targets
+    }
+
+    // A current-thread runtime is entered, never driven, by these tests.
+    // Registration has a real manager version/request ID, while discovery and
+    // server tasks cannot run; response injection exercises App admission only.
+    fn completion_intent_fixture() -> (Cagents, CardId, LspDocumentId) {
+        let mut app = lsp_test_app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = repository_card(&mut app, "/repo");
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "tail\n");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.drain_lsp_intents(card));
+        let doc = app
+            .lsp_document(card)
+            .expect("the editable fixture is registered");
+        assert!(app.lsp.document_version(doc).is_some());
+        (app, card, doc)
+    }
+
+    fn request_test_completion(
+        app: &mut Cagents,
+        card: CardId,
+    ) -> (crate::lsp::LspRequestId, LspPosition) {
+        drop(app.request_lsp(card, LspRequestKind::Completion));
+        app.lsp_contexts[&card].completion_request.unwrap()
+    }
+
+    #[test]
+    fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, card, doc) = completion_intent_fixture();
+        let version = app.lsp.document_version(doc);
+        let (old, at) = request_test_completion(&mut app, card);
+        for (step, motion) in [
+            widget::text_editor::Motion::Right,
+            widget::text_editor::Motion::Left,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card,
+                    action: widget::text_editor::Action::Move(motion),
+                })),
+            );
+            if step == 0 {
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                    unreachable!()
+                };
+                assert_ne!(
+                    runtime.cursor_position(),
+                    Some(at),
+                    "the caret really leaves A"
+                );
+            }
+        }
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.cursor_position(), Some(at));
+        assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+        assert_eq!(app.lsp.document_version(doc), version);
+        let old_answer = || LspEvent::Completion {
+            request: old,
+            doc,
+            items: vec![completion_item("old")],
+        };
+        app.apply_lsp_event(old_answer());
+        assert!(app.lsp_contexts[&card].completion_request.is_none());
+        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.editor_completion_targets(card).is_empty());
+
+        let pending = request_test_completion(&mut app, card);
+        assert_ne!(pending.0, old);
+        app.apply_lsp_event(old_answer());
+        assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+        app.apply_lsp_event(LspEvent::Completion {
+            request: pending.0,
+            doc,
+            items: vec![completion_item("fresh")],
+        });
+        let target = app.lsp_contexts[&card].context.completions[0].clone();
+        drop(app.update(Message::ContextInspector(
+            InspectorAction::ApplyLspCompletion {
+                card,
+                index: 0,
+                target,
+            },
+        )));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some("freshtail\n"));
+        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+    }
+
+    #[test]
+    fn no_change_editor_intent_retires_shown_inspector_candidates_and_pending_request() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for action in [
+            widget::text_editor::Action::Move(widget::text_editor::Motion::Left),
+            widget::text_editor::Action::ClearSelection,
+        ] {
+            let (mut app, card, doc) = completion_intent_fixture();
+            let target =
+                publish_test_completions(&mut app, card, vec![completion_item("shown")]).remove(0);
+            let version = app.lsp.document_version(doc);
+            let pending = request_test_completion(&mut app, card);
+            let state = app.lsp_contexts.get_mut(&card).unwrap();
+            state.context.hover = Some("retained hover".into());
+            state.context.locations = Some((crate::lsp::LocationKind::References, Vec::new()));
+            state.context.diagnostics = vec![diagnostic("standing diagnostic")];
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card,
+                    action,
+                })),
+            );
+            assert_eq!(app.lsp.document_version(doc), version);
+            let state = &app.lsp_contexts[&card];
+            assert!(state.completion_request.is_none());
+            assert!(state.context.completions.is_empty());
+            assert_eq!(state.context.hover.as_deref(), Some("retained hover"));
+            assert!(state.context.locations.is_some());
+            assert_eq!(state.context.diagnostics.len(), 1);
+            app.apply_lsp_event(LspEvent::Completion {
+                request: pending.0,
+                doc,
+                items: vec![completion_item("late")],
+            });
+            drop(app.update(Message::ContextInspector(
+                InspectorAction::ApplyLspCompletion {
+                    card,
+                    index: 0,
+                    target,
+                },
+            )));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert_eq!(runtime.cursor_position(), Some(pending.1));
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+            assert!(runtime.editor_completion_targets(card).is_empty());
+            assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn scroll_preserves_pending_and_shown_completion_and_inspector_activation() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, card, doc) = completion_intent_fixture();
+        let pending = request_test_completion(&mut app, card);
+        let scroll = || {
+            Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Scroll { lines: 2 },
+            })
+        };
+        drop(app.update(scroll()));
+        assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+        app.apply_lsp_event(LspEvent::Completion {
+            request: pending.0,
+            doc,
+            items: vec![completion_item("scroll")],
+        });
+        let target = app.lsp_contexts[&card].context.completions[0].clone();
+        drop(app.update(scroll()));
+        assert_eq!(
+            app.lsp_contexts[&card].context.completions,
+            vec![target.clone()]
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(
+            runtime.editor_completion_targets(card),
+            vec![target.clone()]
+        );
+        drop(app.update(Message::ContextInspector(
+            InspectorAction::ApplyLspCompletion {
+                card,
+                index: 0,
+                target,
+            },
+        )));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert_eq!(runtime.editor_text().as_deref(), Some("scrolltail\n"));
+    }
+
+    #[test]
+    fn rejected_hidden_and_foreign_editor_actions_preserve_completion_intents() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for control in 0..4 {
+            let (mut app, card, _) = completion_intent_fixture();
+            let targets =
+                publish_test_completions(&mut app, card, vec![completion_item("current")]);
+            let pending = request_test_completion(&mut app, card);
+            let action_card = match control {
+                0 => {
+                    app.worktree_dialog = Some(WorktreeDialog::new(
+                        ProjectId::new(),
+                        PathBuf::from("/repo"),
+                        WorktreeDraft::default(),
+                    ));
+                    assert!(app.modal_is_open());
+                    card
+                }
+                1 => {
+                    let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+                        unreachable!()
+                    };
+                    drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+                    assert!(runtime.shows_diff());
+                    assert!(!runtime.editable_surface_visible());
+                    card
+                }
+                2 => CardId::new(),
+                _ => {
+                    app.cards.insert(card, CardRuntime::Settings);
+                    card
+                }
+            };
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: action_card,
+                    action: widget::text_editor::Action::Move(widget::text_editor::Motion::Right),
+                })),
+            );
+            assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+            assert_eq!(app.lsp_contexts[&card].context.completions, targets);
+        }
     }
 
     /// Both UI routes must retain the chosen publication and exact edits,

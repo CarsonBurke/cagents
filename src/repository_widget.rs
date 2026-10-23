@@ -3719,7 +3719,7 @@ impl RepositoryRuntime {
     /// Only Edit mounts it. The comparison surface renders the diff model, and
     /// Markdown preview renders the parsed document, so neither has a buffer
     /// to focus or search.
-    fn editable_surface_visible(&self) -> bool {
+    pub(crate) fn editable_surface_visible(&self) -> bool {
         let DocumentState::Editable(_) = &self.document else {
             return false;
         };
