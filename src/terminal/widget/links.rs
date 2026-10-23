@@ -100,6 +100,10 @@ fn boundary(row: &RowSnapshot, column: usize) -> bool {
             .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
 }
 
+/// A file URL opens only when it names the terminal's own machine, by no host
+/// or `localhost`. The terminal host has already respelled links naming it by
+/// its host name that way; this window cannot judge that name itself, since
+/// it may be attached to a remote device.
 fn safe_url(text: &str) -> Option<url::Url> {
     let url = url::Url::parse(text).ok()?;
     match url.scheme() {
