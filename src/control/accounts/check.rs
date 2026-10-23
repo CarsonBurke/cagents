@@ -178,7 +178,7 @@ fn execute_with(
     {
         return Err(invalid_report());
     }
-    output(report)
+    output(*report)
 }
 
 fn invalid_report() -> AppError {
@@ -512,7 +512,7 @@ mod tests {
                                 }
                             } else {
                                 ServerResponse::DeviceOperation {
-                                    reply: Reply::AccountCheck(report),
+                                    reply: Reply::AccountCheck(Box::new(report)),
                                 }
                             }
                         }
