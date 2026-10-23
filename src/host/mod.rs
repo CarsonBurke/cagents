@@ -14,6 +14,8 @@ mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod service;
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests;
 mod state;
 mod work;
 mod worktree_removal;
@@ -438,11 +440,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -462,6 +461,22 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    // Request and register every original before waiting on any one worker.
+    // One absolute deadline bounds the whole batch, including pending joins;
+    // an unfinished owner cannot consume another five seconds per sibling.
+    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles
+        .iter()
+        .map(|handle| handle.shutdown_until(deadline))
+        .collect()
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
