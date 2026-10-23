@@ -1,6 +1,8 @@
 mod account_lifecycle;
 mod account_readiness;
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
+#[cfg(test)]
+pub(crate) use state::SharedHost as TestSharedHost;
 mod activity;
 mod agent_execution;
 mod automations;

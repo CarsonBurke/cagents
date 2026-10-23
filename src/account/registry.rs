@@ -2303,7 +2303,7 @@ mod coding_config_init {
             directory: tempfile::TempDir,
             store: Store,
             homes: Homes,
-            host: crate::host::state::SharedHost,
+            host: crate::host::TestSharedHost,
             account: Account,
             expected: PhysicalIdentity,
             system: Vec<Account>,
