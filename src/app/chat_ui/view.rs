@@ -1140,6 +1140,8 @@ impl Runtime {
             }
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
+        } else if self.is_draft() {
+            (None, "Draft")
         } else if snapshot.ready {
             (None, "Ready")
         } else {
@@ -3737,16 +3739,18 @@ impl Runtime {
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
-            ItemContent::Text { text, .. } => text.as_str(),
+            ItemContent::Text { text, .. } => text.clone(),
+            ItemContent::Image {
+                reference: Some(reference),
+                ..
+            } => reference.label(),
             ItemContent::Image {
                 path, description, ..
-            } => Self::attachment_label(path, description),
-            content => turn::step_label(content),
-        }
-        .to_owned();
-        // An attachment sits under its prompt as an outlined chip rather than
-        // another filled bubble, so a message with two images does not read as
-        // three separate things the reader said.
+            } => Self::attachment_label(path, description).to_owned(),
+            content => turn::step_label(content).to_owned(),
+        };
+        // Images stay beneath their prompt on its own side of the transcript,
+        // with the same bounded preview and viewer used for other images.
         let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
         let expanded = self.item_expanded(&item.id);
         let text = if long && !expanded {
@@ -3761,18 +3765,27 @@ impl Runtime {
             text
         };
         let body: Element<'static, Message> = if attachment {
-            widget::row::with_children(vec![
-                widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::plain(
-                    text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .into()
+            // Empty unowned paths also represent documents and refused image
+            // receipts. Keep their descriptor instead of a generic read error.
+            if let Some(cached) = self.presentation_cache().get(&item.id)
+                && matches!(&item.content, ItemContent::Image { path, reference, .. }
+                    if reference.is_some() || !path.is_empty())
+            {
+                self.image_preview(item, cached)
+            } else {
+                widget::row::with_children(vec![
+                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    selectable_prose::plain(
+                        text,
+                        design::TEXT_CAPTION,
+                        iced::Font::default(),
+                        self.target,
+                    ),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+            }
         } else {
             let text = selectable_prose::plain(
                 text,
@@ -4800,6 +4813,9 @@ fn model_list<'a>(
 mod frame_cost;
 
 #[cfg(test)]
+mod user_image_preview_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5667,6 +5683,74 @@ mod tests {
                 "hover controls must not move neighboring messages"
             );
         }
+    }
+
+    #[test]
+    fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let session = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: chat::NativeContinuity::ReconnectOnly,
+            };
+            let mut draft = Runtime::draft(
+                target,
+                session.clone(),
+                Snapshot::default(),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(draft.is_draft());
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert!(!draft.snapshot.ready);
+            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+
+            draft
+                .composer
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new("Unsent local draft".into()),
+                )));
+            assert_eq!(draft.composer.text(), "Unsent local draft");
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+            assert_eq!(draft.conversation_status(true).1, "Switching session");
+            draft.error = Some("Local attachment could not be read".into());
+            assert_eq!(
+                draft.conversation_status(false),
+                (Some(Icon::Warning), "Error")
+            );
+
+            let connecting = Runtime::new(
+                target,
+                session,
+                Connection::Connecting,
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(!connecting.is_draft());
+            assert!(connecting.handle().is_none());
+            assert_eq!(
+                connecting.conversation_status(false),
+                (Some(Icon::AgentWorking), "Connecting")
+            );
+        }
+        let (live, _handle) = frame_cost::live_runtime(&[]);
+        assert!(!live.is_draft());
+        assert!(live.handle().is_some());
+        assert_eq!(live.conversation_status(false), (None, "Ready"));
     }
 
     #[test]
