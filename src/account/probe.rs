@@ -591,13 +591,17 @@ impl Group {
         if !self.kill() {
             return false;
         }
-        self.reaped = self
-            .child
-            .as_mut()
-            .expect("the group retains its original child until Drop")
-            .wait()
-            .await
-            .is_ok();
+        self.reaped = matches!(
+            tokio::time::timeout(
+                EXIT_GRACE,
+                self.child
+                    .as_mut()
+                    .expect("the group retains its original child until Drop")
+                    .wait(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
         self.reaped
     }
 
