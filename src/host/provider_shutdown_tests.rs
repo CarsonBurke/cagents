@@ -54,7 +54,7 @@ fn private_runtime() -> Option<PathBuf> {
         return Some(PathBuf::from(root).canonicalize().unwrap());
     }
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
-    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let _evidence = EvidenceDirectory(Some(directory));
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
