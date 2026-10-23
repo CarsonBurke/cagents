@@ -1539,6 +1539,11 @@ mod process_tests {
         // Require a real startup and completed clean run; absent or rejected
         // diagnostic storage must never count as evidence of no panic.
         assert!(
+            product.available && product.readable && !product.records.is_empty(),
+            "diagnostic storage unavailable, unreadable, or empty: {product:?}; child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
             product
                 .records
                 .iter()
