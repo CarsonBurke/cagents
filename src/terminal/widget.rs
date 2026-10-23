@@ -5463,6 +5463,46 @@ mod tests {
     }
 
     #[test]
+    fn terminal_file_hyperlinks_open_only_paths_on_the_terminals_machine() {
+        let hyperlink = |uri: &str| {
+            let mut line = (*row("label")).clone();
+            line.hyperlinks
+                .push(crate::terminal::snapshot::HyperlinkSpan {
+                    start: 0,
+                    end: 5,
+                    uri: uri.into(),
+                });
+            let snapshot = RenderSnapshot {
+                lines: vec![Arc::new(line)].into(),
+                ..RenderSnapshot::empty()
+            };
+            links::at(&snapshot, 0, 2, std::path::Path::new("/repo")).map(|link| link.url)
+        };
+        for uri in [
+            "file:///tmp/a%20b/%E7%95%8C.md",
+            "file://localhost/tmp/a%20b/%E7%95%8C.md",
+            "file://LOCALHOST/tmp/a%20b/%E7%95%8C.md",
+        ] {
+            let url = hyperlink(uri).unwrap_or_else(|| panic!("{uri} opens"));
+            assert_eq!(url.as_str(), "file:///tmp/a%20b/%E7%95%8C.md");
+            assert_eq!(
+                crate::document_link::resolve(std::path::Path::new("/"), url.as_str()),
+                Ok(crate::document_link::DocumentLink::Local {
+                    path: "/tmp/a b/界.md".into(),
+                    fragment: None,
+                })
+            );
+        }
+        // The terminal host respells links naming its own machine before
+        // they get here. This window may run elsewhere, so a host name that
+        // happens to be its own still names another machine's file.
+        for host in std::iter::once("elsewhere".to_owned()).chain(crate::file_url::test_host_name())
+        {
+            assert_eq!(hyperlink(&format!("file://{host}/tmp/a")), None, "{host}");
+        }
+    }
+
+    #[test]
     fn terminal_link_cache_tracks_snapshot_and_directory_without_retaining_history() {
         let mut cache = links::Cache::default();
         let snapshot = Arc::new(RenderSnapshot {

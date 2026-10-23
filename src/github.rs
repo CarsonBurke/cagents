@@ -3783,25 +3783,25 @@ mod tests {
             "remote",
             "add",
             "origin",
-            "https://github.com/CarsonBurke/cleanrl.git",
+            "https://github.com/ExampleContributor/example-project.git",
         ]);
         git(&[
             "remote",
             "add",
             "upstream",
-            "https://github.com/vwxyzjn/cleanrl.git",
+            "https://github.com/ExampleUpstream/example-project.git",
         ]);
         git(&["config", "branch.Feature/Case.remote", "upstream"]);
         git(&["config", "branch.Feature/Case.pushRemote", "origin"]);
         git(&[
             "config",
             "remote.origin.pushurl",
-            "git@github.com:ActualPublisher/cleanrl.git",
+            "git@github.com:ActualPublisher/example-project.git",
         ]);
         let key = worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
             .unwrap();
         assert_eq!(key.owner, "ActualPublisher");
-        assert_eq!(key.name, "cleanrl");
+        assert_eq!(key.name, "example-project");
         git(&["config", "branch.Feature/Case.pushRemote", "unknown"]);
         assert!(
             worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())

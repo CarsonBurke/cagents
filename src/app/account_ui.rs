@@ -7364,7 +7364,7 @@ mod app_tests {
     #[test]
     fn project_choice_routes_new_shells_and_chats_without_changing_other_projects() {
         let directory = tempfile::tempdir().unwrap();
-        let home = directory.path().join("redact-history");
+        let home = directory.path().join("linked-account-history");
         std::fs::create_dir(&home).unwrap();
         let mut app = app_in_repo();
         let key = uuid::Uuid::new_v4();
