@@ -117,6 +117,289 @@ fn assert_no_app_work(task: Task<Message>) {
 }
 
 #[test]
+fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confirmation() {
+    const NAME: &str = "app::discard_ui::actual_tests::discard_app_accessibility_click_uses_current_rendered_source_and_opens_confirmation";
+    if isolated(NAME) {
+        return;
+    }
+    use cosmic::iced::{
+        Event, Size,
+        advanced::{clipboard, mouse},
+        runtime::user_interface::{Cache, UserInterface},
+    };
+    use iced_accessibility::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+
+    // Use the complete App view and its real UI cache, with no pointer hover.
+    // The event uses Winit's numeric conversion of the CURRENT emitted node;
+    // an AT-SPI global object-path number is not a local AccessKit node ID.
+    fn frame(app: &Cagents, cache: Cache, click: bool) -> (Cache, NodeId, Vec<Message>) {
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui =
+            UserInterface::build(app.view(), Size::new(1280.0, 900.0), cache, &mut renderer);
+        let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let buttons = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == Role::Button
+                    && node.node().label() == Some("Discard all Unstaged")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 1, "one actual current discard control");
+        assert!(!buttons[0].node().is_disabled());
+        let bounds = buttons[0].node().bounds().expect("real button geometry");
+        assert!(bounds.x0 >= 0.0 && bounds.x1 <= 1280.0);
+        assert!(bounds.y0 >= 0.0 && bounds.y1 <= 900.0);
+        let target_node = NodeId::from(buttons[0].id().clone());
+        let mut emitted = Vec::new();
+        if click {
+            let event = Event::A11y(
+                widget::Id::from(u128::from(target_node.0) as u64),
+                ActionRequest {
+                    action: Action::Click,
+                    target_tree: TreeId::ROOT,
+                    target_node,
+                    data: None,
+                },
+            );
+            let (_, statuses) = ui.update(
+                &[event],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut emitted,
+            );
+            assert_eq!(statuses, vec![cosmic::iced::event::Status::Captured]);
+        }
+        (ui.into_cache(), target_node, emitted)
+    }
+
+    fn discard_message(
+        app: &mut Cagents,
+        messages: Vec<Message>,
+        original: uuid::Uuid,
+        key: &ActiveWorktreeKey,
+    ) -> Message {
+        let mut discard = None;
+        for message in messages {
+            match &message {
+                Message::SidebarSnapshot { source, action }
+                    if *source == original
+                        && matches!(&**action,
+                        SidebarAction::ChangeGroup { key: observed,
+                            area: crate::repository::ChangeArea::Unstaged,
+                            command: sidebar::ChangeGroupCommand::Discard } if observed == key) =>
+                {
+                    assert!(
+                        discard.replace(message).is_none(),
+                        "one Click emits one discard intent"
+                    );
+                }
+                Message::SidebarSnapshot { source, action }
+                    if *source == original
+                        && matches!(&**action,
+                        SidebarAction::ChangeViewport { key: observed, scope: sidebar::ChangeTreeScope::Area(
+                            crate::repository::ChangeArea::Unstaged | crate::repository::ChangeArea::Untracked), first_row: 0, .. }
+                            if observed == key) =>
+                {
+                    // Reduce only the real mounted lists' layout callbacks.
+                    // No emitted work or unrelated input is discarded.
+                    assert_no_app_work(app.update(message));
+                    assert_eq!(app.discard_ui.source().unwrap().id, original);
+                    assert!(!app.modal_is_open());
+                }
+                _ => panic!("unexpected actual A11y message: {message:?}"),
+            }
+        }
+        discard.expect("the actual current UI consumes Click into a discard intent")
+    }
+
+    let root = PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap());
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("modified"), b"index modified\n").unwrap();
+    fs::write(root.join("deleted"), b"index deleted\n").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("modified"), b"precious modified\n").unwrap();
+    fs::remove_file(root.join("deleted")).unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    let untracked = root.join("nested/original file");
+    fs::write(&untracked, b"precious untracked\n").unwrap();
+    let untracked_identity = fs::metadata(&untracked).unwrap();
+    let index = fs::read(root.join(".git/index")).unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.window_width = 1280.0;
+    app.window_height = 900.0;
+    app.active_workspace = Some(root.clone());
+    let key = ActiveWorktreeKey {
+        project_id: crate::model::ProjectId::new(),
+        worktree_id: crate::model::WorktreeId::new(),
+        canonical_path: root.clone(),
+    };
+    app.sidebar_model = sidebar::SidebarModel::ready(
+        sidebar::SidebarMode::Expanded,
+        vec![sidebar::SidebarProject::new(
+            key.project_id,
+            crate::repository::RepositoryId::new(),
+            "A11y discard fixture".into(),
+            root.clone(),
+            vec![sidebar::SidebarWorktree::from_durable(
+                key.worktree_id,
+                root.clone(),
+                None,
+            )],
+            Vec::new(),
+        )],
+    )
+    .with_source_control(Some(SourceControlModel::loading(key.clone())));
+    assert!(app.sidebar_state.sync_active_worktree(
+        &app.sidebar_model,
+        &sidebar::SidebarFocus::Repository {
+            worktree: root.clone()
+        }
+    ));
+    app.context_tab = ContextTab::Changes;
+    let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
+    drop(app.update(loaded));
+    let original = app.discard_ui.source().unwrap().id;
+    let source = sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).unwrap();
+    assert_eq!(source.data_state, sidebar::SidebarDataState::Ready);
+    assert_eq!(
+        source
+            .group(crate::repository::ChangeArea::Unstaged)
+            .unwrap()
+            .rows()
+            .len(),
+        2
+    );
+    assert_eq!(
+        source
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()
+            .len(),
+        1
+    );
+    let (cache, first_id, empty) = frame(&app, Cache::new(), false);
+    assert!(empty.is_empty());
+    // Periodic Git refresh uses this same real worker/completion boundary.
+    // A refresh of the same binding must not retire the rendered actor.
+    let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+    assert!(
+        matches!(&loaded, Message::SourceControlLoaded { source, result: Ok(_), .. }
+        if source.id == original)
+    );
+    drop(app.update(loaded));
+    assert_eq!(app.discard_ui.source().unwrap().id, original);
+    let (cache, rebuilt_id, emitted) = frame(&app, cache, true);
+    assert_eq!(
+        rebuilt_id, first_id,
+        "the cached current button retains its native target"
+    );
+    let queued = discard_message(&mut app, emitted, original, &key);
+
+    // Retire only the original source actor after actual widget dispatch.
+    // The old queued action cannot borrow the replacement's authority, even
+    // when the replacement has the same logical worktree and current rows.
+    app.discard_ui.retire_source();
+    let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+    assert!(matches!(
+        &loaded,
+        Message::SourceControlLoaded { result: Ok(_), .. }
+    ));
+    drop(app.update(loaded));
+    let current = app.discard_ui.source().unwrap().id;
+    assert_ne!(current, original);
+    assert_no_app_work(app.update(queued));
+    assert!(!app.modal_is_open());
+    assert!(app.sidebar_state.pending_discard().is_none());
+    assert_eq!(app.discard_ui.source().unwrap().id, current);
+
+    let (_, _, emitted) = frame(&app, cache, true);
+    let current_message = discard_message(&mut app, emitted, current, &key);
+    drop(app.update(current_message));
+    assert!(app.modal_is_open());
+    assert_eq!(app.discard_ui.intent_id(), Some(current));
+    let pending = app
+        .sidebar_state
+        .pending_discard()
+        .expect("actual App confirmation");
+    assert_eq!(pending.key, key);
+    assert_eq!(pending.request.worktree, root);
+    assert_eq!(pending.request.tracked.len(), 2);
+    let mut tracked = pending
+        .request
+        .tracked
+        .iter()
+        .map(|selection| selection.path.as_path())
+        .collect::<Vec<_>>();
+    tracked.sort();
+    assert_eq!(tracked, vec![Path::new("deleted"), Path::new("modified")]);
+    assert!(
+        pending
+            .request
+            .tracked
+            .iter()
+            .all(|selection| selection.old_path.is_none())
+    );
+    assert!(
+        pending.request.untracked.is_empty(),
+        "this control confirms only the tracked area"
+    );
+    assert!(!pending.request.confirmed);
+    let mut renderer = crate::app::tests::headless_renderer();
+    let dialog = UserInterface::build(
+        app.dialog().expect("actual confirmation view"),
+        Size::new(1280.0, 900.0),
+        Cache::new(),
+        &mut renderer,
+    );
+    let accessible = dialog.a11y_nodes(mouse::Cursor::Unavailable);
+    let labels = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter_map(|node| node.node().label())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"Discard changes?"));
+    assert!(labels.contains(&"2 tracked paths will be restored from the index"));
+    assert_eq!(
+        labels.iter().filter(|label| **label == "Discard").count(),
+        1
+    );
+    assert_eq!(
+        app.sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()
+            .len(),
+        1
+    );
+    assert!(!app.discard_ui.has_inflight());
+    assert!(app.discard_ui.slots.is_empty());
+    assert_eq!(
+        fs::read(root.join("modified")).unwrap(),
+        b"precious modified\n"
+    );
+    assert!(!root.join("deleted").exists());
+    assert_eq!(fs::read(&untracked).unwrap(), b"precious untracked\n");
+    let after = fs::metadata(&untracked).unwrap();
+    assert_eq!(
+        (after.dev(), after.ino()),
+        (untracked_identity.dev(), untracked_identity.ino())
+    );
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+}
+
+#[test]
 fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo";
     if isolated(NAME) {
