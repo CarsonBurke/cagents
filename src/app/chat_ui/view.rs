@@ -1120,8 +1120,9 @@ impl Runtime {
         let active = self
             .error
             .as_deref()
-            .or(snapshot.error.as_deref())
-            .and_then(|message| {
+            .into_iter()
+            .chain(snapshot.error.as_deref())
+            .find_map(|message| {
                 chat::failure::Failure::parse(self.session.launch.provider, message)
             });
         let failure_label = active.map(|failure| match failure.kind {

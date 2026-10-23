@@ -631,6 +631,82 @@ fn mixed_blocked_waiting_and_working_children_do_not_hide_real_work_or_clear_par
 }
 
 #[test]
+fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() {
+    let local =
+        "The image insertion point changed while loading. Attach the image again at the new caret.";
+    let local_capacity = "overloaded_error: provider temporarily at capacity";
+    for (provider_error, label) in [
+        (quota("1:30pm", "snapshot-quota"), "Account limit reached"),
+        (
+            "authentication_error: invalid credentials".into(),
+            "Sign-in required",
+        ),
+        ("connection reset by peer".into(), "Connection interrupted"),
+    ] {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let mut snapshot = runtime.snapshot.as_ref().clone();
+        snapshot.generation += 1;
+        snapshot.error = Some(provider_error.clone());
+        snapshot.subagents = vec![child("independent-worker", ToolStatus::Running, false)];
+        runtime.error = Some(local.into());
+        handle.publish_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+        );
+        let details: Vec<_> = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .filter_map(|incident| runtime.failure_details(&incident.key))
+            .collect();
+        assert!(details.iter().any(|raw| raw == local));
+        assert!(details.iter().any(|raw| raw == &provider_error));
+
+        // A recognized local failure keeps its existing precedence. The
+        // independent provider incident and exact original remain available.
+        runtime.error = Some(local_capacity.into());
+        runtime.reconcile_failure_ui();
+        assert_eq!(
+            runtime.conversation_status(false),
+            (
+                Some(Icon::AgentWorking),
+                "Provider at capacity · 1 working".into(),
+            )
+        );
+        assert!(runtime.failure_ui.incidents.iter().any(|incident| {
+            runtime.failure_details(&incident.key).as_deref() == Some(provider_error.as_str())
+        }));
+        runtime.error = None;
+        runtime.reconcile_failure_ui();
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::AgentWorking), format!("{label} · 1 working"))
+        );
+
+        // Clearing provider state must not promote a historical failure into
+        // the active footer, whether a generic local error remains or not.
+        runtime.error = Some(local.into());
+        snapshot.generation += 1;
+        snapshot.error = None;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::AgentWorking), "Subagents working".into())
+        );
+        runtime.error = None;
+        runtime.reconcile_failure_ui();
+        snapshot.generation += 1;
+        snapshot.subagents[0].status = ToolStatus::Succeeded;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.conversation_status(false), (None, "Ready".into()));
+    }
+}
+
+#[test]
 fn local_error_set_change_and_clear_reconcile_without_a_snapshot_publication() {
     let (mut runtime, _) = frame_cost::live_runtime(&[]);
     assert!(runtime.failure_ui.incidents.is_empty());
