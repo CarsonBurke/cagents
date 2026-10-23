@@ -478,14 +478,16 @@ pub(crate) mod tests {
 
     #[test]
     fn rejected_scope_request_preserves_fallback() {
-        let error = enroll_with(
+        let error = rejected_scope_request().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+    pub(crate) fn rejected_scope_request() -> io::Result<()> {
+        enroll_with(
             Command::new("/bin/false"),
             "fixture.scope",
             Duration::from_secs(1),
             || panic!("failed request must not verify membership"),
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
     #[test]
     fn successful_request_requires_exact_confirmed_membership() {
