@@ -1,6 +1,24 @@
 use super::coordination::Coordinated;
 use super::*;
 
+/// Bind a link to the surface that rendered it, before another pane, project,
+/// or child conversation can become selected.
+pub(super) fn capture_document_link(
+    message: Message,
+    target: Target,
+    document: &Option<PathBuf>,
+) -> Message {
+    match message {
+        Message::ChatUi(Action::OpenDocument(found, raw)) if found == target => {
+            action(Action::OpenDocumentFrom(target, document.clone(), raw))
+        }
+        Message::ChatUi(Action::OpenSharedDocument(found, raw)) if found == target => action(
+            Action::OpenDocumentFrom(target, document.clone(), raw.to_string()),
+        ),
+        message => message,
+    }
+}
+
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
         .size(design::TEXT_BODY)
@@ -1087,6 +1105,12 @@ struct Place {
 }
 
 impl Runtime {
+    pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
+        self.selected_subagent
+            .is_none()
+            .then(|| self.session.launch.recipe.working_directory.join(".chat"))
+    }
+
     // Provider descriptions can contain a whole prompt. Keep status controls
     // compact while the full transcript remains available on selection.
     pub(super) fn short_description(raw: &str, limit: usize) -> String {
@@ -1161,7 +1185,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending {
+        } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
@@ -2003,7 +2027,7 @@ impl Runtime {
         } else if self.capacity_refused {
             let enabled = !transitioning
                 && self.pending.is_none()
-                && !self.attachment_chooser_pending
+                && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
                     || !self.attachments.is_empty());
@@ -2026,8 +2050,9 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let enabled =
-                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && self.attachment_chooser_pending.is_none();
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -2108,6 +2133,11 @@ impl Runtime {
                                 .requests
                                 .iter()
                                 .map(|request| {
+                                    // Requests belong to the parent even while
+                                    // its child transcript is being inspected.
+                                    let document = Some(
+                                        self.session.launch.recipe.working_directory.join(".chat"),
+                                    );
                                     request_view(
                                         self.target,
                                         request,
@@ -2115,6 +2145,9 @@ impl Runtime {
                                         available,
                                         RequestSurface::Transcript,
                                     )
+                                    .map(move |message| {
+                                        capture_document_link(message, target, &document)
+                                    })
                                 })
                                 .collect::<Vec<_>>(),
                         )
@@ -2283,16 +2316,15 @@ impl Runtime {
                 } else {
                     crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
                 },
-                crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
-                    "Pasted image".to_owned()
-                } else {
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                crate::design::caption(
+                    if attachment.reference.is_none()
+                        && clipboard_image::is_pasted(&attachment.path)
+                    {
+                        "Pasted image".into()
+                    } else {
+                        attachment.label()
+                    },
+                )
                 .width(Length::Fill)
                 .into(),
                 icon(
@@ -2307,7 +2339,10 @@ impl Runtime {
             attachment_chips.push(
                 widget::tooltip(
                     chip,
-                    design::caption(attachment.path.display().to_string()),
+                    design::caption(attachment.reference.as_ref().map_or_else(
+                        || attachment.path.display().to_string(),
+                        |reference| reference.name.clone(),
+                    )),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
@@ -2569,7 +2604,7 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                available && self.attachment_chooser_pending.is_none(),
                 Action::Attach(target),
             ));
         }
@@ -2941,6 +2976,7 @@ impl Runtime {
         // The whole pane takes a drop, not just the composer: the transcript
         // is most of what a reader aims at, and a drop lands in the draft
         // wherever it was aimed.
+        let document = self.document_link_origin();
         crate::file_drop::target_with_hover(
             pane,
             ("chat", target.card),
@@ -2948,6 +2984,7 @@ impl Runtime {
             move |payload| action(Action::Dropped(target, payload)),
             move |hovering| action(Action::DropHover(target, hovering)),
         )
+        .map(move |message| capture_document_link(message, target, &document))
     }
 
     /// The page of history this conversation is waiting on, if any.
@@ -4268,7 +4305,9 @@ impl Runtime {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
-            ItemContent::Image { path, description } => Self::attachment_label(path, description),
+            ItemContent::Image {
+                path, description, ..
+            } => Self::attachment_label(path, description),
             content => turn::step_label(content),
         };
         if attachment {
@@ -4813,6 +4852,16 @@ pub(super) fn request_view<'a>(
     }
     for field in &request.fields {
         rows.push(field_view(target, request, field, answers, available));
+    }
+    for (label, uri) in artifacts::links(request) {
+        rows.push(
+            crate::interaction::tooltip(
+                widget::button::link(format!("Open artifact: {label}"))
+                    .on_press(action(Action::OpenDocument(target, uri.clone()))),
+                uri,
+            )
+            .into(),
+        );
     }
     rows.push(answers_view(target, request, available, surface));
     widget::container(
@@ -5361,6 +5410,101 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
+        use iced::advanced::{Layout, Shell, Widget, clipboard, layout, mouse, widget::Tree};
+        use iced::{Event, Point, Rectangle, Size};
+        let question = "Compare tree-real-*.png and [Expanded](docs/tree%20expanded.png).";
+        let request = chat::Request {
+            kind: chat::RequestKind::Question,
+            id: "review".into(),
+            title: "Review".into(),
+            description: String::new(),
+            fields: vec![chat::Field {
+                id: question.into(),
+                label: question.into(),
+                description: "Screenshots".into(),
+                choices: vec![],
+                multiple: false,
+                secret: false,
+                initial: String::new(),
+            }],
+            actions: vec![],
+        };
+        let answers = Answers::new();
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
+        let document = Some(PathBuf::from("/producing/worktree/.chat"));
+        let mut element =
+            request_view(target, &request, &answers, true, RequestSurface::Transcript)
+                .map(move |message| capture_document_link(message, target, &document));
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(520.0, 1000.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let buttons: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Open artifact:"))
+            })
+            .collect();
+        assert_eq!(
+            buttons.len(),
+            1,
+            "the bare pattern never becomes a file action"
+        );
+        assert_eq!(buttons[0].node().label(), Some("Open artifact: Expanded"));
+        let bounds = buttons[0].node().bounds().unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocumentFrom(found, Some(origin), uri))]
+            if *found == target && origin == Path::new("/producing/worktree/.chat") && uri == "docs/tree%20expanded.png")
+        );
+        assert_eq!(
+            request.fields[0].id, question,
+            "the provider answer key stays literal"
+        );
+        assert!(
+            answers.is_empty(),
+            "opening an artifact must not answer the question"
+        );
+    }
 
     #[test]
     fn recorded_message_timestamp_format_uses_message_metadata() {
@@ -11435,6 +11579,7 @@ mod tests {
             content: ItemContent::Image {
                 path: "/image.png".into(),
                 description: "Image".into(),
+                reference: None,
             },
             started_at: None,
             at: None,

@@ -172,7 +172,10 @@ use crate::{
 /// each is appended, and none reaches a peer that cannot issue the request.
 /// Worktree removal - `work::Request::{RemovalPlan, Remove, Snapshots}` and
 /// their responses - is appended under the same policy.
-pub const PROTOCOL_VERSION: u16 = 104;
+/// Version 105 adds immutable image-reference metadata to Attachment and
+/// ItemContent::Image. These are positional postcard fields, so all three
+/// executables must be replaced together; JSON omission alone is compatible.
+pub const PROTOCOL_VERSION: u16 = 105;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -2372,6 +2375,99 @@ mod tests {
         let applied = wire.apply(Some(&restored)).unwrap();
         assert_eq!(applied.activity, next.activity);
         assert_eq!(applied.lines, restored.lines);
+    }
+
+    #[test]
+    fn managed_image_identity_roundtrips_prompt_and_snapshot_with_json_legacy_defaults() {
+        let reference = crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 19,
+            device: uuid::Uuid::new_v4(),
+            name: "literal *.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        let attachment = crate::chat::Attachment {
+            path: "/private/image.png".into(),
+            reference: Some(reference.clone()),
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id: TerminalId::new(),
+            command: crate::chat::Command::Prompt {
+                text: format!("Inspect {}", reference.token()),
+                attachments: vec![attachment.clone()],
+                mode: crate::chat::PromptMode::Send,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(
+            read_frame::<ClientRequest>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            request
+        );
+        let image = crate::chat::ItemContent::Image {
+            path: attachment.path.to_str().unwrap().into(),
+            description: reference.label(),
+            reference: Some(reference.clone()),
+        };
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                items: vec![Arc::new(crate::chat::Item {
+                    id: "image".into(),
+                    role: crate::chat::Role::User,
+                    content: image.clone(),
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            response
+        );
+        let legacy = serde_json::json!({"path":"/legacy.png"});
+        assert_eq!(
+            serde_json::from_value::<crate::chat::Attachment>(legacy)
+                .unwrap()
+                .reference,
+            None
+        );
+        let mut legacy_image = serde_json::to_value(image).unwrap();
+        legacy_image["Image"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reference");
+        assert!(matches!(
+            serde_json::from_value::<crate::chat::ItemContent>(legacy_image).unwrap(),
+            crate::chat::ItemContent::Image {
+                reference: None,
+                ..
+            }
+        ));
+        #[derive(serde::Serialize)]
+        struct LegacyAttachment {
+            path: PathBuf,
+        }
+        let legacy = postcard::to_stdvec(&LegacyAttachment {
+            path: "/legacy.png".into(),
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
+            "JSON defaults cannot repair positional postcard layout"
+        );
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
     }
 
     #[test]

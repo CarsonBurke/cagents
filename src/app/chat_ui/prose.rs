@@ -2178,6 +2178,14 @@ mod tests {
                 Arc::ptr_eq(url, shared),
                 "the actual image button action shares its full prepared destination"
             );
+            let origin = Some(PathBuf::from("/producing/worktree/.chat"));
+            let captured =
+                super::super::view::capture_document_link(messages.remove(0), target, &origin);
+            assert!(
+                matches!(captured, Message::ChatUi(Action::OpenDocumentFrom(found, Some(path), raw))
+                if found == target && path == Path::new("/producing/worktree/.chat") && raw == uri),
+                "the native source action must retain its rendered origin across later selection changes"
+            );
         }
     }
 

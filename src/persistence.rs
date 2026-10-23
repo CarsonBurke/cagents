@@ -268,6 +268,7 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -343,6 +344,10 @@ pub struct RetainedChatCopy {
     pub source: crate::chat::Session,
     pub copy: CardState,
     pub draft: String,
+    /// Exact managed-image draft metadata, committed with this inert copy.
+    /// Empty omission preserves the digest of pre-image retained-copy receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::chat::Attachment>,
     pub scope: Option<PathBuf>,
     pub channel: Option<crate::model::ChannelId>,
 }
@@ -360,6 +365,20 @@ impl RetainedChatCopy {
             return Err(StoreError::InvalidState(
                 "Retained chat copy changed its captured source".into(),
             ));
+        }
+        let mut identities = std::collections::HashSet::new();
+        for attachment in &self.attachments {
+            let reference = attachment.reference.as_ref().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "Retained image copies require explicit image identity".into(),
+                )
+            })?;
+            reference.validate().map_err(StoreError::InvalidState)?;
+            if !identities.insert((reference.device, reference.id)) {
+                return Err(StoreError::InvalidState(
+                    "Retained image copy repeats an image identity".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -394,7 +413,21 @@ impl RetainedChatCopy {
                 "Retained chat copy text changed before saving".into(),
             ));
         }
+        if state
+            .chat_draft_attachments
+            .get(&self.copy.id)
+            .is_some_and(|attachments| attachments != &self.attachments)
+        {
+            return Err(StoreError::InvalidState(
+                "Retained chat copy images changed before saving".into(),
+            ));
+        }
         state.chat_drafts.insert(self.copy.id, self.draft.clone());
+        if !self.attachments.is_empty() {
+            state
+                .chat_draft_attachments
+                .insert(self.copy.id, self.attachments.clone());
+        }
         state.local_only_cards.insert(self.copy.id);
         state
             .pending_chat_admissions
@@ -1514,6 +1547,12 @@ impl StateStore {
                 || load_card_connection(&transaction, copy.copy.id, &self.boot_id, None)?
                     .is_none_or(|card| card.kind != copy.copy.kind)
                 || manifest.chat_drafts.get(&copy.copy.id) != Some(&copy.draft)
+                || manifest
+                    .chat_draft_attachments
+                    .get(&copy.copy.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    != copy.attachments.as_slice()
                 || !manifest.local_only_cards.contains(&copy.copy.id)
                 || manifest.pending_chat_admissions.get(&copy.copy.id) != Some(&copy.source)
                 || !(manifest.card_scopes.contains_key(&copy.copy.id)
@@ -1564,6 +1603,11 @@ impl StateStore {
         manifest
             .chat_drafts
             .insert(copy.copy.id, copy.draft.clone());
+        if !copy.attachments.is_empty() {
+            manifest
+                .chat_draft_attachments
+                .insert(copy.copy.id, copy.attachments.clone());
+        }
         manifest.local_only_cards.insert(copy.copy.id);
         manifest
             .pending_chat_admissions
@@ -1575,6 +1619,10 @@ impl StateStore {
         copy.project(&mut state)?;
         for (name, value) in [
             ("chat_drafts", to_json(&manifest.chat_drafts)?),
+            (
+                "chat_draft_attachments",
+                to_json(&manifest.chat_draft_attachments)?,
+            ),
             ("local_only_cards", to_json(&manifest.local_only_cards)?),
             (
                 "pending_chat_admissions",
@@ -2017,6 +2065,7 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            chat_draft_attachments: manifest.chat_draft_attachments,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -3898,6 +3947,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:chat_draft_attachments"),
+        &to_json(&state.chat_draft_attachments)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &to_json(&state.repository_navigation)?,
     )?;
@@ -5266,6 +5320,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat drafts", &value))
         .transpose()?
         .unwrap_or_default(),
+        chat_draft_attachments: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:chat_draft_attachments"),
+        )?
+        .map(|value| from_json("workspace chat image drafts", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -5896,6 +5957,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -7253,6 +7315,76 @@ mod tests {
     }
 
     #[test]
+    fn workspace_managed_image_drafts_roundtrip_additive_metadata_and_legacy_absence() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("image-draft-boot");
+        let store = StateStore::open(
+            directory.path().join("image-drafts.sqlite3"),
+            boot_id.clone(),
+        )
+        .unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        let reference = crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 37,
+            device: uuid::Uuid::new_v4(),
+            name: "literal {draft} *.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        let image = crate::chat::Attachment {
+            path: "/private/owned/image.png".into(),
+            reference: Some(reference.clone()),
+        };
+        workspace
+            .chat_drafts
+            .insert(card, format!("Keep {}", reference.token()));
+        workspace
+            .chat_draft_attachments
+            .insert(card, vec![image.clone()]);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments[&card],
+            [image.clone()]
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments[&card],
+            [image]
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("chat_draft_attachments");
+        assert!(
+            serde_json::from_value::<WorkspaceState>(legacy)
+                .unwrap()
+                .chat_draft_attachments
+                .is_empty()
+        );
+        workspace.chat_draft_attachments.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_draft_attachments
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn workspace_chat_drafts_commit_and_restore_with_terminal_cards() {
         let directory = tempdir().unwrap();
         let boot_id = boot("draft-boot");
@@ -7323,6 +7455,20 @@ mod tests {
         (workspace, chat)
     }
 
+    fn retained_image_fixture(number: u64) -> crate::chat::Attachment {
+        crate::chat::Attachment {
+            path: format!("/private/owned/image-{number}.png").into(),
+            reference: Some(crate::chat::ImageReference {
+                id: uuid::Uuid::from_u128(u128::from(number) + 1000),
+                number,
+                device: uuid::Uuid::from_u128(77),
+                name: format!("Image {number}"),
+                sha256: "a".repeat(64),
+                extension: "png".into(),
+            }),
+        }
+    }
+
     #[test]
     fn retained_chat_copy_is_atomic_idempotent_and_never_rewrites_canonical() {
         for stage in ["source", "upgraded", "replaced"] {
@@ -7342,6 +7488,9 @@ mod tests {
                 .chat_drafts
                 .insert(original, "Canonical draft untouched".into());
             workspace.agent_updates.insert(original, None);
+            workspace
+                .chat_draft_attachments
+                .insert(original, vec![retained_image_fixture(13)]);
             let mut lane = SaveLane::default();
             lane.save(&store, &workspace).unwrap();
             let mut canonical = source.clone();
@@ -7377,6 +7526,7 @@ mod tests {
                 source: source.clone(),
                 copy: card,
                 draft: "Exact saved text  \nsecond line 🦀".into(),
+                attachments: vec![retained_image_fixture(29)],
                 scope: None,
                 channel: None,
             };
@@ -7388,10 +7538,24 @@ mod tests {
                 before,
                 "{stage}"
             );
-            for mutation in ["text", "source", "descriptor", "origin", "occupied"] {
+            for mutation in [
+                "text",
+                "images",
+                "image-path",
+                "image-label",
+                "image-duplicate",
+                "source",
+                "descriptor",
+                "origin",
+                "occupied",
+            ] {
                 let mut changed = copy.clone();
                 match mutation {
                     "text" => changed.draft.push('!'),
+                    "images" => changed.attachments.clear(),
+                    "image-path" => changed.attachments[0].path = "/other/image.png".into(),
+                    "image-label" => changed.attachments[0].reference.as_mut().unwrap().number += 1,
+                    "image-duplicate" => changed.attachments.push(changed.attachments[0].clone()),
                     "source" => {
                         changed
                             .source
@@ -7415,6 +7579,23 @@ mod tests {
                     committed.generation
                 );
             }
+            let mut projected = workspace.clone();
+            copy.project(&mut projected).unwrap();
+            assert_eq!(
+                projected.chat_draft_attachments[&copy.copy.id],
+                copy.attachments
+            );
+            assert_eq!(
+                projected.chat_draft_attachments[&original],
+                workspace.chat_draft_attachments[&original]
+            );
+            projected
+                .chat_draft_attachments
+                .insert(copy.copy.id, vec![retained_image_fixture(42)]);
+            assert!(
+                copy.project(&mut projected).is_err(),
+                "projection cannot reinterpret accepted image metadata"
+            );
             drop(store);
             let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
             let saved = reopened
@@ -7431,6 +7612,14 @@ mod tests {
                 CardKind::Chat(source.clone())
             );
             assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+            assert_eq!(
+                saved.chat_draft_attachments[&copy.copy.id],
+                copy.attachments
+            );
+            assert_eq!(
+                saved.chat_draft_attachments[&original],
+                workspace.chat_draft_attachments[&original]
+            );
             assert_eq!(saved.chat_drafts[&original], "Canonical draft untouched");
             assert_eq!(saved.agent_updates, workspace.agent_updates);
             assert!(saved.local_only_cards.contains(&copy.copy.id));
@@ -7452,6 +7641,123 @@ mod tests {
             assert_eq!(receipt.len(), 64);
             assert!(!receipt.contains("Exact saved text"));
         }
+    }
+
+    #[test]
+    fn retained_image_copy_rolls_back_all_fields_when_image_metadata_cannot_commit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("copy-failure.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let original = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let before = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        let mut card = workspace.cards[0].clone();
+        card.id = CardId::new();
+        let copy = RetainedChatCopy {
+            workspace: workspace.id,
+            source_card: original,
+            source,
+            copy: card,
+            draft: String::new(),
+            attachments: vec![retained_image_fixture(29)],
+            scope: None,
+            channel: None,
+        };
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_retained_images BEFORE INSERT ON metadata
+             WHEN NEW.key LIKE '%:navigation:chat_draft_attachments'
+             BEGIN SELECT RAISE(ABORT, 'fixture refuses image metadata'); END;",
+            )
+            .unwrap();
+        assert!(store.preserve_chat_copy(&copy).is_err());
+        assert!(store.load_card(copy.copy.id, None).unwrap().is_none());
+        assert_eq!(
+            store.load_workspace(workspace.id, None).unwrap().unwrap(),
+            before
+        );
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER refuse_retained_images")
+            .unwrap();
+        store.preserve_chat_copy(&copy).unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let saved = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert!(saved.chat_drafts[&copy.copy.id].is_empty());
+        assert_eq!(
+            saved.chat_draft_attachments[&copy.copy.id],
+            copy.attachments
+        );
+    }
+
+    #[test]
+    fn empty_retained_image_metadata_preserves_legacy_receipt_bytes_and_replay_defaults() {
+        #[derive(Serialize)]
+        struct LegacyCopy<'a> {
+            workspace: WorkspaceId,
+            source_card: CardId,
+            source: &'a crate::chat::Session,
+            copy: &'a CardState,
+            draft: &'a str,
+            scope: &'a Option<PathBuf>,
+            channel: Option<crate::model::ChannelId>,
+        }
+        let (workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let mut card = workspace.cards[0].clone();
+        card.id = CardId::new();
+        card.kind = CardKind::Chat(source.clone());
+        let copy = RetainedChatCopy {
+            workspace: workspace.id,
+            source_card: workspace.cards[0].id,
+            source,
+            copy: card,
+            draft: "Legacy exact bytes \n🦀".into(),
+            attachments: Vec::new(),
+            scope: None,
+            channel: None,
+        };
+        let legacy = LegacyCopy {
+            workspace: copy.workspace,
+            source_card: copy.source_card,
+            source: &copy.source,
+            copy: &copy.copy,
+            draft: &copy.draft,
+            scope: &copy.scope,
+            channel: copy.channel,
+        };
+        let old_bytes = to_json(&legacy).unwrap();
+        assert_eq!(
+            to_json(&copy).unwrap(),
+            old_bytes,
+            "old receipt SHA256 input is byte-identical"
+        );
+        let old_request = serde_json::from_str::<RetainedChatCopy>(&old_bytes).unwrap();
+        assert_eq!(old_request, copy);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy-copy.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let committed = store.preserve_chat_copy(&old_request).unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.preserve_chat_copy(&copy).unwrap(),
+            committed,
+            "legacy receipt remains replayable after reopening"
+        );
     }
 
     #[test]

@@ -1,9 +1,16 @@
 //! User-authorized resident handle management; never attaches or interrupts work.
 use super::*;
 use crate::terminal_ipc::{ChatCapacity, ChatReleaseInspection};
+pub(super) mod image_assets;
+pub use image_assets::ImageAssetCommand;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ChatCommand {
+    /// Inspect or explicitly remove images stored on this physical device, without a daemon.
+    ImageAssets {
+        #[command(subcommand)]
+        command: ImageAssetCommand,
+    },
     /// Show resident and spawning counts, or persist a new admission limit.
     Capacity {
         #[command(subcommand)]
@@ -33,6 +40,10 @@ pub enum CapacityCommand {
 
 fn validate_command(command: &ChatCommand) -> Result<(), AppError> {
     match command {
+        ChatCommand::ImageAssets { .. } => Err(AppError::new(
+            "image_assets_local_only",
+            "Image assets require the local physical-store command route",
+        )),
         ChatCommand::Capacity {
             command: Some(CapacityCommand::Set { limit }),
         } => crate::native_chat_capacity::validate(*limit)
@@ -66,6 +77,10 @@ fn execute_requests(
 ) -> Result<CommandOutput, AppError> {
     validate_command(&command)?;
     match command {
+        ChatCommand::ImageAssets { .. } => Err(AppError::new(
+            "image_assets_local_only",
+            "Image assets require the local physical-store command route",
+        )),
         ChatCommand::Capacity { command } => {
             let request_value = match command {
                 None => ClientRequest::ChatCapacityInspect,

@@ -373,10 +373,79 @@ impl From<&str> for StartFailure {
     }
 }
 
+/// A cagents-owned immutable image identity. The UUID receipt is authority;
+/// the device-wide number is only its stable, human-readable label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageReference {
+    pub id: uuid::Uuid,
+    pub number: u64,
+    pub device: uuid::Uuid,
+    pub name: String,
+    pub sha256: String,
+    pub extension: String,
+}
+
+impl ImageReference {
+    pub fn label(&self) -> String {
+        format!("Image {}", self.number)
+    }
+
+    pub fn token(&self) -> String {
+        format!("[{}]", self.label())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_nil() || self.device.is_nil() || self.number == 0 {
+            return Err("The image reference has no valid identity.".into());
+        }
+        if !matches!(self.extension.as_str(), "png" | "jpg" | "gif" | "webp")
+            || self.name.len() > 256
+            || self.name.chars().any(char::is_control)
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("The image reference metadata is invalid.".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
+    /// Absent on legacy provider files and non-image attachments. Legacy text
+    /// that happens to say `[Image N]` never manufactures an image reference.
+    #[serde(default)]
+    pub reference: Option<ImageReference>,
 }
+
+impl Attachment {
+    pub fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            reference: None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.reference
+            .as_ref()
+            .map(ImageReference::label)
+            .unwrap_or_else(|| {
+                self.path
+                    .file_name()
+                    .unwrap_or(self.path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+    }
+}
+
+pub mod attachment_assets;
 
 /// The file extensions every provider's image input recognises.
 pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -1665,6 +1734,8 @@ pub enum ItemContent {
     Image {
         path: String,
         description: String,
+        #[serde(default)]
+        reference: Option<ImageReference>,
     },
     /// Something another agent, or the harness on its behalf, delivered to
     /// this conversation: a subagent's report, a teammate's or another
@@ -1782,7 +1853,18 @@ impl ItemContent {
                 .len()
                 .saturating_add(input.len())
                 .saturating_add(output.len()),
-            Self::Image { path, description } => path.len().saturating_add(description.len()),
+            Self::Image {
+                path,
+                description,
+                reference,
+            } => path.len().saturating_add(description.len()).saturating_add(
+                reference.as_ref().map_or(0, |r| {
+                    r.name
+                        .len()
+                        .saturating_add(r.sha256.len())
+                        .saturating_add(96)
+                }),
+            ),
             Self::Delivery {
                 from,
                 sender,

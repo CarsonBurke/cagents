@@ -47,6 +47,7 @@ host = [
     "dep:tungstenite",
 ]
 ui = [
+    "dep:accesskit_unix",
     "dep:base64",
     "dep:ashpd",
     "dep:async-channel",
@@ -220,6 +221,9 @@ wayland-server = { version = "=0.31.14", optional = true }
 # Platform backends are explicit rather than inherited from iced/winit defaults.
 # Match the common package identities so Cargo unifies widget/runtime features.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The UI diagnostics regression exercises the same native accessibility adapter
+# used by iced, without requiring a display server or affecting CLI/host lanes.
+accesskit_unix = { version = "0.18.0", git = "https://github.com/wash2/accesskit", tag = "cosmic-0.14", default-features = false, features = ["tokio"], optional = true }
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"], optional = true }
 # Only Linux enables the portal's Wayland handle integration.
 ashpd = { version = "0.12.3", default-features = false, features = ["wayland"], optional = true }

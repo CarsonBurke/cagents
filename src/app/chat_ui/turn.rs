@@ -865,6 +865,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: "/home/reader/diagram.png".into(),
                     description: "User attachment".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -1213,6 +1214,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: "/fixture.png".into(),
                     description: "Preview".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
