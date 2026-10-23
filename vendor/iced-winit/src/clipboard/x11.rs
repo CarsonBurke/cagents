@@ -349,6 +349,14 @@ mod tests {
             limit,
         );
         match std::env::var("X11_FIXTURE_EXPECT").as_deref() {
+            Ok("timeout") => {
+                let error = data.expect_err("stalled transfer was accepted");
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::TimedOut
+                );
+                assert!(start.elapsed() >= TIMEOUT);
+            }
             Ok("error") => {
                 assert!(data.is_err(), "malformed transfer was accepted")
             }
