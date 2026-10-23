@@ -306,10 +306,18 @@ mod tests {
     }
     #[test]
     fn sticky_sibling_qualifies_direct_temporary_directory_sources() {
-        for temporary_parent in ["/tmp", "/var/tmp"] {
-            let source = tempfile::tempdir_in(temporary_parent).unwrap();
+        // Two independently owned sticky parents retain the two positive
+        // cases without assuming public /tmp or /var/tmp checkout ancestry.
+        for _ in 0..2 {
+            let temporary_parent = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                temporary_parent.path(),
+                std::fs::Permissions::from_mode(0o1777),
+            )
+            .unwrap();
+            let source = tempfile::tempdir_in(temporary_parent.path()).unwrap();
             let source_root = Arc::new(Root::open(source.path()).unwrap());
-            let parent_root = Arc::new(Root::open(Path::new(temporary_parent)).unwrap());
+            let parent_root = Arc::new(Root::open(temporary_parent.path()).unwrap());
             let known = Arc::from([source_root.clone()]);
             validate_recovery_parent(&parent_root, &source_root, &known).unwrap();
             let parent = StickyParent::acquire(parent_root).unwrap();
