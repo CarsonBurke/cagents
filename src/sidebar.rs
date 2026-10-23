@@ -11,7 +11,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -3027,16 +3027,25 @@ impl SidebarState {
         if self.retained_attention.is_empty() {
             return;
         }
-        self.retained_attention.retain(|row, _| match *row {
-            SelectionRow::Channel(id) => model
-                .projects
-                .iter()
-                .any(|project| project.channels.iter().any(|channel| channel.id == id)),
-            SelectionRow::Worktree(project, worktree) => model
-                .project(project)
-                .is_some_and(|project| project.worktrees.iter().any(|known| known.id == worktree)),
-            SelectionRow::Project(_) => false,
-        });
+        // Projection can run on every terminal wake. Index live identities
+        // once, rather than searching the entire model for every kept row.
+        let live: HashSet<SelectionRow> = model
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .channels
+                    .iter()
+                    .map(|channel| SelectionRow::Channel(channel.id))
+                    .chain(
+                        project
+                            .worktrees
+                            .iter()
+                            .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id)),
+                    )
+            })
+            .collect();
+        self.retained_attention.retain(|row, _| live.contains(row));
     }
 
     /// How the Attention filter keeps `row` listed because it was dealt with
@@ -15598,7 +15607,15 @@ pub(crate) mod tests {
             true,
             1,
         ));
-        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let other_project = SidebarProject::new(
+            project_id(2),
+            RepositoryId(Uuid::from_u128(20)),
+            "Other".into(),
+            "/repo/other".into(),
+            vec![entry.worktrees[1].clone()],
+            Vec::new(),
+        );
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry, other_project]);
         let project = project_id(1);
         let worktree = model.projects[0].worktrees[1].id;
         let worktree_row = SelectionRow::Worktree(project, worktree);
@@ -15615,15 +15632,25 @@ pub(crate) mod tests {
 
         state.prune_retained_attention(&model);
         assert_eq!(state.retained_attention.len(), 2, "both still exist");
-        model.projects[0].channels.clear();
+        // Channel identity survives a move between projects.
+        let channel = model.projects[0].channels.pop().unwrap();
+        model.projects[1].channels.push(channel);
+        state.prune_retained_attention(&model);
+        assert_eq!(state.retained_attention.len(), 2, "the channel moved");
+
+        // An equal worktree ID under another project cannot keep this row.
+        let removed = model.projects[0].worktrees.remove(1);
         state.prune_retained_attention(&model);
         assert_eq!(
             state.retained_attention,
-            BTreeMap::from([(worktree_row, Listing::Read)])
+            BTreeMap::from([(channel_row, Listing::Read)])
         );
-        model.projects[0].worktrees.remove(1);
+        model.projects[1].channels.clear();
         state.prune_retained_attention(&model);
         assert!(state.retained_attention.is_empty());
+        model.projects[0].worktrees.push(removed);
+        state.prune_retained_attention(&model);
+        assert_eq!(state.worktree_listing(project, worktree), Listing::Live);
     }
 
     #[test]
