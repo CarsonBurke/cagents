@@ -728,8 +728,7 @@ impl Cagents {
             .collect::<Vec<_>>();
         for card in cards {
             self.retire_lsp_card(card);
-            self.sidebar_state.clear_agent_activity(card);
-            self.sidebar_state.acknowledge_agent_update(card);
+            self.sidebar_state.forget_card_attention(card);
             self.chat_discard(card);
             self.cards.remove(&card);
             self.lifecycle.remove(card);
@@ -1403,8 +1402,7 @@ impl Cagents {
                         .collect::<Vec<_>>();
                     for &id in &ids {
                         self.retire_lsp_card(id);
-                        self.sidebar_state.clear_agent_activity(id);
-                        self.sidebar_state.acknowledge_agent_update(id);
+                        self.sidebar_state.forget_card_attention(id);
                         self.chat_discard(id);
                         self.cards.remove(&id);
                         self.lifecycle.remove(id);
