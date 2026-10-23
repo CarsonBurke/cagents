@@ -180,6 +180,18 @@ pub(super) fn view<'a>(
             .wrap()
             .into(),
     ];
+    for incident in runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .filter(|incident| incident.active_recovery)
+    {
+        rows.push(
+            widget::container(runtime.failure_diagnostics(incident))
+                .id(runtime.find_anchor(&format!("failure:{}", incident.key)))
+                .into(),
+        );
+    }
     if let Some(detail) = runtime.auth_verification_detail() {
         rows.insert(
             1,

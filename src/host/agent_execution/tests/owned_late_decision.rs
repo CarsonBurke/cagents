@@ -14,6 +14,8 @@ use std::{
 };
 
 const ROLE: &str = "CAGENTS_LATE_DECISION_FIXTURE_ROLE";
+const INHERITED_SCOPE: &str = "CAGENTS_LATE_DECISION_AUTHORITY_PRESENCE";
+const RETAINED_HELPER: &str = "CAGENTS_TEST_RETAINED_ACTOR_HELPER";
 const ROOT: &str = "CAGENTS_EXECUTION_FIXTURE";
 const LOG_LIMIT: u64 = 262144;
 
@@ -50,6 +52,15 @@ fn receipt(root: &Path, name: &str, value: &str) {
 }
 fn command(name: &str, root: &Path, role: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
+    // Keep delegation and the same-head test executable inherited unchanged
+    // at both controller/worker boundaries. Other state is fixture-owned.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new(RETAINED_HELPER)
+        {
+            command.env_remove(name);
+        }
+    }
     command
         .args([
             "--exact",
@@ -57,8 +68,17 @@ fn command(name: &str, root: &Path, role: &str) -> Command {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env_clear()
         .env(ROLE, role)
+        .env(
+            INHERITED_SCOPE,
+            if crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default()
+            {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .env(ROOT, root)
         .env("CAGENTS_EXECUTION_SERVICE_TEST", name)
         .env("HOME", root.join("home"))
@@ -426,7 +446,29 @@ impl Drop for Family {
 }
 
 pub(super) fn run(name: &str, body: impl FnOnce()) {
-    match std::env::var(ROLE).unwrap_or_default().as_str() {
+    let role = std::env::var(ROLE).unwrap_or_default();
+    if !role.is_empty() {
+        assert!(
+            std::env::var_os(RETAINED_HELPER).is_some(),
+            "private controller/worker requires the inherited real retained helper"
+        );
+        // The actual worker still reaches transport::helper_executable, which
+        // validates the absolute executable and then runs the real helper.
+        // Assert the actual inherited scope BEFORE controller process policy or
+        // the worker body; the marker contains no capability or session ID.
+        let expected = match std::env::var(INHERITED_SCOPE).as_deref() {
+            Ok("present") => true,
+            Ok("absent") => false,
+            _ => panic!("missing or invalid fixture authority presence marker"),
+        };
+        assert_eq!(
+            crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default(),
+            expected,
+            "private controller/worker lost its inherited authority scope"
+        );
+    }
+    match role.as_str() {
         "worker" => {
             body();
             let root =
