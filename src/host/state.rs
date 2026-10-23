@@ -38,6 +38,8 @@ pub(super) const MAX_TERMINALS: usize = 1024;
 const SHUTDOWN_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 const MAX_SHUTDOWN_CAPABILITIES: usize = 32;
 
+pub(super) const RETAINED_CHILD_CLEANUP_MESSAGE: &str = "Original helper cleanup is still retained or quarantined outside the session inventory; termination was not requested. Wait for exact cleanup, or resolve retained ownership diagnostics before retrying.";
+
 /// Why the shared model cannot be served.
 ///
 /// Reported rather than answered with an empty model: an empty model is a
@@ -1802,6 +1804,12 @@ impl HostState {
             return Err(
                 "Sessions are still starting; wait for reservations to settle and retry".into(),
             );
+        }
+        // This observes only already-published external custody. A worker or
+        // join lane can publish later without taking control_gate; this is not
+        // an exit-wide absence fence. Both prepare and commit validate here.
+        if crate::daemon::child_reaper::has_retained_ownership() {
+            return Err(RETAINED_CHILD_CLEANUP_MESSAGE.into());
         }
         Ok(())
     }
@@ -4582,6 +4590,8 @@ mod bounded_input_upgrade_tests;
 mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
+#[cfg(test)]
+mod retained_child_shutdown_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;
 
