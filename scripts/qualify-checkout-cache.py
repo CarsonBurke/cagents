@@ -418,7 +418,10 @@ def main():
         assert (ROOT / source).read_text().splitlines().count(
             'include!("modules.rs");'
         ) == 1, source
-    for source in ("src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs"):
+    for source in (
+        "src/modules.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
+        "crates/iced-contracts/src/lib.rs",
+    ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
     guard_vendor_hooks()
     if args.evidence:

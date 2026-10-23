@@ -360,6 +360,25 @@ cargo test --locked --no-default-features --features host --test terminal_load_c
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
+The four named-tree reconciliation contracts share their cases between the root
+UI target and a focused workspace package. For edits confined to vendored
+iced-core tree reconciliation, run the focused package first:
+
+```sh
+cargo test --locked -p cagents-iced-contracts
+```
+
+The package uses the UI's exact iced-core Git revision; the root Cargo patch
+resolves both targets to `vendor/iced-core`, with the production `a11y` Id
+implementation. It compiles without the application, libcosmic renderer, or
+native UI runtime. The cases do not render; the isolated harness uses an
+uninhabited renderer. Retain validation through the UI's concrete renderer when
+changing the tree contract or UI integration:
+
+```sh
+cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+```
+
 Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
