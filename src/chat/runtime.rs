@@ -3673,6 +3673,212 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
+        let mut store = Store::new().unwrap();
+        let raw =
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)\noriginal diagnostics";
+        for (prompt, failure) in [("prompt-one", "failure-one"), ("prompt-two", "failure-two")] {
+            store
+                .apply(Event::Item(Item {
+                    id: prompt.into(),
+                    role: Role::User,
+                    content: ItemContent::Text {
+                        text: "Explain the limit notice".into(),
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    at: None,
+                    started_at: None,
+                }))
+                .unwrap();
+            let mut item = Item {
+                id: failure.into(),
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: raw.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            assert!(super::super::failure::mark_provider_error(
+                crate::agent::Provider::Claude,
+                &mut item
+            ));
+            store.apply(Event::Item(item)).unwrap();
+        }
+        let window = store.window().unwrap();
+        let failures: Vec<_> = window
+            .items
+            .iter()
+            .filter_map(|item| {
+                super::super::failure::provider_error_text(crate::agent::Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        assert_eq!(failures, [("failure-one", raw), ("failure-two", raw)]);
+        assert_eq!(
+            window
+                .items
+                .iter()
+                .filter(|item| item.role == Role::User)
+                .count(),
+            2
+        );
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let quote = Item {
+            id: "child-user-quotation".into(),
+            role: Role::System,
+            content: ItemContent::Text {
+                text: raw.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        for event in store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: quote,
+            })
+            .unwrap()
+        {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let quoted = &state.subagents[0].items[0];
+        assert_eq!(quoted.role, Role::System);
+        assert!(
+            super::super::failure::provider_error_text(crate::agent::Provider::Claude, quoted)
+                .is_none()
+        );
+        assert!(matches!(&quoted.content, ItemContent::Text { text, .. } if text==raw));
+    }
+
+    #[test]
+    fn mixed_child_failure_and_background_notice_preserve_real_activity_through_store() {
+        let mut store = Store::new().unwrap();
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut apply = |state: &mut Snapshot, event| {
+            for event in store.apply(event).unwrap() {
+                apply_event(state, &mut indices, event);
+            }
+        };
+        let child = |id: &str, status, waiting, detail: &str| Event::Subagent {
+            id: id.into(),
+            kind: "Review".into(),
+            description: id.into(),
+            status: Some(status),
+            background: Some(true),
+            model: None,
+            waiting: Some(waiting),
+            detail: Some(detail.into()),
+        };
+        apply(&mut state, Event::Ready(true));
+        apply(
+            &mut state,
+            Event::Status {
+                busy: false,
+                detail: "Parent turn ended".into(),
+            },
+        );
+        apply(
+            &mut state,
+            Event::Error {
+                message: "You've hit your limit · resets 1:30pm".into(),
+                fatal: false,
+            },
+        );
+        apply(
+            &mut state,
+            child(
+                "failed",
+                ToolStatus::Failed,
+                false,
+                "connection reset by peer",
+            ),
+        );
+        apply(&mut state, child("live", ToolStatus::Running, false, ""));
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Running, true, "quota exceeded"),
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert!(state.is_working());
+        let error = state.error.clone();
+        apply(
+            &mut state,
+            Event::Item(Item {
+                id: "actual-background-completion".into(),
+                role: Role::User,
+                content: ItemContent::Delivery {
+                    kind: super::super::DeliveryKind::Notice,
+                    from: String::new(),
+                    sender: "bash-task".into(),
+                    summary: "Background command completed (exit code 0)".into(),
+                    body: String::new(),
+                },
+                at: None,
+                started_at: None,
+            }),
+        );
+        assert!(!state.busy);
+        assert_eq!(state.error, error);
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|child| child.status == ToolStatus::Running)
+                .count(),
+            2
+        );
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Failed, false, "quota exceeded"),
+        );
+        assert_eq!(
+            state.activity(),
+            ActivityState::Working,
+            "A distinct live child still owns work"
+        );
+        // A replayed failed child's diagnostic is not a new launch or a parent
+        // status update. Its terminal status and the live sibling survive.
+        apply(
+            &mut state,
+            Event::Subagent {
+                id: "failed".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some("connection reset by peer".into()),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Working);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .find(|child| child.id == "failed")
+                .unwrap()
+                .status,
+            ToolStatus::Failed
+        );
+        apply(&mut state, child("live", ToolStatus::Succeeded, false, ""));
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert_eq!(
+            state.error, error,
+            "An unrelated completion cannot clear the parent's limit"
+        );
+    }
+
+    #[test]
     fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
         struct Frames(VecDeque<Vec<Event>>);
         impl Adapter for Frames {
