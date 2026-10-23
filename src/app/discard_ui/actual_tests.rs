@@ -190,13 +190,50 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
         worktree_id: crate::model::WorktreeId::new(),
         canonical_path: root.clone(),
     };
-    app.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+    // The actual inspector binds its source through the selected project and
+    // worktree, not through the snapshot model alone. Populate the same model
+    // identity and synchronize that selection before the real snapshot read.
+    app.sidebar_model = sidebar::SidebarModel::ready(
+        sidebar::SidebarMode::Expanded,
+        vec![sidebar::SidebarProject::new(
+            key.project_id,
+            crate::model::RepositoryId::new(),
+            "Discard fixture".into(),
+            root.clone(),
+            vec![sidebar::SidebarWorktree::from_durable(
+                key.worktree_id,
+                root.clone(),
+                None,
+            )],
+            Vec::new(),
+        )],
+    )
+    .with_source_control(Some(SourceControlModel::loading(key.clone())));
+    assert!(app.sidebar_state.sync_active_worktree(
+        &app.sidebar_model,
+        &sidebar::SidebarFocus::Repository {
+            worktree: root.clone(),
+        },
+    ));
+    assert_eq!(app.sidebar_state.active_worktree(), Some(&key));
     let loaded = crate::app::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
     assert!(matches!(
         &loaded,
         Message::SourceControlLoaded { result: Ok(_), .. }
     ));
     drop(app.update(loaded));
+    let source = sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state)
+        .expect("the selected original checkout owns the inspector snapshot");
+    assert_eq!(source.data_state, sidebar::SidebarDataState::Ready);
+    assert_eq!(
+        source
+            .group(crate::repository::ChangeArea::Unstaged)
+            .unwrap()
+            .rows()
+            .len(),
+        1,
+        "the real Git snapshot exposes the one changed original file"
+    );
     app.context_tab = ContextTab::Changes;
     let original = app.discard_ui.source().unwrap().id;
     let renderer = crate::app::tests::headless_renderer();
