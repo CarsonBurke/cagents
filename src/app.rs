@@ -1271,6 +1271,17 @@ fn session_health_stream(
     ))
 }
 
+/// The channels holding `card`. An open card's unread update and waiting
+/// agent mark every one of their sidebar rows.
+fn channels_holding(
+    channels: &[crate::model::ProjectChannel],
+    card: CardId,
+) -> impl Iterator<Item = &crate::model::ProjectChannel> {
+    channels
+        .iter()
+        .filter(move |channel| channel.cards.contains(&card))
+}
+
 fn terminal_completed(session: &TerminalSession) -> bool {
     matches!(&session.continuity,
         TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
@@ -7581,6 +7592,18 @@ impl Cagents {
             .card_activity(card)
             .map(|activity| activity.state);
         let next = activity.map(|activity| activity.state);
+        // Only an agent that carries on was answered. One that disconnects,
+        // fails, or closes while waiting reports no state at all.
+        if previous == Some(crate::agent::ActivityState::Waiting)
+            && matches!(
+                next,
+                Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle)
+            )
+        {
+            let listed = self.attention_listed_rows();
+            let placement = self.attention_placement(card, &listed);
+            self.sidebar_state.settle_waiting_agent(card, &placement);
+        }
         if (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
             || (previous == Some(crate::agent::ActivityState::Working)
                 && next == Some(crate::agent::ActivityState::Idle))
@@ -7600,10 +7623,8 @@ impl Cagents {
             .flatten();
         if finished
             && let Some(project) = worktree.as_ref().map(|key| key.project_id).or_else(|| {
-                self.durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card))
+                channels_holding(&self.durable.channels, card)
+                    .next()
                     .map(|channel| channel.project_id)
             })
         {
@@ -7634,11 +7655,8 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let channel = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.cards.contains(&id))
+        let channel = channels_holding(&self.durable.channels, id)
+            .next()
             .map(|channel| channel.id);
         let scope = if let Some(channel) = channel {
             self.select_channel(channel)
@@ -7666,11 +7684,60 @@ impl Cagents {
         Task::batch([scope, focus, transcript, read])
     }
 
+    /// The user has read `card`'s update.
+    fn read_card_update(&mut self, card: CardId) {
+        self.read_card_updates(&[card]);
+    }
+
+    /// The user has read these cards' updates. The rows the Attention list
+    /// draws are gathered once, before any read changes them, and only when
+    /// there is an update to read.
+    fn read_card_updates(&mut self, cards: &[CardId]) {
+        let mut listed = None;
+        for &card in cards {
+            if !self.sidebar_state.has_card_update(card) {
+                continue;
+            }
+            let listed = listed.get_or_insert_with(|| self.attention_listed_rows());
+            let placement = self.attention_placement(card, listed);
+            self.sidebar_state
+                .acknowledge_agent_update(card, &placement);
+        }
+    }
+
+    /// The rows the Attention list draws now. Only that list keeps rows, so
+    /// nothing is gathered under another filter.
+    fn attention_listed_rows(&self) -> Vec<sidebar::SelectionRow> {
+        if self.sidebar_state.filter() == sidebar::SidebarFilter::Attention {
+            self.visible_sidebar_rows()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Where `card`'s attention shows among `listed`, so dealing with it
+    /// keeps those rows in place.
+    fn attention_placement<'a>(
+        &self,
+        card: CardId,
+        listed: &'a [sidebar::SelectionRow],
+    ) -> sidebar::AttentionPlacement<'a> {
+        if listed.is_empty() {
+            return sidebar::AttentionPlacement::default();
+        }
+        sidebar::AttentionPlacement {
+            channels: channels_holding(&self.durable.channels, card)
+                .map(|channel| channel.id)
+                .collect(),
+            listed,
+        }
+    }
+
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        self.read_card_updates(&cards);
         let tasks: Vec<_> = cards
             .into_iter()
             .map(|card| {
-                self.sidebar_state.acknowledge_agent_update(card);
                 self.acknowledge_card_notices(card);
                 if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
                     && let Err(error) = handle.acknowledge_updates()
@@ -7701,7 +7768,7 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
-        self.sidebar_state.acknowledge_agent_update(card);
+        self.read_card_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
             && let Err(error) = handle.acknowledge_updates()
         {
@@ -15307,6 +15374,11 @@ impl Application for Cagents {
                             Task::none()
                         }
                     },
+                    // Hiding removes the control that did it.
+                    SidebarAction::HideReadAttention => {
+                        iced::widget::operation::focus(sidebar::attention_filter_focus_id())
+                            .map(cosmic::Action::App)
+                    }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
@@ -17268,6 +17340,8 @@ impl Application for Cagents {
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
+        self.sidebar_state
+            .prune_retained_attention(&self.sidebar_model);
         if reconcile_row_selection {
             self.prune_sidebar_row_selection();
         }
@@ -26966,6 +27040,28 @@ mod tests {
         assert!(!app.focus_save_pending);
     }
 
+    /// Seen means seen by the user. The focused pane of a window in the
+    /// background has not been seen, so its news must still mark it unread.
+    #[test]
+    fn an_update_for_the_focused_pane_of_a_background_window_marks_it_unread() {
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+
+        app.refresh_ui.focused = true;
+        assert!(
+            app.pane_is_active(card),
+            "the fixture differs from a seen pane only in window focus"
+        );
+        app.observe_agent_update_for_card(card);
+        assert!(!app.sidebar_state.has_card_update(card));
+
+        app.refresh_ui.focused = false;
+        app.observe_agent_update_for_card(card);
+        assert!(app.sidebar_state.has_card_update(card));
+    }
+
     #[test]
     fn unread_agent_updates_snapshot_only_saved_open_cards_and_persist_reads() {
         let mut app = context_inspector_test_app(true);
@@ -27010,7 +27106,8 @@ mod tests {
         assert!(!restored.has_card_update(closed_id));
         assert!(!restored.has_card_update(missing));
 
-        app.sidebar_state.acknowledge_agent_update(open);
+        app.sidebar_state
+            .acknowledge_agent_update(open, &sidebar::AttentionPlacement::default());
         let read = app.persistent_workspace();
         assert!(read.agent_updates.is_empty());
         assert!(app.durable.agent_updates.is_empty());
@@ -27057,6 +27154,263 @@ mod tests {
         let saved = app.persistent_workspace();
         crate::persistence::validate_workspace(&saved).unwrap();
         assert_eq!(saved.focused, None);
+    }
+
+    /// The app under the Attention filter with `card` held by one channel.
+    fn attention_channel_test_app() -> (Cagents, CardId, crate::model::ChannelId) {
+        use crate::model::{ChannelId, ProjectChannel};
+        use crate::sidebar::{SidebarFilter, SidebarProject};
+
+        let mut app = context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: project,
+                title: "channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::Attention,
+        ))));
+        (app, card, channel)
+    }
+
+    fn attention_lists_channel(app: &Cagents, channel: crate::model::ChannelId) -> bool {
+        attention_lists(app, sidebar::SelectionRow::Channel(channel))
+    }
+
+    fn attention_lists(app: &Cagents, row: sidebar::SelectionRow) -> bool {
+        sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+            .contains(&row)
+    }
+
+    /// Gives the project holding `channel` a worktree.
+    fn add_attention_worktree(
+        app: &mut Cagents,
+        channel: crate::model::ChannelId,
+    ) -> sidebar::SelectionRow {
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .project_id;
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_model
+            .projects
+            .iter_mut()
+            .find(|entry| entry.id == project)
+            .unwrap()
+            .worktrees
+            .push(sidebar::SidebarWorktree::from_durable(
+                worktree,
+                "/repo/feature".into(),
+                Some("feature".into()),
+            ));
+        sidebar::SelectionRow::Worktree(project, worktree)
+    }
+
+    /// Rows kept under Attention go with their channel or worktree on the
+    /// next ordinary update, so one created again is not drawn as read.
+    #[test]
+    fn attention_forgets_kept_rows_once_their_surface_is_gone() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let worktree_row = add_attention_worktree(&mut app, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        let channel_row = sidebar::SelectionRow::Channel(channel);
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, channel_row) && attention_lists(&app, worktree_row));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists(&app, channel_row) && attention_lists(&app, worktree_row),
+            "both rows are kept"
+        );
+
+        let saved_channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .clone();
+        let saved_worktree = {
+            let entry = app
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|entry| entry.id == project)
+                .unwrap();
+            let index = entry
+                .worktrees
+                .iter()
+                .position(|known| known.id == worktree)
+                .unwrap();
+            entry.worktrees.remove(index)
+        };
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|entry| entry.id != channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+
+        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
+        app.sidebar_model
+            .projects
+            .iter_mut()
+            .find(|entry| entry.id == project)
+            .unwrap()
+            .worktrees
+            .push(saved_worktree);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        assert!(
+            !attention_lists(&app, channel_row),
+            "a channel created again is not drawn as read"
+        );
+        assert!(
+            !attention_lists(&app, worktree_row),
+            "a worktree created again is not drawn as read"
+        );
+    }
+
+    /// Closing a pane whose update is unread is not reading it, so its row
+    /// leaves the Attention list instead of staying as read.
+    #[test]
+    fn attention_does_not_keep_the_row_of_a_closed_unread_pane() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let worktree_row = add_attention_worktree(&mut app, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, worktree_row));
+        app.workspace.request_close(card).unwrap();
+        drop(app.update(Message::CommitClose(card)));
+        assert!(
+            app.card_state(card)
+                .is_none_or(|state| !state.existence.is_open()),
+            "the pane closed"
+        );
+        assert!(!attention_lists(&app, worktree_row));
+    }
+
+    fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {
+        Some(crate::agent::Activity {
+            provider: crate::agent::Provider::Claude,
+            state,
+        })
+    }
+
+    /// Dealing with a row in the Attention list, by reading it or by
+    /// answering its waiting agent, leaves the row where the pointer left it
+    /// until the user hides read rows or chooses another filter.
+    #[test]
+    fn attention_keeps_channels_the_user_dealt_with_until_hidden() {
+        use crate::agent::ActivityState;
+        use crate::sidebar::SidebarFilter;
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        let hide = || Message::Sidebar(SidebarAction::HideReadAttention);
+        app.observe_agent_update_for_card(card);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists_channel(&app, channel));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists_channel(&app, channel),
+            "a channel read under Attention stays listed"
+        );
+        app.context_inspector_open = false;
+        let task = app.update(hide());
+        assert!(
+            !attention_lists_channel(&app, channel),
+            "hiding read rows drops it"
+        );
+        assert_eq!(app.sidebar_state.filter(), SidebarFilter::Attention);
+        assert_eq!(
+            focused(&app, task),
+            Some(sidebar::attention_filter_focus_id()),
+            "focus leaves the control hiding removed for the filter it served"
+        );
+
+        // A wait the user already read elsewhere lists the channel on its own.
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::All,
+        ))));
+        app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Waiting));
+        app.read_card_update(card);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::Attention,
+        ))));
+        assert!(attention_lists_channel(&app, channel));
+        app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Working));
+        app.refresh_sidebar_channels();
+        assert!(
+            attention_lists_channel(&app, channel),
+            "answering a waiting agent keeps its channel"
+        );
+        drop(app.update(hide()));
+        assert!(!attention_lists_channel(&app, channel));
+    }
+
+    /// A waiting agent that disconnects, or whose chat goes away, was not
+    /// answered: its row leaves the Attention list with the wait.
+    #[test]
+    fn attention_drops_a_waiting_chat_that_disconnects_or_closes() {
+        use crate::agent::ActivityState;
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        // The user is looking at the pane, so its wait is not also unread
+        // news: only the wait lists the channel.
+        app.refresh_ui.focused = true;
+        let ends: [fn(&mut Cagents, CardId); 3] = [
+            |app, card| app.shared_chat_detach(card),
+            |app, card| app.chat_forget(card),
+            |app, card| {
+                app.sidebar_state.forget_card_attention(card);
+                app.chat_forget(card);
+            },
+        ];
+        for (index, end) in ends.into_iter().enumerate() {
+            app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Waiting));
+            app.refresh_sidebar_channels();
+            assert!(!app.sidebar_state.has_card_update(card), "path {index}");
+            assert!(attention_lists_channel(&app, channel), "path {index}");
+            end(&mut app, card);
+            app.refresh_sidebar_channels();
+            // A kept row would stay listed after its wait ended.
+            assert!(
+                !attention_lists_channel(&app, channel),
+                "path {index} was not an answer"
+            );
+        }
     }
 
     #[test]
