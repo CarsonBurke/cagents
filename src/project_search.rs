@@ -599,10 +599,11 @@ mod tests {
         ] {
             std::fs::write(fixture.path().join(path), "marker").unwrap();
         }
-        let found = matches(run(fixture.path(), options("marker")))
+        let mut found = matches(run(fixture.path(), options("marker")))
             .into_iter()
             .map(|matched| matched.path)
             .collect::<Vec<_>>();
+        found.sort();
         assert_eq!(
             found,
             vec![
