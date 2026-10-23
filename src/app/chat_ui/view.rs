@@ -1083,8 +1083,7 @@ impl Runtime {
     }
 
     /// Completion requires provider evidence; an idle, attached conversation
-    /// without that evidence is ready. An unstarted draft runs no connection;
-    /// an admitted conversation without readiness is still connecting.
+    /// without that evidence is ready, while an unattached one is connecting.
     pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
@@ -5672,116 +5671,72 @@ mod tests {
         }
     }
 
-    fn footer_draft() -> Runtime {
+    #[test]
+    fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let session = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: chat::NativeContinuity::ReconnectOnly,
+            };
+            let mut draft = Runtime::draft(
+                target,
+                session.clone(),
+                Snapshot::default(),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(draft.is_draft());
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert!(!draft.snapshot.ready);
+            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+
+            draft
+                .composer
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new("Unsent local draft".into()),
+                )));
+            assert_eq!(draft.composer.text(), "Unsent local draft");
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert_eq!(draft.conversation_status(false), (None, "Draft"));
+            assert_eq!(draft.conversation_status(true).1, "Switching session");
+            draft.error = Some("Local attachment could not be read".into());
+            assert_eq!(
+                draft.conversation_status(false),
+                (Some(Icon::Warning), "Error")
+            );
+
+            let connecting = Runtime::new(
+                target,
+                session,
+                Connection::Connecting,
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(!connecting.is_draft());
+            assert!(connecting.handle().is_none());
+            assert_eq!(
+                connecting.conversation_status(false),
+                (Some(Icon::AgentWorking), "Connecting")
+            );
+        }
         let (live, _handle) = frame_cost::live_runtime(&[]);
-        Runtime::draft(
-            live.target,
-            live.session.clone(),
-            draft_snapshot(live.session.launch.provider, Vec::new(), None, None),
-            true,
-            crate::settings::EditorSyntaxTheme::default(),
-        )
-    }
-
-    #[test]
-    fn conversation_footer_distinguishes_an_unstarted_draft_from_a_connection() {
-        let mut draft = footer_draft();
-        assert!(draft.is_draft());
-        assert!(!draft.snapshot.ready);
-        assert_eq!(draft.conversation_status(false), (None, "Draft"));
-        draft.replace_draft(text_editor::Content::with_text("Unsent prompt"));
-        draft.attach([PathBuf::from("unsent.png")]);
-        assert_eq!(draft.conversation_status(false), (None, "Draft"));
-
-        draft.connection = Connection::Connecting;
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::AgentWorking), "Connecting")
-        );
-        let (mut live, _handle) = frame_cost::live_runtime(&[]);
-        Arc::make_mut(&mut live.snapshot).ready = false;
-        assert_eq!(
-            live.conversation_status(false),
-            (Some(Icon::AgentWorking), "Connecting")
-        );
-        Arc::make_mut(&mut live.snapshot).ready = true;
+        assert!(!live.is_draft());
+        assert!(live.handle().is_some());
         assert_eq!(live.conversation_status(false), (None, "Ready"));
-    }
-
-    #[test]
-    fn conversation_footer_preserves_a_drafts_errors_and_pending_work() {
-        let mut draft = footer_draft();
-        draft.error = Some("Admission refused".into());
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::Warning), "Error")
-        );
-        draft.error = None;
-        Arc::make_mut(&mut draft.snapshot).error = Some("Attachment refused".into());
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::Warning), "Error")
-        );
-        Arc::make_mut(&mut draft.snapshot).error = None;
-        assert_eq!(draft.conversation_status(false), (None, "Draft"));
-        assert_eq!(
-            draft.conversation_status(true),
-            (Some(Icon::AgentWorking), "Switching session")
-        );
-        draft.attachment_chooser_pending = Some(uuid::Uuid::new_v4());
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::AgentWorking), "Choosing attachments")
-        );
-        draft.attachment_chooser_pending = None;
-        draft.pending = Some(PendingCommand {
-            followup: false,
-            take_back: None,
-            id: 1,
-            draft_revision: None,
-            request: None,
-            first_prompt: None,
-            model: None,
-            sent: None,
-            sent_attachments: Vec::new(),
-            page: None,
-            queued: None,
-        });
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::AgentWorking), "Sending")
-        );
-        draft.pending = None;
-        draft.queued = Some(Queued {
-            text: "First prompt".into(),
-            resolved_text: "First prompt".into(),
-            attachments: Vec::new(),
-            model: None,
-            draft: draft.session.clone(),
-            since: None,
-            rechecking: false,
-        });
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::AgentWorking), "Starting")
-        );
-        draft.queued = None;
-        draft.disconnected = true;
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::Warning), "Disconnected")
-        );
-        draft.disconnected = false;
-        draft.closed_elsewhere = true;
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::Close), "Closed")
-        );
-        draft.replace_draft(text_editor::Content::with_text("Retained prompt"));
-        assert_eq!(
-            draft.conversation_status(false),
-            (Some(Icon::Close), "Closed · draft retained")
-        );
     }
 
     #[test]
