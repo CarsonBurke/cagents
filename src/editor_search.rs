@@ -263,7 +263,7 @@ fn convert_case(replacement: &str, case: ReplacementCase) -> String {
                 // Contextual Sigma changes neither the initial mapping's
                 // scalar count nor its UTF-8 length. Include every byte when
                 // the initial lowercase mapping expands (for example İ).
-                let prefix_bytes = first.to_lowercase().map(char::len_utf8).sum();
+                let prefix_bytes: usize = first.to_lowercase().map(char::len_utf8).sum();
                 result.replace_range(..prefix_bytes, &first.to_uppercase().to_string());
             }
             result
