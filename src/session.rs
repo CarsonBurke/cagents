@@ -1781,6 +1781,9 @@ impl SessionStore for Arc<StateStore> {
     fn shutdown(&self) -> Result<(), StoreError> {
         StateStore::shutdown(self)
     }
+    fn compact_closed_cards(&self) {
+        <StateStore as SessionStore>::compact_closed_cards(self.as_ref());
+    }
     fn checkpoint_wal_if_large(&self) {
         report_checkpoint(StateStore::checkpoint_wal_if_large(self));
     }
@@ -3231,6 +3234,88 @@ mod tests {
                 }),
             }],
         }
+    }
+
+    #[test]
+    fn actual_shared_writer_compacts_aged_closed_payloads_and_preserves_the_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("writer-compaction.sqlite3");
+        let boot = BootId::new("writer-compaction");
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        state.cards[0].kind = CardKind::Settings;
+        state.cards[0].title = "Closed disposable presentation".repeat(1024);
+        let id = state.cards[0].id;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        state.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert!(
+            runtime
+                .operation_store
+                .load_card(id, None)
+                .unwrap()
+                .is_some()
+        );
+        runtime.shutdown();
+        drop(runtime);
+        // Age only this fixture's already committed closed payload. Production
+        // still applies the real seven-day policy on its ordinary writer.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE cards SET updated_at_unix_ms=1 WHERE card_id=?1 AND retired=1",
+                    [id.to_string()]
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        let (mut runtime, restored) = SessionRuntime::open(&path, boot).unwrap();
+        let restored = restored.unwrap();
+        assert!(restored.cards.is_empty());
+        assert!(
+            runtime
+                .operation_store
+                .load_card(id, None)
+                .unwrap()
+                .is_some()
+        );
+        // Exercise SessionRuntime's real Arc<StateStore> worker, rather than
+        // calling the direct StateStore compaction implementation in the test.
+        runtime.snapshot(Arc::new(restored));
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime
+            .operation_store
+            .load_card(id, None)
+            .unwrap()
+            .is_some()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "actual writer did not compact its aged payload"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.operation_store.card_was_closed(id));
+        runtime.shutdown();
+        drop(runtime);
+        let store = StateStore::open(&path, BootId::new("compaction-reopen")).unwrap();
+        assert!(store.load_card(id, None).unwrap().is_none());
+        assert!(
+            store.card_was_closed(id),
+            "payload disposal must not erase closure authority"
+        );
+        store.shutdown().unwrap();
     }
 
     #[test]
