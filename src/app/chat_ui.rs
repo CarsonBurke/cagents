@@ -3475,19 +3475,31 @@ impl Runtime {
     ///
     /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
     /// it and a returning runtime restores it, so typing a single character no
-    /// longer makes the card impossible to leave. Attachments and half-entered
-    /// request answers still block, because those are references and decisions
-    /// that cannot be reconstructed from text.
+    /// longer makes the card impossible to leave. Managed image receipts are
+    /// stashed alongside it. Legacy path-only attachments and half-entered
+    /// request answers still need this runtime.
     pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending.is_some() {
             Some("Finish or cancel the file chooser before leaving the chat.")
+        } else if self.pastes_pending != 0 {
+            Some("Wait for the image attachment to finish before leaving the chat.")
         } else if self.pending.is_some() {
             Some("Wait for the pending chat command to finish before leaving the chat.")
         } else if self.queued.is_some() {
             Some(QUEUED_BLOCKER)
         } else if !self.followups.is_empty() {
             Some("Send or take back the queued follow-up before leaving the chat.")
-        } else if !self.attachments.is_empty() {
+        } else if self
+            .attachments
+            .iter()
+            .chain(self.unsent_attachments())
+            .any(|attachment| {
+                attachment
+                    .reference
+                    .as_ref()
+                    .is_none_or(|reference| reference.validate().is_err())
+            })
+        {
             Some("Send or remove the attached files before leaving the chat.")
         } else if self
             .answers
@@ -3520,8 +3532,9 @@ impl Runtime {
     }
     /// Why this chat cannot survive the process restarting.
     ///
-    /// Composer text is included in the workspace snapshot flushed before an
-    /// update. Attachments, answers and in-flight work still need a live UI.
+    /// Composer text and managed image receipts are included in the workspace
+    /// snapshot flushed before an update. Path-only attachments, answers and
+    /// in-flight work still need a live UI.
     pub(super) fn restart_blocker(&self) -> Option<&'static str> {
         self.transition_blocker()
     }
@@ -14226,6 +14239,87 @@ mod tests {
             assert!(app.exit.is_none(), "hidden chat input also blocks closing");
             assert_eq!(app.transient_work_close, Some(window));
         }
+    }
+
+    #[test]
+    fn managed_image_drafts_can_close_with_their_saved_receipts() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let text = format!("keep {} here", image.reference.as_ref().unwrap().token());
+            write(&mut app, card, &text);
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_attachments(vec![image.clone()]);
+            assert!(app.window_close_transient_blocker().is_none());
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.chat_drafts[&card], text);
+            assert_eq!(saved.chat_draft_attachments[&card], [image.clone()]);
+            let CardRuntime::Chat(runtime) = app.cards.remove(&card).unwrap() else {
+                unreachable!()
+            };
+            let session = runtime.session.clone();
+            app.chat_ui.parked.insert(card, runtime);
+            assert!(app.parked_chat_restart_blocker().is_none());
+            app.chat_ui = State::with_draft_attachments(
+                saved.chat_drafts.clone(),
+                saved.chat_draft_attachments.clone(),
+            );
+            drop(app.open_chat_draft(card, session));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(runtime.attachments, [image]);
+            assert!(app.window_close_transient_blocker().is_none());
+        });
+    }
+
+    #[test]
+    fn image_draft_close_keeps_pending_and_unpersistable_work_protected() {
+        let _admission = attachment_draft::test_admission();
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.replace_attachments(vec![image.clone()]);
+            let ticket = runtime.begin_attachment_insert();
+            assert!(
+                runtime
+                    .restart_blocker()
+                    .unwrap()
+                    .contains("image attachment")
+            );
+            assert!(runtime.finish_attachment_insert(ticket.id, "", vec![]));
+            assert!(runtime.restart_blocker().is_none());
+            // A recalled managed image must not hide the original unsent
+            // path-only attachment, which the workspace cannot preserve.
+            runtime.remember_with_attachments("previous image".into(), vec![image.clone()]);
+            runtime.replace_attachments(vec![Attachment::file("/unsaved.txt")]);
+            runtime.recall(true);
+            assert!(
+                runtime
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.reference.is_some())
+            );
+            assert!(
+                runtime
+                    .restart_blocker()
+                    .unwrap()
+                    .contains("attached files")
+            );
+            runtime.recall(false);
+            let mut malformed = image;
+            malformed.reference.as_mut().unwrap().sha256.clear();
+            runtime.replace_attachments(vec![malformed]);
+            assert!(
+                runtime
+                    .restart_blocker()
+                    .unwrap()
+                    .contains("attached files")
+            );
+        });
     }
 
     #[test]
