@@ -330,13 +330,7 @@ impl Cagents {
                     {
                         self.pending_panel_open = None;
                     }
-                    let location = repository_task(runtime.open_file_location(
-                        card,
-                        matched.path,
-                        matched.line,
-                        matched.column,
-                        matched.length,
-                    ));
+                    let location = repository_task(runtime.open_search_result(card, &matched));
                     // Match the ordinary Repository action boundary: opening
                     // another buffer must drain its old LSP Close immediately.
                     let language = self.drain_lsp_intents(card);
@@ -629,7 +623,7 @@ fn result_row<'a>(
     );
     // Streamed batches only append within a generation. A new query/root can
     // reuse this position, but must not inherit the previous button's press.
-    iced::widget::keyed::Column::with_children([((state.generation, index), row)])
+    widget::container(crate::ui_controls::owned((state.generation, index), row))
         .width(Length::Fill)
         .into()
 }
@@ -806,6 +800,7 @@ mod tests {
                     line: 0,
                     column: 0,
                     length: 3,
+                    line_identity: project_search::LineIdentity::new("hit"),
                     snippet: "hit".into(),
                     highlight: 0..3,
                 }],
@@ -885,6 +880,7 @@ mod tests {
                 line: 0,
                 column: 0,
                 length: 3,
+                line_identity: project_search::LineIdentity::new("hit"),
                 snippet: "hit".into(),
                 highlight: 0..3,
             });
@@ -938,6 +934,7 @@ mod tests {
                 line: 12,
                 column: prefix.len(),
                 length: hit.len(),
+                line_identity: project_search::LineIdentity::new(&format!("{prefix}{hit}{suffix}")),
                 snippet: format!("{prefix}{hit}{suffix}"),
                 highlight: prefix.len()..prefix.len() + hit.len(),
             };
@@ -1028,6 +1025,7 @@ mod tests {
                 line: 0,
                 column: 0,
                 length: 3,
+                line_identity: project_search::LineIdentity::new("hit"),
                 snippet: "hit".into(),
                 highlight: 0..3,
             });
@@ -1071,6 +1069,7 @@ mod tests {
             line: 0,
             column: 0,
             length: 1,
+            line_identity: project_search::LineIdentity::new("a"),
             snippet: "a".into(),
             highlight: 0..1,
         });
@@ -1120,6 +1119,7 @@ mod tests {
             line: 0,
             column: 0,
             length: 3,
+            line_identity: project_search::LineIdentity::new("new query"),
             snippet: "new query".into(),
             highlight: 0..3,
         };

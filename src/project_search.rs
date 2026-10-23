@@ -8,6 +8,7 @@ use std::{
 
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use regex::RegexBuilder;
+use sha2::{Digest, Sha256};
 
 use crate::process::CancellationToken;
 
@@ -38,9 +39,33 @@ pub struct Match {
     pub line: usize,
     pub column: usize,
     pub length: usize,
+    pub line_identity: LineIdentity,
     pub snippet: String,
     /// Match range inside the displayed (possibly shortened) snippet.
     pub highlight: std::ops::Range<usize>,
+}
+
+/// Identity of one physical line's UTF-8 content, excluding its CR/LF ending.
+/// The scanner and native editor both separate CR, LF, CRLF and LFCR endings.
+/// Retain fixed-size evidence rather than a potentially megabyte-long line for
+/// each result. Matching a changed file never silently relocates the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineIdentity {
+    bytes: usize,
+    sha256: [u8; 32],
+}
+
+impl LineIdentity {
+    pub fn new(text: &str) -> Self {
+        Self {
+            bytes: text.len(),
+            sha256: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+
+    pub fn matches(&self, text: &str) -> bool {
+        text.len() == self.bytes && Self::new(text) == *self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +316,8 @@ pub fn search(
                 std::str::from_utf8(&bytes).expect("only validated complete lines enter the block");
             if options.regex || regex.is_match(text) {
                 for text in native_lines(text) {
+                    // Several matches in the same long line share one digest.
+                    let mut line_identity = None;
                     for matched in regex.find_iter(text) {
                         if cancellation.is_cancelled() {
                             return;
@@ -316,6 +343,8 @@ pub fn search(
                             line,
                             column: matched.start(),
                             length: matched.len(),
+                            line_identity: *line_identity
+                                .get_or_insert_with(|| LineIdentity::new(text)),
                             snippet,
                             highlight,
                         });
@@ -763,13 +792,7 @@ mod tests {
             let card = CardId::new();
             let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &text);
             for matched in found {
-                drop(runtime.open_file_location(
-                    card,
-                    matched.path,
-                    matched.line,
-                    matched.column,
-                    matched.length,
-                ));
+                drop(runtime.open_search_result(card, &matched));
                 assert_eq!(runtime.selected_text().as_deref(), Some("needle"));
             }
         }
