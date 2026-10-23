@@ -817,18 +817,26 @@ impl Cagents {
         })
     }
 
+    /// Opens `path` in the editor `editor_id` names, at `caret` when the
+    /// file is open here and that editor can be told where.
     pub(super) fn open_file_in_editor(
         &mut self,
         path: PathBuf,
+        caret: Option<crate::external_editor::Caret>,
         editor_id: String,
     ) -> Task<Message> {
         if self.modal_is_open() {
             return Task::none();
         }
-        self.launch_editor(path, &editor_id)
+        self.launch_editor(path, caret, &editor_id)
     }
 
-    fn launch_editor(&mut self, path: PathBuf, editor_id: &str) -> Task<Message> {
+    fn launch_editor(
+        &mut self,
+        path: PathBuf,
+        caret: Option<crate::external_editor::Caret>,
+        editor_id: &str,
+    ) -> Task<Message> {
         let Some(editor) = self
             .project_ui
             .editors
@@ -842,11 +850,12 @@ impl Cagents {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || crate::external_editor::launch(&editor, &path))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::external_editor::launch(&editor, &path, caret)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::ProjectUi(Action::Finished(result))
         })
     }
@@ -1094,7 +1103,7 @@ impl Cagents {
                         }));
                     }
                     ProjectCommand::OpenEditor(editor_id) => {
-                        return self.launch_editor(target.path, &editor_id);
+                        return self.launch_editor(target.path, None, &editor_id);
                     }
                     ProjectCommand::Delete => {
                         let blocker = self.worktree_deletion_blocker(&target);
