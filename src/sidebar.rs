@@ -3055,7 +3055,8 @@ impl SidebarState {
     /// What the Attention filter lists a worktree for: an unread update, or an
     /// agent waiting for input.
     fn worktree_needs_attention(&self, project: ProjectId, worktree: WorktreeId) -> bool {
-        self.has_agent_update(project, worktree) || self.worktree_has_waiting_agent(project, worktree)
+        self.has_agent_update(project, worktree)
+            || self.worktree_has_waiting_agent(project, worktree)
     }
 
     /// The general activity indicator prefers Working when several panes
@@ -3071,15 +3072,24 @@ impl SidebarState {
     fn worktree_row_state(&self, project: ProjectId, worktree: WorktreeId) -> WorktreeRowState {
         WorktreeRowState {
             unread: self.has_agent_update(project, worktree),
-            activity: if self.filter == SidebarFilter::Attention
-                && self.worktree_has_waiting_agent(project, worktree)
-            {
-                Some(crate::agent::ActivityState::Waiting)
-            } else {
-                self.agent_activity(project, worktree)
-            },
+            activity: self.worktree_row_activity(project, worktree),
             has_panes: self.worktree_has_panes(project, worktree),
             listing: self.worktree_listing(project, worktree),
+        }
+    }
+
+    /// Rows and collapsed project headers describe the same outstanding wait.
+    fn worktree_row_activity(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<crate::agent::ActivityState> {
+        if self.filter == SidebarFilter::Attention
+            && self.worktree_has_waiting_agent(project, worktree)
+        {
+            Some(crate::agent::ActivityState::Waiting)
+        } else {
+            self.agent_activity(project, worktree)
         }
     }
 
@@ -4984,23 +4994,30 @@ fn project_identity_row<'a>(
     compact: bool,
     review_mode: bool,
     query: &str,
+    activity: Option<crate::agent::ActivityState>,
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let label = (!compact).then(|| project_name_label(project, query));
+    let mut name = if review_mode && project.github_ready {
+        format!("Browse pull requests in {}", project.name)
+    } else if compact {
+        chrome.compact_open_name.to_string()
+    } else {
+        chrome.open_name.to_string()
+    };
+    match activity {
+        Some(crate::agent::ActivityState::Waiting) => name.push_str(", agent needs input"),
+        Some(crate::agent::ActivityState::Working) => name.push_str(", agent working"),
+        _ => {}
+    }
     let control = grid
         .control(
             grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
             selected,
         )
         .id(chrome.open_id.clone())
-        .name(if review_mode && project.github_ready {
-            Cow::Owned(format!("Browse pull requests in {}", project.name))
-        } else if compact {
-            Cow::Owned(chrome.compact_open_name.to_string())
-        } else {
-            Cow::Owned(chrome.open_name.to_string())
-        })
+        .name(name)
         .on_press_maybe(
             project_primary_action(
                 project,
@@ -5366,6 +5383,22 @@ fn project_view<'a>(
 
     let worktree_count = project.worktrees.len();
     let has_children = worktree_count > 0 || !project.channels.is_empty();
+    let collapsed_activity = if expanded {
+        None
+    } else {
+        entity
+            .channels
+            .iter()
+            .filter_map(|channel| channel.activity)
+            .chain(entity.worktrees.iter().filter_map(|worktree| {
+                project.state.worktree_row_activity(project_id, worktree.id)
+            }))
+            .max_by_key(|activity| match activity {
+                crate::agent::ActivityState::Waiting => 2,
+                crate::agent::ActivityState::Working => 1,
+                _ => 0,
+            })
+    };
     let project_identity = project_identity_row(
         entity,
         selection == Some(SidebarSelection::Project(project_id)),
@@ -5373,6 +5406,11 @@ fn project_view<'a>(
         false,
         project.state.filter == SidebarFilter::PullRequests,
         &project.state.query,
+        if project.state.filter == SidebarFilter::Attention {
+            collapsed_activity
+        } else {
+            None
+        },
     );
 
     let disclosure: Element<'static, SidebarAction> = if has_children {
@@ -5418,27 +5456,12 @@ fn project_view<'a>(
         .align_y(Alignment::Center)
         .width(Length::Fill);
     if !expanded {
-        let activity = entity
-            .channels
-            .iter()
-            .filter_map(|channel| channel.activity)
-            .chain(
-                entity
-                    .worktrees
-                    .iter()
-                    .filter_map(|worktree| project.state.agent_activity(project_id, worktree.id)),
-            )
-            .max_by_key(|activity| match activity {
-                crate::agent::ActivityState::Waiting => 2,
-                crate::agent::ActivityState::Working => 1,
-                _ => 0,
-            });
         let unread = entity.channels.iter().any(|channel| channel.unread)
             || entity
                 .worktrees
                 .iter()
                 .any(|worktree| project.state.has_agent_update(project_id, worktree.id));
-        if let Some(indicator) = agent_indicator(activity, unread) {
+        if let Some(indicator) = agent_indicator(collapsed_activity, unread) {
             identity = identity.push(indicator);
         }
         identity = identity.push(design::caption(
@@ -13135,7 +13158,15 @@ pub(crate) mod tests {
         // the group hands it.
         let header = |compact: bool, width: f32| {
             laid_out(
-                &mut project_identity_row(&model.projects[0], false, false, compact, false, ""),
+                &mut project_identity_row(
+                    &model.projects[0],
+                    false,
+                    false,
+                    compact,
+                    false,
+                    "",
+                    None,
+                ),
                 width,
             )
         };
@@ -13241,7 +13272,7 @@ pub(crate) mod tests {
         let width = design::NAVIGATION_DEFAULT_WIDTH;
         let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
         let mut element = project_header_row(
-            project_identity_row(&model.projects[0], false, false, false, false, ""),
+            project_identity_row(&model.projects[0], false, false, false, false, "", None),
             vec![
                 icon_action(
                     Icon::ChannelAdd,
@@ -15634,6 +15665,44 @@ pub(crate) mod tests {
             )
             .ends_with(", agent needs input")
         );
+        state.apply(&SidebarAction::ToggleProject(project));
+        let collapsed = project_list(&model, &state, false, false);
+        let collapsed_tree = Tree::new(&collapsed);
+        assert!(
+            collapsed_tree.find(&selection_row_focus_id(row)).is_none(),
+            "the wait must be exposed by the header while its child is unmounted"
+        );
+        fn contains_tag(tree: &Tree, tag: cosmic::iced::advanced::widget::tree::Tag) -> bool {
+            tree.tag == tag || tree.children.iter().any(|child| contains_tag(child, tag))
+        }
+        let spinner = crate::ui_controls::activity_spinner::<SidebarAction>(
+            f32::from(ROW_ICON_SIZE),
+            design::warning_color,
+        );
+        assert!(
+            !contains_tag(&collapsed_tree, spinner.as_widget().tag()),
+            "the collapsed header must not mask the wait with a working spinner"
+        );
+        let names = accessible_names(&headless_renderer(), collapsed);
+        assert!(
+            names.contains(&format!(
+                "{}, agent needs input",
+                model.projects[0].chrome.open_name
+            )),
+            "the collapsed project button describes its waiting indicator: {names:?}"
+        );
+        let mut all = state.clone();
+        all.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+        let unfiltered = project_list(&model, &all, false, false);
+        assert!(
+            contains_tag(&Tree::new(&unfiltered), spinner.as_widget().tag()),
+            "outside Attention the collapsed header retains its general activity summary"
+        );
+        assert!(
+            accessible_names(&headless_renderer(), unfiltered)
+                .contains(&model.projects[0].chrome.open_name.to_string())
+        );
+        state.apply(&SidebarAction::ToggleProject(project));
         for compact in [false, true] {
             assert!(visible_selection_rows(&model, &state, compact).contains(&row));
         }
