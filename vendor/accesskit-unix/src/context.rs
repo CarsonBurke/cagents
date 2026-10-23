@@ -307,10 +307,23 @@ where
     }
 
     async fn screen_reader_changed(&mut self, change: PropertyChanged<'static, bool>) {
-        let enabled = change.get().await.unwrap_or_else(|error| {
-            debug!(%error, "Unreadable screen-reader status; treating it as disabled");
-            false
-        });
+        let enabled = match bounded(change.get()).await {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                // Invalidated properties need another D-Bus read. A failed
+                // refresh is not an explicit disabled status: keep retrying
+                // even if this launcher never emits another property change.
+                self.disconnect_atspi_bus().await;
+                if let Some(session) = &mut self.session {
+                    session.forget_status();
+                    if session.launcher_owner.is_some() {
+                        self.atspi_reconnect
+                            .schedule("The AT-SPI bus launcher", &error);
+                    }
+                }
+                return;
+            }
+        };
         let Some(session) = &mut self.session else {
             return;
         };
@@ -975,6 +988,41 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_invalidated_status_is_retried() {
+        if !in_isolated_process(
+            "unreadable_invalidated_status_is_retried",
+            SessionBus::Running,
+        ) {
+            return;
+        }
+        let dir = TempDir::new();
+        let _atspi_bus = start_atspi_bus(&dir.path().join("atspi-bus"));
+        let (observed_tx, observed) = mpsc::channel();
+        let _launcher = serve_launcher(&dir, 0, observed_tx.clone());
+        let (tx, context, finished) = start_context(&observed_tx);
+        expect(&observed, &context, Observed::Activated);
+
+        let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+        with_client(&session_bus, |connection| async move {
+            connection
+                .call_method(
+                    Some(LAUNCHER),
+                    "/org/a11y/bus",
+                    Some("org.a11y.Status"),
+                    "InvalidateScreenReaderStatus",
+                    &(),
+                )
+                .await
+                .unwrap();
+        });
+        expect(&observed, &context, Observed::Deactivated);
+        // The launcher stays alive and emits no further status changes. The
+        // one failed refresh must recover on its own, without restarting UI.
+        expect(&observed, &context, Observed::Activated);
+        expect_shutdown(tx, context, finished);
+    }
+
+    #[test]
     fn session_bus_loss_is_followed() {
         if !in_isolated_process("session_bus_loss_is_followed", SessionBus::Missing) {
             return;
@@ -1606,6 +1654,7 @@ mod tests {
         screen_reader_enabled: bool,
         /// Reads of the screen-reader status still to be left unanswered.
         unanswered: AtomicUsize,
+        unreadable: AtomicUsize,
     }
 
     #[zbus::interface(name = "org.a11y.Status")]
@@ -1616,11 +1665,32 @@ mod tests {
         }
 
         #[zbus(property)]
-        async fn screen_reader_enabled(&self) -> bool {
+        async fn screen_reader_enabled(&self) -> zbus::fdo::Result<bool> {
             if take_one(&self.unanswered) {
                 future::pending::<()>().await;
             }
-            self.screen_reader_enabled
+            if take_one(&self.unreadable) {
+                return Err(zbus::fdo::Error::Failed("temporary status failure".into()));
+            }
+            Ok(self.screen_reader_enabled)
+        }
+
+        async fn invalidate_screen_reader_status(
+            &self,
+            #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        ) -> zbus::Result<()> {
+            self.unreadable.store(1, Ordering::Relaxed);
+            emitter
+                .emit(
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &(
+                        "org.a11y.Status",
+                        std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new(),
+                        ["ScreenReaderEnabled"],
+                    ),
+                )
+                .await
         }
 
         #[zbus(property)]
@@ -1654,6 +1724,7 @@ mod tests {
         let status = FakeStatus {
             screen_reader_enabled: true,
             unanswered: AtomicUsize::new(unanswered_status_reads),
+            unreadable: AtomicUsize::new(0),
         };
         let launcher = FakeLauncher {
             missing_requests: AtomicUsize::new(missing_requests),
