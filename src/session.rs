@@ -2205,7 +2205,10 @@ impl PendingWrites {
                         self.quarantine.refuse_workspace(snapshot, &error);
                         continue;
                     }
-                    match store.save_workspace_with_terminal_panes(
+                    let observed =
+                        tracing::enabled!(target: "cagents::persistence", tracing::Level::TRACE)
+                            .then(Instant::now);
+                    let result = store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {
                             workspace: self.workspace_generation,
@@ -2213,7 +2216,26 @@ impl PendingWrites {
                         },
                         &adoptions,
                         &restorations,
-                    ) {
+                    );
+                    // The synchronous store call has returned, so its SQLite
+                    // reservation and connection lock are no longer held. Do
+                    // not log errors, paths, recipes or snapshot contents.
+                    if let Some(started) = observed {
+                        tracing::trace!(
+                            target: "cagents::persistence",
+                            operation = "workspace_commit",
+                            workspace = %snapshot.id,
+                            elapsed_ns = started.elapsed().as_nanos(),
+                            generation_before = self.workspace_generation,
+                            generation_after = ?result.as_ref().ok().map(|commit| commit.generation),
+                            cards = snapshot.cards.len(),
+                            adoptions = adoptions.len(),
+                            restorations = restorations.len(),
+                            succeeded = result.is_ok(),
+                            "workspace save returned"
+                        );
+                    }
+                    match result {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
