@@ -2560,9 +2560,13 @@ mod tests {
 
         // Corrupt the IDAT stream after its metadata. Construction is admitted
         // and the later decode error must release every transient/retained lease.
-        let idat = bytes.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
+        let mut chunk = 8; // Skip the PNG signature, then follow chunk lengths.
+        while &bytes[chunk + 4..chunk + 8] != b"IDAT" {
+            let length = u32::from_be_bytes(bytes[chunk..chunk + 4].try_into().unwrap()) as usize;
+            chunk += length + 12;
+        }
         let mut damaged = bytes.clone();
-        damaged[idat + 4] ^= 0xff;
+        damaged[chunk + 8] ^= 0xff;
         assert!(matches!(
             bounded_handle(damaged, &budget),
             Loaded::Unavailable
