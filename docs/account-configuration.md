@@ -215,6 +215,13 @@ explicitly permits one GitHub repository read under the same policy. Reported pu
 permission is metadata; no push or repository mutation is performed. Omitting
 that option does not request the endpoint check.
 
+Provider cleanup is separate from scratch cleanup: success requires confirmation
+that the owned process group accepted its termination signal (or was absent) and
+the original provider leader was reaped. An uncertain cleanup keeps the account
+home and workspace occupied for destructive operations; it does not prevent
+ordinary launches. A failed group signal stays quarantined rather than allowing
+a later observation of leader exit to authorize directory removal.
+
 JSON uses the normal CLI envelope and retains each observation's status/reason,
 the selected account, requested and resolved workspace, expected identity,
 observation time, daemon proof, physical identities, and executable identity.

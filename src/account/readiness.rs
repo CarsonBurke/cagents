@@ -233,6 +233,11 @@ pub struct CheckReport {
     pub account_home_identity: Option<PhysicalIdentity>,
     pub workspace_identity: Option<PhysicalIdentity>,
     pub provider_executable: Option<ExecutableIdentity>,
+    /// The owned provider group accepted its kill signal (or was absent),
+    /// and its original leader was confirmed reaped. This does not census
+    /// arbitrary descendants that escaped that group. Distinct from removal
+    /// of the workspace scratch file.
+    pub provider_cleanup_confirmed: bool,
     pub authentication: Measurement,
     pub execution_profile_configured: Measurement,
     pub profile: Option<PolicySummary>,
@@ -259,6 +264,7 @@ impl CheckReport {
             account_home_identity: None,
             workspace_identity: None,
             provider_executable: None,
+            provider_cleanup_confirmed: false,
             authentication: Measurement::unknown(CheckReason::NotChecked),
             execution_profile_configured: Measurement::unknown(CheckReason::NotChecked),
             profile: None,

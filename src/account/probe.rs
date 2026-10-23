@@ -19,6 +19,7 @@ use std::{
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -490,13 +491,32 @@ fn command(account: &Account, program: &Path) -> Command {
     command
 }
 
-/// A spawned CLI and the process group it leads, which goes with it: when
-/// the probe finishes, and when it is abandoned by its timeout, so nothing
-/// the CLI started outlives the probe.
+/// A task-owned use lease retained by a blocking spawn and its process group.
+/// The host performs its final short admission inside this method. Dropping an
+/// async wait cannot release the lease while that blocking work can still act.
+pub(crate) trait SpawnOwner: Send + Sync {
+    fn spawn(&self, command: &mut Command) -> Result<io::Result<Child>, String>;
+    fn preserve_unconfirmed(&self, child: Child, group_signal_confirmed: bool);
+}
+
+/// The established account-registry admission, unchanged for ordinary probes
+/// and reused inside a host-owned short launch guard.
+pub(crate) fn spawn_authorized(command: &mut Command) -> Result<io::Result<Child>, String> {
+    let _account =
+        super::registry::authorize_command(command.as_std()).map_err(|error| error.to_string())?;
+    Ok(command.spawn())
+}
+
+/// A spawned CLI and its owned process group. Normal completion confirms the
+/// group kill signal and reaps the leader; cancellation retains uncertain
+/// cleanup in the diagnostic's scoped owner.
 struct Group {
-    child: Child,
+    child: Option<Child>,
+    reaped: bool,
     /// The group's id - the child's pid - until the group has been killed.
     id: Option<i32>,
+    signal_confirmed: bool,
+    _owner: Option<Arc<dyn SpawnOwner>>,
 }
 
 impl Group {
@@ -504,15 +524,31 @@ impl Group {
     /// just installed or updated, or inherited for an instant by a process
     /// another thread is forking - is busy rather than missing, so it is
     /// tried again a few times before the start counts as failed.
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_owned(command, None).await
+    }
+
+    async fn spawn_owned(
+        mut command: Command,
+        owner: Option<Arc<dyn SpawnOwner>>,
+    ) -> Result<Self, String> {
         let mut delay = Duration::from_millis(10);
         loop {
+            let attempt_owner = owner.clone();
             let (returned, spawned) = tokio::task::spawn_blocking(move || {
-                let _account = super::registry::authorize_command(command.as_std())
-                    .map_err(|error| error.to_string())?;
-                let spawned = command.spawn().map(|child| {
+                let spawned = match &attempt_owner {
+                    Some(owner) => owner.spawn(&mut command)?,
+                    None => spawn_authorized(&mut command)?,
+                }
+                .map(|child| {
                     let id = child.id().and_then(|id| i32::try_from(id).ok());
-                    Self { child, id }
+                    Self {
+                        child: Some(child),
+                        reaped: false,
+                        id,
+                        signal_confirmed: false,
+                        _owner: attempt_owner,
+                    }
                 });
                 Ok::<_, String>((command, spawned))
             })
@@ -535,6 +571,8 @@ impl Group {
 
     fn stdout(&mut self) -> Result<tokio::io::Take<ChildStdout>, String> {
         self.child
+            .as_mut()
+            .expect("the group retains its original child until Drop")
             .stdout
             .take()
             .map(|stdout| stdout.take(OUTPUT_LIMIT))
@@ -545,13 +583,22 @@ impl Group {
     /// left of its group and only then reaps it. The caller has already
     /// dropped its ends of the pipes, so a CLI still writing cannot block on
     /// them.
-    async fn finish(&mut self) {
+    async fn finish(&mut self) -> bool {
         let deadline = tokio::time::Instant::now() + EXIT_GRACE;
         while !self.leader_exited() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(EXIT_POLL).await;
         }
-        self.kill();
-        let _ = self.child.wait().await;
+        if !self.kill() {
+            return false;
+        }
+        self.reaped = self
+            .child
+            .as_mut()
+            .expect("the group retains its original child until Drop")
+            .wait()
+            .await
+            .is_ok();
+        self.reaped
     }
 
     /// Whether the leader has exited, without reaping it: until it is
@@ -575,16 +622,19 @@ impl Group {
         }
     }
 
-    fn kill(&mut self) {
-        if let Some(id) = self.id.take() {
+    fn kill(&mut self) -> bool {
+        if let Some(id) = self.id {
             // SAFETY: `killpg` only sends a signal. The id is a group this
             // probe created, and its leader is not reaped until after this
             // call - `finish` waits without reaping, and a dropped child is
             // reaped later by tokio - so the id cannot belong to anyone else.
-            unsafe {
-                libc::killpg(id, libc::SIGKILL);
+            let result = unsafe { libc::killpg(id, libc::SIGKILL) };
+            if result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                self.id = None;
+                self.signal_confirmed = true;
             }
         }
+        self.signal_confirmed
     }
 }
 
@@ -593,7 +643,17 @@ impl Drop for Group {
         // Reached without `finish` when a probe is abandoned mid-way, by its
         // timeout most of all. `kill_on_drop` covers the child; this covers
         // anything it started.
-        self.kill();
+        let signal_confirmed = self.kill();
+        if !self.reaped
+            && let Some(owner) = &self._owner
+            && let Some(mut child) = self.child.take()
+            && (!signal_confirmed || !matches!(child.try_wait(), Ok(Some(_))))
+        {
+            // The blocking spawn and original child retain occupancy even
+            // after their async waiter is cancelled. A successful killpg is
+            // not evidence that this child has actually been reaped.
+            owner.preserve_unconfirmed(child, signal_confirmed);
+        }
     }
 }
 
@@ -605,10 +665,21 @@ struct Session {
 }
 
 impl Session {
-    async fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(command: Command) -> Result<Self, String> {
+        Self::spawn_with_owner(command, None).await
+    }
+
+    async fn spawn_owned(command: Command, owner: Arc<dyn SpawnOwner>) -> Result<Self, String> {
+        Self::spawn_with_owner(command, Some(owner)).await
+    }
+
+    async fn spawn_with_owner(
+        mut command: Command,
+        owner: Option<Arc<dyn SpawnOwner>>,
+    ) -> Result<Self, String> {
         command.stdin(Stdio::piped());
-        let mut group = Group::spawn(command).await?;
-        let stdin = group.child.stdin.take();
+        let mut group = Group::spawn_owned(command, owner).await?;
+        let stdin = group.child.as_mut().unwrap().stdin.take();
         let stdout = group.stdout()?;
         Ok(Self {
             group,
@@ -652,7 +723,7 @@ impl Session {
     }
 
     /// Closes the CLI's input and output, and finishes its group.
-    async fn close(self) {
+    async fn close(self) -> bool {
         let Self {
             mut group,
             stdin,
@@ -660,7 +731,7 @@ impl Session {
         } = self;
         drop(stdin);
         drop(lines);
-        group.finish().await;
+        group.finish().await
     }
 }
 
@@ -1052,6 +1123,78 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_waiter_retains_owner_across_late_blocking_spawn() {
+        struct DelayedOwner {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            custody: Arc<std::sync::Mutex<Vec<(Child, bool)>>>,
+        }
+        impl SpawnOwner for DelayedOwner {
+            fn spawn(&self, command: &mut Command) -> Result<io::Result<Child>, String> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .map_err(|_| "fixture spawn was not released")?;
+                spawn_authorized(command)
+            }
+            fn preserve_unconfirmed(&self, child: Child, signal: bool) {
+                self.custody.lock().unwrap().push((child, signal));
+            }
+        }
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let custody = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let owner = Arc::new(DelayedOwner {
+            entered: std::sync::Mutex::new(Some(entered)),
+            release: std::sync::Mutex::new(released),
+            custody: Arc::clone(&custody),
+        });
+        let weak = Arc::downgrade(&owner);
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let waiter = tokio::spawn(Group::spawn_owned(command, Some(owner.clone())));
+        waiting.await.unwrap();
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+        drop(owner);
+        assert!(
+            weak.upgrade().is_some(),
+            "blocking spawn still owns admission"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A late Group is dropped by the cancelled join receiver. If Drop
+        // could not reap immediately, it transferred its original handle.
+        let children = std::mem::take(&mut *custody.lock().unwrap());
+        for (mut child, signalled) in children {
+            assert!(signalled, "the fixture owns its fresh process group");
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn selected_home_probes_remove_inherited_credentials_but_system_keeps_them() {

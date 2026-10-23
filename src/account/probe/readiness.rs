@@ -21,13 +21,14 @@ tokio::task_local! {
     static FORBID_PROVIDER_IO: ();
 }
 
-pub async fn run(
+pub(crate) async fn run(
     account: Account,
     workspace: PathBuf,
     request: CheckRequest,
     helper: PathBuf,
     expected_home: PhysicalIdentity,
     expected_workspace: PhysicalIdentity,
+    owner: Option<std::sync::Arc<dyn super::SpawnOwner>>,
 ) -> CheckReport {
     let mut report = CheckReport::new(&request);
     report.workspace = workspace.clone();
@@ -150,7 +151,13 @@ pub async fn run(
         .arg("app-server")
         .current_dir(&workspace)
         .env("CODEX_HOME", &home);
-    let mut session = match tokio::time::timeout(TIMEOUT, Session::spawn(process)).await {
+    let spawn = async move {
+        match owner {
+            Some(owner) => Session::spawn_owned(process, owner).await,
+            None => Session::spawn(process).await,
+        }
+    };
+    let mut session = match tokio::time::timeout(TIMEOUT, spawn).await {
         Ok(Ok(session)) => session,
         Ok(Err(_)) => {
             stop(
@@ -176,7 +183,7 @@ pub async fn run(
         .as_ref()
         != Some(&home)
     {
-        session.close().await;
+        report.provider_cleanup_confirmed = session.close().await;
         stop(
             &mut report,
             CheckReason::AccountMismatch,
@@ -221,7 +228,7 @@ pub async fn run(
         }
     }
     // Even a timed-out exchange owns and reaps only its own provider group.
-    session.close().await;
+    report.provider_cleanup_confirmed = session.close().await;
     if original_home
         .as_ref()
         .and_then(|path| path.canonicalize().ok())
@@ -1021,6 +1028,7 @@ mod capture_tests {
                         PathBuf::from("/not-invoked/cagents"),
                         expected_home,
                         expected_workspace,
+                        None,
                     ),
                 )
                 .await;
