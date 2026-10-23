@@ -1945,23 +1945,6 @@ mod coding_config_init {
         CensusUnavailable,
         CensusLimit,
     }
-    impl CodingConfigRefusal {
-        pub(crate) fn description(self) -> &'static str {
-            match self {
-                Self::RegistryUnavailable => "The account registry could not be read",
-                Self::RegistryBusy => "Another account operation is using the registry; try again",
-                Self::RegistryNewer => "The account registry needs a newer cagents version",
-                Self::InvalidAccount => "Choose a registered, available Codex account",
-                Self::ContextChanged => "The selected account context changed; check it again",
-                Self::SharedHome => "Another account uses the selected home",
-                Self::SharedConfig => "Another account's configuration points to this file",
-                Self::CensusUnavailable => {
-                    "Account configuration independence could not be confirmed"
-                }
-                Self::CensusLimit => "Too many account paths are involved to confirm independence",
-            }
-        }
-    }
     type Refusal = CodingConfigRefusal;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2239,6 +2222,10 @@ mod coding_config_init {
             if key.provider != Provider::Codex
                 || latest.is_archived(key.key)
                 || latest.pending().iter().any(|row| row.key == key.key)
+                // Deserialization accepts duplicate rows. A second home with
+                // this UUID must not disappear through the census's selected
+                // account exclusion, even if its provider differs.
+                || latest.registered().iter().filter(|row| row.key == key.key).count() != 1
             {
                 return Err(Refusal::InvalidAccount);
             }
@@ -2553,6 +2540,54 @@ mod coding_config_init {
                 Err(Refusal::SharedConfig)
             );
             assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn accepted_duplicate_uuid_rows_refuse_without_rewriting_or_touching_either_config() {
+            for provider in [Provider::Codex, Provider::Claude] {
+                let fixture = Fixture::new();
+                let reservation = fixture.reserve();
+                let other = fixture.directory.path().join("duplicate-home");
+                fs::create_dir(&other).unwrap();
+                let config = other.join("config.toml");
+                symlink(fixture.path(), &config).unwrap();
+                let link_before = fs::symlink_metadata(&config).unwrap();
+                let original = fixture.store.load().unwrap();
+                let mut duplicate = original.clone();
+                let mut row = duplicate.accounts[0].clone();
+                row.provider = provider;
+                row.linked_home = Some(other);
+                duplicate.accounts.push(row);
+
+                // Exercise the actual accepted on-disk preimage rather than
+                // relying on a normal writer to construct malformed metadata.
+                let bytes = toml::to_string_pretty(&duplicate).unwrap().into_bytes();
+                fs::write(fixture.store.path(), &bytes).unwrap();
+                let accepted = fixture.store.load().unwrap();
+                assert_eq!(accepted, duplicate);
+                assert_eq!(accepted.defaults, original.defaults);
+                assert_eq!(accepted.project_defaults, original.project_defaults);
+                assert_eq!(accepted.revision(), original.revision());
+                // Selected-only validation sees the first row unchanged;
+                // the new lease-time uniqueness guard must close this gap.
+                assert!(reservation.verify_registry(&accepted).is_ok());
+                assert_eq!(
+                    fixture.initialize(&reservation, |_| panic!("publication must not start")),
+                    Err(Refusal::InvalidAccount)
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+                assert_eq!(fixture.store.load().unwrap(), accepted);
+                assert!(matches!(
+                    fs::symlink_metadata(fixture.path()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                ));
+                let link_after = fs::symlink_metadata(&config).unwrap();
+                assert_eq!(
+                    (link_after.dev(), link_after.ino()),
+                    (link_before.dev(), link_before.ino())
+                );
+                assert_eq!(fs::read_link(&config).unwrap(), fixture.path());
+            }
         }
 
         #[test]
