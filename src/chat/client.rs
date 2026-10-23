@@ -1435,6 +1435,13 @@ impl ClientHandle {
         self.inner.visible.load(Ordering::Acquire)
     }
 
+    /// Marks the connection lost, as the reader thread does when its daemon
+    /// goes away.
+    #[cfg(test)]
+    pub(crate) fn disconnect_for_test(&self) {
+        self.inner.alive.store(false, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         self.install_snapshot_for_test(snapshot);
