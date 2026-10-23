@@ -24,6 +24,411 @@ pub(super) fn retained_helper_executable() -> std::path::PathBuf {
     executable
 }
 
+// Exercise the actual shutdown tail, not a hand-built PreparedUpgrade. The
+// provider, holder, checkpoint and successor all retain one issued session.
+#[test]
+fn committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment() {
+    retained_upgrade_tail(false);
+}
+
+#[test]
+fn failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment() {
+    retained_upgrade_tail(true);
+}
+
+fn retained_upgrade_tail(fail_final_save: bool) {
+    use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    use crate::upgrade::handoff::{Phase, Store};
+    const CHILD: &str = "CAGENTS_RETAINED_UPGRADE_TEST";
+    const SCOPE: &str = "CAGENTS_RETAINED_UPGRADE_AUTHORITY_PRESENCE";
+    const ROOT: &str = "CAGENTS_RETAINED_UPGRADE_ROOT";
+    let name = if fail_final_save {
+        "failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment"
+    } else {
+        "committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment"
+    };
+    let _helper = retained_helper_executable();
+    if std::env::var(CHILD).as_deref() != Ok(name) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+            "tmp",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap());
+        // Inherit the caller's opaque delegation and actual validated helper;
+        // neither value is copied into a marker or replaced with User authority.
+        for (key, _) in std::env::vars_os() {
+            if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+                && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+            {
+                command = command.env_remove(key);
+            }
+        }
+        command = command
+            .args([
+                "--exact",
+                &format!("host::chat::retained_actor_tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .cwd(root)
+            .env(CHILD, name)
+            .env(
+                SCOPE,
+                if Authority::from_environment() != Authority::default() {
+                    "present"
+                } else {
+                    "absent"
+                },
+            )
+            .env(ROOT, root)
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("TMPDIR", root.join("tmp"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .timeout(Duration::from_secs(90))
+            .output_limits(256 * 1024, 256 * 1024);
+        let result = SystemProcessExecutor.execute(&command, &CancellationToken::new());
+        let (stdout, stderr) = match &result {
+            Ok(output) => (&output.stdout, &output.stderr),
+            Err(error) => (&error.stdout, &error.stderr),
+        };
+        fs::write(root.join("child-stdout"), stdout).unwrap();
+        fs::write(root.join("child-stderr"), stderr).unwrap();
+        // Retain original evidence until the external command guardian has
+        // settled every admitted owner, including after a failed child.
+        let retained = directory.keep();
+        let output = result.expect("bounded retained-upgrade child must settle");
+        assert!(
+            output.success,
+            "retained upgrade child failed (evidence {}):\n{}\n{}",
+            retained.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        println!("retained upgrade fixture evidence: {}", retained.display());
+        return;
+    }
+    let expected_scope = match std::env::var(SCOPE).unwrap().as_str() {
+        "present" => true,
+        "absent" => false,
+        _ => panic!("invalid inherited scope marker"),
+    };
+    assert_eq!(
+        Authority::from_environment() != Authority::default(),
+        expected_scope
+    );
+    let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = |incarnation| HostSessionProof {
+        host_session_id: HostSessionId::new("retained-upgrade-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let first = proof("first");
+    let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &first).unwrap());
+    let registry_path = root.join("registry.sqlite3");
+    let mut registry = super::super::model::Registry::at(&registry_path).unwrap();
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: root.join("project"),
+            name: "Retained upgrade fixture".into(),
+            kind: ProjectKind::Folder,
+        })
+        .unwrap();
+    let accepted = registry
+        .submit_agent(
+            &Origin::User,
+            &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: Provider::Claude,
+                    account: Some(crate::account::Account::system(Provider::Claude).id()),
+                    target: ExecutionTarget {
+                        repository: root.join("project"),
+                        directory: root.join("project"),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                }),
+                prompt: "One exact slow turn".into(),
+                idempotency_key: "retained-upgrade-one-turn".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let mut state = HostState::new(first.clone());
+    state.install_model(registry);
+    let host = Arc::new(HostLock::new(state));
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let source = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = source.id;
+    start_execution(
+        &host,
+        0,
+        source,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle
+        .actor_identity()
+        .expect("real execed retained Claude actor");
+    let active_proof = Arc::new(std::sync::Mutex::new(first.clone()));
+    struct Cleanup {
+        owner: Option<crate::daemon::holder_registry::Record>,
+        proof: Arc<std::sync::Mutex<HostSessionProof>>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let Some(owner) = &self.owner else { return };
+            // Preservation deliberately makes the old proxy unsuitable for
+            // Close. Reauthenticate only this exact fixture owner for cleanup.
+            let proof = self.proof.lock().unwrap().clone();
+            let result = Handle::inspect_remote(owner, proof.clone())
+                .and_then(|inspection| {
+                    Handle::adopt_remote(owner, inspection.source, proof, |_| {})
+                })
+                .and_then(|handle| {
+                    handle.close()?;
+                    handle.finish_retained_close()
+                });
+            if let Err(error) = result {
+                eprintln!("retained-upgrade cleanup remains unconfirmed: {error}");
+            }
+        }
+    }
+    let mut cleanup = Cleanup {
+        owner: Some(identity.record.clone()),
+        proof: active_proof.clone(),
+    };
+    let registry = super::super::agent_execution::registry(&host).unwrap();
+    let source = host.lock().unwrap().chats[&id].session.clone();
+    registry
+        .lock()
+        .unwrap()
+        .bind_agent(
+            accepted.agent.id,
+            None,
+            crate::agent_execution::HostedSession::Chat(source),
+        )
+        .unwrap();
+    handle
+        .command_for_run(
+            accepted.run.id,
+            chat::Command::Prompt {
+                text: "One exact slow turn".into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            },
+        )
+        .unwrap();
+    wait_until(
+        || {
+            root.join("provider-done").exists()
+                && registry
+                    .lock()
+                    .unwrap()
+                    .agent_run(accepted.run.id)
+                    .unwrap()
+                    .state
+                    == State::Succeeded
+                && handle.is_idle()
+                && handle
+                    .uncommitted_outcomes()
+                    .is_ok_and(|outcomes| outcomes.is_empty())
+        },
+        "accepted Claude turn and semantic ACK did not settle",
+    );
+    let session_id = handle
+        .confirmed_session_id()
+        .expect("provider confirmed issued session");
+    assert!(matches!(
+        handle.native_continuity(),
+        chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ));
+    let control_gate = host.lock().unwrap().control_gate.clone();
+    let control = control_gate.write().unwrap();
+    let capability = host
+        .lock()
+        .unwrap()
+        .shutdown_preflight(Instant::now())
+        .unwrap()
+        .capability;
+    super::super::state::prepare_upgrade(&host, capability, false).unwrap();
+    drop(control);
+    let store = Store::discover().unwrap();
+    let prepared = store.load().unwrap().unwrap();
+    assert_eq!(prepared.phase, Phase::Prepared);
+    assert_eq!(prepared.chats.len(), 1);
+    assert_eq!(
+        prepared.chats[0].launch.session_id.as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        prepared.chats[0].source.native_continuity,
+        handle.native_continuity()
+    );
+    let prepared_bytes = fs::read(&store.path).unwrap();
+    if fail_final_save {
+        fs::rename(&store.path, root.join("prepared-backup.json")).unwrap();
+        fs::create_dir(&store.path).unwrap();
+    }
+    let result = super::super::finish_chat_shutdown(&host);
+    if fail_final_save {
+        let error = result.expect_err("actual Ready publication must fail");
+        assert!(
+            error.contains(&std::io::Error::from_raw_os_error(libc::EISDIR).to_string()),
+            "must fail the actual checkpoint rename, not an earlier actor operation: {error}"
+        );
+        assert!(store.path.is_dir());
+        assert_eq!(
+            fs::read(root.join("prepared-backup.json")).unwrap(),
+            prepared_bytes
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "retained Claude must not receive a forbidden post-preserve Close: {result:?}"
+        );
+        let ready = store.load().unwrap().unwrap();
+        assert_eq!(ready.phase, Phase::Ready);
+        assert_eq!(ready.chats[0].launch, prepared.chats[0].launch);
+    }
+    assert!(!host.lock().unwrap().has_committed_upgrade());
+    assert!(identity.record.root.is_current() && identity.record.holder.is_current());
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let old_host = Arc::downgrade(&host);
+    let proxy_alive = handle.resource_lifetime();
+    drop(handle);
+    drop(notifications);
+    drop(host);
+    wait_until(
+        || old_host.strong_count() == 0 && !proxy_alive(),
+        "old daemon/proxy did not detach",
+    );
+    drop(lease.take());
+    let next = proof("successor");
+    lease = Some(crate::daemon::HostLease::acquire(&paths, &next).unwrap());
+    *active_proof.lock().unwrap() = next.clone();
+    let mut state = HostState::new(next);
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let successor = Arc::new(HostLock::new(state));
+    let notifications = super::super::notifications::Broker::start(
+        &successor,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    successor.lock().unwrap().notifications = Some(notifications.handle());
+    super::native_recovery::restore(&successor, 0, &prepared.chats[0].source).unwrap();
+    let handle = successor.lock().unwrap().chats[&id].handle.clone();
+    assert_eq!(handle.actor_identity(), Some(identity.clone()));
+    assert_eq!(
+        handle.confirmed_session_id().as_deref(),
+        Some(session_id.as_str())
+    );
+    handle.set_visible(true);
+    wait_until(
+        || {
+            handle
+                .snapshot(None)
+                .is_some_and(|snapshot| snapshot.items.len() >= 40)
+        },
+        "successor failed to hydrate retained transcript",
+    );
+    let snapshot = handle.snapshot(None).unwrap();
+    assert_retained_copy_sources(&handle, &snapshot);
+    let transcript = snapshot
+        .items
+        .iter()
+        .filter_map(|item| match &item.content {
+            chat::ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for index in 0..40 {
+        assert_eq!(transcript.matches(&format!("FRAME_{index:03}|")).count(), 1);
+    }
+    let successor_registry = super::super::agent_execution::registry(&successor).unwrap();
+    assert_eq!(
+        successor_registry
+            .lock()
+            .unwrap()
+            .agent_run(accepted.run.id)
+            .unwrap()
+            .state,
+        State::Succeeded
+    );
+    super::super::agent_execution::process(
+        &successor,
+        Authority::default(),
+        crate::agent_execution::Operation::Close(accepted.agent.id),
+    )
+    .unwrap();
+    wait_until(
+        || !identity.record.root.is_current() && !identity.record.holder.is_current(),
+        "normal owning Close left original provider/helper alive",
+    );
+    assert!(!successor.lock().unwrap().chats.contains_key(&id));
+    assert_eq!(
+        fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "upgrade/recovery must not replay the accepted prompt"
+    );
+    cleanup.owner = None;
+    drop(notifications);
+    drop(lease);
+}
+
 #[test]
 fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     retained_turn_final_action("close");
