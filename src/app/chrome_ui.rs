@@ -682,6 +682,16 @@ mod tests {
         .into()
     }
 
+    fn notice_focus_fixture(app: &Cagents) -> Element<'_, Message> {
+        widget::column::with_children(vec![
+            notice_header(app),
+            rename_fixture_view(app),
+            app.dialog()
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
+        ])
+        .into()
+    }
+
     /// Mounts the header as `app` now draws it, then applies `task`'s widget
     /// operations to it, as the runtime does once an update has been drawn.
     /// Returns the messages the task produced and the ids holding focus after.
@@ -714,12 +724,12 @@ mod tests {
             }
         }
 
-        let mut element = notice_header(app);
+        let mut element = notice_focus_fixture(app);
         tree.diff(element.as_widget_mut());
         let node = element.as_widget_mut().layout(
             tree,
             renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 100.0)),
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1600.0)),
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -822,7 +832,7 @@ mod tests {
                 assert!(
                     matches!(
                         messages.as_slice(),
-                        [Message::NoticeControlRetired { focused }] if *focused == holds_keyboard
+                        [Message::NoticeControlRetired]
                     ),
                     "{path}: {messages:?}"
                 );
@@ -868,12 +878,114 @@ mod tests {
         assert!(
             matches!(
                 messages.as_slice(),
-                [Message::NoticeControlRetired { focused: false }]
+                [Message::NoticeControlRetired]
             ),
             "{messages:?}"
         );
         let _ = app.update(messages.pop().unwrap());
         assert!(app.notice_control().is_none());
+    }
+
+    #[test]
+    fn retiring_notices_never_take_focus_from_a_newer_keyboard_owner() {
+        use iced::advanced::widget::Tree;
+
+        // Interleave both before the widget operation and after its reply:
+        // neither a stale focus query nor its cleanup may override new UI.
+        for before_operation in [false, true] {
+            for owner in ["palette", "rename", "dialog", "editor"] {
+                let mut app = rename_test_app();
+                focus_main_window(&mut app, true);
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+                );
+                assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+                let mut retirement = Some(app.update(Message::ExpireNotices));
+                let mut replies = if before_operation {
+                    Vec::new()
+                } else {
+                    apply_to_header(&app, &mut tree, &renderer, retirement.take().unwrap()).0
+                };
+                let (open, destination) = match owner {
+                    "palette" => (
+                        app.update_palette(palette_ui::Action::Open),
+                        widget::Id::new("palette.query"),
+                    ),
+                    "rename" => (
+                        app.update_chrome(Action::Rename(app.workspace.focused().unwrap())),
+                        widget::Id::new("chrome.rename.input"),
+                    ),
+                    "dialog" => {
+                        // Mount the real confirmation without requesting any
+                        // daemon operation; Cancel is an actual dialog widget.
+                        app.daemon_health_ui.confirmation = true;
+                        let destination = widget::Id::new("daemon-health.cancel");
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                    _ => {
+                        let destination = crate::settings_widgets::search_id();
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                };
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, open);
+                assert_eq!(focused, [destination.to_string()], "{owner}");
+                if let Some(retirement) = retirement {
+                    replies = apply_to_header(&app, &mut tree, &renderer, retirement).0;
+                }
+                assert!(matches!(replies.as_slice(), [Message::NoticeControlRetired]));
+                let cleanup = app.update(replies.pop().unwrap());
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+                assert_eq!(
+                    focused,
+                    [destination.to_string()],
+                    "{owner}, before operation: {before_operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_notice_cancels_the_pending_focus_handoff() {
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+        let _ = apply_to_header(
+            &app,
+            &mut tree,
+            &renderer,
+            iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+        );
+        let retirement = app.update(Message::ExpireNotices);
+        app.notices.record(TransientNotice::warning("A newer report."));
+        let (mut replies, focused) = apply_to_header(&app, &mut tree, &renderer, retirement);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert!(matches!(replies.as_slice(), [Message::NoticeControlRetired]));
+        let cleanup = app.update(replies.pop().unwrap());
+        let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert_eq!(app.notices.len(), 1);
     }
 
     #[test]
@@ -1375,8 +1487,54 @@ mod tab_style_tests {
 }
 
 const NOTICES_CONTROL_ID: &str = "chrome.notices";
+const RETIRING_NOTICES_ID: &str = "chrome.notices.retiring";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
+
+/// Check ownership and transfer focus in one runtime operation chain. An
+/// asynchronous boolean reply would become stale if another field, dialog or
+/// popup took focus before the application handled it.
+struct RetireNoticeFocus {
+    source: widget::Id,
+    marker: widget::Id,
+    target: widget::Id,
+    retiring: bool,
+    focused: bool,
+    target_present: bool,
+}
+
+impl iced::advanced::widget::Operation for RetireNoticeFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        visit(self);
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, _: iced::Rectangle) {
+        self.retiring |= id == Some(&self.marker);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if id == Some(&self.source) {
+            self.focused |= state.is_focused();
+        }
+        self.target_present |= id == Some(&self.target);
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        use iced::advanced::widget::operation::{Outcome, focusable};
+        if self.retiring && self.focused && self.target_present {
+            // Iced applies chained operations synchronously, without an
+            // intervening application message that could change the owner.
+            Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+        } else {
+            Outcome::None
+        }
+    }
+}
 
 /// The deadline a notice expiry timer is armed for. As the subscription's
 /// identity, an earlier deadline replaces the timer and an unchanged one
@@ -1896,8 +2054,8 @@ impl Cagents {
     /// The notices control goes with the last notice, whatever removed it:
     /// a confirmation retiring, a dismissal, a success resolving a failure,
     /// a pane closing. Holding the keyboard, it would take the keyboard with
-    /// it. So for one more frame it stays, while the tree is asked whether it
-    /// has focus; the answer moves focus to the inspector toggle beside it.
+    /// it. So it stays until the widget operation conditionally hands focus
+    /// to the inspector toggle beside it. The cleanup reply never moves focus.
     /// `before` is the control's severity before this update, if it showed.
     ///
     /// With the notices open, `reconcile_notice_popup` closes them and moves
@@ -1916,25 +2074,23 @@ impl Cagents {
             return Task::none();
         }
         self.chrome_ui.retiring_notice_control = Some(severity);
-        // Collected, because a tree without the control answers nothing at
-        // all, and the control must still go.
-        iced::widget::operation::is_focused(widget::Id::new(NOTICES_CONTROL_ID))
-            .collect()
-            .map(|answers| {
-                cosmic::Action::App(Message::NoticeControlRetired {
-                    focused: answers.contains(&true),
-                })
-            })
+        // Collect even an empty operation outcome so an absent control still
+        // retires. Focus is settled in the widget tree, never by this reply.
+        iced::runtime::task::widget(RetireNoticeFocus {
+            source: widget::Id::new(NOTICES_CONTROL_ID),
+            marker: widget::Id::new(RETIRING_NOTICES_ID),
+            target: context_inspector_toggle_id(),
+            retiring: false,
+            focused: false,
+            target_present: false,
+        })
+        .collect()
+        .map(|_| cosmic::Action::App(Message::NoticeControlRetired))
     }
 
-    pub(super) fn notice_control_retired(&mut self, focused: bool) -> Task<Message> {
+    pub(super) fn notice_control_retired(&mut self) -> Task<Message> {
         self.chrome_ui.retiring_notice_control = None;
-        // A notice raised meanwhile keeps the control, focus included.
-        if focused && !self.has_chrome_notices() {
-            iced::widget::operation::focus(context_inspector_toggle_id()).map(cosmic::Action::App)
-        } else {
-            Task::none()
-        }
+        Task::none()
     }
 
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
@@ -2086,7 +2242,22 @@ impl Cagents {
                 .into()
             });
         Some(crate::ui_controls::popover(
-            control,
+            // Keep the wrapper and button shape stable through retirement so
+            // their focus state survives. Only a still-retiring control with
+            // no newer keyboard layer advertises the handoff marker.
+            widget::container(control).id(widget::Id::new(
+                if self.chrome_ui.retiring_notice_control.is_some()
+                    && !self.has_chrome_notices()
+                    && !self.modal_is_open()
+                    && !self.palette.is_open()
+                    && self.chrome_ui.popup.is_none()
+                    && self.chrome_ui.rename.is_none()
+                {
+                    RETIRING_NOTICES_ID
+                } else {
+                    "chrome.notices.anchor"
+                },
+            )),
             content,
             widget::popover::Position::Bottom,
             Message::ChromeUi(Action::Close),

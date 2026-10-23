@@ -4590,11 +4590,8 @@ pub enum Message {
     DismissAllNotices,
     /// The earliest confirmation in the notice log is due to retire.
     ExpireNotices,
-    /// The notices control, kept on screen one frame past the last notice,
-    /// has been asked whether it held keyboard focus.
-    NoticeControlRetired {
-        focused: bool,
-    },
+    /// The retiring notices control has finished its conditional focus handoff.
+    NoticeControlRetired,
 }
 
 /// An application exit in progress.
@@ -17045,7 +17042,7 @@ impl Application for Cagents {
                 self.notices.expire(Instant::now());
                 Task::none()
             }
-            Message::NoticeControlRetired { focused } => self.notice_control_retired(focused),
+            Message::NoticeControlRetired => self.notice_control_retired(),
             Message::DirectoryFilesLoaded {
                 key,
                 request,
