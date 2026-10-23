@@ -3055,15 +3055,29 @@ impl SidebarState {
     /// What the Attention filter lists a worktree for: an unread update, or an
     /// agent waiting for input.
     fn worktree_needs_attention(&self, project: ProjectId, worktree: WorktreeId) -> bool {
-        self.has_agent_update(project, worktree)
-            || self.agent_activity(project, worktree) == Some(crate::agent::ActivityState::Waiting)
+        self.has_agent_update(project, worktree) || self.worktree_has_waiting_agent(project, worktree)
+    }
+
+    /// The general activity indicator prefers Working when several panes
+    /// share a worktree. Attention must still expose another pane's wait.
+    fn worktree_has_waiting_agent(&self, project: ProjectId, worktree: WorktreeId) -> bool {
+        self.agent_activity.values().any(|entry| {
+            entry.owner == Some((project, worktree))
+                && entry.activity.state == crate::agent::ActivityState::Waiting
+        })
     }
 
     /// Everything a worktree row draws about the agents and panes in it.
     fn worktree_row_state(&self, project: ProjectId, worktree: WorktreeId) -> WorktreeRowState {
         WorktreeRowState {
             unread: self.has_agent_update(project, worktree),
-            activity: self.agent_activity(project, worktree),
+            activity: if self.filter == SidebarFilter::Attention
+                && self.worktree_has_waiting_agent(project, worktree)
+            {
+                Some(crate::agent::ActivityState::Waiting)
+            } else {
+                self.agent_activity(project, worktree)
+            },
             has_panes: self.worktree_has_panes(project, worktree),
             listing: self.worktree_listing(project, worktree),
         }
@@ -15579,6 +15593,64 @@ pub(crate) mod tests {
         model.projects[0].worktrees.remove(1);
         state.prune_retained_attention(&model);
         assert!(state.retained_attention.is_empty());
+    }
+
+    #[test]
+    fn attention_keeps_a_waiting_pane_visible_beside_a_working_pane() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let project = project_id(1);
+        let worktree = model.projects[0].worktrees[1].id;
+        let row = SelectionRow::Worktree(project, worktree);
+        let working = CardId::new();
+        let waiting = CardId::new();
+        let activity = |state| Activity {
+            provider: Provider::Codex,
+            state,
+        };
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(waiting, project, worktree);
+        read(&mut state, &model, waiting, Vec::new());
+        assert_eq!(state.worktree_listing(project, worktree), Listing::Read);
+
+        state.set_agent_activity(working, project, worktree, activity(ActivityState::Working));
+        state.set_agent_activity(waiting, project, worktree, activity(ActivityState::Waiting));
+        assert_eq!(
+            state.agent_activity(project, worktree),
+            Some(ActivityState::Working),
+            "the general activity indicator still summarizes working panes"
+        );
+        assert_eq!(state.worktree_listing(project, worktree), Listing::Live);
+        assert_eq!(
+            state.worktree_row_state(project, worktree).activity,
+            Some(ActivityState::Waiting),
+            "Attention shows the wait that keeps the row listed"
+        );
+        assert!(
+            worktree_accessible_name(
+                &model.projects[0].worktrees[1],
+                state.worktree_row_state(project, worktree)
+            )
+            .ends_with(", agent needs input")
+        );
+        for compact in [false, true] {
+            assert!(visible_selection_rows(&model, &state, compact).contains(&row));
+        }
+        state.apply(&SidebarAction::HideReadAttention);
+        for compact in [false, true] {
+            assert!(
+                visible_selection_rows(&model, &state, compact).contains(&row),
+                "a live wait cannot be hidden as read, compact={compact}"
+            );
+        }
+
+        settle(&mut state, &model, waiting);
+        state.set_agent_activity(waiting, project, worktree, activity(ActivityState::Idle));
+        assert_eq!(state.worktree_listing(project, worktree), Listing::Handled);
+        assert!(visible_selection_rows(&model, &state, false).contains(&row));
+        state.apply(&SidebarAction::HideReadAttention);
+        assert!(!visible_selection_rows(&model, &state, false).contains(&row));
     }
 
     #[test]
