@@ -2030,11 +2030,17 @@ impl Focus {
 }
 
 impl<Highlighter: text::Highlighter> State<Highlighter> {
-    /// Clears focus, selection, and all interaction state.
-    pub fn clear_focus(&mut self) {
+    /// Leaves native focus without turning an outside pointer press into an
+    /// editor action. External result controls still own the selected buffer.
+    fn blur(&mut self) {
         self.focus = None;
         self.drag_click = None;
         self.context_menu_position = None;
+    }
+
+    /// Clears focus, selection, and all interaction state.
+    pub fn clear_focus(&mut self) {
+        self.blur();
         self.pending_edit = Some(Action::ClearSelection);
     }
 }
@@ -2268,6 +2274,14 @@ where
             state.horizontal_grab = None;
         }
         let pointer = cursor.position().filter(|point| _viewport.contains(*point));
+        // Layout can extend behind an adjacent pane or a clipped parent. New
+        // pointer interactions belong only to the visible editor; keep the
+        // original cursor for an already-owned drag below.
+        let visible_cursor = if pointer.is_some() {
+            cursor
+        } else {
+            mouse::Cursor::Unavailable
+        };
         if self.popup.is_none() {
             state.popup_bounds = None;
         }
@@ -2437,14 +2451,14 @@ where
                 event,
                 Event::Mouse(mouse::Event::ButtonPressed(_))
                     | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
-            ) && cursor.position_over(text_bounds).is_none()
+            ) && visible_cursor.position_over(text_bounds).is_none()
             {
-                state.clear_focus();
+                state.blur();
             }
 
             match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                    if let Some(pos) = cursor.position_over(text_bounds) {
+                    if let Some(pos) = visible_cursor.position_over(text_bounds) {
                         if state.focus.is_none() {
                             state.focus = Some(Focus::now());
                         }
@@ -2513,12 +2527,21 @@ where
             _ => {}
         }
 
+        let input_cursor = if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            && state.drag_click.is_some()
+        {
+            // A drag admitted in the viewport keeps its existing movement
+            // and release contract after crossing the clip boundary.
+            cursor
+        } else {
+            visible_cursor
+        };
         if let Some(update) = Update::from_event(
             event,
             state,
             layout.bounds(),
             self.text_padding(),
-            cursor,
+            input_cursor,
             self.key_binding.as_deref(),
         ) {
             match update {
@@ -5146,6 +5169,236 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    fn pointer_event(
+        editor: &mut TextEditor<'_, highlighter::PlainText, Action>,
+        tree: &mut widget::Tree,
+        node: &layout::Node,
+        renderer: &cosmic::Renderer,
+        input: (mouse::Event, Point),
+        viewport: &Rectangle,
+        published: &mut Vec<Action>,
+    ) -> bool {
+        let mut shell = Shell::new(published);
+        editor.update(
+            tree,
+            &Event::Mouse(input.0),
+            Layout::new(node),
+            mouse::Cursor::Available(input.1),
+            renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut shell,
+            viewport,
+        );
+        shell.is_event_captured()
+    }
+
+    #[test]
+    fn clipped_and_external_presses_blur_without_publishing_editor_actions() {
+        let renderer = headless_renderer();
+        let size = Size::new(600.0, 200.0);
+        let viewport = Rectangle::with_size(Size::new(250.0, 200.0));
+        for point in [Point::new(400.0, 60.0), Point::new(650.0, 60.0)] {
+            for button in [
+                mouse::Button::Left,
+                mouse::Button::Middle,
+                mouse::Button::Right,
+            ] {
+                let mut content = Content::with_text("selected text\n");
+                content.set_cursor(Cursor {
+                    position: Position { line: 0, column: 8 },
+                    selection: Some(Position { line: 0, column: 0 }),
+                });
+                let mut editor = wheel_editor(&content, Wrapping::None);
+                let mut tree = widget::Tree::new(
+                    &editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>,
+                );
+                let node =
+                    editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+                tree.state
+                    .downcast_mut::<State<highlighter::PlainText>>()
+                    .focus = Some(Focus::now());
+                let before = (content.text(), content.cursor(), content.selection());
+                let mut actions = Vec::new();
+                let captured = pointer_event(
+                    &mut editor,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    (mouse::Event::ButtonPressed(button), point),
+                    &viewport,
+                    &mut actions,
+                );
+                assert!(actions.is_empty(), "outside {button:?} emitted {actions:?}");
+                assert!(!captured, "an external control owns the press");
+                let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+                assert!(state.focus.is_none());
+                assert!(state.drag_click.is_none());
+                assert!(state.context_menu_position.is_none());
+                assert_eq!(
+                    (content.text(), content.cursor(), content.selection()),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_pointer_presses_keep_editor_and_context_menu_behavior() {
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(600.0, 200.0));
+        for button in [
+            mouse::Button::Left,
+            mouse::Button::Middle,
+            mouse::Button::Right,
+        ] {
+            let content = Content::with_text("visible text\n");
+            let mut editor = wheel_editor(&content, Wrapping::None);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+            let node = editor.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut actions = Vec::new();
+            assert!(pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonPressed(button), Point::new(60.0, 30.0)),
+                &viewport,
+                &mut actions,
+            ));
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            assert!(state.focus.is_some());
+            if button == mouse::Button::Right {
+                assert!(actions.is_empty());
+                assert!(state.context_menu_position.is_some());
+            } else {
+                assert!(matches!(actions.as_slice(), [Action::Click(_)]));
+                assert!(state.context_menu_position.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_focus_operation_still_requests_selection_clearing() {
+        let renderer = headless_renderer();
+        let content = Content::with_text("selection\n");
+        let mut editor = wheel_editor(&content, Wrapping::None);
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let viewport = Rectangle::with_size(Size::new(600.0, 200.0));
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        operation::Focusable::unfocus(tree.state.downcast_mut::<State<highlighter::PlainText>>());
+        let mut actions = Vec::new();
+        pointer_event(
+            &mut editor,
+            &mut tree,
+            &node,
+            &renderer,
+            (
+                mouse::Event::CursorMoved {
+                    position: Point::new(30.0, 30.0),
+                },
+                Point::new(30.0, 30.0),
+            ),
+            &viewport,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::ClearSelection]));
+    }
+
+    #[test]
+    fn admitted_drag_and_scrollbar_grabs_settle_outside_the_viewport() {
+        let renderer = headless_renderer();
+        let size = Size::new(600.0, 200.0);
+        for kind in 0..3 {
+            let source = format!("{}\n", "wide text ".repeat(150)).repeat(100);
+            let content = Content::with_text(&source);
+            let mut editor = wheel_editor(&content, Wrapping::None);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+            let node = editor.layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+            let geometry = editor.scroll_geometry(node.bounds());
+            let (start, outside, viewport) = match kind {
+                0 => (
+                    Point::new(30.0, 30.0),
+                    Point::new(400.0, 60.0),
+                    Rectangle::with_size(Size::new(250.0, 200.0)),
+                ),
+                1 => (
+                    geometry.thumb.center(),
+                    Point::new(geometry.track.center_x(), 180.0),
+                    Rectangle::with_size(Size::new(600.0, 100.0)),
+                ),
+                _ => {
+                    let horizontal = geometry.horizontal.expect("wide content has a thumb");
+                    (
+                        horizontal.thumb.center(),
+                        Point::new(500.0, horizontal.track.center_y()),
+                        Rectangle::with_size(Size::new(250.0, 200.0)),
+                    )
+                }
+            };
+            assert!(viewport.contains(start));
+            assert!(!viewport.contains(outside));
+            let mut actions = Vec::new();
+            assert!(pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonPressed(mouse::Button::Left), start),
+                &viewport,
+                &mut actions,
+            ));
+            actions.clear();
+            let before_horizontal = content.0.borrow().horizontal;
+            pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::CursorMoved { position: outside }, outside),
+                &viewport,
+                &mut actions,
+            );
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            match kind {
+                0 => assert!(matches!(actions.as_slice(), [Action::Drag(_)])),
+                1 => {
+                    assert!(state.scrollbar_grab.is_some());
+                    assert!(
+                        matches!(state.scrollbar_target, Some(ScrollTarget::Fraction { fraction, .. }) if fraction > 0.0)
+                    );
+                }
+                _ => {
+                    assert!(state.horizontal_grab.is_some());
+                    assert!(content.0.borrow().horizontal > before_horizontal);
+                }
+            }
+            pointer_event(
+                &mut editor,
+                &mut tree,
+                &node,
+                &renderer,
+                (mouse::Event::ButtonReleased(mouse::Button::Left), outside),
+                &viewport,
+                &mut actions,
+            );
+            let state = tree.state.downcast_ref::<State<highlighter::PlainText>>();
+            assert!(state.drag_click.is_none());
+            assert!(state.scrollbar_grab.is_none());
+            assert!(state.horizontal_grab.is_none());
+        }
     }
 
     #[test]
