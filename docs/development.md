@@ -311,6 +311,30 @@ guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
 
+### Process scope isolation
+
+Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
+namespace. Before submitting one, the daemon connects to the fixed
+`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
+peer pidfd and active PID namespace to match this caller. The proof retains the
+connection, pidfd and namespace descriptor through the existing user-bus
+request. It does not infer the manager's identity from a bus broker, a nonzero
+peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+
+This relies on the existing trusted OS manager and its well-known user-bus
+service routing; it does not protect against a hostile same-user replacement
+of those OS services. The request's routing and launch authority are unchanged.
+If the peer, namespace ioctl or required access cannot be proved, no scope
+request is attempted and ordinary launch is retained without claiming separate
+OOM isolation. An actual request or membership failure in a proved context
+still reports failure. Scope-dependent tests report unqualified isolation when
+that same proof is unavailable, and keep their strict membership assertions
+when it is available. Kernel-peer regressions use private Unix sockets without
+submitting requests to the OS manager.
+
+See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
+
 ## Testing
 
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
