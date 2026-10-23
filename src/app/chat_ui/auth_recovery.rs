@@ -30,7 +30,7 @@ impl Runtime {
             && self.pending.is_none()
             && self.queued.is_none()
             && !self.snapshot.busy
-            && !self.attachment_chooser_pending
+            && self.attachment_chooser_pending.is_none()
     }
 }
 impl Cagents {

@@ -1090,7 +1090,7 @@ impl Runtime {
         if self.closed_elsewhere
             || self.queued.is_some()
             || transitioning
-            || self.attachment_chooser_pending
+            || self.attachment_chooser_pending.is_some()
             || self.pending.is_some()
             || self.disconnected
             || snapshot.exited
@@ -1182,7 +1182,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending {
+        } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
@@ -1641,7 +1641,7 @@ impl Runtime {
         } else if self.capacity_refused {
             let enabled = !transitioning
                 && self.pending.is_none()
-                && !self.attachment_chooser_pending
+                && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
                     || !self.attachments.is_empty());
@@ -1664,8 +1664,9 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let enabled =
-                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && self.attachment_chooser_pending.is_none();
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -1876,16 +1877,15 @@ impl Runtime {
                 } else {
                     crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
                 },
-                crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
-                    "Pasted image".to_owned()
-                } else {
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                crate::design::caption(
+                    if attachment.reference.is_none()
+                        && clipboard_image::is_pasted(&attachment.path)
+                    {
+                        "Pasted image".into()
+                    } else {
+                        attachment.label()
+                    },
+                )
                 .width(Length::Fill)
                 .into(),
                 icon(
@@ -1900,7 +1900,10 @@ impl Runtime {
             attachment_chips.push(
                 widget::tooltip(
                     chip,
-                    design::caption(attachment.path.display().to_string()),
+                    design::caption(attachment.reference.as_ref().map_or_else(
+                        || attachment.path.display().to_string(),
+                        |reference| reference.name.clone(),
+                    )),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
@@ -2162,7 +2165,7 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                available && self.attachment_chooser_pending.is_none(),
                 Action::Attach(target),
             ));
         }
@@ -3827,7 +3830,9 @@ impl Runtime {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
-            ItemContent::Image { path, description } => Self::attachment_label(path, description),
+            ItemContent::Image {
+                path, description, ..
+            } => Self::attachment_label(path, description),
             content => turn::step_label(content),
         }
         .to_owned();
@@ -7951,6 +7956,7 @@ mod tests {
             content: ItemContent::Image {
                 path: "/image.png".into(),
                 description: "Image".into(),
+                reference: None,
             },
             started_at: None,
             at: None,
