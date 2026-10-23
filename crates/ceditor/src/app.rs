@@ -4512,7 +4512,7 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Completion(id, index, target) => {
-                    if self.modal_open() {
+                    if self.active != Some(id) || self.modal_open() {
                         return Task::none();
                     }
                     if let Some(tab) = self.tab_mut(id) {
@@ -7223,6 +7223,61 @@ mod tests {
             },
             false,
         )));
+    }
+
+    #[test]
+    fn standalone_completion_callback_cannot_apply_to_an_inactive_tab() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, directory, card, doc) = completion_find_fixture();
+        std::fs::write(directory.path().join("other.rs"), "other buffer\n").unwrap();
+        let other = add(
+            &mut app,
+            directory.path().to_str().unwrap(),
+            Some("other.rs"),
+        );
+        load_selected(&mut app, other);
+        drop(app.update(Message::Select(card)));
+        let request = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, request.0, "queued");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        let version = app.lsp.document_version(doc);
+        drop(app.update(Message::Select(other)));
+        assert_eq!(app.active, Some(other));
+        assert_eq!(app.tab(card).unwrap().completions, vec![target.clone()]);
+        drop(app.update(Message::Completion(card, 0, target.clone())));
+        assert_eq!(app.active, Some(other));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("tail tail\n")
+        );
+        assert_eq!(
+            app.tab(other).unwrap().runtime.editor_text().as_deref(),
+            Some("other buffer\n")
+        );
+        assert!(!app.tab(card).unwrap().runtime.is_dirty());
+        assert!(!app.tab(other).unwrap().runtime.is_dirty());
+        assert_eq!(app.lsp.document_version(doc), version);
+        assert_eq!(app.tab(card).unwrap().completions, vec![target]);
+
+        // Returning to A and requesting a fresh answer still applies normally.
+        drop(app.update(Message::Select(card)));
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(app.active, Some(card));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshtail tail\n")
+        );
+        assert_eq!(
+            app.tab(other).unwrap().runtime.editor_text().as_deref(),
+            Some("other buffer\n")
+        );
     }
 
     #[test]
