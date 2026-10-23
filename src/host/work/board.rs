@@ -363,7 +363,7 @@ fn linked_ticket(issue_id: &str, tickets: &BTreeMap<String, Ticket>) -> LinearTi
 /// The ticket a Linear-style branch name names, once Linear confirmed it:
 /// `fix/discard-1117-x` looks like one and is not. Linear also answers a
 /// former team key with the issue's current identifier, so `fix/issue-1403`
-/// about GitHub issue 1403 could come back as `MAIN-1403`; only an answer
+/// about GitHub issue 1403 could come back as `TEAM-1403`; only an answer
 /// under the same identifier confirms a guess.
 fn branch_ticket(branch: &str, tickets: &BTreeMap<String, Ticket>) -> Option<LinearTicket> {
     let identifier = crate::work::ticket_from_branch(branch)?;
@@ -398,11 +398,11 @@ mod tests {
             url: format!("https://linear.app/team/issue/{identifier}"),
         };
         let tickets = BTreeMap::from([
-            ("MAIN-7552".to_owned(), ticket("MAIN-7552")),
-            ("ISSUE-1403".to_owned(), ticket("MAIN-1403")),
+            ("TEAM-123".to_owned(), ticket("TEAM-123")),
+            ("ISSUE-1403".to_owned(), ticket("TEAM-1403")),
         ]);
-        let confirmed = branch_ticket("fix/main-7552-vimeo", &tickets).unwrap();
-        assert_eq!(confirmed.identifier.as_deref(), Some("MAIN-7552"));
+        let confirmed = branch_ticket("fix/team-123-display", &tickets).unwrap();
+        assert_eq!(confirmed.identifier.as_deref(), Some("TEAM-123"));
         assert_eq!(confirmed.source, TicketSource::BranchName);
         assert_eq!(branch_ticket("fix/issue-1403-compact", &tickets), None);
         assert_eq!(branch_ticket("fix/main-1-unasked", &tickets), None);

@@ -1113,6 +1113,12 @@ impl HostedTerminalHandle {
         self.inner.published.desired_visibility()
     }
 
+    /// Ends the connection for good, as giving up on a lost daemon does.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.inner.stop.request();
+    }
+
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();

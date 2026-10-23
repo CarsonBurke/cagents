@@ -183,13 +183,16 @@ scripts/run-development --hot
 scripts/run-development --hot-integrated
 ```
 
-The helper builds three native Linux products separately using locked
-`dev-runtime` builds, then stages the matched CLI/daemon beside cargo-hot's
-private executable bundle. Cargo-hot always targets the native host triple,
-adds a linker and saved compilation objects, and may need a substantial first
-build even with the ordinary runner's warmed cache. `CARGO_BUILD_JOBS` controls
-its spawned build jobs. Only one hot session can run at a time: the upstream
-client/server uses localhost port1100, and all development sessions share state.
+The helper builds the native Linux CLI and daemon separately using locked
+`dev-runtime` builds, resolves and fetches the selected UI dependency graph with
+locked Cargo metadata, then stages the matched CLI/daemon beside cargo-hot's
+private executable bundle. Cargo-hot builds the UI directly; an ordinary UI
+preflight build would produce an unused executable. Cargo-hot always targets
+the native host triple, adds a linker and saved compilation objects, and may need
+a substantial first build even with the ordinary runner's warmed cache.
+`CARGO_BUILD_JOBS` controls its spawned build jobs. Only one hot session can run
+at a time: the upstream client/server uses localhost port 1100, and all development
+sessions share state.
 
 Every helper Cargo invocation runs with `Cargo.lock` mounted read-only in a
 private bubblewrap mount namespace. This also refuses atomic replacement/unlink
@@ -311,11 +314,37 @@ guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
 
+### Process scope isolation
+
+Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
+namespace. Before submitting one, the daemon connects to the fixed
+`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
+peer pidfd and active PID namespace to match this caller. The proof retains the
+connection, pidfd and namespace descriptor through the existing user-bus
+request. It does not infer the manager's identity from a bus broker, a nonzero
+peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+
+This relies on the existing trusted OS manager and its well-known user-bus
+service routing; it does not protect against a hostile same-user replacement
+of those OS services. The request's routing and launch authority are unchanged.
+If the peer, namespace ioctl or required access cannot be proved, no scope
+request is attempted and ordinary launch is retained without claiming separate
+OOM isolation. An actual request or membership failure in a proved context
+still reports failure. Scope-dependent tests report unqualified isolation when
+that same proof is unavailable, and keep their strict membership assertions
+when it is available. Kernel-peer regressions use private Unix sockets without
+submitting requests to the OS manager.
+
+See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
+
 ## Testing
 
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
-feature, the `ui` and `host` unit tests and every gated integration target are
-compiled out. Cover the boundaries a change touches:
+feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
+targets whose required features are absent, rather than compiling and linking
+empty harnesses. The host-only terminal workload example is also skipped outside
+its lane. Cover the boundaries a change touches:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
@@ -330,6 +359,10 @@ cargo test --locked --no-default-features --features host --lib terminal::
 cargo test --locked --no-default-features --features host --test terminal_load_contract
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+Explicitly selecting a gated target without its feature, including through a
+`--test '*'` glob, reports the missing feature instead of succeeding with zero
+tests. Use `--all-targets` to select all targets available in a feature lane.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary

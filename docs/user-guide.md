@@ -589,12 +589,13 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**All run history** includes runs from removed definitions. It pages through
+**Run history** includes runs from removed definitions. It pages through
 their original names, times, outcomes, and bounded results. Opening history does
 not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. Completion alerts
-open this exact run history and survive provider cleanup. Removing a definition
-prevents future runs and retains its past runs.
+session; completed fresh sessions remain readable in history. A completion alert
+opens its run under **Automations**, with a trail back to the list, and
+survives provider cleanup. Removing a definition prevents future runs and
+retains its past runs.
 
 The same operations are available without a window:
 
@@ -605,8 +606,24 @@ cagents automation enable AUTOMATION_ID --revision REVISION --confirm
 cagents automation run-now AUTOMATION_ID --execution-revision EXECUTION_REVISION --request-id REQUEST_UUID --confirm
 cagents automation history
 cagents automation history AUTOMATION_ID --limit 50
+cagents automation audit AUTOMATION_ID --limit 50
 cagents automation run FIRING_ID
 ```
+
+**Lifecycle** in the native automation details, or `automation audit`, lists
+committed management changes and system pause, block and recovery receipts.
+Each receipt identifies its exact revision, time, cause and actor class; these
+classes describe an admitted user management request or a system operation,
+not a person's identity. Run outcomes remain in **Run history**. Audit reads do
+not launch providers or change a schedule. The last 256 lifecycle receipts per
+automation are retained, including after removal; pages contain at most 100.
+Use the audit page's `next` value as `--before SEQUENCE` for an older page.
+Earlier unrecorded or expired events remain explicitly unavailable: their actor
+and cause cannot be recovered from the current enabled state. Prompt bodies,
+launch environment and provider diagnostics are excluded from these receipts.
+Hosted conversations can read only receipts committed in their own project.
+Moving a definition does not move its earlier audit receipts into the new
+project; management inspection retains the complete retained chain.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History
@@ -806,6 +823,40 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+### Image references and local image storage
+
+Pasted and selected images receive stable **Image N** labels. Their inline
+`[Image N]` references stay with the actual image through edits, queued message
+revision, retry and supported provider history. Removing an attachment does not
+silently attach another image with the same display number. A prompt with
+managed images explains when an attached image's inline reference is missing
+before sending. Text may also refer to earlier images by label; a label alone
+does not select or attach an image.
+
+Owned image assets persist separately from disposable preview caches. The
+physical-device store is bounded to 4096 images and 2 GiB; accepted images and
+persisted drafts are not silently removed to admit new images. Preview memory
+and provider-specific input limits still apply.
+
+Inspect safe image receipt metadata from the user's CLI on the device holding
+the images. These commands work without a daemon and reject hosted-agent or
+remote-device authority:
+
+```sh
+cagents chat image-assets list
+cagents --json chat image-assets list
+cagents chat image-assets remove UUID --sha256 EXACT_SHA256 --acknowledge-history-loss
+```
+
+Use the exact UUID and SHA-256 shown by `list` to remove one image. Removal is
+explicit and can make that image unavailable in drafts and saved history; it
+does not delete the conversation or reuse its image number. A stale digest is
+refused. The inventory prints labels, UUIDs, hashes and byte counts, without
+image bytes, original filenames or private source paths. Omit `--device`, or
+use `--device local`; the command always addresses this physical device.
+Provider history that does not retain verifiable image data cannot reconstruct
+a trusted reference from its label alone.
+
 ### Messages, branches, and child agents
 
 Chat loads recent image previews first. **Load preview** gives the selected image
@@ -990,6 +1041,27 @@ advertised capabilities, and image attachments need an image-capable model.
 Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
+
+When asking for feedback on generated artifacts, agents should provide one
+explicit Markdown link per artifact, such as `[Expanded](docs/tree-expanded.png)`,
+including the path relative to the producing
+conversation's working directory (or an absolute path on that conversation's
+device). Shell shorthand such as `tree-real-*.png` or
+`tree-fixture-dark-{collapsed,expanded}.png` remains literal text; it does not
+select or attach multiple images. Claude's `AskUserQuestion` question and option
+text also supplies no image attachments. Native questions offer **Open artifact**
+controls for up to 16 explicit concrete links, without changing question or
+answer text. Bare paths and unresolved shell patterns stay text. For more
+artifacts, put the concrete links in the preceding transcript message. Encode
+literal filename metacharacters in file URLs, for example `%2A` for `*`.
+An image attachment is a separate
+provider image block or a file explicitly selected in the composer. For remote
+conversations, local paths belong to the selected device; a matching filename
+on the UI computer does not identify the same artifact.
+Concrete remote image links open a read-only gallery on the selected device's
+bytes. Loading can be cancelled, and remote files cannot be opened in a local
+external viewer. Missing files and preview-capacity errors report the device
+and path so the producer can supply a concrete supported image.
 
 - Drag across prompts, answers, code, and tool output and press `Ctrl+C` to
   copy the selected text. Double-click selects a word; triple-click selects

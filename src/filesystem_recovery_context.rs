@@ -622,14 +622,23 @@ mod tests {
             self.0.store(true, Ordering::SeqCst);
         }
     }
+    // Exercise a real sticky parent without assuming that a shared system
+    // temporary directory has no enclosing checkout marker. The owning test
+    // keeps both private directories alive through every cleanup/retry oracle.
+    fn sticky_source_fixture() -> (tempfile::TempDir, tempfile::TempDir, Arc<StickyParent>) {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let directory = tempfile::tempdir_in(parent.path()).unwrap();
+        let sticky = StickyParent::acquire(Arc::new(Root::open(parent.path()).unwrap())).unwrap();
+        (parent, directory, sticky)
+    }
+
     #[test]
     fn sticky_bootstrap_cleanup_removes_only_its_owned_empty_sibling() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (_parent, directory, sticky) = sticky_source_fixture();
         let runtime = tempfile::tempdir().unwrap();
         let source = Arc::new(Root::open(directory.path()).unwrap());
-        let sticky =
-            StickyParent::acquire(Arc::new(Root::open(std::path::Path::new("/tmp")).unwrap()))
-                .unwrap();
         let protection =
             crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
                 .unwrap();
@@ -650,12 +659,9 @@ mod tests {
 
     #[test]
     fn sticky_bootstrap_retry_resolves_leaf_before_parent_cleanup() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (_parent, directory, sticky) = sticky_source_fixture();
         let runtime = tempfile::tempdir().unwrap();
         let source = Arc::new(Root::open(directory.path()).unwrap());
-        let sticky =
-            StickyParent::acquire(Arc::new(Root::open(std::path::Path::new("/tmp")).unwrap()))
-                .unwrap();
         let protection =
             crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
                 .unwrap();
@@ -687,12 +693,9 @@ mod tests {
 
     #[test]
     fn sticky_bootstrap_nonempty_cleanup_retains_original_for_retry() {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (_parent, directory, sticky) = sticky_source_fixture();
         let runtime = tempfile::tempdir().unwrap();
         let source = Arc::new(Root::open(directory.path()).unwrap());
-        let sticky =
-            StickyParent::acquire(Arc::new(Root::open(std::path::Path::new("/tmp")).unwrap()))
-                .unwrap();
         let protection =
             crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
                 .unwrap();

@@ -275,16 +275,44 @@ impl NoticeSeverity {
     }
 }
 
+/// The operation, and the object it acted on, that a notice reports on.
+///
+/// A notice raised under a key takes the place of whatever that key last
+/// raised: a retry that fails again does not stack a second report, and one
+/// that succeeds replaces the failure with its confirmation. Resolving a key
+/// withdraws its notice without announcing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKey {
+    /// Opening the conversation in this card, or switching its terminal to one.
+    ChatAttach(CardId),
+    /// Saving the account that one sign-in produced.
+    SignIn(uuid::Uuid),
+    /// Adding an existing account home from the accounts table.
+    AccountLink,
+    /// Telling panes whether they are on screen.
+    SurfaceVisibility,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransientNotice {
     severity: NoticeSeverity,
+    /// What happened, in the reader's terms.
     message: String,
+    /// The underlying reason as the failing component reported it, for a
+    /// bug report or a search; drawn beneath the message.
+    details: Option<String>,
+    key: Option<NoticeKey>,
 }
 
 /// Notices retained for review. Bounded because nothing else bounds them: the
 /// shell raises a notice from almost a hundred call sites, several of them on
 /// per-frame or per-poll paths.
 const NOTICE_LOG_CAPACITY: usize = 24;
+
+/// How long a confirmation stays before it retires on its own: long enough to
+/// read one sentence, short enough that a success glyph in the header still
+/// means something just happened.
+const NOTICE_SUCCESS_LIFETIME: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoggedNotice {
@@ -293,6 +321,9 @@ struct LoggedNotice {
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
+    /// When a confirmation retires. Warnings and errors have none: they wait
+    /// for their key to resolve or for the reader to dismiss them.
+    expires_at: Option<Instant>,
 }
 
 /// The shell's notice history: a bounded ring plus the identity counter that
@@ -301,30 +332,124 @@ struct LoggedNotice {
 struct NoticeLog {
     entries: VecDeque<LoggedNotice>,
     next_id: u64,
+    /// Since when confirmations have stopped counting down, because nobody
+    /// could be reading them: the window is in the background, or the reader
+    /// has the notices open. A confirmation gets its whole lifetime in front
+    /// of someone who can see it.
+    paused_at: Option<Instant>,
 }
 
 impl NoticeLog {
     fn record(&mut self, notice: TransientNotice) {
-        // Scanning the whole log rather than only its tail is what makes
-        // deduplication survive interleaving: a poll that raises two failures
-        // in turn would otherwise alternate them forever and fill the log with
-        // copies. The repeat moves to the back because the user cares that it
-        // is happening now, and `recent` reads newest first.
-        if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
+        self.record_at(notice, Instant::now());
+    }
+
+    fn record_at(&mut self, notice: TransientNotice, now: Instant) {
+        // Recorded while paused, a confirmation's countdown starts with the
+        // resume: `resume` moves every deadline on by the pause's length.
+        let counted_from = self.paused_at.unwrap_or(now);
+        let expires_at = (notice.severity == NoticeSeverity::Success)
+            .then(|| counted_from + NOTICE_SUCCESS_LIFETIME);
+        // A keyed notice takes over its key's entry, whatever either says, so
+        // a key never holds more than one. An unkeyed one only collapses onto
+        // an identical message. Scanning the whole log rather than only its
+        // tail is what makes that survive interleaving: a poll that raises two
+        // failures in turn would otherwise alternate them forever and fill the
+        // log with copies. The repeat moves to the back because the user cares
+        // that it is happening now, and `recent` reads newest first.
+        let previous = self.entries.iter().position(|entry| match notice.key {
+            Some(key) => entry.notice.key == Some(key),
+            None => entry.notice == notice,
+        });
+        if let Some(index) = previous {
             let mut entry = self.entries.remove(index).expect("index came from the log");
-            entry.repeats = entry.repeats.saturating_add(1);
-            self.entries.push_back(entry);
-            return;
+            if entry.notice == notice {
+                entry.repeats = entry.repeats.saturating_add(1);
+                entry.expires_at = expires_at;
+                self.entries.push_back(entry);
+                return;
+            }
+            // Replaced: the new report gets an identity of its own, so a
+            // Dismiss aimed at the old one cannot remove it.
         }
         self.next_id = self.next_id.wrapping_add(1);
         self.entries.push_back(LoggedNotice {
             id: self.next_id,
             notice,
             repeats: 1,
+            expires_at,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // The notice just recorded always stays: it is what the reader is
+            // being told now. Among the rest the oldest entry of the lowest
+            // severity goes first, so a run of confirmations or warnings
+            // cannot push out a failure that nothing has resolved.
+            let earlier = self.entries.len() - 1;
+            let index = self
+                .entries
+                .iter()
+                .take(earlier)
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index)
+                .expect("an overflowing log holds more than the new entry");
+            self.entries.remove(index);
         }
+    }
+
+    /// Stops confirmations counting down from `now`; see `paused_at`.
+    fn pause(&mut self, now: Instant) {
+        self.paused_at.get_or_insert(now);
+    }
+
+    /// Lets confirmations count down again from where they stopped.
+    fn resume(&mut self, now: Instant) {
+        let Some(since) = self.paused_at.take() else {
+            return;
+        };
+        let paused = now.saturating_duration_since(since);
+        for expiry in self
+            .entries
+            .iter_mut()
+            .filter_map(|entry| entry.expires_at.as_mut())
+        {
+            *expiry += paused;
+        }
+    }
+
+    /// Whether `key` has a report standing.
+    fn has(&self, key: NoticeKey) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.notice.key == Some(key))
+    }
+
+    /// Withdraws whatever `key` last reported, because its condition no
+    /// longer holds.
+    fn resolve(&mut self, key: NoticeKey) {
+        self.entries.retain(|entry| entry.notice.key != Some(key));
+    }
+
+    /// Retires every confirmation due by `now`. Nothing is due while paused,
+    /// which also discards a timer that fired just before the pause began.
+    fn expire(&mut self, now: Instant) {
+        if self.paused_at.is_some() {
+            return;
+        }
+        self.entries
+            .retain(|entry| entry.expires_at.is_none_or(|expiry| expiry > now));
+    }
+
+    /// When the next confirmation is due to retire: never while paused, and
+    /// never with no confirmation waiting, so neither arms a timer.
+    fn next_expiry(&self) -> Option<Instant> {
+        if self.paused_at.is_some() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.expires_at)
+            .min()
     }
 
     fn dismiss(&mut self, id: u64) {
@@ -337,9 +462,9 @@ impl NoticeLog {
 
     /// Newest first: the log reads downward from the most recent event.
     ///
-    /// Nothing retires on a timer. A notice the user never saw is worse than
-    /// one that waits: the header carries the severity until it is dismissed,
-    /// and capacity is what bounds the log.
+    /// Only confirmations retire on a timer. A failure the user never saw is
+    /// worse than one that waits: the header carries its severity until the
+    /// operation that raised it resolves it or the reader dismisses it.
     fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
         self.entries.iter().rev()
     }
@@ -463,7 +588,20 @@ impl TransientNotice {
         Self {
             severity,
             message: message.into(),
+            details: None,
+            key: None,
         }
+    }
+
+    /// Ties the notice to the operation that raised it; see [`NoticeKey`].
+    fn with_key(mut self, key: NoticeKey) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
     }
 
     fn success(message: impl Into<String>) -> Self {
@@ -593,12 +731,34 @@ fn notice_surface_detail<'a>(
     severity: NoticeSeverity,
     text: impl Into<Cow<'a, str>> + 'a,
 ) -> Element<'a, Message> {
+    notice_detail_text(severity, text).into()
+}
+
+/// A notice's underlying reason, kept to a few lines so one long error chain
+/// cannot crowd the rest of the notices out of the popup. The whole of it is
+/// in the log, which records every warning and error with its details.
+fn notice_surface_details<'a>(
+    severity: NoticeSeverity,
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> Element<'a, Message> {
+    notice_detail_text(severity, text)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            EllipsizeHeightLimit::Lines(NOTICE_DETAIL_LINES),
+        ))
+        .into()
+}
+
+const NOTICE_DETAIL_LINES: usize = 4;
+
+fn notice_detail_text<'a>(
+    severity: NoticeSeverity,
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> widget::SelectableText<'a> {
     widget::selectable_text(text)
         .size(design::TEXT_CAPTION)
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Color(severity.detail_color()))
-        .into()
 }
 
 /// Button styling for a control inside a `notice_surface`.
@@ -1109,6 +1269,17 @@ fn session_health_stream(
             }
         },
     ))
+}
+
+/// The channels holding `card`. An open card's unread update and waiting
+/// agent mark every one of their sidebar rows.
+fn channels_holding(
+    channels: &[crate::model::ProjectChannel],
+    card: CardId,
+) -> impl Iterator<Item = &crate::model::ProjectChannel> {
+    channels
+        .iter()
+        .filter(move |channel| channel.cards.contains(&card))
 }
 
 fn terminal_completed(session: &TerminalSession) -> bool {
@@ -4428,6 +4599,10 @@ pub enum Message {
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
     DismissAllNotices,
+    /// The earliest confirmation in the notice log is due to retire.
+    ExpireNotices,
+    /// The retiring notices control has finished its conditional focus handoff.
+    NoticeControlRetired,
 }
 
 /// An application exit in progress.
@@ -7417,6 +7592,18 @@ impl Cagents {
             .card_activity(card)
             .map(|activity| activity.state);
         let next = activity.map(|activity| activity.state);
+        // Only an agent that carries on was answered. One that disconnects,
+        // fails, or closes while waiting reports no state at all.
+        if previous == Some(crate::agent::ActivityState::Waiting)
+            && matches!(
+                next,
+                Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle)
+            )
+        {
+            let listed = self.attention_listed_rows();
+            let placement = self.attention_placement(card, &listed);
+            self.sidebar_state.settle_waiting_agent(card, &placement);
+        }
         if (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
             || (previous == Some(crate::agent::ActivityState::Working)
                 && next == Some(crate::agent::ActivityState::Idle))
@@ -7436,10 +7623,8 @@ impl Cagents {
             .flatten();
         if finished
             && let Some(project) = worktree.as_ref().map(|key| key.project_id).or_else(|| {
-                self.durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card))
+                channels_holding(&self.durable.channels, card)
+                    .next()
                     .map(|channel| channel.project_id)
             })
         {
@@ -7470,11 +7655,8 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let channel = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.cards.contains(&id))
+        let channel = channels_holding(&self.durable.channels, id)
+            .next()
             .map(|channel| channel.id);
         let scope = if let Some(channel) = channel {
             self.select_channel(channel)
@@ -7502,11 +7684,60 @@ impl Cagents {
         Task::batch([scope, focus, transcript, read])
     }
 
+    /// The user has read `card`'s update.
+    fn read_card_update(&mut self, card: CardId) {
+        self.read_card_updates(&[card]);
+    }
+
+    /// The user has read these cards' updates. The rows the Attention list
+    /// draws are gathered once, before any read changes them, and only when
+    /// there is an update to read.
+    fn read_card_updates(&mut self, cards: &[CardId]) {
+        let mut listed = None;
+        for &card in cards {
+            if !self.sidebar_state.has_card_update(card) {
+                continue;
+            }
+            let listed = listed.get_or_insert_with(|| self.attention_listed_rows());
+            let placement = self.attention_placement(card, listed);
+            self.sidebar_state
+                .acknowledge_agent_update(card, &placement);
+        }
+    }
+
+    /// The rows the Attention list draws now. Only that list keeps rows, so
+    /// nothing is gathered under another filter.
+    fn attention_listed_rows(&self) -> Vec<sidebar::SelectionRow> {
+        if self.sidebar_state.filter() == sidebar::SidebarFilter::Attention {
+            self.visible_sidebar_rows()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Where `card`'s attention shows among `listed`, so dealing with it
+    /// keeps those rows in place.
+    fn attention_placement<'a>(
+        &self,
+        card: CardId,
+        listed: &'a [sidebar::SelectionRow],
+    ) -> sidebar::AttentionPlacement<'a> {
+        if listed.is_empty() {
+            return sidebar::AttentionPlacement::default();
+        }
+        sidebar::AttentionPlacement {
+            channels: channels_holding(&self.durable.channels, card)
+                .map(|channel| channel.id)
+                .collect(),
+            listed,
+        }
+    }
+
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        self.read_card_updates(&cards);
         let tasks: Vec<_> = cards
             .into_iter()
             .map(|card| {
-                self.sidebar_state.acknowledge_agent_update(card);
                 self.acknowledge_card_notices(card);
                 if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
                     && let Err(error) = handle.acknowledge_updates()
@@ -7537,7 +7768,7 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
-        self.sidebar_state.acknowledge_agent_update(card);
+        self.read_card_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
             && let Err(error) = handle.acknowledge_updates()
         {
@@ -11453,6 +11684,63 @@ impl Cagents {
         })
     }
 
+    /// How a notice names a pane: quoted, by the title its tab shows, so a
+    /// terminal reads as its numbered tab rather than a name several tabs
+    /// share. The notice log is shared by every pane, so "this conversation"
+    /// would not say which.
+    fn notice_pane_name(&self, card: CardId) -> Option<String> {
+        self.card_state(card)
+            .map(|state| format!("“{}”", self.repository_chrome(state).0))
+    }
+
+    /// Withdraws reports about cards that are gone. A card leaves by many
+    /// paths - a close, a deleted worktree or channel, a sign-in's terminal
+    /// retiring, another client removing a shared pane - so this holds for
+    /// all of them in one place, after every update, rather than in each.
+    fn resolve_notices_for_closed_cards(&mut self) {
+        let closed = self
+            .notices
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.notice.key {
+                Some(key @ NoticeKey::ChatAttach(card))
+                    if self
+                        .card_state(card)
+                        .is_none_or(|state| !state.existence.is_open()) =>
+                {
+                    Some(key)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for key in closed {
+            self.notices.resolve(key);
+        }
+    }
+
+    /// Whether `key` has a report standing, including one raised earlier in
+    /// this same update that the log has not drained yet.
+    fn notice_stands(&self, key: NoticeKey) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|notice| notice.key == Some(key))
+            || self.notices.has(key)
+    }
+
+    /// Withdraws whatever `key` reported, because its condition no longer
+    /// holds, including a report raised earlier in this same update that the
+    /// log has not drained yet.
+    fn resolve_notice(&mut self, key: NoticeKey) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|notice| notice.key == Some(key))
+        {
+            self.status = None;
+        }
+        self.notices.resolve(key);
+    }
+
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .durable
@@ -11461,16 +11749,22 @@ impl Cagents {
             .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
             .map(|card| card.id)
             .collect::<HashSet<_>>();
-        let mut failure = None;
+        let mut failures = Vec::new();
         for (id, runtime) in &mut self.cards {
             let visible = workspace_visible && visible_cards.contains(id);
             let result = match runtime {
-                CardRuntime::Terminal(surface) => if visible {
+                // A terminal whose daemon connection has ended for good
+                // already says so in its pane, and the next attachment
+                // applies visibility as it starts, so there is nothing for
+                // this pass to report; that matches a disconnected chat.
+                CardRuntime::Terminal(surface) => match if visible {
                     surface.reveal()
                 } else {
                     surface.hide()
-                }
-                .map_err(|error| error.to_string()),
+                } {
+                    Ok(()) | Err(crate::terminal::TerminalSendError::Closed) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                },
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
@@ -11487,15 +11781,50 @@ impl Cagents {
                 | CardRuntime::Automations
                 | CardRuntime::Work => Ok(()),
             };
-            if failure.is_none() {
-                failure = result.err();
+            if let Err(error) = result {
+                failures.push((*id, visible, error));
             }
         }
-        if let Some(error) = failure {
-            self.status = Some(TransientNotice::error(format!(
-                "could not update workspace visibility: {error}"
-            )));
+        self.report_surface_visibility(failures);
+    }
+
+    /// Reports the panes one visibility pass could not reach, each as
+    /// `(card, whether it was being shown, why)`. Visibility is reapplied on
+    /// every pass, so a pass that reaches every pane is what resolves an
+    /// earlier failure.
+    fn report_surface_visibility(&mut self, mut failures: Vec<(CardId, bool, String)>) {
+        if failures.is_empty() {
+            self.resolve_notice(NoticeKey::SurfaceVisibility);
+            return;
         }
+        // A pane left showing stale content is the failure the reader can
+        // see, so it is the one reported when both kinds happen together.
+        let showing = failures.iter().any(|(_, visible, _)| *visible);
+        failures.retain(|(_, visible, _)| *visible == showing);
+        // Named in saved card order, so which pane a notice leads with does
+        // not depend on how a hash map iterates; panes no longer saved come
+        // last, and ids break the tie.
+        failures.sort_by_cached_key(|(id, _, _)| (self.card_index(*id).unwrap_or(usize::MAX), *id));
+        let others = failures.len() - 1;
+        let (card, _, error) = failures.swap_remove(0);
+        let pane = self.notice_pane_name(card);
+        let subject = match (pane, others) {
+            (Some(pane), 0) => pane,
+            (None, 0) => "A pane".to_owned(),
+            (Some(pane), 1) => format!("{pane} and 1 other pane"),
+            (Some(pane), others) => format!("{pane} and {others} other panes"),
+            (None, others) => format!("{} panes", others + 1),
+        };
+        let message = match (showing, others) {
+            (true, 0) => format!("{subject} may not show its latest content."),
+            (true, _) => format!("{subject} may not show their latest content."),
+            (false, _) => format!("{subject} may keep updating while hidden."),
+        };
+        self.status = Some(
+            TransientNotice::warning(message)
+                .with_details(error)
+                .with_key(NoticeKey::SurfaceVisibility),
+        );
     }
 
     /// The focused card when it is a repository card showing an editable
@@ -13201,6 +13530,7 @@ impl Application for Cagents {
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
         let chat_drafts = durable.chat_drafts.clone();
+        let chat_draft_attachments = durable.chat_draft_attachments.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
         // the whole of its life, so the observer starts with the window rather
@@ -13313,9 +13643,9 @@ impl Application for Cagents {
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
-            chat_ui: chat_ui::State::with_drafts(chat_drafts),
+            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
             resume_ui: resume_ui::State::default(),
-            update_ui: update_ui::State::default(),
+            update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -13507,6 +13837,7 @@ impl Application for Cagents {
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
+            app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -13533,6 +13864,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
             Message::RepositoryLoaded { result: Ok(_), .. }
@@ -14264,15 +14596,20 @@ impl Application for Cagents {
                 self.update_editor_lsp(card, action)
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
-                let path = match self.cards.get(&card) {
+                let target = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
-                        runtime
-                            .selected_path()
-                            .map(|path| runtime.descriptor.worktree.join(path))
+                        runtime.selected_path().map(|path| {
+                            (
+                                runtime.descriptor.worktree.join(path),
+                                runtime.external_caret(),
+                            )
+                        })
                     }
                     _ => None,
                 };
-                path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
+                target.map_or_else(Task::none, |(path, caret)| {
+                    self.open_file_in_editor(path, caret, editor_id)
+                })
             }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
@@ -14892,7 +15229,11 @@ impl Application for Cagents {
                         if !self.source_control_is_bound(&key) {
                             return Task::none();
                         }
-                        self.open_file_in_editor(key.canonical_path.join(path.as_path()), editor_id)
+                        self.open_file_in_editor(
+                            key.canonical_path.join(path.as_path()),
+                            None,
+                            editor_id,
+                        )
                     }
                     SidebarAction::OpenChange { key, path, area } => {
                         // The card has two diff bases. A conflict has no staged
@@ -15030,6 +15371,11 @@ impl Application for Cagents {
                             Task::none()
                         }
                     },
+                    // Hiding removes the control that did it.
+                    SidebarAction::HideReadAttention => {
+                        iced::widget::operation::focus(sidebar::attention_filter_focus_id())
+                            .map(cosmic::Action::App)
+                    }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
@@ -16628,33 +16974,15 @@ impl Application for Cagents {
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
-                if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
-                {
-                    self.tab_history.finish(self.workspace.focused());
-                    // Losing the window is not a choice of workspace, and the
-                    // release that would have made one never arrives.
-                    self.cancel_workspace_preview();
-                }
-                let account_focus = match action {
-                    refresh_ui::Action::Focused(id, focused)
-                        if self.core.main_window_id() == Some(id) =>
-                    {
-                        Some((focused, focused && !self.refresh_ui.focused))
-                    }
-                    _ => None,
-                };
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
                 let refresh = self.update_refresh(action);
-                let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
-                    self.accounts_focus_changed(focused, regained)
-                });
                 let shared = if self.shared_views.blocked.is_empty() {
                     Task::none()
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                Task::batch([refresh, self.flush_document_tone(), shared])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -16743,13 +17071,23 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
+                // A daemon that went away or speaks another protocol may have
+                // been replaced by an install, which is when a stale window
+                // starts losing its terminals: look now, not at the next tick.
+                let inspection = if self.daemon_health_ui.health == health {
+                    Task::none()
+                } else {
+                    self.update_update_ui(update_ui::Action::InspectInstallation)
+                };
                 self.daemon_health_ui.health = health;
-                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                let confirmation = if !self.daemon_health_ui.health.unavailable()
+                    && self.daemon_health_ui.confirmation
                 {
                     self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([inspection, confirmation])
             }
             Message::AcknowledgeSessionRecovery => {
                 if let Some(health) = &mut self.save_health {
@@ -16770,6 +17108,13 @@ impl Application for Cagents {
                 let reconciled = self.reconcile_notice_popup();
                 Task::batch([reconciled, self.refocus_notices()])
             }
+            Message::ExpireNotices => {
+                // Nothing is due while the countdown is paused, which also
+                // makes a timer that fired as the notices opened a no-op.
+                self.notices.expire(Instant::now());
+                Task::none()
+            }
+            Message::NoticeControlRetired => self.notice_control_retired(),
             Message::DirectoryFilesLoaded {
                 key,
                 request,
@@ -16941,20 +17286,39 @@ impl Application for Cagents {
             self.sync_worktree_protections();
         }
         self.sync_popup_keyboard_nav();
-        if let Some(notice) = self.status.take()
-            && !crate::daemon_health::replaces_notice(&notice.message)
-        {
-            match notice.severity {
-                NoticeSeverity::Error => {
-                    tracing::error!(message = %notice.message, "application notice")
+        // The transport wording the health banner replaces may sit in either
+        // part of a notice: a reworded one keeps the raw reason as detail.
+        if let Some(notice) = self.status.take() {
+            if crate::daemon_health::replaces_notice(&notice.message)
+                || notice
+                    .details
+                    .as_deref()
+                    .is_some_and(crate::daemon_health::replaces_notice)
+            {
+                // The banner speaks for this outcome now, so an earlier report
+                // under the same key would only be giving an outdated reason.
+                if let Some(key) = notice.key {
+                    self.notices.resolve(key);
                 }
-                NoticeSeverity::Warning => {
-                    tracing::warn!(message = %notice.message, "application notice")
+            } else {
+                let details = notice.details.as_deref();
+                match notice.severity {
+                    NoticeSeverity::Error => {
+                        tracing::error!(message = %notice.message, details, "application notice")
+                    }
+                    NoticeSeverity::Warning => {
+                        tracing::warn!(message = %notice.message, details, "application notice")
+                    }
+                    NoticeSeverity::Success => {}
                 }
-                NoticeSeverity::Success => {}
+                self.notices.record(notice);
             }
-            self.notices.record(notice);
         }
+        self.resolve_notices_for_closed_cards();
+        self.sync_notice_countdown();
+        // Before `reconcile_notice_popup`, which owns the case of the notices
+        // being open when their last entry goes.
+        let task = Task::batch([task, self.retire_notice_control(notice_control)]);
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
@@ -16973,6 +17337,8 @@ impl Application for Cagents {
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
+        self.sidebar_state
+            .prune_retained_attention(&self.sidebar_model);
         if reconcile_row_selection {
             self.prune_sidebar_row_selection();
         }
@@ -17007,6 +17373,7 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        self.reconcile_chat_failure_presentations();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
@@ -17021,6 +17388,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.notification_subscription(),
+            self.notice_expiry_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             self.refresh_subscription(),
             self.review_request_subscription(),
@@ -17197,7 +17565,9 @@ impl Application for Cagents {
         if self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
-                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                self.device_ui
+                    .can_close()
+                    .then_some(Message::Device(device_ui::Action::Close)),
                 1.0,
             ));
         }
@@ -20571,6 +20941,172 @@ mod tests {
         }
     }
 
+    /// A key names one operation on one object: raising it again replaces
+    /// its report, a success replaces its failure, and resolving it withdraws
+    /// the report without touching anything else.
+    #[test]
+    fn keyed_notices_replace_and_resolve_their_own_report() {
+        let card = CardId::new();
+        let key = NoticeKey::ChatAttach(card);
+        let mut log = NoticeLog::default();
+        log.record(TransientNotice::warning("unrelated"));
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("Exact native chat not found")
+                .with_key(key),
+        );
+        let first = log.recent().next().unwrap().id;
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("daemon refused")
+                .with_key(key),
+        );
+        assert_eq!(log.len(), 2, "re-raising a key replaces its report");
+        let replaced = log.recent().next().unwrap();
+        assert_eq!(replaced.notice.details.as_deref(), Some("daemon refused"));
+        assert_ne!(replaced.id, first, "a Dismiss for the old report is stale");
+        // An identical report under the same key is a repeat, as unkeyed.
+        log.record(
+            TransientNotice::error("Could not reopen “Fix parser”.")
+                .with_details("daemon refused")
+                .with_key(key),
+        );
+        assert_eq!(log.recent().next().unwrap().repeats, 2);
+
+        // Another object's report under the same operation is its own.
+        let other = NoticeKey::ChatAttach(CardId::new());
+        log.record(TransientNotice::error("Could not reopen “Other”.").with_key(other));
+        assert_eq!(log.len(), 3);
+
+        log.record(TransientNotice::success("Reopened.").with_key(key));
+        assert_eq!(log.len(), 3, "the success takes the failure's place");
+        assert!(
+            log.recent()
+                .filter(|entry| entry.notice.key == Some(key))
+                .all(|entry| entry.notice.severity == NoticeSeverity::Success)
+        );
+
+        log.resolve(other);
+        log.resolve(key);
+        let remaining = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, ["unrelated"]);
+    }
+
+    /// Confirmations retire on their own; warnings and errors wait. With
+    /// nothing left to retire there is no deadline, so no timer runs.
+    #[test]
+    fn successes_expire_and_failures_remain() {
+        let now = Instant::now();
+        let mut log = NoticeLog::default();
+        assert_eq!(log.next_expiry(), None);
+        log.record_at(TransientNotice::error("Could not reopen"), now);
+        log.record_at(TransientNotice::warning("May be stale"), now);
+        assert_eq!(log.next_expiry(), None, "nothing here retires on a timer");
+        log.record_at(TransientNotice::success("Account added."), now);
+        let later = now + Duration::from_secs(2);
+        log.record_at(TransientNotice::success("Copied."), later);
+        assert_eq!(log.next_expiry(), Some(now + NOTICE_SUCCESS_LIFETIME));
+
+        log.expire(now + NOTICE_SUCCESS_LIFETIME - Duration::from_millis(1));
+        assert_eq!(log.len(), 4, "nothing retires early");
+        log.expire(now + NOTICE_SUCCESS_LIFETIME);
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.next_expiry(), Some(later + NOTICE_SUCCESS_LIFETIME));
+
+        // A repeat of a confirmation is a fresh one, and waits afresh.
+        log.record_at(
+            TransientNotice::success("Copied."),
+            later + Duration::from_secs(5),
+        );
+        log.expire(later + NOTICE_SUCCESS_LIFETIME);
+        assert_eq!(log.len(), 3);
+
+        log.expire(now + Duration::from_secs(3600));
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        assert_eq!(log.next_expiry(), None);
+    }
+
+    /// A burst of confirmations stays bounded without evicting a failure or a
+    /// warning that nothing has resolved.
+    #[test]
+    fn a_success_flood_preserves_unresolved_failures() {
+        let now = Instant::now();
+        let mut log = NoticeLog::default();
+        log.record_at(TransientNotice::error("Still disconnected"), now);
+        log.record_at(TransientNotice::warning("May be stale"), now);
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record_at(TransientNotice::success(format!("Copied {index}.")), now);
+            assert!(log.len() <= NOTICE_LOG_CAPACITY);
+        }
+        log.expire(now + NOTICE_SUCCESS_LIFETIME);
+        let remaining = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, ["May be stale", "Still disconnected"]);
+    }
+
+    /// Overflow never takes the notice that caused it: that is what the
+    /// reader is being told now, whatever is already waiting.
+    #[test]
+    fn the_newest_notice_survives_a_full_log_of_worse_ones() {
+        let mut log = NoticeLog::default();
+        for index in 0..NOTICE_LOG_CAPACITY {
+            log.record(TransientNotice::error(format!("error {index}")));
+        }
+        log.record(TransientNotice::warning("May be stale"));
+        assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[0], "May be stale");
+        assert!(!messages.contains(&"error 0"), "the oldest error made room");
+        assert!(messages.contains(&"error 1"));
+
+        log.record(TransientNotice::success("Copied."));
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages[0], "Copied.");
+        // Once no longer newest, the warning is the lowest severity left.
+        assert!(!messages.contains(&"May be stale"));
+        assert!(messages.contains(&"error 1"));
+    }
+
+    /// A paused countdown neither retires anything nor arms a timer, and
+    /// resumes where it stopped: a confirmation gets its whole lifetime of
+    /// unpaused time, including one raised during the pause.
+    #[test]
+    fn a_paused_countdown_resumes_where_it_stopped() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut log = NoticeLog::default();
+        log.record_at(TransientNotice::success("Account added."), start);
+        assert_eq!(log.next_expiry(), Some(at(6)));
+
+        log.pause(at(2));
+        log.pause(at(3));
+        assert_eq!(log.next_expiry(), None, "no timer runs while paused");
+        log.record_at(TransientNotice::success("Copied."), at(4));
+        log.expire(at(100));
+        assert_eq!(log.len(), 2, "nothing retires while paused");
+
+        // Paused from 2 s to 10 s: the first had 4 s left, the second all 6.
+        log.resume(at(10));
+        assert_eq!(log.next_expiry(), Some(at(14)));
+        log.expire(at(14));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.next_expiry(), Some(at(16)));
+        log.resume(at(20));
+        assert_eq!(log.next_expiry(), Some(at(16)), "resuming twice is a no-op");
+    }
+
     /// The log is what keeps a report from being overwritten by the next one,
     /// and capacity is the only thing bounding it: the shell raises notices
     /// from a per-poll path, so a repeating failure must not evict the history.
@@ -20605,13 +21141,23 @@ mod tests {
         log.dismiss(newest);
         assert_eq!(log.len(), 1);
 
-        // Distinct messages past capacity drop the oldest, never grow.
+        // Distinct messages past capacity drop the oldest of the lowest
+        // severity, never grow, and never push out the unresolved error.
         for index in 0..NOTICE_LOG_CAPACITY * 2 {
             log.record(TransientNotice::warning(format!("failure {index}")));
         }
         assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
-        // The surviving error was evicted, so the header must stop claiming one.
-        assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
+        let messages = log
+            .recent()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.contains(&"first failure"));
+        assert!(!messages.contains(&"failure 0"));
+        assert_eq!(
+            messages[0],
+            format!("failure {}", NOTICE_LOG_CAPACITY * 2 - 1)
+        );
 
         log.clear();
         assert!(log.is_empty());
@@ -20960,8 +21506,10 @@ mod tests {
         }
 
         fn assert_saving(app: &Cagents, card: CardId) {
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
-                if runtime.is_saving() && !runtime.can_abandon_unsaved_changes()));
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+                if runtime.is_saving() && !runtime.can_abandon_unsaved_changes())
+            );
             assert!(app.operation_recovery_pending());
         }
 
@@ -20997,18 +21545,21 @@ mod tests {
             let Message::Repository(RepositoryAction::RetainedSaveFinished {
                 result: Err(error @ crate::editor::retained_save::RetainedSaveError::Io(_)),
                 ..
-            }) = &completed else {
+            }) = &completed
+            else {
                 panic!("removing the target causes an actual pre-publication failure");
             };
             let error = error.to_string();
             assert!(!self.path.exists(), "failed Save must not publish A");
             assert!(!app.operation_recovery_pending());
             drop(app.update(completed));
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
                 if !runtime.is_saving() && runtime.is_dirty() && runtime.blocks_navigation()
                     && runtime.editor_text().as_deref() == Some("A\n")
                     && runtime.save_error().is_some_and(|message|
-                        message.contains(&error) && message.contains("replaced on disk"))));
+                        message.contains(&error) && message.contains("replaced on disk")))
+            );
             let mut target = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -21373,16 +21924,20 @@ mod tests {
         // in the middle of the row rather than at its end.
         std::fs::remove_file(&fixture.path).unwrap();
         let failed = task_app_message(task);
-        assert!(matches!(&failed, Message::Repository(
-            RepositoryAction::RetainedSaveFinished {
-                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)), ..
-            }
-        )));
+        assert!(matches!(
+            &failed,
+            Message::Repository(RepositoryAction::RetainedSaveFinished {
+                result: Err(crate::editor::retained_save::RetainedSaveError::Io(_)),
+                ..
+            })
+        ));
         assert!(!fixture.path.exists());
         assert!(!app.operation_recovery_pending());
         let _ = app.update(failed);
-        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
-            if runtime.is_dirty() && runtime.can_abandon_unsaved_changes()));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+            if runtime.is_dirty() && runtime.can_abandon_unsaved_changes())
+        );
         assert!(
             app.dirty_repository_close.is_some(),
             "a failed save leaves the dialog up"
@@ -21443,9 +21998,11 @@ mod tests {
         let fixture = CloseSaveFixture::install(&mut app, first);
         let warning = fixture.post_persist_warning(&mut app, first);
         drop(app.update(warning));
-        assert!(matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime))
+        assert!(
+            matches!(app.cards.get(&first), Some(CardRuntime::Repository(runtime))
             if runtime.is_dirty() && !runtime.is_saving() && runtime.blocks_navigation()
-                && runtime.save_error().is_some_and(|warning| warning.contains("replaced on disk"))));
+                && runtime.save_error().is_some_and(|warning| warning.contains("replaced on disk")))
+        );
         app.cards.insert(
             second,
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
@@ -22527,6 +23084,102 @@ mod tests {
         (app, id, directory)
     }
 
+    /// A terminal whose daemon connection has ended for good - its client
+    /// gives up once a killed daemon stays gone - says so in its own pane,
+    /// and the attachment that replaces it applies visibility as it starts,
+    /// so telling it whether it is on screen cannot fail in a way worth a
+    /// notice.
+    #[test]
+    fn a_terminal_whose_connection_ended_raises_no_visibility_notice() {
+        let (mut app, card, _directory) = live_agent_app("sh");
+        let Some(CardRuntime::Terminal(surface)) = app.cards.get(&card) else {
+            unreachable!();
+        };
+        surface.stop_for_test();
+        assert!(matches!(
+            surface.hide(),
+            Err(crate::terminal::TerminalSendError::Closed)
+        ));
+        app.set_workspace_surfaces_visible(false);
+        app.set_workspace_surfaces_visible(true);
+        assert!(
+            app.status.is_none(),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+    }
+
+    /// A visibility failure names the same pane however the runtimes happen
+    /// to be stored, says how many others failed with it, and reports the
+    /// panes left showing stale content ahead of those left updating.
+    #[test]
+    fn a_visibility_notice_names_panes_in_card_order() {
+        let mut app = context_inspector_test_app(false);
+        let cards = ["Build", "Logs", "Shell"].map(|title| {
+            let mut card = terminal_card_state();
+            card.title = title.into();
+            card
+        });
+        let [a, b, c] = cards.each_ref().map(|card| card.id);
+        app.durable = Arc::new(WorkspaceState {
+            cards: cards.into(),
+            ..WorkspaceState::default()
+        });
+        let name = |app: &Cagents, card| app.notice_pane_name(card).unwrap();
+        let reported = |app: &Cagents| {
+            let notice = app.status.as_ref().expect("a visibility notice");
+            assert_eq!(notice.key, Some(NoticeKey::SurfaceVisibility));
+            (notice.message.clone(), notice.details.clone().unwrap())
+        };
+
+        for failures in [
+            vec![(c, true, "c"), (a, false, "a"), (b, true, "b")],
+            vec![(b, true, "b"), (c, true, "c"), (a, false, "a")],
+        ] {
+            app.report_surface_visibility(
+                failures
+                    .into_iter()
+                    .map(|(card, visible, error)| (card, visible, error.to_owned()))
+                    .collect(),
+            );
+            assert_eq!(
+                reported(&app),
+                (
+                    format!(
+                        "{} and 1 other pane may not show their latest content.",
+                        name(&app, b)
+                    ),
+                    "b".to_owned()
+                )
+            );
+        }
+
+        app.report_surface_visibility(vec![
+            (c, true, "c".into()),
+            (b, true, "b".into()),
+            (a, true, "a".into()),
+        ]);
+        assert_eq!(
+            reported(&app).0,
+            format!(
+                "{} and 2 other panes may not show their latest content.",
+                name(&app, a)
+            )
+        );
+        app.report_surface_visibility(vec![(c, true, "c".into())]);
+        assert_eq!(
+            reported(&app).0,
+            format!("{} may not show its latest content.", name(&app, c))
+        );
+        app.report_surface_visibility(vec![(a, false, "a".into())]);
+        assert_eq!(
+            reported(&app).0,
+            format!("{} may keep updating while hidden.", name(&app, a))
+        );
+        app.report_surface_visibility(Vec::new());
+        assert!(app.status.is_none(), "a clean pass withdraws the notice");
+    }
+
     #[test]
     fn terminal_review_revision_acknowledges_same_card_cancellation_and_focus_switch() {
         let (mut app, card, _directory) = live_agent_app("owned-review-fixture");
@@ -22803,10 +23456,11 @@ mod tests {
             "the terminal surface is still what the card draws"
         );
         assert!(
-            app.notices
-                .entries
-                .iter()
-                .any(|entry| entry.notice.message.contains("refused the handoff")),
+            app.notices.entries.iter().any(|entry| entry
+                .notice
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("refused the handoff"))),
             "the refusal is recorded as a notice, not a process abort: {:?}",
             app.notices.entries
         );
@@ -26383,6 +27037,28 @@ mod tests {
         assert!(!app.focus_save_pending);
     }
 
+    /// Seen means seen by the user. The focused pane of a window in the
+    /// background has not been seen, so its news must still mark it unread.
+    #[test]
+    fn an_update_for_the_focused_pane_of_a_background_window_marks_it_unread() {
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+
+        app.refresh_ui.focused = true;
+        assert!(
+            app.pane_is_active(card),
+            "the fixture differs from a seen pane only in window focus"
+        );
+        app.observe_agent_update_for_card(card);
+        assert!(!app.sidebar_state.has_card_update(card));
+
+        app.refresh_ui.focused = false;
+        app.observe_agent_update_for_card(card);
+        assert!(app.sidebar_state.has_card_update(card));
+    }
+
     #[test]
     fn unread_agent_updates_snapshot_only_saved_open_cards_and_persist_reads() {
         let mut app = context_inspector_test_app(true);
@@ -26427,7 +27103,8 @@ mod tests {
         assert!(!restored.has_card_update(closed_id));
         assert!(!restored.has_card_update(missing));
 
-        app.sidebar_state.acknowledge_agent_update(open);
+        app.sidebar_state
+            .acknowledge_agent_update(open, &sidebar::AttentionPlacement::default());
         let read = app.persistent_workspace();
         assert!(read.agent_updates.is_empty());
         assert!(app.durable.agent_updates.is_empty());
@@ -26474,6 +27151,263 @@ mod tests {
         let saved = app.persistent_workspace();
         crate::persistence::validate_workspace(&saved).unwrap();
         assert_eq!(saved.focused, None);
+    }
+
+    /// The app under the Attention filter with `card` held by one channel.
+    fn attention_channel_test_app() -> (Cagents, CardId, crate::model::ChannelId) {
+        use crate::model::{ChannelId, ProjectChannel};
+        use crate::sidebar::{SidebarFilter, SidebarProject};
+
+        let mut app = context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: project,
+                title: "channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::Attention,
+        ))));
+        (app, card, channel)
+    }
+
+    fn attention_lists_channel(app: &Cagents, channel: crate::model::ChannelId) -> bool {
+        attention_lists(app, sidebar::SelectionRow::Channel(channel))
+    }
+
+    fn attention_lists(app: &Cagents, row: sidebar::SelectionRow) -> bool {
+        sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+            .contains(&row)
+    }
+
+    /// Gives the project holding `channel` a worktree.
+    fn add_attention_worktree(
+        app: &mut Cagents,
+        channel: crate::model::ChannelId,
+    ) -> sidebar::SelectionRow {
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .project_id;
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_model
+            .projects
+            .iter_mut()
+            .find(|entry| entry.id == project)
+            .unwrap()
+            .worktrees
+            .push(sidebar::SidebarWorktree::from_durable(
+                worktree,
+                "/repo/feature".into(),
+                Some("feature".into()),
+            ));
+        sidebar::SelectionRow::Worktree(project, worktree)
+    }
+
+    /// Rows kept under Attention go with their channel or worktree on the
+    /// next ordinary update, so one created again is not drawn as read.
+    #[test]
+    fn attention_forgets_kept_rows_once_their_surface_is_gone() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let worktree_row = add_attention_worktree(&mut app, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        let channel_row = sidebar::SelectionRow::Channel(channel);
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, channel_row) && attention_lists(&app, worktree_row));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists(&app, channel_row) && attention_lists(&app, worktree_row),
+            "both rows are kept"
+        );
+
+        let saved_channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .clone();
+        let saved_worktree = {
+            let entry = app
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|entry| entry.id == project)
+                .unwrap();
+            let index = entry
+                .worktrees
+                .iter()
+                .position(|known| known.id == worktree)
+                .unwrap();
+            entry.worktrees.remove(index)
+        };
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .retain(|entry| entry.id != channel);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+
+        Arc::make_mut(&mut app.durable).channels.push(saved_channel);
+        app.sidebar_model
+            .projects
+            .iter_mut()
+            .find(|entry| entry.id == project)
+            .unwrap()
+            .worktrees
+            .push(saved_worktree);
+        drop(app.update(Message::Sidebar(
+            SidebarAction::SearchChanged(String::new()),
+        )));
+        assert!(
+            !attention_lists(&app, channel_row),
+            "a channel created again is not drawn as read"
+        );
+        assert!(
+            !attention_lists(&app, worktree_row),
+            "a worktree created again is not drawn as read"
+        );
+    }
+
+    /// Closing a pane whose update is unread is not reading it, so its row
+    /// leaves the Attention list instead of staying as read.
+    #[test]
+    fn attention_does_not_keep_the_row_of_a_closed_unread_pane() {
+        let (mut app, card, channel) = attention_channel_test_app();
+        let worktree_row = add_attention_worktree(&mut app, channel);
+        let sidebar::SelectionRow::Worktree(project, worktree) = worktree_row else {
+            unreachable!()
+        };
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists(&app, worktree_row));
+        app.workspace.request_close(card).unwrap();
+        drop(app.update(Message::CommitClose(card)));
+        assert!(
+            app.card_state(card)
+                .is_none_or(|state| !state.existence.is_open()),
+            "the pane closed"
+        );
+        assert!(!attention_lists(&app, worktree_row));
+    }
+
+    fn agent_activity(state: crate::agent::ActivityState) -> Option<crate::agent::Activity> {
+        Some(crate::agent::Activity {
+            provider: crate::agent::Provider::Claude,
+            state,
+        })
+    }
+
+    /// Dealing with a row in the Attention list, by reading it or by
+    /// answering its waiting agent, leaves the row where the pointer left it
+    /// until the user hides read rows or chooses another filter.
+    #[test]
+    fn attention_keeps_channels_the_user_dealt_with_until_hidden() {
+        use crate::agent::ActivityState;
+        use crate::sidebar::SidebarFilter;
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        let hide = || Message::Sidebar(SidebarAction::HideReadAttention);
+        app.observe_agent_update_for_card(card);
+        app.refresh_sidebar_channels();
+        assert!(attention_lists_channel(&app, channel));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(
+            attention_lists_channel(&app, channel),
+            "a channel read under Attention stays listed"
+        );
+        app.context_inspector_open = false;
+        let task = app.update(hide());
+        assert!(
+            !attention_lists_channel(&app, channel),
+            "hiding read rows drops it"
+        );
+        assert_eq!(app.sidebar_state.filter(), SidebarFilter::Attention);
+        assert_eq!(
+            focused(&app, task),
+            Some(sidebar::attention_filter_focus_id()),
+            "focus leaves the control hiding removed for the filter it served"
+        );
+
+        // A wait the user already read elsewhere lists the channel on its own.
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::All,
+        ))));
+        app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Waiting));
+        app.read_card_update(card);
+        drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+            SidebarFilter::Attention,
+        ))));
+        assert!(attention_lists_channel(&app, channel));
+        app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Working));
+        app.refresh_sidebar_channels();
+        assert!(
+            attention_lists_channel(&app, channel),
+            "answering a waiting agent keeps its channel"
+        );
+        drop(app.update(hide()));
+        assert!(!attention_lists_channel(&app, channel));
+    }
+
+    /// A waiting agent that disconnects, or whose chat goes away, was not
+    /// answered: its row leaves the Attention list with the wait.
+    #[test]
+    fn attention_drops_a_waiting_chat_that_disconnects_or_closes() {
+        use crate::agent::ActivityState;
+
+        let (mut app, card, channel) = attention_channel_test_app();
+        // The user is looking at the pane, so its wait is not also unread
+        // news: only the wait lists the channel.
+        app.refresh_ui.focused = true;
+        let ends: [fn(&mut Cagents, CardId); 3] = [
+            |app, card| app.shared_chat_detach(card),
+            |app, card| app.chat_forget(card),
+            |app, card| {
+                app.sidebar_state.forget_card_attention(card);
+                app.chat_forget(card);
+            },
+        ];
+        for (index, end) in ends.into_iter().enumerate() {
+            app.observe_agent_activity_for_card(card, agent_activity(ActivityState::Waiting));
+            app.refresh_sidebar_channels();
+            assert!(!app.sidebar_state.has_card_update(card), "path {index}");
+            assert!(attention_lists_channel(&app, channel), "path {index}");
+            end(&mut app, card);
+            app.refresh_sidebar_channels();
+            // A kept row would stay listed after its wait ended.
+            assert!(
+                !attention_lists_channel(&app, channel),
+                "path {index} was not an answer"
+            );
+        }
     }
 
     #[test]
@@ -28797,6 +29731,48 @@ mod tests {
         let _ = app.open_pending_pull_requests(project);
 
         assert_eq!(reviewed_number(&app, card), Some(7));
+    }
+
+    /// What a review pane shows can change without the durable workspace
+    /// changing, as when a restored card opens the pull request it already
+    /// names. The alert focus the daemon sees must follow the pane anyway.
+    #[test]
+    fn a_review_opened_without_a_durable_change_republishes_its_alert_focus() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.refresh_ui.focused = true;
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        app.complete_review_read_for_test(&[7]);
+        app.sync_notification_presence();
+        let before = app
+            .notification_ui
+            .take_pending_presence_for_test()
+            .expect("the focused pane's presence");
+        assert_eq!(before.focused_target, None, "no review is open yet");
+
+        let durable = Arc::as_ptr(&app.durable);
+        let target = app
+            .pull_request_target(project, 7)
+            .expect("a listed target");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("a pull request pane");
+        };
+        drop(
+            pane.review
+                .update(crate::pull_request_review::Action::Open(target)),
+        );
+        assert_eq!(reviewed_number(&app, card), Some(7));
+        app.sync_notification_presence();
+        assert_eq!(Arc::as_ptr(&app.durable), durable);
+        let presence = app
+            .notification_ui
+            .take_pending_presence_for_test()
+            .expect("opening a review changes what the window focuses");
+        assert!(matches!(
+            presence.focused_target,
+            Some(crate::notifications::Target::PullRequest(request))
+                if request.number == 7 && request.request == "request-7"
+        ));
     }
 
     #[test]
