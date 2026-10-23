@@ -1575,6 +1575,11 @@ fn execute(
     let mut previous = std::mem::take(&mut canonical.blocks);
     #[cfg(test)]
     let mut syntax_work = (0, 0);
+    // Settled fences drop their individual parser immediately. Keep one lazy
+    // job owner across the whole pass so adjacent fences share grammar/regex
+    // storage, without retaining it in finished presentation or loading it for
+    // a message with no new highlighted fences.
+    let mut syntax_job = None;
     for_each_fence(
         canonical.parsed.markdown.items().iter().chain(
             coordinated
@@ -1595,15 +1600,16 @@ fn execute(
                         syntax_work.0 += 1;
                         syntax_work.1 += code.len();
                     }
-                    prose::CodeBlock::new(
-                        language.and_then(prose::fence_language),
-                        code,
-                        request.theme,
-                    )
+                    let language = language.and_then(prose::fence_language);
+                    if language.is_some() {
+                        syntax_job.get_or_insert_with(crate::diff_view::syntax_lease);
+                    }
+                    prose::CodeBlock::new(language, code, request.theme)
                 })
             });
         },
     );
+    drop(syntax_job);
     if shared.cancelled.load(Ordering::Relaxed) {
         return Err("Message loading was cancelled.".into());
     }

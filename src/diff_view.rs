@@ -264,8 +264,41 @@ pub(crate) fn syntax_spans<'a>(
 
 use two_face::re_exports::syntect::{highlighting, parsing};
 
+/// Parsers and a preparation job share grammar/regex storage. The rendezvous
+/// keeps no strong owner after the last job or streaming parser has finished.
+#[derive(Default)]
+struct SyntaxCache {
+    current: std::sync::Mutex<std::sync::Weak<parsing::SyntaxSet>>,
+    #[cfg(test)]
+    loads: std::sync::atomic::AtomicUsize,
+}
+impl SyntaxCache {
+    fn acquire(&self) -> SyntaxLease {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(syntaxes) = current.upgrade() {
+            return SyntaxLease(syntaxes);
+        }
+        let syntaxes = Arc::new(two_face::syntax::extra_no_newlines());
+        #[cfg(test)]
+        self.loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *current = Arc::downgrade(&syntaxes);
+        SyntaxLease(syntaxes)
+    }
+}
+
+pub(crate) struct SyntaxLease(Arc<parsing::SyntaxSet>);
+
+pub(crate) fn syntax_lease() -> SyntaxLease {
+    static CACHE: LazyLock<SyntaxCache> = LazyLock::new(SyntaxCache::default);
+    CACHE.acquire()
+}
+
 struct HighlightParser {
-    syntaxes: &'static parsing::SyntaxSet,
+    syntaxes: SyntaxLease,
     parser: parsing::ParseState,
     stack: parsing::ScopeStack,
     highlighters: [highlighting::Highlighter<'static>; 2],
@@ -274,16 +307,24 @@ struct HighlightParser {
 
 impl HighlightParser {
     fn new(token: &str, theme: crate::settings::EditorSyntaxTheme) -> Self {
-        static SYNTAXES: LazyLock<parsing::SyntaxSet> =
-            LazyLock::new(two_face::syntax::extra_no_newlines);
+        Self::with_syntaxes(token, theme, syntax_lease())
+    }
+
+    fn with_syntaxes(
+        token: &str,
+        theme: crate::settings::EditorSyntaxTheme,
+        syntaxes: SyntaxLease,
+    ) -> Self {
         static THEMES: LazyLock<highlighting::ThemeSet> =
             LazyLock::new(highlighting::ThemeSet::load_defaults);
-        let syntax = SYNTAXES
+        let syntax = syntaxes
+            .0
             .find_syntax_by_token(token)
-            .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
+            .unwrap_or_else(|| syntaxes.0.find_syntax_plain_text());
+        let parser = parsing::ParseState::new(syntax);
         Self {
-            syntaxes: &SYNTAXES,
-            parser: parsing::ParseState::new(syntax),
+            syntaxes,
+            parser,
             stack: parsing::ScopeStack::new(),
             highlighters: [false, true].map(|dark| {
                 highlighting::Highlighter::new(&THEMES.themes[syntect_theme_name(theme, dark)])
@@ -304,7 +345,7 @@ impl HighlightParser {
             .unwrap_or(line);
         let ops = self
             .parser
-            .parse_line(line, self.syntaxes)
+            .parse_line(line, &self.syntaxes.0)
             .unwrap_or_default();
         check_cancelled(cancellation)?;
         let mut spans: [Vec<SyntaxSpan>; 2] = Default::default();
@@ -1513,6 +1554,119 @@ mod tests {
     /// The default syntax theme, spelled once for the call sites that only
     /// need *a* theme rather than a particular one.
     const AUTO: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+
+    #[test]
+    fn syntax_job_shares_892_real_parsers_and_releases_grammar_after_last_owner() {
+        let cache = SyntaxCache::default();
+        let job = cache.acquire();
+        let grammar = Arc::downgrade(&job.0);
+        let source = "let answer = values.iter().map(|value| value + 1);\n";
+        let mut expected = None;
+        for _ in 0..892 {
+            let lease = cache.acquire();
+            assert!(Arc::ptr_eq(&job.0, &lease.0));
+            let mut parser = HighlightParser::with_syntaxes("rust", AUTO, lease);
+            let spans = parser.line(source, &CancellationToken::new()).unwrap();
+            assert!(!spans[0].is_empty());
+            if let Some(expected) = &expected {
+                assert_eq!(&spans, expected);
+            } else {
+                expected = Some(spans);
+            }
+        }
+        assert_eq!(cache.loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let mut streaming = HighlightParser::with_syntaxes("rust", AUTO, cache.acquire());
+        streaming
+            .line("/* open\n", &CancellationToken::new())
+            .unwrap();
+        drop(job);
+        assert!(
+            grammar.upgrade().is_some(),
+            "live streaming parser owns its grammar"
+        );
+        streaming
+            .line("still comment */ let x = 1;\n", &CancellationToken::new())
+            .unwrap();
+        drop(streaming);
+        assert!(
+            grammar.upgrade().is_none(),
+            "no process strong owner remains"
+        );
+        let next_job = cache.acquire();
+        assert_eq!(cache.loads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(next_job.0.find_syntax_by_token("rust").is_some());
+    }
+
+    #[test]
+    fn concurrent_syntax_leases_share_one_actual_grammar_until_all_parsers_finish() {
+        let cache = Arc::new(SyntaxCache::default());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    let mut parser = HighlightParser::with_syntaxes("rust", AUTO, cache.acquire());
+                    let spans = parser
+                        .line("fn main() {}\n", &CancellationToken::new())
+                        .unwrap();
+                    assert!(!spans[0].is_empty());
+                    sender.send(parser).unwrap();
+                })
+            })
+            .collect();
+        drop(sender);
+        let mut parsers = Vec::new();
+        for _ in 0..4 {
+            parsers.push(
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap(),
+            );
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let grammar = Arc::downgrade(&parsers[0].syntaxes.0);
+        assert!(
+            parsers
+                .iter()
+                .all(|parser| Arc::ptr_eq(&parsers[0].syntaxes.0, &parser.syntaxes.0))
+        );
+        assert_eq!(cache.loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        while parsers.len() > 1 {
+            parsers.pop();
+        }
+        assert!(grammar.upgrade().is_some());
+        parsers.clear();
+        assert!(grammar.upgrade().is_none());
+    }
+
+    #[test]
+    fn cancelled_and_unwound_syntax_jobs_release_their_actual_grammar() {
+        let cache = SyntaxCache::default();
+        let job = cache.acquire();
+        let grammar = Arc::downgrade(&job.0);
+        let mut parser = HighlightParser::with_syntaxes("rust", AUTO, cache.acquire());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(parser.line("fn cancelled() {}\n", &cancellation).is_err());
+        drop(parser);
+        drop(job);
+        assert!(grammar.upgrade().is_none());
+
+        let job = cache.acquire();
+        let grammar = Arc::downgrade(&job.0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parser = HighlightParser::with_syntaxes("rust", AUTO, job);
+            parser
+                .line("fn actual() {}\n", &CancellationToken::new())
+                .unwrap();
+            panic!("fixture job unwind after actual grammar work");
+        }));
+        assert!(result.is_err());
+        assert!(grammar.upgrade().is_none());
+    }
 
     /// The diff surface and the editable buffer must agree for *every* theme
     /// the setting offers, not only the default: they are two independent
