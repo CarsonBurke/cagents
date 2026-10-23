@@ -2792,6 +2792,18 @@ struct CommitDraft {
     revision: u64,
 }
 
+/// The exact ordered roots the projection owns, borrowed on a cache hit.
+fn attention_roots(project: &SidebarProject) -> impl Iterator<Item = (WorktreeId, &Path)> {
+    project
+        .worktrees
+        .iter()
+        .map(|row| (row.id, row.path.as_path()))
+        .chain((project.kind == ProjectKind::Folder).then_some((
+            WorktreeId::from_uuid(project.id.as_uuid()),
+            project.repository.as_path(),
+        )))
+}
+
 #[derive(Debug, Clone)]
 struct AttentionProjection {
     dirty: bool,
@@ -3410,34 +3422,38 @@ impl SidebarState {
         durable: &Arc<crate::model::WorkspaceState>,
         projects: &[SidebarProject],
     ) {
-        let inventory: Vec<_> = projects
-            .iter()
-            .map(|project| {
-                (
-                    project.id,
-                    project
-                        .worktrees
-                        .iter()
-                        .map(|row| (row.id, row.path.clone()))
-                        .chain(
-                            project
-                                .folder_key()
-                                .map(|key| (key.worktree_id, key.canonical_path)),
-                        )
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
         if self.attention_projection.as_ref().is_some_and(|cache| {
             !cache.dirty
                 && cache
                     .source
                     .upgrade()
                     .is_some_and(|old| Arc::ptr_eq(&old, durable))
-                && cache.inventory == inventory
+                && cache.inventory.len() == projects.len()
+                && cache
+                    .inventory
+                    .iter()
+                    .zip(projects)
+                    .all(|((id, roots), project)| {
+                        *id == project.id
+                            && roots
+                                .iter()
+                                .map(|(id, path)| (*id, path.as_path()))
+                                .eq(attention_roots(project))
+                    })
         }) {
             return;
         }
+        let inventory: Vec<_> = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.id,
+                    attention_roots(project)
+                        .map(|(id, path)| (id, path.to_path_buf()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         #[cfg(test)]
         {
             self.attention_projection_rebuilds += 1;
@@ -12373,6 +12389,114 @@ pub(crate) mod tests {
         state.refresh_attention_projection(&durable, &projects);
         assert_eq!(state.project_attention(other.id).unread, 0);
         assert_eq!(state.project_attention(project.id).unread, 0);
+    }
+
+    #[test]
+    fn attention_cache_refiles_unchanged_workspace_when_root_inventory_changes() {
+        let mut projects = vec![project()];
+        let project = projects[0].id;
+        let original = projects[0].worktrees[1].clone();
+        let card = compact_attention_terminal(CardId::new());
+        let durable = Arc::new(crate::model::WorkspaceState {
+            card_scopes: std::collections::HashMap::from([(card.id, original.path.clone())]),
+            cards: vec![card.clone()],
+            ..Default::default()
+        });
+        let mut state = SidebarState::default();
+        state.observe_card_update(card.id);
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.worktree_attention(project, original.id).unread, 1);
+        let rebuilt = state.attention_projection_rebuilds;
+        projects[0].name = "Display metadata changed".into();
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.attention_projection_rebuilds, rebuilt);
+
+        projects[0].worktrees[1].path = "/different-root".into();
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        projects[0].worktrees[1].path = original.path.clone();
+        let replacement = WorktreeId::new();
+        projects[0].worktrees[1].id = replacement;
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.worktree_attention(project, original.id).unread, 0);
+        assert_eq!(state.worktree_attention(project, replacement).unread, 1);
+
+        let rebuilt = state.attention_projection_rebuilds;
+        projects[0].worktrees.swap(0, 1);
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.attention_projection_rebuilds, rebuilt + 1);
+        assert_eq!(state.worktree_attention(project, replacement).unread, 1);
+        let removed = projects[0].worktrees.remove(0);
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        projects[0].worktrees.insert(0, removed);
+        let renamed_project = project_id(98);
+        projects[0].id = renamed_project;
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        assert_eq!(
+            state
+                .worktree_attention(renamed_project, replacement)
+                .unread,
+            1
+        );
+
+        let mut unrelated = projects[0].clone();
+        unrelated.id = project_id(99);
+        unrelated.worktrees.clear();
+        projects.push(unrelated);
+        state.refresh_attention_projection(&durable, &projects);
+        let rebuilt = state.attention_projection_rebuilds;
+        projects.swap(0, 1);
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.attention_projection_rebuilds, rebuilt + 1);
+        assert_eq!(state.project_attention(renamed_project).unread, 1);
+        projects.pop();
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(renamed_project).unread, 0);
+    }
+
+    #[test]
+    fn attention_cache_tracks_folder_binding_without_a_new_workspace() {
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let project = folder.id;
+        let root = folder.repository.clone();
+        let card = compact_attention_terminal(CardId::new());
+        let durable = Arc::new(crate::model::WorkspaceState {
+            card_scopes: std::collections::HashMap::from([(card.id, root.clone())]),
+            cards: vec![card.clone()],
+            ..Default::default()
+        });
+        let mut projects = vec![folder];
+        let mut state = SidebarState::default();
+        state.observe_card_update(card.id);
+        state.refresh_attention_projection(&durable, &projects);
+        let folder_worktree = WorktreeId::from_uuid(project.as_uuid());
+        assert_eq!(state.worktree_attention(project, folder_worktree).unread, 1);
+
+        projects[0].repository = "/different-folder".into();
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        projects[0].repository = root;
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.worktree_attention(project, folder_worktree).unread, 1);
+        projects[0].kind = ProjectKind::Git;
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        projects[0].kind = ProjectKind::Folder;
+        projects[0].id = project_id(99);
+        state.refresh_attention_projection(&durable, &projects);
+        assert_eq!(state.project_attention(project).unread, 0);
+        assert_eq!(
+            state
+                .worktree_attention(
+                    project_id(99),
+                    WorktreeId::from_uuid(project_id(99).as_uuid())
+                )
+                .unread,
+            1
+        );
     }
 
     fn relocated_attention_model(
