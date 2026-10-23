@@ -26291,10 +26291,13 @@ mod tests {
             *ticket = uuid::Uuid::new_v4();
             drop(app.update(Message::Repository(stale)));
             let mut foreign = result.clone();
-            let RepositoryAction::FindLoaded { card, .. } = &mut foreign else {
+            let RepositoryAction::FindLoaded {
+                card: foreign_card, ..
+            } = &mut foreign
+            else {
                 unreachable!()
             };
-            *card = CardId::new();
+            *foreign_card = CardId::new();
             drop(app.update(Message::Repository(foreign)));
             assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
             assert_eq!(app.lsp_contexts[&card].context.completions, shown);
