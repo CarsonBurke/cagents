@@ -102,6 +102,20 @@ fn git(root: &Path, arguments: &[&str]) {
         .unwrap();
 }
 
+/// A batch of no-op tasks can still own an empty stream. Prove there is no
+/// work before polling, then require synchronous exhaustion with no action.
+fn assert_no_app_work(task: Task<Message>) {
+    use cosmic::iced::futures::{FutureExt, StreamExt};
+
+    assert_eq!(task.units(), 0, "bookkeeping must schedule no App work");
+    if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+        assert!(
+            matches!(stream.next().now_or_never(), Some(None)),
+            "bookkeeping must finish immediately without any App action"
+        );
+    }
+}
+
 #[test]
 fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo() {
     const NAME: &str = "app::discard_ui::actual_tests::discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo";
@@ -206,10 +220,7 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
                     assert_eq!(*source, original, "phase {phase}: {message:?}");
                     assert_eq!(observed, key, "phase {phase}: {message:?}");
                     let task = app.update(message);
-                    assert!(
-                        iced::runtime::task::into_stream(task).is_none(),
-                        "editor selection bookkeeping must not discard asynchronous App work"
-                    );
+                    assert_no_app_work(task);
                     assert_eq!(app.sidebar_state.commit_message(), commit_message);
                     assert!(!app.modal_is_open());
                     assert_eq!(app.discard_ui.source().unwrap().id, original);
@@ -246,10 +257,7 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
                         "phase {phase}: callback must name the currently mounted epoch: {message:?}"
                     );
                     let task = app.update(message);
-                    assert!(
-                        iced::runtime::task::into_stream(task).is_none(),
-                        "viewport bookkeeping must not discard asynchronous App work"
-                    );
+                    assert_no_app_work(task);
                     assert!(!app.modal_is_open());
                     assert_eq!(app.discard_ui.source().unwrap().id, original);
                     continue;
