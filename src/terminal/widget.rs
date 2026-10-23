@@ -5414,6 +5414,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_artifact_shorthand_is_not_a_concrete_file_link() {
+        let directory = tempfile::tempdir().unwrap();
+        for matches in [0, 1, 2] {
+            if matches > 0 {
+                std::fs::write(
+                    directory.path().join(format!("tree-real-{matches}.png")),
+                    "fixture",
+                )
+                .unwrap();
+            }
+            for text in [
+                "tree-real-*.png",
+                ".worktrees/review/docs/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png",
+                "docs/tree-?.png",
+                "docs/tree-[12].png",
+            ] {
+                let snapshot = RenderSnapshot {
+                    lines: vec![row(text)].into(),
+                    ..RenderSnapshot::empty()
+                };
+                assert!(
+                    terminal_link_at(&snapshot, 0, 5, directory.path()).is_none(),
+                    "{text}, {matches} matches"
+                );
+            }
+        }
+        for text in [
+            "\"tree-real-*.png\"",
+            "`tree-real-*.png`",
+            "'tree-real-*.png'",
+        ] {
+            let snapshot = RenderSnapshot {
+                lines: vec![row(text)].into(),
+                ..RenderSnapshot::empty()
+            };
+            assert_eq!(
+                terminal_link_at(&snapshot, 0, 5, directory.path()),
+                Some(url::Url::from_file_path(directory.path().join("tree-real-*.png")).unwrap()),
+                "quoted literal {text}"
+            );
+        }
+        let snapshot = RenderSnapshot {
+            lines: vec![row("file:///concrete/tree-real-*.png")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            terminal_link_at(&snapshot, 0, 5, directory.path())
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            std::path::PathBuf::from("/concrete/tree-real-*.png")
+        );
+    }
+
+    #[test]
     fn terminal_link_spans_exclude_prose_and_follow_soft_wraps() {
         let mut first = (*row("(https://example.")).clone();
         first.wrapped = true;
@@ -5460,6 +5515,46 @@ mod tests {
                 .as_str(),
             "https://example.org/"
         );
+    }
+
+    #[test]
+    fn terminal_file_hyperlinks_open_only_paths_on_the_terminals_machine() {
+        let hyperlink = |uri: &str| {
+            let mut line = (*row("label")).clone();
+            line.hyperlinks
+                .push(crate::terminal::snapshot::HyperlinkSpan {
+                    start: 0,
+                    end: 5,
+                    uri: uri.into(),
+                });
+            let snapshot = RenderSnapshot {
+                lines: vec![Arc::new(line)].into(),
+                ..RenderSnapshot::empty()
+            };
+            links::at(&snapshot, 0, 2, std::path::Path::new("/repo")).map(|link| link.url)
+        };
+        for uri in [
+            "file:///tmp/a%20b/%E7%95%8C.md",
+            "file://localhost/tmp/a%20b/%E7%95%8C.md",
+            "file://LOCALHOST/tmp/a%20b/%E7%95%8C.md",
+        ] {
+            let url = hyperlink(uri).unwrap_or_else(|| panic!("{uri} opens"));
+            assert_eq!(url.as_str(), "file:///tmp/a%20b/%E7%95%8C.md");
+            assert_eq!(
+                crate::document_link::resolve(std::path::Path::new("/"), url.as_str()),
+                Ok(crate::document_link::DocumentLink::Local {
+                    path: "/tmp/a b/界.md".into(),
+                    fragment: None,
+                })
+            );
+        }
+        // The terminal host respells links naming its own machine before
+        // they get here. This window may run elsewhere, so a host name that
+        // happens to be its own still names another machine's file.
+        for host in std::iter::once("elsewhere".to_owned()).chain(crate::file_url::test_host_name())
+        {
+            assert_eq!(hyperlink(&format!("file://{host}/tmp/a")), None, "{host}");
+        }
     }
 
     #[test]

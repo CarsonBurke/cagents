@@ -100,6 +100,10 @@ fn boundary(row: &RowSnapshot, column: usize) -> bool {
             .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
 }
 
+/// A file URL opens only when it names the terminal's own machine, by no host
+/// or `localhost`. The terminal host has already respelled links naming it by
+/// its host name that way; this window cannot judge that name itself, since
+/// it may be attached to a remote device.
 fn safe_url(text: &str) -> Option<url::Url> {
     let url = url::Url::parse(text).ok()?;
     match url.scheme() {
@@ -109,7 +113,7 @@ fn safe_url(text: &str) -> Option<url::Url> {
     }
 }
 
-fn parse(text: &str, cwd: &Path) -> Option<url::Url> {
+fn parse(text: &str, cwd: &Path, quoted: bool) -> Option<url::Url> {
     if let Some(url) = safe_url(text) {
         return Some(url);
     }
@@ -118,6 +122,14 @@ fn parse(text: &str, cwd: &Path) -> Option<url::Url> {
     }
     // Unsupported URL schemes must never become file paths.
     if text.contains("://") {
+        return None;
+    }
+    // Bare shell shorthand is not a concrete file link. Explicit URLs and
+    // quoted names can still name real files containing these characters.
+    if !quoted
+        && (text.contains(['*', '?', '[', ']'])
+            || text.contains('{') && text.contains(',') && text.contains('}'))
+    {
         return None;
     }
     let mut path = text;
@@ -216,7 +228,7 @@ fn from_positions(
     if hit_end <= start || hit_start >= end {
         return None;
     }
-    let url = parse(trimmed, cwd)?;
+    let url = parse(trimmed, cwd, quoted)?;
     let mut spans: Vec<(usize, u16, u16)> = Vec::new();
     for (&(row, column), &(cell_start, cell_end)) in positions.iter().zip(&offsets) {
         if cell_end < start || cell_start >= end || (cell_end == start && cell_start != cell_end) {
