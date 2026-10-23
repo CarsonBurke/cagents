@@ -806,6 +806,40 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+### Image references and local image storage
+
+Pasted and selected images receive stable **Image N** labels. Their inline
+`[Image N]` references stay with the actual image through edits, queued message
+revision, retry and supported provider history. Removing an attachment does not
+silently attach another image with the same display number. A prompt with
+managed images explains when an attached image's inline reference is missing
+before sending. Text may also refer to earlier images by label; a label alone
+does not select or attach an image.
+
+Owned image assets persist separately from disposable preview caches. The
+physical-device store is bounded to 4096 images and 2 GiB; accepted images and
+persisted drafts are not silently removed to admit new images. Preview memory
+and provider-specific input limits still apply.
+
+Inspect safe image receipt metadata from the user's CLI on the device holding
+the images. These commands work without a daemon and reject hosted-agent or
+remote-device authority:
+
+```sh
+cagents chat image-assets list
+cagents --json chat image-assets list
+cagents chat image-assets remove UUID --sha256 EXACT_SHA256 --acknowledge-history-loss
+```
+
+Use the exact UUID and SHA-256 shown by `list` to remove one image. Removal is
+explicit and can make that image unavailable in drafts and saved history; it
+does not delete the conversation or reuse its image number. A stale digest is
+refused. The inventory prints labels, UUIDs, hashes and byte counts, without
+image bytes, original filenames or private source paths. Omit `--device`, or
+use `--device local`; the command always addresses this physical device.
+Provider history that does not retain verifiable image data cannot reconstruct
+a trusted reference from its label alone.
+
 ### Messages, branches, and child agents
 
 Chat loads recent image previews first. **Load preview** gives the selected image
