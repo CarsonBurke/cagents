@@ -672,6 +672,10 @@ impl Cagents {
         }
     }
 
+    fn project_content_search_available(&self) -> bool {
+        !crate::device::is_remote() && self.sidebar_state.active_worktree().is_some()
+    }
+
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
         if let Some(card) = self.palette.move_pane {
             return self.filter_palette_entries(self.pane_move_palette_entries(card));
@@ -680,6 +684,10 @@ impl Cagents {
             .iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
             .filter(|descriptor| descriptor.scope.applies_to(self.focused_pane()))
+            .filter(|descriptor| {
+                descriptor.action != Command::SearchInProject
+                    || self.project_content_search_available()
+            })
             .map(|descriptor| {
                 (
                     descriptor.label.to_owned(),
@@ -918,6 +926,12 @@ impl Cagents {
             Command::CloseFocusedCard => close_focused_message(&self.workspace)
                 .map_or_else(Task::none, |message| self.update(message)),
             Command::FocusProjectSearch => self.update(Message::FocusProjectSearch),
+            Command::SearchInProject => {
+                if !self.project_content_search_available() {
+                    return Task::none();
+                }
+                self.update(Message::SelectContextTab(ContextTab::Search))
+            }
             Command::FindInPane => {
                 if self.settings_card_focused() {
                     return iced::widget::operation::focus(crate::settings_widgets::search_id())
@@ -1069,6 +1083,7 @@ impl SettingsField {
             Self::ShortcutClonePane => Some(Command::ClonePane),
             Self::ShortcutCloseFocusedColumn => Some(Command::CloseFocusedCard),
             Self::ShortcutSearchProjects => Some(Command::FocusProjectSearch),
+            Self::ShortcutSearchInProject => Some(Command::SearchInProject),
             Self::ShortcutFindInPane => Some(Command::FindInPane),
             Self::ShortcutPreviousColumn => Some(Command::FocusAdjacent(
                 crate::workspace::FocusDirection::Left,
@@ -1180,6 +1195,7 @@ impl ShortcutDraft {
             (Command::FocusPane7, self.focus_pane_7.as_str()),
             (Command::FocusPane8, self.focus_pane_8.as_str()),
             (Command::FocusPane9, self.focus_pane_9.as_str()),
+            (Command::SearchInProject, self.search_in_project.as_str()),
         ]
     }
 }
@@ -1233,6 +1249,48 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn project_content_search_palette_command_requires_a_selected_root_and_opens_search() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        assert!(!app.project_content_search_available());
+        assert!(
+            !app.palette_entries().iter().any(|(_, _, message)| matches!(
+                message,
+                Message::RunCommand(Command::SearchInProject)
+            ))
+        );
+        let before = app.context_tab;
+        drop(app.update(Message::RunCommand(Command::SearchInProject)));
+        assert_eq!(app.context_tab, before);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let root = app.sidebar_state.active_worktree().unwrap().clone();
+        let (_, hint, command) = app
+            .palette_entries()
+            .into_iter()
+            .find(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::SearchInProject))
+            })
+            .unwrap();
+        assert_eq!(hint, "Ctrl+Alt+F");
+        drop(app.update(command));
+        assert_eq!(app.context_tab, ContextTab::Search);
+        assert!(app.context_inspector_open);
+        assert_eq!(app.sidebar_state.active_worktree(), Some(&root));
+        let SettingsDecision::Persist(edited) = settings_update(
+            &app.settings,
+            SettingsField::ShortcutSearchInProject,
+            "Ctrl+Alt+J",
+        ) else {
+            panic!("new field must accept a free chord");
+        };
+        assert_eq!(edited.keyboard_shortcuts.search_in_project, ["Ctrl+Alt+J"]);
+        assert_eq!(
+            edited.keyboard_shortcuts.search_projects,
+            app.settings.keyboard_shortcuts.search_projects
+        );
+    }
 
     /// Run a real scroll operation against the retained native widget tree.
     fn scroll_fixture_step(
@@ -1787,22 +1845,38 @@ mod tests {
                 matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == target)
             }).unwrap();
             let held = Message::Palette(Action::Run(MessageBox(Box::new(selected))));
-            let before = (app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone());
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
             let (response, _) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Prepare, response,
+                action: instance::UiUpdateAction::Prepare,
+                response,
             })));
-            assert!(app.update_prepared, "real Prepare admitted the palette-open window");
+            assert!(
+                app.update_prepared,
+                "real Prepare admitted the palette-open window"
+            );
             drop(app.update(held.clone()));
-            assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                app.workspace.order().collect::<Vec<_>>(), app.workspace.focused(),
-                app.settings.palette_recents.clone()), before);
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
             assert_eq!(app.palette.query.as_deref(), Some("@held pane"));
             let (response, receiver) = std::sync::mpsc::sync_channel(1);
             drop(app.update(Message::UiUpdate(instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Cancel, response,
+                action: instance::UiUpdateAction::Cancel,
+                response,
             })));
             assert_eq!(receiver.try_recv().unwrap(), "ok");
             drop(app.update(held));
@@ -1888,7 +1962,8 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
-    }    #[test]
+    }
+    #[test]
     fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();

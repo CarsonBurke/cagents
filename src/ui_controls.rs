@@ -6,6 +6,7 @@ pub mod button;
 mod display;
 mod editable;
 pub mod field;
+mod find_options;
 mod gauge;
 mod icon;
 mod icon_button;
@@ -17,6 +18,7 @@ mod shrinkable;
 mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
+pub use find_options::{FindOption, find_options};
 pub use gauge::{activity_spinner, budget_bar, budget_radial, budget_radial_toned};
 pub use icon::{Icon, ceditor_icon, ceditor_window_icon, passive_icon, provider_icon};
 pub use icon_button::{
