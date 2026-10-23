@@ -172,9 +172,9 @@ mod tests {
     #[test]
     fn branch_references_carry_the_identifier_in_the_default_workspace() {
         assert_eq!(
-            Reference::from_branch("fix/main-7552-vimeo"),
+            Reference::from_branch("fix/team-123-display"),
             Some(Reference {
-                id: "MAIN-7552".into(),
+                id: "TEAM-123".into(),
                 workspace: None,
             })
         );
