@@ -4525,6 +4525,7 @@ name = "iced_winit"
 version = "0.14.0"
 dependencies = [
  "build_helpers",
+ "clipboard_x11",
  "cosmic-client-toolkit",
  "cursor-icon",
  "dnd",
@@ -4548,6 +4549,7 @@ dependencies = [
  "window_clipboard",
  "winit",
  "winit-core",
+ "x11rb",
  "xkbcommon 0.7.0",
  "xkbcommon-dl",
  "xkeysym",

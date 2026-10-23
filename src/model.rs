@@ -1226,6 +1226,8 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    #[serde(default)]
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1272,6 +1274,7 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
