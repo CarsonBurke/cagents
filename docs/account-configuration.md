@@ -242,6 +242,12 @@ readiness. Existing actors retain their own captured permissions and network
 policy. Linking a home, confirming its login and checking this default policy
 remain distinct operations.
 
+If the result reports a read-only default, you can request file edits for a new
+conversation through **Permissions → Workspace write**. This leaves account
+defaults unchanged, so the default-policy check can still report read-only.
+Existing conversations and network access have separate policies; this choice
+does not configure unattended agents.
+
 ## Removing a linked account registration
 
 Use the stable account ID from `cagents account list` on the selected device:

@@ -427,7 +427,7 @@ fn measurement(label: &'static str, value: Measurement) -> Element<'static, Mess
     .into()
 }
 fn results(report: &CheckReport, now_ms: Millis) -> Element<'_, Message> {
-    use crate::account::readiness::{ApprovalPolicy, SandboxMode};
+    use crate::account::readiness::{ApprovalPolicy, CheckReason, SandboxMode};
     let observed = if report.observed_at == 0 {
         "No provider observation recorded".to_owned()
     } else {
@@ -478,6 +478,19 @@ fn results(report: &CheckReport, now_ms: Millis) -> Element<'_, Message> {
             .wrapping(iced::widget::text::Wrapping::Word)
             .into(),
         );
+        if profile.sandbox_mode == SandboxMode::ReadOnly
+            && report.authentication.status == CheckStatus::Passed
+            && matches!(
+                report.execution_profile_configured.reason,
+                CheckReason::PolicyReported | CheckReason::ImplicitPolicy
+            )
+        {
+            rows.push(
+                design::caption("For a new conversation, choose Permissions → Workspace write to request file edits. Account defaults stay unchanged; existing conversations and network access have separate policies.")
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+            );
+        }
     }
     if let Some(cleanup) = report.workspace_cleanup {
         rows.push(
