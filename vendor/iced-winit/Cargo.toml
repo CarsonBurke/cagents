@@ -29,7 +29,7 @@ debug = ["iced_debug/enable"]
 sysinfo = ["dep:sysinfo"]
 unconditional-rendering = []
 linux-theme-detection = ["dep:mundy", "mundy/async-io", "mundy/color-scheme"]
-x11 = ["winit/x11"]
+x11 = ["winit/x11", "dep:clipboard_x11", "dep:x11rb"]
 system = ["sysinfo"]
 program = []
 wayland-dlopen = ["winit/wayland-dlopen"]
@@ -60,6 +60,9 @@ iced_program = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c
 
 
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+
+clipboard_x11 = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20", optional = true }
+x11rb = { version = "0.13", optional = true }
 
 mundy = { version = "0.2", default-features = false, optional = true }
 

@@ -13201,6 +13201,7 @@ impl Application for Cagents {
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
         let chat_drafts = durable.chat_drafts.clone();
+        let chat_draft_attachments = durable.chat_draft_attachments.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
         // the whole of its life, so the observer starts with the window rather
@@ -13313,7 +13314,7 @@ impl Application for Cagents {
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
-            chat_ui: chat_ui::State::with_drafts(chat_drafts),
+            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
@@ -17206,7 +17207,9 @@ impl Application for Cagents {
         if self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
-                (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
+                self.device_ui
+                    .can_close()
+                    .then_some(Message::Device(device_ui::Action::Close)),
                 1.0,
             ));
         }
