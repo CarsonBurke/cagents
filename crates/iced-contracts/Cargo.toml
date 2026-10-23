@@ -1,0 +1,11 @@
+[package]
+name = "cagents-iced-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+# Root patch selects the same vendored package as the UI, with its production Id.
+iced_core = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y"] }
