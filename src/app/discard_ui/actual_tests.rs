@@ -369,7 +369,16 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
     assert!(labels.contains(&"Discard changes?"));
     assert!(labels.contains(&"2 tracked paths will be restored from the index"));
     assert_eq!(
-        labels.iter().filter(|label| **label == "Discard").count(),
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == Role::Button
+                    && node.node().label() == Some("Discard")
+                    && !node.node().is_disabled()
+            })
+            .count(),
         1
     );
     assert_eq!(
