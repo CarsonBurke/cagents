@@ -510,6 +510,32 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
 fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
     let mut fixture = Fixture::new();
     let project = fixture.root.path().join("project");
+    // This case owns lifecycle receipts, not discovery of a plain folder.
+    // Bind its project explicitly even when TMPDIR is inside another checkout.
+    let initialized = Fixture::command(fixture.root.path(), "git")
+        .args([
+            "init",
+            "--quiet",
+            "--template=",
+            "--initial-branch=lifecycle-fixture",
+        ])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    let discovered = Fixture::command(fixture.root.path(), "git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(discovered.status.success(), "{discovered:?}");
+    let discovered = String::from_utf8(discovered.stdout).unwrap();
+    assert_eq!(
+        Path::new(discovered.trim_end()).canonicalize().unwrap(),
+        project.canonicalize().unwrap(),
+        "the audit fixture must not discover an enclosing repository"
+    );
     fixture.cli(&["project", "open", project.to_str().unwrap()]);
     let provider = fixture.root.path().join("bin/omp");
     fs::write(
