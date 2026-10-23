@@ -1206,8 +1206,15 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            // Isolate synthetic provider credentials without changing the
+            // inherited cagents caller's delegation.
+            let authority = std::env::var_os(crate::agent_execution::AUTHORITY_ENV);
+            child.env_clear();
+            if let Some(authority) = authority {
+                child.env(crate::agent_execution::AUTHORITY_ENV, authority);
+            }
             child.args(["--exact", "account::probe::tests::selected_home_probes_remove_inherited_credentials_but_system_keeps_them", "--nocapture"])
-                .env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
+                .env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
             for provider in Account::PROVIDERS {
                 for name in super::super::credential_overrides(provider) {
                     child.env(name, "fixture-only");
