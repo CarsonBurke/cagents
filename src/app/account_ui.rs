@@ -1901,6 +1901,9 @@ impl Cagents {
                     self.account_ui.table.escape();
                 } else if self.account_ui.check.is_open() {
                     self.account_ui.check.close();
+                    if self.account_ui.table.link.is_some() {
+                        return widget::text_input::focus(table::link_id());
+                    }
                 } else {
                     self.account_ui.table.escape();
                 }
@@ -2546,8 +2549,22 @@ impl Cagents {
             }
             Action::Add { provider, device } => self.add_account(provider, device),
             Action::LinkStart(provider) => {
+                if self.account_ui.table.linking {
+                    return Task::none();
+                }
                 self.account_ui.table.add_menu = false;
-                self.account_ui.table.link = Some((provider, String::new()));
+                // Switching inline editors hides the check, not its bounded
+                // request. Resume an existing draft instead of losing its path.
+                self.account_ui.check.close();
+                if self
+                    .account_ui
+                    .table
+                    .link
+                    .as_ref()
+                    .is_none_or(|(known, _)| *known != provider)
+                {
+                    self.account_ui.table.link = Some((provider, String::new()));
+                }
                 widget::text_input::focus(table::link_id())
             }
             Action::LinkInput(path) => {

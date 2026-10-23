@@ -279,8 +279,12 @@ impl Cagents {
                 )
             }
             Action::Close(_) => {
-                self.account_ui.check.form = None;
-                Task::none()
+                self.account_ui.check.close();
+                if self.account_ui.table.link.is_some() {
+                    widget::text_input::focus(table::link_id())
+                } else {
+                    Task::none()
+                }
             }
             Action::Prepared { form, result } => {
                 if let Some(current) = &mut self.account_ui.check.form
@@ -831,6 +835,147 @@ mod tests {
             )
             .is_empty(),
             "a known registered identity stays read-only"
+        );
+    }
+
+    #[test]
+    fn existing_home_editor_resumes_visible_focus_without_cancelling_pending_check() {
+        use super::super::Action as AccountAction;
+        use crate::app::tests::focused_element;
+        let (mut app, first, second) = fixture();
+        let home = "/selected/existing-codex-home";
+        drop(app.update_account_ui(AccountAction::LinkStart(Provider::Codex)));
+        let messages = set_value(
+            super::super::table::table(&app, 1000.0),
+            "accounts.link-home",
+            home,
+        );
+        assert!(
+            !messages.is_empty(),
+            "the mounted home field must accept input"
+        );
+        for message in messages {
+            if let Message::AccountUi(action) = message {
+                drop(app.update_account_ui(action));
+            }
+        }
+        open(&mut app, &first);
+        assert!(view(&app).is_some());
+        assert_eq!(app.account_ui.table.link.as_ref().unwrap().1, home);
+        let messages = click(view(&app).unwrap(), "Check");
+        apply(&mut app, messages);
+        let first_pending = app.account_ui.check.pending.as_ref().unwrap().clone();
+        let queued_close = click(view(&app).unwrap(), "Close");
+
+        // Use the same rendered toolbar choice as the production popover.
+        let messages = click(super::super::table::table(&app, 1000.0), "Add account");
+        for message in messages {
+            if let Message::AccountUi(action) = message {
+                drop(app.update_account_ui(action));
+            }
+        }
+        assert!(app.account_ui.table.add_menu);
+        let choice = click(
+            super::super::table::add_menu(&app.account_ui, false),
+            "Existing Codex home",
+        )
+        .into_iter()
+        .find_map(|message| match message {
+            Message::AccountUi(action @ AccountAction::LinkStart(_)) => Some(action),
+            _ => None,
+        })
+        .expect("the actual existing-home choice must dispatch");
+        let focus = app.update_account_ui(choice);
+        assert!(
+            view(&app).is_none(),
+            "the check editor must give way to the requested home editor"
+        );
+        assert_eq!(
+            app.account_ui.table.link,
+            Some((Provider::Codex, home.into()))
+        );
+        assert_eq!(
+            app.account_ui.check.pending.as_ref().unwrap().sequence,
+            first_pending.sequence
+        );
+        assert_eq!(
+            focused_element(super::super::table::table(&app, 1000.0), focus),
+            Some(super::super::table::link_id())
+        );
+        apply(&mut app, queued_close);
+        assert!(app.account_ui.check.pending.is_some());
+
+        // A completion for the hidden editor cannot be adopted by a new one.
+        open(&mut app, &second);
+        drop(app.update_account_check(Action::Finished {
+            sequence: first_pending.sequence,
+            result: Ok(report(&first_pending.request)),
+        }));
+        assert!(app.account_ui.check.form.as_ref().unwrap().report.is_none());
+        let sequence = app.account_ui.check.form.as_ref().unwrap().sequence;
+        drop(app.update_account_check(Action::Run(sequence)));
+        let newer = app.account_ui.check.pending.as_ref().unwrap().clone();
+        drop(app.update_account_check(Action::Finished {
+            sequence: first_pending.sequence,
+            result: Ok(report(&first_pending.request)),
+        }));
+        assert_eq!(
+            app.account_ui.check.pending.as_ref().unwrap().sequence,
+            newer.sequence
+        );
+        let close = click(view(&app).unwrap(), "Close")
+            .into_iter()
+            .find_map(|message| match message {
+                Message::AccountUi(super::super::Action::Check(action @ Action::Close(_))) => {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let focus = app.update_account_check(close);
+        assert_eq!(
+            focused_element(super::super::table::table(&app, 1000.0), focus),
+            Some(super::super::table::link_id())
+        );
+        assert_eq!(
+            app.account_ui.check.pending.as_ref().unwrap().sequence,
+            newer.sequence
+        );
+        assert_eq!(
+            app.account_ui.table.link,
+            Some((Provider::Codex, home.into()))
+        );
+
+        // An in-flight link cannot have its operand replaced by an old menu
+        // callback, and the visible menu reflects that disabled action.
+        open(&mut app, &first);
+        let stale_choice = click(
+            super::super::table::add_menu(&app.account_ui, false),
+            "Existing Claude home",
+        )
+        .into_iter()
+        .find_map(|message| match message {
+            Message::AccountUi(action @ AccountAction::LinkStart(_)) => Some(action),
+            _ => None,
+        })
+        .unwrap();
+        app.account_ui.table.linking = true;
+        assert!(
+            click(
+                super::super::table::add_menu(&app.account_ui, false),
+                "Existing Codex home"
+            )
+            .is_empty()
+        );
+        drop(app.update_account_ui(stale_choice));
+        assert!(view(&app).is_some());
+        assert_eq!(
+            app.account_ui.table.link,
+            Some((Provider::Codex, home.into()))
+        );
+        assert_eq!(
+            app.account_ui.check.pending.as_ref().unwrap().sequence,
+            newer.sequence
         );
     }
 
