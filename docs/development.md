@@ -338,8 +338,10 @@ and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/bl
 ## Testing
 
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
-feature, the `ui` and `host` unit tests and every gated integration target are
-compiled out. Cover the boundaries a change touches:
+feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
+targets whose required features are absent, rather than compiling and linking
+empty harnesses. The host-only terminal workload example is also skipped outside
+its lane. Cover the boundaries a change touches:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
@@ -354,6 +356,10 @@ cargo test --locked --no-default-features --features host --lib terminal::
 cargo test --locked --no-default-features --features host --test terminal_load_contract
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+Explicitly selecting a gated target without its feature, including through a
+`--test '*'` glob, reports the missing feature instead of succeeding with zero
+tests. Use `--all-targets` to select all targets available in a feature lane.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
