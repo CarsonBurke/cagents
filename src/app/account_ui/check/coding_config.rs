@@ -87,7 +87,7 @@ struct Pending {
 }
 struct Completion {
     context: Context,
-    text: &'static str,
+    text: String,
 }
 impl Completion {
     fn current(&self, app: &Cagents) -> bool {
@@ -228,25 +228,25 @@ pub(super) fn update(app: &mut Cagents, action: Action) -> Task<Message> {
                 {
                     match report.outcome {
                         Outcome::Created => {
-                            "Coding defaults created. Run Check again to measure actual access."
+                            "Coding defaults created. Run Check again to measure actual access.".into()
                         }
-                        Outcome::NotCreated(_) => {
-                            "Coding defaults were not created. Inspect the configuration before another request."
+                        Outcome::NotCreated(reason) => {
+                            format!("Coding defaults were not created: {}.", reason.description())
                         }
                         Outcome::CreationUncertain(_) => {
-                            "Configuration creation could not be fully confirmed. Inspect the account configuration; no retry was sent."
+                            "Configuration creation could not be fully confirmed. Inspect the account configuration; no retry was sent.".into()
                         }
                     }
                 }
                 _ => {
-                    "The device did not confirm configuration creation. Inspect the account configuration before another request; no retry was sent."
+                    "The device did not confirm configuration creation. Inspect the account configuration before another request; no retry was sent.".into()
                 }
             };
             // A mutation may finish after Close/reopen. Keep its receipt and
             // surface a notice without attaching it to a different form/report.
             app.account_ui.check.coding_config.last = Some(Completion {
                 context: pending.context.clone(),
-                text,
+                text: text.clone(),
             });
             if pending.context.current(app) {
                 let form = app.account_ui.check.form.as_mut().unwrap();
@@ -369,7 +369,7 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
         && last.current(app)
     {
         rows.push(
-            design::caption(last.text)
+            design::caption(last.text.as_str())
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
         );
@@ -664,6 +664,36 @@ mod tests {
             },
         ));
         assert_eq!(app.account_ui.check.coding_config.next, next);
+    }
+
+    #[test]
+    fn coding_defaults_definite_refusal_keeps_its_actionable_reason_separate_from_uncertainty() {
+        use crate::account::coding_config::Refusal;
+
+        let (mut app, first, _) = ready();
+        observed(&mut app, Presence::Absent);
+        let (sequence, request) = dispatch_creation(&mut app);
+        let result = CreateReport {
+            account: first,
+            host: request.observation.host,
+            home: request.observation.home,
+            network_access: request.network_access,
+            outcome: Outcome::NotCreated(Refusal::RegistryBusy),
+        };
+        drop(update(
+            &mut app,
+            Action::Created {
+                sequence,
+                result: Ok(result),
+            },
+        ));
+        let state = &app.account_ui.check.coding_config;
+        assert!(!state.pending());
+        assert!(state.draft.is_none());
+        let text = &state.last.as_ref().unwrap().text;
+        assert!(text.starts_with("Coding defaults were not created:"));
+        assert!(text.contains(Refusal::RegistryBusy.description()));
+        assert!(!text.contains("did not confirm"));
     }
 
     #[test]

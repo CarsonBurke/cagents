@@ -53,6 +53,56 @@ pub enum Refusal {
     FileSyncFailed,
     ContextChanged,
     PublicationUnavailable,
+    RegistryUnavailable,
+    RegistryBusy,
+    RegistryNewer,
+    AccountUnavailable,
+    AccountBusyOrChanged,
+    SharedHome,
+    SharedConfig,
+    CensusUnavailable,
+    CensusLimit,
+}
+impl Refusal {
+    /// Safe product copy, independent of filesystem paths or OS diagnostics.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::RegistryUnavailable => "The account registry could not be read",
+            Self::RegistryBusy => {
+                "Another account operation is using the registry; wait for it to finish"
+            }
+            Self::RegistryNewer => "The account registry needs a newer cagents version",
+            Self::AccountUnavailable => {
+                "The selected account or its registry is unavailable; check the account list"
+            }
+            Self::AccountBusyOrChanged => {
+                "The selected account is busy or changed; check it again after its work finishes"
+            }
+            Self::SharedHome => {
+                "Another account uses this home; choose an independent account home"
+            }
+            Self::SharedConfig => {
+                "Another account's configuration points to this file; preserve its shared settings"
+            }
+            Self::CensusUnavailable => "Account configuration independence could not be confirmed",
+            Self::CensusLimit => "Too many account paths are involved to confirm independence",
+            Self::HomeUnavailable => "The selected account home is unavailable or changed",
+            Self::ExistingConfiguration => "A configuration entry already exists; it was preserved",
+            Self::PresenceUnknown => "Configuration absence could not be confirmed",
+            Self::StagingUnavailable => {
+                "This device could not prepare an independent configuration"
+            }
+            Self::InvalidStagedFile | Self::VerificationFailed => {
+                "The new configuration could not be safely prepared"
+            }
+            Self::WriteFailed => "The new configuration could not be written",
+            Self::FileSyncFailed => "The new configuration could not be synced",
+            Self::ContextChanged => "The selected account context changed; check it again",
+            Self::PublicationUnavailable => {
+                "This device could not publish the configuration without replacement"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

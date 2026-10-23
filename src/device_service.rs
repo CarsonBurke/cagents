@@ -1988,6 +1988,8 @@ mod wire_tests {
                 for outcome in [
                     Outcome::Created,
                     Outcome::NotCreated(Refusal::ExistingConfiguration),
+                    Outcome::NotCreated(Refusal::RegistryBusy),
+                    Outcome::NotCreated(Refusal::SharedConfig),
                     Outcome::CreationUncertain(Uncertainty::ContextChanged),
                 ] {
                     roundtrip(&Reply::AccountCodingConfigCreate(Box::new(CreateReport {

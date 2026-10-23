@@ -4,7 +4,10 @@ use super::{SharedHost, account_lifecycle::Reservation};
 use crate::{
     account::{
         Account,
-        coding_config::{self, CreateReport, CreateRequest, InspectRequest, Observation, Presence},
+        coding_config::{
+            self, CreateReport, CreateRequest, InspectRequest, Observation, Outcome, Presence,
+            Refusal,
+        },
         home::Homes,
         registry::{Registry, Store},
     },
@@ -146,9 +149,24 @@ pub(super) fn create(
     // Reject stale backend context before any registry or filesystem lookup.
     validate_create(host, &request)?;
     let inspect = request.observation.request();
-    let (store, homes, registry, account) = installation(&inspect)?;
-    let reservation = Reservation::install(host, &[account])
-        .map_err(|_| refused("The selected account is busy or changed; inspect again"))?;
+    let (store, homes, registry, account) = match installation(&inspect) {
+        Ok(installation) => installation,
+        Err(_) => {
+            return Ok(report(
+                &request,
+                Outcome::NotCreated(Refusal::AccountUnavailable),
+            ));
+        }
+    };
+    let reservation = match Reservation::install(host, &[account]) {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            return Ok(report(
+                &request,
+                Outcome::NotCreated(Refusal::AccountBusyOrChanged),
+            ));
+        }
+    };
     create_reserved(host, &request, &store, &homes, &registry, &reservation)
 }
 
@@ -162,12 +180,22 @@ fn create_reserved(
 ) -> Result<CreateReport, ProtocolError> {
     validate_create(host, request)?;
     let inspect = request.observation.request();
-    selected(registry, homes, &inspect)?;
+    if selected(registry, homes, &inspect).is_err() {
+        return Ok(report(
+            request,
+            Outcome::NotCreated(Refusal::ContextChanged),
+        ));
+    }
     // Bind the expected email's registration snapshot to this reservation.
     // The Store subsequently repeats this exact context under its real lease.
-    let _root = reservation
-        .coding_config_root(registry, &inspect.account, inspect.expected_home)
-        .map_err(|_| refused(CONTEXT_CHANGED))?;
+    let Ok(_root) =
+        reservation.coding_config_root(registry, &inspect.account, inspect.expected_home)
+    else {
+        return Ok(report(
+            request,
+            Outcome::NotCreated(Refusal::ContextChanged),
+        ));
+    };
     let outcome = store
         .try_initialize_codex_config_reserved(
             reservation,
@@ -176,14 +204,33 @@ fn create_reserved(
             inspect.expected_home,
             request.network_access,
         )
-        .map_err(|reason| refused(reason.description()))?;
-    Ok(CreateReport {
-        account: inspect.account,
+        .unwrap_or_else(|reason| {
+            use crate::account::registry::CodingConfigRefusal as R;
+            // These Store errors precede publication. After-link failures are
+            // Outcome::CreationUncertain and must never enter this projection.
+            Outcome::NotCreated(match reason {
+                R::RegistryUnavailable => Refusal::RegistryUnavailable,
+                R::RegistryBusy => Refusal::RegistryBusy,
+                R::RegistryNewer => Refusal::RegistryNewer,
+                R::InvalidAccount => Refusal::AccountUnavailable,
+                R::ContextChanged => Refusal::ContextChanged,
+                R::SharedHome => Refusal::SharedHome,
+                R::SharedConfig => Refusal::SharedConfig,
+                R::CensusUnavailable => Refusal::CensusUnavailable,
+                R::CensusLimit => Refusal::CensusLimit,
+            })
+        });
+    Ok(report(request, outcome))
+}
+
+fn report(request: &CreateRequest, outcome: Outcome) -> CreateReport {
+    CreateReport {
+        account: request.observation.account.clone(),
         host: request.observation.host.clone(),
-        home: inspect.expected_home,
+        home: request.observation.home,
         network_access: request.network_access,
         outcome,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +445,38 @@ mod tests {
     }
 
     #[test]
+    fn registry_contention_returns_definite_not_created_without_changing_files() {
+        let f = fixture();
+        let reservation = reserve(&f);
+        let registry_path = f._root.path().join("registry/accounts.toml");
+        let before = fs::read(&registry_path).unwrap();
+        let lease = f.store.hold_registry_lock_for_account_test().unwrap();
+        let request = CreateRequest {
+            observation: Observation {
+                account: f.request.account.clone(),
+                host: proof(&f.host),
+                home: f.request.expected_home,
+                presence: Presence::Absent,
+                expected_email: f.request.expected_email.clone(),
+            },
+            network_access: false,
+        };
+        let result = create_reserved(
+            &f.host,
+            &request,
+            &f.store,
+            &f.homes,
+            &f.registry,
+            &reservation,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, Outcome::NotCreated(Refusal::RegistryBusy));
+        assert!(!f.home.join("config.toml").exists());
+        assert_eq!(fs::read(&registry_path).unwrap(), before);
+        drop(lease);
+    }
+
+    #[test]
     fn creation_does_not_adopt_an_identity_changed_during_reservation_installation() {
         let f = fixture();
         // The frontend/initial read names X; reservation installation sees Y.
@@ -424,7 +503,7 @@ mod tests {
             },
             network_access: false,
         };
-        let error = create_reserved(
+        let result = create_reserved(
             &f.host,
             &request,
             &f.store,
@@ -432,8 +511,8 @@ mod tests {
             &f.registry,
             &reservation,
         )
-        .unwrap_err();
-        assert_eq!(error.message, CONTEXT_CHANGED);
+        .unwrap();
+        assert_eq!(result.outcome, Outcome::NotCreated(Refusal::ContextChanged));
         assert!(!f.home.join("config.toml").exists());
         assert_eq!(
             f.store
