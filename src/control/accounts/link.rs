@@ -23,6 +23,12 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
 
 pub(super) fn parse_home(value: &str) -> Result<String, String> {
     let value = value.trim();
+    if value
+        .strip_prefix("~/")
+        .is_some_and(|relative| Path::new(relative).is_absolute())
+    {
+        return Err("Use one slash after ~ so the account home stays relative to the selected device's home".into());
+    }
     if value.contains('\0') || !(Path::new(value).is_absolute() || value.starts_with("~/")) {
         return Err(
             "Use an absolute account home on the selected device, or a quoted '~/path'".into(),
@@ -128,6 +134,7 @@ mod tests {
         for (provider, home) in [
             (Provider::Omp, "/private/home"),
             (Provider::Codex, "relative/home"),
+            (Provider::Codex, "~//selected"),
         ] {
             let Err(error) = execute(provider, home.into()) else {
                 panic!("invalid input reached account registration");
@@ -139,6 +146,8 @@ mod tests {
             ("unknown", "/private/home"),
             ("codex", "relative/home"),
             ("codex", "~another/home"),
+            ("codex", "~//selected"),
+            ("codex", "~///selected"),
             ("codex", "~"),
             ("codex", ""),
             ("codex", "/private/\0home"),
