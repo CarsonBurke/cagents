@@ -186,9 +186,13 @@ pub(crate) fn create_with_listener(
     let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
         .sun_path
         .len();
-    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= capacity {
+    if socket.to_str().is_none()
+        || bytes.is_empty()
+        || bytes.contains(&0)
+        || bytes.len() >= capacity
+    {
         return Err(format!(
-            "Owned Codex listener requires a nonempty, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter temporary directory"
+            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
         ));
     }
     create_inner(launch, Some(socket), None)
@@ -3166,7 +3170,11 @@ impl Adapter for Codex {
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
-                    step.events.push(session_notice(message));
+                    let mut notice = session_notice(message);
+                    if let Event::Item(item) = &mut notice {
+                        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+                    }
+                    step.events.push(notice);
                 } else {
                     step.events.push(Event::Error {
                         message,
@@ -4127,6 +4135,7 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Provider;
 
     fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
         Launch {
@@ -4151,12 +4160,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn owned_listener_rejects_unusable_unix_addresses_before_preparation_or_spawn() {
+        use std::os::unix::ffi::OsStringExt;
+
         let home = tempfile::tempdir().unwrap();
         let launch = owned_listener_test_launch(home.path());
         let before = launch.recipe.clone();
         for socket in [
             PathBuf::new(),
             PathBuf::from("/nul\0socket"),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff])),
             PathBuf::from(format!("/{}", "x".repeat(107))),
             PathBuf::from(format!("/{}", "x".repeat(108))),
             PathBuf::from(format!("/{}x", "λ".repeat(53))),
@@ -5869,13 +5881,63 @@ mod tests {
             panic!("{:?}", first.events)
         };
         assert_eq!(item.role, Role::System);
-        assert!(
-            matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
         let [Event::Item(next)] = second.events.as_slice() else {
             panic!("{:?}", second.events)
         };
         assert_ne!(item.id, next.id);
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, next),
+            Some("Reconnecting... 1/2")
+        );
+        for (cause, expected_kind) in [
+            (
+                "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+                chat::failure::FailureKind::AccountLimit,
+            ),
+            (
+                "Your access token could not be refreshed. Please sign in again.",
+                chat::failure::FailureKind::Authentication,
+            ),
+        ] {
+            let raw = format!(
+                "{cause}\nHTTP raw response: {}",
+                "retained diagnostic ".repeat(120_000)
+            );
+            assert!(raw.len() > 2 * 1024 * 1024);
+            let mut retry = frame.clone();
+            retry["params"]["error"]["message"] = json!(raw);
+            let retry = adapter.receive(retry).unwrap();
+            let [Event::Item(error)] = retry.events.as_slice() else {
+                panic!("retry must remain only a timeline item");
+            };
+            assert!(error.id.starts_with("codex-notice:"));
+            assert_ne!(error.id, item.id);
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, error),
+                Some(raw.as_str())
+            );
+            assert_eq!(
+                chat::failure::Failure::parse(Provider::Codex, &raw)
+                    .unwrap()
+                    .kind,
+                expected_kind
+            );
+            let warning = adapter
+                .receive(
+                    json!({"method":"warning","params":{"threadId":"thread-exact","message":raw}}),
+                )
+                .unwrap();
+            let [Event::Item(warning)] = warning.events.as_slice() else {
+                panic!("warning must remain a timeline item");
+            };
+            assert!(chat::failure::provider_error_text(Provider::Codex, warning).is_none());
+            assert!(matches!(&warning.content, ItemContent::Text { text, .. } if text == &raw));
+        }
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
@@ -5899,9 +5961,17 @@ mod tests {
             .children
             .insert("child-thread".into(), Box::new(child));
         let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
-        assert!(
-            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+        let [Event::SubagentItem { id, item }] = step.events.as_slice() else {
+            panic!("A child retry must remain only in its exact child timeline");
+        };
+        assert_eq!(id, "child-thread");
+        assert_eq!(item.role, Role::System);
+        assert!(item.id.starts_with("codex-notice:"));
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
     }
 
     #[test]

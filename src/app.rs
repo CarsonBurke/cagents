@@ -17299,6 +17299,7 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        self.reconcile_chat_failure_presentations();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
         }
