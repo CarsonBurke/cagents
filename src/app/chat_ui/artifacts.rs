@@ -48,7 +48,11 @@ fn add(label: &str, uri: &str, output: &mut Vec<(String, String)>) {
     {
         return;
     }
-    let web = match Url::parse(uri) {
+    // Match the opener's coordinate grammar before URL classification:
+    // `main.rs:42:7` otherwise looks like the unsupported `main.rs` scheme.
+    // Keep the original URI below so the opener still receives its position.
+    let (destination, _) = crate::document_link::file_position(uri);
+    let web = match Url::parse(destination) {
         Ok(url) if matches!(url.scheme(), "https" | "http") => url.host_str().is_some(),
         Ok(url) if url.scheme() == "file" && url.to_file_path().is_ok() => false,
         Ok(_) => return,
@@ -148,6 +152,52 @@ mod tests {
             "approval payloads are not review artifacts"
         );
     }
+    #[test]
+    fn review_artifact_coordinates_preserve_bare_names_and_exact_opening_targets() {
+        use crate::document_link::{self, DocumentLink};
+        let source = std::path::Path::new("/producer/worktree/.chat");
+        for (uri, path, fragment) in [
+            ("Cargo.toml:42", "/producer/worktree/Cargo.toml", "L42"),
+            ("main.rs:42:7", "/producer/worktree/main.rs", "L42:7"),
+            ("src/main.rs:9:2", "/producer/worktree/src/main.rs", "L9:2"),
+            ("/other/file.rs:3", "/other/file.rs", "L3"),
+            ("résumé.rs:8:3", "/producer/worktree/résumé.rs", "L8:3"),
+        ] {
+            let extracted = links(&question(&format!("[source]({uri})")));
+            assert_eq!(extracted, [("source".to_owned(), uri.to_owned())]);
+            // Exercise the same two shared helpers used by the actual opener:
+            // admission must not strip coordinates from its captured payload,
+            // change the producing directory, or reinterpret an absolute path.
+            let (destination, position) = document_link::file_position(&extracted[0].1);
+            assert_eq!(position.as_deref(), Some(fragment));
+            assert_eq!(
+                document_link::resolve(source, destination).unwrap(),
+                DocumentLink::Local {
+                    path: path.into(),
+                    fragment: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn review_artifact_coordinate_admission_preserves_url_and_shorthand_guards() {
+        let web = "https://example.test:8443/report";
+        let literal = "file:///producer/literal%2A.rs#L42";
+        assert_eq!(
+            links(&question(&format!(
+                "[web]({web}) [literal]({literal}) \
+                 [unsafe](javascript:42) [unsafe-coordinate](javascript:payload.rs:42) \
+                 [mail](mailto:user@example.test:42) [glob](main*.rs:42) \
+                 [nested-glob](src/main?.rs:42) [brace](main-{{one,two}}.rs:42)"
+            ))),
+            [
+                ("web".into(), web.into()),
+                ("literal".into(), literal.into())
+            ]
+        );
+    }
+
     #[test]
     fn review_artifact_selection_is_bounded_without_scanning_the_filesystem() {
         let many = (0..100)
