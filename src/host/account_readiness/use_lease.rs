@@ -147,6 +147,31 @@ pub(in crate::host) fn ensure_outside(map: &Leases, path: &Path) -> Result<(), S
     }
     // Never hold the map/HostState lock while resolving paths or walking pins.
     let target = DestructiveScope::capture(path)?;
+    ensure_clear(readers, target)
+}
+
+/// Census an already captured destructive operand, even if its old spelling
+/// now names an unrelated replacement. The caller retains its original path
+/// and pin binding and supplies both; do not re-follow the path for identity.
+pub(in crate::host) fn ensure_outside_directory(
+    map: &Leases,
+    path: &Path,
+    pin: &File,
+) -> Result<(), String> {
+    let readers: Vec<_> = map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    if readers.is_empty() {
+        return Ok(());
+    }
+    let target = DestructiveScope::from_pin(path, pin)?;
+    ensure_clear(readers, target)
+}
+
+fn ensure_clear(readers: Vec<Arc<Scope>>, target: DestructiveScope) -> Result<(), String> {
     for reader in readers {
         if reader.home.overlaps(&target)? || reader.workspace.overlaps(&target)? {
             return Err("An account check is using this directory or one inside or around it; wait for the check to finish".into());
@@ -163,6 +188,26 @@ struct DestructiveScope {
     _pin: Option<File>,
 }
 impl DestructiveScope {
+    fn from_pin(path: &Path, pin: &File) -> Result<Self, String> {
+        validate_path(path)?;
+        let pin = pin
+            .try_clone()
+            .map_err(|_| "The destructive directory scope cannot be retained")?;
+        let metadata = pin
+            .metadata()
+            .map_err(|_| "The destructive directory scope cannot be identified")?;
+        if !metadata.is_dir() {
+            return Err("The destructive scope is not a directory".into());
+        }
+        let ancestors = super::super::account_lifecycle::physical_ancestors(path, Some(&pin))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity: Some((metadata.dev(), metadata.ino())),
+            ancestors,
+            _pin: Some(pin),
+        })
+    }
+
     fn capture(path: &Path) -> Result<Self, String> {
         let path = normalize(path)?;
         let pin = match OpenOptions::new()
@@ -193,15 +238,7 @@ impl DestructiveScope {
 // Missing descendants still participate in the namespace guard, without
 // interpreting '..' through a missing component or using this client's HOME.
 fn normalize(path: &Path) -> Result<PathBuf, String> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    {
-        return Err(
-            "The destructive directory scope must be absolute without parent traversal".into(),
-        );
-    }
+    validate_path(path)?;
     let mut existing = path;
     let mut missing = Vec::new();
     loop {
@@ -224,6 +261,19 @@ fn normalize(path: &Path) -> Result<PathBuf, String> {
             Err(_) => return Err("The destructive directory scope cannot be resolved".into()),
         }
     }
+}
+
+fn validate_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(
+            "The destructive directory scope must be absolute without parent traversal".into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,5 +399,30 @@ mod tests {
         fs::rename(&first, root.path().join("retired-first")).unwrap();
         fs::create_dir(&first).unwrap();
         assert!(Scope::capture(&home, &pin(&home), &first, &original).is_err());
+    }
+
+    #[test]
+    fn destructive_pin_census_follows_the_original_root_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        for path in [&home, &source, &destination] {
+            fs::create_dir(path).unwrap();
+        }
+        let original = source.join("destructive-root");
+        fs::create_dir_all(original.join("workspace")).unwrap();
+        let destructive_pin = pin(&original);
+        let moved = destination.join("renamed-root");
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        // A reader enrolled after the move does not share the original lexical
+        // spelling. Only the destructive operation's retained pin finds it.
+        let map = Leases::default();
+        let lease = Lease::enroll(&map, capture(&home, &moved.join("workspace")));
+        assert!(ensure_outside(&map, &original).is_ok());
+        assert!(ensure_outside_directory(&map, &original, &destructive_pin).is_err());
+        drop(lease);
+        assert!(ensure_outside_directory(&map, &original, &destructive_pin).is_ok());
     }
 }
