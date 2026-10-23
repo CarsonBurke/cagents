@@ -28,9 +28,8 @@ const COMPACT_HEADER_WIDTH: f32 = 440.0;
 const SIDE_BY_SIDE_WIDTH: f32 = 700.0;
 const LIST_WIDTH: f32 = 240.0;
 /// The most of a narrow pane's height the stacked list takes from the
-/// selection below it, and the least it is given on a short pane.
+/// selection below it, including short split panes.
 const STACKED_LIST_SHARE: f32 = 0.4;
-const STACKED_LIST_MIN_HEIGHT: f32 = 160.0;
 const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
@@ -2127,7 +2126,7 @@ impl State {
                 widget::column::with_children(vec![
                     widget::container(list)
                         .width(Length::Fill)
-                        .max_height((size.height * STACKED_LIST_SHARE).max(STACKED_LIST_MIN_HEIGHT))
+                        .max_height(size.height * STACKED_LIST_SHARE)
                         .into(),
                     crate::design::horizontal_rule(),
                     content,
@@ -3373,6 +3372,48 @@ mod tests {
     }
 
     #[test]
+    fn a_short_stacked_pane_keeps_the_selected_automation_scrollable() {
+        let owner = automation();
+        let mut rows = vec![owner.summary(None)];
+        for index in 0..4 {
+            let mut other = automation();
+            other.definition.name = format!("Other automation {index}");
+            rows.push(other.summary(None));
+        }
+        let state = State {
+            rows,
+            selected: Some(owner),
+            list_status: ListStatus::Loaded,
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        for width in [300.0, 480.0] {
+            for height in [160.0, 240.0, 360.0] {
+                let outline = Outline::of(&state, width, height);
+                assert_eq!(
+                    outline.scrollables.len(),
+                    2,
+                    "list and selection scroll independently"
+                );
+                let list = outline.scrollables[0].0;
+                let details = outline.scrollables[1].0;
+                assert!(
+                    list.height <= height * STACKED_LIST_SHARE + 0.5,
+                    "at {width}x{height} the list must leave room below its header: {list:?}"
+                );
+                assert!(
+                    details.height > 0.0,
+                    "at {width}x{height} the selected automation must have a usable viewport: {details:?}"
+                );
+                assert!(
+                    details.y + details.height <= height + 0.5,
+                    "the selected viewport stays inside the pane: {details:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn automation_switcher_selects_the_view_on_screen_and_a_run_keeps_its_origin() {
         use crate::automations::FiringState;
         fn selected(state: &State, busy: bool) -> Section {
@@ -3842,6 +3883,119 @@ mod tests {
             "the same control names the work: {busy:?}"
         );
         assert!(!busy[refresh].1, "and cannot start it again");
+    }
+
+    #[test]
+    fn refresh_keeps_keyboard_focus_through_a_failed_request_and_retry() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse,
+            widget::{Operation, Tree, operation},
+        };
+        use cosmic::iced::{Event, Rectangle, Size, keyboard};
+        #[derive(Default)]
+        struct Focused(Option<bool>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&refresh_id()) {
+                    self.0 = Some(state.is_focused());
+                }
+            }
+        }
+        fn enter(
+            state: &State,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            focus_once: bool,
+        ) -> Vec<Action> {
+            let mut element = state.view();
+            tree.diff(element.as_widget_mut());
+            let viewport = Rectangle::with_size(Size::new(900.0, 700.0));
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            if focus_once {
+                let mut focus = operation::focusable::focus::<()>(refresh_id());
+                element
+                    .as_widget_mut()
+                    .operate(tree, Layout::new(&node), renderer, &mut focus);
+            }
+            let mut focused = Focused::default();
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), renderer, &mut focused);
+            assert_eq!(
+                focused.0,
+                Some(true),
+                "the retained Refresh control keeps keyboard focus"
+            );
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut actions = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut actions),
+                &viewport,
+            );
+            actions
+        }
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            list_status: ListStatus::Loaded,
+            ..Default::default()
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(state.view().as_widget());
+        let actions = enter(&state, &mut tree, &renderer, true);
+        assert!(matches!(actions.as_slice(), [Action::Refresh]));
+        let Some(Effect::Request { sequence, .. }) =
+            state.update(actions.into_iter().next().unwrap())
+        else {
+            panic!("the focused control starts its real list read");
+        };
+        assert!(
+            enter(&state, &mut tree, &renderer, false).is_empty(),
+            "Enter cannot duplicate an in-flight read"
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("offline list fixture".into())),
+        });
+        assert!(matches!(state.list_status, ListStatus::Failed(_)));
+        let actions = enter(&state, &mut tree, &renderer, false);
+        assert!(
+            matches!(actions.as_slice(), [Action::Refresh]),
+            "the same keyboard focus retries after failure"
+        );
+        assert!(matches!(
+            state.update(actions.into_iter().next().unwrap()),
+            Some(Effect::Request {
+                request: Request::List { after: None, .. },
+                ..
+            })
+        ));
     }
 
     #[test]
