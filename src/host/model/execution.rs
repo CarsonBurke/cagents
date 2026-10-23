@@ -2016,7 +2016,8 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE native_actor_retirements;
+                        "DROP TABLE automation_lifecycle;
+                         DROP TABLE native_actor_retirements;
                          DROP TABLE native_actor_ownerships;
                          DROP TABLE native_actor_cursors;
                          DROP TABLE shared_view_terminal_sources;
@@ -2881,7 +2882,10 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP INDEX agents_by_name; PRAGMA user_version=9;")
+            .execute_batch(
+                "DROP TABLE automation_lifecycle;
+                 DROP INDEX agents_by_name; PRAGMA user_version=9;",
+            )
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

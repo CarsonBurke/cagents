@@ -68,8 +68,14 @@ impl Fixture {
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_cagents"));
-        c.env_clear()
-            .env("HOME", self.path())
+        // Preserve delegation while isolating credentials, paths and tools.
+        // The fixture curl/keyring and private HOME still own every request.
+        for (name, _) in std::env::vars_os() {
+            if name != std::ffi::OsStr::new(cagents::agent_execution::AUTHORITY_ENV) {
+                c.env_remove(name);
+            }
+        }
+        c.env("HOME", self.path())
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.path().join("bin").display()),

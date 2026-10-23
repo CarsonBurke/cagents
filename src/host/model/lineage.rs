@@ -513,7 +513,10 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE session_lineages; PRAGMA user_version = 3;")
+            .execute_batch(
+                "DROP TABLE automation_lifecycle;
+                 DROP TABLE session_lineages; PRAGMA user_version = 3;",
+            )
             .unwrap();
         drop(registry);
 

@@ -589,12 +589,13 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**All run history** includes runs from removed definitions. It pages through
+**Run history** includes runs from removed definitions. It pages through
 their original names, times, outcomes, and bounded results. Opening history does
 not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. Completion alerts
-open this exact run history and survive provider cleanup. Removing a definition
-prevents future runs and retains its past runs.
+session; completed fresh sessions remain readable in history. A completion alert
+opens its run under **Automations**, with a trail back to the list, and
+survives provider cleanup. Removing a definition prevents future runs and
+retains its past runs.
 
 The same operations are available without a window:
 
@@ -605,8 +606,24 @@ cagents automation enable AUTOMATION_ID --revision REVISION --confirm
 cagents automation run-now AUTOMATION_ID --execution-revision EXECUTION_REVISION --request-id REQUEST_UUID --confirm
 cagents automation history
 cagents automation history AUTOMATION_ID --limit 50
+cagents automation audit AUTOMATION_ID --limit 50
 cagents automation run FIRING_ID
 ```
+
+**Lifecycle** in the native automation details, or `automation audit`, lists
+committed management changes and system pause, block and recovery receipts.
+Each receipt identifies its exact revision, time, cause and actor class; these
+classes describe an admitted user management request or a system operation,
+not a person's identity. Run outcomes remain in **Run history**. Audit reads do
+not launch providers or change a schedule. The last 256 lifecycle receipts per
+automation are retained, including after removal; pages contain at most 100.
+Use the audit page's `next` value as `--before SEQUENCE` for an older page.
+Earlier unrecorded or expired events remain explicitly unavailable: their actor
+and cause cannot be recovered from the current enabled state. Prompt bodies,
+launch environment and provider diagnostics are excluded from these receipts.
+Hosted conversations can read only receipts committed in their own project.
+Moving a definition does not move its earlier audit receipts into the new
+project; management inspection retains the complete retained chain.
 
 Read both revisions from `show`. Reuse the same request UUID when retrying a
 manual request whose response was lost; a new UUID means a new run. History
