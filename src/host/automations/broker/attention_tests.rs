@@ -10,7 +10,7 @@ use crate::{
     workspace_model::ModelEdit,
 };
 
-fn add_waiting_run(registry: &mut Registry) -> Run {
+fn add_started_run(registry: &mut Registry) -> Run {
     let definition = serde_json::from_value(serde_json::json!({
         "name":"private automation title", "prompt":"private automation prompt",
         "agent":{"provider":"Claude","account":null,"target":{"repository":"/fixture","directory":"/fixture","channel":null},"surface":"Chat","model":null,"permission_mode":null},
@@ -42,7 +42,7 @@ fn add_waiting_run(registry: &mut Registry) -> Run {
         .unwrap()
         .accepted
         .unwrap();
-    let run = registry
+    registry
         .update_agent_run(
             accepted.run.id,
             accepted.run.revision,
@@ -51,7 +51,11 @@ fn add_waiting_run(registry: &mut Registry) -> Run {
             },
             300,
         )
-        .unwrap();
+        .unwrap()
+}
+
+fn add_waiting_run(registry: &mut Registry) -> Run {
+    let run = add_started_run(registry);
     registry
         .update_agent_run(run.id, run.revision, Update::Waiting, 400)
         .unwrap()
@@ -199,18 +203,45 @@ fn journal_write_failure_keeps_source_until_a_later_real_commit() {
 #[test]
 fn source_ack_failure_retains_commit_proof_without_resending_the_event() {
     let (directory, registry, _) = fixture();
+    add_waiting_run(&mut registry.lock().unwrap());
+    let before = registry
+        .lock()
+        .unwrap()
+        .pending_automation_attention(100)
+        .unwrap()
+        .into_iter()
+        .map(|pending| pending.receipt)
+        .collect::<Vec<_>>();
+    assert_eq!(before.len(), 2);
     let (notifications, mut journal) =
         JournalTestBridge::new(&directory.path().join("notices.sqlite3")).unwrap();
     let mut transfer = AttentionTransfer::default();
     transfer.pump(&registry, Some(&notifications)).unwrap();
-    journal.commit_next(&Preferences::default(), false).unwrap();
+    assert!(
+        journal
+            .commit_next(&Preferences::default(), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        journal
+            .commit_next(&Preferences::default(), false)
+            .unwrap()
+            .is_some()
+    );
+    // BTree order is the production batch order. Refuse the second DELETE,
+    // after the first one has executed, to require atomic source rollback.
+    let second = transfer.in_flight.keys().nth(1).copied().unwrap();
     let connection = rusqlite::Connection::open(directory.path().join("registry.sqlite3")).unwrap();
-    connection.execute_batch("CREATE TRIGGER fail_source_ack BEFORE DELETE ON automation_run_attention BEGIN SELECT RAISE(ABORT,'fixture source acknowledgement refused'); END").unwrap();
+    connection.execute_batch(&format!("CREATE TRIGGER fail_source_ack BEFORE DELETE ON automation_run_attention WHEN OLD.run='{}' AND OLD.revision='{}' BEGIN SELECT RAISE(ABORT,'fixture source acknowledgement refused'); END",second.run,second.revision)).unwrap();
     assert!(transfer.pump(&registry, Some(&notifications)).is_err());
-    assert!(matches!(
-        transfer.in_flight.values().next(),
-        Some(AttentionCommit::Committed)
-    ));
+    assert_eq!(transfer.in_flight.len(), 2);
+    assert!(
+        transfer
+            .in_flight
+            .values()
+            .all(|proof| matches!(proof, AttentionCommit::Committed))
+    );
     assert!(journal.pending_events().is_empty());
     assert_eq!(
         registry
@@ -218,9 +249,12 @@ fn source_ack_failure_retains_commit_proof_without_resending_the_event() {
             .unwrap()
             .pending_automation_attention(100)
             .unwrap()
-            .len(),
-        1
+            .into_iter()
+            .map(|pending| pending.receipt)
+            .collect::<Vec<_>>(),
+        before
     );
+    assert_eq!(journal.list().unwrap().len(), 2);
     connection
         .execute_batch("DROP TRIGGER fail_source_ack")
         .unwrap();
@@ -229,7 +263,7 @@ fn source_ack_failure_retains_commit_proof_without_resending_the_event() {
     assert!(transfer.in_flight.is_empty());
     assert!(
         journal.pending_events().is_empty(),
-        "retry the source ACK alone"
+        "retry the source ACK batch alone"
     );
     assert!(
         registry
@@ -414,9 +448,47 @@ fn suppressed_private_automation_attention_commits_without_prompt_or_title_conte
 
 #[test]
 fn receipt_ownership_is_bounded_and_later_source_pages_make_progress() {
-    let (directory, registry, _) = fixture();
-    for _ in 0..MAX_ATTENTION_IN_FLIGHT {
-        add_waiting_run(&mut registry.lock().unwrap());
+    fn finish_and_close(registry: &mut Registry, run: Run) {
+        let finished = registry
+            .update_agent_run(
+                run.id,
+                run.revision,
+                Update::Finished {
+                    state: crate::agent_execution::State::Succeeded,
+                    result: Default::default(),
+                },
+                500,
+            )
+            .unwrap();
+        let agent = registry.agent(finished.agent).unwrap();
+        assert!(
+            registry
+                .close_agent(&agent.origin, agent.id)
+                .unwrap()
+                .closed
+        );
+    }
+
+    let (directory, registry, first) = fixture();
+    {
+        let mut registry = registry.lock().unwrap();
+        finish_and_close(&mut registry, first);
+        // Build pending terminal evidence sequentially through normal run
+        // transitions and close. Never exceed live-run/open-agent admission.
+        for _ in 0..MAX_ATTENTION_IN_FLIGHT {
+            let run = add_started_run(&mut registry);
+            finish_and_close(&mut registry, run);
+        }
+        assert!(registry.agents(None).unwrap().is_empty());
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .iter()
+                .all(|pending| {
+                    pending.event.evidence.kind == crate::notifications::Kind::Succeeded
+                })
+        );
     }
     let (notifications, mut journal) =
         JournalTestBridge::new(&directory.path().join("notices.sqlite3")).unwrap();
@@ -424,11 +496,41 @@ fn receipt_ownership_is_bounded_and_later_source_pages_make_progress() {
     transfer.pump(&registry, Some(&notifications)).unwrap();
     assert_eq!(transfer.in_flight.len(), MAX_ATTENTION_IN_FLIGHT);
     assert_eq!(journal.pending_events().len(), MAX_ATTENTION_IN_FLIGHT);
-    // A withheld first page neither duplicates nor allocates more receivers.
-    transfer.pump(&registry, Some(&notifications)).unwrap();
+    // A full receiver page must not acquire the source mutex or an Immediate
+    // transaction just to rediscover its own pending edges. The timeout is a
+    // deadlock/progress guard, not a throughput or latency assertion.
+    let original = journal.pending_events();
+    let (sent, received) = std::sync::mpsc::channel();
+    let source = registry.clone();
+    let destination = notifications.clone();
+    let held = registry.lock().unwrap();
+    let worker = std::thread::spawn(move || {
+        let result = transfer.pump(&source, Some(&destination));
+        sent.send((transfer, result)).unwrap();
+    });
+    let result = received.recv_timeout(Duration::from_secs(5));
+    // Release before asserting/joining so a regression cannot strand a thread
+    // behind the guard when this test reports the failure.
+    drop(held);
+    worker.join().unwrap();
+    let (mut transfer, result) = result.expect("full receiver page must not need source admission");
+    result.unwrap();
     assert_eq!(transfer.in_flight.len(), MAX_ATTENTION_IN_FLIGHT);
     assert_eq!(journal.pending_events().len(), MAX_ATTENTION_IN_FLIGHT);
-    for _ in 0..MAX_ATTENTION_IN_FLIGHT {
+
+    // One free slot still reads the full source page: the first99 entries are
+    // already in flight, while the later101st edge must fill that last slot.
+    journal.commit_next(&Preferences::default(), true).unwrap();
+    transfer.pump(&registry, Some(&notifications)).unwrap();
+    let queued = journal.pending_events();
+    assert_eq!(queued.len(), MAX_ATTENTION_IN_FLIGHT);
+    assert_eq!(transfer.in_flight.len(), MAX_ATTENTION_IN_FLIGHT);
+    assert!(
+        !original
+            .iter()
+            .any(|event| event.target == queued.last().unwrap().target)
+    );
+    for _ in 1..MAX_ATTENTION_IN_FLIGHT {
         journal.commit_next(&Preferences::default(), true).unwrap();
     }
     transfer.pump(&registry, Some(&notifications)).unwrap();

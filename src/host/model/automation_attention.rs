@@ -175,6 +175,40 @@ impl Registry {
             .map(|changed| changed == 1)
             .map_err(|error| error.to_string())
     }
+
+    /// A bounded batch of original successful journal receipts shares one
+    /// source transaction. Callers retain every proof until this returns Ok;
+    /// any delete/commit error leaves the entire batch unacknowledged. Stale
+    /// or duplicate receipts are harmless exact-delete no-ops.
+    pub(crate) fn ack_automation_attention_batch(
+        &mut self,
+        receipts: &[AutomationAttentionReceipt],
+    ) -> Result<(), String> {
+        if receipts.len() > MAX_PAGE {
+            return Err("Automation attention acknowledgement batch exceeds its limit".into());
+        }
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        {
+            let mut delete = tx
+                .prepare("DELETE FROM automation_run_attention WHERE run=?1 AND revision=?2")
+                .map_err(|error| error.to_string())?;
+            for receipt in receipts {
+                delete
+                    .execute(params![
+                        receipt.run.to_string(),
+                        receipt.revision.to_string()
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
 }
 
 fn read_pending(db: &Connection, limit: usize) -> Result<Vec<PendingAutomationAttention>, String> {
@@ -662,6 +696,97 @@ mod tests {
         assert_eq!(
             pending[0].event.evidence.key,
             format!("{}:waiting:{}", waiting.id, new_waiting.revision)
+        );
+    }
+
+    #[test]
+    fn batch_ack_rolls_back_prior_deletes_and_retry_preserves_a_newer_replacement() {
+        let (mut registry, _directory, first) = fixture();
+        let second = accept(&mut registry);
+        let third = accept(&mut registry);
+        for accepted in [&first, &second, &third] {
+            let running = start(&mut registry, &accepted.run);
+            registry
+                .update_agent_run(running.id, running.revision, Update::Waiting, 400)
+                .unwrap();
+        }
+        let original = registry.pending_automation_attention(100).unwrap();
+        let first_receipt = original[0].receipt;
+        let second_receipt = original[1].receipt;
+        let stale_third = original[2].receipt;
+        let resumed = registry
+            .update_agent_run(third.run.id, stale_third.revision, Update::Resumed, 500)
+            .unwrap();
+        registry
+            .update_agent_run(third.run.id, resumed.revision, Update::Waiting, 600)
+            .unwrap();
+        let before = registry.pending_automation_attention(100).unwrap();
+        let replacement = before[2].clone();
+        assert_ne!(replacement.receipt, stale_third);
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TABLE refuse_attention_ack(run TEXT NOT NULL);
+            CREATE TEMP TRIGGER fail_attention_ack BEFORE DELETE ON automation_run_attention
+            WHEN OLD.run=(SELECT run FROM refuse_attention_ack)
+            BEGIN SELECT RAISE(ABORT, 'fixture second source delete refused'); END;",
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "INSERT INTO refuse_attention_ack VALUES (?1)",
+                [second.run.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .ack_automation_attention_batch(&[first_receipt, second_receipt, stale_third])
+                .is_err()
+        );
+        let retained = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(retained.len(), before.len());
+        for (actual, expected) in retained.iter().zip(&before) {
+            assert_eq!(
+                actual.receipt, expected.receipt,
+                "the first delete must roll back when the second aborts"
+            );
+            assert_eq!(actual.event, expected.event);
+        }
+        registry
+            .db
+            .execute_batch("DROP TRIGGER fail_attention_ack")
+            .unwrap();
+        registry
+            .ack_automation_attention_batch(&[
+                first_receipt,
+                first_receipt,
+                second_receipt,
+                stale_third,
+            ])
+            .unwrap();
+        let retained = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].receipt, replacement.receipt);
+        assert_eq!(retained[0].event, replacement.event);
+        assert!(
+            registry
+                .ack_automation_attention_batch(&[replacement.receipt; 101])
+                .is_err()
+        );
+        registry.ack_automation_attention_batch(&[]).unwrap();
+        assert_eq!(
+            registry.pending_automation_attention(100).unwrap()[0].receipt,
+            replacement.receipt
+        );
+        registry
+            .ack_automation_attention_batch(&[replacement.receipt; 100])
+            .unwrap();
+        assert!(
+            registry
+                .pending_automation_attention(100)
+                .unwrap()
+                .is_empty()
         );
     }
 

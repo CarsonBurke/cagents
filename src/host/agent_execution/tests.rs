@@ -52,10 +52,13 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     }
     install_claude(&root.join("bin/claude"));
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    // Keep the caller's delegation inherited unchanged, without inspecting or
-    // copying its value. Every other environment input is fixture-owned.
+    // Keep the caller's delegation and optional matched helper inherited
+    // unchanged. Retained mode still requires its separate explicit opt-in;
+    // ordinary service fixtures continue using the local transport.
     for (name, _) in std::env::vars_os() {
-        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+        {
             command.env_remove(name);
         }
     }

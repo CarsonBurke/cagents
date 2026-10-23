@@ -797,16 +797,27 @@ impl AttentionTransfer {
                 },
                 AttentionCommit::Committed => {}
             }
-            if !acknowledge {
-                continue;
+        }
+        if acknowledge {
+            let committed = self
+                .in_flight
+                .iter()
+                .filter_map(|(receipt, state)| {
+                    matches!(state, AttentionCommit::Committed).then_some(*receipt)
+                })
+                .collect::<Vec<_>>();
+            if !committed.is_empty() {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ack_automation_attention_batch(&committed)?;
+                // Retire proof only after the whole transaction commits. Any
+                // failure retains every Committed entry for ACK-only retry.
+                // An exact stale ACK can never remove a replacement edge.
+                for receipt in committed {
+                    self.in_flight.remove(&receipt);
+                }
             }
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .ack_automation_attention(receipt)?;
-            // A false ACK means the exact edge was replaced or withdrawn; it
-            // never authorizes deleting the newer source row for this run.
-            self.in_flight.remove(&receipt);
         }
 
         Ok(retry)
@@ -819,6 +830,13 @@ impl AttentionTransfer {
     ) -> Result<AttentionProgress, String> {
         if self.poll_receipts(registry, true)? {
             return Ok(AttentionProgress::Retry);
+        }
+        // The first page may consist entirely of these original in-flight
+        // edges. At capacity do not acquire a source write transaction merely
+        // to rediscover them. Keep the full page limit below when partially
+        // occupied, so an in-flight prefix cannot starve later source rows.
+        if self.in_flight.len() == MAX_ATTENTION_IN_FLIGHT {
+            return Ok(AttentionProgress::Waiting);
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         // A short Immediate source transaction also excludes writers using a
