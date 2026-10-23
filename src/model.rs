@@ -1226,6 +1226,8 @@ pub struct WorkspaceState {
     /// Unsent native-chat composer text, keyed by the card that owns it.
     #[serde(default)]
     pub chat_drafts: HashMap<CardId, String>,
+    #[serde(default)]
+    pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1272,6 +1274,7 @@ impl Default for WorkspaceState {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            chat_draft_attachments: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -1304,6 +1307,8 @@ impl WorkspaceState {
         }
         self.card_scopes.retain(|id, _| !retired.contains(id));
         self.chat_drafts.retain(|id, _| !retired.contains(id));
+        self.chat_draft_attachments
+            .retain(|id, _| !retired.contains(id));
         self.agent_updates.retain(|id, _| !retired.contains(id));
         self.pending_chat_admissions
             .retain(|id, _| !retired.contains(id));
@@ -1393,6 +1398,7 @@ mod tests {
             .chat_drafts
             .insert(closed, "retained composer".repeat(1024));
         state.chat_drafts.insert(open, "unsent".into());
+        state.chat_drafts.insert(pending, "closing unsent".into());
         state.card_scopes.insert(closed, PathBuf::from("/project"));
         let admission = crate::chat::Session {
             id: TerminalId::new(),
@@ -1412,11 +1418,39 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
         };
+        let directory = tempfile::tempdir().unwrap();
+        let shared_asset = directory.path().join("shared-draft.png");
+        let retired_asset = directory.path().join("retired-draft.png");
+        let asset_bytes = b"managed assets are not owned by descriptor retirement";
+        std::fs::write(&shared_asset, asset_bytes).unwrap();
+        std::fs::write(&retired_asset, asset_bytes).unwrap();
+        let image = crate::chat::Attachment {
+            path: shared_asset.clone(),
+            reference: Some(crate::chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number: 37,
+                device: uuid::Uuid::new_v4(),
+                name: "shared-draft.png".into(),
+                sha256: "a".repeat(64),
+                extension: "png".into(),
+            }),
+        };
+        let mut retired_image = image.clone();
+        retired_image.path = retired_asset.clone();
+        retired_image.reference.as_mut().unwrap().id = uuid::Uuid::new_v4();
         for id in [closed, pending, open] {
             state.agent_updates.insert(id, None);
             state.pending_chat_admissions.insert(id, admission.clone());
+            state.chat_draft_attachments.insert(id, vec![image.clone()]);
         }
+        state
+            .chat_draft_attachments
+            .get_mut(&closed)
+            .unwrap()
+            .push(retired_image);
         assert_eq!(state.retire_committed_cards(&BTreeSet::new()), 0);
+        assert_eq!(state.chat_draft_attachments.len(), 3);
+        assert_eq!(state.chat_draft_attachments[&closed].len(), 2);
         assert_eq!(state.pending_chat_admissions.len(), 3);
         assert_eq!(state.agent_updates.len(), 3);
         assert_eq!(
@@ -1430,12 +1464,19 @@ mod tests {
         assert!(!state.chat_drafts.contains_key(&closed));
         assert!(!state.card_scopes.contains_key(&closed));
         assert_eq!(state.chat_drafts[&open], "unsent");
+        assert_eq!(state.chat_drafts[&pending], "closing unsent");
         assert!(!state.agent_updates.contains_key(&closed));
         assert!(!state.pending_chat_admissions.contains_key(&closed));
+        assert!(!state.chat_draft_attachments.contains_key(&closed));
         for id in [pending, open] {
             assert!(state.agent_updates.contains_key(&id));
             assert_eq!(state.pending_chat_admissions[&id], admission);
+            assert_eq!(state.chat_draft_attachments[&id], vec![image.clone()]);
         }
+        // These records own metadata, not the managed asset store. Neither a
+        // shared draft nor a closed-only blob is deleted by RAM retirement.
+        assert_eq!(std::fs::read(shared_asset).unwrap(), asset_bytes);
+        assert_eq!(std::fs::read(retired_asset).unwrap(), asset_bytes);
         assert_eq!(state.focused, Some(open));
     }
 
