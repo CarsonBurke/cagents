@@ -269,6 +269,22 @@ Closing the form leaves an outstanding request running and its result appears
 in a notice. If creation cannot be confirmed, inspect the account configuration
 before another request. Cagents does not retry or roll back an uncertain creation.
 
+For headless setup, use the same selected-device flow through the CLI:
+
+```sh
+cagents --device workstation account create-coding-defaults \
+  --account codex/00000000-0000-4000-8000-000000000001 \
+  --workspace '~/projects/example' --expect-email you@example.com
+```
+
+This checks the selected login without a scratch write or GitHub request, then
+inspects and creates only an absent configuration. Add `--allow-network` to
+include network access; it is disabled otherwise. The command preserves inherited
+caller authority, so hosted agents cannot use it to change their permissions.
+Existing entries are preserved. An uncertain creation is not retried: inspect
+the same account on the same device before another request. Created defaults
+apply to new Codex processes and do not establish actual execution readiness.
+
 ## Removing a linked account registration
 
 Use the stable account ID from `cagents account list` on the selected device:

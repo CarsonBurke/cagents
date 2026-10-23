@@ -2,6 +2,7 @@ use super::*;
 use crate::account::info::{Query, Report};
 
 mod check;
+mod coding_defaults;
 mod link;
 mod list;
 mod preferences;
@@ -11,6 +12,8 @@ mod removal;
 pub enum AccountCommand {
     /// Observe one Codex account's default policy and explicitly requested capabilities.
     Check(check::Args),
+    /// Create absent coding defaults for one registered Codex account; preserves existing files.
+    CreateCodingDefaults(coding_defaults::Args),
     /// Register an existing provider home on this device, or on --device.
     /// Does not transfer credentials or verify coding access.
     Link {
@@ -60,6 +63,7 @@ pub enum AccountCommand {
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
         AccountCommand::Check(args) => return check::execute(args),
+        AccountCommand::CreateCodingDefaults(args) => return coding_defaults::execute(args),
         AccountCommand::Link { provider, home } => return link::execute(provider, home),
         AccountCommand::Default {
             provider,
