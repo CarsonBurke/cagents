@@ -13664,7 +13664,7 @@ pub(crate) mod tests {
     fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
         let renderer = headless_renderer();
         let worktree = worktree(3, "feature", true);
-        let expected_name = worktree_accessible_name(&worktree, false, None, false);
+        let expected_name = worktree_accessible_name(&worktree, WorktreeRowState::default());
         assert!(expected_name.contains("1 changes"));
         fn badge_count(node: &layout::Node) -> usize {
             usize::from(
