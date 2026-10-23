@@ -119,9 +119,12 @@ fn enroll(
             state.account_readiness_uses.clone(),
         )
     };
+    // A new explicit check can retire previously completed quarantined checks
+    // before the bounded enrollment limit is evaluated.
+    use_lease::cleanup_retained(&map);
     let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
     verify_start(host, &home, &working)?;
-    let lease = Arc::new(use_lease::Lease::enroll(&map, scope));
+    let lease = Arc::new(use_lease::Lease::enroll(&map, scope).map_err(scope_error)?);
     Ok(Arc::new(Owner {
         host: host.clone(),
         home,
@@ -145,6 +148,10 @@ impl crate::account::probe::SpawnOwner for Owner {
         verify_start(&self.host, &self.home, &self.working).map_err(|error| error.message)?;
         crate::account::probe::spawn_authorized(command)
     }
+
+    fn preserve_unconfirmed(&self, child: tokio::process::Child) {
+        self._lease.retain_unconfirmed(child);
+    }
 }
 
 fn scope_error(message: String) -> ProtocolError {
@@ -160,7 +167,9 @@ fn uses(host: &SharedHost) -> use_lease::Leases {
 
 /// Caller serializes the final destructive census with reader enrollment.
 pub(super) fn ensure_unused(host: &SharedHost, path: &Path) -> Result<(), ProtocolError> {
-    use_lease::ensure_outside(&uses(host), path).map_err(scope_error)
+    let map = uses(host);
+    use_lease::cleanup_retained(&map);
+    use_lease::ensure_outside(&map, path).map_err(scope_error)
 }
 
 pub(super) fn ensure_unused_directory(
@@ -168,11 +177,15 @@ pub(super) fn ensure_unused_directory(
     path: &Path,
     pin: &File,
 ) -> Result<(), ProtocolError> {
-    use_lease::ensure_outside_directory(&uses(host), path, pin).map_err(scope_error)
+    let map = uses(host);
+    use_lease::cleanup_retained(&map);
+    use_lease::ensure_outside_directory(&map, path, pin).map_err(scope_error)
 }
 
 pub(super) fn ensure_idle(host: &SharedHost) -> Result<(), ProtocolError> {
-    if use_lease::active_count(&uses(host)) == 0 {
+    let map = uses(host);
+    use_lease::cleanup_retained(&map);
+    if use_lease::active_count(&map) == 0 {
         Ok(())
     } else {
         Err(refused(
@@ -495,6 +508,63 @@ mod tests {
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.contains("shutdown is committed"), "{error}");
         ensure_idle(&host).unwrap();
+    }
+
+    #[test]
+    fn retained_original_child_fences_removal_until_reaped_without_blocking_launches() {
+        use crate::account::probe::SpawnOwner;
+        use std::{
+            collections::BTreeMap,
+            process::Stdio,
+            time::{Duration, Instant},
+        };
+        let (_root, host, home, working) = lease_fixture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let owner = enroll(&host, home.clone(), working.clone()).unwrap();
+        // EOF on this owned pipe controls a real harmless child. Its original
+        // Child is moved to quarantine; no PID census or signal is substituted
+        // for the eventual try_wait proof.
+        let mut command = tokio::process::Command::new("/bin/cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .current_dir(&working.canonical);
+        let mut child = owner.spawn(&mut command).unwrap().unwrap();
+        let input = child.stdin.take().unwrap();
+        owner.preserve_unconfirmed(child);
+        drop(owner);
+        assert!(ensure_idle(&host).is_err());
+        assert!(ensure_unused(&host, &working.canonical).is_err());
+        assert!(
+            super::super::worktree_removal::Reservation::install(&host, &working.canonical)
+                .is_err()
+        );
+        super::super::account_lifecycle::ensure_launch(
+            &host,
+            &working.canonical,
+            &BTreeMap::from([("CODEX_HOME".into(), home.canonical.to_str().unwrap().into())]),
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        admit(&host, &crate::terminal_ipc::ClientRequest::List).unwrap();
+        drop(input);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ensure_idle(&host).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the original child did not finish and reap"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ensure_unused(&host, &working.canonical).unwrap();
+        super::super::worktree_removal::Reservation::install(&host, &working.canonical).unwrap();
     }
 
     #[test]
