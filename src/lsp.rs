@@ -37,7 +37,6 @@ use crate::repository_widget::text_editor::{Position as NativePosition, TextSnap
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
-use std::io;
 use std::ops::{ControlFlow, Range};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
@@ -47,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
+use std::{fmt, io};
 
 use async_lsp::router::Router;
 use async_lsp::{MainLoop, ServerSocket};
@@ -540,6 +540,39 @@ pub struct LspProgress {
     pub done: bool,
 }
 
+/// Authority to deliver one document's current server status or progress.
+/// Only the manager and its bound producer can mint this capability.
+#[derive(Clone)]
+pub struct LspDelivery(Arc<DeliveryState>);
+
+struct DeliveryState {
+    active: AtomicBool,
+    session: Option<Arc<AtomicBool>>,
+}
+
+impl fmt::Debug for LspDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspDelivery").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for LspDelivery {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl LspDelivery {
+    fn active(&self) -> bool {
+        self.0.active.load(Ordering::Acquire)
+            && self
+                .0
+                .session
+                .as_ref()
+                .is_none_or(|retired| !retired.load(Ordering::Acquire))
+    }
+}
+
 /// Everything the runtime pushes to the application.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspEvent {
@@ -579,10 +612,12 @@ pub enum LspEvent {
     Status {
         doc: LspDocumentId,
         status: LspStatus,
+        delivery: LspDelivery,
     },
     Progress {
         doc: LspDocumentId,
         progress: LspProgress,
+        delivery: LspDelivery,
     },
     /// A request produced no usable answer. Superseded requests report
     /// [`LspError::Cancelled`].
@@ -1176,6 +1211,13 @@ impl SnapshotStore {
         Some(self.lock().uris.get(uri)?.latest())
     }
 
+    fn bound_to_other_session(&self, uri: &Url, session: &SessionKey) -> bool {
+        self.lock()
+            .uris
+            .get(uri)
+            .is_some_and(|state| &state.session != session)
+    }
+
     fn snapshot_at(&self, uri: &Url, version: i32) -> Option<Arc<Snapshot>> {
         let inner = self.lock();
         let state = inner.uris.get(uri)?;
@@ -1268,6 +1310,8 @@ enum StagedClass {
 
 #[derive(Debug, Default)]
 struct PendingInner {
+    /// One producer per current document binding, including unbacked refusals.
+    deliveries: HashMap<LspDocumentId, LspDelivery>,
     /// Newest replaceable event per class. Bounded by the number of open
     /// documents, and a document's entries are dropped when it closes.
     replaceable: HashMap<StagedClass, LspEvent>,
@@ -1282,7 +1326,32 @@ struct PendingInner {
 }
 
 impl PendingInner {
+    fn bind(&mut self, doc: LspDocumentId, session: Option<Arc<AtomicBool>>) -> LspDelivery {
+        let delivery = LspDelivery(Arc::new(DeliveryState {
+            active: AtomicBool::new(true),
+            session,
+        }));
+        if let Some(previous) = self.deliveries.insert(doc, delivery.clone()) {
+            previous.0.active.store(false, Ordering::Release);
+        }
+        delivery
+    }
+
+    fn accepts(&self, event: &LspEvent) -> bool {
+        match event {
+            LspEvent::Status { doc, delivery, .. } | LspEvent::Progress { doc, delivery, .. } => {
+                delivery.active() && self.deliveries.get(doc) == Some(delivery)
+            }
+            _ => true,
+        }
+    }
+
     fn stage(&mut self, event: LspEvent) {
+        // Check under the same lock as rebinding, before replacing a current
+        // class. Dropping stale traffic only at delivery would lose that class.
+        if !self.accepts(&event) {
+            return;
+        }
         let class = match &event {
             LspEvent::Diagnostics { doc, version, .. } => {
                 let staged = self.diagnostic_versions.entry(*doc).or_insert(i32::MIN);
@@ -1319,7 +1388,9 @@ impl PendingInner {
                 if let StagedClass::Diagnostics(doc) = class {
                     inner.diagnostic_versions.remove(&doc);
                 }
-                return Some(event);
+                if inner.accepts(&event) {
+                    return Some(event);
+                }
             }
         };
         if prefer_terminal {
@@ -1330,6 +1401,9 @@ impl PendingInner {
     }
 
     fn forget(&mut self, doc: LspDocumentId) {
+        if let Some(delivery) = self.deliveries.remove(&doc) {
+            delivery.0.active.store(false, Ordering::Release);
+        }
         for class in [
             StagedClass::Diagnostics(doc),
             StagedClass::Status(doc),
@@ -1380,15 +1454,53 @@ struct EventSink {
 }
 
 impl EventSink {
+    fn bind(&self, doc: LspDocumentId, session: Option<Arc<AtomicBool>>) -> LspDelivery {
+        self.pending
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bind(doc, session)
+    }
+
+    fn session_delivery(
+        &self,
+        doc: LspDocumentId,
+        retired: &Arc<AtomicBool>,
+    ) -> Option<LspDelivery> {
+        let inner = self.pending.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let delivery = inner.deliveries.get(&doc)?;
+        (delivery.active()
+            && delivery
+                .0
+                .session
+                .as_ref()
+                .is_some_and(|session| Arc::ptr_eq(session, retired)))
+        .then(|| delivery.clone())
+    }
+
+    fn accepts(&self, event: &LspEvent) -> bool {
+        self.pending
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepts(event)
+    }
+
     /// Awaits channel capacity. Only session and request tasks call this, so
     /// backpressure slows protocol traffic rather than losing results.
     async fn emit(&self, event: LspEvent) {
+        if !self.accepts(&event) {
+            return;
+        }
         let _ = self.tx.send(event).await;
     }
 
     /// Never blocks. When the channel is full the event is staged by class,
     /// and [`drain_pending`] moves it on as capacity appears.
     fn emit_now(&self, event: LspEvent) {
+        if !self.accepts(&event) {
+            return;
+        }
         match self.tx.try_send(event) {
             Ok(()) => {}
             Err(async_channel::TrySendError::Closed(_)) => {}
@@ -2306,10 +2418,14 @@ impl SessionContext {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
         for doc in self.snapshots.docs_for_session(&self.key) {
+            let Some(delivery) = self.events.session_delivery(doc, &self.retired) else {
+                continue;
+            };
             self.events
                 .emit(LspEvent::Status {
                     doc,
                     status: status.clone(),
+                    delivery,
                 })
                 .await;
         }
@@ -2452,9 +2568,13 @@ fn publish_progress(state: &mut RouterState, params: &lsp_types::ProgressParams)
     // *this* session sees it and the surface can show one indexing indicator.
     // Documents belonging to another server or root are none of its business.
     for doc in state.snapshots.docs_for_session(&state.key) {
+        let Some(delivery) = state.events.session_delivery(doc, &state.retired) else {
+            continue;
+        };
         state.events.emit_now(LspEvent::Progress {
             doc,
             progress: progress.clone(),
+            delivery,
         });
     }
 }
@@ -3826,6 +3946,7 @@ struct PendingOpen {
     version: i32,
     text: Arc<Snapshot>,
     saved_text: Option<String>,
+    unavailable_reason: Option<String>,
     ticket: u64,
     owner: Arc<RegistrationOwner>,
     _discovery: Option<DiscoveryTask>,
@@ -3996,6 +4117,13 @@ impl LspManager {
         self.receiver.clone()
     }
 
+    /// Validate status/progress immediately before applying it to a surface.
+    /// A queued value can outlive its server or the document binding it named.
+    #[must_use]
+    pub fn event_is_current(&self, event: &LspEvent) -> bool {
+        self.events.accepts(event)
+    }
+
     /// Identity of the channel [`Self::events`] returns.
     ///
     /// Distinct for every manager ever built, so a subscription keyed on it is
@@ -4112,6 +4240,7 @@ impl LspManager {
                     version,
                     text: source,
                     saved_text: None,
+                    unavailable_reason: Some(discovery::BUSY_REASON.into()),
                     ticket,
                     owner: Arc::default(),
                     _discovery: None,
@@ -4165,6 +4294,7 @@ impl LspManager {
                 version,
                 text: source,
                 saved_text: None,
+                unavailable_reason: None,
                 ticket,
                 owner: Arc::default(),
                 _discovery: Some(DiscoveryTask {
@@ -4280,6 +4410,33 @@ impl LspManager {
             server_id: Arc::from(server.id.as_str()),
             root: Arc::from(root.clone()),
         };
+        // URI ownership is singular even when discovery legitimately selects
+        // a different bounded workspace for a second editor of the same file.
+        // Refuse before starting a backend or changing the original stream.
+        if self.snapshots.bound_to_other_session(&uri, &key) {
+            let reason = "This file is already open under another language-server workspace. Close its original editor before retrying.".to_owned();
+            // Keep this registration independently retryable without joining
+            // the original URI stream. A new ticket also rejects any queued
+            // duplicate of the discovery that just refused admission.
+            let ticket = self.next_discovery;
+            self.next_discovery += 1;
+            self.pending_opens.insert(
+                doc,
+                PendingOpen {
+                    path: path.to_owned(),
+                    worktree: worktree.to_owned(),
+                    language,
+                    version,
+                    text: source,
+                    saved_text: None,
+                    unavailable_reason: Some(reason.clone()),
+                    ticket,
+                    owner,
+                    _discovery: None,
+                },
+            );
+            return self.unavailable(doc, reason);
+        }
         // Keep a refused document registered so Restart can retry admission
         // after another workspace becomes idle, with its latest buffer text.
         // Ensure first: reopening previously blocked documents must not also
@@ -4327,6 +4484,7 @@ impl LspManager {
             Ok(handle) => handle,
             Err(reason) => return self.unavailable(doc, reason),
         };
+        self.events.bind(doc, Some(Arc::clone(&handle.retired)));
         // Sent unconditionally: the session decides whether this is the URI's
         // first `didOpen` or a full resynchronisation of an already open file.
         let _ = handle.commands.send(SessionCommand::Open {
@@ -4706,13 +4864,12 @@ impl LspManager {
     #[must_use]
     pub fn status(&self, doc: LspDocumentId) -> LspStatus {
         if let Some(pending) = self.pending_opens.get(&doc) {
-            return if pending._discovery.is_some() {
-                LspStatus::Starting
-            } else {
-                LspStatus::Unavailable {
-                    reason: discovery::BUSY_REASON.into(),
-                }
-            };
+            return pending
+                .unavailable_reason
+                .as_ref()
+                .map_or(LspStatus::Starting, |reason| LspStatus::Unavailable {
+                    reason: reason.clone(),
+                });
         }
         let Some(reference) = self.documents.get(&doc) else {
             return LspStatus::Disabled;
@@ -4957,9 +5114,11 @@ impl LspManager {
 
     fn unavailable(&self, doc: LspDocumentId, reason: String) -> LspStatus {
         let status = LspStatus::Unavailable { reason };
+        let delivery = self.events.bind(doc, None);
         self.events.emit_now(LspEvent::Status {
             doc,
             status: status.clone(),
+            delivery,
         });
         status
     }
@@ -5346,7 +5505,7 @@ impl std::fmt::Debug for LspManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::sync::atomic::AtomicUsize;
@@ -5676,7 +5835,9 @@ mod tests {
 
     async fn await_ready(events: &async_channel::Receiver<LspEvent>, doc: LspDocumentId) {
         next_matching(events, |event| match event {
-            LspEvent::Status { doc: at, status } if *at == doc && status.is_ready() => Some(()),
+            LspEvent::Status {
+                doc: at, status, ..
+            } if *at == doc && status.is_ready() => Some(()),
             _ => None,
         })
         .await;
@@ -5691,7 +5852,7 @@ mod tests {
         let mut pending: HashSet<_> = documents.iter().copied().collect();
         assert!(!pending.is_empty(), "expected documents to become ready");
         next_matching(events, |event| {
-            if let LspEvent::Status { doc, status } = event
+            if let LspEvent::Status { doc, status, .. } = event
                 && status.is_ready()
             {
                 pending.remove(doc);
@@ -5707,23 +5868,39 @@ mod tests {
     #[test]
     fn concurrent_readiness_wait_retains_reverse_order_and_ignores_unrelated_events() {
         block_on(async {
-            let (sender, events) = async_channel::bounded(8);
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let source = manager.events();
             let one = LspDocumentId(1);
             let two = LspDocumentId(2);
-            for (doc, status) in [
-                (two, LspStatus::Ready),
-                (LspDocumentId(3), LspStatus::Ready),
-                (one, LspStatus::Starting),
-                (two, LspStatus::Ready),
-                (one, LspStatus::Ready),
-            ] {
-                sender.try_send(LspEvent::Status { doc, status }).unwrap();
+            let three = LspDocumentId(3);
+            for doc in [one, two, three] {
+                manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "text");
             }
-            // Closing after preloading makes a lost Ready fail immediately,
-            // rather than depending on the suite's generous scheduling bound.
+            let _handle = handle_of(&slot).await;
+            let mut ready = HashMap::new();
+            while ready.len() < 3 {
+                let event = next_matching(&source, |event| match event {
+                    LspEvent::Status {
+                        status: LspStatus::Ready,
+                        ..
+                    } => Some(event.clone()),
+                    _ => None,
+                })
+                .await;
+                ready.insert(event_doc(&event).unwrap(), event);
+            }
+            let (sender, events) = async_channel::bounded(8);
+            for doc in [two, three, two, one] {
+                sender.try_send(ready[&doc].clone()).unwrap();
+            }
+            // The actual producer's values are reordered, not reminted with
+            // an unfenced default. The old sequential waiter still fails.
             drop(sender);
             await_ready_documents(&events, &[one, two]).await;
             assert!(events.is_empty());
+            manager.begin_shutdown().await;
         });
     }
 
@@ -5760,6 +5937,380 @@ mod tests {
             server_id: "rust-analyzer".to_owned(),
             language_id: "rust-analyzer".to_owned(),
         }
+    }
+
+    /// A real manager binding and in-process LSP wire for UI progress tests.
+    pub(crate) struct ProgressFixture {
+        pub(crate) doc: LspDocumentId,
+        pub(crate) ready: LspEvent,
+        handle: FakeHandle,
+        events: async_channel::Receiver<LspEvent>,
+        _root: tempfile::TempDir,
+    }
+
+    pub(crate) async fn progress_fixture() -> (LspManager, ProgressFixture) {
+        let (root, worktree, file) = workspace();
+        let mut manager = rust_manager();
+        let doc = LspDocumentId(1);
+        let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+        let events = manager.events();
+        manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc");
+        let handle = handle_of(&slot).await;
+        let ready = next_matching(&events, |event| match event {
+            LspEvent::Status {
+                status: LspStatus::Ready,
+                ..
+            } => Some(event.clone()),
+            _ => None,
+        })
+        .await;
+        (
+            manager,
+            ProgressFixture {
+                doc,
+                ready,
+                handle,
+                events,
+                _root: root,
+            },
+        )
+    }
+
+    impl ProgressFixture {
+        pub(crate) async fn publish(&self, progress: LspProgress) -> LspEvent {
+            let value = if progress.done {
+                json!({"kind":"end", "message":progress.message})
+            } else {
+                json!({"kind":"begin", "title":progress.title.unwrap_or_default(),
+                    "message":progress.message, "percentage":progress.percentage})
+            };
+            self.handle
+                .notify("$/progress", json!({"token":progress.token, "value":value}));
+            next_matching(&self.events, |event| match event {
+                LspEvent::Progress { .. } => Some(event.clone()),
+                _ => None,
+            })
+            .await
+        }
+    }
+
+    #[test]
+    fn queued_status_and_progress_cannot_cross_a_session_restart() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let doc = LspDocumentId(1);
+            let events = manager.events();
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc");
+            let old_handle = handle_of(&slot).await;
+            let old_ready = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Ready,
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            old_handle.notify(
+                "$/progress",
+                json!({"token":"old", "value":{
+                "kind":"begin", "title":"Old indexing"}}),
+            );
+            let old_progress = next_matching(&events, |event| match event {
+                LspEvent::Progress { .. } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            old_handle.write_raw(b"Content-Length: invalid\r\n\r\n".to_vec());
+            let old_failed = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Failed { .. },
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+
+            // Withhold replacement initialization: a stale Ready must not
+            // masquerade as readiness while the genuine new server starts.
+            let replacement = Arc::new(Mutex::new(None));
+            let output = Arc::clone(&replacement);
+            manager.set_transport(Arc::new(move |_| {
+                let (transport, handle) = fake_transport(|incoming| {
+                    if incoming.method == "shutdown" {
+                        vec![json!({"jsonrpc":"2.0", "id":incoming.id, "result":null})]
+                    } else {
+                        Vec::new()
+                    }
+                });
+                *output.lock().unwrap() = Some(handle);
+                Ok(transport)
+            }));
+            manager.restart(doc);
+            let new_handle = handle_of(&replacement).await;
+            let initialize = new_handle.wait_for("initialize").await;
+            let mut displayed = manager.status(doc);
+            assert_eq!(displayed, LspStatus::Starting);
+            for event in [old_ready, old_failed, old_progress] {
+                assert!(!manager.event_is_current(&event));
+                if manager.event_is_current(&event) {
+                    if let LspEvent::Status { status, .. } = event {
+                        displayed = status;
+                    }
+                }
+                assert_eq!(displayed, LspStatus::Starting);
+            }
+            new_handle
+                .push
+                .send(Outgoing::Message(json!({"jsonrpc":"2.0",
+                "id":initialize.id, "result":{"capabilities":incremental_capabilities()}})))
+                .unwrap();
+            let ready = next_matching(&events, |event| match event {
+                LspEvent::Status {
+                    status: LspStatus::Ready,
+                    ..
+                } => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            assert!(manager.event_is_current(&ready));
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn unbacked_refusal_survives_delivery_but_not_close_or_rebinding() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut manager = rust_manager();
+        let doc = LspDocumentId(1);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff.rs".to_vec()));
+        let status =
+            manager.open_for_test(doc, &path, Path::new("/fixture"), rust_language(), 1, "");
+        assert!(matches!(status, LspStatus::Unavailable { .. }));
+        assert_eq!(manager.status(doc), LspStatus::Disabled);
+        let event = manager.events().try_recv().unwrap();
+        assert!(
+            matches!(&event, LspEvent::Status { status: delivered, .. } if *delivered == status)
+        );
+        assert!(manager.event_is_current(&event));
+        manager.close(doc);
+        assert!(!manager.event_is_current(&event));
+        manager.open_for_test(doc, &path, Path::new("/fixture"), rust_language(), 1, "");
+        let rebound = manager.events().try_recv().unwrap();
+        assert!(manager.event_is_current(&rebound));
+        assert!(!manager.event_is_current(&event));
+    }
+
+    #[test]
+    fn stale_producers_cannot_displace_current_staged_status_or_progress() {
+        use std::os::unix::ffi::OsStringExt;
+        block_on(async {
+            let (manager, fixture) = progress_fixture().await;
+            let mut manager = manager;
+            let old_progress = fixture
+                .publish(LspProgress {
+                    token: "old".into(),
+                    title: Some("Old".into()),
+                    message: None,
+                    percentage: None,
+                    done: false,
+                })
+                .await;
+            let doc = fixture.doc;
+            let old_ready = fixture.ready.clone();
+            // A genuine URI refusal supersedes this doc without retiring the
+            // shared backend. Fill the channel to exercise actual staging.
+            let peer = LspDocumentId(2);
+            let reference = manager.documents[&doc].clone();
+            manager.open_for_test(
+                peer,
+                &reference.path,
+                &reference.worktree,
+                reference.language.clone(),
+                1,
+                "abc",
+            );
+            let backend = manager.sessions[&reference.session].clone();
+            while !manager.events.tx.is_full() {
+                manager.events.emit_now(LspEvent::Resources { doc });
+            }
+            let refused = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/\xff.rs".to_vec()));
+            let current_status =
+                manager.open_for_test(doc, &refused, Path::new("/fixture"), rust_language(), 1, "");
+            let current = manager.events.pending.inner.lock().unwrap().replaceable
+                [&StagedClass::Status(doc)]
+                .clone();
+            {
+                let mut inner = manager.events.pending.inner.lock().unwrap();
+                // Model the delayed producer already past its initial check.
+                inner.stage(old_ready);
+                inner.stage(old_progress.clone());
+                assert_eq!(inner.replaceable[&StagedClass::Status(doc)], current);
+                assert!(!inner.replaceable.contains_key(&StagedClass::Progress(doc)));
+            }
+            assert!(!backend.retired.load(Ordering::Acquire));
+            assert!(
+                manager
+                    .events
+                    .session_delivery(peer, &backend.retired)
+                    .is_some()
+            );
+            // A live new producer's progress also survives delayed old traffic.
+            manager.open_for_test(
+                doc,
+                &reference.path,
+                &reference.worktree,
+                reference.language,
+                1,
+                "abc",
+            );
+            let delivery = manager
+                .events
+                .session_delivery(doc, &backend.retired)
+                .unwrap();
+            let progress = LspEvent::Progress {
+                doc,
+                delivery,
+                progress: LspProgress {
+                    token: "new".into(),
+                    title: Some("New".into()),
+                    message: None,
+                    percentage: None,
+                    done: false,
+                },
+            };
+            manager.events.emit_now(progress.clone());
+            let drained = {
+                let mut inner = manager.events.pending.inner.lock().unwrap();
+                inner.stage(current);
+                inner.stage(old_progress);
+                let mut values = Vec::new();
+                while let Some(event) = inner.take(false) {
+                    values.push(event);
+                }
+                values
+            };
+            assert!(drained.contains(&progress));
+            assert!(matches!(current_status, LspStatus::Unavailable { .. }));
+            while fixture.events.try_recv().is_ok() {}
+            manager.begin_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_uri_with_another_workspace_owner_is_refused_before_backend_admission() {
+        block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let outer = directory.path().canonicalize().unwrap();
+            let package = outer.join("pkg");
+            std::fs::create_dir(&package).unwrap();
+            std::fs::write(outer.join("Cargo.toml"), "[workspace]\nmembers=[\"pkg\"]\n").unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\nname=\"pkg\"\n").unwrap();
+            let file = package.join("lib.rs");
+            std::fs::write(&file, "fixture").unwrap();
+            let mut manager = rust_manager();
+            let registry =
+                install_fake_registry(&mut manager, full_sync_capabilities(), |_| Vec::new());
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            assert_eq!(
+                open_discovered(&mut manager, one, &file, &outer).await,
+                outer
+            );
+            let uri = Url::from_file_path(&file).unwrap();
+            let original = manager.snapshots.latest(&uri).unwrap();
+            let events = manager.events();
+            let language = rust_language();
+            assert_eq!(
+                manager.open(two, &file, &package, language, 1, "different"),
+                LspStatus::Starting
+            );
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == two => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(root, package);
+            let owner = Arc::clone(&manager.pending_opens[&two].owner);
+            manager.save(two, "saved during discovery");
+            let refusal = manager.finish_discovery(two, ticket, root).unwrap();
+            assert!(
+                matches!(&refusal, LspStatus::Unavailable { reason } if reason.contains("another language-server workspace"))
+            );
+            assert_eq!(manager.status(two), refusal);
+            assert!(Arc::ptr_eq(&manager.pending_opens[&two].owner, &owner));
+            assert_eq!(
+                manager.pending_opens[&two].saved_text.as_deref(),
+                Some("saved during discovery")
+            );
+            assert_eq!(manager.document_version(two), Some(1));
+            assert_ne!(manager.pending_opens[&two].ticket, ticket);
+            assert_eq!(
+                manager.finish_discovery(two, ticket, package.clone()),
+                None,
+                "a duplicate old discovery cannot readmit the refused registration"
+            );
+            assert_eq!(manager.sessions.len(), 1, "no second backend was admitted");
+            assert_eq!(
+                registry.lock().unwrap().len(),
+                1,
+                "no second transport was spawned"
+            );
+            assert!(!manager.documents.contains_key(&two));
+            let (recipients, _) = manager
+                .snapshots
+                .diagnostic_snapshot(&uri, &manager.documents[&one].session)
+                .unwrap();
+            assert_eq!(recipients, vec![one]);
+            assert!(Arc::ptr_eq(
+                &manager.snapshots.latest(&uri).unwrap(),
+                &original
+            ));
+            assert_eq!(manager.document_version(one), Some(original.version));
+            let event = next_matching(&events, |event| match event {
+                LspEvent::Status { doc, .. } if *doc == two => Some(event.clone()),
+                _ => None,
+            })
+            .await;
+            assert!(manager.event_is_current(&event));
+            assert!(matches!(event, LspEvent::Status { status, .. } if status == refusal));
+            manager.close(one);
+            manager.change(two, 2, &[], "saved blocked edit");
+            manager.save(two, "saved blocked edit");
+            manager.change(two, 3, &[], "newest unsaved blocked edit");
+            manager.restart(two);
+            assert_eq!(manager.status(two), LspStatus::Starting);
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == two => {
+                    Some((*ticket, root.clone()))
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(root, package);
+            let status = manager.finish_discovery(two, ticket, root).unwrap();
+            if !status.is_ready() {
+                await_ready(&events, two).await;
+            }
+            assert_eq!(registry.lock().unwrap().len(), 2);
+            assert_eq!(
+                manager.documents[&two].session.root.as_ref(),
+                package.as_path()
+            );
+            let backend = handle_for(&registry, &package).await;
+            let saved = backend.wait_for("textDocument/didSave").await;
+            let opened = &backend.entries("textDocument/didOpen")[0];
+            assert_eq!(
+                opened.params["textDocument"]["text"],
+                "newest unsaved blocked edit"
+            );
+            assert_eq!(opened.params["textDocument"]["version"], 3);
+            assert_eq!(saved.params["text"], "saved blocked edit");
+            manager.begin_shutdown().await;
+        });
     }
 
     async fn open_discovered(
@@ -9094,7 +9645,9 @@ mod tests {
             manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "abc\n");
             let _handle = handle_of(&slot).await;
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc: at, status } if *at == doc => match status {
+                LspEvent::Status {
+                    doc: at, status, ..
+                } if *at == doc => match status {
                     LspStatus::Failed { .. } => Some(status.clone()),
                     _ => None,
                 },
@@ -9164,6 +9717,7 @@ mod tests {
             LspEvent::Status {
                 doc: at,
                 status: LspStatus::Failed { reason, .. },
+                ..
             } if *at == doc => Some(reason.clone()),
             _ => None,
         })
@@ -9383,7 +9937,9 @@ mod tests {
                 LspStatus::Starting
             );
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc: at, status } if *at == doc => match status {
+                LspEvent::Status {
+                    doc: at, status, ..
+                } if *at == doc => match status {
                     LspStatus::Unavailable { .. } => Some(status.clone()),
                     _ => None,
                 },
@@ -10357,7 +10913,9 @@ mod tests {
                 }),
             );
             let doc = next_matching(&events, |event| match event {
-                LspEvent::Progress { doc, progress } if progress.token == "indexing" => Some(*doc),
+                LspEvent::Progress { doc, progress, .. } if progress.token == "indexing" => {
+                    Some(*doc)
+                }
                 _ => None,
             })
             .await;
@@ -10508,7 +11066,7 @@ mod tests {
             manager.open_for_test(one, &first, &worktree, rust_language(), 1, "a\n");
             let _ = handle_for(&registry, &worktree).await;
             let status = next_matching(&events, |event| match event {
-                LspEvent::Status { doc, status } if *doc == one => match status {
+                LspEvent::Status { doc, status, .. } if *doc == one => match status {
                     LspStatus::Failed { .. } => Some(status.clone()),
                     _ => None,
                 },

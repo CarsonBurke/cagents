@@ -4378,6 +4378,9 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if !self.lsp.event_is_current(&event) {
+                            return self.lsp_next();
+                        }
                         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
                             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                                 && let Some(error) = language_server_failure(status)
@@ -7486,23 +7489,25 @@ mod tests {
         let id = add(&mut app, "/workspace", Some("a.rs"));
         let doc = LspDocumentId(1);
         app.tab_mut(id).unwrap().runtime.set_lsp_document(Some(doc));
+        app.lsp = LspManager::new(cagents::settings::AppSettings::default().language_servers);
+        let language = app.lsp.language_for(Path::new("/workspace/a.rs")).unwrap();
+        // With no async runtime, the real manager refuses registration. Its
+        // reason has no SessionHandle and must survive the delivery fence.
+        let status = app.lsp.open(
+            doc,
+            Path::new("/workspace/a.rs"),
+            Path::new("/workspace"),
+            language,
+            1,
+            "",
+        );
+        let expected = language_server_failure(status).expect("real admission refusal");
+        assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
+        let event = app.lsp.events().try_recv().unwrap();
         let generation = app.lsp.generation();
-        drop(app.update(Message::Lsp(
-            generation,
-            Some(LspEvent::Status {
-                doc,
-                status: LspStatus::Failed {
-                    reason: "initialize failed".into(),
-                    stderr_tail: vec![
-                        "toolchain unavailable".into(),
-                        "infinite recursion detected".into(),
-                    ],
-                },
-            }),
-        )));
+        drop(app.update(Message::Lsp(generation, Some(event.clone()))));
         let evidence = app.tab(id).unwrap().lsp_error.clone().unwrap();
-        assert!(evidence.contains("initialize failed"));
-        assert!(evidence.contains("toolchain unavailable\ninfinite recursion detected"));
+        assert_eq!(evidence, expected);
         drop(app.update(Message::Notices));
         assert!(app.modal_open());
         drop(app.update(Message::CloseNotices));
@@ -7512,14 +7517,26 @@ mod tests {
         drop(app.update(Message::Dismiss));
         assert!(app.tab(id).unwrap().lsp_error.is_none());
         assert!(!app.modal_open());
-        drop(app.update(Message::Lsp(
-            generation,
-            Some(LspEvent::Status {
-                doc,
-                status: LspStatus::Ready,
-            }),
-        )));
-        assert!(app.tab(id).unwrap().lsp_error.is_none());
+        app.lsp.close(doc);
+        drop(app.update(Message::Lsp(generation, Some(event))));
+        assert!(
+            app.tab(id).unwrap().lsp_error.is_none(),
+            "closed producer cannot restore a dismissed error"
+        );
+    }
+
+    #[test]
+    fn language_server_failure_preserves_the_full_stderr_evidence() {
+        let failure = language_server_failure(LspStatus::Failed {
+            reason: "initialize failed".into(),
+            stderr_tail: vec![
+                "toolchain unavailable".into(),
+                "infinite recursion detected".into(),
+            ],
+        })
+        .unwrap();
+        assert!(failure.contains("initialize failed"));
+        assert!(failure.contains("toolchain unavailable\ninfinite recursion detected"));
     }
 
     #[test]

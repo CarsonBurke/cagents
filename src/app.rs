@@ -10847,6 +10847,9 @@ impl Cagents {
 
     /// Routes one language-server event onto the card whose document it names.
     fn apply_lsp_event(&mut self, event: LspEvent) {
+        if !self.lsp.event_is_current(&event) {
+            return;
+        }
         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
             if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
                 && let Some(card) = self.lsp_documents.get(&doc)
@@ -25541,41 +25544,123 @@ mod tests {
         assert!(app.lsp_contexts[&card].context.notice.is_some());
     }
 
-    /// Progress is transient by definition, so it occupies the notice slot and
-    /// is cleared on `done` rather than accumulating a log nobody dismisses.
-    #[test]
-    fn progress_occupies_the_notice_slot_until_it_is_done() {
+    #[tokio::test]
+    async fn a_queued_ready_cannot_replace_starting_after_restart() {
+        let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
         let mut app = lsp_test_app();
+        app.lsp = manager;
+        let card = repository_card(&mut app, "/repo");
+        let doc = publisher.doc;
+        lsp_state(&mut app, card).document = Some(doc);
+        app.lsp_documents.insert(doc, card);
+        app.lsp.restart(doc);
+        lsp_state(&mut app, card).context.status = Some(LspStatus::Starting);
+        let untouched: Arc<[String]> = Arc::from(["before delivery".to_owned()]);
+        lsp_state(&mut app, card).context.live_servers = untouched.clone();
+        app.apply_lsp_event(publisher.ready.clone());
+        assert_eq!(
+            app.lsp_contexts[&card].context.status,
+            Some(LspStatus::Starting)
+        );
+        assert!(
+            Arc::ptr_eq(&app.lsp_contexts[&card].context.live_servers, &untouched),
+            "reject before Status refreshes any visible state"
+        );
+        let events = app.lsp.events();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(30), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(
+                &event,
+                LspEvent::Status {
+                    status: LspStatus::Ready,
+                    ..
+                }
+            ) {
+                app.apply_lsp_event(event);
+                break;
+            }
+        }
+        assert_eq!(
+            app.lsp_contexts[&card].context.status,
+            Some(LspStatus::Ready)
+        );
+        app.lsp.begin_shutdown().await;
+    }
+
+    #[test]
+    fn a_current_unbacked_refusal_keeps_its_reason_and_a_closed_one_is_ignored() {
+        let mut app = lsp_test_app();
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        let card = repository_card(&mut app, "/repo");
+        let doc = LspDocumentId(1);
+        lsp_state(&mut app, card).document = Some(doc);
+        app.lsp_documents.insert(doc, card);
+        let language = app.lsp.language_for(Path::new("/repo/a.rs")).unwrap();
+        // This real admission refusal has no backing session or snapshot.
+        let status = app.lsp.open(
+            doc,
+            Path::new("/repo/a.rs"),
+            Path::new("/repo"),
+            language,
+            1,
+            "",
+        );
+        assert!(matches!(status, LspStatus::Unavailable { .. }));
+        assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
+        let event = app.lsp.events().try_recv().unwrap();
+        app.apply_lsp_event(event.clone());
+        assert_eq!(app.lsp_contexts[&card].context.status, Some(status));
+        app.lsp.close(doc);
+        lsp_state(&mut app, card).context.status = Some(LspStatus::Starting);
+        app.apply_lsp_event(event);
+        assert_eq!(
+            app.lsp_contexts[&card].context.status,
+            Some(LspStatus::Starting)
+        );
+    }
+
+    /// Progress occupies the notice slot until its producer marks it done.
+    #[tokio::test]
+    async fn progress_occupies_the_notice_slot_until_it_is_done() {
+        let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
+        let mut app = lsp_test_app();
+        app.lsp = manager;
         let card = repository_card(&mut app, "/repo");
         lsp_state(&mut app, card).document = Some(LspDocumentId(1));
         app.lsp_documents.insert(LspDocumentId(1), card);
 
-        app.apply_lsp_event(LspEvent::Progress {
-            doc: LspDocumentId(1),
-            progress: crate::lsp::LspProgress {
-                token: "indexing".into(),
-                title: Some("Indexing".into()),
-                message: None,
-                percentage: Some(40),
-                done: false,
-            },
-        });
+        app.apply_lsp_event(
+            publisher
+                .publish(crate::lsp::LspProgress {
+                    token: "indexing".into(),
+                    title: Some("Indexing".into()),
+                    message: None,
+                    percentage: Some(40),
+                    done: false,
+                })
+                .await,
+        );
         assert_eq!(
             app.lsp_contexts[&card].context.notice.as_deref(),
             Some("Indexing (40%)")
         );
 
-        app.apply_lsp_event(LspEvent::Progress {
-            doc: LspDocumentId(1),
-            progress: crate::lsp::LspProgress {
-                token: "indexing".into(),
-                title: Some("Indexing".into()),
-                message: None,
-                percentage: Some(100),
-                done: true,
-            },
-        });
+        app.apply_lsp_event(
+            publisher
+                .publish(crate::lsp::LspProgress {
+                    token: "indexing".into(),
+                    title: Some("Indexing".into()),
+                    message: None,
+                    percentage: Some(100),
+                    done: true,
+                })
+                .await,
+        );
         assert!(app.lsp_contexts[&card].context.notice.is_none());
+        app.lsp.begin_shutdown().await;
     }
 
     /// A location arrives absolute and the card's file list is
@@ -26315,9 +26400,11 @@ mod tests {
     /// The notice slot has two independent producers. An indexing report
     /// arriving a second later must not erase the one message telling the user
     /// their hover, locations and completions were thrown away.
-    #[test]
-    fn progress_does_not_erase_a_failure_the_user_has_not_read() {
+    #[tokio::test]
+    async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
+        let (manager, publisher) = crate::lsp::tests::progress_fixture().await;
         let mut app = lsp_test_app();
+        app.lsp = manager;
         let card = repository_card(&mut app, "/repo");
         lsp_state(&mut app, card).document = Some(LspDocumentId(1));
         app.lsp_documents.insert(LspDocumentId(1), card);
@@ -26334,16 +26421,17 @@ mod tests {
             .expect("the desync is reported");
 
         for done in [false, true] {
-            app.apply_lsp_event(LspEvent::Progress {
-                doc: LspDocumentId(1),
-                progress: crate::lsp::LspProgress {
-                    token: "indexing".into(),
-                    title: Some("Indexing".into()),
-                    message: None,
-                    percentage: None,
-                    done,
-                },
-            });
+            app.apply_lsp_event(
+                publisher
+                    .publish(crate::lsp::LspProgress {
+                        token: "indexing".into(),
+                        title: Some("Indexing".into()),
+                        message: None,
+                        percentage: None,
+                        done,
+                    })
+                    .await,
+            );
             assert_eq!(
                 app.lsp_contexts[&card].context.notice.as_deref(),
                 Some(failure.as_str()),
@@ -26354,20 +26442,22 @@ mod tests {
         // Dismissing is the user saying they have read it; only then may
         // progress have the slot.
         let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
-        app.apply_lsp_event(LspEvent::Progress {
-            doc: LspDocumentId(1),
-            progress: crate::lsp::LspProgress {
-                token: "indexing".into(),
-                title: Some("Indexing".into()),
-                message: None,
-                percentage: Some(10),
-                done: false,
-            },
-        });
+        app.apply_lsp_event(
+            publisher
+                .publish(crate::lsp::LspProgress {
+                    token: "indexing".into(),
+                    title: Some("Indexing".into()),
+                    message: None,
+                    percentage: Some(10),
+                    done: false,
+                })
+                .await,
+        );
         assert_eq!(
             app.lsp_contexts[&card].context.notice.as_deref(),
             Some("Indexing (10%)")
         );
+        app.lsp.begin_shutdown().await;
     }
 
     /// Opening a file no configured server claims is a supported configuration,
