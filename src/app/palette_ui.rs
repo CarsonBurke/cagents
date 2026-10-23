@@ -172,6 +172,7 @@ fn entry_key(message: &Message) -> Option<String> {
         Message::ResumeConversation(resume_ui::Action::Open) => {
             Some("command:resume_conversation".into())
         }
+        Message::Sidebar(SidebarAction::OpenWork) => Some("command:open_work".into()),
         _ => None,
     }
 }
@@ -2480,5 +2481,15 @@ mod tests {
         assert!(matches!(messages.as_slice(),
             [Message::Palette(Action::Run(MessageBox(message)))]
             if matches!(message.as_ref(), Message::Sidebar(SidebarAction::OpenWork))));
+        drop(app.update(messages.into_iter().next().unwrap()));
+        assert!(!app.palette.is_open());
+        assert_eq!(
+            app.settings.palette_recents.first().map(String::as_str),
+            Some("command:open_work"),
+        );
+        drop(app.update_palette(Action::Open));
+        let entries = app.palette_entries();
+        assert!(EntryIdentity::Workboard.matches(&entries[0].2));
+        assert_eq!(app.palette.selected, Some(EntryIdentity::Workboard));
     }
 }
