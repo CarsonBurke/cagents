@@ -1246,10 +1246,9 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
         widget::row::with_children(vec![
             crate::ui_controls::button::quiet("Use code")
-                .on_press(Message::AccountUi(Action::Add {
-                    provider: Provider::Codex,
-                    device: true,
-                }))
+                .on_press(Message::AccountUi(Action::UseCodeForBlockedLogin(
+                    login.key,
+                )))
                 .into(),
             crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
                 .compact()
@@ -1271,6 +1270,168 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dispatch through the actual row, so a leftover generic Add callback
+    // cannot pass a reducer-only test of the new key-bearing action.
+    fn click_login_row(login: &Login, label: &str) -> Vec<Message> {
+        use iced::advanced::{Layout, clipboard, layout, widget::Tree};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Size, mouse};
+
+        let mut element = login_row(login);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = Size::new(1000.0, 200.0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label))
+            .unwrap_or_else(|| panic!("missing actual login control: {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        let point = Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let mut ui = UserInterface::build(element, size, Cache::new(), &mut renderer);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(!messages.is_empty(), "actual control did not dispatch");
+        messages
+    }
+
+    fn blocked_login(key: u128) -> Login {
+        Login {
+            provider: Provider::Codex,
+            key: uuid::Uuid::from_u128(key),
+            home: PathBuf::from("/cagents-fixture/accounts/codex")
+                .join(uuid::Uuid::from_u128(key).to_string()),
+            phase: LoginPhase::CallbackBlocked,
+            attempts: 0,
+            next_check: 0,
+            started_at: 0,
+            recovered: false,
+        }
+    }
+
+    fn replay(app: &mut Cagents, messages: Vec<Message>) {
+        for message in messages {
+            if let Message::AccountUi(action) = message {
+                // A positive control tests entry to the existing Add route,
+                // not login execution: never poll its discovery/home future.
+                drop(app.update_account_ui(action));
+            }
+        }
+    }
+
+    #[test]
+    fn dismissed_blocked_row_callbacks_cannot_start_code_login_for_another_row() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui.logins.push(blocked_login(145901));
+        let key = app.account_ui.logins[0].key;
+        let code = click_login_row(&app.account_ui.logins[0], "Use code");
+        let cancel = click_login_row(&app.account_ui.logins[0], "Dismiss failed sign-in");
+        // Normal abandonment completion removes A. Retained native callbacks
+        // can arrive after this reducer and after another row/popup appears.
+        drop(app.update_account_ui(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Abandoned(None)),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        app.account_ui.logins.push(blocked_login(145902));
+        let other = app.account_ui.logins[0].account();
+        app.account_ui.table.add_menu = true;
+        app.account_ui.popover = Some(other.id());
+        let registry = app.account_ui.registry.clone();
+        replay(&mut app, cancel);
+        replay(&mut app, code);
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(app.account_ui.popover, Some(other.id()));
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(app.account_ui.logins[0].account(), other);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        assert_eq!(app.account_ui.registry, registry);
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn code_recovery_callback_requires_original_codex_blocked_phase() {
+        for (provider, phase) in [
+            (Provider::Codex, LoginPhase::Waiting),
+            (Provider::Codex, LoginPhase::Verifying),
+            (Provider::Codex, LoginPhase::Settling),
+            (Provider::Claude, LoginPhase::CallbackBlocked),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.account_ui.logins.push(blocked_login(145903));
+            let code = click_login_row(&app.account_ui.logins[0], "Use code");
+            app.account_ui.logins[0].provider = provider;
+            app.account_ui.logins[0].phase = phase;
+            app.account_ui.table.add_menu = true;
+            let account = app.account_ui.logins[0].account();
+            app.account_ui.popover = Some(account.id());
+            replay(&mut app, code);
+            assert!(app.account_ui.table.add_menu, "{provider:?}/{phase:?}");
+            assert_eq!(app.account_ui.popover, Some(account.id()));
+            assert_eq!(app.account_ui.logins.len(), 1);
+            assert_eq!(app.account_ui.logins[0].account(), account);
+            assert_eq!(app.account_ui.logins[0].phase, phase);
+            assert!(app.status.is_none());
+        }
+    }
+
+    #[test]
+    fn current_blocked_row_code_callback_keeps_existing_route_and_modal_gate() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        app.account_ui.homes = Some(Homes::at(directory.path()));
+        app.account_ui.store = None;
+        app.account_ui.logins.push(blocked_login(145904));
+        let account = app.account_ui.logins[0].account();
+        let code = click_login_row(&app.account_ui.logins[0], "Use code");
+        assert!(code.iter().any(|message| matches!(message,
+            Message::AccountUi(Action::UseCodeForBlockedLogin(key)) if *key == app.account_ui.logins[0].key)));
+        assert!(code.iter().all(|message| matches!(message,
+            Message::AccountUi(action) if action.blocked_while_modal())));
+        app.account_ui.table.add_menu = true;
+        app.account_ui.popover = Some(account.id());
+        replay(&mut app, code);
+        // add_account closes these synchronously before returning its future.
+        // The stale cases above preserve them; this proves a real positive
+        // routing control rather than accepting every callback as a no-op.
+        assert!(!app.account_ui.table.add_menu);
+        assert!(app.account_ui.popover.is_none());
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(app.account_ui.logins[0].account(), account);
+        assert!(app.status.is_none());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_sign_in_waiting_to_be_asked_again_no_longer_points_at_its_terminal() {
