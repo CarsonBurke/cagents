@@ -6648,17 +6648,17 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_v11_layout_migration_is_format_only_and_preserves_rows() {
+    fn synthetic_v11_layout_migration_preserves_rows_through_retirement() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         write_retained_ui_fixture(&path);
         let mut connection = Connection::open(&path).unwrap();
         configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
-        // Synthetic layout test only. Exported before/after compatibility
-        // fixtures above always use actual normal-writer schema admission.
+        // Synthetic layout test only. Restore the pre-retirement column/table
+        // layout instead of stamping today's v14 schema as a v11 database.
+        remove_v12_fixture_schema(&connection);
         connection.pragma_update(None, "user_version", 11).unwrap();
         let before = logical_ui_rows(&connection);
-        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
         migrate(&mut connection).unwrap();
         assert_eq!(
             connection
@@ -6666,8 +6666,39 @@ mod tests {
                 .unwrap(),
             CURRENT_SCHEMA_VERSION
         );
-        assert_eq!(logical_ui_rows(&connection), before);
-        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
+        let mut after = logical_ui_rows(&connection);
+        for table in [
+            "closed_cards",
+            "closed_terminal_claims",
+            "closed_terminal_claim_keys",
+            "closed_card_archives",
+        ] {
+            assert!(
+                after.remove(table).unwrap().is_empty(),
+                "open fixture must not invent closure evidence"
+            );
+        }
+        for row in after.get_mut("cards").unwrap() {
+            assert_eq!(
+                row.pop().as_deref(),
+                Some("Integer(0)"),
+                "only the new open residency flag is added"
+            );
+        }
+        assert_eq!(
+            after, before,
+            "all existing payload/navigation/proof rows remain byte-exact"
+        );
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
