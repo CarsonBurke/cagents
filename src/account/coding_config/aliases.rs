@@ -111,6 +111,11 @@ pub(crate) struct Witness {
 }
 
 impl Witness {
+    /// Lets the Store caller bound retained observations across its full census.
+    pub(crate) fn observation_count(&self) -> usize {
+        self.observations.len()
+    }
+
     fn push(&mut self, observation: Observed) -> Result<(), ()> {
         if self.observations.len() == MAX_OBSERVATIONS {
             return Err(());
