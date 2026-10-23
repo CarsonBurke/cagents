@@ -1592,9 +1592,7 @@ fn fact_element(fact: Fact) -> Element<'static, InspectorAction> {
             if let Some(key) = completion_key {
                 // The release of a press on an old response must not trigger
                 // the new callback occupying the same visual row.
-                cosmic::iced::widget::keyed::Column::with_children([(key, button.into())])
-                    .width(Length::Fill)
-                    .into()
+                crate::ui_controls::owned(key, button)
             } else {
                 button.into()
             }

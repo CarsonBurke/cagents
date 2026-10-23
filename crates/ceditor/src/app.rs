@@ -5385,7 +5385,7 @@ fn completion_row(tab: &Tab, index: usize) -> Option<Element<'_, Message>> {
         target.clone(),
     ));
     Some(
-        iced::widget::keyed::Column::with_children([(target.native_key(), row.into())])
+        widget::container(cagents::ui_controls::owned(target.native_key(), row))
             .width(Length::Fill)
             .into(),
     )

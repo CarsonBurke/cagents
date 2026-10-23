@@ -9631,11 +9631,7 @@ fn completion_row(
         card,
         action: EditorLspAction::Choose { index, target },
     });
-    Some(
-        iced::widget::keyed::Column::with_children([(key, button.into())])
-            .width(Length::Fill)
-            .into(),
-    )
+    Some(crate::ui_controls::owned(key, button))
 }
 
 fn editable_document_view<'a>(
