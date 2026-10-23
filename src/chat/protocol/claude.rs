@@ -3834,6 +3834,9 @@ fn content_text(value: &Value) -> String {
         value.to_string()
     }
 }
+// Question and option strings are provider-authored text, not attachment
+// descriptors. Preserve them verbatim: they also serve as answer-map keys.
+// A filename or shell pattern in a question does not authorize a file read.
 fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
     let questions = input["questions"]
         .as_array()
@@ -7601,6 +7604,55 @@ mod tests {
     }
 
     #[test]
+    fn question_artifact_shorthand_remains_text_and_round_trips_exactly() {
+        let question = "Compare .worktrees/v2review-related-sites-redesign/docs/local/v2review/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png and tree-real-*.png";
+        let description = "Inspect [expanded](docs/local/v2review/tree-fixture-dark-expanded.png)";
+        let input = json!({"questions":[{
+            "question":question,
+            "header":"Artifacts",
+            "options":[
+                {"label":"Use fixtures", "description":description},
+                {"label":"Use tree-real-*.png", "description":"Keep the literal filename"}
+            ]
+        }]});
+        let mut adapter = Claude::default();
+        let requested = adapter
+            .receive(approval("artifacts", "AskUserQuestion", input.clone()))
+            .unwrap();
+        // The request supplies no image blocks. In particular, neither the
+        // question nor an option description becomes a filesystem attachment.
+        assert!(requested.writes.is_empty());
+        assert_eq!(requested.events.len(), 1);
+        let Event::Request(request) = &requested.events[0] else {
+            panic!("question request");
+        };
+        assert_eq!(request.fields[0].id, question);
+        assert_eq!(request.fields[0].label, question);
+        assert_eq!(request.fields[0].choices[0].description, description);
+        assert_eq!(request.fields[0].choices[1].id, "Use tree-real-*.png");
+
+        let answered = adapter
+            .answer(
+                "artifacts".into(),
+                "allow".into(),
+                vec![Answer {
+                    field: question.into(),
+                    values: vec!["Use tree-real-*.png".into()],
+                }],
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({question:"Use tree-real-*.png"});
+        assert_eq!(
+            answered.writes,
+            vec![reply(
+                "artifacts",
+                json!({"behavior":"allow","updatedInput":expected})
+            )]
+        );
+    }
+
+    #[test]
     fn skipping_questions_is_not_a_tool_permission_denial() {
         let mut adapter = Claude::default();
         let input = json!({"questions":[{"question":"Which file?","options":[{"label":"First"},{"label":"Second"}]}]});
@@ -11115,6 +11167,46 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
+        );
+    }
+
+    #[test]
+    fn attachment_paths_are_exact_and_relative_to_the_provider_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_cwd = directory.path().join("child-worktree");
+        std::fs::create_dir(&provider_cwd).unwrap();
+        std::fs::write(
+            directory.path().join("tree-real-expanded.png"),
+            "wrong root",
+        )
+        .unwrap();
+        std::fs::write(
+            provider_cwd.join("tree-real-expanded.png"),
+            b"\x89PNG\r\n\x1a\nchild image",
+        )
+        .unwrap();
+        let concrete =
+            attachment_block(&provider_cwd, Path::new("tree-real-expanded.png")).unwrap();
+        assert_eq!(concrete["type"], "image");
+        assert_eq!(
+            concrete["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nchild image")
+        );
+        for shorthand in ["tree-real-*.png", "tree-real-{expanded,collapsed}.png"] {
+            let error = attachment_block(&provider_cwd, Path::new(shorthand)).unwrap_err();
+            assert!(error.contains(&provider_cwd.join(shorthand).display().to_string()));
+        }
+        // Pattern characters can be valid literal filenames. Do not reject or
+        // expand them when an explicitly selected attachment exists verbatim.
+        std::fs::write(
+            provider_cwd.join("tree-real-*.png"),
+            b"\x89PNG\r\n\x1a\nliteral image",
+        )
+        .unwrap();
+        let literal = attachment_block(&provider_cwd, Path::new("tree-real-*.png")).unwrap();
+        assert_eq!(
+            literal["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nliteral image")
         );
     }
 
