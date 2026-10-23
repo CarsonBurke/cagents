@@ -331,6 +331,10 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
+
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 38] {
         [
@@ -800,6 +804,9 @@ impl DefaultPane {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub schema_version: u32,
+    /// Stable palette entry keys, newest first. Old settings default to empty.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     #[serde(default = "default_focus_follows_mouse")]
@@ -952,6 +959,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
+            palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
@@ -1635,6 +1643,10 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let mut seen = std::collections::HashSet::new();
+        self.palette_recents
+            .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
+        self.palette_recents.truncate(24);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -3137,6 +3149,36 @@ mod tests {
             restored.editor_syntax_theme,
             EditorSyntaxTheme::InspiredGitHub
         );
+    }
+
+    #[test]
+    fn palette_recents_survive_save_and_old_settings_default_to_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        save(&path, &settings).unwrap();
+        assert_eq!(
+            load(&path).unwrap().palette_recents,
+            settings.palette_recents
+        );
+        let mut legacy = toml::Value::try_from(&settings).unwrap();
+        legacy.as_table_mut().unwrap().remove("palette_recents");
+        let restored: AppSettings = legacy.try_into().unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec![
+            String::new(),
+            "command:open_settings".into(),
+            "command:open_settings".into(),
+            "x".repeat(129),
+        ];
+        settings
+            .palette_recents
+            .extend((0..30).map(|i| format!("pane:{i}")));
+        let validated = settings.validate().unwrap();
+        assert_eq!(validated.palette_recents.len(), 24);
+        assert_eq!(validated.palette_recents[0], "command:open_settings");
+        assert_eq!(validated.palette_recents[1], "pane:0");
     }
 
     #[test]
