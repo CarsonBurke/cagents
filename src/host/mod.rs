@@ -480,11 +480,7 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
             chat.close()

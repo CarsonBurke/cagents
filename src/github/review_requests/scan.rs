@@ -357,7 +357,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requested {
     pub entry: Entry,
     pub current: Current,

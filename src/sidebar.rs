@@ -581,27 +581,35 @@ impl SidebarProject {
             crate::github::review_requests::scan::Requested,
         >,
     ) {
-        let apply = |row: &mut SidebarPullRequest| {
-            let request = requested.get(&row.number);
-            row.needs_review = request.is_some();
-            row.review_requested_again = request.is_some_and(|request| {
-                request.history == crate::github::review_requests::scan::History::ReRequested
-            });
+        let flags = |number: u64| {
+            let request = requested.get(&number);
+            (
+                request.is_some(),
+                request.is_some_and(|request| {
+                    request.history == crate::github::review_requests::scan::History::ReRequested
+                }),
+            )
         };
         for row in &mut self.pull_requests {
-            apply(row);
+            (row.needs_review, row.review_requested_again) = flags(row.number);
         }
         if let Some(cached) = &mut self.cached_display {
             for row in &mut cached.rows {
-                apply(row);
+                (row.needs_review, row.review_requested_again) = flags(row.number);
             }
         }
+        // Discovery reapplies the same requests on nearly every pass, and a
+        // worktree's row can only be replaced whole, so it is cloned only
+        // when its flags actually differ.
         for worktree in &mut self.worktrees {
-            if let Some(mut row) = worktree.pull_request().cloned() {
-                apply(&mut row);
-                if worktree.pull_request() != Some(&row) {
-                    worktree.set_pull_request(row);
-                }
+            let Some(row) = worktree.pull_request() else {
+                continue;
+            };
+            let flags = flags(row.number);
+            if flags != (row.needs_review, row.review_requested_again) {
+                let mut row = row.clone();
+                (row.needs_review, row.review_requested_again) = flags;
+                worktree.set_pull_request(row);
             }
         }
     }
@@ -12461,10 +12469,10 @@ pub(crate) mod tests {
 
     #[test]
     fn worktree_labels_keep_literal_branches_through_pr_lifecycle() {
-        let branch = "CarsonBurke/claws-turnstile-fix";
+        let branch = "Developer/browser-challenge-fix";
         let mut row = worktree(11, branch, false);
         assert_eq!(&*row.chrome.label, branch);
-        assert!(row.matches("carsonburke/"));
+        assert!(row.matches("developer/"));
         let mut pr = project().pull_requests.remove(0);
         pr.title = "Fix browser challenge handling".into();
         row.set_pull_request(pr);

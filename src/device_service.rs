@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const MAX_TEXT_BYTES: u64 = 512 * 1024;
+/// Leave room for the response envelope without increasing the IPC frame cap.
+pub(crate) const MAX_DEVICE_IMAGE_BYTES: usize = crate::terminal::ipc::MAX_FRAME_BYTES - 4096;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Home,
@@ -66,6 +68,17 @@ pub enum Operation {
         provider: crate::agent::Provider,
         selection: crate::account::preferences::DefaultSelection,
     },
+    /// A concrete image path on this device; relative to the conversation cwd.
+    /// Appended to preserve existing Postcard discriminants.
+    ReadImage {
+        root: PathBuf,
+        path: PathBuf,
+    },
+    /// Resolve immutable image identity in this backend's owned store. The
+    /// displaying computer supplies no filesystem path. Appended wire tag.
+    ReadImageAsset {
+        reference: crate::chat::ImageReference,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -118,6 +131,7 @@ pub enum Reply {
     SavedUnconfirmed {
         error: String,
     },
+    Image(Vec<u8>),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -314,6 +328,13 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
             let root = fs_safety::Root::open(&root).map_err(|error| error.to_string())?;
             Ok(Reply::Text(read(&root, &path)?))
         }
+        Operation::ReadImage { root, path } => {
+            read_image_file(&root, &path, MAX_DEVICE_IMAGE_BYTES).map(Reply::Image)
+        }
+        Operation::ReadImageAsset { reference } => {
+            crate::chat::attachment_assets::read(&reference, MAX_DEVICE_IMAGE_BYTES)
+                .map(Reply::Image)
+        }
         Operation::Write {
             root,
             path,
@@ -322,6 +343,53 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
         } => write_with_sync(&root, &path, &expected, &content, fs_safety::sync_directory),
         Operation::Git { root, operation } => git(root, operation).map(Reply::Text),
     }
+}
+
+/// Read the producer's exact concrete filename on its owning device. Resolve
+/// relative names only against the verified conversation cwd; never search
+/// directories, expand patterns, or reinterpret a path on the UI computer.
+pub(crate) fn read_image_file(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let limit = limit.min(crate::chat::MAX_INLINE_IMAGE_BYTES);
+    use std::os::unix::fs::OpenOptionsExt;
+    if !path.is_absolute() && !root.is_absolute() {
+        return Err("the conversation working directory is unavailable".into());
+    }
+    // Preserve kernel symlink/.. semantics. Explicit provider image paths can
+    // legitimately name /tmp artifacts or a sibling worktree.
+    let path = root.join(path);
+    let io_error = |error: std::io::Error| format!("{}: {error}", path.display());
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: the image must be a regular file",
+            path.display()
+        ));
+    }
+    let too_large = || {
+        format!(
+            "{}: the image exceeds the {} KiB file preview limit",
+            path.display(),
+            limit / 1024
+        )
+    };
+    if metadata.len() > limit as u64 {
+        return Err(too_large());
+    }
+    let bytes = crate::fs_safety::read_bounded(&mut file, limit as u64)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 #[cfg(feature = "host")]
@@ -694,6 +762,235 @@ fn unstage_command(
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
+    use std::path::Path;
+    #[test]
+    fn image_asset_operation_reads_backend_receipts_and_refuses_foreign_or_missing_identity() {
+        crate::chat::attachment_assets::with_test_image(|backend| {
+            let reference = backend.reference.as_ref().unwrap();
+            let expected = std::fs::read(&backend.path).unwrap();
+            assert_eq!(
+                execute(Operation::ReadImageAsset {
+                    reference: reference.clone()
+                })
+                .unwrap(),
+                Reply::Image(expected)
+            );
+            let mut missing = reference.clone();
+            missing.id = uuid::Uuid::new_v4();
+            assert!(
+                execute(Operation::ReadImageAsset { reference: missing })
+                    .unwrap_err()
+                    .contains("unavailable")
+            );
+            crate::chat::attachment_assets::with_test_image(|other| {
+                assert_ne!(reference.device, other.reference.as_ref().unwrap().device);
+                assert!(
+                    execute(Operation::ReadImageAsset {
+                        reference: reference.clone()
+                    })
+                    .unwrap_err()
+                    .contains("another device")
+                );
+            });
+            let operation = Operation::ReadImageAsset {
+                reference: reference.clone(),
+            };
+            let encoded = postcard::to_allocvec(&operation).unwrap();
+            assert_eq!(
+                encoded[0], 17,
+                "new operation appends after ReadImage's existing tag16"
+            );
+            assert_eq!(
+                postcard::from_bytes::<Operation>(&encoded).unwrap(),
+                operation
+            );
+            assert_eq!(
+                postcard::to_allocvec(&Operation::ReadImage {
+                    root: "/backend".into(),
+                    path: "image.png".into()
+                })
+                .unwrap()[0],
+                16
+            );
+            let envelope = crate::terminal::ipc::ServerEnvelope {
+                version: crate::terminal::ipc::PROTOCOL_VERSION,
+                request_id: Some(u64::MAX),
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                    boot_id: crate::model::BootId::new(uuid::Uuid::new_v4().to_string()),
+                    host_incarnation: crate::model::HostIncarnation::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                },
+                message: crate::terminal::ipc::ServerMessage::Response {
+                    response: crate::terminal::ipc::ServerResponse::DeviceOperation {
+                        reply: Reply::Image(vec![0; MAX_DEVICE_IMAGE_BYTES]),
+                    },
+                },
+            };
+            let mut frame = Vec::new();
+            crate::terminal::ipc::write_frame(&mut frame, &envelope).unwrap();
+            assert!(frame.len() <= crate::terminal::ipc::MAX_FRAME_BYTES);
+            assert_eq!(
+                crate::terminal::ipc::read_frame::<crate::terminal::ipc::ServerEnvelope>(
+                    &mut std::io::Cursor::new(frame)
+                )
+                .unwrap()
+                .unwrap(),
+                envelope
+            );
+        });
+    }
+
+    #[test]
+    fn image_read_returns_literal_binary_files_on_the_selected_device() {
+        let device = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(".worktrees/review/docs/tree-fixture-dark-expanded.png");
+        std::fs::create_dir_all(device.path().join(path.parent().unwrap())).unwrap();
+        let expected = b"\x89PNG\0device bytes";
+        std::fs::write(device.path().join(&path), expected).unwrap();
+        for path in [path.clone(), device.path().join(&path)] {
+            assert_eq!(
+                execute(Operation::ReadImage {
+                    root: device.path().into(),
+                    path
+                })
+                .unwrap(),
+                Reply::Image(expected.to_vec())
+            );
+        }
+        for path in [
+            PathBuf::from(".worktrees/review/docs/tree-fixture-dark-{collapsed,expanded}.png"),
+            PathBuf::from(".worktrees/review/docs/tree-real-*.png"),
+            PathBuf::from(".worktrees/review/docs/missing.png"),
+        ] {
+            assert!(
+                execute(Operation::ReadImage {
+                    root: device.path().into(),
+                    path
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn image_read_preserves_explicit_paths_and_rejects_special_files_and_oversize() {
+        use std::os::unix::fs::symlink;
+        let device = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.png"), b"outside").unwrap();
+        symlink(outside.path(), device.path().join("linked")).unwrap();
+        assert_eq!(
+            read_image_file(device.path(), Path::new("linked/secret.png"), 32).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            read_image_file(device.path(), &outside.path().join("secret.png"), 32).unwrap(),
+            b"outside"
+        );
+        assert!(read_image_file(device.path(), Path::new("."), 32).is_err());
+        let fifo = device.path().join("pipe.png");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let root = device.path().to_path_buf();
+        let task = std::thread::spawn(move || {
+            sender
+                .send(read_image_file(&root, Path::new("pipe.png"), 32))
+                .unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        task.join().unwrap();
+        std::fs::write(device.path().join("image.png"), vec![0; 32]).unwrap();
+        assert_eq!(
+            read_image_file(device.path(), Path::new("image.png"), 32)
+                .unwrap()
+                .len(),
+            32
+        );
+        std::fs::write(device.path().join("image.png"), vec![0; 33]).unwrap();
+        assert!(
+            read_image_file(device.path(), Path::new("image.png"), 32)
+                .unwrap_err()
+                .contains("limit")
+        );
+        std::fs::File::create(device.path().join("large.png"))
+            .unwrap()
+            .set_len(MAX_DEVICE_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(
+            execute(Operation::ReadImage {
+                root: device.path().into(),
+                path: "large.png".into()
+            })
+            .unwrap_err()
+            .contains("limit")
+        );
+    }
+
+    #[test]
+    fn image_read_preserves_kernel_parent_components_in_symlink_paths() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("selected");
+        let actual = directory.path().join("actual");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(actual.join("nested")).unwrap();
+        std::fs::write(cwd.join("image.png"), b"wrong image").unwrap();
+        std::fs::write(actual.join("image.png"), b"correct image").unwrap();
+        symlink(actual.join("nested"), cwd.join("link")).unwrap();
+        assert_eq!(
+            read_image_file(&cwd, Path::new("link/../image.png"), 32).unwrap(),
+            b"correct image"
+        );
+        assert_eq!(
+            read_image_file(&cwd, Path::new("../actual/image.png"), 32).unwrap(),
+            b"correct image"
+        );
+    }
+
+    #[test]
+    fn appended_image_wire_variants_preserve_existing_tags_and_fit_frame_budget() {
+        assert_eq!(postcard::to_allocvec(&Operation::Home).unwrap(), vec![0]);
+        let previous_tail = Operation::AccountDefault {
+            expected_revision: 0,
+            provider: crate::agent::Provider::Claude,
+            selection: crate::account::preferences::DefaultSelection::Automatic,
+        };
+        assert_eq!(postcard::to_allocvec(&previous_tail).unwrap()[0], 15);
+        assert_eq!(postcard::to_allocvec(&Reply::Saved).unwrap(), vec![10]);
+        assert_eq!(
+            postcard::to_allocvec(&Reply::SavedUnconfirmed {
+                error: String::new()
+            })
+            .unwrap(),
+            vec![13, 0]
+        );
+        let operation = Operation::ReadImage {
+            root: "/device/project".into(),
+            path: "image.png".into(),
+        };
+        let encoded = postcard::to_allocvec(&operation).unwrap();
+        assert_eq!(encoded[0], 16);
+        assert_eq!(
+            postcard::from_bytes::<Operation>(&encoded).unwrap(),
+            operation
+        );
+        let reply = Reply::Image(vec![0; MAX_DEVICE_IMAGE_BYTES]);
+        let encoded = postcard::to_allocvec(&reply).unwrap();
+        assert_eq!(encoded[0], 14);
+        assert!(encoded.len() < crate::terminal::ipc::MAX_FRAME_BYTES - 4000);
+        assert_eq!(postcard::from_bytes::<Reply>(&encoded).unwrap(), reply);
+    }
+
     fn git_output(root: &std::path::Path, arguments: &[&str]) -> Vec<u8> {
         let output = std::process::Command::new("git")
             .current_dir(root)
