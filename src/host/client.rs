@@ -405,6 +405,7 @@ pub(super) fn process_request(
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
+                super::account_readiness::ensure_unused(host, &request.path)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -468,6 +469,7 @@ pub(super) fn process_request(
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
+    super::account_readiness::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
