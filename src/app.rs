@@ -14264,15 +14264,20 @@ impl Application for Cagents {
                 self.update_editor_lsp(card, action)
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
-                let path = match self.cards.get(&card) {
+                let target = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
-                        runtime
-                            .selected_path()
-                            .map(|path| runtime.descriptor.worktree.join(path))
+                        runtime.selected_path().map(|path| {
+                            (
+                                runtime.descriptor.worktree.join(path),
+                                runtime.external_caret(),
+                            )
+                        })
                     }
                     _ => None,
                 };
-                path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
+                target.map_or_else(Task::none, |(path, caret)| {
+                    self.open_file_in_editor(path, caret, editor_id)
+                })
             }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
@@ -14892,7 +14897,11 @@ impl Application for Cagents {
                         if !self.source_control_is_bound(&key) {
                             return Task::none();
                         }
-                        self.open_file_in_editor(key.canonical_path.join(path.as_path()), editor_id)
+                        self.open_file_in_editor(
+                            key.canonical_path.join(path.as_path()),
+                            None,
+                            editor_id,
+                        )
                     }
                     SidebarAction::OpenChange { key, path, area } => {
                         // The card has two diff bases. A conflict has no staged

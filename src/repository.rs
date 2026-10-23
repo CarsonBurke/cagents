@@ -3257,10 +3257,10 @@ fn linear_issue_key(value: &str) -> bool {
 /// The managed directory a branch's worktree is created in, relative to the
 /// managed root.
 ///
-/// A branch is a path already: `carson/main-5717-fix` names a directory
-/// `main-5717-fix` inside `carson`, which is how every other tool that lays
+/// A branch is a path already: `developer/team-123-fix` names a directory
+/// `team-123-fix` inside `developer`, which is how every other tool that lays
 /// worktrees out by branch spells it and what a reader expects to see in a
-/// file manager. Encoding the slash produced `carson%2Fmain-5717-fix`, a name
+/// file manager. Encoding the slash produced `developer%2Fteam-123-fix`, a name
 /// nobody typed and nobody could read.
 ///
 /// Every other byte a filesystem or a shell could misread is still
@@ -13034,8 +13034,8 @@ mod worktree_journal_tests {
             branch_destination_component("a%2Fb")
         );
         assert_eq!(
-            branch_destination_component("carson/main-5717-fix"),
-            Path::new("carson").join("main-5717-fix")
+            branch_destination_component("developer/team-123-fix"),
+            Path::new("developer").join("team-123-fix")
         );
         assert_eq!(
             branch_destination_component("release/v1.2"),
