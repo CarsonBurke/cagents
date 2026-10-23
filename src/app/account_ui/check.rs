@@ -591,11 +591,9 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
     }
     if pending {
         rows.push(
-            design::caption(
-                "A check is finishing. Closing this form leaves the bounded check running.",
-            )
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .into(),
+            design::caption("A check is finishing. Closing this form leaves the check running.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
         );
     } else if form.preparing {
         rows.push(design::caption("Connecting to the selected device…").into());
