@@ -22,7 +22,11 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 pub(super) fn parse_home(value: &str) -> Result<String, String> {
-    let value = value.trim();
+    // The destination's established linker trims text-field input. Refuse an
+    // ambiguous CLI operand rather than silently selecting a different home.
+    if value.trim() != value {
+        return Err("Use an account home without leading or trailing whitespace".into());
+    }
     if value
         .strip_prefix("~/")
         .is_some_and(|relative| Path::new(relative).is_absolute())
@@ -135,6 +139,8 @@ mod tests {
             (Provider::Omp, "/private/home"),
             (Provider::Codex, "relative/home"),
             (Provider::Codex, "~//selected"),
+            (Provider::Codex, "/private/selected "),
+            (Provider::Codex, " ~/selected"),
         ] {
             let Err(error) = execute(provider, home.into()) else {
                 panic!("invalid input reached account registration");
@@ -148,6 +154,9 @@ mod tests {
             ("codex", "~another/home"),
             ("codex", "~//selected"),
             ("codex", "~///selected"),
+            ("codex", "/private/selected "),
+            ("codex", " ~/selected"),
+            ("codex", "/private/selected\u{2003}"),
             ("codex", "~"),
             ("codex", ""),
             ("codex", "/private/\0home"),
