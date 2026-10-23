@@ -2963,6 +2963,32 @@ impl Cagents {
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
+        if self.channel_work.view.is_open() {
+            let end = widget::row::with_children(vec![
+                widget::row::with_children(self.notice_control()).into(),
+                widget::row::with_children(self.update_control()).into(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .into();
+            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            return widget::column::with_children(vec![
+                heading,
+                crate::interaction::focused_escape(
+                    self.channel_work
+                        .view
+                        .view(
+                            width,
+                            (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
+                        )
+                        .map(Message::ChannelWork),
+                    || Message::ChannelWorkEscape,
+                ),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
         let indicators = self.context_rail_indicators();
         let tabs = widget::row::with_children(
             ContextTab::ALL
@@ -3039,6 +3065,20 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let tabs = widget::row::with_children(vec![
+            tabs.into(),
+            crate::ui_controls::button::secondary("Channel work")
+                .name("Open current channel work")
+                .on_press_maybe(
+                    self.durable
+                        .active_channel
+                        .filter(|_| !self.modal_is_open())
+                        .map(Message::OpenChannelWork),
+                )
+                .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::XS);
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)

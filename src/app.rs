@@ -6,6 +6,7 @@ mod branch_ui;
 #[cfg(feature = "integrated-browser")]
 mod browser_import_ui;
 mod channel_ui;
+mod channel_work;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_health_ui;
@@ -2716,6 +2717,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
+        Message::ChannelWork(action) => !action.background(),
+        Message::OpenChannelWork(_) | Message::ChannelWorkEscape => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -4581,6 +4584,10 @@ pub enum Message {
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
+    ChannelWork(crate::channel_work_ui::Action),
+    OpenChannelWork(ChannelId),
+    ChannelWorkPoll,
+    ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -5185,6 +5192,7 @@ pub struct Cagents {
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
+    channel_work: channel_work::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -13670,6 +13678,7 @@ impl Application for Cagents {
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -15130,6 +15139,7 @@ impl Application for Cagents {
                     SidebarAction::OpenChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Open(channel_id))
                     }
+                    SidebarAction::OpenChannelWork { channel_id } => self.open_channel_work(channel_id),
                     SidebarAction::DeleteChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
@@ -16985,6 +16995,10 @@ impl Application for Cagents {
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
+            Message::ChannelWork(action) => self.update_channel_work(action),
+            Message::OpenChannelWork(channel) => self.open_channel_work(channel),
+            Message::ChannelWorkEscape => self.channel_work.view.escape().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
+            Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -17411,6 +17425,7 @@ impl Application for Cagents {
             self.account_subscription(),
             self.automation_subscription(),
             self.work_subscription(),
+            self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
@@ -26894,6 +26909,7 @@ mod tests {
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
