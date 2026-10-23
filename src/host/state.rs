@@ -7,7 +7,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -335,6 +338,48 @@ struct PreparedUpgrade {
     /// Exact registered owners promised uninterrupted process continuity by a
     /// confirmed update. Errors must orphan these owners, never release them.
     continuing: Vec<TerminalHandle>,
+    /// Stable lossless reader/input cuts remain reversible until every carry
+    /// or emergency preservation outcome has settled, including final-save failure.
+    prepared_input: Vec<PreparedTerminalInput>,
+}
+
+/// A unique reversible PTY cut, separate from the existing pidfd process
+/// freezes. Cancellation never certifies ownership transfer or reader restart.
+struct PreparedTerminalInput {
+    handle: TerminalHandle,
+    token: Arc<AtomicBool>,
+    resumed: crossbeam_channel::Receiver<Result<(), String>>,
+}
+
+impl PreparedTerminalInput {
+    fn prepare(handle: TerminalHandle) -> Result<Self, String> {
+        let token = Arc::new(AtomicBool::new(true));
+        let (reply, resumed) = crossbeam_channel::bounded(1);
+        // Own rollback before sending: timeout or any later save/refusal must
+        // cancel this exact token, never a subsequent preparation.
+        let cut = Self {
+            handle,
+            token,
+            resumed,
+        };
+        cut.handle.prepare_input_handoff(cut.token.clone(), reply)?;
+        Ok(cut)
+    }
+}
+
+impl Drop for PreparedTerminalInput {
+    fn drop(&mut self) {
+        self.handle.cancel_input_handoff(&self.token);
+        match self.resumed.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "terminal input rollback remains unconfirmed; original owner stays fenced")
+            }
+            Err(error) => {
+                tracing::error!(%error, "terminal input cut outcome remains unconfirmed; original owner stays fenced")
+            }
+        }
+    }
 }
 
 impl HostState {
@@ -2224,6 +2269,24 @@ fn prepare_upgrade_with_carry_policy(
             paired_codex,
         )
     };
+    // Exclusive control fences raw client input; it does not stop the PTY
+    // parser generating reply frames from later child output. Stop each
+    // carried reader losslessly before ACK, then retain the exact reversible
+    // cut through commit and emergency preservation. Future output remains
+    // unread in the original kernel PTY until its exact successor adopts it.
+    let mut prepared_input = Vec::with_capacity(carried.len());
+    for terminal in &carried {
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.descriptor(0, terminal.source.id)?.session != terminal.source {
+                return Err(upgrade_error(
+                    "A carried terminal changed before its input could be verified",
+                ));
+            }
+            state.terminals[&terminal.source.id].handle.clone()
+        };
+        prepared_input.push(PreparedTerminalInput::prepare(handle).map_err(upgrade_error)?);
+    }
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
         && (previous.proof != proof || previous.phase != Phase::Prepared)
@@ -2365,6 +2428,7 @@ fn prepare_upgrade_with_carry_policy(
         relaunch_agents,
         holders: holders.map(std::path::Path::to_owned),
         continuing,
+        prepared_input,
     });
     state.shutting_down = true;
     state.shutdown_capabilities.clear();
@@ -2435,6 +2499,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
         relaunch_agents,
         holders,
         continuing,
+        prepared_input,
     }) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2555,6 +2620,10 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             }
         }
     }
+    // Keep every successful cut alive through the complete error-preserve
+    // loop above. A transferred worker only acknowledges settlement; dropping
+    // this guard can never resurrect it or reopen its input.
+    drop(prepared_input);
     result
 }
 
@@ -4507,6 +4576,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
     )
 }
 
+#[cfg(test)]
+mod bounded_input_upgrade_tests;
 #[cfg(test)]
 mod native_upgrade_tests;
 #[cfg(test)]
