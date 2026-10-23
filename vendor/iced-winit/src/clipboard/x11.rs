@@ -171,6 +171,7 @@ impl Transfer {
         expected: Atom,
         format: u8,
         remaining: usize,
+        delete: bool,
     ) -> Result<GetPropertyReply, Error> {
         self.check_deadline()?;
         let connection = &self.context.connection;
@@ -195,7 +196,7 @@ impl Transfer {
         }
         let reply = connection
             .get_property(
-                true,
+                delete,
                 self.context.window,
                 self.context.atoms.property,
                 expected,
@@ -263,11 +264,12 @@ impl Transfer {
             )?
             .reply()?;
         if header.type_ != self.context.atoms.incr {
-            let reply = self.property(expected, format, limit)?;
+            let reply = self.property(expected, format, limit, true)?;
             self.check_owner()?;
             return Ok(Some(reply));
         }
-        let announcement = self.property(self.context.atoms.incr, 32, 4)?;
+        let announcement =
+            self.property(self.context.atoms.incr, 32, 4, false)?;
         let mut sizes = announcement
             .value32()
             .ok_or_else(|| invalid("invalid INCR size"))?;
@@ -275,8 +277,14 @@ impl Transfer {
         if sizes.next().is_some() || size as usize > limit {
             return Err(invalid("invalid or excessive INCR size"));
         }
-        // GetProperty(delete=true) acknowledges INCR. Ignore queued old
-        // PropertyNotify events; the property may already be absent when read.
+        // Validate the announcement before acknowledging it: an oversized
+        // declaration must not start an unnecessary payload transfer.
+        connection.delete_property(
+            self.context.window,
+            self.context.atoms.property,
+        )?;
+        // Ignore queued old PropertyNotify events; the property may already
+        // be absent when read.
         connection.flush()?;
         let mut data = Vec::new();
         loop {
@@ -301,7 +309,8 @@ impl Transfer {
             if header.type_ == x11rb::NONE {
                 continue;
             }
-            let chunk = self.property(expected, format, limit - data.len())?;
+            let chunk =
+                self.property(expected, format, limit - data.len(), true)?;
             connection.flush()?;
             if chunk.value.is_empty() {
                 self.check_owner()?;
