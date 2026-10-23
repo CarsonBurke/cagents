@@ -76,6 +76,10 @@ version = "0.18.0"
 dependencies = [
  "accesskit 0.22.0",
  "accesskit_atspi_common",
+ "async-channel",
+ "async-executor",
+ "async-io",
+ "async-task",
  "atspi",
  "futures-lite",
  "serde",

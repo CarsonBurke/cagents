@@ -1678,7 +1678,7 @@ mod tests {
         async fn invalidate_screen_reader_status(
             &self,
             #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        ) -> zbus::Result<()> {
+        ) -> zbus::fdo::Result<()> {
             self.unreadable.store(1, Ordering::Relaxed);
             emitter
                 .emit(
@@ -1687,10 +1687,11 @@ mod tests {
                     &(
                         "org.a11y.Status",
                         std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new(),
-                        ["ScreenReaderEnabled"],
+                        vec!["ScreenReaderEnabled"],
                     ),
                 )
                 .await
+                .map_err(zbus::fdo::Error::from)
         }
 
         #[zbus(property)]
