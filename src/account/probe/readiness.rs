@@ -15,11 +15,19 @@ type RpcResult = Result<Value, CheckReason>;
 const EXEC_TIMEOUT_MS: i64 = 8_000;
 const EXEC_OUTPUT_CAP: u64 = 16 * 1024;
 
+#[cfg(test)]
+tokio::task_local! {
+    /// A capture-refusal regression must never contact an installed provider.
+    static FORBID_PROVIDER_IO: ();
+}
+
 pub async fn run(
     account: Account,
     workspace: PathBuf,
     request: CheckRequest,
     helper: PathBuf,
+    expected_home: PhysicalIdentity,
+    expected_workspace: PhysicalIdentity,
 ) -> CheckReport {
     let mut report = CheckReport::new(&request);
     report.workspace = workspace.clone();
@@ -63,15 +71,21 @@ pub async fn run(
         }
     };
     let home_identity = match directory_identity(&home) {
-        Ok(identity) => identity,
-        Err(reason) => {
-            stop(&mut report, reason, CheckStatus::Failed);
+        Ok(identity) if identity == (expected_home.device, expected_home.inode) => identity,
+        _ => {
+            stop(
+                &mut report,
+                CheckReason::HomeUnavailable,
+                CheckStatus::Failed,
+            );
             return report;
         }
     };
     let workspace_identity = match directory_identity(&workspace) {
-        Ok(identity) => identity,
-        Err(_) => {
+        Ok(identity) if identity == (expected_workspace.device, expected_workspace.inode) => {
+            identity
+        }
+        _ => {
             stop(
                 &mut report,
                 CheckReason::WorkspaceChanged,
@@ -80,6 +94,11 @@ pub async fn run(
             return report;
         }
     };
+    #[cfg(test)]
+    assert!(
+        FORBID_PROVIDER_IO.try_with(|_| ()).is_err(),
+        "a changed host capture reached provider preparation"
+    );
     // A readiness check must not silently lose serialization with official
     // usage/login probes. Hold the same lock through provider cleanup.
     let Some(cache) = Cache::installation() else {
@@ -954,5 +973,69 @@ mod projection_tests {
             report.workspace_cleanup,
             Some(crate::account::workspace_probe::Cleanup::Unconfirmed)
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replaced_host_captures_refuse_before_provider_preparation() {
+        for replace_home in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let workspace = root.path().join("workspace");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::create_dir(&workspace).unwrap();
+            let home_tuple = directory_identity(&home).unwrap();
+            let workspace_tuple = directory_identity(&workspace).unwrap();
+            let expected_home = PhysicalIdentity {
+                device: home_tuple.0,
+                inode: home_tuple.1,
+            };
+            let expected_workspace = PhysicalIdentity {
+                device: workspace_tuple.0,
+                inode: workspace_tuple.1,
+            };
+            let selected = if replace_home { &home } else { &workspace };
+            // Preserve the old directory so its inode cannot be recycled for
+            // the replacement, exactly as the host's held descriptor does.
+            std::fs::rename(selected, root.path().join("retired")).unwrap();
+            std::fs::create_dir(selected).unwrap();
+            let account = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), home);
+            let request = CheckRequest {
+                account: account.id(),
+                workspace: workspace.clone(),
+                expected_email: "selected@example.test".into(),
+                write: true,
+                github_repository: None,
+            };
+            let report = FORBID_PROVIDER_IO
+                .scope(
+                    (),
+                    run(
+                        account,
+                        workspace,
+                        request,
+                        PathBuf::from("/not-invoked/cagents"),
+                        expected_home,
+                        expected_workspace,
+                    ),
+                )
+                .await;
+            let reason = if replace_home {
+                CheckReason::HomeUnavailable
+            } else {
+                CheckReason::WorkspaceChanged
+            };
+            assert_eq!(
+                report.authentication,
+                Measurement::new(CheckStatus::Failed, reason)
+            );
+            assert_eq!(report.workspace_write, Measurement::unknown(reason));
+            assert!(report.provider_executable.is_none());
+            assert!(report.observed_identity.is_none());
+        }
     }
 }
