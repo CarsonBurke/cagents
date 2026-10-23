@@ -150,7 +150,8 @@ fn invalid_report() -> AppError {
 }
 
 fn output(report: CheckReport) -> Result<CommandOutput, AppError> {
-    let passed = report.authentication.status == CheckStatus::Passed
+    let passed = report.provider_cleanup_confirmed
+        && report.authentication.status == CheckStatus::Passed
         && report.execution_profile_configured.status == CheckStatus::Passed
         && matches!(
             report.workspace_write.status,
@@ -186,6 +187,11 @@ fn output(report: CheckReport) -> Result<CommandOutput, AppError> {
             "No observations",
         )
     );
+    human.push_str(if report.provider_cleanup_confirmed {
+        "\nProvider process cleanup: confirmed"
+    } else {
+        "\nProvider process cleanup: not confirmed"
+    });
     if let Some(cleanup) = report.workspace_cleanup {
         let description = match cleanup {
             Cleanup::NotCreated => "not created",
@@ -364,6 +370,7 @@ mod tests {
         let mut report = CheckReport::new(request);
         report.workspace = "/remote/home/workspace with space ".into();
         report.observed_at = 123;
+        report.provider_cleanup_confirmed = true;
         report.host = Some(proof);
         report.authentication =
             Measurement::new(CheckStatus::Passed, CheckReason::IdentityConfirmed);
@@ -393,6 +400,28 @@ mod tests {
         report.github = Measurement::new(CheckStatus::Passed, CheckReason::GitHubRepositoryAccess);
         report.github_push_allowed = Some(false);
         report
+    }
+
+    #[test]
+    fn unconfirmed_provider_cleanup_cannot_produce_success() {
+        let request = args().request().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("check-peer"),
+            boot_id: crate::model::BootId::new("private-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("private-incarnation"),
+        };
+        let mut report = successful_report(&request, proof);
+        report.provider_cleanup_confirmed = false;
+        let output = output(report).unwrap();
+        assert_eq!(output.data["outcome"], "failed");
+        assert_eq!(output.data["authentication"]["status"], "passed");
+        assert_eq!(output.data["workspace_cleanup"], "removed");
+        assert!(
+            output
+                .human
+                .contains("Provider process cleanup: not confirmed")
+        );
+        assert_eq!(output.exit_code(), ExitCode::from(4));
     }
 
     #[test]

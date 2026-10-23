@@ -405,6 +405,7 @@ pub(super) fn process_request(
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
+                super::account_readiness::ensure_unused(host, &request.path)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -449,9 +450,13 @@ pub(super) fn process_request(
     }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
+    // Account preference writes also retain this short local fence from the
+    // reader census through registry commit; they perform no provider RPC.
     let exclusive = matches!(
         &request,
-        ClientRequest::PrepareUpgrade { .. }
+        ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::AccountsUpdate { .. },
+        } | ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
@@ -468,6 +473,7 @@ pub(super) fn process_request(
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
+    super::account_readiness::admit(host, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -1514,6 +1520,63 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn account_preference_update_cannot_cross_an_admitted_reader() {
+        let (_proof, host) = panic_test_host("account-preferences-reader-gate");
+        let gate = control_gate(&host);
+        let reader = gate.read().unwrap();
+        let worker_host = host.clone();
+        let (started, ready) = crossbeam_channel::bounded(1);
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(process_request(
+                    &worker_host,
+                    1,
+                    ClientRequest::DeviceOperation {
+                        operation: crate::device_service::Operation::AccountsUpdate {
+                            expected_revision: 0,
+                            // Refuse after admission, before looking up or opening any
+                            // installation registry. The fixture touches no settings.
+                            registry: serde_json::Value::Null,
+                        },
+                    },
+                ))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let blocked = matches!(
+            result.recv_timeout(Duration::from_millis(100)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        drop(reader);
+        let error = if blocked {
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+        } else {
+            // Join before asserting so even a regressed early response leaves
+            // no fixture thread behind.
+            worker.join().unwrap();
+            panic!(
+                "account preference update crossed admitted reader before its census/commit fence"
+            );
+        };
+        worker.join().unwrap();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(error.message.starts_with("Invalid account preferences:"));
+        assert!(matches!(
+            process_request(&host, 1, ClientRequest::List).unwrap().0,
+            ServerResponse::Listed { .. }
+        ));
+        assert!(
+            gate.try_write().is_ok(),
+            "failed preference update retained admission"
+        );
+    }
 
     #[test]
     fn resident_release_drains_admitted_control_operations_before_retirement() {

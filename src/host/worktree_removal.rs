@@ -132,6 +132,7 @@ impl Reservation {
             }
         };
         super::client::ensure_control_open(host)?;
+        super::account_readiness::ensure_unused_directory(host, &scope.path, &scope._pin)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.values().any(|other| other.overlaps(&scope)) {
             return Err(refusal(
@@ -159,6 +160,8 @@ impl Reservation {
     /// automation work targets it, or an account operation is changing a
     /// credential directory inside it. Call outside HostState.
     pub(super) fn ensure_unoccupied(&self, host: &SharedHost) -> Result<(), String> {
+        super::account_readiness::ensure_unused_directory(host, &self.scope.path, &self.scope._pin)
+            .map_err(|error| error.message)?;
         let hosted = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut hosted: Vec<(&'static str, PathBuf)> = Vec::new();
@@ -180,10 +183,16 @@ impl Reservation {
                 }
             }
             for session in state.chat_spawning.values() {
-                hosted.push(("A starting chat", session.launch.recipe.working_directory.clone()));
+                hosted.push((
+                    "A starting chat",
+                    session.launch.recipe.working_directory.clone(),
+                ));
             }
             for binding in state.chat_bindings.values() {
-                hosted.push(("An agent being adopted", binding.working_directory().to_owned()));
+                hosted.push((
+                    "An agent being adopted",
+                    binding.working_directory().to_owned(),
+                ));
             }
             for handoff in state.chat_handoffs.values() {
                 for directory in handoff.working_directories() {
@@ -248,7 +257,9 @@ impl Reservation {
             Ok(Some((pid, name))) => Err(format!(
                 "{name} (process {pid}) is using this worktree; close it and retry"
             )),
-            Err(error) => Err(format!("Cannot check processes using the worktree: {error}")),
+            Err(error) => Err(format!(
+                "Cannot check processes using the worktree: {error}"
+            )),
         }
     }
 
@@ -324,8 +335,7 @@ pub(super) fn admit(
     Ok(())
 }
 
-const STARTING_INSIDE: &str =
-    "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
+const STARTING_INSIDE: &str = "This worktree is being removed. Start the session somewhere else, or wait for the removal to finish.";
 
 /// Refuses a launch whose working directory lies in a worktree being removed.
 /// Caller holds shared control admission through the launch it checks.

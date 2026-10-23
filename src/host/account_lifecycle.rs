@@ -130,7 +130,10 @@ impl Home {
 
 /// Walk the actual directory parent chain through descriptors. Lexical
 /// aliases can change when a reserved home/provider parent is renamed.
-pub(super) fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+pub(super) fn physical_ancestors(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, String> {
     let mut cursor = if let Some(pin) = pin {
         pin.try_clone().map_err(|error| error.to_string())?
     } else {
@@ -340,6 +343,13 @@ impl Reservation {
         }
         let writer = super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
+        for home in &homes {
+            if let Some(pin) = &home.pin {
+                super::account_readiness::ensure_unused_directory(host, &home.canonical, pin)?;
+            } else {
+                super::account_readiness::ensure_unused(host, &home.canonical)?;
+            }
+        }
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
             return Err(refusal(
@@ -626,6 +636,13 @@ impl Reservation {
             .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
         super::client::ensure_control_open(&host)
             .map_err(|error| io::Error::other(error.message))?;
+        let actual = &updated.homes[index];
+        super::account_readiness::ensure_unused_directory(
+            &host,
+            &actual.canonical,
+            actual.pin.as_deref().expect("created home is pinned"),
+        )
+        .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&basis, &entries) {
             return Err(io::Error::other(
@@ -909,6 +926,9 @@ pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<()
         .map_err(|error| refusal(error.to_string()))?;
     let homes = crate::account::home::Homes::installation();
     let changed = current.changed_account_homes(proposed, homes.as_ref());
+    for home in &changed {
+        super::account_readiness::ensure_unused(host, home)?;
+    }
     ensure_paths(host, changed)
 }
 

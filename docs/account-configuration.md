@@ -204,6 +204,10 @@ provider-home override, environment values, arbitrary command or policy override
 It authenticates the caller to the selected daemon and submits one check without
 automatic retries.
 
+Executable lookup uses the application's already discovered shell search path,
+or the daemon's inherited `PATH` when discovery has not completed. This check
+does not start an interactive shell to discover another executable location.
+
 Authentication, the reported default execution policy, workspace write access,
 and GitHub repository access are separate observations. The official Codex client
 reads its account and effective configuration without starting a model turn.
@@ -214,6 +218,13 @@ the command does not request a scratch file. `--github-repository OWNER/REPO`
 explicitly permits one GitHub repository read under the same policy. Reported push
 permission is metadata; no push or repository mutation is performed. Omitting
 that option does not request the endpoint check.
+
+Provider cleanup is separate from scratch cleanup: success requires confirmation
+that the owned process group accepted its termination signal (or was absent) and
+the original provider leader was reaped. An uncertain cleanup keeps the account
+home and workspace occupied for destructive operations; it does not prevent
+ordinary launches. A failed group signal stays quarantined rather than allowing
+a later observation of leader exit to authorize directory removal.
 
 JSON uses the normal CLI envelope and retains each observation's status/reason,
 the selected account, requested and resolved workspace, expected identity,

@@ -1,6 +1,6 @@
 //! Model-free measurements through the official Codex app server. No command
 //! in this module requests a policy override, thread, turn, or unsandboxed API.
-use super::{Cache, Session, TIMEOUT, command, find_executable, now_ms, search_path};
+use super::{Cache, Session, TIMEOUT, command, current_search_path, find_executable, now_ms};
 use crate::{
     account::{Account, Identity, UsageStatus, readiness::*},
     agent::Provider,
@@ -21,13 +21,14 @@ tokio::task_local! {
     static FORBID_PROVIDER_IO: ();
 }
 
-pub async fn run(
+pub(crate) async fn run(
     account: Account,
     workspace: PathBuf,
     request: CheckRequest,
     helper: PathBuf,
     expected_home: PhysicalIdentity,
     expected_workspace: PhysicalIdentity,
+    owner: Option<std::sync::Arc<dyn super::SpawnOwner>>,
 ) -> CheckReport {
     let mut report = CheckReport::new(&request);
     report.workspace = workspace.clone();
@@ -124,7 +125,10 @@ pub async fn run(
             return report;
         }
     };
-    let path = search_path().await;
+    // This explicit diagnostic uses the already discovered shell PATH, or
+    // the daemon's inherited PATH. It never starts an interactive shell as
+    // a hidden preparation step outside its owned provider process group.
+    let path = current_search_path();
     let Some(program) = find_executable(Provider::Codex.executable(), path.as_deref()) else {
         stop(
             &mut report,
@@ -150,7 +154,13 @@ pub async fn run(
         .arg("app-server")
         .current_dir(&workspace)
         .env("CODEX_HOME", &home);
-    let mut session = match tokio::time::timeout(TIMEOUT, Session::spawn(process)).await {
+    let spawn = async move {
+        match owner {
+            Some(owner) => Session::spawn_owned(process, owner).await,
+            None => Session::spawn(process).await,
+        }
+    };
+    let mut session = match tokio::time::timeout(TIMEOUT, spawn).await {
         Ok(Ok(session)) => session,
         Ok(Err(_)) => {
             stop(
@@ -176,7 +186,7 @@ pub async fn run(
         .as_ref()
         != Some(&home)
     {
-        session.close().await;
+        report.provider_cleanup_confirmed = session.close().await;
         stop(
             &mut report,
             CheckReason::AccountMismatch,
@@ -221,7 +231,7 @@ pub async fn run(
         }
     }
     // Even a timed-out exchange owns and reaps only its own provider group.
-    session.close().await;
+    report.provider_cleanup_confirmed = session.close().await;
     if original_home
         .as_ref()
         .and_then(|path| path.canonicalize().ok())
@@ -1021,6 +1031,7 @@ mod capture_tests {
                         PathBuf::from("/not-invoked/cagents"),
                         expected_home,
                         expected_workspace,
+                        None,
                     ),
                 )
                 .await;
