@@ -219,14 +219,20 @@ fn output(report: CheckReport) -> Result<CommandOutput, AppError> {
             .map(|(name, measurement)| [
                 name.into(),
                 status(measurement).into(),
-                format!("{:?}", measurement.reason)
+                measurement.reason.description().into()
             ])
             .collect(),
             "No observations",
         )
     );
     if let Some(cleanup) = report.workspace_cleanup {
-        human.push_str(&format!("\nWorkspace cleanup: {cleanup:?}"));
+        let description = match cleanup {
+            Cleanup::NotCreated => "not created",
+            Cleanup::Removed => "removed",
+            Cleanup::ReplacementPreserved => "replacement preserved",
+            Cleanup::Unconfirmed => "not confirmed",
+        };
+        human.push_str(&format!("\nWorkspace cleanup: {description}"));
     }
     if let Some(push) = report.github_push_allowed {
         human.push_str(&format!(
