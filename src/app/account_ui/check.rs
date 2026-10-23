@@ -280,7 +280,7 @@ impl Cagents {
             }
             Action::Close(_) => {
                 self.account_ui.check.close();
-                if self.account_ui.table.link.is_some() {
+                if !self.modal_is_open() && self.account_ui.table.link.is_some() {
                     widget::text_input::focus(table::link_id())
                 } else {
                     Task::none()
@@ -976,6 +976,47 @@ mod tests {
         assert_eq!(
             app.account_ui.check.pending.as_ref().unwrap().sequence,
             newer.sequence
+        );
+    }
+
+    #[test]
+    fn queued_check_close_does_not_focus_a_home_field_behind_a_new_modal() {
+        let (mut app, first, _) = fixture();
+        drop(app.update_account_ui(super::super::Action::LinkStart(Provider::Codex)));
+        drop(app.update_account_ui(super::super::Action::LinkInput(
+            "/selected/existing-home".into(),
+        )));
+        open(&mut app, &first);
+        let sequence = app.account_ui.check.form.as_ref().unwrap().sequence;
+        drop(app.update_account_check(Action::Run(sequence)));
+        let pending = app.account_ui.check.pending.as_ref().unwrap().sequence;
+        let close = click(view(&app).unwrap(), "Close")
+            .into_iter()
+            .find_map(|message| match message {
+                Message::AccountUi(super::super::Action::Check(action @ Action::Close(_))) => {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .unwrap();
+        app.device_ui.open = true;
+        assert!(app.modal_is_open());
+        assert!(!close.blocked_while_modal());
+        let task = app.update_account_check(close);
+        assert!(app.account_ui.check.form.is_none());
+        assert_eq!(
+            app.account_ui.check.pending.as_ref().unwrap().sequence,
+            pending
+        );
+        assert_eq!(
+            crate::app::tests::focused_element(super::super::table::table(&app, 1000.0), task),
+            None,
+            "an old Close callback must leave the new modal's keyboard focus alone"
+        );
+        assert!(app.modal_is_open());
+        assert_eq!(
+            app.account_ui.table.link.as_ref().unwrap().1,
+            "/selected/existing-home"
         );
     }
 
