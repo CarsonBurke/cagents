@@ -445,6 +445,9 @@ struct AccountRecovery {
 
 struct Attempt {
     target: Target,
+    /// Whether this begins the launch or puts a saved conversation back,
+    /// which decides whether a failure is reported as a start or a reopen.
+    intent: chat::Intent,
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
@@ -3411,12 +3414,23 @@ impl Runtime {
     /// A first message waiting to be sent keeps it current while the card is
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
+    ///
+    /// A connection already lost has nothing to tell: the pane reports the
+    /// disconnection itself, and the handle that replaces it is shown with the
+    /// visibility recorded here.
     fn present(&self) -> Result<(), String> {
         let visible = self.visible.load(Ordering::Relaxed)
             || self.queued.is_some()
             || !self.followups.is_empty();
-        self.handle()
-            .map_or(Ok(()), |handle| handle.set_visible(visible))
+        match self.handle() {
+            Some(handle) if handle.is_connected() => match handle.set_visible(visible) {
+                // The connection can drop between the check and the call, and
+                // is then as lost as one found lost: not this pass's to report.
+                Err(_) if !handle.is_connected() => Ok(()),
+                result => result,
+            },
+            _ => Ok(()),
+        }
     }
     fn show(&mut self, visible: bool) {
         if let Err(error) = self.set_visible(visible) {
@@ -4698,6 +4712,7 @@ impl Cagents {
             card,
             Phase::Starting(Attempt {
                 target,
+                intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
                 upgrade_admission: None,
@@ -6182,6 +6197,7 @@ impl Cagents {
             card,
             Phase::Starting(Attempt {
                 target,
+                intent,
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
@@ -7633,6 +7649,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
+                        self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         if account_source.is_some() || attempt.upgrade_admission.is_some() {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
@@ -7719,6 +7736,9 @@ impl Cagents {
                         // if nothing had started it. Chats opened before a
                         // first message started anything come back this way
                         // after an update.
+                        // Nothing is left to reopen, so an earlier report
+                        // that reopening failed no longer applies.
+                        self.resolve_notice(NoticeKey::ChatAttach(target.card));
                         let mut draft = attempt.session.clone();
                         draft.reset_owned_codex_listener();
                         draft.proof = None;
@@ -7765,12 +7785,40 @@ impl Cagents {
                                 self.chat_ui.capacity_offers.remove(&target.card);
                             }
                             self.fail_runtime(target.card, failure.message.clone());
-                            self.status = Some(TransientNotice::error(failure.message));
+                            // The notice says what the reader lost in their
+                            // terms; the pane keeps the daemon's reason, and
+                            // the attempt that succeeds withdraws the notice.
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a conversation".to_owned());
+                            // A launch that names no conversation had none to
+                            // reopen: starting it is what failed.
+                            let verb = if attempt.intent == chat::Intent::Start
+                                && attempt.session.launch.session_id.is_none()
+                            {
+                                "start"
+                            } else {
+                                "reopen"
+                            };
+                            self.status = Some(
+                                TransientNotice::error(format!("Could not {verb} {pane}."))
+                                    .with_details(failure.message)
+                                    .with_key(NoticeKey::ChatAttach(target.card)),
+                            );
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
                             self.chat_ui.fresh_offers.remove(&target.card);
-                            self.status = Some(TransientNotice::error(failure.message));
+                            let pane = self
+                                .notice_pane_name(target.card)
+                                .unwrap_or_else(|| "a terminal".to_owned());
+                            self.status = Some(
+                                TransientNotice::error(format!(
+                                    "Could not switch {pane} to native chat."
+                                ))
+                                .with_details(failure.message)
+                                .with_key(NoticeKey::ChatAttach(target.card)),
+                            );
                         }
                         let cleanup = if account_source.is_some() {
                             self.retire_chat(target.card, None, Some(attempt.session))
@@ -16593,6 +16641,111 @@ mod tests {
         }
     }
 
+    /// A restored conversation that cannot be reopened says so in the reader's
+    /// terms, keeps the daemon's reason as detail, and stops saying it once a
+    /// retry has reopened it.
+    #[test]
+    fn a_successful_retry_clears_the_failed_reopen_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let reason = "Exact native chat not found; no replacement process was spawned";
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(reason)));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(reason));
+
+        // A retry that fails for another reason replaces the notice rather
+        // than adding one beside it.
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let later = "fixture: executable unavailable";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::retry(later)));
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(later));
+
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, attempt, Ok(handle));
+        assert!(chat_runtime(&app, card).connected());
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// Starting over is a start, not a reopen, and says so when it fails. A
+    /// conversation that turns out never to have been named opens as a draft,
+    /// with nothing left to reopen, so its failure notice goes too.
+    #[test]
+    fn a_fresh_start_reports_a_start_and_a_draft_withdraws_the_failure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let attempt = chat_runtime_attempt(&app, card);
+        let gone = "the provider no longer has this conversation";
+        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+        assert!(app.chat_offers_fresh_conversation(card));
+
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = chat_runtime_attempt(&app, card);
+        let unavailable = "fixture: executable unavailable";
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry(unavailable)),
+        );
+        assert_eq!(errors(&app), [format!("Could not start {pane}.")]);
+        assert_eq!(
+            attach_failure_details(&app, card).as_deref(),
+            Some(unavailable)
+        );
+
+        // Restored later, the never-named conversation turns out to be gone.
+        let Some(CardKind::Chat(unnamed)) = app.card_state(card).map(|state| state.kind.clone())
+        else {
+            unreachable!();
+        };
+        assert_eq!(unnamed.launch.session_id, None);
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, unnamed, chat::Intent::Restore);
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+        );
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// A conversation whose connection is gone already says so in its pane,
+    /// and reattaching presents its visibility afresh, so telling it whether
+    /// it is on screen cannot fail in a way worth a notice.
+    #[test]
+    fn a_disconnected_chat_raises_no_visibility_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        chat_runtime(&app, card)
+            .handle()
+            .unwrap()
+            .disconnect_for_test();
+        app.set_workspace_surfaces_visible(false);
+        app.set_workspace_surfaces_visible(true);
+        assert!(
+            app.status.is_none(),
+            "{:?}",
+            app.status.as_ref().map(|notice| &notice.message)
+        );
+    }
+
     #[test]
     fn failed_retry_adapter_cannot_acknowledge_retained_native_cleanup() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -16748,6 +16901,14 @@ mod tests {
             Ok(()),
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// The reason recorded beneath `card`'s failure to open its conversation.
+    fn attach_failure_details(app: &Cagents, card: CardId) -> Option<String> {
+        app.notices
+            .recent()
+            .find(|entry| entry.notice.key == Some(crate::app::NoticeKey::ChatAttach(card)))
+            .and_then(|entry| entry.notice.details.clone())
     }
 
     /// The errors the shell has recorded. `status` is drained into the notice
@@ -19239,6 +19400,7 @@ mod tests {
                 card,
                 Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
@@ -19296,6 +19458,7 @@ mod tests {
                     card,
                     Phase::Starting(Attempt {
                         target: next,
+                        intent: chat::Intent::Restore,
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
@@ -20164,7 +20327,20 @@ mod tests {
             app.chat_switch_ready(id),
             "a failed attachment can be retried"
         );
-        assert_eq!(errors(&app), [reason]);
+        // Named as its tab names it.
+        let tab = app
+            .repository_chrome(app.card_state(id).unwrap())
+            .0
+            .into_owned();
+        assert_eq!(
+            errors(&app),
+            [format!("Could not switch “{tab}” to native chat.")]
+        );
+        assert_eq!(
+            attach_failure_details(&app, id).as_deref(),
+            Some(reason),
+            "the reason stays readable beneath it"
+        );
         assert!(
             matches!(
                 crate::app::tests::task_app_message(task),
@@ -22557,6 +22733,7 @@ mod tests {
             let phase = match owner {
                 "account" => Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: f.source.clone(),
                     recovery: Some(AccountRecovery {
                         source: f.source.clone(),
@@ -22577,6 +22754,7 @@ mod tests {
                     other.launch.recipe.arguments.push("--other-start".into());
                     Phase::Starting(Attempt {
                         target,
+                        intent: chat::Intent::Restore,
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
@@ -22860,6 +23038,7 @@ mod tests {
                 card,
                 Phase::Starting(Attempt {
                     target,
+                    intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
@@ -22937,6 +23116,7 @@ mod tests {
                     card,
                     Phase::Starting(Attempt {
                         target: next,
+                        intent: chat::Intent::Restore,
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
