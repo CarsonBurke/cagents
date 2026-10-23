@@ -24,6 +24,8 @@ use std::{
 const TEST: &str =
     "host::provider_shutdown_tests::cleanup_refusal_is_reported_and_healthy_owners_still_stop";
 const ROOT: &str = "CAGENTS_PROVIDER_SHUTDOWN_TEST_ROOT";
+const INHERITED_SCOPE: &str = "CAGENTS_PROVIDER_SHUTDOWN_AUTHORITY_PRESENCE";
+const RETAINED_HELPER: &str = "CAGENTS_TEST_RETAINED_ACTOR_HELPER";
 
 /// Keep the ORIGINAL runtime on success and failure until the external strict
 /// command guardian settles the full family. Child exit alone is not that proof.
@@ -38,6 +40,17 @@ impl Drop for EvidenceDirectory {
 
 fn private_runtime() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os(ROOT) {
+        let expected = match std::env::var(INHERITED_SCOPE).as_deref() {
+            Ok("present") => true,
+            Ok("absent") => false,
+            _ => panic!("missing or invalid shutdown fixture authority presence marker"),
+        };
+        assert_eq!(
+            crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default(),
+            expected,
+            "private shutdown fixture lost its inherited authority scope"
+        );
         return Some(PathBuf::from(root).canonicalize().unwrap());
     }
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
@@ -51,15 +64,30 @@ fn private_runtime() -> Option<PathBuf> {
     }
     let executable = std::env::current_exe().unwrap();
     let mut command = CommandSpec::new(&executable);
-    // CommandSpec removes these before applying the explicit private values;
-    // no process-wide environment mutation races another libtest thread.
+    // Keep delegation and any same-head helper path inherited unchanged.
+    // Other child state is private; no process-wide environment mutation races
+    // another libtest thread and no capability value is inspected or copied.
     for (name, _) in std::env::vars_os() {
-        command = command.env_remove(name);
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new(RETAINED_HELPER)
+        {
+            command = command.env_remove(name);
+        }
     }
     command = command
         .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
         .cwd(&root)
         .env(ROOT, &root)
+        .env(
+            INHERITED_SCOPE,
+            if crate::agent_execution::Authority::from_environment()
+                != crate::agent_execution::Authority::default()
+            {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .env("HOME", root.join("home"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("XDG_DATA_HOME", root.join("data"))
