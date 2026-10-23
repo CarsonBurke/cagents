@@ -422,17 +422,14 @@ fn measurement(label: &'static str, value: Measurement) -> Element<'static, Mess
     .spacing(space::XXS)
     .into()
 }
-fn results(report: &CheckReport) -> Element<'_, Message> {
+fn results(report: &CheckReport, now_ms: Millis) -> Element<'_, Message> {
     use crate::account::readiness::{ApprovalPolicy, SandboxMode};
     let observed = if report.observed_at == 0 {
         "No provider observation recorded".to_owned()
     } else {
         format!(
             "Observed {}",
-            account::format_local_moment(
-                unix_seconds(report.observed_at),
-                unix_seconds(report.observed_at)
-            )
+            account::format_local_moment(unix_seconds(report.observed_at), unix_seconds(now_ms))
         )
     };
     let mut rows = vec![
@@ -578,7 +575,7 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
         rows.push(design::caption("Connecting to the selected device…").into());
     }
     if current && let Some(report) = &form.report {
-        rows.push(results(report));
+        rows.push(results(report, app.account_ui.now_ms));
     }
     rows.push(
         widget::row::with_children(vec![
