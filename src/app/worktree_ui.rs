@@ -341,28 +341,38 @@ impl Cagents {
 
     /// The exact directory a channel enters, also used by navigation admission.
     pub(super) fn channel_directory(&self, id: ChannelId) -> Option<PathBuf> {
-        let channel = self.durable.channels.iter().find(|channel| channel.id == id)?;
-        let project = self.sidebar_model.project(channel.project_id)?;
-        Some(project
-            .worktrees
+        let channel = self
+            .durable
+            .channels
             .iter()
-            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-            .map(|worktree| worktree.path.clone())
-            .unwrap_or_else(|| {
-                project
-                    .repository
-                    .parent()
-                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                    .unwrap_or(&project.repository)
-                    .to_path_buf()
-            }))
+            .find(|channel| channel.id == id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .map(|worktree| worktree.path.clone())
+                .unwrap_or_else(|| {
+                    project
+                        .repository
+                        .parent()
+                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                        .unwrap_or(&project.repository)
+                        .to_path_buf()
+                }),
+        )
     }
 
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
-        let channel = self.durable.channels.iter().find(|channel| channel.id == id)
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
             .expect("the channel directory resolved this same channel");
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
