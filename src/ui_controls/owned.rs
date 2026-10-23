@@ -186,3 +186,143 @@ impl<Key: Clone + Eq + 'static, Message> Widget<Message, Theme, Renderer>
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui_controls::accessibility_probe::headless_renderer;
+    use cosmic::iced::Point;
+    use cosmic::iced::advanced::clipboard;
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+    use cosmic::widget;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Action {
+        Original,
+        Replacement,
+    }
+
+    // Exercise the runtime's real cache and native button state, including its
+    // named-state extraction/restore path. The label and child count stay fixed.
+    struct Frames {
+        cache: Cache,
+        renderer: Renderer,
+        named: bool,
+    }
+
+    impl Frames {
+        fn new(named: bool) -> Self {
+            Self {
+                cache: Cache::new(),
+                renderer: headless_renderer(),
+                named,
+            }
+        }
+
+        fn frame(
+            &mut self,
+            owner: u64,
+            action: Option<Action>,
+            event: Option<mouse::Event>,
+        ) -> Vec<Action> {
+            let button = widget::button::custom(crate::design::body("Open"))
+                .width(Length::Fill)
+                .height(40)
+                .on_press_maybe(action);
+            let button = if self.named {
+                button.id(widget::Id::new("owned.native-action"))
+            } else {
+                button
+            };
+            let mut ui = UserInterface::build(
+                owned(owner, button),
+                Size::new(240.0, 80.0),
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let mut messages = Vec::new();
+            let events = event.map(Event::Mouse).into_iter().collect::<Vec<_>>();
+            let _ = ui.update(
+                &events,
+                // Probe the fill-width part beyond the label, so the positive
+                // controls also require the wrapper's native sizing contract.
+                mouse::Cursor::Available(Point::new(220.0, 20.0)),
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            self.cache = ui.into_cache();
+            messages
+        }
+
+        fn press(&mut self, owner: u64, action: Action) {
+            assert!(
+                self.frame(
+                    owner,
+                    Some(action),
+                    Some(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                )
+                .is_empty()
+            );
+        }
+
+        fn release(&mut self, owner: u64, action: Action) -> Vec<Action> {
+            self.frame(
+                owner,
+                Some(action),
+                Some(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            )
+        }
+    }
+
+    #[test]
+    fn changed_owner_cannot_lend_a_held_native_press_to_the_same_label_replacement() {
+        for named in [false, true] {
+            let mut frames = Frames::new(named);
+            frames.press(1, Action::Original);
+            assert!(frames.release(2, Action::Replacement).is_empty());
+            frames.press(2, Action::Replacement);
+            assert_eq!(
+                frames.release(2, Action::Replacement),
+                [Action::Replacement]
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_owner_preserves_a_held_native_press_across_cached_frames() {
+        for named in [false, true] {
+            let mut frames = Frames::new(named);
+            frames.press(1, Action::Original);
+            assert!(frames.frame(1, Some(Action::Original), None).is_empty());
+            assert_eq!(frames.release(1, Action::Original), [Action::Original]);
+        }
+    }
+
+    #[test]
+    fn returning_to_a_previous_owner_does_not_restore_its_old_native_press() {
+        for named in [false, true] {
+            let mut frames = Frames::new(named);
+            frames.press(1, Action::Original);
+            assert!(frames.frame(2, Some(Action::Replacement), None).is_empty());
+            assert!(frames.release(1, Action::Original).is_empty());
+            frames.press(1, Action::Original);
+            assert_eq!(frames.release(1, Action::Original), [Action::Original]);
+        }
+    }
+
+    #[test]
+    fn disabled_then_enabled_replacement_requires_a_fresh_native_press() {
+        for named in [false, true] {
+            let mut frames = Frames::new(named);
+            frames.press(1, Action::Original);
+            assert!(frames.frame(2, None, None).is_empty());
+            assert!(frames.release(3, Action::Replacement).is_empty());
+            frames.press(3, Action::Replacement);
+            assert_eq!(
+                frames.release(3, Action::Replacement),
+                [Action::Replacement]
+            );
+        }
+    }
+}
