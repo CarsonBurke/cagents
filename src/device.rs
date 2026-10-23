@@ -1556,10 +1556,10 @@ mod tests {
             scoped_window_slot("a-b", "c"),
             scoped_window_slot("a", "b-c")
         );
-        assert_ne!(scoped_window_slot("fw16", "primary"), "fw16-primary");
+        assert_ne!(scoped_window_slot("build-host", "primary"), "build-host-primary");
         assert_eq!(
-            scoped_window_slot("fw16", "primary"),
-            scoped_window_slot("fw16", "primary")
+            scoped_window_slot("build-host", "primary"),
+            scoped_window_slot("build-host", "primary")
         );
         crate::instance::validate_window_slot(&scoped_window_slot(
             "long-device-name",
@@ -1694,8 +1694,8 @@ mod tests {
     #[test]
     fn streams_multiplex_over_a_private_master_and_spill_to_the_next() {
         let device = Device {
-            name: "fw16".into(),
-            host: "marvin@fw16".into(),
+            name: "build-host".into(),
+            host: "user@build-host".into(),
             executable: "/home/a b/cagents".into(),
         };
         let directory = tempfile::tempdir().unwrap();
@@ -1710,7 +1710,7 @@ mod tests {
         assert!(!plain.iter().any(|argument| argument.contains("Control")));
         assert_eq!(
             plain[plain.len() - 3..],
-            ["--", "marvin@fw16", "'/home/a b/cagents' daemon bridge"]
+            ["--", "user@build-host", "'/home/a b/cagents' daemon bridge"]
         );
         let directory = Path::new("/run/user/1000/cagents/device-0123456789ab");
         let control = control_path(directory, 0).unwrap();
@@ -1752,7 +1752,7 @@ mod tests {
         assert_eq!(quote("/home/a'b/cagents"), "'/home/a'\\''b/cagents'");
         assert!(
             validate(&Device {
-                name: "fw16".into(),
+                name: "build-host".into(),
                 host: "-oProxyCommand=evil".into(),
                 executable: default_executable()
             })
@@ -1761,15 +1761,15 @@ mod tests {
         assert!(
             validate(&Device {
                 name: "local".into(),
-                host: "fw16".into(),
+                host: "build-host".into(),
                 executable: default_executable()
             })
             .is_err()
         );
         assert!(
             validate(&Device {
-                name: "fw16".into(),
-                host: "marvin@fw16".into(),
+                name: "build-host".into(),
+                host: "user@build-host".into(),
                 executable: default_executable()
             })
             .is_ok()
