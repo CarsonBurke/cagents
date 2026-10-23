@@ -1186,12 +1186,17 @@ impl SnapshotStore {
             .map(Arc::clone)
     }
 
-    fn docs_for_uri(&self, uri: &Url) -> Vec<LspDocumentId> {
-        self.lock()
-            .uris
-            .get(uri)
-            .map(|state| state.docs.clone())
-            .unwrap_or_default()
+    /// Admit a diagnostic batch only from the session that owns this URI.
+    /// Recipients and text must come from the same publication, rather than
+    /// independently looking up a URI that another live server can also name.
+    fn diagnostic_snapshot(
+        &self,
+        uri: &Url,
+        session: &SessionKey,
+    ) -> Option<(Vec<LspDocumentId>, Arc<Snapshot>)> {
+        let inner = self.lock();
+        let state = inner.uris.get(uri)?;
+        (&state.session == session).then(|| (state.docs.clone(), state.latest()))
     }
 
     fn docs_for_session(&self, session: &SessionKey) -> Vec<LspDocumentId> {
@@ -2360,11 +2365,8 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     if state.retired.load(Ordering::Acquire) {
         return;
     }
-    let docs = state.snapshots.docs_for_uri(&params.uri);
-    if docs.is_empty() {
-        return;
-    }
-    let Some(snapshot) = state.snapshots.latest(&params.uri) else {
+    let Some((docs, snapshot)) = state.snapshots.diagnostic_snapshot(&params.uri, &state.key)
+    else {
         return;
     };
     // A versioned batch is only valid for the text it was computed from.
@@ -6314,6 +6316,9 @@ mod tests {
                         std::fs::create_dir_all(directory.join("src")).unwrap();
                         std::fs::write(directory.join("package.json"), "{}").unwrap();
                         std::fs::write(directory.join("tsconfig.json"), r#"{"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#).unwrap();
+                        for config in ["tsconfig.app.json", "tsconfig.node.json"] {
+                            std::fs::write(directory.join(config), "{}").unwrap();
+                        }
                     }
                     std::fs::write(root.path().join(descriptor), contents).unwrap();
                     let mut manager =
@@ -6560,6 +6565,7 @@ mod tests {
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(root.path().join(manifest), content).unwrap();
             std::fs::write(package.parent().unwrap().join("package.json"), "{}").unwrap();
+            std::fs::write(package.parent().unwrap().join("tsconfig.json"), "{}").unwrap();
             assert_eq!(
                 discover_root(
                     &package.join("index.ts"),
@@ -10226,6 +10232,92 @@ mod tests {
                     .map(|entry| entry.params["textDocument"]["uri"].clone())
                     .collect::<Vec<Value>>()
             );
+            manager.shutdown();
+        });
+    }
+
+    #[test]
+    fn diagnostics_reach_only_the_documents_of_the_emitting_session() {
+        block_on(async {
+            let first_root = tempfile::tempdir().expect("tempdir");
+            let second_root = tempfile::tempdir().expect("tempdir");
+            let first = first_root.path().join("one.rs");
+            let second = second_root.path().join("two.rs");
+            std::fs::write(&first, "a\n").expect("write");
+            std::fs::write(&second, "b\n").expect("write");
+
+            let mut manager = rust_manager();
+            let registry =
+                install_fake_registry(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let one = LspDocumentId(1);
+            let two = LspDocumentId(2);
+            manager.open_for_test(one, &first, first_root.path(), rust_language(), 1, "a\n");
+            manager.open_for_test(two, &second, second_root.path(), rust_language(), 1, "b\n");
+            let first_handle = handle_for(&registry, first_root.path()).await;
+            let second_handle = handle_for(&registry, second_root.path()).await;
+            await_ready_documents(&events, &[one, two]).await;
+            assert_eq!(manager.sessions.len(), 2);
+
+            let first_uri = Url::from_file_path(&first).expect("uri").to_string();
+            let second_uri = Url::from_file_path(&second).expect("uri").to_string();
+            for version in [Some(1), None] {
+                first_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": second_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "another live server does not own this file"
+                        }]
+                    }),
+                );
+                // This follows the foreign publication on the SAME server's
+                // ordered wire. Its real event is the barrier: a leaked batch
+                // must fail before it, without a sleep or an absent-event guess.
+                first_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": first_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "first server's own diagnostic"
+                        }]
+                    }),
+                );
+                let (doc, message) = next_matching(&events, |event| match event {
+                    LspEvent::Diagnostics { doc, items, .. } => {
+                        Some((*doc, items.first().map(|item| item.message.to_owned())))
+                    }
+                    _ => None,
+                })
+                .await;
+                assert_eq!(doc, one, "a live server cannot publish into another root");
+                assert_eq!(message.as_deref(), Some("first server's own diagnostic"));
+
+                second_handle.notify(
+                    "textDocument/publishDiagnostics",
+                    json!({
+                        "uri": second_uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                            "message": "second server's own diagnostic"
+                        }]
+                    }),
+                );
+                let (doc, message) = next_matching(&events, |event| match event {
+                    LspEvent::Diagnostics { doc, items, .. } => {
+                        Some((*doc, items.first().map(|item| item.message.to_owned())))
+                    }
+                    _ => None,
+                })
+                .await;
+                assert_eq!(doc, two);
+                assert_eq!(message.as_deref(), Some("second server's own diagnostic"));
+            }
             manager.shutdown();
         });
     }
