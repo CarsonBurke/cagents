@@ -128,6 +128,17 @@ pub enum AutomationCommand {
         #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
+    /// Inspect bounded lifecycle receipts (enable, disable, edits and system pauses).
+    Audit {
+        /// Automation ID, including a removed definition's retained audit.
+        id: Uuid,
+        /// Continue before the sequence returned as next by the previous page.
+        #[arg(long)]
+        before: Option<u64>,
+        /// Maximum page size (1 through 100); larger values are refused.
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        limit: usize,
+    },
     /// Read one immutable firing, including its bounded execution result.
     Run {
         #[arg(help = "The firing ID reported by history.")]
@@ -280,6 +291,10 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             let human = history_human(&history, now_ms());
             (json!({"history": history}), human)
         }
+        Response::Audit(page) => {
+            let human = audit_human(&page, now_ms());
+            (json!({"audit": page}), human)
+        }
         Response::Detail(detail) => {
             let human = format!(
                 "{}\t{}\n{}",
@@ -334,6 +349,42 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+fn audit_human(page: &crate::automations::LifecyclePage, now_ms: u64) -> String {
+    let mut human = super::format::table(
+        ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"],
+        page.events
+            .iter()
+            .map(|event| {
+                [
+                    event.sequence.to_string(),
+                    event.revision.to_string(),
+                    super::format::relative_time(event.occurred_ms, now_ms),
+                    event.cause.label().into(),
+                    event.actor.label().into(),
+                    if event.blocked {
+                        "Blocked"
+                    } else if event.enabled {
+                        "Enabled"
+                    } else {
+                        "Paused"
+                    }
+                    .into(),
+                ]
+            })
+            .collect(),
+        "No recorded lifecycle events",
+    );
+    if page.earlier_events_unavailable {
+        human.push_str(
+            "\nEarlier lifecycle events are unavailable; their actor and cause are unknown.",
+        );
+    }
+    if let Some(next) = page.next {
+        human.push_str(&format!("\nContinue with --before {next}"));
+    }
+    human
 }
 
 fn list_human(entries: &[crate::automations::Summary]) -> String {
@@ -513,6 +564,9 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
         ),
         AutomationCommand::Cancel { id, firing } => {
             ("automation.cancel", Request::Cancel { id, firing })
+        }
+        AutomationCommand::Audit { id, before, limit } => {
+            ("automation.audit", Request::Audit { id, before, limit })
         }
         AutomationCommand::History {
             id,
@@ -769,6 +823,83 @@ mod tests {
                 confirmed: true,
             }
         );
+    }
+
+    #[test]
+    fn automation_lifecycle_human_view_labels_actor_state_and_missing_history() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let page = LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 42,
+                automation: Uuid::new_v4(),
+                revision: 7,
+                occurred_ms: 100,
+                cause: LifecycleCause::ReleaseBlocked,
+                actor: LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: Some(Uuid::new_v4()),
+            }],
+            next: Some(42),
+            earlier_events_unavailable: true,
+        };
+        let human = audit_human(&page, 100);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"]
+        );
+        assert!(
+            human.contains("Session cleanup blocked")
+                && human.contains("System")
+                && human.contains("Blocked")
+        );
+        assert!(human.contains("actor and cause are unknown") && human.contains("--before 42"));
+        assert_eq!(
+            audit_human(
+                &LifecyclePage {
+                    events: vec![],
+                    next: None,
+                    earlier_events_unavailable: false
+                },
+                100
+            ),
+            "No recorded lifecycle events"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_audit_is_read_only_scoped_and_has_a_bounded_cursor() {
+        let id = Uuid::new_v4().to_string();
+        assert!(parse(&["cagents", "automation", "audit"]).is_err());
+        assert!(parse(&["cagents", "automation", "audit", &id, "--limit", "101"]).is_err());
+        let (_, request) = request(
+            parse(&[
+                "cagents",
+                "automation",
+                "audit",
+                &id,
+                "--before",
+                "42",
+                "--limit",
+                "1",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            Request::Audit {
+                id: id.parse().unwrap(),
+                before: Some(42),
+                limit: 1
+            }
+        );
+        assert!(request.allowed_from_hosted_conversation());
     }
 
     #[test]

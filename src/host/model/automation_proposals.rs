@@ -525,7 +525,10 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE automation_proposals; PRAGMA user_version=10;")
+            .execute_batch(
+                "DROP TABLE automation_lifecycle;
+                 DROP TABLE automation_proposals; PRAGMA user_version=10;",
+            )
             .unwrap();
         drop(registry);
         let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
