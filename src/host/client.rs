@@ -372,6 +372,34 @@ pub(super) fn process_request(
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
     if let ClientRequest::DeviceOperation {
+        operation:
+            operation @ (crate::device_service::Operation::AccountCodingConfigInspect(_)
+            | crate::device_service::Operation::AccountCodingConfigCreate(_)),
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        // The user's admission precedes all account/filesystem work. Scoped
+        // reservation/Store checks run without a global guard over storage.
+        let reply = match operation {
+            crate::device_service::Operation::AccountCodingConfigInspect(inspect) => {
+                crate::device_service::Reply::AccountCodingConfigInspect(Box::new(
+                    super::coding_config::inspect(host, inspect.clone())?,
+                ))
+            }
+            crate::device_service::Operation::AccountCodingConfigCreate(create) => {
+                crate::device_service::Reply::AccountCodingConfigCreate(Box::new(
+                    super::coding_config::create(host, create.clone())?,
+                ))
+            }
+            _ => unreachable!("the early branch matches only fixed configuration operations"),
+        };
+        return Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false));
+    }
+    if let ClientRequest::DeviceOperation {
         operation: crate::device_service::Operation::AccountCheck(check),
     } = &request
     {
@@ -1520,6 +1548,64 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn coding_config_operations_require_user_admission_before_request_or_filesystem_work() {
+        use crate::{
+            account::{
+                coding_config::{CreateRequest, InspectRequest, Observation, Presence},
+                readiness::PhysicalIdentity,
+            },
+            device_service::Operation,
+        };
+        let (proof, _) = panic_test_host("coding-config-admission");
+        // Malformed identity would be refused by the handler. Both operations
+        // must instead hit the existing agent/user boundary first, before a
+        // registry/home can be resolved or any storage can be touched.
+        let inspect = InspectRequest {
+            account: "codex/00000000-0000-4000-8000-000000000001"
+                .parse()
+                .unwrap(),
+            expected_home: PhysicalIdentity {
+                device: 1,
+                inode: 2,
+            },
+            expected_email: String::new(),
+        };
+        let create = CreateRequest {
+            observation: Observation {
+                account: inspect.account.clone(),
+                host: proof,
+                home: inspect.expected_home,
+                presence: Presence::Absent,
+                expected_email: String::new(),
+            },
+            network_access: true,
+        };
+        for operation in [
+            Operation::AccountCodingConfigInspect(inspect),
+            Operation::AccountCodingConfigCreate(create),
+        ] {
+            let (_, host) = panic_test_host("coding-config-admission");
+            host.lock()
+                .unwrap()
+                .agent_clients
+                .insert(1, crate::agent_execution::Lineage(TerminalId::new()));
+            let error = process_request(
+                &host,
+                1,
+                ClientRequest::DeviceOperation {
+                    operation: operation.clone(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+            host.lock().unwrap().request_shutdown();
+            let error = process_request(&host, 1, ClientRequest::DeviceOperation { operation })
+                .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        }
+    }
 
     #[test]
     fn account_preference_update_cannot_cross_an_admitted_reader() {

@@ -6,6 +6,7 @@ mod agent_execution;
 mod automations;
 mod chat;
 mod client;
+mod coding_config;
 mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;

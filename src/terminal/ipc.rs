@@ -177,7 +177,9 @@ use crate::{
 /// executables must be replaced together; JSON omission alone is compatible.
 /// Version 106 adds selected-account capability check request/report frames.
 /// A matched set refuses an older daemon instead of inventing readiness.
-pub const PROTOCOL_VERSION: u16 = 106;
+/// Version 107 appends selected-user fixed configuration inspection/creation.
+/// Metadata observations grant neither mutation nor execution authority.
+pub const PROTOCOL_VERSION: u16 = 107;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

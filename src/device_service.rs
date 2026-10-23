@@ -81,6 +81,10 @@ pub enum Operation {
     },
     /// A finite user-requested check of one account's default coding policy.
     AccountCheck(crate::account::readiness::CheckRequest),
+    /// Metadata-only inspection for an explicitly selected user account.
+    AccountCodingConfigInspect(crate::account::coding_config::InspectRequest),
+    /// Explicit creation of one absent fixed config; never an execution permit.
+    AccountCodingConfigCreate(crate::account::coding_config::CreateRequest),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -135,6 +139,8 @@ pub enum Reply {
     },
     Image(Vec<u8>),
     AccountCheck(Box<crate::account::readiness::CheckReport>),
+    AccountCodingConfigInspect(Box<crate::account::coding_config::Observation>),
+    AccountCodingConfigCreate(Box<crate::account::coding_config::CreateReport>),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -194,6 +200,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     match operation {
         Operation::AccountCheck(_) => {
             Err("Account checks require the selected daemon's scoped admission".into())
+        }
+        Operation::AccountCodingConfigInspect(_) | Operation::AccountCodingConfigCreate(_) => {
+            Err("Account configuration requires the selected daemon's user admission".into())
         }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
@@ -1930,6 +1939,67 @@ mod wire_tests {
         report.workspace_write = Measurement::unknown(CheckReason::SandboxSetupFailed);
         roundtrip(&Operation::AccountCheck(request));
         roundtrip(&Reply::AccountCheck(Box::new(report)));
+    }
+
+    #[test]
+    fn coding_config_frames_preserve_selected_context_network_choice_and_uncertainty() {
+        use crate::{
+            account::{
+                coding_config::{
+                    CreateReport, CreateRequest, InspectRequest, Observation, Outcome, Presence,
+                    Refusal, Uncertainty,
+                },
+                readiness::PhysicalIdentity,
+            },
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+        };
+        let inspect = InspectRequest {
+            account: "codex/00000000-0000-4000-8000-000000000001"
+                .parse()
+                .unwrap(),
+            expected_home: PhysicalIdentity {
+                device: 8,
+                inode: 13,
+            },
+            expected_email: "selected@example.test".into(),
+        };
+        roundtrip(&Operation::AccountCodingConfigInspect(inspect.clone()));
+        for presence in [Presence::Absent, Presence::Present, Presence::Unknown] {
+            let observation = Observation {
+                account: inspect.account.clone(),
+                host: HostSessionProof {
+                    host_session_id: HostSessionId::new("coding-config-wire"),
+                    boot_id: BootId::new("wire-boot"),
+                    host_incarnation: HostIncarnation::new("wire-incarnation"),
+                },
+                home: inspect.expected_home,
+                presence,
+                expected_email: inspect.expected_email.clone(),
+            };
+            roundtrip(&Reply::AccountCodingConfigInspect(Box::new(
+                observation.clone(),
+            )));
+            for network_access in [false, true] {
+                let request = CreateRequest {
+                    observation: observation.clone(),
+                    network_access,
+                };
+                roundtrip(&Operation::AccountCodingConfigCreate(request));
+                for outcome in [
+                    Outcome::Created,
+                    Outcome::NotCreated(Refusal::ExistingConfiguration),
+                    Outcome::CreationUncertain(Uncertainty::ContextChanged),
+                ] {
+                    roundtrip(&Reply::AccountCodingConfigCreate(Box::new(CreateReport {
+                        account: observation.account.clone(),
+                        host: observation.host.clone(),
+                        home: observation.home,
+                        network_access,
+                        outcome,
+                    })));
+                }
+            }
+        }
     }
 
     #[test]

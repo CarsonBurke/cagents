@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs_safety::{self, Root};
 
+mod api;
+pub use api::{CreateReport, CreateRequest, InspectRequest, Observation};
+pub(crate) mod aliases;
+
 const NAME: &str = "config.toml";
 const OFFLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = false\n";
 const ONLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = true\n";
@@ -29,7 +33,7 @@ const ONLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"works
 /// Metadata only. Read-only/implicit provider policy does not establish absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Presence {
+pub enum Presence {
     Absent,
     Present,
     Unknown,
@@ -38,7 +42,7 @@ pub(crate) enum Presence {
 /// Fixed failure projections; never paths, OS diagnostics or configuration text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Refusal {
+pub enum Refusal {
     HomeUnavailable,
     ExistingConfiguration,
     PresenceUnknown,
@@ -53,7 +57,7 @@ pub(crate) enum Refusal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Uncertainty {
+pub enum Uncertainty {
     DirectorySyncFailed,
     ContextChanged,
     PublishedFileChanged,
@@ -63,7 +67,7 @@ pub(crate) enum Uncertainty {
 /// An uncertain visible file is retained; it is never unlinked as rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Outcome {
+pub enum Outcome {
     Created,
     NotCreated(Refusal),
     CreationUncertain(Uncertainty),
