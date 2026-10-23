@@ -12461,10 +12461,10 @@ pub(crate) mod tests {
 
     #[test]
     fn worktree_labels_keep_literal_branches_through_pr_lifecycle() {
-        let branch = "CarsonBurke/claws-turnstile-fix";
+        let branch = "Developer/browser-challenge-fix";
         let mut row = worktree(11, branch, false);
         assert_eq!(&*row.chrome.label, branch);
-        assert!(row.matches("carsonburke/"));
+        assert!(row.matches("developer/"));
         let mut pr = project().pull_requests.remove(0);
         pr.title = "Fix browser challenge handling".into();
         row.set_pull_request(pr);
