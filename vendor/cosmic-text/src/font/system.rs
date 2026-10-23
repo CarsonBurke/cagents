@@ -88,12 +88,12 @@ impl FontCachedCodepointSupportInfo {
     #[inline(always)]
     fn unknown_has_codepoint(
         &mut self,
-        font_codepoints: &[u32],
         codepoint: u32,
         supported_insert_pos: usize,
         not_supported_insert_pos: usize,
+        supports: impl FnOnce() -> bool,
     ) -> bool {
-        let ret = font_codepoints.contains(&codepoint);
+        let ret = supports();
         if ret {
             // don't bother inserting if we are going to truncate the entry away
             if supported_insert_pos != Self::SUPPORTED_MAX_SZ {
@@ -112,16 +112,16 @@ impl FontCachedCodepointSupportInfo {
     }
 
     #[inline(always)]
-    fn has_codepoint(&mut self, font_codepoints: &[u32], codepoint: u32) -> bool {
+    fn has_codepoint(&mut self, codepoint: u32, supports: impl FnOnce() -> bool) -> bool {
         match self.supported.binary_search(&codepoint) {
             Ok(_) => true,
             Err(supported_insert_pos) => match self.not_supported.binary_search(&codepoint) {
                 Ok(_) => false,
                 Err(not_supported_insert_pos) => self.unknown_has_codepoint(
-                    font_codepoints,
                     codepoint,
                     supported_insert_pos,
                     not_supported_insert_pos,
+                    supports,
                 ),
             },
         }
@@ -344,16 +344,37 @@ impl FontSystem {
         weight: fontdb::Weight,
         word: &str,
     ) -> Option<usize> {
-        self.get_font(id, weight).map(|font| {
-            let code_points = font.unicode_codepoints();
-            let cache = self
-                .font_codepoint_support_info_cache
-                .entry(id)
-                .or_insert_with(FontCachedCodepointSupportInfo::new);
+        let font = self.get_font(id, weight)?;
+        #[cfg(feature = "monospace_fallback")]
+        let code_points = font.unicode_codepoints();
+        // The optional precomputed table is empty in the default build. Read
+        // the loaded face's nominal cmap instead: treating that absent table
+        // as no coverage makes even supported ASCII probe every mono fallback.
+        #[cfg(not(feature = "monospace_fallback"))]
+        let face = skrifa::FontRef::from_index(font.data(), self.db.face(id)?.index).ok()?;
+        #[cfg(not(feature = "monospace_fallback"))]
+        let charmap = face.charmap();
+        let cache = self
+            .font_codepoint_support_info_cache
+            .entry(id)
+            .or_insert_with(FontCachedCodepointSupportInfo::new);
+        Some(
             word.chars()
-                .filter(|ch| cache.has_codepoint(code_points, u32::from(*ch)))
-                .count()
-        })
+                .filter(|ch| {
+                    let codepoint = u32::from(*ch);
+                    cache.has_codepoint(codepoint, || {
+                        #[cfg(feature = "monospace_fallback")]
+                        {
+                            code_points.contains(&codepoint)
+                        }
+                        #[cfg(not(feature = "monospace_fallback"))]
+                        {
+                            charmap.map(codepoint).is_some()
+                        }
+                    })
+                })
+                .count(),
+        )
     }
 
     pub fn get_font_matches(&mut self, attrs: &Attrs<'_>) -> Arc<Vec<FontMatchKey>> {
@@ -477,3 +498,7 @@ impl<T> DerefMut for BorrowedWithFontSystem<'_, T> {
         self.inner
     }
 }
+
+#[cfg(all(test, feature = "std", not(feature = "monospace_fallback")))]
+#[path = "system/default_coverage_tests.rs"]
+mod default_coverage_tests;
