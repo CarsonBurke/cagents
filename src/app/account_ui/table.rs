@@ -1395,8 +1395,13 @@ mod tests {
     #[test]
     fn blocked_login_text_and_dismiss_controls_fit_and_dispatch_at_narrow_and_wide_widths() {
         let login = blocked_login(145900);
-        let mut narrow = None;
-        for width in [300.0, 1000.0] {
+        let mut narrow: Option<[iced::Size; 2]> = None;
+        let widths = [300.0_f32, 1000.0];
+        // COSMIC exports x1 = (x + width) in f32 through accessibility.
+        // Reconstructing x1 - x0 can round differently as the row moves.
+        // Allow only coordinate roundoff, far below a pixel of compression.
+        let roundoff = 2.0 * f32::EPSILON * widths[1];
+        for width in widths {
             let (code, bounds) = click_login_row_at_width(&login, "Use code", width);
             assert!(matches!(code.as_slice(),
                 [Message::AccountUi(Action::UseCodeForBlockedLogin(key))] if *key == login.key));
@@ -1407,10 +1412,21 @@ mod tests {
                 [Message::AccountUi(Action::CancelLogin(key))] if *key == login.key));
             let sizes = bounds.map(|bounds| bounds.size());
             if let Some(narrow) = narrow {
-                assert_eq!(
-                    sizes, narrow,
-                    "narrow rows must not compress either control to make room for account text"
-                );
+                for (label, (actual, expected)) in ["Use code", "Dismiss failed sign-in"]
+                    .into_iter()
+                    .zip(sizes.into_iter().zip(narrow))
+                {
+                    let delta = iced::Size::new(
+                        (actual.width - expected.width).abs(),
+                        (actual.height - expected.height).abs(),
+                    );
+                    assert!(
+                        delta.width <= roundoff && delta.height <= roundoff,
+                        "narrow rows must not compress {label} to make room for account text: \
+                         actual {actual:?}, narrow {expected:?}, delta {delta:?}, \
+                         maximum f32 coordinate roundoff {roundoff} at row width {width}"
+                    );
+                }
             } else {
                 narrow = Some(sizes);
             }
