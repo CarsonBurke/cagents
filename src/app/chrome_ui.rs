@@ -830,10 +830,7 @@ mod tests {
                 assert!(!app.has_chrome_notices(), "{path}");
                 let (mut messages, _) = apply_to_header(&app, &mut tree, &renderer, query);
                 assert!(
-                    matches!(
-                        messages.as_slice(),
-                        [Message::NoticeControlRetired]
-                    ),
+                    matches!(messages.as_slice(), [Message::NoticeControlRetired]),
                     "{path}: {messages:?}"
                 );
                 let moved = app.update(messages.pop().unwrap());
@@ -876,10 +873,7 @@ mod tests {
             messages
         });
         assert!(
-            matches!(
-                messages.as_slice(),
-                [Message::NoticeControlRetired]
-            ),
+            matches!(messages.as_slice(), [Message::NoticeControlRetired]),
             "{messages:?}"
         );
         let _ = app.update(messages.pop().unwrap());
@@ -947,7 +941,10 @@ mod tests {
                 if let Some(retirement) = retirement {
                     replies = apply_to_header(&app, &mut tree, &renderer, retirement).0;
                 }
-                assert!(matches!(replies.as_slice(), [Message::NoticeControlRetired]));
+                assert!(matches!(
+                    replies.as_slice(),
+                    [Message::NoticeControlRetired]
+                ));
                 let cleanup = app.update(replies.pop().unwrap());
                 let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
                 assert_eq!(
@@ -978,10 +975,14 @@ mod tests {
             iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
         );
         let retirement = app.update(Message::ExpireNotices);
-        app.notices.record(TransientNotice::warning("A newer report."));
+        app.notices
+            .record(TransientNotice::warning("A newer report."));
         let (mut replies, focused) = apply_to_header(&app, &mut tree, &renderer, retirement);
         assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
-        assert!(matches!(replies.as_slice(), [Message::NoticeControlRetired]));
+        assert!(matches!(
+            replies.as_slice(),
+            [Message::NoticeControlRetired]
+        ));
         let cleanup = app.update(replies.pop().unwrap());
         let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
         assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
