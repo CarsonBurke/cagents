@@ -1149,7 +1149,11 @@ impl Cagents {
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
-                        return launch_task(PathBuf::from("xdg-open"), target.path, false);
+                        #[cfg(target_os = "macos")]
+                        let (opener, separate_arguments) = ("/usr/bin/open", true);
+                        #[cfg(not(target_os = "macos"))]
+                        let (opener, separate_arguments) = ("xdg-open", false);
+                        return launch_task(PathBuf::from(opener), target.path, separate_arguments);
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
@@ -1840,11 +1844,11 @@ impl Cagents {
     }
 }
 
-fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
+fn launch_task(executable: PathBuf, path: PathBuf, separate_arguments: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut command = std::process::Command::new(executable);
-            if editor {
+            if separate_arguments {
                 command.arg("--");
             }
             let child = command
