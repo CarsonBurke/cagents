@@ -14,6 +14,7 @@ use std::{
 use uuid::Uuid;
 
 pub(in crate::host) type Leases = Arc<Mutex<BTreeMap<Uuid, Arc<Scope>>>>;
+const MAX_LEASES: usize = 256;
 
 struct Directory {
     path: PathBuf,
@@ -84,6 +85,12 @@ impl Directory {
 pub(in crate::host) struct Scope {
     home: Directory,
     workspace: Directory,
+    retained: Mutex<Retained>,
+}
+#[derive(Default)]
+struct Retained {
+    active_leases: usize,
+    children: Vec<tokio::process::Child>,
 }
 impl Scope {
     pub(in crate::host) fn capture(
@@ -95,36 +102,101 @@ impl Scope {
         Ok(Arc::new(Self {
             home: Directory::capture(home, home_pin)?,
             workspace: Directory::capture(workspace, workspace_pin)?,
+            retained: Mutex::new(Retained::default()),
         }))
     }
 }
 
-/// Removal on Drop also covers provider errors and early-return paths.
+/// Drop releases a confirmed scope. Unconfirmed original children keep its map
+/// token occupied until a later nonblocking census proves they were reaped.
 pub(in crate::host) struct Lease {
     map: Leases,
     token: Uuid,
+    scope: Arc<Scope>,
 }
 impl Lease {
     /// Caller has completed overlapping account/removal checks and still holds
     /// the shared control guard that serializes destructive scope enrollment.
     /// No filesystem work, provider work or waiting is performed while locked.
-    pub(in crate::host) fn enroll(map: &Leases, scope: Arc<Scope>) -> Self {
+    pub(in crate::host) fn enroll(map: &Leases, scope: Arc<Scope>) -> Result<Self, String> {
+        let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.len() >= MAX_LEASES {
+            return Err(
+                "Too many account checks are active or awaiting cleanup; wait and retry".into(),
+            );
+        }
         let token = Uuid::new_v4();
-        map.lock()
+        scope
+            .retained
+            .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(token, scope);
-        Self {
+            .active_leases += 1;
+        entries.insert(token, Arc::clone(&scope));
+        drop(entries);
+        Ok(Self {
             map: Arc::clone(map),
             token,
-        }
+            scope,
+        })
+    }
+
+    /// Transfer custody of the original handle when its owner cannot prove
+    /// exit. Never reconstruct a handle from a PID or signal a discovered PID.
+    pub(in crate::host) fn retain_unconfirmed(&self, child: tokio::process::Child) {
+        self.scope
+            .retained
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .children
+            .push(child);
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.map
+        // All paths taking both locks use map -> retained. try_wait is never
+        // called with the map lock held.
+        let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut retained = self
+            .scope
+            .retained
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.token);
+            .unwrap_or_else(|p| p.into_inner());
+        retained.active_leases -= 1;
+        if retained.active_leases == 0 && retained.children.is_empty() {
+            entries.remove(&self.token);
+        }
+    }
+}
+
+/// Poll only the retained original handles. None/errors preserve uncertainty;
+/// only an actual successful reap can release their pinned directories. No
+/// waiting, PID lookup, signals, timers or background cleanup task is involved.
+pub(in crate::host) fn cleanup_retained(map: &Leases) {
+    let readers: Vec<_> = map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(token, scope)| (*token, Arc::clone(scope)))
+        .collect();
+    for (token, scope) in readers {
+        {
+            let mut retained = scope.retained.lock().unwrap_or_else(|p| p.into_inner());
+            retained
+                .children
+                .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        }
+        // Enrollment can race this poll, so recheck under the same lock order
+        // before retiring this exact snapshot token.
+        let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
+        let retained = scope.retained.lock().unwrap_or_else(|p| p.into_inner());
+        if retained.active_leases == 0
+            && retained.children.is_empty()
+            && entries
+                .get(&token)
+                .is_some_and(|current| Arc::ptr_eq(current, &scope))
+        {
+            entries.remove(&token);
+        }
     }
 }
 
@@ -302,7 +374,8 @@ mod tests {
             fs::create_dir_all(path.join("child")).unwrap();
         }
         let map = Leases::default();
-        let _lease = Lease::enroll(&map, capture(&home, &workspace));
+        let _lease = Lease::enroll(&map, capture(&home, &workspace)).unwrap();
+        cleanup_retained(&map);
         for operand in [&home, &workspace] {
             for target in [
                 operand.to_path_buf(),
@@ -321,8 +394,8 @@ mod tests {
         assert!(ensure_outside(&map, &root.path().join("accounts/another")).is_ok());
         // Sibling and even same-scope readers coexist; this map is not a writer
         // reservation, and therefore cannot block ordinary launches.
-        let _sibling = Lease::enroll(&map, capture(&home, &sibling));
-        let _same = Lease::enroll(&map, capture(&home, &workspace));
+        let _sibling = Lease::enroll(&map, capture(&home, &sibling)).unwrap();
+        let _same = Lease::enroll(&map, capture(&home, &workspace)).unwrap();
         assert!(ensure_outside(&map, &sibling).is_err());
     }
 
@@ -339,7 +412,7 @@ mod tests {
         let alias = root.path().join("selected-alias");
         symlink(&workspace, &alias).unwrap();
         let map = Leases::default();
-        let lease = Lease::enroll(&map, capture(&home, &alias));
+        let lease = Lease::enroll(&map, capture(&home, &alias)).unwrap();
         assert!(ensure_outside(&map, &alias).is_err());
         let moved = new.join("renamed-workspace");
         fs::rename(&workspace, &moved).unwrap();
@@ -367,7 +440,7 @@ mod tests {
         fs::create_dir(&home).unwrap();
         fs::create_dir_all(workspace.join("child")).unwrap();
         let map = Leases::default();
-        let _lease = Lease::enroll(&map, capture(&home, &workspace));
+        let _lease = Lease::enroll(&map, capture(&home, &workspace)).unwrap();
         let moved = root.path().join("moved-parent");
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir_all(&workspace).unwrap();
@@ -387,8 +460,8 @@ mod tests {
             fs::create_dir(path).unwrap();
         }
         let map = Leases::default();
-        let first_lease = Lease::enroll(&map, capture(&home, &first));
-        let second_lease = Lease::enroll(&map, capture(&home, &second));
+        let first_lease = Lease::enroll(&map, capture(&home, &first)).unwrap();
+        let second_lease = Lease::enroll(&map, capture(&home, &second)).unwrap();
         drop(first_lease);
         assert!(ensure_outside(&map, &first).is_ok());
         assert!(ensure_outside(&map, &second).is_err());
@@ -419,10 +492,97 @@ mod tests {
         // A reader enrolled after the move does not share the original lexical
         // spelling. Only the destructive operation's retained pin finds it.
         let map = Leases::default();
-        let lease = Lease::enroll(&map, capture(&home, &moved.join("workspace")));
+        let lease = Lease::enroll(&map, capture(&home, &moved.join("workspace"))).unwrap();
         assert!(ensure_outside(&map, &original).is_ok());
         assert!(ensure_outside_directory(&map, &original, &destructive_pin).is_err());
         drop(lease);
         assert!(ensure_outside_directory(&map, &original, &destructive_pin).is_ok());
+    }
+
+    #[test]
+    fn concurrent_enrollment_respects_the_total_bound_and_reopens_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let scope = capture(&home, &workspace);
+        let map = Leases::default();
+        let leases: Vec<_> = (0..MAX_LEASES - 1)
+            .map(|_| Lease::enroll(&map, Arc::clone(&scope)).unwrap())
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let results = std::thread::scope(|threads| {
+            let attempts: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let map = Arc::clone(&map);
+                    let scope = Arc::clone(&scope);
+                    threads.spawn(move || {
+                        barrier.wait();
+                        Lease::enroll(&map, scope)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(Lease::enroll(&map, Arc::clone(&scope)).is_err());
+        drop(results);
+        drop(leases);
+        cleanup_retained(&map);
+        assert!(ensure_outside(&map, &workspace).is_ok());
+        let _next = Lease::enroll(&map, scope).unwrap();
+        assert!(ensure_outside(&map, &workspace).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_unreaped_child_keeps_its_scope_after_the_lease_drops() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let sibling = root.path().join("sibling");
+        for path in [&home, &workspace, &sibling] {
+            fs::create_dir(path).unwrap();
+        }
+        let map = Leases::default();
+        let lease = Lease::enroll(&map, capture(&home, &workspace)).unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(&workspace)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let input = child.stdin.take().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        lease.retain_unconfirmed(child);
+        drop(lease);
+        cleanup_retained(&map);
+        assert!(ensure_outside(&map, &home).is_err());
+        assert!(ensure_outside(&map, &workspace).is_err());
+        assert!(ensure_outside(&map, &sibling).is_ok());
+        // Only this original child's own stdin EOF completes the finite fixture.
+        // The census never looks up a PID or signals any process.
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                cleanup_retained(&map);
+                if ensure_outside(&map, &workspace).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the original child must be reaped after stdin EOF");
+        assert!(ensure_outside(&map, &home).is_ok());
     }
 }
