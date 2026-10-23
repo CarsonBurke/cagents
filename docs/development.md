@@ -183,13 +183,16 @@ scripts/run-development --hot
 scripts/run-development --hot-integrated
 ```
 
-The helper builds three native Linux products separately using locked
-`dev-runtime` builds, then stages the matched CLI/daemon beside cargo-hot's
-private executable bundle. Cargo-hot always targets the native host triple,
-adds a linker and saved compilation objects, and may need a substantial first
-build even with the ordinary runner's warmed cache. `CARGO_BUILD_JOBS` controls
-its spawned build jobs. Only one hot session can run at a time: the upstream
-client/server uses localhost port1100, and all development sessions share state.
+The helper builds the native Linux CLI and daemon separately using locked
+`dev-runtime` builds, resolves and fetches the selected UI dependency graph with
+locked Cargo metadata, then stages the matched CLI/daemon beside cargo-hot's
+private executable bundle. Cargo-hot builds the UI directly; an ordinary UI
+preflight build would produce an unused executable. Cargo-hot always targets
+the native host triple, adds a linker and saved compilation objects, and may need
+a substantial first build even with the ordinary runner's warmed cache.
+`CARGO_BUILD_JOBS` controls its spawned build jobs. Only one hot session can run
+at a time: the upstream client/server uses localhost port 1100, and all development
+sessions share state.
 
 Every helper Cargo invocation runs with `Cargo.lock` mounted read-only in a
 private bubblewrap mount namespace. This also refuses atomic replacement/unlink
@@ -338,8 +341,10 @@ and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/bl
 ## Testing
 
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
-feature, the `ui` and `host` unit tests and every gated integration target are
-compiled out. Cover the boundaries a change touches:
+feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
+targets whose required features are absent, rather than compiling and linking
+empty harnesses. The host-only terminal workload example is also skipped outside
+its lane. Cover the boundaries a change touches:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
@@ -354,6 +359,10 @@ cargo test --locked --no-default-features --features host --lib terminal::
 cargo test --locked --no-default-features --features host --test terminal_load_contract
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+Explicitly selecting a gated target without its feature, including through a
+`--test '*'` glob, reports the missing feature instead of succeeding with zero
+tests. Use `--all-targets` to select all targets available in a feature lane.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
