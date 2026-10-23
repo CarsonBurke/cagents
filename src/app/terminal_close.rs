@@ -145,8 +145,7 @@ impl Cagents {
         // card from its channel's membership.
         let emptied = self.channels_emptied_by(&[card]);
         self.retire_lsp_card(card);
-        self.sidebar_state.clear_agent_activity(card);
-        self.sidebar_state.acknowledge_agent_update(card);
+        self.sidebar_state.forget_card_attention(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
         Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
@@ -395,8 +394,7 @@ impl Cagents {
             }
         }
         self.retire_lsp_card(id);
-        self.sidebar_state.clear_agent_activity(id);
-        self.sidebar_state.acknowledge_agent_update(id);
+        self.sidebar_state.forget_card_attention(id);
         self.chat_discard(id);
         // A draft still waiting out its debounce is the last thing
         // typed into the pane; closing it is not discarding it.
