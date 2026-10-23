@@ -1,11 +1,13 @@
 use super::*;
 use workspace_widget::GlobalShortcut as Command;
 
+mod row;
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     recording: Option<SettingsField>,
     query: Option<String>,
-    selected: usize,
+    selected: Option<EntryIdentity>,
     move_pane: Option<CardId>,
 }
 impl State {
@@ -28,6 +30,85 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct MessageBox(pub Box<Message>);
 
+// Selection is an intent captured by a query or navigation key, not a live row index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryIdentity {
+    Command(Command),
+    Pane(CardId),
+    Worktree(ProjectId, crate::model::WorktreeId, PathBuf),
+    Channel(crate::model::ChannelId),
+    Repository(ProjectId, PathBuf),
+    ResumeConversation,
+    Workboard,
+    MovePane(CardId, crate::model::ChannelId),
+}
+
+impl EntryIdentity {
+    fn widget_id(&self) -> widget::Id {
+        widget::Id::new(format!("palette.row.{self:?}"))
+    }
+
+    fn capture(message: &Message) -> Option<Self> {
+        Some(match message {
+            Message::RunCommand(command) => Self::Command(*command),
+            Message::Palette(Action::FocusPane(card)) => Self::Pane(*card),
+            Message::Sidebar(SidebarAction::OpenWorktree {
+                project_id,
+                worktree_id,
+                path,
+            }) => Self::Worktree(*project_id, *worktree_id, path.clone()),
+            Message::Sidebar(SidebarAction::OpenChannel { channel_id }) => {
+                Self::Channel(*channel_id)
+            }
+            Message::Sidebar(SidebarAction::OpenRepository {
+                project_id,
+                repository,
+            }) => Self::Repository(*project_id, repository.clone()),
+            Message::ResumeConversation(resume_ui::Action::Open) => Self::ResumeConversation,
+            Message::Sidebar(SidebarAction::OpenWork) => Self::Workboard,
+            Message::MovePaneToChannel { card, channel } => Self::MovePane(*card, *channel),
+            _ => return None,
+        })
+    }
+
+    fn matches(&self, message: &Message) -> bool {
+        match (self, message) {
+            (Self::Command(expected), Message::RunCommand(actual)) => expected == actual,
+            (Self::Pane(expected), Message::Palette(Action::FocusPane(actual))) => {
+                expected == actual
+            }
+            (
+                Self::Worktree(project, worktree, path),
+                Message::Sidebar(SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path: actual,
+                }),
+            ) => project == project_id && worktree == worktree_id && path == actual,
+            (
+                Self::Channel(expected),
+                Message::Sidebar(SidebarAction::OpenChannel { channel_id }),
+            ) => expected == channel_id,
+            (
+                Self::Repository(project, path),
+                Message::Sidebar(SidebarAction::OpenRepository {
+                    project_id,
+                    repository,
+                }),
+            ) => project == project_id && path == repository,
+            (Self::Workboard, Message::Sidebar(SidebarAction::OpenWork)) => true,
+            (Self::ResumeConversation, Message::ResumeConversation(resume_ui::Action::Open)) => {
+                true
+            }
+            (
+                Self::MovePane(expected_card, expected_channel),
+                Message::MovePaneToChannel { card, channel },
+            ) => expected_card == card && expected_channel == channel,
+            _ => false,
+        }
+    }
+}
+
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
 
@@ -39,7 +120,20 @@ fn palette_query(query: &str) -> (Option<char>, &str) {
     }
 }
 
-fn search_label(label: &str) -> &str {
+fn palette_mode_query(query: &str, moving: bool) -> (Option<char>, &str) {
+    if moving {
+        (None, query.trim())
+    } else {
+        palette_query(query)
+    }
+}
+
+fn search_label(label: &str, moving: bool) -> &str {
+    if moving {
+        return label
+            .strip_prefix("Move pane to channel: ")
+            .unwrap_or(label);
+    }
     ["Focus pane: ", "Open workspace: ", "Open channel: "]
         .into_iter()
         .find_map(|prefix| label.strip_prefix(prefix))
@@ -88,7 +182,7 @@ fn match_score(label: &str, query: &str) -> Option<usize> {
     crate::search_match::score(&matching::lowercase(label), &matching::lowercase(query))
 }
 
-fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
+fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static, Message> {
     use iced::widget::text::Span;
     if query.is_empty() {
         return design::body(label.to_owned())
@@ -101,7 +195,7 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
     }
     let accent = design::accent_color(&cosmic::theme::active());
     let font = cosmic::font::default();
-    let searchable = search_label(label);
+    let searchable = search_label(label, moving);
     let offset = label.len() - searchable.len();
     let matches = matching::highlighted_ranges(searchable, query, offset);
     let mut spans: Vec<Span<'static, ()>> = Vec::new();
@@ -174,8 +268,8 @@ impl Cagents {
                 }
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
-                self.palette.selected = 0;
                 self.palette.move_pane = None;
+                self.capture_first_palette_entry();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
@@ -186,12 +280,14 @@ impl Cagents {
                 }
                 let task = self.update_palette(Action::Open);
                 self.palette.move_pane = Some(card);
+                self.capture_first_palette_entry();
                 task
             }
             Action::Close => {
                 self.palette.recording = None;
                 self.palette.query = None;
                 self.palette.move_pane = None;
+                self.palette.selected = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
@@ -199,7 +295,7 @@ impl Cagents {
             }
             Action::Query(query) => {
                 self.palette.query = Some(query);
-                self.palette.selected = 0;
+                self.capture_first_palette_entry();
                 self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
@@ -207,12 +303,16 @@ impl Cagents {
                 if self.modal_is_open() || self.focused_repository_is_saving() {
                     return Task::none();
                 }
-                if self.card_state(id).is_none_or(|card| !card.existence.is_open())
+                if self
+                    .card_state(id)
+                    .is_none_or(|card| !card.existence.is_open())
                     || self.refuse_for_deleting_card(id)
                 {
                     return Task::none();
                 }
-                let card = self.card_state(id).expect("the open target is still present");
+                let card = self
+                    .card_state(id)
+                    .expect("the open target is still present");
                 let channel = self
                     .durable
                     .channels
@@ -220,11 +320,17 @@ impl Cagents {
                     .find(|channel| channel.cards.contains(&id))
                     .map(|channel| channel.id);
                 let path = channel.map_or_else(
-                    || self.card_worktree(card).map(Path::to_path_buf)
-                        .or_else(|| self.active_workspace.clone()),
+                    || {
+                        self.card_worktree(card)
+                            .map(Path::to_path_buf)
+                            .or_else(|| self.active_workspace.clone())
+                    },
                     |channel| self.channel_directory(channel),
                 );
-                if path.as_deref().is_some_and(|path| self.refuse_in_deleting_worktree(path)) {
+                if path
+                    .as_deref()
+                    .is_some_and(|path| self.refuse_in_deleting_worktree(path))
+                {
                     return Task::none();
                 }
                 let navigation = if self.workspace.order().any(|candidate| candidate == id) {
@@ -243,13 +349,21 @@ impl Cagents {
                 navigation.chain(self.update(Message::FocusCard(id)))
             }
             Action::Submit => {
+                let Some(selected) = self.palette.selected.as_ref() else {
+                    return self.update_palette(Action::Close);
+                };
                 let entry = self
                     .palette_entries()
                     .into_iter()
-                    .nth(self.palette.selected);
+                    .find(|(_, _, message)| selected.matches(message));
                 match entry {
                     Some((_, _, message)) => self.run_palette_command(message),
-                    None => self.update_palette(Action::Close),
+                    None => {
+                        self.status = Some(TransientNotice::warning(
+                            "That palette result is no longer available. Choose another result.",
+                        ));
+                        Task::none()
+                    }
                 }
             }
         }
@@ -265,6 +379,7 @@ impl Cagents {
         }
         self.palette.query = None;
         self.palette.move_pane = None;
+        self.palette.selected = None;
         let command = self.update(message);
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
@@ -369,14 +484,18 @@ impl Cagents {
         } = event
             && modifiers.is_empty()
         {
-            let count = self.palette_entries().len();
+            let entries = self.palette_entries();
+            let count = entries.len();
+            let selected = self.selected_palette_index(&entries);
             match key {
                 keyboard::key::Named::ArrowDown if count > 0 => {
-                    self.palette.selected = (self.palette.selected + 1) % count;
+                    let next = selected.map_or(0, |index| (index + 1) % count);
+                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
                     return Some(self.reveal_palette_selection());
                 }
                 keyboard::key::Named::ArrowUp if count > 0 => {
-                    self.palette.selected = (self.palette.selected + count - 1) % count;
+                    let next = selected.map_or(count - 1, |index| (index + count - 1) % count);
+                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
                     return Some(self.reveal_palette_selection());
                 }
                 keyboard::key::Named::Enter => return Some(self.update_palette(Action::Submit)),
@@ -386,54 +505,154 @@ impl Cagents {
         Some(Task::none())
     }
 
-    fn reveal_palette_selection(&self) -> Task<Message> {
-        crate::interaction::reveal_list_selection(
-            widget::Id::new("palette.commands"),
-            self.palette.selected,
-            ROW_HEIGHT,
-            ROW_SPACING,
-        )
+    fn capture_first_palette_entry(&mut self) {
+        self.palette.selected = self
+            .palette_entries()
+            .first()
+            .and_then(|(_, _, message)| EntryIdentity::capture(message));
     }
 
-    fn palette_pane_label(&self, card: &CardState) -> String {
-        let title = self.card_display_title(card);
-        let place = self
+    fn selected_palette_index(&self, entries: &[(String, String, Message)]) -> Option<usize> {
+        let selected = self.palette.selected.as_ref()?;
+        entries
+            .iter()
+            .position(|(_, _, message)| selected.matches(message))
+    }
+
+    fn reveal_palette_selection(&self) -> Task<Message> {
+        self.selected_palette_index(&self.palette_entries())
+            .map_or_else(Task::none, |index| {
+                crate::interaction::reveal_list_selection(
+                    widget::Id::new("palette.commands"),
+                    index,
+                    ROW_HEIGHT,
+                    ROW_SPACING,
+                )
+            })
+    }
+
+    fn palette_pane_entries(&self) -> Vec<(String, String, Message)> {
+        // All lookups live for this immutable entry build. Preserve each
+        // resolver's first match without scanning memberships for every pane.
+        let mut cards = HashMap::new();
+        for card in &self.durable.cards {
+            cards.entry(card.id).or_insert(card);
+        }
+        // Match card_state's validated index preference, including its fallback
+        // when a restored index is absent or stale.
+        for (id, index) in &self.card_indices {
+            if let Some(card) = self.durable.cards.get(*index).filter(|card| card.id == *id) {
+                cards.insert(*id, card);
+            }
+        }
+        let mut projects = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            projects.entry(project.id).or_insert(project);
+        }
+        let mut worktree_labels = HashMap::new();
+        for project in projects.values() {
+            for worktree in &project.worktrees {
+                worktree_labels
+                    .entry((project.id, worktree.id))
+                    .or_insert_with(|| format!("{} · {}", worktree.label(), project.name));
+            }
+        }
+        let mut path_labels = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            // worktree_at prefers a folder binding over rows at the same path.
+            // A binding without a corresponding row still reserves that path.
+            if let Some(key) = project.folder_key() {
+                path_labels
+                    .entry(project.repository.as_path())
+                    .or_insert_with(|| {
+                        worktree_labels
+                            .get(&(key.project_id, key.worktree_id))
+                            .map(String::as_str)
+                    });
+            }
+            for worktree in &project.worktrees {
+                path_labels
+                    .entry(worktree.path.as_path())
+                    .or_insert_with(|| {
+                        worktree_labels
+                            .get(&(project.id, worktree.id))
+                            .map(String::as_str)
+                    });
+            }
+        }
+        let channel_places: Vec<_> = self
             .durable
             .channels
             .iter()
-            .find(|channel| channel.cards.contains(&card.id))
             .map(|channel| {
-                self.sidebar_model.project(channel.project_id).map_or_else(
+                projects.get(&channel.project_id).map_or_else(
                     || channel.title.clone(),
                     |project| format!("{} · {}", channel.title, project.name),
                 )
             })
-            .or_else(|| {
-                self.card_worktree(card).map(|path| {
-                    self.sidebar_model
-                        .worktree_at(path)
-                        .and_then(|key| {
-                            self.sidebar_model.project(key.project_id).map(|project| {
-                                project
-                                    .worktrees
-                                    .iter()
-                                    .find(|worktree| worktree.id == key.worktree_id)
-                                    .map(|worktree| {
-                                        format!("{} · {}", worktree.label(), project.name)
-                                    })
-                            })
-                        })
-                        .flatten()
-                        .unwrap_or_else(|| {
-                            path.file_name()
-                                .unwrap_or(path.as_os_str())
-                                .to_string_lossy()
-                                .into_owned()
-                        })
+            .collect();
+        let mut pane_channels = HashMap::new();
+        for (channel, place) in self.durable.channels.iter().zip(&channel_places) {
+            let primary = if channel.title_source == crate::model::ChannelTitleSource::Manual {
+                channel.cards.iter().copied().find(|id| {
+                    cards.get(id).is_some_and(|card| {
+                        card.existence.is_open() && matches!(card.kind, CardKind::Chat(_))
+                    })
                 })
+            } else {
+                None
+            };
+            for id in &channel.cards {
+                let entry = pane_channels.entry(*id).or_insert((place.as_str(), None));
+                // Empty channels count for ownership but never supply a title.
+                if !channel.title.is_empty() && entry.1.is_none() {
+                    entry.1 = Some((channel, primary));
+                }
+            }
+        }
+        let roots = self.indexed_worktree_roots();
+        self.durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| {
+                let title = self.card_display_title_with_chat_title(card, || {
+                    let CardKind::Chat(session) = &card.kind else {
+                        return None;
+                    };
+                    let (channel, primary) = pane_channels.get(&card.id)?.1?;
+                    (card.title == chat_ui::chat_card_title(session.launch.provider)
+                        || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                            && primary == Some(card.id)))
+                    .then_some(channel.title.as_str())
+                });
+                let place = pane_channels
+                    .get(&card.id)
+                    .map(|(place, _)| Cow::Borrowed(*place))
+                    .or_else(|| {
+                        self.unchanneled_card_worktree_indexed(card, &roots)
+                            .map(|path| {
+                                path_labels.get(path).copied().flatten().map_or_else(
+                                    || {
+                                        Cow::Owned(
+                                            path.file_name()
+                                                .unwrap_or(path.as_os_str())
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        )
+                                    },
+                                    Cow::Borrowed,
+                                )
+                            })
+                    })
+                    .unwrap_or(Cow::Borrowed("Global"));
+                (
+                    format!("Focus pane: {title} · {place}"),
+                    self.palette_pane_status(card.id).into(),
+                    Message::Palette(Action::FocusPane(card.id)),
+                )
             })
-            .unwrap_or_else(|| "Global".into());
-        format!("Focus pane: {title} · {place}")
+            .collect()
     }
 
     fn palette_pane_status(&self, card: CardId) -> &'static str {
@@ -481,18 +700,7 @@ impl Cagents {
             "Every worktree and branch in progress".into(),
             Message::Sidebar(SidebarAction::OpenWork),
         ));
-        for card in self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open())
-        {
-            entries.push((
-                self.palette_pane_label(card),
-                self.palette_pane_status(card.id).into(),
-                Message::Palette(Action::FocusPane(card.id)),
-            ));
-        }
+        entries.extend(self.palette_pane_entries());
         if let Some(card) = self.workspace.focused() {
             entries.extend(self.pane_move_palette_entries(card));
         }
@@ -554,10 +762,14 @@ impl Cagents {
         &self,
         mut entries: Vec<(String, String, Message)>,
     ) -> Vec<(String, String, Message)> {
-        let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
+        let (category, query) = palette_mode_query(
+            self.palette.query.as_deref().unwrap_or(""),
+            self.palette.move_pane.is_some(),
+        );
         entries.retain(|(label, _, message)| {
             category.is_none_or(|category| entry_category(message) == category)
-                && match_score(search_label(label), query).is_some()
+                && match_score(search_label(label, self.palette.move_pane.is_some()), query)
+                    .is_some()
         });
         entries.sort_by_cached_key(|(label, _, message)| {
             let recent = entry_key(message)
@@ -575,7 +787,8 @@ impl Cagents {
                 _ => 3,
             };
             (
-                match_score(search_label(label), query).unwrap_or(usize::MAX),
+                match_score(search_label(label, self.palette.move_pane.is_some()), query)
+                    .unwrap_or(usize::MAX),
                 recent,
                 common,
             )
@@ -605,30 +818,35 @@ impl Cagents {
         .id(widget::Id::new("palette.query"))
         .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
+        let selected = self.selected_palette_index(&entries);
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
-            .map(|(index, (label, chord, message))| {
-                let (_, needle) = palette_query(query);
+            .filter_map(|(index, (label, chord, message))| {
+                let identity = EntryIdentity::capture(&message)?;
+                let (_, needle) = palette_mode_query(query, self.palette.move_pane.is_some());
                 let row = widget::row::with_children(vec![
-                    highlighted_label(&label, needle),
+                    highlighted_label(&label, needle, self.palette.move_pane.is_some()),
                     design::caption(chord)
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
                 ])
                 .spacing(space::M)
                 .align_y(Alignment::Center);
-                widget::button::custom(
+                let button = widget::button::custom(
                     widget::container(row)
                         .height(Length::Fill)
                         .align_y(Alignment::Center),
                 )
-                .class(palette_row_style(index == self.palette.selected))
+                .id(identity.widget_id())
+                .name(label)
+                .class(palette_row_style(selected == Some(index)))
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
                 .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
-                .into()
+                .into();
+                Some(row::owned(identity, button))
             })
             .collect();
         let rows = if rows.is_empty() {
@@ -1515,24 +1733,43 @@ mod tests {
 
     fn inactive_palette_pane(channel: bool) -> (Cagents, CardId, PathBuf) {
         let mut app = settings_focus_fixture();
-        let mut card = app.card_state(app.workspace.focused().unwrap()).unwrap().clone();
+        let mut card = app
+            .card_state(app.workspace.focused().unwrap())
+            .unwrap()
+            .clone();
         card.id = CardId::new();
         card.title = "Held pane".into();
         let path = PathBuf::from("/palette-held-workspace");
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(SidebarProject::new(
-            project, RepositoryId::new(), "Held workspace".into(), path.clone(),
-            Vec::new(), Vec::new(),
-        ).with_kind(ProjectKind::Folder));
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Held workspace".into(),
+                path.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
         if channel {
-            Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel {
-                id: crate::model::ChannelId::new(), project_id: project,
-                title: "Held channel".into(), title_source: Default::default(),
-                ordinal: 0, shared: false, cards: vec![card.id], focused: Some(card.id),
-            });
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id: crate::model::ChannelId::new(),
+                    project_id: project,
+                    title: "Held channel".into(),
+                    title_source: Default::default(),
+                    ordinal: 0,
+                    shared: false,
+                    cards: vec![card.id],
+                    focused: Some(card.id),
+                });
         } else {
             app.worktree_owners.insert(card.id, path.clone());
-            Arc::make_mut(&mut app.durable).card_scopes.insert(card.id, path.clone());
+            Arc::make_mut(&mut app.durable)
+                .card_scopes
+                .insert(card.id, path.clone());
         }
         let id = card.id;
         Arc::make_mut(&mut app.durable).cards.push(card);
@@ -1578,8 +1815,12 @@ mod tests {
         for channel in [false, true] {
             for closing in [false, true] {
                 let (mut app, target, path) = inactive_palette_pane(channel);
-                let before = (app.active_workspace.clone(), app.durable.active_channel,
-                    app.workspace.order().collect::<Vec<_>>(), app.workspace.focused());
+                let before = (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                );
                 if closing {
                     let project = app.sidebar_model.projects.last().unwrap().id;
                     app.project_ui.closing.insert(project, path.clone());
@@ -1589,9 +1830,22 @@ mod tests {
                 drop(app.update(Message::Palette(Action::Run(MessageBox(Box::new(
                     Message::Palette(Action::FocusPane(target)),
                 ))))));
-                assert_eq!((app.active_workspace.clone(), app.durable.active_channel,
-                    app.workspace.order().collect::<Vec<_>>(), app.workspace.focused()), before);
-                assert!(app.status.is_some());
+                assert_eq!(
+                    (
+                        app.active_workspace.clone(),
+                        app.durable.active_channel,
+                        app.workspace.order().collect::<Vec<_>>(),
+                        app.workspace.focused()
+                    ),
+                    before
+                );
+                let warning = TransientNotice::warning(if closing {
+                    "That project is being removed."
+                } else {
+                    "That worktree is being deleted."
+                });
+                assert!(app.status.is_none(), "actual update drained the warning");
+                assert!(app.notices.recent().any(|entry| entry.notice == warning));
             }
         }
     }
@@ -1633,5 +1887,598 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.insert(0, other);
         assert_eq!(app.card_state(id).unwrap().id, id);
         assert_eq!(app.card_state_mut(id).unwrap().id, id);
+    }    #[test]
+    fn move_picker_ranks_destinations_and_keeps_category_prefixes_literal() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        app.palette.move_pane = Some(card);
+        let first = crate::model::ChannelId::new();
+        let exact = crate::model::ChannelId::new();
+        let entry = |label: &str, channel| {
+            (
+                format!("Move pane to channel: {label}"),
+                String::new(),
+                Message::MovePaneToChannel { card, channel },
+            )
+        };
+        app.palette.query = Some("refactor".into());
+        let entries = app.filter_palette_entries(vec![
+            entry("alpha-wt-refactor-ui", first),
+            entry("refactor", exact),
+        ]);
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(entries[0].2, Message::MovePaneToChannel { card: id, channel }
+            if id == card && channel == exact)
+        );
+        app.palette.query = Some("#release".into());
+        let entries =
+            app.filter_palette_entries(vec![entry("#release", exact), entry("release", first)]);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(entries[0].2, Message::MovePaneToChannel { card: id, channel }
+            if id == card && channel == exact)
+        );
+        assert_eq!(
+            palette_mode_query("#release", false),
+            (Some('#'), "release")
+        );
+        assert_eq!(palette_mode_query("#release", true), (None, "#release"));
+        app.palette.move_pane = None;
+        app.palette.query = Some(">move".into());
+        let entries = app.filter_palette_entries(vec![entry("refactor", exact)]);
+        assert_eq!(
+            entries.len(),
+            1,
+            "normal command search must retain the move verb"
+        );
+        assert!(
+            matches!(entries[0].2, Message::MovePaneToChannel { card: id, channel }
+            if id == card && channel == exact)
+        );
+    }
+
+    #[test]
+    fn palette_pane_labels_preserve_channel_title_precedence_across_live_renames() {
+        let (mut app, primary, path) = inactive_palette_pane(true);
+        let provider = crate::agent::Provider::Omp;
+        let session = crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: Vec::new(),
+                    working_directory: path.clone(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut secondary = app.card_state(primary).unwrap().clone();
+        secondary.id = CardId::new();
+        secondary.title = chat_ui::chat_card_title(provider).into();
+        secondary.kind = CardKind::Chat(session.clone());
+        let utility = app.workspace.focused().unwrap();
+        let durable = Arc::make_mut(&mut app.durable);
+        let card = durable
+            .cards
+            .iter_mut()
+            .find(|card| card.id == primary)
+            .unwrap();
+        card.title = "Provider suggestion".into();
+        card.kind = CardKind::Chat(session);
+        durable.cards.push(secondary.clone());
+        // The empty first channel owns the place label; the first nonempty
+        // channel supplies the primary manual title and the secondary default.
+        durable.channels[0].title.clear();
+        durable.channels[0].cards.push(secondary.id);
+        let mut named = durable.channels[0].clone();
+        named.id = crate::model::ChannelId::new();
+        named.title = "Investigation".into();
+        named.title_source = crate::model::ChannelTitleSource::Manual;
+        named.cards = vec![utility, primary, secondary.id];
+        durable.channels.push(named.clone());
+        named.id = crate::model::ChannelId::new();
+        named.title = "Later membership".into();
+        durable.channels.push(named);
+        app.worktree_owners.insert(primary, "/ignored-owner".into());
+        let labels = |app: &Cagents| {
+            app.palette_pane_entries()
+                .into_iter()
+                .filter_map(|(label, _, message)| match message {
+                    Message::Palette(Action::FocusPane(id))
+                        if id == primary || id == secondary.id =>
+                    {
+                        Some((id, label))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&app),
+            vec![
+                (
+                    primary,
+                    "Focus pane: Investigation ·  · Held workspace".into()
+                ),
+                (
+                    secondary.id,
+                    "Focus pane: Investigation ·  · Held workspace".into(),
+                ),
+            ]
+        );
+        Arc::make_mut(&mut app.durable).channels[1].title = "Renamed".into();
+        app.chrome_ui
+            .user_titles
+            .insert(secondary.id, "Local title".into());
+        assert_eq!(
+            labels(&app),
+            vec![
+                (primary, "Focus pane: Renamed ·  · Held workspace".into()),
+                (
+                    secondary.id,
+                    "Focus pane: Local title ·  · Held workspace".into(),
+                ),
+            ]
+        );
+    }
+
+    fn palette_pointer_step(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        target: &EntryIdentity,
+        event: iced::mouse::Event,
+        point: Option<iced::Point>,
+    ) -> (iced::Point, Vec<Message>) {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::{Event, Rectangle, Size, mouse};
+        struct Bounds {
+            id: widget::Id,
+            found: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&self.id) {
+                    self.found = Some(bounds);
+                }
+            }
+        }
+        let mut element = app.palette_surface().unwrap();
+        tree.diff(element.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(1000.0, 1600.0));
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds {
+            id: target.widget_id(),
+            found: None,
+        };
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        let bounds = bounds
+            .found
+            .expect("actual production row is a native focusable button");
+        assert!((bounds.height - ROW_HEIGHT).abs() < 0.5);
+        let point = point.unwrap_or_else(|| bounds.center());
+        assert!(
+            bounds.contains(point),
+            "held pointer must remain at the same row position"
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        (point, messages)
+    }
+
+    #[test]
+    fn palette_row_accessibility_keeps_actionable_full_labels_after_target_reset() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::{Size, mouse};
+        use iced_accessibility::accesskit::{Action as A11yAction, Role};
+        fn accessible(
+            app: &Cagents,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+        ) -> iced_accessibility::A11yTree {
+            let mut element = app.palette_surface().unwrap();
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                tree,
+                renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1600.0)),
+            );
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), tree, mouse::Cursor::Unavailable)
+        }
+        fn assert_button(tree: &iced_accessibility::A11yTree, card: CardId, label: &str) {
+            let expected: iced_accessibility::A11yId = EntryIdentity::Pane(card).widget_id().into();
+            let node = tree
+                .root()
+                .iter()
+                .chain(tree.children())
+                .find(|node| iced_accessibility::IdEq::eq(node.id(), &expected))
+                .expect("actual result button remains accessible");
+            assert_eq!(node.node().role(), Role::Button);
+            assert!(node.node().supports_action(A11yAction::Click));
+            assert!(node.node().supports_action(A11yAction::Focus));
+            assert!(
+                node.node()
+                    .label()
+                    .is_some_and(|actual| actual.contains(label))
+            );
+        }
+        let (mut app, original, path) = inactive_palette_pane(false);
+        app.card_state_mut(original).unwrap().title =
+            "Archive held agent with a complete accessible name".into();
+        let mut other = app.card_state(original).unwrap().clone();
+        other.id = CardId::new();
+        other.title = "Unrelated archive held agent".into();
+        let replacement = other.id;
+        app.worktree_owners.insert(replacement, path.clone());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(replacement, path);
+        Arc::make_mut(&mut app.durable).cards.push(other);
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@held".into())));
+        assert!(
+            matches!(app.palette_entries()[0].2, Message::Palette(Action::FocusPane(id)) if id == original)
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let before = accessible(&app, &mut tree, &renderer);
+        assert_button(
+            &before,
+            original,
+            "Archive held agent with a complete accessible name",
+        );
+        assert_button(&before, replacement, "Unrelated archive held agent");
+        app.card_state_mut(replacement).unwrap().title = "Held new agent".into();
+        assert_eq!(app.palette_entries().len(), 2);
+        assert!(
+            matches!(app.palette_entries()[0].2, Message::Palette(Action::FocusPane(id)) if id == replacement)
+        );
+        let after = accessible(&app, &mut tree, &renderer);
+        assert_button(
+            &after,
+            original,
+            "Archive held agent with a complete accessible name",
+        );
+        assert_button(&after, replacement, "Held new agent");
+    }
+
+    #[test]
+    fn native_palette_press_cannot_transfer_to_another_target_at_the_same_row() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let (mut app, original, path) = inactive_palette_pane(false);
+        app.card_state_mut(original).unwrap().title = "Archive held agent".into();
+        let mut other = app.card_state(original).unwrap().clone();
+        other.id = CardId::new();
+        other.title = "Unrelated archive held agent".into();
+        let replacement = other.id;
+        app.worktree_owners.insert(replacement, path.clone());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(replacement, path);
+        Arc::make_mut(&mut app.durable).cards.push(other);
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@held".into())));
+        assert!(
+            matches!(app.palette_entries()[0].2, Message::Palette(Action::FocusPane(id)) if id == original)
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(original),
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        app.card_state_mut(replacement).unwrap().title = "Held new agent".into();
+        assert_eq!(
+            app.palette_entries().len(),
+            2,
+            "equal child count must exercise positional reuse"
+        );
+        assert!(
+            matches!(app.palette_entries()[0].2, Message::Palette(Action::FocusPane(id)) if id == replacement)
+        );
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(replacement),
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(
+            messages.is_empty(),
+            "old press must not activate the rebuilt replacement callback"
+        );
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(replacement),
+            Event::ButtonPressed(Button::Left),
+            Some(point),
+        );
+        assert!(messages.is_empty());
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(replacement),
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::Run(MessageBox(message)))]
+            if matches!(message.as_ref(), Message::Palette(Action::FocusPane(id)) if *id == replacement))
+        );
+    }
+
+    #[test]
+    fn native_palette_press_survives_status_refresh_of_the_same_target() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let (mut app, target, _) = inactive_palette_pane(false);
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@held".into())));
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(target),
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        app.sidebar_state.observe_agent_update(
+            target,
+            ProjectId::new(),
+            crate::model::WorktreeId::new(),
+        );
+        assert_eq!(app.palette_entries()[0].1, "• Unread");
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Pane(target),
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::Palette(Action::Run(MessageBox(message)))]
+            if matches!(message.as_ref(), Message::Palette(Action::FocusPane(id)) if *id == target))
+        );
+    }
+
+    #[test]
+    fn keyboard_selection_keeps_its_pane_when_live_results_rank_ahead() {
+        let (mut app, target, path) = inactive_palette_pane(false);
+        app.card_state_mut(target).unwrap().title = "Archive held agent".into();
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@held".into())));
+        assert_eq!(app.palette.selected, Some(EntryIdentity::Pane(target)));
+        let mut fresh = app.card_state(target).unwrap().clone();
+        fresh.id = CardId::new();
+        fresh.title = "Held new agent".into();
+        let fresh_id = fresh.id;
+        app.worktree_owners.insert(fresh_id, path.clone());
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.card_scopes.insert(fresh_id, path.clone());
+        durable.cards.push(fresh);
+        let entries = app.palette_entries();
+        assert!(matches!(entries[0].2, Message::Palette(Action::FocusPane(id)) if id == fresh_id));
+        assert_eq!(app.selected_palette_index(&entries), Some(1));
+        drop(app.update(Message::Palette(Action::Submit)));
+        assert_eq!(app.active_workspace.as_ref(), Some(&path));
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.settings.palette_recents[0], format!("pane:{target}"));
+    }
+
+    #[test]
+    fn keyboard_selection_refuses_a_removed_pane_and_a_replaced_workspace_path() {
+        for workspace_path_changed in [false, true] {
+            let (mut app, target, _) = inactive_palette_pane(false);
+            drop(app.update_palette(Action::Open));
+            drop(app.update_palette(Action::Query(if workspace_path_changed {
+                "#heldworkspace".into()
+            } else {
+                "@held".into()
+            })));
+            assert!(app.palette.selected.is_some());
+            let before = (
+                app.active_workspace.clone(),
+                app.workspace.focused(),
+                app.settings.palette_recents.clone(),
+            );
+            if workspace_path_changed {
+                app.sidebar_model.projects.last_mut().unwrap().repository =
+                    PathBuf::from("/replacement-held-workspace");
+            } else {
+                let mut fresh = app.card_state(target).unwrap().clone();
+                fresh.id = CardId::new();
+                Arc::make_mut(&mut app.durable)
+                    .cards
+                    .retain(|card| card.id != target);
+                Arc::make_mut(&mut app.durable).cards.push(fresh);
+            }
+            assert!(
+                !app.palette_entries().is_empty(),
+                "another live row must not inherit selection"
+            );
+            drop(app.update(Message::Palette(Action::Submit)));
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.workspace.focused(),
+                    app.settings.palette_recents.clone()
+                ),
+                before
+            );
+            assert!(app.palette.is_open());
+            let expected = TransientNotice::warning(
+                "That palette result is no longer available. Choose another result.",
+            );
+            assert!(
+                app.notices
+                    .recent()
+                    .any(|notice| notice.notice.message == expected.message)
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_selection_keeps_project_worktree_and_exact_path() {
+        let project_id = ProjectId::new();
+        let worktree_id = crate::model::WorktreeId::new();
+        let original = Message::Sidebar(SidebarAction::OpenWorktree {
+            project_id,
+            worktree_id,
+            path: PathBuf::from("/original-worktree"),
+        });
+        let selected = EntryIdentity::capture(&original).unwrap();
+        assert!(selected.matches(&original));
+        for (project_id, worktree_id, path) in [
+            (ProjectId::new(), worktree_id, "/original-worktree"),
+            (
+                project_id,
+                crate::model::WorktreeId::new(),
+                "/original-worktree",
+            ),
+            (project_id, worktree_id, "/replacement-worktree"),
+        ] {
+            assert!(
+                !selected.matches(&Message::Sidebar(SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path: PathBuf::from(path),
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn palette_pane_navigation_preserves_scope_when_original_protection_is_refused() {
+        for blocked in [true, false] {
+            let destination = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let path = destination.path().canonicalize().unwrap();
+            let (mut app, target, _) = inactive_palette_pane(false);
+            app.sidebar_model.projects.last_mut().unwrap().repository = path.clone();
+            app.worktree_owners.insert(target, path.clone());
+            Arc::make_mut(&mut app.durable)
+                .card_scopes
+                .insert(target, path.clone());
+            app.worktree_protections
+                .use_fixture_runtime(runtime.path().into());
+            let exclusive = blocked.then(|| {
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &path, true).unwrap()
+            });
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+            );
+            drop(app.update(Message::Palette(Action::FocusPane(target))));
+            if blocked {
+                assert_eq!(
+                    (
+                        app.active_workspace.clone(),
+                        app.durable.active_channel,
+                        app.workspace.order().collect::<Vec<_>>(),
+                        app.workspace.focused()
+                    ),
+                    before
+                );
+                assert!(
+                    app.notices
+                        .recent()
+                        .any(|entry| entry.notice.message.contains("Cannot open this worktree"))
+                );
+            } else {
+                assert_eq!(app.active_workspace.as_ref(), Some(&path));
+                assert_eq!(app.workspace.focused(), Some(target));
+                assert!(
+                    crate::worktree_cleanup::fixture_protection(runtime.path(), &path, true)
+                        .is_err(),
+                    "the admitted destination keeps its actual shared protection"
+                );
+            }
+            drop(exclusive);
+        }
+    }
+
+    #[test]
+    fn work_board_entry_remains_an_actionable_typed_palette_row() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let mut app = settings_focus_fixture();
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">work board".into())));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Open Work board");
+        assert!(EntryIdentity::Workboard.matches(&entries[0].2));
+        assert_eq!(app.palette.selected, Some(EntryIdentity::Workboard));
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(app.palette_surface().unwrap().as_widget());
+        let (point, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Workboard,
+            Event::ButtonPressed(Button::Left),
+            None,
+        );
+        assert!(messages.is_empty());
+        let (_, messages) = palette_pointer_step(
+            &app,
+            &mut tree,
+            &renderer,
+            &EntryIdentity::Workboard,
+            Event::ButtonReleased(Button::Left),
+            Some(point),
+        );
+        assert!(matches!(messages.as_slice(),
+            [Message::Palette(Action::Run(MessageBox(message)))]
+            if matches!(message.as_ref(), Message::Sidebar(SidebarAction::OpenWork))));
     }
 }
