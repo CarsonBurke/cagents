@@ -11147,8 +11147,8 @@ impl Cagents {
                     && runtime.cursor_position() == Some(at)
                 {
                     state.completion_request = None;
-                    runtime.set_editor_completions(items.clone());
-                    state.context.completions = items;
+                    runtime.set_editor_completions(items);
+                    state.context.completions = runtime.editor_completion_targets(card);
                 }
             }
             LspEvent::Hover {
@@ -11196,6 +11196,9 @@ impl Cagents {
                 // what is gone is every answer computed against the text the
                 // two sides disagreed about.
                 state.invalidate_answers();
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.dismiss_editor_results();
+                }
                 state.failure = Some(format!(
                     "resynchronised with the language server after {error}"
                 ));
@@ -11238,9 +11241,11 @@ impl Cagents {
                 at,
                 coordinates,
             } => self.jump_to_lsp_location(card, path, at, coordinates),
-            InspectorAction::ApplyLspCompletion { card, index, label } => {
-                self.apply_lsp_completion(card, index, &label)
-            }
+            InspectorAction::ApplyLspCompletion {
+                card,
+                index,
+                target,
+            } => self.apply_lsp_completion(card, index, &target),
             InspectorAction::RequestLspHover(card) => self.request_lsp(card, LspRequestKind::Hover),
             InspectorAction::GoToLspDefinition(card) => {
                 self.request_lsp(card, LspRequestKind::Definition)
@@ -11265,6 +11270,10 @@ impl Cagents {
                     state.refresh_notice();
                     state.context.status = Some(self.lsp.status(doc));
                 }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.dismiss_editor_results();
+                    runtime.set_editor_diagnostics(Vec::new());
+                }
                 Task::none()
             }
             InspectorAction::DismissLspResults(card) => {
@@ -11272,6 +11281,9 @@ impl Cagents {
                     state.invalidate_answers();
                     state.failure = None;
                     state.refresh_notice();
+                }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.dismiss_editor_results();
                 }
                 Task::none()
             }
@@ -11367,32 +11379,40 @@ impl Cagents {
         }))
     }
 
-    fn apply_lsp_completion(&mut self, card: CardId, index: usize, label: &str) -> Task<Message> {
+    fn apply_lsp_completion(
+        &mut self,
+        card: CardId,
+        index: usize,
+        target: &repository_widget::CompletionTarget,
+    ) -> Task<Message> {
         let Some(state) = self.lsp_contexts.get(&card) else {
             return Task::none();
         };
-        let Some(item) = state.context.completions.get(index) else {
+        let Some(current) = state.context.completions.get(index) else {
             return Task::none();
         };
-        // The list is addressed by position, and a fresh completion response
-        // replaces it wholesale. The label is the fingerprint that catches a
-        // list which changed under the press: applying the wrong candidate
-        // writes text the user never chose.
-        if item.label != label {
+        // A queued action names the exact publication, document revision and
+        // edits the user chose. A label can be reused with different edits.
+        if current != target {
             self.status = Some(TransientNotice::warning(
                 "the completion list changed; nothing was applied",
             ));
             return Task::none();
         }
-        let item = item.clone();
         let applied = match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.apply_completion(&item),
+            Some(CardRuntime::Repository(runtime)) => {
+                let applied = runtime.apply_completion_target(card, target);
+                if applied {
+                    runtime.dismiss_editor_results();
+                }
+                applied
+            }
             _ => false,
         };
         if !applied {
             self.status = Some(TransientNotice::warning(format!(
                 "`{}` could not be applied to this buffer",
-                item.label
+                target.item().label
             )));
             return Task::none();
         }
@@ -11491,13 +11511,7 @@ impl Cagents {
                 self.context_inspector_open = true;
                 self.request_lsp(card, LspRequestKind::References)
             }
-            Action::Choose { index, label } => {
-                let task = self.apply_lsp_completion(card, index, &label);
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                    runtime.dismiss_editor_results();
-                }
-                task
-            }
+            Action::Choose { index, target } => self.apply_lsp_completion(card, index, &target),
             Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
@@ -25947,54 +25961,130 @@ mod tests {
         );
     }
 
-    /// The completion list is addressed by position and a fresh response
-    /// replaces it wholesale, so the label is the fingerprint that catches a
-    /// list which changed under the press.
-    #[test]
-    fn a_completion_whose_label_moved_is_not_applied() {
-        let mut app = lsp_test_app();
-        let card = repository_card(&mut app, "/repo");
-        lsp_state(&mut app, card).context.completions = vec![completion_item("alpha")];
-
-        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
-            card,
-            index: 0,
-            label: "beta".into(),
-        });
-        assert_eq!(
-            notice(&app),
-            Some("the completion list changed; nothing was applied")
-        );
-        // Refused, not consumed: the list the user is looking at is still there.
-        assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
-
-        // A matching fingerprint gets as far as the buffer, which is a
-        // different outcome from the refusal above.
-        app.status = None;
-        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
-            card,
-            index: 0,
-            label: "alpha".into(),
-        });
-        assert_eq!(
-            notice(&app),
-            Some("`alpha` could not be applied to this buffer")
-        );
+    fn completion_targets_for_test(
+        card: CardId,
+        items: Vec<crate::lsp::LspCompletionItem>,
+    ) -> Vec<repository_widget::CompletionTarget> {
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "tail\n");
+        runtime.set_editor_completions(items);
+        runtime.editor_completion_targets(card)
     }
 
-    /// An index past the end of a list that shrank must not panic, and must not
-    /// silently apply the last candidate either.
+    fn publish_test_completions(
+        app: &mut Cagents,
+        card: CardId,
+        items: Vec<crate::lsp::LspCompletionItem>,
+    ) -> Vec<repository_widget::CompletionTarget> {
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
+            panic!("the fixture owns an actual editor");
+        };
+        runtime.set_editor_completions(items);
+        let targets = runtime.editor_completion_targets(card);
+        assert!(
+            !targets.is_empty(),
+            "the fixture has a registered editable document"
+        );
+        lsp_state(app, card).context.completions = targets.clone();
+        targets
+    }
+
+    /// Both UI routes must retain the chosen publication and exact edits,
+    /// including a replacement that reuses the same label.
+    #[test]
+    fn a_completion_whose_label_moved_is_not_applied() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for popup in [false, true] {
+            for replacement_kind in 0..3 {
+                let mut app = lsp_test_app();
+                // Register a real document without driving discovery or a server.
+                app.lsp = LspManager::new(AppSettings::default().language_servers);
+                let card = repository_card(&mut app, "/repo");
+                let (runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", "tail\n");
+                app.cards
+                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
+                drop(app.drain_lsp_intents(card));
+                let held = publish_test_completions(&mut app, card, vec![completion_item("alpha")])
+                    .remove(0);
+                let mut replacement = completion_item(if replacement_kind == 0 {
+                    "beta"
+                } else {
+                    "alpha"
+                });
+                if replacement_kind == 1 {
+                    replacement.edit.new_text = "different-edit".into();
+                }
+                let expected = format!("{}tail\n", replacement.edit.new_text);
+                let fresh = publish_test_completions(&mut app, card, vec![replacement]).remove(0);
+                if popup {
+                    drop(app.update_editor_lsp(
+                        card,
+                        repository_widget::EditorLspAction::Choose {
+                            index: 0,
+                            target: held,
+                        },
+                    ));
+                } else {
+                    drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
+                        card,
+                        index: 0,
+                        target: held,
+                    }));
+                }
+                assert_eq!(
+                    notice(&app),
+                    Some("the completion list changed; nothing was applied")
+                );
+                assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                    unreachable!()
+                };
+                assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+                assert_eq!(
+                    runtime.editor_completion_targets(card).len(),
+                    1,
+                    "rejecting an old action must not dismiss the fresh response"
+                );
+                app.status = None;
+                if popup {
+                    drop(app.update_editor_lsp(
+                        card,
+                        repository_widget::EditorLspAction::Choose {
+                            index: 0,
+                            target: fresh,
+                        },
+                    ));
+                } else {
+                    drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
+                        card,
+                        index: 0,
+                        target: fresh,
+                    }));
+                }
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                    unreachable!()
+                };
+                assert_eq!(runtime.editor_text().as_deref(), Some(expected.as_str()));
+                assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            }
+        }
+    }
+
+    /// An index past the end of a list that shrank must not panic or apply.
     #[test]
     fn a_completion_index_past_the_end_applies_nothing() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
-        lsp_state(&mut app, card).context.completions = vec![completion_item("alpha")];
-
-        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
+        let target = completion_targets_for_test(card, vec![completion_item("alpha")]).remove(0);
+        lsp_state(&mut app, card).context.completions = vec![target.clone()];
+        drop(app.update_lsp(InspectorAction::ApplyLspCompletion {
             card,
             index: 4,
-            label: "alpha".into(),
-        });
+            target,
+        }));
         assert_eq!(notice(&app), None);
         assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
     }
@@ -26134,11 +26224,17 @@ mod tests {
     fn a_desync_drops_the_answers_and_keeps_the_diagnostics() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "tail\n");
+        runtime.set_lsp_document(Some(LspDocumentId(1)));
+        runtime.set_editor_completions(vec![completion_item("alpha")]);
+        let target = runtime.editor_completion_targets(card).remove(0);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
         app.lsp_documents.insert(LspDocumentId(1), card);
         let state = lsp_state(&mut app, card);
         state.document = Some(LspDocumentId(1));
         state.context.hover = Some("hover".into());
-        state.context.completions = vec![completion_item("alpha")];
+        state.context.completions = vec![target.clone()];
         state.context.locations = Some((crate::lsp::LocationKind::Definition, Vec::new()));
         state.context.diagnostics = vec![diagnostic("undefined name")];
 
@@ -26156,6 +26252,60 @@ mod tests {
         // schedule, and are refused by version at the point of use instead.
         assert_eq!(state.context.diagnostics.len(), 1);
         assert!(state.context.notice.is_some());
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.editor_completion_targets(card).is_empty());
+        drop(app.update_editor_lsp(
+            card,
+            repository_widget::EditorLspAction::Choose { index: 0, target },
+        ));
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        assert!(runtime.editor_completion_targets(card).is_empty());
+        assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+    }
+
+    #[test]
+    fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
+        for restart in [false, true] {
+            let mut app = lsp_test_app();
+            let card = repository_card(&mut app, "/repo");
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "tail\n");
+            runtime.set_lsp_document(Some(LspDocumentId(1)));
+            runtime.set_editor_completions(vec![completion_item("alpha")]);
+            runtime.set_editor_diagnostics(vec![diagnostic("standing")]);
+            let target = runtime.editor_completion_targets(card).remove(0);
+            assert!(runtime.diagnostic_navigation_available());
+            app.cards
+                .insert(card, CardRuntime::Repository(Box::new(runtime)));
+            let state = lsp_state(&mut app, card);
+            state.document = Some(LspDocumentId(1));
+            state.context.completions = vec![target.clone()];
+            state.context.diagnostics = vec![diagnostic("standing")];
+            let action = if restart {
+                InspectorAction::RestartLanguageServer(card)
+            } else {
+                InspectorAction::DismissLspResults(card)
+            };
+            drop(app.update_lsp(action));
+            assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            assert_eq!(
+                app.lsp_contexts[&card].context.diagnostics.is_empty(),
+                restart
+            );
+            drop(app.update_editor_lsp(
+                card,
+                repository_widget::EditorLspAction::Choose { index: 0, target },
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                unreachable!()
+            };
+            assert!(runtime.editor_completion_targets(card).is_empty());
+            assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
+            assert_eq!(runtime.diagnostic_navigation_available(), !restart);
+        }
     }
 
     /// A superseded request is the ordinary result of typing while one is in

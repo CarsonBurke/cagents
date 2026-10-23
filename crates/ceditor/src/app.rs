@@ -2,10 +2,7 @@ use cagents::settings_widgets::{Setting, field as settings_field, group as setti
 use cagents::{
     design,
     github::GitHubService,
-    lsp::{
-        LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
-        LspStatus,
-    },
+    lsp::{LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspStatus},
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     pull_request_review::{self, ReviewSource},
     repository::{
@@ -14,8 +11,8 @@ use cagents::{
         StageRequest, UnstageRequest,
     },
     repository_widget::{
-        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
-        RepositoryRuntime,
+        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, LspIntent, RepositoryAction,
+        RepositoryFile, RepositoryRuntime,
     },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
@@ -85,7 +82,7 @@ struct Tab {
     /// edits rebase the standing set to the manager's new version; publishes
     /// replace it only when their version still matches that manager state.
     diagnostics_version: Option<i32>,
-    completions: Vec<LspCompletionItem>,
+    completions: Vec<CompletionTarget>,
     hover: Option<String>,
     lsp_error: Option<String>,
     mutation: Option<MutationKind>,
@@ -207,7 +204,7 @@ pub enum Message {
     OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
-    Completion(CardId, usize),
+    Completion(CardId, usize, CompletionTarget),
     Jump(CardId, LspPosition),
     Key(keyboard::Event, bool),
     Notices,
@@ -4417,7 +4414,10 @@ impl Application for Editor {
                                 {
                                     tab.set_diagnostics(items, Some(version));
                                 }
-                                LspEvent::Completion { items, .. } => tab.completions = items,
+                                LspEvent::Completion { items, .. } => {
+                                    tab.runtime.set_editor_completion_list(items);
+                                    tab.completions = tab.runtime.editor_completion_targets(tab.id);
+                                }
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
                                 LspEvent::Status { status, .. } => {
                                     if let Some(error) = language_server_failure(status) {
@@ -4460,13 +4460,14 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::Completion(id, index) => {
+                Message::Completion(id, index, target) => {
                     if self.modal_open() {
                         return Task::none();
                     }
                     if let Some(tab) = self.tab_mut(id) {
-                        if let Some(item) = tab.completions.get(index).cloned() {
-                            tab.runtime.apply_completion(&item);
+                        if tab.completions.get(index) == Some(&target)
+                            && tab.runtime.apply_completion_target(id, &target)
+                        {
                             tab.completions.clear();
                         }
                     }
@@ -4718,12 +4719,10 @@ impl Application for Editor {
             );
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
-                for (index, item) in tab.completions.iter().enumerate() {
-                    results.push(
-                        widget::button::text(&item.label)
-                            .on_press(Message::Completion(tab.id, index))
-                            .into(),
-                    );
+                for index in 0..tab.completions.len() {
+                    if let Some(row) = completion_row(tab, index) {
+                        results.push(row);
+                    }
                 }
                 if let Some(hover) = &tab.hover {
                     results.push(widget::text::body(hover).into());
@@ -5378,6 +5377,20 @@ impl Editor {
     }
 }
 
+fn completion_row(tab: &Tab, index: usize) -> Option<Element<'_, Message>> {
+    let target = tab.completions.get(index)?;
+    let row = widget::button::text(&target.item().label).on_press(Message::Completion(
+        tab.id,
+        index,
+        target.clone(),
+    ));
+    Some(
+        iced::widget::keyed::Column::with_children([(target.native_key(), row.into())])
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5387,6 +5400,181 @@ mod tests {
     // offline preflight. This is tracked test data, never an external include.
     const NATIVE_FIND_FIXTURE_SETTINGS: &str =
         "schema_version = 3\neditor_auto_save = false\nlanguage_servers = []\n";
+
+    fn completion_pointer_step<M: Clone>(
+        mut row: Element<'_, M>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<M> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::{Event, Rectangle, Size, mouse};
+        struct Bounds(Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                assert!(
+                    self.0.replace(bounds).is_none(),
+                    "one actual completion button"
+                );
+            }
+        }
+        tree.diff(row.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(360.0, 100.0));
+        let node = row.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds(None);
+        row.as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        let point = bounds
+            .0
+            .expect("production completion is a focusable button")
+            .center();
+        let mut messages = Vec::new();
+        row.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn standalone_completion_press_and_held_intent_cannot_cross_a_response() {
+        use cagents::lsp::LspCompletionItem;
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        use iced::mouse::{Button, Event};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        for replacement in [None, Some("old"), Some("new")] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("code.rs"), "foo\n").unwrap();
+            let mut app = editor();
+            let id = add(
+                &mut app,
+                directory.path().to_str().unwrap(),
+                Some("code.rs"),
+            );
+            load_selected(&mut app, id);
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                Some("foo\n")
+            );
+            let item = LspCompletionItem {
+                label: "same label".into(),
+                kind: None,
+                detail: None,
+                documentation: None,
+                sort_text: None,
+                filter_text: None,
+                preselect: false,
+                deprecated: false,
+                edit: cagents::lsp::LspCompletionEdit {
+                    range: cagents::lsp::LspRange {
+                        start: LspPosition::new(0, 0),
+                        end: LspPosition::new(0, 3),
+                    },
+                    replace_range: None,
+                    new_text: "old".into(),
+                    snippet: None,
+                },
+                additional_edits: vec![],
+            };
+            let install = |app: &mut Editor, item| {
+                let tab = app.tab_mut(id).unwrap();
+                tab.runtime.set_lsp_document(Some(LspDocumentId(41)));
+                tab.runtime.set_editor_completion_list(vec![item]);
+                tab.completions = tab.runtime.editor_completion_targets(id);
+            };
+            install(&mut app, item.clone());
+            let held = app.tab(id).unwrap().completions[0].clone();
+            let row = completion_row(app.tab(id).unwrap(), 0).unwrap();
+            let mut tree = Tree::new(row.as_widget());
+            drop(row);
+            assert!(
+                completion_pointer_step(
+                    completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            if let Some(text) = replacement {
+                let mut changed = item.clone();
+                changed.edit.new_text = text.into();
+                install(&mut app, changed);
+                drop(app.update(Message::Completion(id, 0, held)));
+                assert_eq!(
+                    app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                    Some("foo\n")
+                );
+            }
+            let messages = completion_pointer_step(
+                completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            let mut messages = if replacement.is_some() {
+                assert!(
+                    messages.is_empty(),
+                    "the old native press cannot select the replacement"
+                );
+                assert!(
+                    completion_pointer_step(
+                        completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left)
+                    )
+                    .is_empty()
+                );
+                completion_pointer_step(
+                    completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                )
+            } else {
+                messages
+            };
+            assert_eq!(messages.len(), 1);
+            drop(app.update(messages.pop().unwrap()));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                Some(if replacement == Some("new") {
+                    "new\n"
+                } else {
+                    "old\n"
+                })
+            );
+            assert!(app.tab(id).unwrap().completions.is_empty());
+        }
+    }
 
     #[test]
     fn native_find_fixture_settings_load_and_disable_runtime_autosave() {

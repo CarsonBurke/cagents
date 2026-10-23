@@ -340,6 +340,46 @@ pub enum LspIntent {
     Close,
 }
 
+/// One accepted completion list, distinct even after a runtime is replaced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompletionEpoch(uuid::Uuid);
+
+impl CompletionEpoch {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+/// Immutable editor and edit identity captured when a candidate was presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionTarget {
+    identity: Arc<AsyncIdentity>,
+    document: LspDocumentId,
+    revision: u64,
+    epoch: CompletionEpoch,
+    index: usize,
+    item: Arc<LspCompletionItem>,
+}
+
+impl CompletionTarget {
+    pub fn card(&self) -> CardId {
+        self.identity.card
+    }
+    pub fn item(&self) -> &LspCompletionItem {
+        &self.item
+    }
+    pub fn native_key(&self) -> (CardId, LspDocumentId, u64, u64, CompletionEpoch, usize) {
+        (
+            self.card(),
+            self.document,
+            self.identity.generation,
+            self.revision,
+            self.epoch,
+            self.index,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
     Complete,
@@ -355,7 +395,7 @@ pub enum EditorLspAction {
     Diagnostic(bool),
     Choose {
         index: usize,
-        label: String,
+        target: CompletionTarget,
     },
     Next(bool),
     Dismiss,
@@ -367,7 +407,9 @@ struct EditorLanguageState {
     selected_diagnostic: Option<usize>,
     hover_diagnostic: Option<crate::lsp::LspDiagnostic>,
     marks: Vec<text_editor::Diagnostic>,
-    completions: Vec<LspCompletionItem>,
+    completions: Vec<Arc<LspCompletionItem>>,
+    completion_epoch: CompletionEpoch,
+    completion_popup: bool,
     selected: usize,
     hover: Vec<markdown::Item>,
     hover_at: Option<text_editor::Position>,
@@ -3473,9 +3515,36 @@ impl RepositoryRuntime {
 
     pub fn set_editor_completions(&mut self, items: Vec<LspCompletionItem>) {
         self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
-        self.language.completions = items;
+        self.language.completion_popup = true;
+        self.language.completion_epoch = CompletionEpoch::new();
+        self.language.completions = items.into_iter().map(Arc::new).collect();
         self.language.hover.clear();
         self.language.hover_diagnostic = None;
+    }
+
+    /// Cache the same response for a host that renders its own completion list.
+    pub fn set_editor_completion_list(&mut self, items: Vec<LspCompletionItem>) {
+        self.set_editor_completions(items);
+        self.language.completion_popup = false;
+    }
+
+    pub fn editor_completion_targets(&self, card: CardId) -> Vec<CompletionTarget> {
+        let Some(first) = self.completion_target(card, 0) else {
+            return Vec::new();
+        };
+        self.language
+            .completions
+            .iter()
+            .enumerate()
+            .map(|(index, item)| CompletionTarget {
+                identity: first.identity.clone(),
+                document: first.document,
+                revision: first.revision,
+                epoch: first.epoch,
+                index,
+                item: item.clone(),
+            })
+            .collect()
     }
 
     pub fn set_editor_hover(&mut self, markdown: Option<&str>, at: Option<LspPosition>) {
@@ -4254,6 +4323,42 @@ impl RepositoryRuntime {
         origin = self.find_origin.unwrap_or(origin);
         self.find_matches
             .partition_point(|(start, _)| (start.line, start.column) < origin)
+    }
+
+    fn completion_target(&self, card: CardId, index: usize) -> Option<CompletionTarget> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some(CompletionTarget {
+            identity: Arc::new(AsyncIdentity {
+                card,
+                worktree: self.descriptor.worktree.clone(),
+                path: self.selected_path()?.to_path_buf(),
+                generation: self.generation,
+            }),
+            document: self.lsp_document()?,
+            revision: document.revision,
+            epoch: self.language.completion_epoch,
+            index,
+            item: self.language.completions.get(index)?.clone(),
+        })
+    }
+
+    pub fn apply_completion_target(&mut self, card: CardId, target: &CompletionTarget) -> bool {
+        if target.card() != card
+            || target.epoch != self.language.completion_epoch
+            || !self
+                .language
+                .completions
+                .get(target.index)
+                .is_some_and(|item| Arc::ptr_eq(item, &target.item))
+            || !self.accepts_selected(&target.identity)
+            || self.lsp_document() != Some(target.document)
+            || !matches!(&self.document, DocumentState::Editable(document) if document.revision == target.revision)
+        {
+            return false;
+        }
+        self.apply_completion(target.item())
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -9499,6 +9604,40 @@ fn pdf_page_surface(
         .into()
 }
 
+fn completion_row(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    index: usize,
+) -> Option<Element<'_, RepositoryAction>> {
+    let item = runtime.language.completions.get(index)?;
+    let target = runtime.completion_target(card, index)?;
+    let key = target.native_key();
+    let label = crate::design::body(&item.label).width(Length::Fill);
+    let detail = crate::design::caption(item.detail.as_deref().unwrap_or_default())
+        .wrapping(iced::widget::text::Wrapping::None)
+        .ellipsize(iced::widget::text::Ellipsize::End(
+            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+        ));
+    let button = widget::button::custom(widget::column::with_children(vec![
+        label.into(),
+        detail.into(),
+    ]))
+    .class(crate::ui_controls::control_style(
+        index == runtime.language.selected,
+        None,
+    ))
+    .width(Length::Fill)
+    .on_press(RepositoryAction::Language {
+        card,
+        action: EditorLspAction::Choose { index, target },
+    });
+    Some(
+        iced::widget::keyed::Column::with_children([(key, button.into())])
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
 fn editable_document_view<'a>(
     card: CardId,
     runtime: &'a RepositoryRuntime,
@@ -9611,11 +9750,9 @@ fn editable_document_view<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        let popup: Option<Element<'a, RepositoryAction>> = if !runtime
-            .language
-            .completions
-            .is_empty()
-        {
+        let has_completions =
+            runtime.language.completion_popup && !runtime.language.completions.is_empty();
+        let popup: Option<Element<'a, RepositoryAction>> = if has_completions {
             let selected = runtime.language.selected;
             let first = selected.saturating_sub(4);
             let choices = runtime
@@ -9625,28 +9762,7 @@ fn editable_document_view<'a>(
                 .enumerate()
                 .skip(first)
                 .take(10)
-                .map(|(index, item)| {
-                    let label = crate::design::body(&item.label).width(Length::Fill);
-                    let detail = crate::design::caption(item.detail.as_deref().unwrap_or_default())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ));
-                    widget::button::custom(widget::column::with_children(vec![
-                        label.into(),
-                        detail.into(),
-                    ]))
-                    .class(crate::ui_controls::control_style(index == selected, None))
-                    .width(Length::Fill)
-                    .on_press(RepositoryAction::Language {
-                        card,
-                        action: EditorLspAction::Choose {
-                            index,
-                            label: item.label.clone(),
-                        },
-                    })
-                    .into()
-                })
+                .filter_map(|(index, _)| completion_row(card, runtime, index))
                 .collect::<Vec<_>>();
             Some(
                 widget::container(
@@ -9824,26 +9940,23 @@ fn editable_document_view<'a>(
                         EditorLspAction::Definition(None)
                     }),
                     Key::Named(Named::Escape)
-                        if !runtime.language.completions.is_empty()
+                        if has_completions
                             || !runtime.language.hover.is_empty()
                             || runtime.language.hover_diagnostic.is_some() =>
                     {
                         Some(EditorLspAction::Dismiss)
                     }
-                    Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
+                    Key::Named(Named::ArrowDown) if has_completions => {
                         Some(EditorLspAction::Next(true))
                     }
-                    Key::Named(Named::ArrowUp) if !runtime.language.completions.is_empty() => {
+                    Key::Named(Named::ArrowUp) if has_completions => {
                         Some(EditorLspAction::Next(false))
                     }
-                    Key::Named(Named::Tab | Named::Enter)
-                        if !runtime.language.completions.is_empty() =>
-                    {
+                    Key::Named(Named::Tab | Named::Enter) if has_completions => {
                         let index = runtime.language.selected;
-                        Some(EditorLspAction::Choose {
-                            index,
-                            label: runtime.language.completions[index].label.clone(),
-                        })
+                        runtime
+                            .completion_target(card, index)
+                            .map(|target| EditorLspAction::Choose { index, target })
                     }
                     _ => None,
                 };
@@ -16375,6 +16488,191 @@ mod tests {
             edit,
             additional_edits,
         }
+    }
+
+    fn completion_pointer_step<M: Clone>(
+        mut row: Element<'_, M>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<M> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::{Event, Rectangle, Size, mouse};
+        struct Bounds(Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                assert!(
+                    self.0.replace(bounds).is_none(),
+                    "one actual completion button"
+                );
+            }
+        }
+        tree.diff(row.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(360.0, 100.0));
+        let node = row.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds(None);
+        row.as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        let point = bounds
+            .0
+            .expect("production completion is a focusable button")
+            .center();
+        let mut messages = Vec::new();
+        row.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn native_completion_press_belongs_to_the_original_response_including_same_label_edits() {
+        use iced::mouse::{Button, Event};
+        let renderer = headless_renderer();
+        for replacement in [None, Some("old"), Some("new")] {
+            let card = CardId::new();
+            let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "foo\n");
+            runtime.set_lsp_document(Some(LspDocumentId(41)));
+            let item = completion_item(
+                completion_edit(
+                    LspRange {
+                        start: LspPosition::new(0, 0),
+                        end: LspPosition::new(0, 3),
+                    },
+                    "old",
+                ),
+                vec![],
+            );
+            runtime.set_editor_completions(vec![item.clone()]);
+            let held = runtime.editor_completion_targets(card).remove(0);
+            let again = runtime.editor_completion_targets(card).remove(0);
+            assert!(
+                Arc::ptr_eq(&held.item, &again.item),
+                "rendering reuses the accepted payload"
+            );
+            let row = completion_row(card, &runtime, 0).unwrap();
+            let mut tree = Tree::new(row.as_widget());
+            drop(row);
+            assert!(
+                completion_pointer_step(
+                    completion_row(card, &runtime, 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            if let Some(text) = replacement {
+                let mut changed = item.clone();
+                changed.edit.new_text = text.into();
+                runtime.set_editor_completions(vec![changed]);
+                assert!(
+                    !runtime.apply_completion_target(card, &held),
+                    "held intent cannot cross even an identical response"
+                );
+            }
+            let messages = completion_pointer_step(
+                completion_row(card, &runtime, 0).unwrap(),
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            let messages = if replacement.is_some() {
+                assert!(
+                    messages.is_empty(),
+                    "old press cannot invoke a new response callback"
+                );
+                assert!(
+                    completion_pointer_step(
+                        completion_row(card, &runtime, 0).unwrap(),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left)
+                    )
+                    .is_empty()
+                );
+                completion_pointer_step(
+                    completion_row(card, &runtime, 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                )
+            } else {
+                messages
+            };
+            let [
+                RepositoryAction::Language {
+                    action: EditorLspAction::Choose { target, .. },
+                    ..
+                },
+            ] = messages.as_slice()
+            else {
+                panic!("actual button must emit its captured completion");
+            };
+            assert!(runtime.apply_completion_target(card, target));
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some(if replacement == Some("new") {
+                    "new\n"
+                } else {
+                    "old\n"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn completion_intent_refuses_reopened_documents_and_actual_buffer_edits() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "foo\n");
+        runtime.set_lsp_document(Some(LspDocumentId(1)));
+        let item = completion_item(
+            completion_edit(
+                LspRange {
+                    start: LspPosition::new(0, 0),
+                    end: LspPosition::new(0, 3),
+                },
+                "old",
+            ),
+            vec![],
+        );
+        runtime.set_editor_completions(vec![item.clone()]);
+        let old = runtime.editor_completion_targets(card).remove(0);
+        assert!(!runtime.apply_completion_target(CardId::new(), &old));
+        runtime.set_lsp_document(Some(LspDocumentId(2)));
+        runtime.set_editor_completions(vec![item]);
+        assert!(!runtime.apply_completion_target(card, &old));
+        let current = runtime.editor_completion_targets(card).remove(0);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let edited = runtime.editor_text().unwrap();
+        assert_ne!(
+            document_revision(&runtime),
+            current.revision,
+            "actual edit changes the captured revision"
+        );
+        assert!(!runtime.apply_completion_target(card, &current));
+        assert_eq!(runtime.editor_text().unwrap(), edited);
     }
 
     fn buffer_text(runtime: &RepositoryRuntime) -> String {
