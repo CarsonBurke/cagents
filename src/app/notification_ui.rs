@@ -500,7 +500,9 @@ impl Cagents {
                         .iter()
                         .any(|notice| notice.id == *id && !notice.acknowledged)
                 });
-                for card in self.notification_unread_cards(&snapshot) {
+                let (unread, failed) = self.notification_attention_updates(&snapshot);
+                self.sidebar_state.set_failed_updates(failed);
+                for card in unread {
                     self.observe_agent_update_for_card(card);
                 }
                 self.notification_ui.preview_generation =
@@ -832,30 +834,42 @@ impl Cagents {
         Task::batch([adopted, focus])
     }
 
-    fn notification_unread_cards(&self, snapshot: &Snapshot) -> BTreeSet<CardId> {
+    fn notification_attention_updates(
+        &self,
+        snapshot: &Snapshot,
+    ) -> (BTreeSet<CardId>, BTreeSet<CardId>) {
+        let mut unread = BTreeSet::new();
+        let mut failed = BTreeSet::new();
         if snapshot.notices.is_empty() {
-            return BTreeSet::new();
+            return (unread, failed);
         }
         let cards = self.notification_attention_cards();
-        snapshot
-            .notices
-            .iter()
-            .filter_map(|notice| {
-                if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
-                    return None;
-                }
-                let session = notice.event.source_session()?;
-                cards.get(&session).copied().flatten()
-            })
-            .collect()
+        for notice in &snapshot.notices {
+            if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
+                continue;
+            }
+            let Some(card) = notice
+                .event
+                .source_session()
+                .and_then(|session| cards.get(&session).copied().flatten())
+            else {
+                continue;
+            };
+            unread.insert(card);
+            if notice.event.evidence.kind == crate::notifications::Kind::Failed {
+                failed.insert(card);
+            }
+        }
+        (unread, failed)
     }
 
     /// Journal and workspace-model watches are independent. Reconsider retained
     /// unread evidence after canonical pane/scope reconciliation, without
     /// waiting for a second journal snapshot or adopting/reading a pane.
     pub(super) fn reproject_notification_unread(&mut self) {
-        let cards = self.notification_unread_cards(&self.notification_ui.snapshot);
-        if cards.is_empty() {
+        let (cards, failed) = self.notification_attention_updates(&self.notification_ui.snapshot);
+        let failed_changed = self.sidebar_state.set_failed_updates(failed);
+        if cards.is_empty() && !failed_changed {
             return;
         }
         for card in cards {
@@ -2617,103 +2631,340 @@ mod tests {
     }
 
     #[test]
+    fn compact_attention_failed_news_is_distinct_from_working_and_unconfirmed_loss() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.durable.cards[0].id;
+        let session = card_session(&app.durable.cards[0]).unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Attention".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: project,
+                title: "Agent".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Codex,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
+        let notice = |kind, key: &str| crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(),
+            acknowledged: false,
+            delivered: true,
+            window: None,
+            event: crate::notifications::Event::session(
+                session,
+                crate::agent::Provider::Codex,
+                "/repo".into(),
+                crate::notifications::Evidence {
+                    key: key.into(),
+                    kind,
+                },
+            ),
+        };
+        let failed = notice(crate::notifications::Kind::Failed, "known-failed-turn");
+        let loss = notice(crate::notifications::Kind::Interrupted, "observation-ended");
+        let cancelled = notice(
+            crate::notifications::Kind::Cancelled,
+            "known-cancelled-turn",
+        );
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![failed.clone(), loss.clone(), cancelled.clone()],
+                diagnostic: None,
+            }))),
+        );
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(
+            summary.unread, 1,
+            "three journal events still name one conversation"
+        );
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            summary.working, 1,
+            "historical failure does not stop live work"
+        );
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Failed));
+        assert_eq!(app.sidebar_model.projects[0].channels[0].attention, summary);
+        let mut read_failed = failed;
+        read_failed.acknowledged = true;
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![read_failed, loss, cancelled],
+                diagnostic: None,
+            }))),
+        );
+        let summary = app.sidebar_state.project_attention(project);
+        assert_eq!(
+            summary.failed, 0,
+            "an empty failed projection replaces the old one"
+        );
+        assert_eq!(summary.unread, 1);
+        assert_eq!(summary.state(), Some(sidebar::AttentionState::Working));
+        assert_eq!(
+            app.sidebar_state.card_activity(card).unwrap().state,
+            crate::agent::ActivityState::Working
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.card_attention(card).failed, 0);
+    }
+
+    #[test]
+    fn compact_attention_empty_foreign_draft_alias_cannot_erase_canonical_failed_news() {
+        use crate::workspace_model::views::{Pane, View};
+        let (mut app, agent) = scheduled_attention_fixture();
+        let session = agent.console.as_ref().unwrap().id;
+        let canonical = CardId::from_uuid(agent.id.as_uuid());
+        let channel = match &agent.placement {
+            crate::agent_execution::Placement::Channel(channel) => *channel,
+            _ => unreachable!(),
+        };
+        let project = app.durable.channels[0].project_id;
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.adopt_execution_agent(&agent).unwrap());
+        let card = app.card_state(canonical).unwrap().clone();
+        app.workspace_model.views = vec![View {
+            scope: agent.placement.clone(),
+            revision: 1,
+            panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()],
+            retired: vec![],
+        }];
+        let mut alias = card.clone();
+        alias.id = CardId::new();
+        let alias_id = alias.id;
+        let foreign = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            foreign,
+            RepositoryId::new(),
+            "Legacy inventory".into(),
+            "/foreign".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let mut foreign_channel = app.durable.channels[0].clone();
+        foreign_channel.id = ChannelId::new();
+        foreign_channel.project_id = foreign;
+        foreign_channel.shared = false;
+        foreign_channel.cards = vec![alias_id];
+        foreign_channel.focused = None;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.insert(0, alias);
+        durable.channels.push(foreign_channel);
+        app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
+            (alias_id, "Keep alias draft".into()),
+            (canonical, "Keep canonical draft".into()),
+        ]));
+        app.acknowledge_view_edit(agent.placement.clone(), None);
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.blocked.contains(&agent.placement));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        assert_eq!(
+            app.sidebar_state.card_attention(alias_id),
+            sidebar::AttentionSummary::default()
+        );
+        app.refresh_ui.focused = false;
+        let mut snapshot = attention_snapshot(session);
+        snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Failed;
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 1);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 1);
+        assert_eq!(
+            app.sidebar_state.project_attention(foreign),
+            sidebar::AttentionSummary::default()
+        );
+        assert!(!app.sidebar_state.has_card_update(alias_id));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkChannelRead(channel))));
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert_eq!(app.sidebar_state.project_attention(project).unread, 0);
+        assert_eq!(app.sidebar_state.project_attention(project).failed, 0);
+        assert!(app.notification_ui.acknowledged_for_test(notice));
+        assert!(app.card_state(alias_id).unwrap().existence.is_open());
+        let saved = app.persistent_workspace();
+        let drafts = &saved.chat_drafts;
+        assert_eq!(
+            drafts.get(&alias_id).map(String::as_str),
+            Some("Keep alias draft")
+        );
+        assert_eq!(
+            drafts.get(&canonical).map(String::as_str),
+            Some("Keep canonical draft")
+        );
+    }
+
+    #[test]
+    fn model_only_attention_reprojection_clears_failed_news_without_an_unread_target() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = false;
+        let card = app.durable.cards[0].clone();
+        let session = card_session(&card).unwrap();
+        let mut snapshot = attention_snapshot(session);
+        snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Failed;
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 1);
+
+        // A new open alias makes an unmanaged session ambiguous. No second
+        // journal Snapshot arrives, and attribution must not choose an alias.
+        let mut alias = card.clone();
+        alias.id = CardId::new();
+        let alias_id = alias.id;
+        Arc::make_mut(&mut app.durable).cards.push(alias);
+        let (unread, failed) = app.notification_attention_updates(&snapshot);
+        assert!(unread.is_empty());
+        assert!(failed.is_empty());
+        app.reproject_notification_unread();
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 0);
+        assert_eq!(app.sidebar_state.card_attention(alias_id).failed, 0);
+        assert_eq!(app.notification_ui.snapshot, snapshot);
+        assert_eq!(
+            app.durable.cards.len(),
+            2,
+            "projection neither adopts nor removes"
+        );
+
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .retain(|known| known.id != alias_id);
+        app.reproject_notification_unread();
+        assert_eq!(app.sidebar_state.card_attention(card.id).failed, 1);
+        assert_eq!(app.notification_ui.snapshot, snapshot);
+    }
+
+    #[test]
     fn notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot() {
         use super::super::workspace_model_sync::ModelUpdate;
         use crate::workspace_model::views::{Pane, View};
-        for connected in [false, true] {
-            for control in ["valid", "locally-acknowledged", "replaced-proof"] {
-                let (mut app, agent) = scheduled_attention_fixture();
-                let session = agent.console.as_ref().unwrap().id;
-                let canonical = CardId::from_uuid(agent.id.as_uuid());
-                app.workspace_model.agents.push(agent.clone());
-                drop(app.adopt_execution_agent(&agent).unwrap());
-                let card = app.card_state(canonical).unwrap().clone();
-                app.workspace_model.views = vec![View {
-                    scope: agent.placement.clone(),
-                    revision: 1,
-                    panes: vec![
-                        Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap(),
-                    ],
-                    retired: vec![],
-                }];
-                let mut alias = card.clone();
-                alias.id = CardId::new();
-                let alias_id = alias.id;
-                Arc::make_mut(&mut app.durable).cards.insert(0, alias);
-                app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
-                    (alias_id, "Preserved alias draft".into()),
-                    (canonical, "Preserved canonical draft".into()),
-                ]));
-                // Establish the actual initialized shared-view blocker. These
-                // two live aliases cannot be made unique by discarding a draft.
-                app.acknowledge_view_edit(agent.placement.clone(), None);
-                drop(app.reconcile_shared_views());
-                assert!(app.shared_views.blocked.contains(&agent.placement));
-                app.refresh_ui.focused = false;
-                let focus = app.workspace.focused();
-                Arc::make_mut(&mut app.durable).workspace_model_identity =
-                    Some(app.workspace_model.identity);
-                let mut model = std::mem::take(&mut app.workspace_model);
-                let mut snapshot = attention_snapshot(session);
-                // A cold, already-completed source need not emit another runtime
-                // activity transition or another identical broker snapshot.
-                snapshot.notices[0].event.evidence.kind = crate::notifications::Kind::Succeeded;
-                let notice = snapshot.notices[0].id;
-                drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot.clone()))));
-                assert!(!app.sidebar_state.has_card_update(canonical));
-                assert!(!app.sidebar_state.has_card_update(alias_id));
-                if control == "locally-acknowledged" {
-                    app.notification_ui.acknowledge(notice);
-                }
-                if control == "replaced-proof" {
-                    let CardKind::Terminal(replaced) = &mut model.views[0].panes[0].kind else {
-                        unreachable!()
-                    };
-                    replaced.continuity = TerminalContinuity::Live {
-                        host_session_id: crate::model::HostSessionId::new("replacement-host"),
-                        boot_id: crate::model::BootId::new("replacement-boot"),
-                        host_incarnation: crate::model::HostIncarnation::new(
-                            "replacement-incarnation",
-                        ),
-                    };
-                }
-                let update = if connected {
-                    ModelUpdate::Connected(model)
-                } else {
-                    ModelUpdate::Read(model)
-                };
-                drop(app.update(Message::WorkspaceModelObserved(update)));
-                assert_eq!(
-                    app.sidebar_state.has_card_update(canonical),
-                    control == "valid"
-                );
-                assert!(!app.sidebar_state.has_card_update(alias_id));
-                assert!(app.shared_views.blocked.contains(&agent.placement));
-                assert!(app.card_state(alias_id).unwrap().existence.is_open());
-                assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
-                assert_eq!(
-                    app.workspace.focused(),
-                    focus,
-                    "unread projection cannot focus or activate"
-                );
-                assert_eq!(
-                    app.notification_ui.snapshot, snapshot,
-                    "no second Snapshot was delivered"
-                );
-                assert_eq!(
-                    app.notification_ui.acknowledged_for_test(notice),
-                    control == "locally-acknowledged"
-                );
-                assert!(app.notification_ui.session_activation.is_none());
-                assert!(!app.chat_start_pending(canonical));
-                // The exact local ACK must also survive a later model replay.
-                if control == "valid" {
-                    drop(app.mark_cards_read(vec![canonical]));
-                    let replay = app.workspace_model.clone();
-                    drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(replay))));
+        for kind in [
+            crate::notifications::Kind::Succeeded,
+            crate::notifications::Kind::Failed,
+        ] {
+            for connected in [false, true] {
+                for control in ["valid", "locally-acknowledged", "replaced-proof"] {
+                    let (mut app, agent) = scheduled_attention_fixture();
+                    let session = agent.console.as_ref().unwrap().id;
+                    let canonical = CardId::from_uuid(agent.id.as_uuid());
+                    app.workspace_model.agents.push(agent.clone());
+                    drop(app.adopt_execution_agent(&agent).unwrap());
+                    let card = app.card_state(canonical).unwrap().clone();
+                    app.workspace_model.views = vec![View {
+                        scope: agent.placement.clone(),
+                        revision: 1,
+                        panes: vec![
+                            Pane::from_card(&card, Some(agent.spec.target.directory.clone()))
+                                .unwrap(),
+                        ],
+                        retired: vec![],
+                    }];
+                    let mut alias = card.clone();
+                    alias.id = CardId::new();
+                    let alias_id = alias.id;
+                    Arc::make_mut(&mut app.durable).cards.insert(0, alias);
+                    app.chat_ui = crate::app::chat_ui::State::with_drafts(HashMap::from([
+                        (alias_id, "Preserved alias draft".into()),
+                        (canonical, "Preserved canonical draft".into()),
+                    ]));
+                    // Establish the actual initialized shared-view blocker. These
+                    // two live aliases cannot be made unique by discarding a draft.
+                    app.acknowledge_view_edit(agent.placement.clone(), None);
+                    drop(app.reconcile_shared_views());
+                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    app.refresh_ui.focused = false;
+                    let focus = app.workspace.focused();
+                    Arc::make_mut(&mut app.durable).workspace_model_identity =
+                        Some(app.workspace_model.identity);
+                    let mut model = std::mem::take(&mut app.workspace_model);
+                    let mut snapshot = attention_snapshot(session);
+                    // A cold, already-completed source need not emit another runtime
+                    // activity transition or another identical broker snapshot.
+                    snapshot.notices[0].event.evidence.kind = kind;
+                    let notice = snapshot.notices[0].id;
+                    drop(app.update(Message::NotificationUi(Action::Snapshot(snapshot.clone()))));
                     assert!(!app.sidebar_state.has_card_update(canonical));
                     assert!(!app.sidebar_state.has_card_update(alias_id));
-                    assert!(app.notification_ui.acknowledged_for_test(notice));
+                    if control == "locally-acknowledged" {
+                        app.notification_ui.acknowledge(notice);
+                    }
+                    if control == "replaced-proof" {
+                        let CardKind::Terminal(replaced) = &mut model.views[0].panes[0].kind else {
+                            unreachable!()
+                        };
+                        replaced.continuity = TerminalContinuity::Live {
+                            host_session_id: crate::model::HostSessionId::new("replacement-host"),
+                            boot_id: crate::model::BootId::new("replacement-boot"),
+                            host_incarnation: crate::model::HostIncarnation::new(
+                                "replacement-incarnation",
+                            ),
+                        };
+                    }
+                    let update = if connected {
+                        ModelUpdate::Connected(model)
+                    } else {
+                        ModelUpdate::Read(model)
+                    };
+                    drop(app.update(Message::WorkspaceModelObserved(update)));
+                    assert_eq!(
+                        app.sidebar_state.has_card_update(canonical),
+                        control == "valid"
+                    );
+                    assert!(!app.sidebar_state.has_card_update(alias_id));
+                    assert_eq!(
+                        app.sidebar_state.card_attention(canonical).failed,
+                        usize::from(
+                            control == "valid" && kind == crate::notifications::Kind::Failed
+                        )
+                    );
+                    assert_eq!(
+                        app.sidebar_state.card_attention(alias_id),
+                        sidebar::AttentionSummary::default()
+                    );
+                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    assert!(app.card_state(alias_id).unwrap().existence.is_open());
+                    assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
+                    assert_eq!(
+                        app.workspace.focused(),
+                        focus,
+                        "unread projection cannot focus or activate"
+                    );
+                    assert_eq!(
+                        app.notification_ui.snapshot, snapshot,
+                        "no second Snapshot was delivered"
+                    );
+                    assert_eq!(
+                        app.notification_ui.acknowledged_for_test(notice),
+                        control == "locally-acknowledged"
+                    );
+                    assert!(app.notification_ui.session_activation.is_none());
+                    assert!(!app.chat_start_pending(canonical));
+                    // The exact local ACK must also survive a later model replay.
+                    if control == "valid" {
+                        drop(app.mark_cards_read(vec![canonical]));
+                        let replay = app.workspace_model.clone();
+                        drop(
+                            app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(replay))),
+                        );
+                        assert!(!app.sidebar_state.has_card_update(canonical));
+                        assert!(!app.sidebar_state.has_card_update(alias_id));
+                        assert!(app.notification_ui.acknowledged_for_test(notice));
+                    }
                 }
             }
         }

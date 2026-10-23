@@ -2742,6 +2742,22 @@ impl Cagents {
             },
             |chrome| Cow::Borrowed(chrome.tooltip.as_str()),
         );
+        let attention = self.sidebar_state.card_attention(id);
+        let tip = if attention != sidebar::AttentionSummary::default() {
+            let mut tip = format!("{tip}\n{}", attention.description());
+            if attention.unread != 0 && self.settings.notifications.message_previews {
+                if let Some(preview) = card
+                    .and_then(super::notification_ui::card_session)
+                    .and_then(|session| self.notification_ui.previews.get(&session))
+                {
+                    tip.push('\n');
+                    tip.push_str(&preview.text);
+                }
+            }
+            Cow::Owned(tip)
+        } else {
+            tip
+        };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
@@ -2775,41 +2791,8 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if self.sidebar_state.has_card_update(id) {
-            let detail = self
-                .settings
-                .notifications
-                .message_previews
-                .then(|| {
-                    card.and_then(super::notification_ui::card_session)
-                        .and_then(|session| self.notification_ui.previews.get(&session))
-                        .map(|preview| preview.text.as_str())
-                })
-                .flatten()
-                .unwrap_or("Needs attention");
-            children.push(tooltip(
-                Icon::Attention
-                    .handle()
-                    .icon()
-                    .size(design::TAB_STATUS_ICON_SIZE),
-                detail,
-            ));
-        } else if let Some(activity) = self.sidebar_state.card_activity(id) {
-            match activity.state {
-                crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner(
-                        design::TAB_STATUS_ICON_SIZE as f32,
-                        design::warning_color,
-                    ),
-                    "Working",
-                )),
-                crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    Icon::Warning,
-                    "Waiting for input",
-                    sidebar::BadgeTone::Warning,
-                )),
-                _ => {}
-            }
+        if let Some(indicator) = sidebar::attention_indicator(attention, false) {
+            children.push(indicator);
         }
         if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);
