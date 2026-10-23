@@ -28,6 +28,7 @@ VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
     "vendor/accesskit-atspi-common", "vendor/harfrust", "vendor/cosmic-text",
     "vendor/smithay-clipboard",
+    "vendor/iced-graphics",
 )
 ENV_WATCH = f'println!("cargo:rerun-if-env-changed={IDENTITY}");'
 
