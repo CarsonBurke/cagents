@@ -5051,10 +5051,11 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(Size::ZERO, viewport.size()),
             );
-            let accessible =
-                element
-                    .as_widget()
-                    .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
             let buttons: Vec<_> = accessible
                 .root()
                 .iter()
