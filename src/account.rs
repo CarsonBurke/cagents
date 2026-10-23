@@ -28,6 +28,7 @@ use crate::chat::local_time;
 pub mod cache;
 pub mod claude;
 pub mod codex;
+pub(crate) mod coding_config;
 #[cfg(feature = "host")]
 pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
