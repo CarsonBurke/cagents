@@ -7,6 +7,8 @@ mod chat;
 mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
+#[cfg(all(test, target_os = "linux"))]
+mod exit_drain_tests;
 mod lock;
 mod model;
 mod notifications;
@@ -308,14 +310,14 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let automation_broker = match automations::start(&host) {
+    let mut automation_broker = match automations::start(&host) {
         Ok(broker) => Some(broker),
         Err(error) => {
             tracing::warn!(%error, "scheduled automations are unavailable");
             None
         }
     };
-    let work_board = match work::Service::start(&host) {
+    let mut work_board = match work::Service::start(&host) {
         Ok(service) => {
             host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
             Some(service)
@@ -325,7 +327,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             None
         }
     };
-    let courier = match agent_execution::mailbox::Courier::start(&host) {
+    let mut courier = match agent_execution::mailbox::Courier::start(&host) {
         Ok(courier) => Some(courier),
         Err(error) => {
             tracing::warn!(%error, "messages between sessions are unavailable");
@@ -335,7 +337,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
 
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
-    let stall_watch = match host.watch(lock::STALL_LIMIT) {
+    let mut stall_watch = match host.watch(lock::STALL_LIMIT) {
         Ok(watch) => Some(watch),
         Err(error) => {
             tracing::warn!(%error, "a wedged host mutex will not be detected");
@@ -347,12 +349,15 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
     let mut runtime_error = None;
+    let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
         "cagents daemon is ready"
     );
 
+    #[cfg(all(test, target_os = "linux"))]
+    exit_drain_tests::observe_ready(&host);
     loop {
         reap_finished(&mut clients);
         if daemon::termination_requested() {
@@ -360,12 +365,36 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
         }
-        if host
+        // Read the epoch BEFORE checking absence. A final ticket release
+        // between this check and a fatal-listener wait must not be lost.
+        let progress_epoch = ordinary_exit_drain
+            .as_ref()
+            .map(|drain| drain.progress_epoch());
+        if let Some(drain) = &ordinary_exit_drain {
+            if drain.try_seal_absence() {
+                break;
+            }
+        } else if host
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|p| p.into_inner())
             .is_shutting_down()
         {
-            break;
+            let Some(drain) = begin_ordinary_exit(&host) else {
+                break; // saved committed-successor decision, before teardown
+            };
+            ordinary_exit_drain = Some(drain);
+
+            // Stop autonomous producers once, then use the original ordinary
+            // cleanup paths. No producer/reaper waits while holding control.
+            drop(stall_watch.take());
+            drop(automation_broker.take());
+            drop(courier.take());
+            host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+            drop(work_board.take());
+            finish_shutdown_owners(&host, &mut runtime_error, false);
+            tracing::info!(pending = %ordinary_exit_drain.as_ref().unwrap().pending_description(),
+                "ordinary daemon exit retains its listener and lease until exact child absence is sealed");
+            continue;
         }
 
         let fatal = match listener.accept() {
@@ -414,52 +443,44 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             Err(error) => Some(error),
         };
         if let Some(error) = fatal {
+            if let Some(drain) = &ordinary_exit_drain {
+                tracing::error!(%error, pending = %drain.pending_description(),
+                    "listener unavailable while original child custody remains; retaining daemon and lease");
+                runtime_error = Some(error);
+                // The existing reaper condition variable supplies a lost-wake
+                // safe fallback only for this unusable-listener path. Normal
+                // pending cleanup keeps accepting read-only clients below.
+                drain.wait_for_progress(progress_epoch.expect("active ordinary exit epoch"));
+                continue;
+            }
             host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
             runtime_error = Some(error);
-            break;
+            // Arm ordinary absence before any return/drop; a committed
+            // successor transfer still takes the saved bypass above.
+            continue;
         }
     }
 
     tracing::info!("cagents daemon is shutting down");
-    // Shutdown waits on providers and holders by design.
-    drop(stall_watch);
-    // Stop deadline acceptance before snapshotting/tearing down provider
-    // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
-    drop(automation_broker);
-    drop(courier);
-    host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
-    drop(work_board);
-    let proof = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .proof()
-        .clone();
-    let (handles, deliveries) = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .graceful_shutdown();
-    if let Err(error) = finish_chat_shutdown(&host) {
-        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
-        runtime_error = Some(io::Error::other(error));
-    }
-    for delivery in &deliveries {
-        let _ = delivery.push(ServerEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id: None,
-            proof: proof.clone(),
-            message: ServerMessage::HostShuttingDown,
-        });
-        delivery.close_after_drain();
-    }
-    for result in finish_terminal_shutdown(&handles) {
-        if let Err(error) = result {
-            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
-            runtime_error = Some(io::Error::other(format!(
-                "terminal shutdown left unconfirmed ownership: {error}"
-            )));
-        }
+    if ordinary_exit_drain.is_some() {
+        // Seal registration and snapshot CURRENT deliveries under the same
+        // lock. Late accepted threads receive an already-closed queue.
+        let deliveries = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_ordinary_exit_registration();
+        close_shutdown_deliveries(&host, &deliveries);
+    } else {
+        // The committed-successor path keeps its existing intentional transfer
+        // behavior and never seals absence or closes reaper admission.
+        drop(stall_watch);
+        drop(automation_broker);
+        drop(courier);
+        host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+        drop(work_board);
+        finish_shutdown_owners(&host, &mut runtime_error, true);
     }
     for client in clients {
         let _ = client.join();
@@ -473,6 +494,73 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     match runtime_error {
         Some(error) => Err(error.into()),
         None => Ok(()),
+    }
+}
+
+/// The ordinary exit caller owns the permit. Keep reservation closure and
+/// public quiescence under the existing writer, then release both locks before
+/// invoking any producer Drop, provider cleanup, child wait or client work.
+fn begin_ordinary_exit(host: &SharedHost) -> Option<crate::daemon::child_reaper::ExitDrain> {
+    let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
+    let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+    // Save intentional successor transfer BEFORE finish_upgrade takes its
+    // state. Such a handoff is not a claim of original-child absence.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .has_committed_upgrade()
+    {
+        return None;
+    }
+    let drain = crate::daemon::child_reaper::begin_exit_drain();
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_ordinary_exit_cleanup();
+    Some(drain)
+}
+
+fn close_shutdown_deliveries(host: &SharedHost, deliveries: &[Arc<delivery::DeliveryQueue>]) {
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    for delivery in deliveries {
+        let _ = delivery.push(ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof: proof.clone(),
+            message: ServerMessage::HostShuttingDown,
+        });
+        delivery.close_after_drain();
+    }
+}
+
+/// Ordinary cleanup runs exactly once before waiting for original tickets.
+/// Successor cleanup preserves the original notification-before-terminal order.
+fn finish_shutdown_owners(
+    host: &SharedHost,
+    runtime_error: &mut Option<io::Error>,
+    close_deliveries: bool,
+) {
+    let (handles, deliveries) = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .graceful_shutdown();
+    if let Err(error) = finish_chat_shutdown(host) {
+        tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
+        *runtime_error = Some(io::Error::other(error));
+    }
+    if close_deliveries {
+        close_shutdown_deliveries(host, &deliveries);
+    }
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
+            tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
+            *runtime_error = Some(io::Error::other(format!(
+                "terminal shutdown left unconfirmed ownership: {error}"
+            )));
+        }
     }
 }
 
