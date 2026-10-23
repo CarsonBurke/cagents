@@ -235,20 +235,21 @@ Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
 otherwise reuse another checkout's code and version stamp. The local Cargo
 configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
-in compiler dep-info, and the version build script watches it as well. Switching
-checkouts rebuilds owned code while keeping the third-party cache warm. Keep
-this identity reference in new owned workspace crates. Cargo must run from
-this checkout or its descendants so it reads the local configuration.
+in compiler dep-info. The version build script tracks it at compilation and
+execution: a runtime watch alone can rerun another checkout's compiled script
+body. Switching checkouts rebuilds owned code while keeping the third-party
+cache warm. Keep this identity reference in new owned workspace crates. Run Cargo
+from this checkout or its descendants so it reads the local configuration.
 
 `python3 scripts/qualify-checkout-cache.py` verifies the boundary using a small,
 offline workspace in `/var/tmp`: an unfixed control reproduces stale reuse,
 then the actual configuration and build script follow A → B → A with the same
-commit, different dirty sources, and old timestamps. It also verifies that an
-unchanged dependency remains cached. Pass `--evidence PATH` to retain the
-fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
-workloads. Its historical-producer control also demonstrates the supported
-package bootstrap below and checks that unrelated dependency bytes and mtimes
-remain unchanged.
+commit, different dirty sources and stamping-script bodies, and old timestamps.
+It also verifies that an unchanged dependency remains cached. Pass
+`--evidence PATH` to retain the fixture and Cargo logs in a new directory. Run it
+sequentially with other Cargo workloads. Its historical-producer control also
+demonstrates the supported package bootstrap below and checks that unrelated
+dependency bytes and mtimes remain unchanged.
 
 A historical checkout without the compile-time checkout anchor can replace a
 shared build-script executable. Returning to an anchored checkout can then
@@ -360,9 +361,40 @@ cargo test --locked --no-default-features --features host --test terminal_load_c
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
-Explicitly selecting a gated target without its feature, including through a
+The four named-tree reconciliation contracts share their cases between the root
+UI target and a focused workspace package. For edits confined to vendored
+iced-core tree reconciliation, run the focused package first:
+
+```sh
+cargo test --locked -p cagents-iced-contracts
+```
+
+The package uses the UI's exact iced-core Git revision; the root Cargo patch
+resolves both targets to `vendor/iced-core`, with the production `a11y` Id
+implementation. It compiles without the application, libcosmic renderer, or
+native UI runtime. The cases do not render; the isolated harness uses an
+uninhabited renderer. Retain validation through the UI's concrete renderer when
+changing the tree contract or UI integration:
+
+```sh
+cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+```
+
+Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
+
+The 40,000-path mutation regression lives in `repository_scale_contract`, so a
+library-suite run does not also create and mutate that filesystem fixture.
+`--all-targets` still runs it in both HOST and UI lanes. When changing repository
+mutations or pathspec handling, include its explicit target:
+
+```sh
+cargo test --locked --no-default-features --features host --test repository_scale_contract
+```
+
+The fixture retains its disk-backed private namespace, subprocess deadline and
+process-family cleanup checks. Its test count and workload are unchanged.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary

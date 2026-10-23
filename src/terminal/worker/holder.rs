@@ -531,6 +531,40 @@ impl OriginalChild {
     }
 }
 
+/// Local acknowledgement identity. The wire reports stay distinct all the way
+/// to the operation waiting for them; an earlier operation may have timed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acknowledgement {
+    ScreenCached,
+    AdoptionCommitted,
+    Detached,
+}
+
+fn await_acknowledgement(
+    answers: &Receiver<Result<Acknowledgement, String>>,
+    expected: Acknowledgement,
+    deadline: Instant,
+) -> Result<(), String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("terminal holder acknowledgement deadline elapsed".into());
+        }
+        let observed = answers
+            .recv_deadline(deadline)
+            .map_err(|error| error.to_string())??;
+        if observed == expected {
+            return Ok(());
+        }
+        // A late success for a different request cannot transfer custody.
+        // Keep the original deadline rather than granting another full wait.
+        tracing::warn!(
+            ?expected,
+            ?observed,
+            "ignored a different terminal holder acknowledgement"
+        );
+    }
+}
+
 /// The daemon's end of a holder: its control socket and its process.
 /// Dropping it releases the holder, unless the holder was detached.
 pub(super) struct Holder {
@@ -543,8 +577,8 @@ pub(super) struct Holder {
     watch: Option<Watch>,
     /// Dropping this ends a watch still waiting on a root its holder left.
     release: Option<std::io::PipeWriter>,
-    /// The holder's answer to a detach, relayed by the watch.
-    acknowledged: Option<Receiver<Result<(), String>>>,
+    /// The holder's typed answers, relayed by the original control watch.
+    acknowledged: Option<Receiver<Result<Acknowledgement, String>>>,
     detached: bool,
     adoption_pending: bool,
     registered: bool,
@@ -591,11 +625,13 @@ impl Holder {
             })
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| error.to_string())?;
-        self.acknowledged
-            .as_ref()
-            .ok_or("holder acknowledgement unavailable")?
-            .recv_timeout(HANDOVER_TIMEOUT)
-            .map_err(|error| error.to_string())?
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::ScreenCached,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )
     }
     pub(super) fn commit_adoption(&mut self) -> Result<(), String> {
         if !self.adoption_pending {
@@ -606,11 +642,13 @@ impl Holder {
             .and_then(|()| send(&self.control, &Request::CommitAdoption, &[]))
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| error.to_string())?;
-        self.acknowledged
-            .as_ref()
-            .ok_or("holder acknowledgement unavailable")?
-            .recv_timeout(HANDOVER_TIMEOUT)
-            .map_err(|error| error.to_string())??;
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::AdoptionCommitted,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )?;
         self.adoption_pending = false;
         Ok(())
     }
@@ -669,18 +707,15 @@ impl Holder {
             .and_then(|()| send(&self.control, &request, &[]))
             .and_then(|()| self.control.set_write_timeout(None))
             .map_err(|error| format!("detach terminal holder: {error}"))?;
-        let answer = self
-            .acknowledged
-            .as_ref()
-            .map(|answer| answer.recv_timeout(HANDOVER_TIMEOUT));
-        match answer {
-            Some(Ok(Ok(()))) => {
-                self.detached = true;
-                Ok(())
-            }
-            Some(Ok(Err(message))) => Err(message),
-            _ => Err("terminal holder did not acknowledge detaching".to_owned()),
-        }
+        await_acknowledgement(
+            self.acknowledged
+                .as_ref()
+                .ok_or("holder acknowledgement unavailable")?,
+            Acknowledgement::Detached,
+            Instant::now() + HANDOVER_TIMEOUT,
+        )?;
+        self.detached = true;
+        Ok(())
     }
 }
 
