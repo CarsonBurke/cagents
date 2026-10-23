@@ -172,6 +172,7 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
     cached.image = None;
     cached.image_source = None;
     cached.image_unavailable = true;
+    cached.image_error = Some("The attachment does not provide an image file path.".into());
     let renderer = crate::app::tests::headless_renderer();
     let (texts, messages) = click_prompt(&renderer, &runtime, &item);
     assert!(
@@ -179,11 +180,54 @@ fn unavailable_user_image_preserves_its_error_without_a_viewer_action() {
             .iter()
             .any(|text| text.contains("owned image receipt could not be verified"))
     );
+    assert!(!messages.iter().any(|message| matches!(
+        message,
+        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+    )));
     assert!(
-        !messages
+        !texts
             .iter()
-            .any(|message| matches!(message, Message::ChatUi(Action::OpenImage(..))))
+            .any(|text| text.contains("does not provide an image file path"))
     );
+}
+
+#[test]
+fn claude_document_placeholder_keeps_its_title_without_image_actions() {
+    // Claude's document decoder represents non-pixel attachments with this
+    // exact shape. A generic failed image read must not replace their title.
+    let item = chat::Item {
+        id: "recorded-claude-document".into(),
+        role: chat::Role::User,
+        content: ItemContent::Image {
+            path: String::new(),
+            description: "Claude document: release-notes.pdf".into(),
+            reference: None,
+        },
+        started_at: None,
+        at: None,
+    };
+    let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    let cached = runtime.cache.get_mut(&item.id).unwrap();
+    cached.image = None;
+    cached.image_source = None;
+    cached.image_unavailable = true;
+    cached.image_error = Some("The attachment does not provide an image file path.".into());
+    let renderer = crate::app::tests::headless_renderer();
+    let (texts, messages) = click_prompt(&renderer, &runtime, &item);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "Claude document: release-notes.pdf")
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("does not provide an image file path"))
+    );
+    assert!(!messages.iter().any(|message| matches!(
+        message,
+        Message::ChatUi(Action::OpenImage(..) | Action::LoadImage(..))
+    )));
 }
 
 #[test]

@@ -3765,7 +3765,12 @@ impl Runtime {
             text
         };
         let body: Element<'static, Message> = if attachment {
-            if let Some(cached) = self.presentation_cache().get(&item.id) {
+            // Empty unowned paths also represent documents and refused image
+            // receipts. Keep their descriptor instead of a generic read error.
+            if let Some(cached) = self.presentation_cache().get(&item.id)
+                && matches!(&item.content, ItemContent::Image { path, reference, .. }
+                    if reference.is_some() || !path.is_empty())
+            {
                 self.image_preview(item, cached)
             } else {
                 widget::row::with_children(vec![
