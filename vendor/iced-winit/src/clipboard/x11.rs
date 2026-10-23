@@ -320,7 +320,14 @@ impl Transfer {
                     ..chunk
                 }));
             }
-            data.try_reserve_exact(chunk.value.len())?;
+            let needed = data.len() + chunk.value.len();
+            if needed > data.capacity() {
+                // Amortize tiny INCR chunks without reserving beyond the cap
+                // or trusting the owner's announced size.
+                let capacity =
+                    data.capacity().saturating_mul(2).max(needed).min(limit);
+                data.try_reserve_exact(capacity - data.len())?;
+            }
             data.extend_from_slice(&chunk.value);
         }
     }
