@@ -19,6 +19,10 @@
 //! The self-updater verifies the complete installed version against this
 //! stamp, then ignores build metadata when comparing it with stable releases.
 
+// A runtime env watch reruns the script, but its compiled body must also follow
+// the checkout when Cargo shares path-package artifacts across worktrees.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
