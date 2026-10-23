@@ -214,6 +214,9 @@ struct HostedPublishedState {
     /// unrelated pointer event repainted the widget from this snapshot.
     announced_generation: AtomicU64,
     semantic_wake_pending: AtomicBool,
+    // At most one coalesced local refusal outlives a full semantic inbox. No
+    // input bytes, daemon error payload or unbounded per-request list is kept.
+    input_rejection: Mutex<Option<(Sender<TerminalEvent>, &'static str)>>,
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
@@ -242,6 +245,7 @@ impl HostedPublishedState {
             acknowledgement_rx,
             announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
+            input_rejection: Mutex::new(None),
             output_observation: Mutex::new(OutputObservation::default()),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
                 TerminalVisibility::Visible
@@ -464,6 +468,54 @@ impl HostedPublishedState {
 
     fn begin_event_drain(&self) {
         self.semantic_wake_pending.store(false, Ordering::Release);
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let full = if let Some((events, operation)) = pending.take() {
+            match events.try_send(Self::input_rejected(operation)) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => false,
+                Err(TrySendError::Full(_)) => {
+                    *pending = Some((events, operation));
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        drop(pending);
+        if full {
+            // This drain frees inbox capacity. A second semantic turn must
+            // retry the retained notice even if no further server data arrives.
+            self.request_semantic_wake();
+        }
+    }
+
+    fn input_rejected(operation: &'static str) -> TerminalEvent {
+        TerminalEvent::InputRejected {
+            operation,
+            message: "The terminal input queue is full; input was not accepted. Retry when output drains.".into(),
+        }
+    }
+
+    fn reject_input(&self, events: &Sender<TerminalEvent>, operation: &'static str) {
+        let mut pending = self
+            .input_rejection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let operation = if pending.is_some() {
+            "send terminal input"
+        } else {
+            operation
+        };
+        match events.try_send(Self::input_rejected(operation)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => *pending = None,
+            Err(TrySendError::Full(_)) => *pending = Some((events.clone(), operation)),
+        }
+        drop(pending);
+        // Never wait on the UI here: Stop and queued ShutdownTerminal must
+        // remain serviceable while its bounded event channel is full.
+        self.request_semantic_wake();
     }
 
     fn hibernate(&self) {
@@ -1181,6 +1233,9 @@ enum PendingRequest {
     Snapshot,
     Acknowledge,
     Command(&'static str),
+    // QueueFull for these commands proves no PTY input was admitted. Keep the
+    // type of the original request, rather than classifying an operation label.
+    Input(&'static str),
     Hibernate,
     Shutdown(Sender<()>),
 }
@@ -1977,6 +2032,10 @@ fn serve_connection(
             }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::Input(_)
+                | ClientCommand::Paste(..)
+                | ClientCommand::Key(_)
+                | ClientCommand::Mouse(_) => PendingRequest::Input(operation),
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -2141,12 +2200,16 @@ fn serve_connection(
                         }
                     }
                     (PendingRequest::Acknowledge, ServerResponse::Accepted)
-                    | (PendingRequest::Command(_), ServerResponse::Accepted) => {}
+                    | (PendingRequest::Command(_), ServerResponse::Accepted)
+                    | (PendingRequest::Input(_), ServerResponse::Accepted) => {}
                     (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
                     }
-                    (PendingRequest::Command(operation), unexpected) => {
+                    (
+                        PendingRequest::Command(operation) | PendingRequest::Input(operation),
+                        unexpected,
+                    ) => {
                         publish_event(
                             events,
                             published,
@@ -2185,8 +2248,19 @@ fn serve_connection(
                         ConnectionEnd::Stop
                     };
                 };
+                let request = pending.remove(&request_id);
+                if error.retryable
+                    && error.code == ProtocolErrorCode::QueueFull
+                    && let Some(PendingRequest::Input(operation)) = &request
+                {
+                    // Version, host proof and exact request correlation have
+                    // already passed. This input was refused before admission,
+                    // so retain this connection and never replay the command.
+                    published.reject_input(events, *operation);
+                    continue;
+                }
                 let mut attachment_failed = false;
-                let operation = match pending.remove(&request_id) {
+                let operation = match request {
                     Some(PendingRequest::Attach) => {
                         attachment_failed = true;
                         published.mark_detached();
@@ -2204,7 +2278,9 @@ fn serve_connection(
                     Some(PendingRequest::Acknowledge) => "acknowledge hosted terminal redraw",
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
-                    Some(PendingRequest::Command(operation)) => operation,
+                    Some(PendingRequest::Command(operation) | PendingRequest::Input(operation)) => {
+                        operation
+                    }
                     None => return ConnectionEnd::Retry,
                 };
                 let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -2467,6 +2543,8 @@ fn publish_event(
 
 #[cfg(test)]
 mod tests {
+    mod input_rejection_tests;
+
     use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
 
     use crate::{

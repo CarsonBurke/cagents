@@ -9180,6 +9180,19 @@ impl Cagents {
                     self.refresh_completed_terminal_find(card);
                     durable_changed = true;
                 }
+                TerminalEvent::InputRejected { operation, message } => {
+                    // The hosted adapter proved this individual command was
+                    // refused before effects. Its live terminal remains owned;
+                    // retry is the reader's choice, never an automatic replay.
+                    if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                        && ended_terminal(self.card_state(card)).is_none()
+                        && !self.terminal_close_pending(card)
+                    {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "Terminal input rejected ({operation}): {message}. Wait briefly, then try again."
+                        )));
+                    }
+                }
                 TerminalEvent::Error { operation, message } => {
                     metadata_changed = true;
                     if matches!(

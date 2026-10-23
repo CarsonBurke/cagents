@@ -81,6 +81,12 @@ pub enum TerminalEvent {
         operation: &'static str,
         message: String,
     },
+    /// A locally correlated daemon admission refusal; the command had no
+    /// effects and this attachment remains live. Never inferred from wire text.
+    InputRejected {
+        operation: &'static str,
+        message: String,
+    },
     AgentActivityChanged(Option<crate::agent::Activity>),
     /// The PTY has drained and the final grid is published. Unlike `Exited`,
     /// this confirms that descendants no longer own the terminal.
