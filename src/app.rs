@@ -8022,23 +8022,38 @@ impl Cagents {
 
     /// Provider activity belongs in the status icon, including restored titles.
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
+        self.card_display_title_with_chat_title(card, || {
+            let CardKind::Chat(session) = &card.kind else {
+                return None;
+            };
+            let channel =
+                self.durable.channels.iter().find(|channel| {
+                    channel.cards.contains(&card.id) && !channel.title.is_empty()
+                })?;
+            (card.title == chat_ui::chat_card_title(session.launch.provider)
+                || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && self.channel_primary_chat(channel) == Some(card.id)))
+            .then_some(channel.title.as_str())
+        })
+    }
+
+    /// Batch projections can resolve channel membership once while sharing the
+    /// same user-title, browser-title and provider-title precedence.
+    fn card_display_title_with_chat_title<'a>(
+        &'a self,
+        card: &'a CardState,
+        chat_title: impl FnOnce() -> Option<&'a str>,
+    ) -> &'a str {
         if let Some(title) = self.chrome_ui.user_titles.get(&card.id) {
             return title;
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
         }
-        if let CardKind::Chat(session) = &card.kind
-            && let Some(channel) = self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
-            && (card.title == chat_ui::chat_card_title(session.launch.provider)
-                || (channel.title_source == crate::model::ChannelTitleSource::Manual
-                    && self.channel_primary_chat(channel) == Some(card.id)))
+        if matches!(card.kind, CardKind::Chat(_))
+            && let Some(title) = chat_title()
         {
-            return &channel.title;
+            return title;
         }
         let title = crate::agent::codex_title_without_status(&card.title);
         // Provider recognition can only change an empty or status-prefixed
