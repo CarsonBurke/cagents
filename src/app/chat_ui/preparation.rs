@@ -317,9 +317,9 @@ pub(super) fn source_bytes(content: &ItemContent) -> Option<usize> {
                 body,
                 ..
             } => Some(body.len().saturating_add(summary.len())),
-            ItemContent::Image { path, description } => {
-                Some(path.len().saturating_add(description.len()))
-            }
+            ItemContent::Image {
+                path, description, ..
+            } => Some(path.len().saturating_add(description.len())),
             _ => None,
         })
 }
@@ -1944,6 +1944,7 @@ mod tests {
         let (mut runtime, _handle) = literal_runtime(ItemContent::Image {
             path: "/tmp/very-long-path/image.png".into(),
             description: description.clone(),
+            reference: None,
         });
         let (run, shared) = job(&runtime.preparation);
         let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
@@ -2078,6 +2079,7 @@ mod tests {
         let content = ItemContent::Image {
             path: remote.clone(),
             description: String::new(),
+            reference: None,
         };
         let prepared = std::thread::spawn(move || {
             literal_content::Prepared::new(&content, &AtomicBool::new(false))

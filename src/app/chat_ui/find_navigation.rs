@@ -1266,9 +1266,9 @@ fn contains_checked(
                 ]);
             }
         }
-        ItemContent::Image { path, description } => {
-            texts.extend([path.as_str(), description.as_str()])
-        }
+        ItemContent::Image {
+            path, description, ..
+        } => texts.extend([path.as_str(), description.as_str()]),
         ItemContent::Delivery {
             from,
             sender,
@@ -1820,7 +1820,9 @@ fn small_raw_work(runtime: &Runtime) -> bool {
                 add(summary);
                 add(body);
             }
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 add(path);
                 add(description);
             }

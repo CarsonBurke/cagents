@@ -123,7 +123,9 @@ impl Prepared {
                     cancelled,
                 )?,
             })),
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 let remote = path.starts_with("https://") || path.starts_with("http://");
                 let url: Option<markdown::Uri> = remote.then(|| Arc::from(path.as_str()));
                 let label = if !path.starts_with("data:") {
