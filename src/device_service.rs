@@ -79,6 +79,8 @@ pub enum Operation {
     ReadImageAsset {
         reference: crate::chat::ImageReference,
     },
+    /// A finite user-requested check of one account's default coding policy.
+    AccountCheck(crate::account::readiness::CheckRequest),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -132,6 +134,7 @@ pub enum Reply {
         error: String,
     },
     Image(Vec<u8>),
+    AccountCheck(crate::account::readiness::CheckReport),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -189,6 +192,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::AccountCheck(_) => {
+            Err("Account checks require the selected daemon's scoped admission".into())
+        }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
@@ -1893,6 +1899,37 @@ mod wire_tests {
         roundtrip(&Reply::SavedUnconfirmed {
             error: "directory sync failed".into(),
         });
+    }
+
+    #[test]
+    fn account_capability_observations_roundtrip_with_scope_and_explicit_check_selection() {
+        use crate::account::readiness::{
+            CheckReason, CheckReport, CheckRequest, CheckStatus, Measurement, PhysicalIdentity,
+        };
+        let request = CheckRequest {
+            account: "codex/00000000-0000-4000-8000-000000000001"
+                .parse()
+                .unwrap(),
+            workspace: "~/task workspace".into(),
+            expected_email: "selected@example.test".into(),
+            write: true,
+            github_repository: Some("owner/repository".into()),
+        };
+        let mut report = CheckReport::new(&request);
+        report.workspace = "/destination/home/task workspace".into();
+        report.account_home_identity = Some(PhysicalIdentity {
+            device: 5,
+            inode: 6,
+        });
+        report.workspace_identity = Some(PhysicalIdentity {
+            device: 5,
+            inode: 7,
+        });
+        report.authentication =
+            Measurement::new(CheckStatus::Passed, CheckReason::IdentityConfirmed);
+        report.workspace_write = Measurement::unknown(CheckReason::SandboxSetupFailed);
+        roundtrip(&Operation::AccountCheck(request));
+        roundtrip(&Reply::AccountCheck(report));
     }
 
     #[test]

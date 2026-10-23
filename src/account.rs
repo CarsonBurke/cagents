@@ -39,9 +39,11 @@ pub mod omp;
 pub mod preferences;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
+pub mod readiness;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod remote;
+pub mod workspace_probe;
 pub mod routing;
 pub mod schedule;
 #[cfg(any(feature = "ui", feature = "host"))]

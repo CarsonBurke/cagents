@@ -107,6 +107,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Fixed local helper used inside the provider's default sandbox.
+    #[command(hide = true)]
+    InternalWorkspaceProbe {
+        workspace: PathBuf,
+        #[arg(long)]
+        device_id: u64,
+        #[arg(long)]
+        inode: u64,
+        #[arg(long)]
+        nonce: uuid::Uuid,
+    },
     /// Generate a shell completion script without contacting services.
     Completions {
         /// Shell whose completion script should be generated.
@@ -2180,6 +2191,38 @@ where
         return ExitCode::SUCCESS;
     }
 
+    // This fixed filesystem helper is already inside the selected provider's
+    // sandbox. It never selects a device, follows a staged owner, opens a
+    // daemon socket, changes authority, or starts a service.
+    if let TopCommand::InternalWorkspaceProbe {
+        workspace,
+        device_id,
+        inode,
+        nonce,
+    } = &cli.command
+    {
+        if cli.device.is_some() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "workspace_probe",
+                    "The internal workspace probe is local only",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        let receipt = crate::account::workspace_probe::probe(workspace, *device_id, *inode, *nonce);
+        match serde_json::to_string(&receipt) {
+            Ok(json) => println!("{json}"),
+            Err(_) => return ExitCode::FAILURE,
+        }
+        return if receipt.is_verified() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // Physical-device image receipts are user-managed local files. Refuse
     // hosted/remote authority before device preparation, staged-owner routing,
     // daemon recovery, or even opening the image store.
@@ -2388,6 +2431,10 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::InternalWorkspaceProbe { .. } => Err(AppError::new(
+            "workspace_probe",
+            "The internal probe must run before device selection",
+        )),
         TopCommand::Completions { shell } => Ok(completions::execute(shell)),
         TopCommand::Diagnostics => {
             let report = crate::diagnostics::inspect().map_err(|_| {

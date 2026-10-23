@@ -371,6 +371,24 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountCheck(check),
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let report = super::account_readiness::check(host, check.clone())?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountCheck(report),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
