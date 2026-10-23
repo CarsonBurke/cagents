@@ -13338,7 +13338,7 @@ impl Application for Cagents {
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
             resume_ui: resume_ui::State::default(),
-            update_ui: update_ui::State::default(),
+            update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -13530,6 +13530,7 @@ impl Application for Cagents {
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
             app.update_update_ui(update_ui::Action::Poll),
+            app.update_update_ui(update_ui::Action::InspectInstallation),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -16660,33 +16661,15 @@ impl Application for Cagents {
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
-                if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
-                {
-                    self.tab_history.finish(self.workspace.focused());
-                    // Losing the window is not a choice of workspace, and the
-                    // release that would have made one never arrives.
-                    self.cancel_workspace_preview();
-                }
-                let account_focus = match action {
-                    refresh_ui::Action::Focused(id, focused)
-                        if self.core.main_window_id() == Some(id) =>
-                    {
-                        Some((focused, focused && !self.refresh_ui.focused))
-                    }
-                    _ => None,
-                };
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
                 let refresh = self.update_refresh(action);
-                let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
-                    self.accounts_focus_changed(focused, regained)
-                });
                 let shared = if self.shared_views.blocked.is_empty() {
                     Task::none()
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                Task::batch([refresh, self.flush_document_tone(), shared])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -16775,13 +16758,23 @@ impl Application for Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
+                // A daemon that went away or speaks another protocol may have
+                // been replaced by an install, which is when a stale window
+                // starts losing its terminals: look now, not at the next tick.
+                let inspection = if self.daemon_health_ui.health == health {
+                    Task::none()
+                } else {
+                    self.update_update_ui(update_ui::Action::InspectInstallation)
+                };
                 self.daemon_health_ui.health = health;
-                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                let confirmation = if !self.daemon_health_ui.health.unavailable()
+                    && self.daemon_health_ui.confirmation
                 {
                     self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([inspection, confirmation])
             }
             Message::AcknowledgeSessionRecovery => {
                 if let Some(health) = &mut self.save_health {
@@ -28917,6 +28910,48 @@ mod tests {
         let _ = app.open_pending_pull_requests(project);
 
         assert_eq!(reviewed_number(&app, card), Some(7));
+    }
+
+    /// What a review pane shows can change without the durable workspace
+    /// changing, as when a restored card opens the pull request it already
+    /// names. The alert focus the daemon sees must follow the pane anyway.
+    #[test]
+    fn a_review_opened_without_a_durable_change_republishes_its_alert_focus() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.refresh_ui.focused = true;
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        app.complete_review_read_for_test(&[7]);
+        app.sync_notification_presence();
+        let before = app
+            .notification_ui
+            .take_pending_presence_for_test()
+            .expect("the focused pane's presence");
+        assert_eq!(before.focused_target, None, "no review is open yet");
+
+        let durable = Arc::as_ptr(&app.durable);
+        let target = app
+            .pull_request_target(project, 7)
+            .expect("a listed target");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("a pull request pane");
+        };
+        drop(
+            pane.review
+                .update(crate::pull_request_review::Action::Open(target)),
+        );
+        assert_eq!(reviewed_number(&app, card), Some(7));
+        app.sync_notification_presence();
+        assert_eq!(Arc::as_ptr(&app.durable), durable);
+        let presence = app
+            .notification_ui
+            .take_pending_presence_for_test()
+            .expect("opening a review changes what the window focuses");
+        assert!(matches!(
+            presence.focused_target,
+            Some(crate::notifications::Target::PullRequest(request))
+                if request.number == 7 && request.request == "request-7"
+        ));
     }
 
     #[test]
