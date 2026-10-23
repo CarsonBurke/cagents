@@ -25,12 +25,84 @@ struct Residency;
 /// Called after reclaiming named state, before parking a tree. Traversal stops
 /// at each boundary: dropping its children releases the whole presentation.
 pub(crate) fn release_parked(tree: &mut Tree) {
+    if release_parked_children(tree) {
+        trace_global_font_sources();
+    }
+}
+
+fn release_parked_children(tree: &mut Tree) -> bool {
     if tree.tag == tree::Tag::of::<Residency>() {
+        let released = !tree.children.is_empty();
         tree.children = Vec::new();
+        released
     } else {
+        let mut released = false;
         for child in &mut tree.children {
-            release_parked(child);
+            released |= release_parked_children(child);
         }
+        released
+    }
+}
+
+/// Observe the global DB's existing shared mappings, without requesting a font.
+/// The native route has already laid out text before parking. The public iced
+/// accessor is lazy, so a synthetic TRACE-enabled caller before any text layout
+/// can initialize that DB; this is not a general non-initialization guarantee.
+fn trace_global_font_sources() {
+    if !tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+        return;
+    }
+    use cosmic::iced::advanced::graphics::text::{self, cosmic_text::fontdb};
+    use std::sync::Arc;
+
+    // Copy only primitive observations. In particular, do not clone a font or
+    // its shared-data Arc, call get_font, or keep the font lock while emitting.
+    let snapshot = text::font_system().try_read().ok().map(|fonts| {
+        fonts
+            .db()
+            .faces()
+            .filter_map(|face| {
+                let fontdb::Source::SharedFile(_, data) = &face.source else {
+                    return None;
+                };
+                let bytes: &[u8] = data.as_ref().as_ref();
+                Some((
+                    face.id,
+                    bytes.as_ptr() as usize,
+                    bytes.len(),
+                    Arc::strong_count(data),
+                ))
+            })
+            .collect::<Vec<_>>()
+    });
+    let Some(sources) = snapshot else {
+        tracing::trace!(
+            target: "cagents::memory",
+            process_id = std::process::id(),
+            owner = "global_font_sources",
+            status = "unknown_lock_unavailable",
+        );
+        return;
+    };
+    tracing::trace!(
+        target: "cagents::memory",
+        process_id = std::process::id(),
+        owner = "global_font_sources",
+        status = "observed",
+        shared_face_references = sources.len(),
+    );
+    for (face_id, source_base, mapped_bytes, shared_references) in sources {
+        // Several faces may share one source. Neither mapped length nor Arc
+        // count is resident/reclaimable bytes; raw smaps provides that join.
+        tracing::trace!(
+            target: "cagents::memory",
+            process_id = std::process::id(),
+            owner = "global_font_source",
+            ?face_id,
+            source_base,
+            mapped_bytes,
+            shared_references,
+        );
     }
 }
 
