@@ -4,7 +4,9 @@
 //! the selected home's lifecycle reservation, and `publish` requires the Store's
 //! actual registry lease throughout both revalidations and publication. Its
 //! callback must check the selected registration/original home and the full
-//! latest registry/System physical-alias census. A diagnostic is not a permit.
+//! latest registry/System home AND fixed config-target alias census, including
+//! dangling links from another home to the absent selected config.toml.
+//! A diagnostic is not a permit.
 //! No existing configuration, credential, home permission or registry is read
 //! for its contents or changed here. There is no named-temporary fallback.
 
@@ -21,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::fs_safety::{self, Root};
 
 const NAME: &str = "config.toml";
-const OFFLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = false\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n";
-const ONLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = true\nexclude_slash_tmp = true\n";
+const OFFLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = false\n";
+const ONLINE: &[u8] = b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\nnetwork_access = true\n";
 
 /// Metadata only. Read-only/implicit provider policy does not establish absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,8 +199,8 @@ fn prepare_with(
 
 impl Prepared {
     /// Caller holds the real Store registry lease and lifecycle reservation
-    /// throughout this call. Revalidation checks full alias census and exact
-    /// selected context; it is not a generic execution-authority callback.
+    /// throughout this call. Revalidation checks full home/config-target alias
+    /// censuses and exact selected context; it is not an execution permit.
     /// Before-link refusal means no publication; after-link failure is uncertain.
     pub(crate) fn publish(self, revalidate: impl FnMut() -> bool) -> Outcome {
         self.publish_with(
@@ -330,22 +332,24 @@ mod tests {
             let metadata = fs::metadata(&path).unwrap();
             assert_eq!(metadata.mode() & 0o7777, 0o600);
             assert_eq!(metadata.nlink(), 1);
-            let profile: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(profile["approval_policy"].as_str(), Some("on-request"));
-            assert_eq!(profile["sandbox_mode"].as_str(), Some("workspace-write"));
-            assert_eq!(
-                profile["sandbox_workspace_write"]["network_access"].as_bool(),
-                Some(network)
-            );
-            assert_eq!(
-                profile["sandbox_workspace_write"]["exclude_tmpdir_env_var"].as_bool(),
-                Some(true)
-            );
-            assert_eq!(
-                profile["sandbox_workspace_write"]["exclude_slash_tmp"].as_bool(),
-                Some(true)
-            );
-            assert_eq!(profile.as_table().unwrap().len(), 3);
+            // Only the requested profile fields are allowed; extra sandbox
+            // overrides must not silently change standard workspace behavior.
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Profile {
+                approval_policy: String,
+                sandbox_mode: String,
+                sandbox_workspace_write: WorkspaceWrite,
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct WorkspaceWrite {
+                network_access: bool,
+            }
+            let profile: Profile = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(profile.approval_policy, "on-request");
+            assert_eq!(profile.sandbox_mode, "workspace-write");
+            assert_eq!(profile.sandbox_workspace_write.network_access, network);
         }
     }
 
