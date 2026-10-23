@@ -63,6 +63,11 @@ impl TerminalSurface {
         self.handle.visibility()
     }
 
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.handle.stop_for_test();
+    }
+
     pub fn generation(&self) -> u64 {
         self.handle.generation()
     }
