@@ -115,18 +115,31 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
 
     // Rebuild between every input, as the native runtime does. Derive the
     // target from the actual laid-out accessible button, not a saved pixel.
-    fn click<'a>(
-        mut view: impl FnMut() -> Element<'a, Message>,
+    fn click(
+        app: &mut Cagents,
+        confirmation: bool,
+        original: uuid::Uuid,
+        key: &ActiveWorktreeKey,
         label: &str,
         size: Size,
         renderer: &cosmic::Renderer,
     ) -> Vec<Message> {
+        fn has_id(tree: &Tree, wanted: &widget::Id) -> bool {
+            tree.id
+                .as_ref()
+                .is_some_and(|id| iced_accessibility::IdEq::eq(id, wanted))
+                || tree.children.iter().any(|child| has_id(child, wanted))
+        }
         let mut tree = Tree::empty();
         let viewport = Rectangle::with_size(size);
         let mut point = None;
         let mut messages = Vec::new();
         for phase in 0..3 {
-            let mut element = view();
+            let mut element = if confirmation {
+                app.dialog().expect("actual confirmation is mounted")
+            } else {
+                app.context_panel(None, size.width)
+            };
             tree.diff(element.as_widget_mut());
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -161,6 +174,7 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
                 1 => mouse::Event::ButtonPressed(mouse::Button::Left),
                 _ => mouse::Event::ButtonReleased(mouse::Button::Left),
             };
+            let mut emitted = Vec::new();
             element.as_widget_mut().update(
                 &mut tree,
                 &Event::Mouse(event),
@@ -168,9 +182,66 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
                 mouse::Cursor::Available(at),
                 renderer,
                 &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
+                &mut Shell::new(&mut emitted),
                 &viewport,
             );
+            drop(element);
+            for message in emitted {
+                if let Message::SidebarSnapshot { source, action } = &message
+                    && let SidebarAction::ChangeViewport {
+                        key: observed,
+                        scope,
+                        first_row,
+                        epoch,
+                    } = &**action
+                {
+                    // Native layout can notify a viewport before a button is
+                    // released. Accept only this actual mounted list's callback
+                    // and reduce it through App before rebuilding the next frame.
+                    assert!(!confirmation, "no change list is mounted in the dialog");
+                    assert_eq!(*source, original, "phase {phase}: {message:?}");
+                    assert_eq!(observed, key, "phase {phase}: {message:?}");
+                    assert_eq!(
+                        *scope,
+                        sidebar::ChangeTreeScope::Area(crate::repository::ChangeArea::Unstaged),
+                        "phase {phase}: {message:?}"
+                    );
+                    assert_eq!(*first_row, 0, "phase {phase}: {message:?}");
+                    assert!(
+                        has_id(
+                            &tree,
+                            &widget::Id::new(format!(
+                                "sidebar.changes.scroll.{}.{scope:?}.{epoch}",
+                                key.worktree_id
+                            ))
+                        ),
+                        "phase {phase}: callback must name the currently mounted epoch: {message:?}"
+                    );
+                    let task = app.update(message);
+                    assert!(
+                        iced::runtime::task::into_stream(task).is_none(),
+                        "viewport bookkeeping must not discard asynchronous App work"
+                    );
+                    assert!(!app.modal_is_open());
+                    assert_eq!(app.discard_ui.source().unwrap().id, original);
+                    continue;
+                }
+                let target = matches!(&message,
+                    Message::SidebarSnapshot { source, action } if *source == original &&
+                    if confirmation {
+                        matches!(&**action, SidebarAction::ConfirmDiscard { key: observed, .. } if observed == key)
+                    } else {
+                        matches!(&**action, SidebarAction::ChangeGroup { key: observed,
+                            command: sidebar::ChangeGroupCommand::Discard, .. } if observed == key)
+                    }
+                );
+                assert!(
+                    target,
+                    "phase {phase}: unexpected actual message: {message:?}"
+                );
+                assert_eq!(phase, 2, "Discard is a release action: {message:?}");
+                messages.push(message);
+            }
             if phase < 2 {
                 assert!(messages.is_empty(), "Discard is a release action");
             }
@@ -238,7 +309,10 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
     let original = app.discard_ui.source().unwrap().id;
     let renderer = crate::app::tests::headless_renderer();
     let mut requested = click(
-        || app.context_panel(None, 380.0),
+        &mut app,
+        false,
+        original,
+        &key,
         "Discard all Unstaged",
         Size::new(380.0, 900.0),
         &renderer,
@@ -259,7 +333,10 @@ fn discard_app_pointer_confirmation_rebuild_keeps_original_receipt_through_undo(
     );
 
     let mut confirmed = click(
-        || app.dialog().expect("actual confirmation is mounted"),
+        &mut app,
+        true,
+        original,
+        &key,
         "Discard",
         Size::new(1280.0, 900.0),
         &renderer,
