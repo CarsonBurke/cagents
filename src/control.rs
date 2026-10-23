@@ -2180,6 +2180,37 @@ where
         return ExitCode::SUCCESS;
     }
 
+    // Physical-device image receipts are user-managed local files. Refuse
+    // hosted/remote authority before device preparation, staged-owner routing,
+    // daemon recovery, or even opening the image store.
+    if let TopCommand::Chat {
+        command: ChatCommand::ImageAssets { command },
+    } = &cli.command
+    {
+        let hosted = [
+            crate::agent_execution::AUTHORITY_ENV,
+            "CAGENTS_AGENT_TOKEN",
+            "CAGENTS_SESSION_TOKEN",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        return match chat::image_assets::execute(
+            command,
+            cli.device.as_deref(),
+            crate::device::is_remote(),
+            hosted,
+        ) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let stopping_daemon = matches!(
         &cli.command,
         TopCommand::Daemon {
@@ -5093,6 +5124,31 @@ mod tests {
             ));
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn pre_image_reference_daemon_revision_is_rejected_before_snapshot_or_prompt() {
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            let mut response = connected_envelope(
+                1,
+                proof("session", "boot", "incarnation"),
+                proof("session", "boot", "incarnation"),
+            );
+            response.version = 104;
+            write_frame(&mut server_stream, &response).unwrap();
+        });
+        assert!(matches!(
+            ControlClient::from_stream(client_stream),
+            Err(ControlError::UnsupportedVersion { actual: 104 })
+        ));
+        server.join().unwrap();
     }
 
     #[test]

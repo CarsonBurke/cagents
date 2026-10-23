@@ -356,7 +356,9 @@ impl Store {
             }
         }
         let mut warning = None;
-        if let ItemContent::Image { path, description } = &mut item.content
+        if let ItemContent::Image {
+            path, description, ..
+        } = &mut item.content
             && path.starts_with("data:")
         {
             match self.image_file(path) {
@@ -402,7 +404,9 @@ impl Store {
             }
             // Descriptions and provider paths can grow; inline bytes have
             // already become a short private path above.
-            ItemContent::Image { description, path } => (
+            ItemContent::Image {
+                description, path, ..
+            } => (
                 std::mem::take(description),
                 String::new(),
                 std::mem::take(path),
@@ -1354,7 +1358,9 @@ impl Store {
                             *name = format!("{name} (part {}/{parts})", part + 1);
                         }
                     }
-                    ItemContent::Image { path, description } => {
+                    ItemContent::Image {
+                        path, description, ..
+                    } => {
                         *description = body0;
                         match attachment {
                             Some(data) => *path = data,
@@ -2076,6 +2082,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: "x".repeat(WINDOW_BYTES - 32 * 1024),
                     description: "image".into(),
+                    reference: None,
                 },
             }))
             .unwrap();
@@ -2596,6 +2603,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: payload.clone(),
                     description: "screenshot".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -2605,7 +2613,9 @@ mod tests {
         let window = store.window().unwrap();
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 assert!(path.starts_with(store.directory.to_str().unwrap()));
                 assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
@@ -2645,6 +2655,7 @@ mod tests {
                             "data:image/png;base64,QUJD".into()
                         },
                         description: id.into(),
+                        reference: None,
                     },
                 }))
                 .unwrap();

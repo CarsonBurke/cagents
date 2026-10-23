@@ -65,6 +65,14 @@ impl Cagents {
         if let Some(text) = self.chat_ui.drafts.remove(&card) {
             runtime.replace_draft(text_editor::Content::with_text(&text));
         }
+        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
+            runtime.replace_attachments(
+                images
+                    .into_iter()
+                    .filter(|image| image.reference.is_some())
+                    .collect(),
+            );
+        }
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -84,6 +92,12 @@ impl Cagents {
             source: runtime.session.clone(),
             copy: self.card_state(copy).expect("retained card exists").clone(),
             draft: runtime.unsent_text(),
+            attachments: runtime
+                .unsent_attachments()
+                .iter()
+                .filter(|image| image.reference.is_some())
+                .cloned()
+                .collect(),
             scope: self.durable.card_scopes.get(&copy).cloned(),
             channel: self
                 .durable
@@ -250,7 +264,9 @@ impl Cagents {
         // the current pane, with its original descriptor and content intact.
         let same_source =
             matches!(&pane.kind, CardKind::Chat(session) if session == &runtime.session);
-        if !same_source && !runtime.unsent_text().is_empty() {
+        if !same_source
+            && (!runtime.unsent_text().is_empty() || !runtime.unsent_attachments().is_empty())
+        {
             let retained = CardId::new();
             let mut state = self
                 .card_state(pane.id)
@@ -263,7 +279,7 @@ impl Cagents {
             state.kind = CardKind::Chat(runtime.session.clone());
             state.residency = Residency::Hot;
             let local_card = state.clone();
-            runtime.target = self.chat_ui.next_target(retained);
+            runtime.retarget(self.chat_ui.next_target(retained));
             let durable = Arc::make_mut(&mut self.durable);
             if let Some(scope) = durable.card_scopes.get(&pane.id).cloned() {
                 durable.card_scopes.insert(retained, scope);
@@ -322,6 +338,15 @@ impl Cagents {
             CardKind::Chat(session) if session.is_unstarted() => {
                 if let Some(CardRuntime::Chat(runtime)) = self.cards.remove(&pane.id) {
                     self.chat_ui.drafts.insert(pane.id, runtime.unsent_text());
+                    let images = runtime
+                        .unsent_attachments()
+                        .iter()
+                        .filter(|image| image.reference.is_some())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !images.is_empty() {
+                        self.chat_ui.draft_attachments.insert(pane.id, images);
+                    }
                 }
                 self.open_chat(pane.id, session.clone(), chat::Intent::Restore)
             }
@@ -332,5 +357,62 @@ impl Cagents {
             _ => Task::none(),
         };
         (Task::batch([task, presentation]), saved_copy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_keeps_image_only_draft_and_rehomes_its_exact_source_metadata() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Claude, Some("/project".into())));
+            let card = app.workspace.focused().unwrap();
+            let mut source = match app.cards.get(&card).unwrap() {
+                CardRuntime::Chat(runtime) => runtime.session.clone(),
+                _ => panic!("native draft expected"),
+            };
+            source.launch.session_id = Some("old-image-thread".into());
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            app.chat_ui
+                .draft_attachments
+                .insert(card, vec![image.clone()]);
+            app.await_shared_chat_admission(card, source.clone());
+            let CardRuntime::Chat(runtime) = app.cards.get(&card).unwrap() else {
+                panic!("saved draft expected")
+            };
+            assert!(runtime.awaiting_admission());
+            assert!(runtime.unsent_text().is_empty());
+            assert_eq!(runtime.unsent_attachments(), [image.clone()]);
+            assert!(!app.chat_ui.draft_attachments.contains_key(&card));
+
+            let mut replacement = app.card_state(card).unwrap().clone();
+            let mut canonical = source.clone();
+            canonical.id = TerminalId::new();
+            canonical.launch.session_id = Some("different-thread".into());
+            replacement.kind = CardKind::Chat(canonical);
+            let pane = crate::workspace_model::views::Pane::from_card(
+                &replacement,
+                Some("/project".into()),
+            )
+            .unwrap();
+            let (task, retained) = app.retain_unresolved_shared_upgrade(&pane);
+            drop(task);
+            let retained = retained.expect("image-only draft must receive an inert source copy");
+            let CardRuntime::Chat(runtime) = app.cards.get(&retained).unwrap() else {
+                panic!("retained source expected")
+            };
+            assert_eq!(runtime.session, source);
+            assert_eq!(runtime.unsent_attachments(), [image.clone()]);
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.chat_draft_attachments[&retained], [image]);
+            assert!(saved.pending_chat_admissions.contains_key(&retained));
+            assert!(
+                matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))),
+                "review-only admission must not start the replacement provider"
+            );
+        });
     }
 }

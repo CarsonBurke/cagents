@@ -107,7 +107,11 @@ pub(super) fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     bounded_handle_size(bytes, budget, None)
 }
 fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Loaded {
-    if bytes.len() > chat::MAX_INLINE_IMAGE_BYTES {
+    decode_handle(&bytes, budget, edge, chat::MAX_INLINE_IMAGE_BYTES)
+}
+
+fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
+    if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
     let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -275,9 +279,15 @@ fn load_with_request(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
 ) -> Loaded {
-    let ItemContent::Image { path, .. } = &item.content else {
+    let ItemContent::Image {
+        path, reference, ..
+    } = &item.content
+    else {
         return Loaded::Unavailable;
     };
+    if let Some(reference) = reference {
+        return managed_with_request(reference, origin.device.is_some(), None, request);
+    }
     if path.starts_with("data:image/") {
         let bytes = (path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES)
             .then(|| path.split_once(";base64,"))
@@ -394,6 +404,51 @@ pub(in crate::app) async fn file_preview(
         )),
     }
 }
+/// Managed image identity is resolved by its owning backend. UI path hints
+/// never authorize a read, including after history restoration across roots.
+fn managed_with_request(
+    reference: &chat::ImageReference,
+    remote: bool,
+    edge: Option<u32>,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Loaded {
+    if let Err(error) = reference.validate() {
+        return Loaded::Failed(error);
+    }
+    let bytes = if remote {
+        request(crate::device_service::Operation::ReadImageAsset { reference: reference.clone() })
+            .and_then(|reply| match reply {
+                crate::device_service::Reply::Image(bytes) if bytes.len() <= crate::device_service::MAX_DEVICE_IMAGE_BYTES => Ok(bytes),
+                _ => Err("The selected device did not return a supported image preview; use matching cagents executables.".into()),
+            })
+    } else {
+        chat::attachment_assets::read(reference, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
+    };
+    match bytes {
+        Ok(bytes) => match bounded_handle_size(bytes, budget(), edge) {
+            Loaded::Unavailable => Loaded::Failed(format!(
+                "Cannot preview {}: unsupported, damaged, or larger than the 16 MiB preview limit.",
+                reference.label()
+            )),
+            loaded => loaded,
+        },
+        Err(error) => Loaded::Failed(format!(
+            "Cannot preview {} on its originating device: {error}",
+            reference.label()
+        )),
+    }
+}
+pub(super) fn managed_thumbnail(reference: &chat::ImageReference) -> Loaded {
+    managed_with_request(
+        reference,
+        crate::device::is_remote(),
+        Some(128),
+        crate::device_service::request,
+    )
+}
+
 #[cfg(test)]
 fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
     match bounded_handle(bytes, budget()) {
@@ -449,6 +504,14 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
 /// Transcript previews and composer thumbnails share worker admission. A
 /// cancelled subscription cannot release a slot while its blocking work runs.
 pub(super) async fn worker(load: impl FnOnce() -> Loaded + Send + 'static) -> Loaded {
+    run_worker(load).await.unwrap_or(Loaded::Unavailable)
+}
+
+/// Staging pasted/selected images shares both worker and memory admission
+/// with previews; cancelling the UI task cannot release running blocking work.
+pub(super) async fn run_worker<T: Send + 'static>(
+    load: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let workers = WORKERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)));
     let permit = workers
@@ -461,8 +524,44 @@ pub(super) async fn worker(load: impl FnOnce() -> Loaded + Send + 'static) -> Lo
         load()
     })
     .await
-    .unwrap_or(Loaded::Unavailable)
+    .map_err(|error| format!("Image processing failed: {error}"))
 }
+
+/// Fully decode before publishing durable bytes, with the existing global
+/// admission limits. Only a 1-pixel temporary preview is retained and dropped.
+pub(super) fn validate_attachment(
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Result<image::ImageFormat, String> {
+    if bytes.is_empty()
+        || bytes.len() as u64 > max_bytes.min(chat::attachment_assets::MAX_IMAGE_BYTES)
+    {
+        return Err("Image exceeds this provider's image size limit.".into());
+    }
+    let format = image::guess_format(bytes).map_err(|_| "The file is not a supported image.")?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+    ) {
+        return Err("The file is not a supported attachment image.".into());
+    }
+    match decode_handle(
+        bytes,
+        budget(),
+        Some(1),
+        chat::attachment_assets::MAX_IMAGE_BYTES as usize,
+    ) {
+        Loaded::Ready(_) => Ok(format),
+        Loaded::Deferred(_) => Err("Image memory is busy. Try attaching the image again.".into()),
+        Loaded::Unavailable | Loaded::Failed(_) => {
+            Err("The image is damaged or exceeds the image dimensions limit.".into())
+        }
+    }
+}
+
 pub(super) fn thumbnail(path: &Path) -> Loaded {
     read_file(path).map_or(Loaded::Unavailable, |bytes| {
         bounded_handle_size(bytes, budget(), Some(128))
@@ -715,6 +814,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
 
 struct Entry {
     id: String,
+    managed: bool,
     path: String,
     label: String,
     handle: iced::widget::image::Handle,
@@ -734,6 +834,7 @@ impl Gallery {
         Self {
             entries: vec![Entry {
                 id: "file".into(),
+                managed: false,
                 // Keep non-UTF8 filenames and literal URL characters exact.
                 path: Url::from_file_path(&path)
                     .map(|url| url.to_string())
@@ -761,11 +862,17 @@ impl Gallery {
         let entries: Vec<_> = items
             .iter()
             .filter_map(|item| {
-                let ItemContent::Image { path, description } = &item.content else {
+                let ItemContent::Image {
+                    path,
+                    description,
+                    reference,
+                } = &item.content
+                else {
                     return None;
                 };
                 Some(Entry {
                     id: item.id.clone(),
+                    managed: reference.is_some(),
                     path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
                         path.clone()
                     } else {
@@ -804,7 +911,13 @@ impl Gallery {
         self.reset = self.reset.wrapping_add(1);
     }
     pub(super) fn url(&self) -> Option<Url> {
-        let path = &self.entries[self.selected].path;
+        let entry = &self.entries[self.selected];
+        // Managed snapshot paths are non-authority hints. The in-app viewer
+        // owns verified pixels; never hand an unverified hint to another app.
+        if entry.managed {
+            return None;
+        }
+        let path = &entry.path;
         if Path::new(path).is_absolute() {
             (!self.remote)
                 .then(|| Url::from_file_path(path).ok())
@@ -980,9 +1093,85 @@ mod tests {
             content: ItemContent::Image {
                 path,
                 description: "Fixture".into(),
+                reference: None,
             },
         }
     }
+    #[test]
+    fn managed_remote_preview_uses_backend_receipt_across_different_roots_and_never_local_hint() {
+        chat::attachment_assets::with_test_image(|backend_image| {
+            let ui_root = tempfile::tempdir().unwrap();
+            let ui_hint = ui_root.path().join("coincident-image.png");
+            let ui_pixels = png();
+            std::fs::write(&ui_hint, &ui_pixels).unwrap();
+            assert_ne!(backend_image.path.parent(), Some(ui_root.path()));
+            let backend_bytes = std::fs::read(&backend_image.path).unwrap();
+            let expected = image::load_from_memory(&backend_bytes)
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            assert_ne!(
+                expected,
+                image::load_from_memory(&ui_pixels)
+                    .unwrap()
+                    .into_rgba8()
+                    .into_raw()
+            );
+            let reference = backend_image.reference.as_ref().unwrap();
+            let mut item = image_item(ui_hint.to_string_lossy().into_owned());
+            if let ItemContent::Image {
+                reference: slot, ..
+            } = &mut item.content
+            {
+                *slot = Some(reference.clone());
+            }
+            let origin = Origin {
+                root: ui_root.path().into(),
+                child: false,
+                device: Some("backend-with-another-home".into()),
+            };
+            let loaded = load_with_request(&item, &origin, |operation| {
+                let crate::device_service::Operation::ReadImageAsset { reference: sent } =
+                    operation
+                else {
+                    panic!("managed preview must not send any caller path");
+                };
+                assert_eq!(&sent, reference);
+                chat::attachment_assets::read(&sent, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
+                    .map(crate::device_service::Reply::Image)
+            });
+            let Loaded::Ready(iced::widget::image::Handle::Rgba { pixels, .. }) = loaded else {
+                panic!("valid backend receipt bytes must decode");
+            };
+            assert_eq!(pixels.as_ref(), expected.as_slice());
+            let mut foreign = reference.clone();
+            foreign.device = uuid::Uuid::new_v4();
+            if let ItemContent::Image {
+                reference: slot, ..
+            } = &mut item.content
+            {
+                *slot = Some(foreign);
+            }
+            let loaded = load_with_request(&item, &origin, |operation| {
+                let crate::device_service::Operation::ReadImageAsset { reference } = operation
+                else {
+                    panic!("no path fallback");
+                };
+                chat::attachment_assets::read(
+                    &reference,
+                    crate::device_service::MAX_DEVICE_IMAGE_BYTES,
+                )
+                .map(crate::device_service::Reply::Image)
+            });
+            assert!(matches!(loaded, Loaded::Failed(error) if error.contains("device")));
+            assert_eq!(
+                std::fs::read(ui_hint).unwrap(),
+                ui_pixels,
+                "foreign receipt never opens or mutates coincident UI pixels"
+            );
+        });
+    }
+
     #[test]
     fn remote_preview_never_reads_same_named_local_pixels_or_falls_back_after_failure() {
         let directory = tempfile::tempdir().unwrap();
@@ -1068,6 +1257,7 @@ mod tests {
         );
         assert!(remote.entries[0].label.contains("FW16 fixture"));
         let local = Gallery::file(path.clone(), None, handle.clone());
+        assert!(!remote.entries[0].managed && !local.entries[0].managed);
         assert_eq!(local.url().unwrap().to_file_path().unwrap(), path);
 
         use std::os::unix::ffi::OsStringExt;
@@ -1166,6 +1356,41 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_gallery_cannot_open_a_different_local_hint_externally() {
+        chat::attachment_assets::with_test_image(|backend_image| {
+            let display = tempfile::tempdir().unwrap();
+            let hint = display.path().join("coincident.png");
+            std::fs::write(&hint, png()).unwrap();
+            let backend_bytes = std::fs::read(&backend_image.path).unwrap();
+            assert_ne!(backend_bytes, png());
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some(display.path().into())));
+            let card = app.workspace.focused().unwrap();
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                panic!("draft chat");
+            };
+            let mut item = image_item(hint.to_string_lossy().into_owned());
+            if let ItemContent::Image { reference, .. } = &mut item.content {
+                *reference = backend_image.reference.clone();
+            }
+            let item = Arc::new(item);
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.items = vec![item.clone()];
+            runtime.snapshot = Arc::new(snapshot);
+            let mut cached =
+                CachedItem::new(&item.content, crate::settings::EditorSyntaxTheme::Auto);
+            cached.image = bytes_handle(backend_bytes);
+            runtime.cache.insert(item.id.clone(), cached);
+            let gallery = Gallery::new(runtime, &item.id).unwrap();
+            assert!(gallery.entries[0].managed);
+            assert!(
+                gallery.url().is_none(),
+                "verified internal pixels must never authorize a coincident external hint"
+            );
+        });
     }
 
     #[test]
@@ -1453,6 +1678,7 @@ mod tests {
     fn gallery_navigation_wraps_and_resets_pan_and_zoom() {
         let entry = |id: &str| Entry {
             id: id.into(),
+            managed: false,
             path: format!("/fixture/{id}.png"),
             label: id.into(),
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
