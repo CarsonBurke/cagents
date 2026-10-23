@@ -90,7 +90,11 @@ pub(in crate::host) struct Scope {
 #[derive(Default)]
 struct Retained {
     active_leases: usize,
-    children: Vec<tokio::process::Child>,
+    children: Vec<UnconfirmedChild>,
+}
+struct UnconfirmedChild {
+    child: tokio::process::Child,
+    group_signal_confirmed: bool,
 }
 impl Scope {
     pub(in crate::host) fn capture(
@@ -142,13 +146,20 @@ impl Lease {
 
     /// Transfer custody of the original handle when its owner cannot prove
     /// exit. Never reconstruct a handle from a PID or signal a discovered PID.
-    pub(in crate::host) fn retain_unconfirmed(&self, child: tokio::process::Child) {
+    pub(in crate::host) fn retain_unconfirmed(
+        &self,
+        child: tokio::process::Child,
+        group_signal_confirmed: bool,
+    ) {
         self.scope
             .retained
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .children
-            .push(child);
+            .push(UnconfirmedChild {
+                child,
+                group_signal_confirmed,
+            });
     }
 }
 impl Drop for Lease {
@@ -169,7 +180,9 @@ impl Drop for Lease {
 }
 
 /// Poll only the retained original handles. None/errors preserve uncertainty;
-/// only an actual successful reap can release their pinned directories. No
+/// only a confirmed group signal followed by a successful reap can release
+/// their pinned directories. A failed/unconfirmed group signal is quarantined
+/// even if its leader exits; leader exit alone cannot establish group cleanup. No
 /// waiting, PID lookup, signals, timers or background cleanup task is involved.
 pub(in crate::host) fn cleanup_retained(map: &Leases) {
     let readers: Vec<_> = map
@@ -181,9 +194,9 @@ pub(in crate::host) fn cleanup_retained(map: &Leases) {
     for (token, scope) in readers {
         {
             let mut retained = scope.retained.lock().unwrap_or_else(|p| p.into_inner());
-            retained
-                .children
-                .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+            retained.children.retain_mut(|record| {
+                !record.group_signal_confirmed || !matches!(record.child.try_wait(), Ok(Some(_)))
+            });
         }
         // Enrollment can race this poll, so recheck under the same lock order
         // before retiring this exact snapshot token.
@@ -563,7 +576,7 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let input = child.stdin.take().unwrap();
         assert!(child.try_wait().unwrap().is_none());
-        lease.retain_unconfirmed(child);
+        lease.retain_unconfirmed(child, true);
         drop(lease);
         cleanup_retained(&map);
         assert!(ensure_outside(&map, &home).is_err());
@@ -584,5 +597,39 @@ mod tests {
         .await
         .expect("the original child must be reaped after stdin EOF");
         assert!(ensure_outside(&map, &home).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconfirmed_group_signal_stays_quarantined_after_leader_exit() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let sibling = root.path().join("sibling");
+        for path in [&home, &workspace, &sibling] {
+            fs::create_dir(path).unwrap();
+        }
+        let map = Leases::default();
+        let lease = Lease::enroll(&map, capture(&home, &workspace)).unwrap();
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(&workspace)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        // The original leader has definitively exited. An unconfirmed group
+        // signal still prevents claiming that the whole group was cleaned up.
+        lease.retain_unconfirmed(child, false);
+        drop(lease);
+        for _ in 0..2 {
+            cleanup_retained(&map);
+            assert!(ensure_outside(&map, &home).is_err());
+            assert!(ensure_outside(&map, &workspace).is_err());
+            assert!(ensure_outside(&map, &sibling).is_ok());
+        }
     }
 }
