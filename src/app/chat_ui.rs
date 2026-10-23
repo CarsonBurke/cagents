@@ -14,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+mod artifacts;
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
@@ -23,7 +24,7 @@ mod coordination;
 mod find;
 mod fold;
 mod hover;
-mod images;
+pub(super) mod images;
 mod layout;
 mod markdown_source;
 mod monospace;
@@ -234,6 +235,8 @@ pub enum Action {
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     OpenUrl(String),
     OpenDocument(Target, String),
+    /// Captured by the rendered surface, independently of later focus changes.
+    OpenDocumentFrom(Target, Option<PathBuf>, String),
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
     OpenImage(Target, String),
@@ -1009,6 +1012,7 @@ struct CachedItem {
     image_source: Option<Arc<chat::Item>>,
     image_item: Option<Arc<chat::Item>>,
     image_unavailable: bool,
+    image_error: Option<String>,
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
@@ -1067,6 +1071,7 @@ impl CachedItem {
             image_source,
             image_item,
             image_unavailable,
+            image_error,
             image_attempt,
             image_wait,
             image_evicted,
@@ -1079,6 +1084,7 @@ impl CachedItem {
                     cached.image_source.clone(),
                     cached.image_item.clone(),
                     cached.image_unavailable,
+                    cached.image_error.clone(),
                     cached.image_attempt,
                     cached.image_wait.clone(),
                     cached.image_evicted,
@@ -1148,6 +1154,7 @@ impl CachedItem {
             image_source,
             image_item,
             image_unavailable,
+            image_error,
             image_attempt,
             image_wait,
             image_evicted,
@@ -8556,8 +8563,22 @@ impl Cagents {
                 return self.chat_changed_file_resolved(target, id, reported, result);
             }
             Action::OpenDocument(target, raw) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let document = runtime.document_link_origin();
+                    return self.open_document_link_from(
+                        Some(target.card),
+                        document.as_deref(),
+                        &raw,
+                    );
+                }
+            }
+            Action::OpenDocumentFrom(target, document, raw) => {
                 if self.chat_runtime_mut(target).is_some() {
-                    return self.open_document_link(Some(target.card), &raw);
+                    return self.open_document_link_from(
+                        Some(target.card),
+                        document.as_deref(),
+                        &raw,
+                    );
                 }
             }
             Action::LoadImage(target, id) => {
@@ -8620,7 +8641,7 @@ impl Cagents {
                     .and_then(|gallery| gallery.url())
                 {
                     return cosmic::task::future(async move {
-                        Message::ExternalLinkOpened(open_system_url(url).await)
+                        Message::ExternalLinkOpened(images::open_external(url).await)
                     });
                 }
             }

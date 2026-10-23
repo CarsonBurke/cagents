@@ -100,6 +100,7 @@ impl AsRef<[u8]> for Pixels {
 pub(in crate::app) enum Loaded {
     Ready(iced::widget::image::Handle),
     Unavailable,
+    Failed(String),
     Deferred(Pressure),
 }
 pub(super) fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
@@ -216,22 +217,182 @@ fn read_file(path: impl AsRef<Path>) -> Option<Vec<u8>> {
         .ok()?;
     (bytes.len() <= chat::MAX_INLINE_IMAGE_BYTES).then_some(bytes)
 }
-fn load(item: &chat::Item) -> Loaded {
+
+pub(super) async fn open_external(url: Url) -> Result<(), String> {
+    open_external_with(url, open_system_url).await
+}
+
+async fn open_external_with<F, Fut>(url: Url, opener: F) -> Result<(), String>
+where
+    F: FnOnce(Url) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if url.scheme() == "file" {
+        let path = url
+            .to_file_path()
+            .map_err(|_| "The image link does not name a local file".to_owned())?;
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::OpenOptionsExt;
+            let checked = || -> std::io::Result<()> {
+                let file = std::fs::OpenOptions::new().read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(std::io::Error::other("the image is not a regular file"));
+                }
+                if metadata.len() > chat::MAX_INLINE_IMAGE_BYTES as u64 {
+                    return Err(std::io::Error::other("the image exceeds the preview file limit"));
+                }
+                Ok(())
+            };
+            checked().map_err(|error| format!("Cannot open image {} on this device: {error}. Paths are literal; choose a concrete existing image.", path.display()))
+        }).await.map_err(|error| format!("Could not check the image file: {error}"))??;
+    }
+    opener(url).await
+}
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Origin {
+    root: PathBuf,
+    child: bool,
+    device: Option<String>,
+}
+impl Origin {
+    fn of(runtime: &Runtime) -> Self {
+        Self {
+            root: runtime.session.launch.recipe.working_directory.clone(),
+            child: runtime.selected_subagent.is_some(),
+            device: crate::device::selected().map(|device| device.name.clone()),
+        }
+    }
+}
+fn load(item: &chat::Item, origin: &Origin) -> Loaded {
+    load_with_request(item, origin, crate::device_service::request)
+}
+fn load_with_request(
+    item: &chat::Item,
+    origin: &Origin,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Loaded {
     let ItemContent::Image { path, .. } = &item.content else {
         return Loaded::Unavailable;
     };
-    let bytes = if Path::new(path).is_absolute() {
-        read_file(path)
-    } else if path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES && path.starts_with("data:image/") {
-        path.split_once(";base64,").and_then(|(_, encoded)| {
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .ok()
+    if path.starts_with("data:image/") {
+        let bytes = (path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES)
+            .then(|| path.split_once(";base64,"))
+            .flatten()
+            .and_then(|(_, encoded)| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+            });
+        return bytes.map_or(Loaded::Unavailable, |bytes| bounded_handle(bytes, budget()));
+    }
+    load_file_with_request(Path::new(path), origin, request)
+}
+fn load_file_with_request(
+    path: &Path,
+    origin: &Origin,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Loaded {
+    if path.as_os_str().is_empty() {
+        return Loaded::Failed("The attachment does not provide an image file path.".into());
+    }
+    if path.as_os_str().as_encoded_bytes().len() > 4096 {
+        return Loaded::Failed("The attachment's image path exceeds 4096 bytes.".into());
+    }
+    // Never interpret a child's relative name through its parent's cwd.
+    if origin.child && !path.is_absolute() {
+        return Loaded::Failed(format!(
+            "Cannot preview {path:?}: the child conversation's working directory is unavailable. Ask for a concrete absolute image path."
+        ));
+    }
+    if !path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|path| Url::parse(path).is_ok_and(|url| !url.scheme().is_empty()))
+    {
+        return Loaded::Failed(
+            "This attachment needs a concrete image file path or inline image data.".into(),
+        );
+    }
+    let bytes = if origin.device.is_some() {
+        // No fallback to the displaying computer, including for an old daemon
+        // that does not understand ReadImage. Its namespace is unrelated.
+        request(crate::device_service::Operation::ReadImage {
+            root: origin.root.clone(),
+            path: path.to_owned(),
+        })
+        .and_then(|reply| match reply {
+            crate::device_service::Reply::Image(bytes)
+                if bytes.len() <= crate::device_service::MAX_DEVICE_IMAGE_BYTES => Ok(bytes),
+            _ => Err("the selected device did not return a supported image preview; use matching cagents executables".into()),
         })
     } else {
-        None
+        crate::device_service::read_image_file(&origin.root, path, chat::MAX_INLINE_IMAGE_BYTES)
     };
-    bytes.map_or(Loaded::Unavailable, |bytes| bounded_handle(bytes, budget()))
+    match bytes {
+        Ok(bytes) => match bounded_handle(bytes, budget()) {
+            Loaded::Unavailable => Loaded::Failed(format!(
+                "Cannot preview {path:?} on {}: unsupported, damaged or oversized image.",
+                origin.device.as_deref().unwrap_or("this device")
+            )),
+            loaded => loaded,
+        },
+        Err(error) => {
+            let hint = if path
+                .to_string_lossy()
+                .chars()
+                .any(|ch| matches!(ch, '*' | '?' | '[' | '{' | '}'))
+            {
+                " Paths are literal; attach each concrete image instead of brace or wildcard shorthand."
+            } else {
+                ""
+            };
+            Loaded::Failed(format!(
+                "Cannot preview {path:?} on {}: {error}{hint}",
+                origin.device.as_deref().unwrap_or("this device")
+            ))
+        }
+    }
+}
+
+/// Explicit device-file links share transcript image admission, without
+/// listing the containing directory or trying the displaying computer.
+pub(in crate::app) async fn file_preview(
+    path: PathBuf,
+    device: Option<String>,
+) -> Result<iced::widget::image::Handle, String> {
+    let origin = Origin {
+        root: PathBuf::from("/"),
+        child: false,
+        device,
+    };
+    let description = format!(
+        "{} on {}",
+        path.display(),
+        origin.device.as_deref().unwrap_or("this device")
+    );
+    if !path.is_absolute() {
+        return Err(format!(
+            "Cannot preview {description}: an absolute device path is required."
+        ));
+    }
+    match worker(move || load_file_with_request(&path, &origin, crate::device_service::request))
+        .await
+    {
+        Loaded::Ready(handle) => Ok(handle),
+        Loaded::Failed(error) => Err(error),
+        Loaded::Unavailable => Err(format!(
+            "Cannot preview {description}: unsupported, damaged or oversized image."
+        )),
+        Loaded::Deferred(_) => Err(format!(
+            "Cannot preview {description}: image preview capacity is full. Close other image previews and try again."
+        )),
+    }
 }
 #[cfg(test)]
 fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
@@ -244,6 +405,7 @@ fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
 #[derive(Clone)]
 pub(super) struct Source {
     target: Target,
+    origin: Origin,
     item: Arc<chat::Item>,
     attempt: u64,
     wait: Option<Pressure>,
@@ -251,6 +413,7 @@ pub(super) struct Source {
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
         self.target == other.target
+            && self.origin == other.origin
             && Arc::ptr_eq(&self.item, &other.item)
             && self.attempt == other.attempt
             && self.wait == other.wait
@@ -261,6 +424,7 @@ impl std::hash::Hash for Source {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::any::TypeId::of::<Self>().hash(state);
         self.target.hash(state);
+        self.origin.hash(state);
         Arc::as_ptr(&self.item).hash(state);
         self.attempt.hash(state);
         self.wait.hash(state);
@@ -273,7 +437,7 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
             pressure.available().await;
         }
         let item = source.item.clone();
-        let loaded = worker(move || load(&item)).await;
+        let loaded = worker(move || load(&item, &source.origin)).await;
         action(Action::ImageLoaded(
             source.target,
             source.item,
@@ -418,6 +582,7 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
         cached.image_wait = None;
         cached.image_evicted = false;
         cached.image_unavailable = false;
+        cached.image_error = None;
     }
     sync(runtime);
 }
@@ -516,7 +681,11 @@ pub(super) fn complete(
     let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
     cached.image_source = None;
     cached.image_wait = None;
-    cached.image_unavailable = matches!(loaded, Loaded::Unavailable);
+    cached.image_unavailable = matches!(loaded, Loaded::Unavailable | Loaded::Failed(_));
+    cached.image_error = match &loaded {
+        Loaded::Failed(error) => Some(error.clone()),
+        _ => None,
+    };
     cached.image = match loaded {
         Loaded::Ready(handle) => Some(handle),
         _ => None,
@@ -532,6 +701,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
             Some(Subscription::run_with(
                 Source {
                     target: runtime.target,
+                    origin: Origin::of(runtime),
                     item: source.clone(),
                     attempt: cached.image_attempt,
                     wait: cached.image_wait.clone(),
@@ -552,9 +722,30 @@ struct Entry {
 pub(in crate::app) struct Gallery {
     entries: Vec<Entry>,
     selected: usize,
+    remote: bool,
     pub(super) reset: u64,
 }
 impl Gallery {
+    pub(in crate::app) fn file(
+        path: PathBuf,
+        device: Option<&str>,
+        handle: iced::widget::image::Handle,
+    ) -> Self {
+        Self {
+            entries: vec![Entry {
+                id: "file".into(),
+                // Keep non-UTF8 filenames and literal URL characters exact.
+                path: Url::from_file_path(&path)
+                    .map(|url| url.to_string())
+                    .unwrap_or_default(),
+                label: format!("{} · {}", device.unwrap_or("This device"), path.display()),
+                handle,
+            }],
+            selected: 0,
+            remote: device.is_some(),
+            reset: 0,
+        }
+    }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
         let items = match runtime.selected_subagent.as_deref() {
             Some(agent) => {
@@ -575,7 +766,18 @@ impl Gallery {
                 };
                 Some(Entry {
                     id: item.id.clone(),
-                    path: path.clone(),
+                    path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
+                        path.clone()
+                    } else {
+                        runtime
+                            .session
+                            .launch
+                            .recipe
+                            .working_directory
+                            .join(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    },
                     label: if description.is_empty() {
                         "Image".into()
                     } else {
@@ -589,6 +791,7 @@ impl Gallery {
         Some(Self {
             entries,
             selected,
+            remote: crate::device::is_remote(),
             reset: 0,
         })
     }
@@ -603,11 +806,13 @@ impl Gallery {
     pub(super) fn url(&self) -> Option<Url> {
         let path = &self.entries[self.selected].path;
         if Path::new(path).is_absolute() {
-            Url::from_file_path(path).ok()
+            (!self.remote)
+                .then(|| Url::from_file_path(path).ok())
+                .flatten()
         } else {
-            Url::parse(path)
-                .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https"))
+            Url::parse(path).ok().filter(|url| {
+                matches!(url.scheme(), "http" | "https") || !self.remote && url.scheme() == "file"
+            })
         }
     }
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
@@ -677,7 +882,13 @@ impl Runtime {
         };
         let Some(handle) = &cached.image else {
             return if cached.image_unavailable {
-                design::caption(format!("{label} · Preview unavailable")).into()
+                design::caption(
+                    cached
+                        .image_error
+                        .clone()
+                        .unwrap_or_else(|| format!("{label} · Preview unavailable")),
+                )
+                .into()
             } else if cached.image_wait.is_some() {
                 design::caption(format!("{label} · Waiting for preview memory…")).into()
             } else if cached.image_source.is_some()
@@ -759,6 +970,229 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+    fn image_item(path: String) -> chat::Item {
+        chat::Item {
+            id: "image".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Image {
+                path,
+                description: "Fixture".into(),
+            },
+        }
+    }
+    #[test]
+    fn remote_preview_never_reads_same_named_local_pixels_or_falls_back_after_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same-path.png");
+        std::fs::write(&path, png()).unwrap();
+        let origin = Origin {
+            root: directory.path().into(),
+            child: false,
+            device: Some("fixture-device".into()),
+        };
+        let item = image_item(path.to_string_lossy().into_owned());
+        let failed = load_with_request(&item, &origin, |operation| {
+            assert!(
+                matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
+                if root == directory.path() && sent == path)
+            );
+            Err("file missing on device".into())
+        });
+        assert!(
+            matches!(failed, Loaded::Failed(error) if error.contains("same-path.png")
+            && error.contains("fixture-device") && error.contains("file missing on device"))
+        );
+        // A reachable older daemon returning an unsupported reply is equally
+        // unable to authorize pixels from this computer's identically named file.
+        assert!(
+            matches!(load_with_request(&item, &origin, |_| Ok(crate::device_service::Reply::Saved)),
+            Loaded::Failed(error) if error.contains("matching cagents executables"))
+        );
+        let invalid_remote = load_with_request(&item, &origin, |_| {
+            Ok(crate::device_service::Reply::Image(
+                b"not remote pixels".to_vec(),
+            ))
+        });
+        assert!(matches!(invalid_remote, Loaded::Failed(_)));
+        assert!(matches!(
+            load_with_request(&item, &origin, |_| Ok(crate::device_service::Reply::Image(
+                png()
+            ))),
+            Loaded::Ready(_)
+        ));
+    }
+    #[test]
+    fn explicit_device_image_links_keep_exact_paths_pixels_and_gallery_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("界 #% literal-*.PNG");
+        std::fs::write(&path, png()).unwrap();
+        let mut remote = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut remote),
+            &[3, 240, 3, 255],
+            1,
+            1,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let origin = Origin {
+            root: "/".into(),
+            child: false,
+            device: Some("FW16 fixture".into()),
+        };
+        let Loaded::Ready(handle) = load_file_with_request(&path, &origin, |operation| {
+            assert!(
+                matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
+                if root == Path::new("/") && sent == path)
+            );
+            Ok(crate::device_service::Reply::Image(remote))
+        }) else {
+            panic!("real remote PNG should decode")
+        };
+        let iced::widget::image::Handle::Rgba { pixels, .. } = &handle else {
+            panic!("decoded pixels")
+        };
+        assert_eq!(
+            pixels.as_ref(),
+            &[3, 240, 3, 255],
+            "remote pixels must win over the actual different local file"
+        );
+        let remote = Gallery::file(path.clone(), Some("FW16 fixture"), handle.clone());
+        assert!(
+            remote.url().is_none(),
+            "a remote file cannot launch a local viewer"
+        );
+        assert!(remote.entries[0].label.contains("FW16 fixture"));
+        let local = Gallery::file(path.clone(), None, handle.clone());
+        assert_eq!(local.url().unwrap().to_file_path().unwrap(), path);
+
+        use std::os::unix::ffi::OsStringExt;
+        let opaque = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"image-\xff.png".to_vec()));
+        let gallery = Gallery::file(opaque.clone(), None, handle);
+        assert_eq!(
+            gallery.url().unwrap().to_file_path().unwrap(),
+            opaque,
+            "file URLs retain non-UTF8 names without a lossy round trip"
+        );
+    }
+    #[test]
+    fn concrete_local_names_use_conversation_cwd_and_unknown_child_cwd_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("cwd");
+        std::fs::create_dir_all(cwd.join("docs")).unwrap();
+        std::fs::write(cwd.join("docs/image.png"), png()).unwrap();
+        std::fs::write(directory.path().join("image.png"), png()).unwrap();
+        let origin = Origin {
+            root: cwd,
+            child: false,
+            device: None,
+        };
+        let item = image_item("docs/image.png".into());
+        assert!(matches!(
+            load_with_request(&item, &origin, |_| panic!(
+                "local preview must not request device transport"
+            )),
+            Loaded::Ready(_)
+        ));
+        let child = Origin {
+            child: true,
+            ..origin.clone()
+        };
+        assert!(
+            matches!(load_with_request(&item, &child, |_| panic!("unknown child cwd must not be requested")),
+            Loaded::Failed(error) if error.contains("child conversation's working directory"))
+        );
+        assert!(matches!(
+            load(&image_item("../image.png".into()), &origin),
+            Loaded::Ready(_)
+        ));
+        for path in ["docs/image-*.png", "docs/image-{a,b}.png"] {
+            assert!(matches!(
+                load(&image_item(path.into()), &origin),
+                Loaded::Failed(_)
+            ));
+        }
+    }
+    #[test]
+    fn inline_images_do_not_consult_any_device_filesystem() {
+        let origin = Origin {
+            root: "/unavailable".into(),
+            child: true,
+            device: Some("remote".into()),
+        };
+        let path = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png())
+        );
+        assert!(matches!(
+            load_with_request(&image_item(path), &origin, |_| panic!(
+                "inline images have no file owner"
+            )),
+            Loaded::Ready(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_image_open_checks_the_exact_file_before_launching_a_viewer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tree-real-*.png");
+        let url = Url::from_file_path(&path).unwrap();
+        let error = open_external_with(url.clone(), |_| async {
+            panic!("a missing pattern must never reach a viewer")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("tree-real-*.png") && error.contains("Paths are literal"));
+        std::fs::write(&path, png()).unwrap();
+        open_external_with(url, |found| async move {
+            assert_eq!(
+                found.to_file_path().unwrap(),
+                path,
+                "literal metacharacters are preserved"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let folder = Url::from_file_path(directory.path()).unwrap();
+        assert!(
+            open_external_with(folder, |_| async { panic!("a directory is not an image") })
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inline_image_gallery_never_offers_a_filesystem_external_link() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/tmp/gallery"))));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("draft chat")
+        };
+        let path = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png())
+        );
+        let item = Arc::new(image_item(path.clone()));
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.items = vec![item.clone()];
+        runtime.snapshot = Arc::new(snapshot);
+        let mut cached = CachedItem::new(&item.content, crate::settings::EditorSyntaxTheme::Auto);
+        cached.image = bytes_handle(png());
+        runtime.cache.insert(item.id.clone(), cached);
+        let gallery = Gallery::new(runtime, &item.id).unwrap();
+        assert_eq!(gallery.entries[0].path, path);
+        assert!(
+            gallery.url().is_none(),
+            "inline pixels are not a local filename"
+        );
     }
     #[test]
     fn file_preview_rejects_fifos_without_waiting_for_a_writer() {
@@ -1026,6 +1460,7 @@ mod tests {
         let mut gallery = Gallery {
             entries: vec![entry("a"), entry("b")],
             selected: 0,
+            remote: false,
             reset: 0,
         };
         gallery.next(false);
@@ -1034,5 +1469,10 @@ mod tests {
         gallery.next(true);
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
+        gallery.remote = true;
+        assert!(
+            gallery.url().is_none(),
+            "a remote path must never open a local file URL"
+        );
     }
 }
