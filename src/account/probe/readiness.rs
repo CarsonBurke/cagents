@@ -1,6 +1,6 @@
 //! Model-free measurements through the official Codex app server. No command
 //! in this module requests a policy override, thread, turn, or unsandboxed API.
-use super::{Cache, Session, TIMEOUT, command, find_executable, now_ms, search_path};
+use super::{Cache, Session, TIMEOUT, command, current_search_path, find_executable, now_ms};
 use crate::{
     account::{Account, Identity, UsageStatus, readiness::*},
     agent::Provider,
@@ -125,7 +125,10 @@ pub(crate) async fn run(
             return report;
         }
     };
-    let path = search_path().await;
+    // This explicit diagnostic uses the already discovered shell PATH, or
+    // the daemon's inherited PATH. It never starts an interactive shell as
+    // a hidden preparation step outside its owned provider process group.
+    let path = current_search_path();
     let Some(program) = find_executable(Provider::Codex.executable(), path.as_deref()) else {
         stop(
             &mut report,
