@@ -17,7 +17,22 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 // account, project, provider installation, or running daemon.
 pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
+    const INHERITED_SCOPE: &str = "CAGENTS_EXECUTION_TEST_AUTHORITY_PRESENCE";
     if std::env::var(CHILD).as_deref() == Ok(name) {
+        // Only this helper sets the presence marker. The separate owned-late-
+        // decision controller also uses CHILD, without this helper's spawn.
+        if let Ok(expected) = std::env::var(INHERITED_SCOPE) {
+            let expected = match expected.as_str() {
+                "present" => true,
+                "absent" => false,
+                _ => panic!("invalid fixture authority presence marker"),
+            };
+            assert_eq!(
+                Authority::from_environment() != Authority::default(),
+                expected,
+                "isolated child lost its inherited authority scope"
+            );
+        }
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
@@ -36,7 +51,15 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Keep the caller's delegation inherited unchanged, without inspecting or
+    // copying its value. Every other environment input is fixture-owned.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+            command.env_remove(name);
+        }
+    }
+    let result = command
         .args([
             "--exact",
             &if name.contains("::") {
@@ -46,8 +69,15 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
             },
             "--nocapture",
         ])
-        .env_clear()
         .env(CHILD, name)
+        .env(
+            INHERITED_SCOPE,
+            if Authority::from_environment() != Authority::default() {
+                "present"
+            } else {
+                "absent"
+            },
+        )
         .env("CAGENTS_EXECUTION_FIXTURE", root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -3629,7 +3659,11 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
             chat::ItemContent::Delivery { body, .. } if body == &sent.message.body)
             })
             .count();
-        if deliveries == 1 && handle.is_idle() {
+        let provider_prompts = std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count();
+        if deliveries == 1 && provider_prompts == 2 && handle.is_idle() {
             assert_eq!(snapshot.activity(), crate::agent::ActivityState::Working);
             assert_eq!(
                 snapshot
