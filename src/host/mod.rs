@@ -277,28 +277,61 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
+    // This mandatory thread service must be available before any adoption
+    // can discard the holder's replay copy. It observes no process until the
+    // same HostState publishes one; it initiates no execution.
+    let _agent_activity = activity::Monitor::start(&host)?;
     let listener = listener_before_restore(&paths, || {
-        let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-        state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-        chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-        chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-        chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-        let retained_runs = chat::retained_actor::retained_runs(&host);
-        // A committed acceptance is not proof of provider delivery. Until a
-        // restored actor supplies exact run evidence, never authorize a resend.
-        if let Ok(registry) = agent_execution::registry(&host) {
-            registry
+        let restored = (|| -> io::Result<()> {
+            let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+            state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+            if let Some(detail) = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .interrupt_unproven_agent_runs_except(
-                    crate::chat::now_ms().unwrap_or(0),
-                    &retained_runs,
-                )
-                .map_err(io::Error::other)?;
+                .startup_recovery()
+            {
+                return Err(io::Error::other(detail.to_owned()));
+            }
+            chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+            let retained_runs = chat::retained_actor::retained_runs(&host);
+            // A committed acceptance is not proof of provider delivery. Until a
+            // restored actor supplies exact run evidence, never authorize a resend.
+            if let Ok(registry) = agent_execution::registry(&host) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .interrupt_unproven_agent_runs_except(
+                        crate::chat::now_ms().unwrap_or(0),
+                        &retained_runs,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state
+                    .terminals
+                    .values()
+                    .any(|record| !record.handle.is_completed())
+                    || state.chats.values().any(|record| record.handle.owns_work())
+                {
+                    // Keep the real listener, lease and original owners. A
+                    // failed restore is not permission to destroy accepted
+                    // replay or start an empty replacement daemon.
+                    state.retain_startup_recovery(error.to_string());
+                    tracing::error!(%error, "startup retained original ownership; recovery-only listener remains available");
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
         }
-        Ok(())
     })?;
-    let _agent_activity = activity::Monitor::start(&host)?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
@@ -308,28 +341,45 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let automation_broker = match automations::start(&host) {
-        Ok(broker) => Some(broker),
-        Err(error) => {
-            tracing::warn!(%error, "scheduled automations are unavailable");
-            None
+    let recovery_only = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .startup_recovery()
+        .is_some();
+    let automation_broker = if recovery_only {
+        None
+    } else {
+        match automations::start(&host) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::warn!(%error, "scheduled automations are unavailable");
+                None
+            }
         }
     };
-    let work_board = match work::Service::start(&host) {
-        Ok(service) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
-            Some(service)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "the Work board is unavailable");
-            None
+    let work_board = if recovery_only {
+        None
+    } else {
+        match work::Service::start(&host) {
+            Ok(service) => {
+                host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+                Some(service)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Work board is unavailable");
+                None
+            }
         }
     };
-    let courier = match agent_execution::mailbox::Courier::start(&host) {
-        Ok(courier) => Some(courier),
-        Err(error) => {
-            tracing::warn!(%error, "messages between sessions are unavailable");
-            None
+    let courier = if recovery_only {
+        None
+    } else {
+        match agent_execution::mailbox::Courier::start(&host) {
+            Ok(courier) => Some(courier),
+            Err(error) => {
+                tracing::warn!(%error, "messages between sessions are unavailable");
+                None
+            }
         }
     };
 
@@ -414,6 +464,19 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             Err(error) => Some(error),
         };
         if let Some(error) = fatal {
+            if host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .recovery_owns_work()
+            {
+                // A listener error cannot authorize loss of the retained raw
+                // prefix. Keep custody and retry this same listener; no rebind,
+                // replacement daemon, adoption retry or new execution occurs.
+                tracing::error!(%error, "recovery listener failed while original ownership remains retained");
+                runtime_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
             host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();

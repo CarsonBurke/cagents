@@ -609,3 +609,418 @@ fn late_child_reply_survives_committed_carry_and_final_save_failures_without_rec
         store.remove().unwrap();
     }
 }
+
+#[test]
+fn restore_keeps_partial_originals_and_raw_prefix_reachable_after_commit_or_store_failure() {
+    const NAME: &str =
+        "restore_keeps_partial_originals_and_raw_prefix_reachable_after_commit_or_store_failure";
+    if isolated(NAME) {
+        return;
+    }
+    let root = std::env::current_dir().unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    for (index, fault) in ["commit", "store", "none"].into_iter().enumerate() {
+        let case = root.join(format!("startup-{index}"));
+        fs::create_dir(&case).unwrap();
+        let mut proof = proof(&format!("retained-startup-{index}"));
+        let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        let original = host(proof.clone());
+        let mut sources = Vec::new();
+        for number in 0..2 {
+            let cwd = case.join(format!("original-{number}"));
+            fs::create_dir(&cwd).unwrap();
+            let session = source(&cwd, QUERY_CHILD);
+            let handle = spawn(&original, &session);
+            wait_text(&handle, "STABLE_INPUT_READY");
+            sources.push((session, handle));
+        }
+        // The checkpoint uses this exact ID order; the second failure cannot
+        // accidentally become a first-owner failure on a random UUID order.
+        sources.sort_by_key(|(session, _)| session.id);
+        let owners = sources
+            .iter()
+            .map(|(_, handle)| handle.holder_identity().unwrap().clone())
+            .collect::<Vec<_>>();
+        let mut roots = owners
+            .iter()
+            .map(OriginalProcesses::pin)
+            .collect::<Vec<_>>();
+        let checkpoint_directory = Store::discover().unwrap().path.parent().unwrap().to_owned();
+        let holders = holder_directory().unwrap();
+        let capability = original
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with_carry_policy(
+            &original,
+            capability,
+            false,
+            Some(&holders),
+            true,
+            || Store::open(&checkpoint_directory),
+        )
+        .unwrap();
+        let store = Store::open(&checkpoint_directory).unwrap();
+        for (source, _) in &sources {
+            fs::write(source.launch.working_directory.join("query-gate"), b"emit").unwrap();
+            wait_file(&source.launch.working_directory.join("query-emitted"));
+            assert!(
+                !source
+                    .launch
+                    .working_directory
+                    .join("reply-received")
+                    .exists()
+            );
+        }
+        let (old_handles, _) = original.lock().unwrap().graceful_shutdown();
+        super::super::finish_chat_shutdown(&original).unwrap();
+        for handle in old_handles {
+            handle.shutdown().unwrap();
+        }
+        assert_eq!(store.load().unwrap().unwrap().phase, Phase::Ready);
+        drop(original);
+        drop(lease.take());
+        proof.host_incarnation = HostIncarnation::new(format!("retained-successor-{index}"));
+        lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        let successor = host(proof.clone());
+        {
+            let mut state = successor.lock().unwrap();
+            state.install_model(
+                crate::host::model::Registry::at(&case.join("registry.sqlite3")).unwrap(),
+            );
+            if fault == "commit" {
+                state.test_fail_startup_commit = Some(sources[1].0.id);
+            }
+            if fault == "store" {
+                state.test_checkpoint_failure_at = Some((sources[1].0.id, store.path.clone()));
+            }
+        }
+        let result = restore_upgrade(&successor);
+        assert_eq!(result.is_err(), fault != "none", "{fault}: {result:?}");
+        let handles = {
+            let state = successor.lock().unwrap();
+            assert_eq!(
+                state.terminals.len(),
+                2,
+                "both actual originals require independently retained parent records"
+            );
+            sources
+                .iter()
+                .map(|(source, _)| state.terminals[&source.id].handle.clone())
+                .collect::<Vec<_>>()
+        };
+        for ((source, handle), owner) in sources
+            .iter()
+            .map(|(source, _)| source)
+            .zip(handles.iter())
+            .zip(owners.iter())
+        {
+            assert_eq!(handle.holder_identity(), Some(owner));
+            assert!(owner.root.is_current());
+            assert!(owner.holder.is_current());
+            assert_eq!(
+                fs::read_to_string(source.launch.working_directory.join("launches")).unwrap(),
+                "launch\n"
+            );
+        }
+        if fault == "commit" {
+            assert!(!handles[0].startup_unresolved());
+            assert!(handles[1].startup_unresolved());
+            let (_, pending, cleanup) = handles[1].retained_startup_state_for_test();
+            assert!(pending && !cleanup);
+            assert_eq!(handles[1].retained_startup_bytes_for_test(), b"\x1b[6n");
+            assert!(
+                !sources[1]
+                    .0
+                    .launch
+                    .working_directory
+                    .join("reply-received")
+                    .exists()
+            );
+            assert!(result.as_ref().unwrap_err().contains("original ownership"));
+        }
+        for (position, (source, _)) in sources.iter().enumerate() {
+            if fault == "commit" && position == 1 {
+                continue;
+            }
+            wait_file(&source.launch.working_directory.join("reply-received"));
+            assert_eq!(
+                fs::read(source.launch.working_directory.join("reply-received")).unwrap(),
+                b"\x1b[1;1R"
+            );
+        }
+        if fault != "none" {
+            assert_eq!(
+                successor
+                    .lock()
+                    .unwrap()
+                    .retained_startup_checkpoint
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                Phase::Restoring
+            );
+            let (response, _, _) =
+                super::super::client::process_request(&successor, 0, ClientRequest::List).unwrap();
+            let ServerResponse::Listed { terminals } = response else {
+                panic!("existing List must remain reachable");
+            };
+            assert_eq!(terminals.len(), 2);
+            for request in [
+                ClientRequest::Input {
+                    terminal_id: sources[0].0.id,
+                    bytes: b"not admitted".to_vec(),
+                },
+                ClientRequest::Resume {
+                    terminal_id: sources[1].0.id,
+                    visible: true,
+                },
+                ClientRequest::Shutdown,
+                ClientRequest::Spawn {
+                    session: source(&case, QUERY_CHILD),
+                    options: TerminalSpawnOptions::default(),
+                },
+            ] {
+                let error =
+                    super::super::client::process_request(&successor, 0, request).unwrap_err();
+                assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+                assert!(error.message.contains("Startup recovery"));
+            }
+            successor.lock().unwrap().request_shutdown();
+            assert!(!successor.lock().unwrap().is_shutting_down());
+            assert!(successor.lock().unwrap().graceful_shutdown().0.is_empty());
+            assert!(owners.iter().all(|owner| owner.root.is_current()));
+            if fault == "commit" {
+                assert_eq!(store.load().unwrap().unwrap().phase, Phase::Restoring);
+                assert_eq!(handles[1].retained_startup_bytes_for_test(), b"\x1b[6n");
+            } else {
+                assert!(
+                    store.load().is_err(),
+                    "real checkpoint path failure must be observable"
+                );
+                let preserved: crate::upgrade::handoff::Checkpoint = serde_json::from_slice(
+                    &fs::read(store.path.with_extension("before-failure.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(preserved.phase, Phase::Restoring);
+                assert_eq!(preserved.carried.len(), 2);
+            }
+        }
+        // Existing public checked Close, not ordinary Stop or a new recovery
+        // wire operation, deliberately authorizes each original destruction.
+        for ((source, _), handle) in sources.iter().zip(handles.iter()) {
+            // Successful lineage restoration detaches execution client zero.
+            // Reattach through the real public route before its checked Close;
+            // the unresolved original is already attached and stays parked.
+            if !successor
+                .lock()
+                .unwrap()
+                .subscriptions
+                .attached(0, source.id)
+            {
+                let (response, _, _) = super::super::client::process_request(
+                    &successor,
+                    0,
+                    ClientRequest::Attach {
+                        terminal_id: source.id,
+                        after_generation: 0,
+                        after_event_sequence: 0,
+                    },
+                )
+                .unwrap();
+                assert!(
+                    matches!(response, ServerResponse::Attached { terminal } if terminal.session.id == source.id)
+                );
+            }
+            let (response, _, _) = super::super::client::process_request(
+                &successor,
+                0,
+                ClientRequest::CloseTerminalChecked {
+                    terminal_id: source.id,
+                    allow_active: true,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                response,
+                ServerResponse::TerminalCloseChecked {
+                    outcome: TerminalCloseResult::Closed,
+                    ..
+                }
+            ));
+            assert!(handle.worker_joined_for_test());
+        }
+        for root in &mut roots {
+            root.settle();
+        }
+        for owner in &owners {
+            assert!(
+                !crate::daemon::holder_registry::retirement_pending(owner).unwrap(),
+                "exact original holder discovery must be retired after proved Close"
+            );
+        }
+        assert!(!successor.lock().unwrap().recovery_owns_work());
+        successor.lock().unwrap().request_shutdown();
+        assert!(successor.lock().unwrap().is_shutting_down());
+        if fault == "store" {
+            fs::remove_dir(&store.path).unwrap();
+            fs::rename(
+                store.path.with_extension("before-failure.json"),
+                &store.path,
+            )
+            .unwrap();
+        }
+        if fault != "none" {
+            store.remove().unwrap();
+        }
+        drop(successor);
+        drop(lease.take());
+    }
+}
+
+#[test]
+fn orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_until_explicit_close()
+{
+    const NAME: &str = "orphan_authority_restore_failure_keeps_the_committed_original_in_recovery_until_explicit_close";
+    if isolated(NAME) {
+        return;
+    }
+    let root = std::env::current_dir().unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    for (index, unavailable_registry_table) in [true, false].into_iter().enumerate() {
+        let case = root.join(format!("orphan-authority-{index}"));
+        fs::create_dir(&case).unwrap();
+        let mut proof = proof(&format!("orphan-authority-{index}"));
+        let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        let original = host(proof.clone());
+        let source = source(&case, QUERY_CHILD);
+        let handle = spawn(&original, &source);
+        wait_text(&handle, "STABLE_INPUT_READY");
+        let owner = handle.holder_identity().unwrap().clone();
+        let mut processes = OriginalProcesses::pin(&owner);
+        let directory = holder_directory().unwrap();
+        let socket = crate::terminal::holder::socket(&directory, source.id);
+        handle.carry(socket).unwrap();
+        fs::write(case.join("query-gate"), b"emit").unwrap();
+        wait_file(&case.join("query-emitted"));
+        assert!(!case.join("reply-received").exists());
+        drop(lease.take());
+        proof.host_incarnation = HostIncarnation::new(format!("orphan-successor-{index}"));
+        lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        let successor = host(proof.clone());
+        let registry_path = case.join("registry.sqlite3");
+        successor
+            .lock()
+            .unwrap()
+            .install_model(crate::host::model::Registry::at(&registry_path).unwrap());
+        let fault = rusqlite::Connection::open(&registry_path).unwrap();
+        if unavailable_registry_table {
+            // A real SQLite query failure AFTER holder commit/activation, not
+            // an injected replacement result or a synthetic source DTO.
+            fault
+                .execute_batch(
+                    "ALTER TABLE agent_authorities RENAME TO unavailable_agent_authorities",
+                )
+                .unwrap();
+        }
+        let result = restore_orphaned_holders(&successor);
+        assert_eq!(result.is_err(), unavailable_registry_table, "{result:?}");
+        let adopted = {
+            let state = successor.lock().unwrap();
+            assert_eq!(state.terminals.len(), 1);
+            assert_eq!(
+                state.startup_recovery().is_some(),
+                unavailable_registry_table
+            );
+            state.terminals[&source.id].handle.clone()
+        };
+        assert_eq!(adopted.holder_identity(), Some(&owner));
+        assert!(owner.root.is_current() && owner.holder.is_current());
+        assert!(
+            !adopted.startup_unresolved(),
+            "this original's reader already activated successfully before the metadata failure"
+        );
+        wait_file(&case.join("reply-received"));
+        assert_eq!(fs::read(case.join("reply-received")).unwrap(), b"\x1b[1;1R");
+        assert_eq!(
+            fs::read_to_string(case.join("launches")).unwrap(),
+            "launch\n"
+        );
+        if unavailable_registry_table {
+            assert!(result.unwrap_err().contains("agent_authorities"));
+            let (response, _, _) =
+                super::super::client::process_request(&successor, 0, ClientRequest::List).unwrap();
+            assert!(
+                matches!(response, ServerResponse::Listed { terminals } if terminals.len() == 1)
+            );
+            for request in [
+                ClientRequest::Input {
+                    terminal_id: source.id,
+                    bytes: b"must not execute".to_vec(),
+                },
+                ClientRequest::Resume {
+                    terminal_id: source.id,
+                    visible: true,
+                },
+                ClientRequest::Shutdown,
+            ] {
+                let error =
+                    super::super::client::process_request(&successor, 0, request).unwrap_err();
+                assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+            }
+            successor.lock().unwrap().request_shutdown();
+            assert!(!successor.lock().unwrap().is_shutting_down());
+            assert!(successor.lock().unwrap().graceful_shutdown().0.is_empty());
+            assert!(owner.root.is_current() && owner.holder.is_current());
+            fault
+                .execute_batch(
+                    "ALTER TABLE unavailable_agent_authorities RENAME TO agent_authorities",
+                )
+                .unwrap();
+            // Repairing the query does not retry adoption or clear quarantine.
+            assert!(successor.lock().unwrap().startup_recovery().is_some());
+            assert_eq!(adopted.holder_identity(), Some(&owner));
+        }
+        let (response, _, _) = super::super::client::process_request(
+            &successor,
+            0,
+            ClientRequest::Attach {
+                terminal_id: source.id,
+                after_generation: 0,
+                after_event_sequence: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(response, ServerResponse::Attached { terminal } if terminal.session.id == source.id)
+        );
+        let (response, _, _) = super::super::client::process_request(
+            &successor,
+            0,
+            ClientRequest::CloseTerminalChecked {
+                terminal_id: source.id,
+                allow_active: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            ServerResponse::TerminalCloseChecked {
+                outcome: TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(adopted.worker_joined_for_test());
+        processes.settle();
+        assert!(!crate::daemon::holder_registry::retirement_pending(&owner).unwrap());
+        assert!(!successor.lock().unwrap().recovery_owns_work());
+        successor.lock().unwrap().request_shutdown();
+        assert!(successor.lock().unwrap().is_shutting_down());
+        drop(successor);
+        drop(original);
+        drop(handle);
+        drop(lease.take());
+    }
+}

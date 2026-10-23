@@ -842,7 +842,8 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
             events,
             published.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let mut root = InputRootGuard::new(&published);
         let handle = TerminalHandle {
             inner: Arc::new(HandleInner {
@@ -1241,4 +1242,172 @@ while True: time.sleep(1)
     assert!(worker.pending_input.is_empty());
     worker.published.request_shutdown();
     finish_captured_input_worker(worker, &handle, &mut root);
+}
+
+#[test]
+fn ambiguous_adoption_commit_keeps_the_original_reader_prefix_and_parent_owner_until_explicit_close()
+ {
+    const NAME: &str = "ambiguous_adoption_commit_keeps_the_original_reader_prefix_and_parent_owner_until_explicit_close";
+    if isolated_input_case(NAME) {
+        return;
+    }
+    let root = std::env::current_dir().unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = crate::model::HostSessionProof {
+        host_session_id: crate::model::HostSessionId::new("startup-prefix-custody"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: crate::model::HostIncarnation::new("startup-prefix-custody"),
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut session = shell_session("");
+    session.launch.program = "/usr/bin/python3".into();
+    session.launch.arguments = vec![
+        "-c".into(),
+        r#"import os,pathlib,time,tty
+tty.setraw(0)
+pathlib.Path('launches').write_bytes(b'one')
+os.write(1,b'ORIGINAL_READY')
+while not pathlib.Path('emit').exists(): time.sleep(.005)
+os.write(1,b'RAW_PREFIX\x1b[6n')
+pathlib.Path('emitted').write_bytes(b'yes')
+reply=os.read(0,128)
+pathlib.Path('unexpected-reply').write_bytes(reply)
+while True: time.sleep(1)
+"#
+        .into(),
+    ];
+    session.launch.working_directory = root.clone();
+    session.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+        host_session_id: proof.host_session_id.clone(),
+        boot_id: proof.boot_id.clone(),
+        host_incarnation: proof.host_incarnation.clone(),
+    };
+    let recovery = holder::Recovery {
+        source: session.clone(),
+        previous_sources: Vec::new(),
+        relaunches: Vec::new(),
+        options: crate::terminal::TerminalSpawnOptions::default(),
+        execution_environment: None,
+        execution_recipe: None,
+    };
+    let original = TerminalHandle::spawn(
+        session.clone(),
+        TerminalConfig {
+            holder_recovery: Some(recovery.clone()),
+            ..TerminalConfig::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    let owner = original.holder_identity().unwrap().clone();
+    let original_record = owner.clone();
+    let holder_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, owner.holder.pid, 0) };
+    assert!(holder_fd >= 0 && owner.holder.is_current());
+    let original_holder = unsafe { File::from_raw_fd(holder_fd as i32) };
+    let mut original_root = InputRootGuard::new(&original.inner.published);
+    wait_for_text(&original, "ORIGINAL_READY");
+    let socket = crate::daemon::holder_registry::socket(
+        &crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Terminal)
+            .unwrap(),
+        session.id,
+    );
+    original.carry(socket.clone()).unwrap();
+    fs::write(root.join("emit"), b"query").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("emitted").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let parent = Arc::new(Mutex::new(None::<TerminalHandle>));
+    let captured = parent.clone();
+    let error = TerminalHandle::spawn_with_execution_installed(
+        session,
+        TerminalConfig {
+            adoption: Some(socket),
+            holder_recovery: Some(recovery),
+            ..TerminalConfig::default()
+        },
+        None,
+        |_| {},
+        move |handle| {
+            assert!(owner.root.is_current());
+            assert!(owner.holder.is_current());
+            handle.fail_startup_commit_after_ack_for_test();
+            *captured.lock().unwrap() = Some(handle.clone());
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    let TerminalStartError::CustodyRetained { handle, message } = error else {
+        panic!("expected real committed original custody");
+    };
+    assert!(message.contains("AFTER actual holder commit acknowledgement"));
+    let retained = parent.lock().unwrap().as_ref().unwrap().clone();
+    assert!(retained.same_worker(&handle));
+    drop(handle); // the error is deliberately not the only parent owner
+    assert!(retained.startup_unresolved());
+    let (_, pending, cleanup) = retained.retained_startup_state_for_test();
+    assert!(
+        pending,
+        "actual Holder must remain adoption_pending after uncertain outcome"
+    );
+    assert!(
+        !cleanup,
+        "no exact original family cleanup has been authorized"
+    );
+    assert!(!retained.is_completed());
+    assert!(
+        retained
+            .startup_diagnostic()
+            .unwrap()
+            .contains("AFTER actual")
+    );
+    assert_eq!(
+        retained.retained_startup_bytes_for_test(),
+        b"RAW_PREFIX\x1b[6n"
+    );
+    assert_eq!(
+        retained.input(b"must not be admitted".to_vec()),
+        Err(TerminalSendError::Closed)
+    );
+    assert_eq!(retained.shutdown(), Err(TerminalSendError::Closed));
+    assert_eq!(
+        retained.retained_startup_bytes_for_test(),
+        b"RAW_PREFIX\x1b[6n"
+    );
+    assert!(
+        !root.join("unexpected-reply").exists(),
+        "a parked reader must not answer the raw query"
+    );
+    assert_eq!(fs::read(root.join("launches")).unwrap(), b"one");
+    assert_eq!(
+        retained.close_checked(false),
+        super::super::ipc::TerminalCloseResult::Active
+    );
+    let (_, pending, cleanup) = retained.retained_startup_state_for_test();
+    assert!(
+        pending && !cleanup,
+        "failed checked close cannot certify cleanup or drop provisional retention"
+    );
+    assert_eq!(
+        retained.retained_startup_bytes_for_test(),
+        b"RAW_PREFIX\x1b[6n"
+    );
+    assert_eq!(
+        retained.close_checked(true),
+        super::super::ipc::TerminalCloseResult::Closed
+    );
+    assert!(retained.is_completed());
+    assert!(retained.worker_joined_for_test());
+    original_root.settled();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !input_root_exited(&original_holder).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "the same original holder must exit after explicit proved cleanup"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!crate::daemon::holder_registry::retirement_pending(&original_record).unwrap());
+    parent.lock().unwrap().take();
 }

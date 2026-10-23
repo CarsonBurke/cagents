@@ -365,11 +365,51 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
+/// Recovery is deliberately a subset of existing authority-checked operations.
+/// No visibility operation retries adoption, and no new command may race a
+/// retained original whose commit outcome is unknown.
+fn ensure_startup_recovery_request(
+    host: &SharedHost,
+    request: &ClientRequest,
+) -> Result<(), ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(detail) = state.startup_recovery() else {
+        return Ok(());
+    };
+    let inspection = matches!(
+        request,
+        ClientRequest::List
+            | ClientRequest::Attach { .. }
+            | ClientRequest::Detach { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::WatchTerminals
+            | ClientRequest::Authenticate { .. }
+            | ClientRequest::CloseTerminalChecked { .. }
+    );
+    let shutdown = matches!(
+        request,
+        ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. }
+    ) && !state.recovery_owns_work();
+    if inspection || shutdown {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        format!(
+            "Startup recovery retained original terminal ownership; inspect/List or explicitly Close the original actor: {detail}"
+        ),
+        false,
+    ))
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -447,6 +487,7 @@ pub(super) fn process_request(
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
+    ensure_startup_recovery_request(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
@@ -1289,6 +1330,9 @@ pub(super) fn process_request(
             super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .startup_closed(terminal_id, &handle);
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .close_terminal_attention(terminal_id, Some(&handle));

@@ -455,6 +455,14 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
+    /// An adopted original has not proved its startup commit. Its raw prefix
+    /// and parked reader remain on the original worker until explicit Close.
+    startup_unresolved: AtomicBool,
+    startup_diagnostic: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_fail_startup_commit: AtomicBool,
+    #[cfg(test)]
+    test_startup_probe: Mutex<Option<Sender<(Vec<u8>, bool, bool)>>>,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -544,6 +552,12 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
+            startup_unresolved: AtomicBool::new(false),
+            startup_diagnostic: Mutex::new(None),
+            #[cfg(test)]
+            test_fail_startup_commit: AtomicBool::new(false),
+            #[cfg(test)]
+            test_startup_probe: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -899,6 +913,11 @@ struct HandleInner {
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
+        // Dropping an error/observer is not authorization to destroy an
+        // adopted replay prefix. HOST owns its separate slot before commit.
+        if self.published.startup_unresolved.load(Ordering::Acquire) {
+            return;
+        }
         self.published.request_shutdown();
         // The body can be this very thread or blocked in a callback/TLS.
         // Pending custody outlives this handle; destruction never joins here.
@@ -1007,6 +1026,19 @@ impl TerminalHandle {
         execution_recipe: Option<LaunchRecipe>,
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_with_execution_installed(session, config, execution_recipe, wake, |_| Ok(()))
+    }
+
+    /// HOST installs an independent live custody slot before this method permits
+    /// its original thread to prepare or commit adoption. Refusal before that
+    /// installation has no adopted owner to unwind.
+    pub(crate) fn spawn_with_execution_installed(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
+    ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
         super::reactor::runtime().map_err(TerminalStartError::Worker)?;
@@ -1028,43 +1060,99 @@ impl TerminalHandle {
         let worker_owner = join_owner.clone();
         let worker_published = Arc::clone(&published);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (begin, admitted) = crossbeam_channel::bounded(1);
+        published
+            .startup_unresolved
+            .store(config.adoption.is_some(), Ordering::Release);
+        let handle = Self {
+            inner: Arc::new(HandleInner {
+                commands: command_tx,
+                events: event_rx,
+                published: published.clone(),
+                worker: join_owner.clone(),
+            }),
+        };
+        if let Err(error) = install(&handle) {
+            published.startup_unresolved.store(false, Ordering::Release);
+            return Err(TerminalStartError::Worker(error));
+        }
 
         let worker = thread::Builder::new()
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
                 let _body = joins::BodyCompletion(worker_owner);
                 let completion = Arc::clone(&worker_published);
-                let result = Worker::start(
-                    session,
-                    config,
-                    execution_recipe,
-                    command_rx,
-                    event_tx,
-                    worker_published,
-                );
+                if admitted.recv().is_err() {
+                    completion
+                        .startup_unresolved
+                        .store(false, Ordering::Release);
+                    completion.completed.store(true, Ordering::Release);
+                    return;
+                }
+                let adopting = config.adoption.is_some();
+                // Preparation has not sent CommitAdoption. A panic here can
+                // only release a provisional control whose holder still owns
+                // its replay backup; it never unwinds a committed local owner.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Worker::prepare(session, config, execution_recipe, command_rx, event_tx, worker_published)
+                })).unwrap_or_else(|_| Err("Terminal preparation panicked before adoption commit".into()));
                 match result {
-                    Ok(worker) => {
-                        let _ = startup_tx.send(Ok(()));
-                        worker.run();
+                    Ok(mut worker) => {
+                        // Crucially the COMPLETE Worker is outside the unwind
+                        // closure. Even a commit/activation panic cannot drop
+                        // the original raw queue, reader, master or control.
+                        let retained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            worker.commit_start()
+                        })).unwrap_or_else(|_| Some("Adoption commit/activation panicked; complete original Worker retained".into()));
+                        if !adopting && let Some(message) = &retained {
+                            completion.startup_unresolved.store(false, Ordering::Release);
+                            completion.completed.store(true, Ordering::Release);
+                            let _ = startup_tx.send(Err(message.clone()));
+                            return;
+                        }
+
+                        if let Some(message) = retained {
+                            *completion
+                                .startup_diagnostic
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) = Some(message.clone());
+                            // A notification callback must not unwind the
+                            // complete owner after the holder discarded replay.
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                worker.error(
+                                    "adoption commit unconfirmed; original output retained",
+                                    message.clone(),
+                                );
+                            }));
+                            let _ = startup_tx.send(Ok(Some(message)));
+                            worker.run_retained_startup();
+                        } else {
+                            completion
+                                .startup_unresolved
+                                .store(false, Ordering::Release);
+                            let _ = startup_tx.send(Ok(None));
+                            worker.run();
+                        }
                     }
                     Err(error) => {
+                        completion
+                            .startup_unresolved
+                            .store(false, Ordering::Release);
                         let _ = startup_tx.send(Err(error));
                         completion.completed.store(true, Ordering::Release);
                     }
                 }
             })
-            .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
+            .map_err(|error| {
+                published.startup_unresolved.store(false, Ordering::Release);
+                TerminalStartError::Worker(error.to_string())
+            })?;
         join_owner.install(worker);
+        let _ = begin.send(());
 
         match startup_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                inner: Arc::new(HandleInner {
-                    commands: command_tx,
-                    events: event_rx,
-                    published,
-                    worker: join_owner,
-                }),
-            }),
+            Ok(Ok(None)) => Ok(handle),
+            Ok(Ok(Some(message))) => Err(TerminalStartError::CustodyRetained { handle, message }),
             Ok(Err(error)) => {
                 joins::request(&join_owner, true, true);
                 let _ = joins::wait_until(
@@ -1073,6 +1161,13 @@ impl TerminalHandle {
                     true,
                 );
                 Err(TerminalStartError::Worker(error))
+            }
+            Err(_) if published.startup_unresolved.load(Ordering::Acquire) => {
+                Err(TerminalStartError::CustodyRetained {
+                    handle,
+                    message: "The original startup thread did not report its adoption outcome"
+                        .into(),
+                })
             }
             Err(_) => {
                 joins::request(&join_owner, true, true);
@@ -1325,7 +1420,8 @@ impl TerminalHandle {
                 events,
                 worker_published,
             )
-            .unwrap();
+            .unwrap()
+            .0;
             assert!(
                 !worker.holder.registered(),
                 "failure fixture must not write holder recovery into user state"
@@ -1816,6 +1912,9 @@ impl TerminalHandle {
     /// Starts shutdown before joining any workers, so a daemon with many
     /// terminals lets all roots handle their hangups concurrently.
     pub(crate) fn request_shutdown(&self) {
+        if self.startup_unresolved() {
+            return;
+        }
         self.inner.published.request_shutdown();
         joins::request(&self.inner.worker, true, false);
     }
@@ -1828,6 +1927,9 @@ impl TerminalHandle {
         &self,
         deadline: std::time::Instant,
     ) -> Result<(), TerminalSendError> {
+        if self.startup_unresolved() {
+            return Err(TerminalSendError::Closed);
+        }
         self.request_shutdown();
         if !joins::wait_until(&self.inner.worker, Some(deadline), true) {
             return Err(TerminalSendError::Closed);
@@ -1941,7 +2043,62 @@ impl TerminalHandle {
         Ok(())
     }
 
+    pub(crate) fn startup_unresolved(&self) -> bool {
+        self.inner
+            .published
+            .startup_unresolved
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_startup_commit_after_ack_for_test(&self) {
+        self.inner
+            .published
+            .test_fail_startup_commit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_startup_bytes_for_test(&self) -> Vec<u8> {
+        self.retained_startup_state_for_test().0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_startup_state_for_test(&self) -> (Vec<u8>, bool, bool) {
+        assert!(self.startup_unresolved());
+        let (reply, result) = crossbeam_channel::bounded(1);
+        *self.inner.published.test_startup_probe.lock().unwrap() = Some(reply);
+        let _ = self.inner.published.capture_tx.try_send(());
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("original retained worker probe")
+    }
+
+    pub(crate) fn startup_diagnostic(&self) -> Option<String> {
+        self.inner
+            .published
+            .startup_diagnostic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        if self.startup_unresolved() {
+            match &command {
+                Command::CloseChecked { .. } => {}
+                // Subscription is observational; it must not activate or parse
+                // the parked reader merely to list/inspect/close its owner.
+                Command::HostVisibility(visibility) => {
+                    self.inner
+                        .published
+                        .visible
+                        .store(*visibility == Visibility::Visible, Ordering::Release);
+                    return Ok(());
+                }
+                _ => return Err(TerminalSendError::Closed),
+            }
+        }
         // Stop closes admission even when an existing cached reader holds the
         // archive lock. Natural completion alone leaves read-only commands live.
         if self
@@ -2355,6 +2512,11 @@ struct Worker {
     reader_restart_pending: bool,
     reply_backpressured: bool,
     reader: Option<JoinHandle<()>>,
+    /// Retained startup never lets this reader consume the PTY. The queued
+    /// original replay prefix stays in pty_rx until explicit recovery.
+    reader_start: Option<Sender<()>>,
+    #[cfg(test)]
+    test_startup_queue: Option<Sender<PtyMessage>>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
     reader_wake: Option<OwnedFd>,
@@ -2375,6 +2537,8 @@ struct Reader {
     wake: OwnedFd,
     done: Receiver<()>,
     output: Receiver<PtyMessage>,
+    #[cfg(test)]
+    test_queue: Sender<PtyMessage>,
     discard_pending: Arc<AtomicBool>,
 }
 
@@ -2416,6 +2580,8 @@ impl Reader {
         if !pending.is_empty() {
             let _ = pty_tx.send(PtyMessage::Bytes(pending));
         }
+        #[cfg(test)]
+        let test_queue = pty_tx.clone();
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let (start, started) = crossbeam_channel::bounded(1);
         let discard_pending = Arc::new(AtomicBool::new(false));
@@ -2441,6 +2607,8 @@ impl Reader {
             wake,
             done,
             output,
+            #[cfg(test)]
+            test_queue,
             discard_pending,
         })
     }
@@ -2453,7 +2621,7 @@ impl Reader {
 }
 
 impl Worker {
-    fn start(
+    fn prepare(
         session: TerminalSession,
         config: TerminalConfig,
         execution_recipe: Option<LaunchRecipe>,
@@ -2694,19 +2862,16 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
-        held.holder.commit_adoption()?;
         if let Some(role) = held.holder.original_role() {
             let _ = published.original_holder_role.set(role.clone());
         }
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
         }
-        reader.activate();
-
         let events = Arc::new(events);
         let _ = published.semantic_events.set(Arc::downgrade(&events));
 
-        Ok(Self {
+        let worker = Self {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&execution),
             resume_foreground: None,
@@ -2760,10 +2925,144 @@ impl Worker {
             reader_restart_pending: false,
             reply_backpressured: false,
             reader: Some(reader.thread),
+            reader_start: reader.start.take(),
+            #[cfg(test)]
+            test_startup_queue: Some(reader.test_queue),
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
             reader_discard_pending: reader.discard_pending,
-        })
+        };
+        Ok(worker)
+    }
+
+    /// Called only with the entire original Worker owned OUTSIDE the caller's
+    /// panic guard. No error/panic can unwind its replay prefix out of custody.
+    fn commit_start(&mut self) -> Option<String> {
+        #[cfg(test)]
+        let retained = if self
+            .published
+            .test_fail_startup_commit
+            .load(Ordering::Acquire)
+        {
+            self.holder.fail_after_actual_commit_for_test().err()
+        } else {
+            self.holder.commit_adoption().err()
+        };
+        #[cfg(not(test))]
+        let retained = self.holder.commit_adoption().err();
+        let mut retained = retained;
+        if retained.is_none() {
+            if let Some(start) = self.reader_start.take()
+                && start.send(()).is_err()
+            {
+                retained = Some(
+                    "The prepared reader did not accept activation; original replay is retained"
+                        .into(),
+                );
+            }
+        }
+        #[cfg(test)]
+        if retained.is_none() {
+            drop(self.test_startup_queue.take());
+        }
+        retained
+    }
+
+    #[cfg(test)]
+    fn start(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        commands: Receiver<Command>,
+        events: Sender<TerminalEvent>,
+        published: Arc<PublishedState>,
+    ) -> Result<(Self, Option<String>), String> {
+        let mut worker = Self::prepare(
+            session,
+            config,
+            execution_recipe,
+            commands,
+            events,
+            published,
+        )?;
+        let retained =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.commit_start()))
+                .unwrap_or_else(|_| {
+                    Some("Commit panicked with its complete original owner retained".into())
+                });
+        Ok((worker, retained))
+    }
+
+    fn run_retained_startup(mut self) {
+        loop {
+            #[cfg(test)]
+            {
+                let probe = self.published.test_startup_probe.lock().unwrap().take();
+                if let Some(probe) = probe {
+                    // The reader is unactivated: this observes and reinstalls
+                    // its actual sole replay message, not a second model/DTO.
+                    let queued = self.pty_rx.try_iter().collect::<Vec<_>>();
+                    let mut raw = Vec::new();
+                    for message in queued {
+                        if let PtyMessage::Bytes(bytes) = &message {
+                            raw.extend_from_slice(bytes);
+                        }
+                        self.test_startup_queue
+                            .as_ref()
+                            .unwrap()
+                            .try_send(message)
+                            .unwrap();
+                    }
+                    let (pending, cleanup) = self.holder.startup_cleanup_state_for_test();
+                    let _ = probe.send((raw, pending, cleanup));
+                }
+            }
+            let close = self
+                .published
+                .priority_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(command) = close {
+                if let Command::CloseChecked {
+                    allow_active,
+                    deadline,
+                    reply,
+                } = command
+                {
+                    // A panicking observer/inspection cannot unwind this
+                    // complete original owner out of its parked frame.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.checked_close(allow_active, deadline)
+                    }))
+                    .unwrap_or_else(|_| {
+                        super::ipc::TerminalCloseResult::Unknown(
+                            "Checked close panicked; original startup custody remains retained"
+                                .into(),
+                        )
+                    });
+                    let closed = outcome == super::ipc::TerminalCloseResult::Closed;
+                    if closed {
+                        // Only an explicit checked destructive close releases
+                        // unresolved replay. Ordinary shutdown/Drop does not.
+                        self.holder.prove_startup_cleanup();
+                        drop(self.reader_start.take());
+                        self.published
+                            .startup_unresolved
+                            .store(false, Ordering::Release);
+                        self.published.request_shutdown();
+                        let _ = reply.send(outcome);
+                        self.run();
+                        return;
+                    }
+                    let _ = reply.send(outcome);
+                }
+            }
+            // The original reader remains unactivated. In particular, no raw
+            // query can be parsed or answered before ownership is confirmed.
+            // A dropped external observer is not an owner-release instruction.
+            let _ = self.published.capture_rx.recv();
+        }
     }
 
     #[cfg(test)]
@@ -6593,7 +6892,9 @@ mod tests {
         let (events, receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         (
-            Worker::start(session, config, None, commands, events, published).unwrap(),
+            Worker::start(session, config, None, commands, events, published)
+                .unwrap()
+                .0,
             receiver,
         )
     }
