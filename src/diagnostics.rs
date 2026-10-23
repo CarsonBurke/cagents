@@ -1375,6 +1375,11 @@ mod process_tests {
         };
         // The child has a private XDG state root; HOME/authority are untouched.
         crate::instance::install_panic_hook("cagents-ui");
+        #[cfg(all(feature = "ui", target_os = "linux"))]
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("no_a11y_bus")) {
+            missing_accessibility_bus_fixture(PathBuf::from(path));
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("panic")) {
             panic!(
                 "TOKEN=secret prompt --api-key private https://user:password@example.test/?token=value#fragment \x1b[31m"
@@ -1445,6 +1450,118 @@ mod process_tests {
         assert!(!take_failure_notice());
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    fn missing_accessibility_bus_fixture(root: PathBuf) {
+        use iced_accessibility::accesskit::{
+            ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate,
+        };
+        struct Inactive;
+        impl ActivationHandler for Inactive {
+            fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+                None
+            }
+        }
+        impl ActionHandler for Inactive {
+            fn do_action(&mut self, _request: ActionRequest) {}
+        }
+        impl DeactivationHandler for Inactive {
+            fn deactivate_accessibility(&mut self) {}
+        }
+        // A completed retry demonstrates that the real context thread ran
+        // through a failed connection, rather than merely being scheduled.
+        let log_path = root.join("a11y.log");
+        let log = File::create(&log_path).unwrap();
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || log.try_clone().unwrap())
+            .try_init()
+            .unwrap();
+        let _adapter = accesskit_unix::Adapter::new(Inactive, Inactive, Inactive);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let logged = std::fs::read_to_string(&log_path).unwrap();
+            if logged.contains("The D-Bus session bus is still unreachable") {
+                assert_eq!(
+                    logged
+                        .matches("The D-Bus session bus is unreachable")
+                        .count(),
+                    1
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "accessibility context did not retry the refused connection: {logged}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        record(Event::Ready);
+        record(Event::Exit { success: true });
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn missing_accessibility_bus_retries_without_recording_a_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_bus = format!("unix:path={}/no-session-bus", root.path().display());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::process_tests::subprocess_fixture",
+                "--nocapture",
+            ])
+            .env(TEST_STATE, root.path())
+            .env(TEST_MODE, "no_a11y_bus")
+            .env("XDG_STATE_HOME", root.path())
+            .env("DBUS_SESSION_BUS_ADDRESS", missing_bus)
+            .env_remove("AT_SPI_BUS_ADDRESS")
+            .env("CAGENTS_LOCAL_DEBUG", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = inspect_at(
+            root.path()
+                .join(crate::instance::STORAGE_NAME)
+                .join("diagnostics"),
+        )
+        .unwrap();
+        let product = report
+            .products
+            .iter()
+            .find(|p| p.product == Product::Ui)
+            .unwrap();
+        // Require a real startup and completed clean run; absent or rejected
+        // diagnostic storage must never count as evidence of no panic.
+        assert!(
+            product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Startup))
+        );
+        assert!(
+            product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Ready))
+        );
+        assert_eq!(
+            product.last_observed.as_ref().unwrap().clean_shutdown,
+            Some(true)
+        );
+        assert!(
+            !product
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Panic { .. }))
+        );
+    }
+
     #[test]
     fn sink_failure_is_nonfatal_and_reported_once_without_recursive_logging() {
         for mode in ["unsafe_file", "write_failure"] {

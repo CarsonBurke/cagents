@@ -1181,6 +1181,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cagents"
 version = "0.1.3"
 dependencies = [
+ "accesskit_unix",
  "arc-swap",
  "ashpd 0.12.3",
  "async-channel",
