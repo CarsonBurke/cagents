@@ -1935,6 +1935,91 @@ mod tests {
     }
 
     #[test]
+    fn managed_image_actual_worker_uses_receipt_label_and_preserves_diagnostics() {
+        let reference = chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 59,
+            device: uuid::Uuid::new_v4(),
+            name: "Original screenshot.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        for path in [
+            "/private/image-storage/private-internal-digest.png",
+            "https://example.test/private-internal-digest.png",
+        ] {
+            let description = "The user's original screenshot description";
+            let content = ItemContent::Image {
+                path: path.into(),
+                description: description.into(),
+                reference: Some(reference.clone()),
+            };
+            let (mut runtime, _handle) = literal_runtime(content.clone());
+            let (run, shared) = job(&runtime.preparation);
+            let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            assert!(output.parsed.markdown.items().is_empty());
+            let literal_content::Prepared::Image { document, .. } =
+                output.literal.as_ref().expect("actual prepared image DTO")
+            else {
+                panic!("actual worker produced an image payload")
+            };
+            assert_ne!(document.created_on, std::thread::current().id());
+            runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
+            let source = runtime.snapshot.items[0].clone();
+            let prepared = runtime
+                .prepared_literal(&source)
+                .expect("installed exact image");
+            let label = prepared.image_prompt().unwrap().plain();
+            assert_eq!(label.as_ref(), reference.label());
+            assert!(!label.contains("private-internal-digest"));
+            let literal_content::Content::Image { document, url } = prepared else {
+                panic!("installed image document")
+            };
+            let markdown::Item::Paragraph(actual_description) = &document.items()[0] else {
+                panic!("original image description")
+            };
+            assert_eq!(actual_description.plain().as_ref(), description);
+            if path.starts_with("https://") {
+                assert_eq!(url.as_deref(), Some(path));
+                assert!(
+                    matches!(&document.items()[1], markdown::Item::Quote(items) if items.is_empty())
+                );
+                let markdown::Item::Paragraph(open) = &document.items()[3] else {
+                    panic!("shared original image URI")
+                };
+                let settings =
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+                assert!(Arc::ptr_eq(
+                    open.spans(settings.style)[0].link.as_ref().unwrap(),
+                    url.as_ref().unwrap(),
+                ));
+            } else {
+                assert!(url.is_none());
+                let markdown::Item::Paragraph(actual_path) = &document.items()[1] else {
+                    panic!("original diagnostic image path")
+                };
+                assert_eq!(actual_path.plain().as_ref(), path);
+            }
+            runtime.show(false);
+            retirement_barrier();
+
+            // The same managed-image branch must still reject canceled work;
+            // a stable label must not make stale preparation installable.
+            let (runtime, _handle) = literal_runtime(content);
+            let (_, shared) = job(&runtime.preparation);
+            shared.cancelled.store(true, Ordering::Release);
+            let result = std::thread::spawn(move || execute(shared, permit()))
+                .join()
+                .unwrap();
+            assert!(matches!(result, Err(ref error) if error == "Message loading was cancelled."));
+            drop(runtime);
+            retirement_barrier();
+        }
+    }
+
+    #[test]
     fn literal_image_worker_native_fields_keep_catalog_and_shared_remote_uri() {
         use iced::advanced::{
             layout,

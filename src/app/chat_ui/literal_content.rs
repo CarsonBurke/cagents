@@ -124,11 +124,18 @@ impl Prepared {
                 )?,
             })),
             ItemContent::Image {
-                path, description, ..
+                path,
+                description,
+                reference,
             } => {
                 let remote = path.starts_with("https://") || path.starts_with("http://");
                 let url: Option<markdown::Uri> = remote.then(|| Arc::from(path.as_str()));
-                let label = if !path.starts_with("data:") {
+                // A managed path is a storage hint, not the reader's attachment
+                // name. Keep the same stable label used by the image receipt.
+                let managed_label = reference.as_ref().map(chat::ImageReference::label);
+                let label = if let Some(label) = managed_label.as_deref() {
+                    label
+                } else if !path.starts_with("data:") {
                     path.rsplit('/')
                         .next()
                         .filter(|name| !name.is_empty())
