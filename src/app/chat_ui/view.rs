@@ -3833,16 +3833,18 @@ impl Runtime {
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
-            ItemContent::Text { text, .. } => text.as_str(),
+            ItemContent::Text { text, .. } => text.clone(),
+            ItemContent::Image {
+                reference: Some(reference),
+                ..
+            } => reference.label(),
             ItemContent::Image {
                 path, description, ..
-            } => Self::attachment_label(path, description),
-            content => turn::step_label(content),
-        }
-        .to_owned();
-        // An attachment sits under its prompt as an outlined chip rather than
-        // another filled bubble, so a message with two images does not read as
-        // three separate things the reader said.
+            } => Self::attachment_label(path, description).to_owned(),
+            content => turn::step_label(content).to_owned(),
+        };
+        // Images stay beneath their prompt on its own side of the transcript,
+        // with the same bounded preview and viewer used for other images.
         let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
         let expanded = self.item_expanded(&item.id);
         let text = if long && !expanded {
@@ -3857,18 +3859,27 @@ impl Runtime {
             text
         };
         let body: Element<'static, Message> = if attachment {
-            widget::row::with_children(vec![
-                widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::plain(
-                    text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .into()
+            // Empty unowned paths also represent documents and refused image
+            // receipts. Keep their descriptor instead of a generic read error.
+            if let Some(cached) = self.presentation_cache().get(&item.id)
+                && matches!(&item.content, ItemContent::Image { path, reference, .. }
+                    if reference.is_some() || !path.is_empty())
+            {
+                self.image_preview(item, cached)
+            } else {
+                widget::row::with_children(vec![
+                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    selectable_prose::plain(
+                        text,
+                        design::TEXT_CAPTION,
+                        iced::Font::default(),
+                        self.target,
+                    ),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+            }
         } else {
             let text = selectable_prose::plain(
                 text,
@@ -4973,6 +4984,9 @@ fn model_list<'a>(
 mod frame_cost;
 #[cfg(test)]
 mod issue1506_tests;
+
+#[cfg(test)]
+mod user_image_preview_tests;
 
 #[cfg(test)]
 mod tests {

@@ -12,6 +12,7 @@ mod icon_button;
 mod placeholder;
 mod popover;
 mod responsive;
+mod shrinkable;
 mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
@@ -23,4 +24,5 @@ pub use icon_button::{
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{popover, popover_item};
 pub use responsive::responsive;
-pub use tabs::{ViewTab, view_tab, view_tab_height, view_tabs};
+pub use shrinkable::shrinkable;
+pub use tabs::{ViewTab, nested_view_tabs, view_tab, view_tab_height, view_tabs};
