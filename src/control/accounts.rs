@@ -1,12 +1,23 @@
 use super::*;
 use crate::account::info::{Query, Report};
 
+mod link;
 mod list;
 mod preferences;
 mod removal;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Register an existing provider home on this device, or on --device.
+    /// Does not transfer credentials or verify coding access.
+    Link {
+        /// Provider whose existing home is registered: claude or codex.
+        #[arg(value_parser = link::parse_provider)]
+        provider: crate::agent::Provider,
+        /// Absolute home on the selected device, or quoted '~/path'.
+        #[arg(value_parser = link::parse_home)]
+        home: String,
+    },
     /// Choose the selected daemon's account for new conversations.
     Default {
         /// Provider whose default changes: claude, codex, or omp (automatic only).
@@ -45,6 +56,7 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Link { provider, home } => return link::execute(provider, home),
         AccountCommand::Default {
             provider,
             selection,
