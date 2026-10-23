@@ -425,7 +425,8 @@ enum JavascriptWorkspace {
 
 fn javascript_workspace(
     directory: &Path,
-    package: &Path,
+    project: &Path,
+    package: Option<&Path>,
     budget: &mut Budget<'_>,
 ) -> Option<JavascriptWorkspace> {
     let pnpm = directory.join("pnpm-workspace.yaml");
@@ -464,10 +465,16 @@ fn javascript_workspace(
         }
     }
     if let Some(patterns) = member_patterns {
-        if directory == package {
+        // A package enclosing a previously discovered config project is not
+        // itself that leaf project. An outer workspace must prove membership
+        // instead of using its own package.json to absorb the nearer config.
+        let member = package
+            .filter(|package| *package != directory || project == directory)
+            .unwrap_or(project);
+        if directory == member {
             return Some(JavascriptWorkspace::Package(true));
         }
-        let relative = package.strip_prefix(directory).ok()?;
+        let relative = member.strip_prefix(directory).ok()?;
         let included = patterns
             .iter()
             .filter(|pattern| !pattern.starts_with('!'))
@@ -492,21 +499,36 @@ fn javascript_workspace(
         return Some(JavascriptWorkspace::Package(false));
     };
     Some(JavascriptWorkspace::References(
-        directory == package
+        directory == project
             || references.iter().any(|entry| {
                 let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) else {
                     return false;
                 };
-                let mut path = directory.join(path);
-                if path
+                let mut config = directory.join(path);
+                if !config
                     .extension()
                     .is_some_and(|extension| extension == "json")
                 {
-                    path.pop();
+                    config.push("tsconfig.json");
                 }
+                let Some(referenced_directory) =
+                    config.parent().and_then(|path| budget.directory(path))
+                else {
+                    return false;
+                };
+                // A reference names one project, not every independent package
+                // or config project below its directory. Keep the document's
+                // nearest boundary even if it has no package.json of its own.
+                if project != referenced_directory {
+                    return false;
+                }
+                // An existing parent is not evidence that the named config
+                // exists. Reuse the bounded, nonblocking descriptor read so a
+                // missing, unreadable, special or invalid config grants nothing.
                 budget
-                    .directory(&path)
-                    .is_some_and(|path| package.starts_with(path))
+                    .read(&config)
+                    .and_then(|bytes| workspace_manifest(bytes, true))
+                    .is_some_and(|manifest| manifest.is_object())
             }),
     ))
 }
@@ -547,6 +569,7 @@ pub(super) fn discover(
         });
     let mut nearest = None;
     let mut package = None;
+    let mut javascript_project = None;
     let mut reference_root = None;
     let mut current = path.parent();
     while let Some(directory) = current {
@@ -604,12 +627,25 @@ pub(super) fn discover(
                 }
             }
         } else if javascript {
-            if package.is_none() && budget.marker(&directory.join("package.json")) {
+            let package_marker =
+                package.is_none() && budget.marker(&directory.join("package.json"));
+            if package_marker {
                 package = Some(canonical.clone());
+            }
+            if javascript_project.is_none()
+                && (package_marker
+                    || budget.marker(&directory.join("tsconfig.json"))
+                    || budget.marker(&directory.join("jsconfig.json")))
+            {
+                javascript_project = Some(canonical.clone());
+                // A real config remains the fallback even when a server's
+                // configured marker list mentions only package.json.
+                nearest.get_or_insert_with(|| canonical.clone());
             }
             match javascript_workspace(
                 &canonical,
-                package.as_deref().unwrap_or(&canonical),
+                javascript_project.as_deref().unwrap_or(&canonical),
+                package.as_deref(),
                 &mut budget,
             ) {
                 Some(JavascriptWorkspace::Package(true)) => return Some(canonical.clone()),
@@ -620,7 +656,7 @@ pub(super) fn discover(
                 Some(JavascriptWorkspace::References(true)) => {
                     if reference_root
                         .as_ref()
-                        .is_none_or(|root| Some(root) == package.as_ref())
+                        .is_none_or(|root| Some(root) == javascript_project.as_ref())
                     {
                         reference_root = Some(canonical.clone());
                     }
@@ -643,4 +679,157 @@ pub(super) fn discover(
 pub(super) fn discover_root(path: &Path, worktree: &Path, markers: &[String]) -> PathBuf {
     discover(path, worktree, markers, &AtomicBool::new(false))
         .unwrap_or_else(|| worktree.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn referenced_package(reference: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("packages/a");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        std::fs::write(package.join("src/index.ts"), "export const value = 1;\n").unwrap();
+        std::fs::write(
+            root.path().join("tsconfig.json"),
+            serde_json::json!({"references": [{"path": reference}]}).to_string(),
+        )
+        .unwrap();
+        (root, package)
+    }
+
+    fn root_for(package: &Path, worktree: &Path) -> PathBuf {
+        discover_root(
+            &package.join("src/index.ts"),
+            worktree,
+            &["package.json".into()],
+        )
+    }
+
+    #[test]
+    fn typescript_references_validate_directory_and_explicit_jsonc_configs() {
+        for (reference, filename) in [
+            ("packages/a", "tsconfig.json"),
+            ("packages/a/tsconfig.build.json", "tsconfig.build.json"),
+        ] {
+            let (root, package) = referenced_package(reference);
+            assert_eq!(root_for(&package, root.path()), package);
+            std::fs::write(
+                package.join(filename),
+                "{ // a real referenced config\n\"compilerOptions\": {\"composite\": true,},\n}",
+            )
+            .unwrap();
+            assert_eq!(root_for(&package, root.path()), root.path());
+        }
+    }
+
+    #[test]
+    fn typescript_references_refuse_missing_and_invalid_named_descriptors() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        for invalid in ["missing", "malformed", "non-object", "oversized", "fifo"] {
+            let (root, package) = referenced_package("packages/a/tsconfig.build.json");
+            // A different valid config in this directory cannot authorize the
+            // explicitly named file, nor can the directory alone authorize it.
+            std::fs::write(package.join("tsconfig.json"), "{}").unwrap();
+            let config = package.join("tsconfig.build.json");
+            match invalid {
+                "missing" => {}
+                "malformed" => std::fs::write(&config, "{\"compilerOptions\":").unwrap(),
+                "non-object" => std::fs::write(&config, "[]").unwrap(),
+                "oversized" => {
+                    std::fs::write(&config, " ".repeat(MAX_MANIFEST_BYTES + 1) + "{}").unwrap();
+                }
+                "fifo" => {
+                    let path = CString::new(config.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(root_for(&package, root.path()), package, "{invalid}");
+            if config.exists() {
+                std::fs::remove_file(&config).unwrap();
+            }
+            std::fs::write(&config, "{\"compilerOptions\": {\"composite\": true}}").unwrap();
+            assert_eq!(root_for(&package, root.path()), root.path(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn typescript_reference_does_not_absorb_a_nested_independent_package() {
+        let (root, package) = referenced_package("packages/a");
+        std::fs::write(package.join("tsconfig.json"), "{}").unwrap();
+        let independent = package.join("independent");
+        std::fs::create_dir_all(independent.join("src")).unwrap();
+        std::fs::write(independent.join("package.json"), "{}").unwrap();
+        std::fs::write(independent.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(independent.join("src/index.ts"), "export {};\n").unwrap();
+
+        assert_eq!(root_for(&package, root.path()), root.path());
+        assert_eq!(root_for(&independent, root.path()), independent);
+    }
+
+    #[test]
+    fn typescript_config_without_package_requires_an_actual_matching_reference() {
+        for ancestor_package in [false, true] {
+            for (reference, belongs) in [
+                ("packages/a/missing.json", false),
+                ("packages/other", false),
+                ("packages/a", true),
+                ("packages/a/tsconfig.json", true),
+            ] {
+                let (root, project) = referenced_package(reference);
+                std::fs::remove_file(project.join("package.json")).unwrap();
+                std::fs::write(project.join("tsconfig.json"), "{}").unwrap();
+                let other = root.path().join("packages/other");
+                std::fs::create_dir_all(&other).unwrap();
+                std::fs::write(other.join("tsconfig.json"), "{}").unwrap();
+                if ancestor_package {
+                    std::fs::write(root.path().join("package.json"), "{}").unwrap();
+                }
+                assert_eq!(
+                    root_for(&project, root.path()),
+                    if belongs { root.path() } else { &project },
+                    "reference={reference}, ancestor package={ancestor_package}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_project_keeps_its_boundary_when_an_outer_workspace_excludes_it() {
+        for filename in ["tsconfig.json", "jsconfig.json"] {
+            let (root, project) = referenced_package("packages/other");
+            std::fs::remove_file(project.join("package.json")).unwrap();
+            std::fs::write(project.join(filename), "{}").unwrap();
+            std::fs::write(
+                root.path().join("package.json"),
+                r#"{"workspaces":["packages/other"]}"#,
+            )
+            .unwrap();
+            assert_eq!(root_for(&project, root.path()), project, "{filename}");
+        }
+    }
+
+    #[test]
+    fn leaf_solution_references_still_join_a_proven_package_workspace() {
+        for (filename, contents) in [
+            ("package.json", r#"{"workspaces":["packages/*"]}"#),
+            ("pnpm-workspace.yaml", "packages:\n - packages/*\n"),
+        ] {
+            let (root, project) = referenced_package("packages/other");
+            std::fs::write(
+                project.join("tsconfig.json"),
+                r#"{"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#,
+            )
+            .unwrap();
+            for config in ["tsconfig.app.json", "tsconfig.node.json"] {
+                std::fs::write(project.join(config), "{}").unwrap();
+            }
+            std::fs::write(root.path().join(filename), contents).unwrap();
+            assert_eq!(root_for(&project, root.path()), root.path(), "{filename}");
+        }
+    }
 }
