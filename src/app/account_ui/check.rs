@@ -1192,12 +1192,16 @@ mod tests {
                         .account
                         .registry_key()
                         .unwrap();
-                    app.account_ui.registry.observe_identity(
-                        key,
-                        &Identity {
-                            email: Some("replacement@example.test".into()),
-                            ..Identity::default()
-                        },
+                    let replacement = Identity {
+                        email: Some("replacement@example.test".into()),
+                        ..Identity::default()
+                    };
+                    // An observation of a different login is refused. Exercise
+                    // the explicit replacement that actually changes this fence.
+                    assert!(app.account_ui.registry.adopt_identity(key, &replacement));
+                    assert_eq!(
+                        app.account_ui.registry.find(key).unwrap().identity(),
+                        replacement
                     );
                 }
                 2 => returned.requested_workspace = "/other-workspace".into(),
@@ -1209,9 +1213,12 @@ mod tests {
                 result: Ok(returned),
             }));
             let form = app.account_ui.check.form.as_ref().unwrap();
-            assert!(form.report.is_none());
-            assert!(form.problem.is_some());
-            assert!(app.account_ui.check.pending.is_none());
+            assert!(form.report.is_none(), "account/report change {change}");
+            assert!(form.problem.is_some(), "account/report change {change}");
+            assert!(
+                app.account_ui.check.pending.is_none(),
+                "account/report change {change}"
+            );
         }
     }
 
