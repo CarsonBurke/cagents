@@ -543,3 +543,5 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     assert!(!host.lock().unwrap().clients.contains_key(&2));
     drop(lease);
 }
+
+mod startup_recovery_tests;

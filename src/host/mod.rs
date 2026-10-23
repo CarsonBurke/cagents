@@ -279,28 +279,61 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
+    // This mandatory thread service must be available before any adoption
+    // can discard the holder's replay copy. It observes no process until the
+    // same HostState publishes one; it initiates no execution.
+    let _agent_activity = activity::Monitor::start(&host)?;
     let listener = listener_before_restore(&paths, || {
-        let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-        state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-        chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-        chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-        chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-        let retained_runs = chat::retained_actor::retained_runs(&host);
-        // A committed acceptance is not proof of provider delivery. Until a
-        // restored actor supplies exact run evidence, never authorize a resend.
-        if let Ok(registry) = agent_execution::registry(&host) {
-            registry
+        let restored = (|| -> io::Result<()> {
+            let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+            state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+            if let Some(detail) = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .interrupt_unproven_agent_runs_except(
-                    crate::chat::now_ms().unwrap_or(0),
-                    &retained_runs,
-                )
-                .map_err(io::Error::other)?;
+                .startup_recovery()
+            {
+                return Err(io::Error::other(detail.to_owned()));
+            }
+            chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+            chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+            let retained_runs = chat::retained_actor::retained_runs(&host);
+            // A committed acceptance is not proof of provider delivery. Until a
+            // restored actor supplies exact run evidence, never authorize a resend.
+            if let Ok(registry) = agent_execution::registry(&host) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .interrupt_unproven_agent_runs_except(
+                        crate::chat::now_ms().unwrap_or(0),
+                        &retained_runs,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state
+                    .terminals
+                    .values()
+                    .any(|record| !record.handle.is_completed())
+                    || state.chats.values().any(|record| record.handle.owns_work())
+                {
+                    // Keep the real listener, lease and original owners. A
+                    // failed restore is not permission to destroy accepted
+                    // replay or start an empty replacement daemon.
+                    state.retain_startup_recovery(error.to_string());
+                    tracing::error!(%error, "startup retained original ownership; recovery-only listener remains available");
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
         }
-        Ok(())
     })?;
-    let _agent_activity = activity::Monitor::start(&host)?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
@@ -310,28 +343,45 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Some(state.agent_tally())
     });
 
-    let mut automation_broker = match automations::start(&host) {
-        Ok(broker) => Some(broker),
-        Err(error) => {
-            tracing::warn!(%error, "scheduled automations are unavailable");
-            None
+    let recovery_only = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .startup_recovery()
+        .is_some();
+    let mut automation_broker = if recovery_only {
+        None
+    } else {
+        match automations::start(&host) {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::warn!(%error, "scheduled automations are unavailable");
+                None
+            }
         }
     };
-    let mut work_board = match work::Service::start(&host) {
-        Ok(service) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
-            Some(service)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "the Work board is unavailable");
-            None
+    let mut work_board = if recovery_only {
+        None
+    } else {
+        match work::Service::start(&host) {
+            Ok(service) => {
+                host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+                Some(service)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Work board is unavailable");
+                None
+            }
         }
     };
-    let mut courier = match agent_execution::mailbox::Courier::start(&host) {
-        Ok(courier) => Some(courier),
-        Err(error) => {
-            tracing::warn!(%error, "messages between sessions are unavailable");
-            None
+    let mut courier = if recovery_only {
+        None
+    } else {
+        match agent_execution::mailbox::Courier::start(&host) {
+            Ok(courier) => Some(courier),
+            Err(error) => {
+                tracing::warn!(%error, "messages between sessions are unavailable");
+                None
+            }
         }
     };
 
@@ -350,6 +400,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let mut clients = Vec::new();
     let mut runtime_error = None;
     let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
+    let mut ordinary_cleanup_started = false;
+    let mut sealed_deliveries = None;
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
@@ -371,7 +423,21 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             .as_ref()
             .map(|drain| drain.progress_epoch());
         if let Some(drain) = &ordinary_exit_drain {
-            if drain.try_seal_absence() {
+            if !ordinary_cleanup_started {
+                ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
+            }
+            // Restored originals can lack a local reaper credit. Their
+            // independent parent/startup proof must settle before either
+            // ordinary teardown or the terminal-child absence seal authorizes
+            // returning from the daemon.
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if ordinary_cleanup_started
+                && !state.ordinary_exit_cleanup_blocked()
+                && drain.try_seal_absence()
+            {
+                // The startup/reply guard, core seal and registration/reply
+                // acquisition fence share this one HostMutex transaction.
+                sealed_deliveries = Some(state.close_ordinary_exit_registration());
                 break;
             }
         } else if host
@@ -391,7 +457,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             drop(courier.take());
             host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
             drop(work_board.take());
-            finish_shutdown_owners(&host, &mut runtime_error, false);
+            ordinary_cleanup_started = finish_shutdown_owners(&host, &mut runtime_error, false);
             tracing::info!(pending = %ordinary_exit_drain.as_ref().unwrap().pending_description(),
                 "ordinary daemon exit retains its listener and lease until exact child absence is sealed");
             continue;
@@ -443,13 +509,22 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             Err(error) => Some(error),
         };
         if let Some(error) = fatal {
+            if host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ordinary_exit_cleanup_blocked()
+            {
+                // Preserve 1204's same-listener recovery on a broken socket.
+                // A restored owner may have no reaper epoch to wait for.
+                tracing::error!(%error, "recovery listener failed while original ownership remains retained");
+                runtime_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
             if let Some(drain) = &ordinary_exit_drain {
                 tracing::error!(%error, pending = %drain.pending_description(),
                     "listener unavailable while original child custody remains; retaining daemon and lease");
                 runtime_error = Some(error);
-                // The existing reaper condition variable supplies a lost-wake
-                // safe fallback only for this unusable-listener path. Normal
-                // pending cleanup keeps accepting read-only clients below.
                 drain.wait_for_progress(progress_epoch.expect("active ordinary exit epoch"));
                 continue;
             }
@@ -465,12 +540,10 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
 
     tracing::info!("cagents daemon is shutting down");
     if ordinary_exit_drain.is_some() {
-        // Seal registration and snapshot CURRENT deliveries under the same
-        // lock. Late accepted threads receive an already-closed queue.
-        let deliveries = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .close_ordinary_exit_registration();
+        // Already fenced atomically with the final startup/core absence check.
+        // Late accepted threads receive an already-closed queue, while the
+        // original writer drains every correlated checked-Close reply first.
+        let deliveries = sealed_deliveries.expect("ordinary exit sealed its delivery fence");
         close_shutdown_deliveries(&host, &deliveries);
     } else {
         // The committed-successor path keeps its existing intentional transfer
@@ -542,11 +615,14 @@ fn finish_shutdown_owners(
     host: &SharedHost,
     runtime_error: &mut Option<io::Error>,
     close_deliveries: bool,
-) {
-    let (handles, deliveries) = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .graceful_shutdown();
+) -> bool {
+    let (handles, deliveries) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !close_deliveries && state.ordinary_exit_cleanup_blocked() {
+            return false;
+        }
+        state.graceful_shutdown()
+    };
     if let Err(error) = finish_chat_shutdown(host) {
         tracing::error!(%error, "daemon shutdown left unconfirmed ownership; recovery evidence retained");
         *runtime_error = Some(io::Error::other(error));
@@ -562,6 +638,7 @@ fn finish_shutdown_owners(
             )));
         }
     }
+    true
 }
 
 fn finish_terminal_shutdown(

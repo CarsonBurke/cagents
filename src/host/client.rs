@@ -88,6 +88,33 @@ impl Drop for Registration {
     }
 }
 
+/// Keep an actual checked Close's result queueable until its handler has
+/// removed custody and serve_with has enqueued the correlated reply. This is
+/// not a remote ACK: existing close_after_drain settles the actual writer.
+struct CheckedCloseReply {
+    host: SharedHost,
+    client_id: ClientId,
+}
+impl CheckedCloseReply {
+    fn new(host: &SharedHost, client_id: ClientId) -> Result<Self, ProtocolError> {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_checked_close_reply(client_id)?;
+        Ok(Self {
+            host: Arc::clone(host),
+            client_id,
+        })
+    }
+}
+impl Drop for CheckedCloseReply {
+    fn drop(&mut self) {
+        self.host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish_checked_close_reply(self.client_id);
+    }
+}
+
 type RequestHandler =
     fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
 
@@ -253,6 +280,20 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
+        // Register even before ordinary exit starts: its writer can enter
+        // after process_request releases control, before this reply is queued.
+        // The final HostMutex seal closes acquisition before any handler effect.
+        let _close_reply = if matches!(&request, ClientRequest::CloseTerminalChecked { .. }) {
+            match CheckedCloseReply::new(&host, client_id) {
+                Ok(reply) => Some(reply),
+                Err(error) => {
+                    let _ = push_error(&delivery, &host, envelope.request_id, error);
+                    break;
+                }
+            }
+        } else {
+            None
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle(&host, client_id, request)
         }))
@@ -419,12 +460,52 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
+/// Recovery is deliberately a subset of existing authority-checked operations.
+/// No visibility operation retries adoption, and no new command may race a
+/// retained original whose commit outcome is unknown.
+fn ensure_startup_recovery_request(
+    host: &SharedHost,
+    request: &ClientRequest,
+) -> Result<(), ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(detail) = state.startup_recovery() else {
+        return Ok(());
+    };
+    let inspection = matches!(
+        request,
+        ClientRequest::List
+            | ClientRequest::Attach { .. }
+            | ClientRequest::Detach { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::WatchTerminals
+            | ClientRequest::Authenticate { .. }
+            | ClientRequest::CloseTerminalChecked { .. }
+    );
+    let shutdown = matches!(
+        request,
+        ClientRequest::Shutdown | ClientRequest::ShutdownV1 { .. }
+    ) && !state.recovery_owns_work();
+    if inspection || shutdown {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        format!(
+            "Startup recovery retained original terminal ownership; inspect/List or explicitly Close the original actor: {detail}"
+        ),
+        false,
+    ))
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     ensure_request_open(host, &request)?;
+    ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -502,6 +583,7 @@ pub(super) fn process_request(
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_request_open(host, &request)?;
+    ensure_startup_recovery_request(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
@@ -1344,6 +1426,9 @@ pub(super) fn process_request(
             super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .startup_closed(terminal_id, &handle);
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .close_terminal_attention(terminal_id, Some(&handle));

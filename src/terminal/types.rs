@@ -212,6 +212,14 @@ pub enum TerminalStartError {
     Worker(String),
     #[error("terminal worker exited before startup completed")]
     WorkerExited,
+    /// The original worker and already-read output remain owned. This is not
+    /// a successful startup, and callers must retain the handle for recovery.
+    #[cfg(feature = "host")]
+    #[error("terminal startup retained original custody: {message}")]
+    CustodyRetained {
+        handle: super::TerminalHandle,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
