@@ -35,6 +35,8 @@ use super::{
 };
 use crate::{agent::Provider, chat::Model};
 
+pub mod readiness;
+
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a CLI's stdout a probe reads before giving up on it.
