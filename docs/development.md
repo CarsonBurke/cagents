@@ -183,13 +183,16 @@ scripts/run-development --hot
 scripts/run-development --hot-integrated
 ```
 
-The helper builds three native Linux products separately using locked
-`dev-runtime` builds, then stages the matched CLI/daemon beside cargo-hot's
-private executable bundle. Cargo-hot always targets the native host triple,
-adds a linker and saved compilation objects, and may need a substantial first
-build even with the ordinary runner's warmed cache. `CARGO_BUILD_JOBS` controls
-its spawned build jobs. Only one hot session can run at a time: the upstream
-client/server uses localhost port1100, and all development sessions share state.
+The helper builds the native Linux CLI and daemon separately using locked
+`dev-runtime` builds, resolves and fetches the selected UI dependency graph with
+locked Cargo metadata, then stages the matched CLI/daemon beside cargo-hot's
+private executable bundle. Cargo-hot builds the UI directly; an ordinary UI
+preflight build would produce an unused executable. Cargo-hot always targets
+the native host triple, adds a linker and saved compilation objects, and may need
+a substantial first build even with the ordinary runner's warmed cache.
+`CARGO_BUILD_JOBS` controls its spawned build jobs. Only one hot session can run
+at a time: the upstream client/server uses localhost port 1100, and all development
+sessions share state.
 
 Every helper Cargo invocation runs with `Cargo.lock` mounted read-only in a
 private bubblewrap mount namespace. This also refuses atomic replacement/unlink
