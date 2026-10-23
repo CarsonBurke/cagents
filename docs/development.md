@@ -357,9 +357,21 @@ cargo test --locked --no-default-features --features host --test terminal_load_c
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
 
-Explicitly selecting a gated target without its feature, including through a
+Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
+
+The 40,000-path mutation regression lives in `repository_scale_contract`, so a
+library-suite run does not also create and mutate that filesystem fixture.
+`--all-targets` still runs it in both HOST and UI lanes. When changing repository
+mutations or pathspec handling, include its explicit target:
+
+```sh
+cargo test --locked --no-default-features --features host --test repository_scale_contract
+```
+
+The fixture retains its disk-backed private namespace, subprocess deadline and
+process-family cleanup checks. Its test count and workload are unchanged.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
