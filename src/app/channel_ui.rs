@@ -1,8 +1,8 @@
 use super::*;
-use crate::agent::ActivityState;
 use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
+use std::collections::BTreeMap;
 
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
 /// daemon itself reports rather than the saved descriptors, together with the
@@ -856,8 +856,7 @@ impl Cagents {
                 continue;
             }
             self.retire_lsp_card(card);
-            self.sidebar_state.clear_agent_activity(card);
-            self.sidebar_state.acknowledge_agent_update(card);
+            self.sidebar_state.forget_card_attention(card);
             if passive {
                 self.shared_chat_detach(card);
             } else {
@@ -1068,7 +1067,17 @@ impl Cagents {
 
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
+        self.sidebar_state
+            .refresh_attention_projection(&self.durable, &self.sidebar_model.projects);
         let durable = &self.durable;
+        let mut cards = HashMap::new();
+        for card in durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !card.kind.is_utility())
+        {
+            cards.entry(card.id).or_insert(card);
+        }
         let previews = &self.notification_ui.previews;
         let allow_previews = self.settings.notifications.message_previews;
         // A failure outlives nothing: a channel that has gone since, however
@@ -1099,16 +1108,13 @@ impl Cagents {
                 };
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
-                let mut activity = None;
-                let mut unread = false;
+                let mut conversations = BTreeMap::<_, sidebar::AttentionSummary>::new();
                 let mut chats = 0;
                 let mut has_panes = false;
                 let mut notification_preview: Option<&super::notification_ui::Preview> = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
-                    let Some(card) = durable.cards.iter().find(|card| {
-                        card.id == *id && card.existence.is_open() && !card.kind.is_utility()
-                    }) else {
+                    let Some(card) = cards.get(id) else {
                         continue;
                     };
                     has_panes = true;
@@ -1131,17 +1137,22 @@ impl Cagents {
                     {
                         chats += 1;
                     }
-                    unread |= state.has_card_update(*id);
-                    match state.card_activity(*id).map(|activity| activity.state) {
-                        Some(ActivityState::Waiting) => activity = Some(ActivityState::Waiting),
-                        Some(ActivityState::Working)
-                            if activity != Some(ActivityState::Waiting) =>
-                        {
-                            activity = Some(ActivityState::Working);
-                        }
-                        _ => {}
+                    let attention = state.card_attention(*id);
+                    if attention != sidebar::AttentionSummary::default() {
+                        let resource = match &card.kind {
+                            CardKind::Chat(session) => (0, session.id.as_uuid()),
+                            CardKind::Terminal(session) => (0, session.id.as_uuid()),
+                            _ => (1, card.id.as_uuid()),
+                        };
+                        conversations.entry(resource).or_default().union(attention);
                     }
                 }
+                let mut attention = sidebar::AttentionSummary::default();
+                for conversation in conversations.into_values() {
+                    attention.add(conversation);
+                }
+                let activity = attention.activity();
+                let unread = attention.unread != 0;
                 let notification_preview = notification_preview
                     .filter(|_| unread)
                     .map(|preview| &preview.text);
@@ -1151,6 +1162,7 @@ impl Cagents {
                         && row.selected == selected
                         && row.activity == activity
                         && row.unread == unread
+                        && row.attention == attention
                         && row.chats == chats
                         && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
@@ -1167,7 +1179,8 @@ impl Cagents {
                         chats,
                         has_panes,
                         channel.ordinal,
-                    );
+                    )
+                    .with_attention(attention);
                     row.deletion = deletion;
                     row = row.with_notification_preview(notification_preview.cloned());
                     if index < project.channels.len() {
