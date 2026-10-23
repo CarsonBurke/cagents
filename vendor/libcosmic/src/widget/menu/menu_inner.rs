@@ -1476,16 +1476,22 @@ fn process_keyboard_events<Message: Clone + 'static>(
 ) -> Option<Option<(usize, MenuState)>> {
     use iced_core::keyboard::{Event, Key, key::Named};
     let (key, pressed) = match event {
-        event::Event::Keyboard(Event::KeyPressed {
-            key: Key::Named(key),
-            modifiers,
-            ..
-        }) if modifiers.is_empty() => (key, true),
-        event::Event::Keyboard(Event::KeyReleased {
-            key: Key::Named(key),
-            modifiers,
-            ..
-        }) if modifiers.is_empty() => (key, false),
+        event::Event::Keyboard(Event::KeyPressed { key, modifiers, .. })
+            if modifiers.is_empty() =>
+        {
+            (key, true)
+        }
+        event::Event::Keyboard(Event::KeyReleased { key, modifiers, .. })
+            if modifiers.is_empty() =>
+        {
+            (key, false)
+        }
+        _ => return None,
+    };
+    let key = match key {
+        Key::Named(key) => key,
+        // XKB/winit reports a physical Space as Character, including release.
+        Key::Character(text) if text.as_str() == " " => &Named::Space,
         _ => return None,
     };
     if !matches!(

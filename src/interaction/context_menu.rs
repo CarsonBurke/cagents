@@ -422,65 +422,79 @@ mod tests {
                 widget::menu::Item::Folder("Empty".to_owned(), Vec::new()),
             ],
         );
+        let named = |keys: Vec<Named>| {
+            keys.into_iter()
+                .map(keyboard::Key::Named)
+                .collect::<Vec<_>>()
+        };
         for (rows, keys, expected, visible) in [
             (
                 ordinary(),
-                vec![Named::ArrowDown, Named::Enter],
+                named(vec![Named::ArrowDown, Named::Enter]),
                 vec![1],
                 Some("First"),
             ),
             (
                 ordinary(),
-                vec![Named::ArrowDown, Named::ArrowDown, Named::Enter],
+                named(vec![Named::ArrowDown, Named::ArrowDown, Named::Enter]),
                 vec![2],
                 Some("Second"),
             ),
             (
                 ordinary(),
-                vec![Named::ArrowUp, Named::Enter],
+                named(vec![Named::ArrowUp, Named::Enter]),
                 vec![2],
                 Some("Second"),
             ),
             (
+                checkbox.clone(),
+                named(vec![Named::ArrowDown, Named::Space]),
+                vec![5],
+                Some("Check"),
+            ),
+            (
                 checkbox,
-                vec![Named::ArrowDown, Named::Space],
+                vec![
+                    keyboard::Key::Named(Named::ArrowDown),
+                    keyboard::Key::Character(" ".into()),
+                ],
                 vec![5],
                 Some("Check"),
             ),
             (
                 submenu,
-                vec![
+                named(vec![
                     Named::ArrowDown,
                     Named::ArrowRight,
                     Named::ArrowDown,
                     Named::ArrowLeft,
                     Named::ArrowRight,
                     Named::Enter,
-                ],
+                ]),
                 vec![3],
                 Some("Child first"),
             ),
             (
                 tall,
-                vec![Named::End, Named::Enter],
+                named(vec![Named::End, Named::Enter]),
                 vec![39],
                 Some("Action 39"),
             ),
             (
                 ordinary(),
-                vec![Named::End, Named::ArrowDown, Named::Enter],
+                named(vec![Named::End, Named::ArrowDown, Named::Enter]),
                 vec![1],
                 Some("First"),
             ),
             (
                 ordinary(),
-                vec![Named::End, Named::Home, Named::Enter],
+                named(vec![Named::End, Named::Home, Named::Enter]),
                 vec![1],
                 Some("First"),
             ),
             (
                 inert,
-                vec![Named::ArrowDown, Named::ArrowUp, Named::Enter],
+                named(vec![Named::ArrowDown, Named::ArrowUp, Named::Enter]),
                 Vec::new(),
                 None,
             ),
@@ -524,9 +538,10 @@ mod tests {
             );
             measured = popup.as_overlay_mut().layout(&renderer, window);
             for key in keys {
-                if let Some(visible) =
-                    visible.filter(|_| matches!(key, Named::Enter | Named::Space))
-                {
+                if let Some(visible) = visible.filter(|_| {
+                    matches!(key, keyboard::Key::Named(Named::Enter | Named::Space))
+                        || matches!(&key, keyboard::Key::Character(text) if text.as_str() == " ")
+                }) {
                     #[derive(Default)]
                     struct Texts(Vec<String>);
                     impl Operation for Texts {
@@ -547,7 +562,36 @@ mod tests {
                         texts.0
                     );
                 }
-                let key = keyboard::Key::Named(key);
+                if matches!(&key, keyboard::Key::Character(text) if text.as_str() == " ") {
+                    // A release while the popup is open belongs to it too;
+                    // this must not activate or reach the underlying pane.
+                    let release = Event::Keyboard(keyboard::Event::KeyReleased {
+                        key: key.clone(),
+                        modified_key: key.clone(),
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                    });
+                    let mut shell = Shell::new(&mut messages);
+                    popup.as_overlay_mut().update(
+                        &release,
+                        Layout::new(&measured),
+                        mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                    );
+                    assert!(
+                        shell.is_event_captured(),
+                        "native Space release stays in the menu"
+                    );
+                    assert!(
+                        messages.is_empty(),
+                        "release never activates the selected action"
+                    );
+                }
                 let event = Event::Keyboard(keyboard::Event::KeyPressed {
                     key: key.clone(),
                     modified_key: key,
