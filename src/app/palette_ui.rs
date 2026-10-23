@@ -80,8 +80,10 @@ fn entry_key(message: &Message) -> Option<String> {
     }
 }
 
+mod matching;
+
 fn match_score(label: &str, query: &str) -> Option<usize> {
-    crate::search_match::score(&label.to_lowercase(), &query.to_lowercase())
+    crate::search_match::score(&matching::lowercase(label), &matching::lowercase(query))
 }
 
 fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
@@ -99,72 +101,26 @@ fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
     let font = cosmic::font::default();
     let searchable = search_label(label);
     let offset = label.len() - searchable.len();
-    let folded: Vec<_> = searchable
-        .char_indices()
-        .flat_map(|(index, ch)| {
-            ch.to_lowercase()
-                .map(move |folded| (folded, offset + index..offset + index + ch.len_utf8()))
-        })
-        .collect();
-    let needle = query.to_lowercase().chars().collect::<Vec<_>>();
-    let mut matches = Vec::new();
-    if !needle.is_empty() {
-        let contiguous = folded
-            .windows(needle.len())
-            .enumerate()
-            .filter(|(_, window)| window.iter().map(|(ch, _)| *ch).eq(needle.iter().copied()))
-            .min_by_key(|(index, _)| {
-                if *index == 0 {
-                    0
-                } else if !folded[index - 1].0.is_alphanumeric() {
-                    1
-                } else {
-                    2
-                }
-            });
-        if let Some((_, window)) = contiguous {
-            matches.extend(window.iter().map(|(_, range)| range.clone()));
-        } else {
-            let mut cursor = 0;
-            for needle in needle {
-                if let Some(index) = folded[cursor..].iter().position(|(ch, _)| *ch == needle) {
-                    cursor += index;
-                    matches.push(folded[cursor].1.clone());
-                    cursor += 1;
-                }
-            }
-        }
-    }
+    let matches = matching::highlighted_ranges(searchable, query, offset);
     let mut spans: Vec<Span<'static, ()>> = Vec::new();
     let mut start = 0;
-    let mut highlighted = false;
-    for (index, _) in label.char_indices() {
-        let next = matches.iter().any(|range| range.contains(&index));
-        if next != highlighted {
-            if start < index {
-                let span = Span::new(label[start..index].to_owned());
-                spans.push(if highlighted {
-                    span.color(accent).font(iced::Font {
-                        weight: iced::font::Weight::Bold,
-                        ..font
-                    })
-                } else {
-                    span
-                });
-            }
-            start = index;
-            highlighted = next;
+    for range in matches {
+        if start < range.start {
+            spans.push(Span::new(label[start..range.start].to_owned()));
         }
+        spans.push(
+            Span::new(label[range.clone()].to_owned())
+                .color(accent)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..font
+                }),
+        );
+        start = range.end;
     }
-    let span = Span::new(label[start..].to_owned());
-    spans.push(if highlighted {
-        span.color(accent).font(iced::Font {
-            weight: iced::font::Weight::Bold,
-            ..font
-        })
-    } else {
-        span
-    });
+    if start < label.len() || spans.is_empty() {
+        spans.push(Span::new(label[start..].to_owned()));
+    }
     widget::container(
         iced::widget::rich_text(spans)
             .size(design::TEXT_BODY)
