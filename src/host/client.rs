@@ -334,13 +334,67 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
     Ok(())
 }
 
+/// Fresh read-only clients must still complete their Connect handshake while
+/// the ordinary exit caller retains original child tickets. This is not the
+/// general mutation gate used by account/worktree/provider operations.
+fn ensure_inspection_open(host: &SharedHost) -> Result<(), ProtocolError> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ordinary_exit_cleanup_pending()
+    {
+        Ok(())
+    } else {
+        ensure_control_open(host)
+    }
+}
+
+fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(), ProtocolError> {
+    if !host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ordinary_exit_cleanup_pending()
+    {
+        return ensure_control_open(host);
+    }
+    if matches!(
+        request,
+        ClientRequest::BuildInfo
+            | ClientRequest::List
+            | ClientRequest::Attach { .. }
+            | ClientRequest::Detach { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::WatchTerminals
+            | ClientRequest::Authenticate { .. }
+            | ClientRequest::CloseTerminalChecked { .. }
+    ) {
+        return Ok(());
+    }
+    if let ClientRequest::ShutdownV1 { version, .. } = request
+        && *version != SHUTDOWN_VERSION
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::UnsupportedVersion,
+            format!("shutdown version {version} is unsupported; expected {SHUTDOWN_VERSION}"),
+            false,
+        ));
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "Ordinary daemon exit is waiting for exact original child cleanup; only inspection and explicit checked Close remain available",
+        false,
+    ))
+}
+
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     {
         let gate = control_gate(host);
         let _control = gate.read().unwrap_or_else(|p| p.into_inner());
         let handles = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if state.shutting_down {
+            if state.shutting_down && !state.ordinary_exit_cleanup_pending() {
                 // Shutdown owns the remaining session state. Removing delivery is
                 // safe, but unregistering would enqueue visibility/redraw effects
                 // after the upgrade's terminal snapshots have been committed.
@@ -370,6 +424,7 @@ pub(super) fn process_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    ensure_request_open(host, &request)?;
     let gate = control_gate(host);
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -446,7 +501,7 @@ pub(super) fn process_request(
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
-    ensure_control_open(host)?;
+    ensure_request_open(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
@@ -1368,7 +1423,7 @@ fn prepare_resume(
 > {
     let gate = control_gate(host);
     let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    ensure_control_open(host)?;
+    ensure_inspection_open(host)?;
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {

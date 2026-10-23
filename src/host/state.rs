@@ -299,6 +299,12 @@ pub(crate) struct HostState {
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
+    /// Ordinary exit has closed new child reservations but still owns exact
+    /// preexisting tickets. This is independent of terminal/model inventory.
+    ordinary_exit_cleanup_pending: bool,
+    /// Registration and the final delivery snapshot share this HostState lock.
+    /// A client thread accepted before the seal may register only as closed.
+    ordinary_exit_registration_closed: bool,
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) native_chat_capacity: usize,
@@ -372,6 +378,8 @@ impl HostState {
             subscriptions: Subscriptions::default(),
             shutting_down: false,
             shutdown_requested: false,
+            ordinary_exit_cleanup_pending: false,
+            ordinary_exit_registration_closed: false,
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
@@ -408,12 +416,20 @@ impl HostState {
 
     pub(crate) fn register_client(&mut self, client_id: ClientId) -> Arc<DeliveryQueue> {
         let delivery = Arc::new(DeliveryQueue::new(client_id, DEFAULT_CLIENT_QUEUE_CAPACITY));
+        if self.ordinary_exit_registration_closed {
+            // The existing writer closes both stream directions when this
+            // already-closed queue drains; its reader cannot hang final join.
+            delivery.close_after_drain();
+            return delivery;
+        }
         self.clients.insert(client_id, Arc::clone(&delivery));
         delivery
     }
 
     pub(super) fn record_client_pid(&mut self, client: ClientId, pid: u32) {
-        self.client_pids.insert(client, pid);
+        if self.clients.contains_key(&client) {
+            self.client_pids.insert(client, pid);
+        }
     }
 
     /// Subscribes `client_id` to terminal-inventory edges. Repeating it is
@@ -1851,6 +1867,22 @@ impl HostState {
             live_terminals_before: count,
             termination_requested: true,
         }
+    }
+
+    pub(super) fn begin_ordinary_exit_cleanup(&mut self) {
+        self.ordinary_exit_cleanup_pending = true;
+        self.shutting_down = true;
+    }
+
+    pub(super) fn ordinary_exit_cleanup_pending(&self) -> bool {
+        self.ordinary_exit_cleanup_pending
+    }
+
+    /// Called only after the exit caller holds the core's sealed absence
+    /// proof. Includes clients registered during the pending cleanup interval.
+    pub(super) fn close_ordinary_exit_registration(&mut self) -> Vec<Arc<DeliveryQueue>> {
+        self.ordinary_exit_registration_closed = true;
+        self.clients.values().cloned().collect()
     }
 
     pub(crate) fn request_shutdown(&mut self) {
