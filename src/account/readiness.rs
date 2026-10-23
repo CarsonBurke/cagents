@@ -280,6 +280,58 @@ impl CheckReport {
             github_push_allowed: None,
         }
     }
+    /// Bind a response to the selected request/backend and reject contradictory
+    /// capability claims. This is response validation, not a future launch permit.
+    pub fn matches_request(
+        &self,
+        request: &CheckRequest,
+        host: &crate::model::HostSessionProof,
+    ) -> bool {
+        if self.account != request.account
+            || self.requested_workspace != request.workspace
+            || self.expected_email != request.expected_email
+            || self.github_repository != request.github_repository
+            || self.scope != CheckScope::AccountDefaultPolicy
+            || self.host.as_ref() != Some(host)
+            || !self.workspace.is_absolute()
+            || self.authentication.status == CheckStatus::NotRequested
+            || self.execution_profile_configured.status == CheckStatus::NotRequested
+            || (self.execution_profile_configured.status == CheckStatus::Passed
+                && self.profile.is_none())
+            || (self.workspace_write.status != CheckStatus::NotRequested) != request.write
+            || (self.github.status != CheckStatus::NotRequested)
+                != request.github_repository.is_some()
+            || (!request.write
+                && (self.workspace_receipt.is_some() || self.workspace_cleanup.is_some()))
+            || (request.write && self.workspace_cleanup.is_none())
+            || (request.github_repository.is_none() && self.github_push_allowed.is_some())
+            || (self.authentication.status != CheckStatus::Passed
+                && (self.workspace_write.status == CheckStatus::Passed
+                    || self.github.status == CheckStatus::Passed))
+        {
+            return false;
+        }
+        if self.authentication.status == CheckStatus::Passed
+            && !report
+                .observed_identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref())
+                .is_some_and(|email| email.trim().eq_ignore_ascii_case(&request.expected_email))
+        {
+            return false;
+        }
+        if self.workspace_write.status == CheckStatus::Passed
+            && (self.workspace_cleanup != Some(super::workspace_probe::Cleanup::Removed)
+                || !report
+                    .workspace_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.is_verified()))
+        {
+            return false;
+        }
+        true
+    }
+
     /// Invalidate requested measurements, preserving evidence already observed
     /// on other axes (for example a successful login before sandbox failure).
     pub fn invalidate_measurements(&mut self, reason: CheckReason) {

@@ -3,7 +3,7 @@ use super::super::*;
 use crate::{
     account::{
         AccountId,
-        readiness::{CheckReport, CheckRequest, CheckScope, CheckStatus, Measurement},
+        readiness::{CheckReport, CheckRequest, CheckStatus, Measurement},
         workspace_probe::Cleanup,
     },
     device_service::{Operation, Reply},
@@ -136,46 +136,7 @@ fn execute_with(
     else {
         return Err(invalid_report());
     };
-    if report.account != request.account
-        || report.requested_workspace != request.workspace
-        || report.expected_email != request.expected_email
-        || report.github_repository != request.github_repository
-        || report.scope != CheckScope::AccountDefaultPolicy
-        || report.host.as_ref() != Some(client.proof())
-        || !report.workspace.is_absolute()
-        || report.authentication.status == CheckStatus::NotRequested
-        || report.execution_profile_configured.status == CheckStatus::NotRequested
-        || (report.execution_profile_configured.status == CheckStatus::Passed
-            && report.profile.is_none())
-        || (report.workspace_write.status != CheckStatus::NotRequested) != request.write
-        || (report.github.status != CheckStatus::NotRequested)
-            != request.github_repository.is_some()
-        || (!request.write
-            && (report.workspace_receipt.is_some() || report.workspace_cleanup.is_some()))
-        || (request.write && report.workspace_cleanup.is_none())
-        || (request.github_repository.is_none() && report.github_push_allowed.is_some())
-        || (report.authentication.status != CheckStatus::Passed
-            && (report.workspace_write.status == CheckStatus::Passed
-                || report.github.status == CheckStatus::Passed))
-    {
-        return Err(invalid_report());
-    }
-    if report.authentication.status == CheckStatus::Passed
-        && !report
-            .observed_identity
-            .as_ref()
-            .and_then(|identity| identity.email.as_deref())
-            .is_some_and(|email| email.trim().eq_ignore_ascii_case(&request.expected_email))
-    {
-        return Err(invalid_report());
-    }
-    if report.workspace_write.status == CheckStatus::Passed
-        && (report.workspace_cleanup != Some(Cleanup::Removed)
-            || !report
-                .workspace_receipt
-                .as_ref()
-                .is_some_and(|receipt| receipt.is_verified()))
-    {
+    if !report.matches_request(&request, client.proof()) {
         return Err(invalid_report());
     }
     output(*report)
