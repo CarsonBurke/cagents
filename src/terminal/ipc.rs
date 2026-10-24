@@ -177,7 +177,9 @@ use crate::{
 /// executables must be replaced together; JSON omission alone is compatible.
 /// Version 110 bounds channel-work projections with independent current/history
 /// cursors and adds exact-target and metadata-only home reads for safe recovery.
-pub const PROTOCOL_VERSION: u16 = 110;
+/// Version 113 appends exact skipped-occurrence count/ranges to Firing;
+/// these positional postcard fields require a matched executable set.
+pub const PROTOCOL_VERSION: u16 = 113;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

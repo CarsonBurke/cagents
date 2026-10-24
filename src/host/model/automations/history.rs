@@ -5,6 +5,16 @@ use crate::automations::{HISTORY_RETAINED_ROWS, SkipReason, SkippedOccurrences, 
 pub(super) const REMOVED_TTL_MS: u64 =
     crate::automations::REMOVED_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
 
+// SQL aliases f/a/r are shared by these two bounded writer entrypoints.
+const ELIGIBLE: &str = "(a.active_firing IS NULL OR a.active_firing<>f.id)
+            AND json_extract(a.record,'$.blocked') IS NULL
+            AND json_extract(f.record,'$.state') NOT IN ('prechecking','accepted','running','waiting')
+            AND coalesce(json_extract(f.record,'$.release_pending'),0)=0
+            AND (json_extract(r.definition,'$.precheck') IS NULL
+              OR (json_extract(f.record,'$.state')='skipped' AND json_extract(f.record,'$.skip') IN ('overlap','capacity','missed_deadline')
+                  AND json_extract(f.record,'$.agent') IS NULL AND json_extract(f.record,'$.run') IS NULL)
+              OR EXISTS(SELECT 1 FROM automation_precheck_history_cleanup c WHERE c.firing=f.id AND c.revision=f.revision))";
+
 /// Root coordinates the published schema step; never change a historical migration.
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
@@ -164,6 +174,13 @@ fn merge(tx: &Transaction<'_>, previous: &mut Firing, next: &Firing) -> Result<b
     Ok(true)
 }
 
+/// Exact claim-time refusal before a precheck could ever own this firing.
+pub(super) fn record_never_launched(tx: &Transaction<'_>, firing: &Firing) -> Result<(), String> {
+    tx.execute("INSERT INTO automation_precheck_history_cleanup(firing,revision,evidence) VALUES(?1,?2,'not_launched')",
+        params![firing.id.to_string(),firing.revision]).map_err(|error|error.to_string())?;
+    Ok(())
+}
+
 pub(super) fn insert_or_coalesce(
     tx: &Transaction<'_>,
     firing: &mut Firing,
@@ -233,24 +250,24 @@ pub(super) fn prune(
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS automation_history_prune(id TEXT PRIMARY KEY); DELETE FROM automation_history_prune;")
         .map_err(|error|error.to_string())?;
     tx.execute(
-        "INSERT INTO automation_history_prune SELECT id FROM (
+        &format!(
+            "WITH latest AS (
+          SELECT automation,max(rowid) AS tail FROM automation_firings
+          WHERE (?1 IS NULL OR automation=?1) GROUP BY automation
+        ) INSERT INTO automation_history_prune SELECT id FROM (
           SELECT f.id,a.deleted_ms,row_number() OVER(PARTITION BY f.automation ORDER BY
-            (f.rowid=(SELECT max(t.rowid) FROM automation_firings t WHERE t.automation=f.automation)) DESC,
+            (f.rowid=latest.tail) DESC,
             coalesce(json_extract(f.record,'$.finished_ms'),f.created_ms) DESC,f.rowid DESC) AS rank
           FROM automation_firings f JOIN automations a ON a.id=f.automation
+          JOIN latest ON latest.automation=f.automation
           JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
-          WHERE (?1 IS NULL OR f.automation=?1 OR a.deleted_ms<?2)
-            AND (a.active_firing IS NULL OR a.active_firing<>f.id)
-            AND json_extract(a.record,'$.blocked') IS NULL
-            AND json_extract(f.record,'$.state') NOT IN ('prechecking','accepted','running','waiting')
-            AND coalesce(json_extract(f.record,'$.release_pending'),0)=0
-            AND (json_extract(r.definition,'$.precheck') IS NULL
-              OR (json_extract(f.record,'$.state')='skipped' AND json_extract(f.record,'$.skip') IN ('overlap','capacity','missed_deadline')
-                  AND json_extract(f.record,'$.agent') IS NULL AND json_extract(f.record,'$.run') IS NULL)
-              OR EXISTS(SELECT 1 FROM automation_precheck_history_cleanup c WHERE c.firing=f.id AND c.revision=f.revision))
-        ) WHERE rank>?3 OR deleted_ms<?2",
-        params![automation.map(|id|id.to_string()),cutoff,limit],
-    ).map_err(|error|error.to_string())?;
+          WHERE (?1 IS NULL OR f.automation=?1)
+            AND {ELIGIBLE}
+        ) WHERE rank>?3 OR deleted_ms<?2"
+        ),
+        params![automation.map(|id| id.to_string()), cutoff, limit],
+    )
+    .map_err(|error| error.to_string())?;
     tx.execute("INSERT INTO automation_retired_manual_requests(automation,request,revision)
         SELECT automation,occurrence_key,revision FROM automation_firings WHERE occurrence_key LIKE 'manual:%'
           AND id IN (SELECT id FROM automation_history_prune)
@@ -260,8 +277,7 @@ pub(super) fn prune(
         [],
     )
     .map_err(|error| error.to_string())?;
-    tx.execute("DELETE FROM automation_revisions WHERE (?1 IS NULL OR automation=?1 OR automation IN
-          (SELECT id FROM automations WHERE deleted_ms<?2))
+    tx.execute("DELETE FROM automation_revisions WHERE (?1 IS NULL OR automation=?1)
         AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=automation_revisions.automation AND f.revision=automation_revisions.revision)
         AND NOT EXISTS(SELECT 1 FROM automations a WHERE a.id=automation_revisions.automation
           AND (a.deleted_ms IS NULL OR a.deleted_ms>=?2) AND json_extract(a.record,'$.execution_revision')=automation_revisions.revision)",
@@ -276,6 +292,42 @@ impl Registry {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         prune(&tx, None, now_ms, HISTORY_RETAINED_ROWS)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Called by the existing coordinator at most once a minute. The partial
+    /// deleted_ms index skips live automations; protected-only tombstones do
+    /// not monopolize the batch and starve later eligible removed history.
+    pub(crate) fn maintain_removed_automation_history(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        super::super::schema::require_current(&tx)?;
+        let cutoff = now_ms.saturating_sub(REMOVED_TTL_MS);
+        let ids=tx.prepare(&format!("SELECT a.id FROM automations a WHERE a.deleted_ms<?1 AND (
+            EXISTS(SELECT 1 FROM automation_firings f JOIN automation_revisions r
+              ON r.automation=f.automation AND r.revision=f.revision
+              WHERE f.automation=a.id AND {ELIGIBLE})
+            OR EXISTS(SELECT 1 FROM automation_revisions r WHERE r.automation=a.id
+              AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=r.automation AND f.revision=r.revision)))
+            ORDER BY a.deleted_ms,a.id LIMIT 8"))
+            .map_err(|e|e.to_string())?.query_map([cutoff],|row| row.get::<_,String>(0))
+            .map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+        for id in ids {
+            prune(
+                &tx,
+                Some(
+                    id.parse()
+                        .map_err(|_| "Stored automation identity is invalid")?,
+                ),
+                now_ms,
+                HISTORY_RETAINED_ROWS,
+            )?;
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -349,5 +401,21 @@ impl Registry {
         compact(&tx, &mut firing)?;
         prune(&tx, Some(firing.automation), now_ms, HISTORY_RETAINED_ROWS)?;
         tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Registry {
+    /// Keep fault injection connection-local so the strict main-schema contract
+    /// remains intact while the real broker exercises its durable ACK path.
+    pub(in crate::host) fn set_automation_history_ack_failure_for_test(
+        &self,
+        refuse: bool,
+    ) -> Result<(), String> {
+        self.db.execute_batch(if refuse {
+            "CREATE TEMP TRIGGER refuse_history_ack BEFORE INSERT ON main.automation_precheck_history_cleanup BEGIN SELECT RAISE(ABORT,'fixture durable ACK failure'); END;"
+        } else {
+            "DROP TRIGGER temp.refuse_history_ack"
+        }).map_err(|error| error.to_string())
     }
 }

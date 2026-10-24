@@ -317,6 +317,12 @@ impl Registry {
         }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
             .map_err(|e| e.to_string())?;
+        history::prune(
+            &tx,
+            Some(firing.automation),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -645,6 +651,12 @@ impl Registry {
             write_automation(tx, &automation)?;
             tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
                 .map_err(|error| error.to_string())?;
+            history::prune(
+                tx,
+                Some(firing.automation),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
             return Ok(false);
         }
         Ok(true)
@@ -1387,6 +1399,10 @@ impl Registry {
             automation.active_firing = Some(firing.id);
         }
         history::insert_or_coalesce(&tx, &mut firing, &key)?;
+        if !project_open && definition.precheck.is_some() {
+            // Project refusal is terminal before any Worker could launch.
+            history::record_never_launched(&tx, &firing)?;
+        }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
             accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
@@ -3624,7 +3640,11 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_operations;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;
                 DROP TABLE channel_work_homes;
                 DROP TABLE automation_lifecycle; PRAGMA user_version=15;",
@@ -3761,4 +3781,5 @@ mod tests {
         assert!(!current.enabled && current.blocked.is_none() && current.active_firing.is_none());
         assert_eq!(recovered.revision, current.revision);
     }
+    include!("automations/history_tests.rs");
 }

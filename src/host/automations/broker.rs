@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
@@ -318,7 +318,37 @@ impl Handle {
     }
 
     fn run(&self) {
-        self.run_with(|host| self.tick(host));
+        let mut maintained = Instant::now();
+        self.run_with(|host| {
+            if maintained.elapsed() >= Duration::from_secs(60)
+                && self.maintain_history_under_control(host)?
+            {
+                maintained = Instant::now();
+            }
+            self.tick(host)
+        });
+    }
+
+    fn maintain_history_under_control(&self, host: &SharedHost) -> Result<bool, String> {
+        let control = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        let _control = match control.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        };
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return Ok(false);
+        }
+        self.0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_removed_automation_history(service::now()?)?;
+        Ok(true)
     }
 
     fn run_with(&self, mut tick: impl FnMut(&SharedHost) -> Result<Duration, String>) {
@@ -704,16 +734,15 @@ impl Handle {
             let Some(revision) = revision else {
                 continue;
             };
-            let mut worker = Worker::recover(&self.0.root, id, revision);
+            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let worker = workers
+                .entry(id)
+                .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
             match worker.retire() {
                 Ok(true) => {
-                    // Retain retry custody before ACK; no workers lock crosses SQL.
-                    self.0
-                        .workers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .entry(id)
-                        .or_insert(worker);
+                    // Retire the actual mapped owner, including its Child. A
+                    // recovered observer cannot replace that reaping custody.
+                    drop(workers);
                     self.0
                         .registry
                         .lock()
@@ -725,14 +754,7 @@ impl Handle {
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(&id);
                 }
-                Ok(false) => {
-                    self.0
-                        .workers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .entry(id)
-                        .or_insert(worker);
-                }
+                Ok(false) => {} // Keep the actual mapped owner for retry.
                 Err(error) => {
                     tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
                 }
@@ -1284,4 +1306,5 @@ mod tests {
             finished.evidence
         );
     }
+    include!("broker/history_tests.rs");
 }

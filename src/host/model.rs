@@ -44,7 +44,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -624,6 +624,10 @@ fn migrate_through(
         channel_work::migrate(tx)?;
         schema::migration_checkpoint(17)?;
     }
+    if version < 18 && target >= 18 {
+        automations::migrate_history(tx)?;
+        schema::migration_checkpoint(18)?;
+    }
     Ok(())
 }
 
@@ -1073,7 +1077,11 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_operations;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE channel_work_operations;
                  DROP TABLE channel_work_entries;
                  DROP TABLE channel_work_homes;
                  DROP TABLE automation_lifecycle;

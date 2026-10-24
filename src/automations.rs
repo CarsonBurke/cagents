@@ -694,3 +694,7 @@ pub struct HistoryPage {
     pub firings: Vec<Firing>,
     pub next: Option<HistoryCursor>,
 }
+
+#[cfg(test)]
+#[path = "automations/history_wire_tests.rs"]
+mod history_wire_tests;

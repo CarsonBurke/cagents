@@ -226,6 +226,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static FIFTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static SIXTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -233,6 +234,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         15 => &FIFTEEN,
         16 => &SIXTEEN,
         17 => &SEVENTEEN,
+        18 => &EIGHTEEN,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -714,6 +716,13 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (18, "DROP TABLE automation_precheck_history_cleanup;"),
+            (18, "DROP TABLE automation_retired_manual_requests;"),
+            (18, "DROP INDEX automation_removed_history;"),
+            (
+                18,
+                "ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+            ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
@@ -762,7 +771,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16, 17] {
+        for version in [13, 14, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -1060,7 +1069,7 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
+        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);

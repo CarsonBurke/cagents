@@ -93,7 +93,10 @@ impl Worker {
         lease.sync_all()?;
         File::open(&directory)?.sync_all()?;
         let fd = lease.as_raw_fd();
+        #[cfg(not(test))]
         let mut command = Command::new(std::env::current_exe()?);
+        #[cfg(test)]
+        let mut command = Command::new(test_helper_executable()?);
         command
             .args([SUPERVISOR])
             .arg(&directory)
@@ -162,6 +165,11 @@ impl Worker {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    #[cfg(test)]
+    pub fn owns_child_for_test(&self) -> bool {
+        self.child.is_some()
     }
 
     pub fn reaped(&mut self) -> io::Result<bool> {
@@ -485,6 +493,22 @@ fn supervisor(directory: &Path, request: &Request, _lease: File) -> io::Result<(
             outcome,
         },
     )
+}
+
+#[cfg(test)]
+fn test_helper_executable() -> io::Result<PathBuf> {
+    let path = PathBuf::from(
+        std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER").ok_or_else(|| {
+            io::Error::other("Precheck Worker tests require the same-head cagentsd helper")
+        })?,
+    );
+    let metadata = path.metadata()?;
+    if !path.is_absolute() || !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err(io::Error::other(
+            "Precheck Worker test helper must be an absolute executable file",
+        ));
+    }
+    Ok(path)
 }
 
 fn failed(diagnostic: String) -> Outcome {
