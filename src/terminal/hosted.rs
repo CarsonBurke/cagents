@@ -1076,10 +1076,26 @@ impl HostedTerminalHandle {
         origin: PasteOrigin,
     ) -> Result<(), TerminalSendError> {
         let text = text.into();
+        let bytes = text.len();
+        let origin_name = match origin {
+            PasteOrigin::Clipboard => "clipboard",
+            PasteOrigin::Drop => "drop",
+        };
         if text.len() > MAX_INPUT_BYTES {
+            tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+                stage = "hosted_enqueue", origin = origin_name, bytes, outcome = "too_large");
             return Err(TerminalSendError::PasteTooLarge(text.len()));
         }
-        self.try_command(ClientCommand::Paste(text, origin))
+        let result = self.try_command(ClientCommand::Paste(text, origin));
+        tracing::debug!(target: "cagents::terminal_input", terminal_id = %self.terminal_id(),
+        stage = "hosted_enqueue", origin = origin_name, bytes,
+        outcome = match &result {
+            Ok(()) => "queued",
+            Err(TerminalSendError::Full) => "full",
+            Err(TerminalSendError::Closed) => "closed",
+            Err(TerminalSendError::PasteTooLarge(_)) => "too_large",
+        });
+        result
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
@@ -2121,6 +2137,15 @@ fn serve_connection(
                 let Some(kind) = pending.remove(&request_id) else {
                     return ConnectionEnd::Retry;
                 };
+                // Diagnostic correlation only; IDs are scoped to this connection.
+                if matches!(&kind, PendingRequest::Input("paste into terminal")) {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if matches!(&response, ServerResponse::Accepted) {
+                        "accepted"
+                    } else {
+                        "unexpected_response"
+                    });
+                }
                 match (kind, response) {
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
@@ -2225,6 +2250,21 @@ fn serve_connection(
                 }
             }
             ServerMessage::Error(error) => {
+                // Keep refusal diagnostics behind the same version/proof fence
+                // and an existing pending request, without retaining paste data.
+                if let Some(request_id) = envelope.request_id
+                    && matches!(
+                        pending.get(&request_id),
+                        Some(PendingRequest::Input("paste into terminal"))
+                    )
+                {
+                    tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+                    stage = "rpc_result", outcome = if error.code == ProtocolErrorCode::QueueFull {
+                        "queue_full"
+                    } else {
+                        "refused"
+                    });
+                }
                 if is_committed_daemon_shutdown(&error) {
                     // In-flight controls can reach the old daemon after its
                     // checkpoint commits. Keep the runtime alive until the
@@ -2411,7 +2451,26 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    codec.write(
+    let paste = match &request {
+        ClientRequest::Paste {
+            terminal_id,
+            text,
+            origin,
+        } => Some((
+            *terminal_id,
+            text.len(),
+            match origin {
+                PasteOrigin::Clipboard => "clipboard",
+                PasteOrigin::Drop => "drop",
+            },
+        )),
+        _ => None,
+    };
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = "started");
+    }
+    let result = codec.write(
         stream,
         &ClientEnvelope {
             version: PROTOCOL_VERSION,
@@ -2419,7 +2478,12 @@ fn send_request(
             proof: Some(proof.clone()),
             request,
         },
-    )?;
+    );
+    if let Some((terminal_id, bytes, origin)) = paste {
+        tracing::debug!(target: "cagents::terminal_input", %terminal_id, request_id,
+            stage = "rpc_write", origin, bytes, outcome = if result.is_ok() { "written" } else { "failed" });
+    }
+    result?;
     pending.insert(request_id, kind);
     Ok(())
 }
