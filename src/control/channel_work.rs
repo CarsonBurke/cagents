@@ -15,26 +15,34 @@ const REQUEST_BYTES: u64 = 64 * 1024;
 pub enum WorkCommand {
     /// Show the authenticated session's actual channel, or an explicit user selection.
     Context {
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
     },
     /// Show declared work, related reviews and recent history in a channel.
     Show {
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Continue history with the previous response's next_history cursor.
         #[arg(long)]
         before: Option<u64>,
+        /// Continue current entries with the previous response's next_current cursor.
         #[arg(long)]
         current_before: Option<u64>,
+        /// Maximum entries per current or history page (1-100).
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
     /// Declare a PR relationship; this does not claim verified filesystem writes.
     Track {
+        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
         #[arg(value_parser = parse_pull_request)]
         url: Target,
+        /// Relationship: contribute, steward, review, or reference.
         #[arg(value_parser = parse_role)]
         role: Role,
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
         /// Save the exact safe request before sending it. The path must not exist.
@@ -43,35 +51,48 @@ pub enum WorkCommand {
     },
     /// End your participation, or all participation when invoked explicitly by the user.
     End {
+        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
         #[arg(value_parser = parse_pull_request)]
         url: Target,
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Save the exact safe request before sending it. The path must not exist.
         #[arg(long)]
         save_request: Option<PathBuf>,
     },
     /// Mark a relationship as not belonging to this channel (explicit user only).
     Dismiss {
+        /// HTTPS pull request URL: https://HOST/OWNER/REPO/pull/NUMBER.
         #[arg(value_parser = parse_pull_request)]
         url: Target,
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
+        /// Save the exact safe request before sending it. The path must not exist.
         #[arg(long)]
         save_request: Option<PathBuf>,
     },
     /// Inspect an original receipt. Missing means unknown, not proof of no effect.
     Result {
+        /// Registry UUID captured for the original operation.
         #[arg(long, value_parser = parse_uuid)]
         registry: Uuid,
+        /// Channel UUID captured for the original operation.
         #[arg(long)]
         channel: ChannelId,
+        /// Confirmed channel creation ordinal captured for the original operation.
         #[arg(long, value_parser = parse_ordinal)]
         ordinal: u32,
+        /// Original mutation UUID to inspect.
         #[arg(long, value_parser = parse_uuid)]
         operation: Uuid,
     },
     /// Explicitly retry an exact saved mutation, preserving its UUID, CAS and caller.
-    Apply { request: PathBuf },
+    Apply {
+        /// Path to the exact request file saved with --save-request.
+        request: PathBuf,
+    },
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, String> {
