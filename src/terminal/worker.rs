@@ -1005,6 +1005,15 @@ impl TerminalHandle {
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
     }
+    #[cfg(test)]
+    pub(crate) fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .ok_or_else(|| std::io::Error::other("original root pidfd was not captured"))?
+            .try_clone()
+    }
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.

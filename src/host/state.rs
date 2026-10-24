@@ -6329,6 +6329,7 @@ for line in sys.stdin:
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
         use crate::upgrade::handoff::{Phase, Store};
+        use std::os::fd::AsRawFd;
         // Exercise both the successful carry and failure after original adoption.
         // Failed recovery retains its live original instead of authorizing replay.
         for invalid_successor in [false, true] {
@@ -6380,6 +6381,7 @@ for line in sys.stdin:
                 assert!(Instant::now() < deadline, "the shell never started");
                 thread::sleep(Duration::from_millis(10));
             };
+            let original_root = crate::terminal::holder::Process::read(pid).unwrap();
             let old = host.lock().unwrap().terminals[&source.id].handle.clone();
             let carried_source = host
                 .lock()
@@ -6474,9 +6476,26 @@ for line in sys.stdin:
                     state.terminals[&source.id].handle.clone()
                 };
                 assert!(!handle.is_completed());
-                let owner = handle.holder_identity().unwrap();
-                assert_eq!(owner.root.pid, pid);
-                assert!(owner.root.is_current() && owner.holder.is_current());
+                let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
+                let fdinfo =
+                    fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd()))
+                        .unwrap();
+                let pinned_pid = fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:"))
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap();
+                assert_eq!(pinned_pid, original_root.pid);
+                let mut readiness = libc::pollfd {
+                    fd: root_pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: the cloned original pidfd stays owned across poll.
+                assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+                assert!(original_root.is_current());
                 assert!(holders.join(source.id.to_string()).exists());
                 let retained_store = Store::open(directory.path()).unwrap();
                 assert_eq!(
@@ -6542,9 +6561,26 @@ for line in sys.stdin:
                 .handle
                 .clone();
             assert!(!handle.is_completed());
-            let owner = handle.holder_identity().unwrap();
-            assert_eq!(owner.root.pid, pid);
-            assert!(owner.root.is_current() && owner.holder.is_current());
+            let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
+            let fdinfo =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd()))
+                    .unwrap();
+            let pinned_pid = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(pinned_pid, original_root.pid);
+            let mut readiness = libc::pollfd {
+                fd: root_pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: the cloned original pidfd stays owned across poll.
+            assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+            assert!(original_root.is_current());
             assert_eq!(
                 handle.close_checked(true),
                 crate::terminal_ipc::TerminalCloseResult::Closed

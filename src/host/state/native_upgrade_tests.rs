@@ -608,6 +608,10 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         cleanup.0.push(pid.unwrap());
         terminals.push((source.id, pid.unwrap()));
     }
+    let original_roots = terminals
+        .iter()
+        .map(|&(terminal, pid)| (terminal, registry::Process::read(pid).unwrap()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let source = provider_session(&root, &program, &proof);
     let id = source.id;
     super::super::chat::start_execution(
@@ -727,9 +731,26 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         assert_eq!(state.terminals.len(), terminals.len());
         for &(terminal, pid) in &terminals {
             let handle = &state.terminals[&terminal].handle;
-            let owner = handle.holder_identity().unwrap();
-            assert_eq!(owner.root.pid, pid, "the candidate owns the same original");
-            assert!(owner.root.is_current());
+            // Legacy carries have no registered-holder Record. Observe the
+            // worker's already-held original root pidfd instead of requiring
+            // optional registry metadata or reopening a reusable PID.
+            let root_pin = handle.original_root_pidfd_for_test().unwrap();
+            let descriptor = std::os::fd::AsRawFd::as_raw_fd(&root_pin);
+            let info = fs::read_to_string(format!("/proc/self/fdinfo/{descriptor}")).unwrap();
+            let captured_pid = info
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:").map(str::trim))
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(captured_pid, pid, "the candidate owns the same original");
+            let mut original = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut original, 1, 0) }, 0);
+            assert!(original_roots[&terminal].is_current());
             assert!(!handle.is_completed());
         }
     }
