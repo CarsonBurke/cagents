@@ -2,7 +2,7 @@ use super::*;
 use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
-    model::WorktreeId,
+    model::{ChannelId, WorktreeId},
     sidebar::ProjectCommand,
 };
 
@@ -10,6 +10,44 @@ use crate::{
 struct AutomaticAttempt {
     project: ProjectId,
     at: Instant,
+}
+
+/// Captured before the effect; an old path result cannot acquire new editor owners.
+#[derive(Debug, Clone)]
+pub struct WorktreeRemovalCapture {
+    lsp: crate::lsp::LspWorktreeRemoval,
+    cards: Vec<RemovalCard>,
+    inventory: Option<u64>,
+    device: Option<(String, String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct RemovalCard {
+    state: CardState,
+    document: Option<LspDocumentId>,
+    scope: Option<PathBuf>,
+    channels: Vec<ChannelId>,
+}
+
+/// Terminal status and authenticated host evidence evolve while deletion waits
+/// for sessions to close. The terminal ID identifies that source incarnation;
+/// the card generation, document, scope and channel fences are checked separately.
+/// Other descriptor contracts remain exact until they define a stable identity.
+fn same_removal_source(captured: &CardKind, current: &CardKind) -> bool {
+    match (captured, current) {
+        (CardKind::Terminal(captured), CardKind::Terminal(current)) => captured.id == current.id,
+        _ => captured == current,
+    }
+}
+
+fn removal_device_key() -> Option<(String, String, String)> {
+    crate::device::selected().map(|device| {
+        (
+            device.name.clone(),
+            device.host.clone(),
+            device.executable.clone(),
+        )
+    })
 }
 
 #[derive(Debug, Default)]
@@ -187,13 +225,15 @@ pub enum Action {
     ProjectSessionsClosed(ProjectId, u64, Result<ProjectSessionClosure, String>),
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
-    AwaitSessions(Target),
+    AwaitSessions(Target, WorktreeRemovalCapture),
     AutomaticallyDeleted {
         target: Target,
+        capture: WorktreeRemovalCapture,
         removed: Option<RemovedWorktree>,
     },
     Deleted {
         target: Target,
+        capture: WorktreeRemovalCapture,
         result: Result<(), String>,
     },
     AvatarLoaded {
@@ -205,6 +245,70 @@ pub enum Action {
 }
 
 impl Cagents {
+    /// Capture the original registrations before selection, waiting or worker I/O.
+    pub(super) fn capture_worktree_removal(&self, target: &Target) -> WorktreeRemovalCapture {
+        let channels = self.removal_card_channels();
+        let cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| {
+                card.existence.is_open()
+                    && (card_belongs_to(card, &target.path)
+                        || self
+                            .durable
+                            .card_scopes
+                            .get(&card.id)
+                            .is_some_and(|scope| scope.starts_with(&target.path)))
+            })
+            .map(|card| RemovalCard {
+                state: card.clone(),
+                document: self.lsp_document(card.id),
+                scope: self.durable.card_scopes.get(&card.id).cloned(),
+                channels: channels.get(&card.id).cloned().unwrap_or_default(),
+            })
+            .collect();
+        WorktreeRemovalCapture {
+            lsp: self.lsp.capture_worktree_removal(&target.path),
+            cards,
+            inventory: self.repository_generations.get(&target.project).copied(),
+            device: removal_device_key(),
+        }
+    }
+
+    fn removal_card_channels(&self) -> HashMap<CardId, Vec<ChannelId>> {
+        let mut channels = HashMap::<CardId, Vec<ChannelId>>::new();
+        for channel in &self.durable.channels {
+            for &id in &channel.cards {
+                channels.entry(id).or_default().push(channel.id);
+            }
+        }
+        channels
+    }
+
+    fn original_removal_cards(
+        &self,
+        target: &Target,
+        capture: &WorktreeRemovalCapture,
+    ) -> Vec<CardId> {
+        if capture.device != removal_device_key() {
+            return Vec::new();
+        }
+        let channels = self.removal_card_channels();
+        capture.cards.iter().filter(|owner| {
+            self.card_state(owner.state.id).is_some_and(|current| {
+                current.existence.is_open() && current.generation == owner.state.generation
+                    && same_removal_source(&owner.state.kind, &current.kind)
+            })
+                && self.lsp_document(owner.state.id) == owner.document
+                && self.durable.card_scopes.get(&owner.state.id) == owner.scope.as_ref()
+                && channels.get(&owner.state.id).map(Vec::as_slice).unwrap_or_default() == owner.channels.as_slice()
+                // A path-only empty repository descriptor is not a physical owner.
+                && (!matches!(owner.state.kind, CardKind::Repository(_))
+                    || self.repository_generations.get(&target.project).copied() == capture.inventory)
+        }).map(|owner| owner.state.id).collect()
+    }
+
     pub(super) fn sync_worktree_protections(&mut self) {
         #[cfg(test)]
         super::terminal_output_tests::record_protection();
@@ -356,6 +460,7 @@ impl Cagents {
             },
         );
         self.sync_worktree_operation_rows();
+        let capture = self.capture_worktree_removal(&target);
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let removed = tokio::task::spawn_blocking(move || {
@@ -367,7 +472,11 @@ impl Cagents {
                 }
                 Some(removed)
             }).await.ok().flatten();
-            Message::ProjectUi(Action::AutomaticallyDeleted { target, removed })
+            Message::ProjectUi(Action::AutomaticallyDeleted {
+                target,
+                capture,
+                removed,
+            })
         })
     }
 
@@ -943,7 +1052,7 @@ impl Cagents {
                     }
                 }
             }
-            Action::AwaitSessions(target) => {
+            Action::AwaitSessions(target, capture) => {
                 let running = target
                     .worktree
                     .and_then(|id| self.project_ui.deletions.get(&id))
@@ -965,7 +1074,7 @@ impl Cagents {
                         self.sync_worktree_operation_rows();
                         return Task::none();
                     }
-                    return self.run_worktree_deletion(target);
+                    return self.run_worktree_deletion(target, capture);
                 }
             }
             Action::EditorsLoaded(result) => match result {
@@ -1346,13 +1455,18 @@ impl Cagents {
                 }
                 return self.start_worktree_deletion(target);
             }
-            Action::AutomaticallyDeleted { target, removed } => {
+            Action::AutomaticallyDeleted {
+                target,
+                capture,
+                removed,
+            } => {
                 if removed
                     .as_ref()
                     .is_some_and(|receipt| receipt.path == target.path)
                 {
                     return self.handle_project_action(Action::Deleted {
                         target,
+                        capture,
                         result: Ok(()),
                     });
                 }
@@ -1362,7 +1476,11 @@ impl Cagents {
                 self.sync_worktree_operation_rows();
                 return self.lifecycle_sweep();
             }
-            Action::Deleted { target, result } => match result {
+            Action::Deleted {
+                target,
+                capture,
+                result,
+            } => match result {
                 Err(failure) => {
                     // A blocker names what to resolve, so it outranks Git's
                     // own account of the same refusal.
@@ -1385,23 +1503,27 @@ impl Cagents {
                     return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
+                    let current = self
+                        .original_removal_cards(&target, &capture)
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    let ids = capture.cards.iter().filter(|owner| {
+                        current.contains(&owner.state.id) && card_belongs_to(&owner.state, &target.path)
+                            // Loaded and dirty buffers remain available for recovery.
+                            && !matches!(self.cards.get(&owner.state.id), Some(CardRuntime::Repository(runtime))
+                                if runtime.selected_path().is_some() || runtime.blocks_navigation())
+                    }).map(|owner| owner.state.id).collect::<Vec<_>>();
+                    if capture.device == removal_device_key() {
+                        let closed = self.lsp.remove_captured_worktree(capture.lsp);
+                        self.clear_removed_lsp_documents(&closed);
+                    }
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
                     }
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
-                    let ids = self
-                        .durable
-                        .cards
-                        .iter()
-                        .filter(|card| {
-                            card.existence.is_open() && card_belongs_to(card, &target.path)
-                        })
-                        .map(|card| card.id)
-                        .collect::<Vec<_>>();
                     for &id in &ids {
-                        self.retire_lsp_card(id);
                         self.sidebar_state.forget_card_attention(id);
                         self.chat_discard(id);
                         self.cards.remove(&id);
@@ -1420,8 +1542,12 @@ impl Cagents {
                     for id in &ids {
                         durable.card_scopes.remove(id);
                     }
-                    for scope in durable.card_scopes.values_mut() {
-                        if scope.starts_with(&target.path) {
+                    for owner in &capture.cards {
+                        if current.contains(&owner.state.id)
+                            && let Some(scope) = durable.card_scopes.get_mut(&owner.state.id)
+                            && Some(&*scope) == owner.scope.as_ref()
+                            && scope.starts_with(&target.path)
+                        {
                             *scope = target.repository.clone();
                         }
                     }
@@ -1503,6 +1629,7 @@ impl Cagents {
         let Some(id) = target.worktree else {
             return Task::none();
         };
+        let capture = self.capture_worktree_removal(&target);
         self.project_ui.deletions.insert(
             id,
             Deletion {
@@ -1521,12 +1648,16 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([leave, self.run_worktree_deletion(target)])
+        Task::batch([leave, self.run_worktree_deletion(target, capture)])
     }
 
     /// Runs the deletion once no session in the worktree is still starting:
     /// one that is would come up after its directory had been emptied.
-    fn run_worktree_deletion(&mut self, target: Target) -> Task<Message> {
+    fn run_worktree_deletion(
+        &mut self,
+        target: Target,
+        capture: WorktreeRemovalCapture,
+    ) -> Task<Message> {
         if self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && card_belongs_to(card, &target.path)
@@ -1534,7 +1665,7 @@ impl Cagents {
         }) {
             return cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Message::ProjectUi(Action::AwaitSessions(target))
+                Message::ProjectUi(Action::AwaitSessions(target, capture))
             });
         }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
@@ -1562,7 +1693,11 @@ impl Cagents {
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
-            Message::ProjectUi(Action::Deleted { target, result })
+            Message::ProjectUi(Action::Deleted {
+                target,
+                capture,
+                result,
+            })
         })
     }
 
@@ -2337,6 +2472,332 @@ mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
 
+    fn removal_callback_test(case: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move { case() });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn removal_lsp_app() -> (Cagents, tempfile::TempDir, Target) {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let worktree = root.path().join("linked");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            worktree.clone(),
+            Some("feature".into()),
+        );
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![primary, linked.clone()],
+            vec![],
+        ));
+        let servers = vec![crate::settings::LanguageServerSettings {
+            id: "removal-callback".into(),
+            languages: vec![crate::settings::LanguageServerLanguage {
+                language_id: "rust".into(),
+                extensions: vec!["rs".into(), "txt".into()],
+            }],
+            // Discovery is deliberately not delivered in these synchronous
+            // callback cases. The real pending registration is enough; this
+            // command is never started. Framed session retirement is tested by LSP.
+            command: vec!["unused-before-discovery-delivery".into()],
+            root_markers: vec![],
+            initialization_options: None,
+        }];
+        app.settings.language_servers = servers.clone();
+        app.lsp = LspManager::new(servers);
+        (
+            app,
+            root,
+            Target {
+                project,
+                worktree: Some(linked.id),
+                repository,
+                path: worktree,
+                label: "feature".into(),
+            },
+        )
+    }
+
+    fn removal_editor(app: &mut Cagents, target: &Target, dirty: bool) -> (CardId, LspDocumentId) {
+        let card = CardId::new();
+        let mut runtime = if dirty {
+            repository_widget::RepositoryRuntime::dirty_fixture(card)
+        } else {
+            repository_widget::RepositoryRuntime::open_fixture(
+                card,
+                "main.rs",
+                "replacement buffer\n",
+            )
+            .0
+        };
+        let selected = runtime.selected_path().unwrap().to_owned();
+        let view = RepositoryView {
+            project: target.project,
+            repository: target.repository.clone(),
+            worktree: target.path.clone(),
+            selected_file: Some(selected.clone()),
+        };
+        runtime.descriptor = view.clone();
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: card,
+            generation: durable.generation,
+            title: "Editor".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Repository(view),
+        });
+        durable.card_scopes.insert(card, target.path.clone());
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.open_lsp_document(
+            card,
+            &target.path.join(selected),
+            &target.path,
+            1,
+            &"buffer\n".into(),
+        ));
+        let doc = app.lsp_document(card).unwrap();
+        assert_eq!(app.lsp.status(doc), LspStatus::Starting);
+        (card, doc)
+    }
+
+    #[test]
+    fn worktree_removal_callback_retires_only_original_documents_and_preserves_same_path_successor()
+    {
+        removal_callback_test(|| {
+            for automatic in [false, true] {
+                let (mut app, _root, target) = removal_lsp_app();
+                let (original, old_doc) = removal_editor(&mut app, &target, false);
+                let empty = CardId::new();
+                let view = RepositoryView {
+                    project: target.project,
+                    repository: target.repository.clone(),
+                    worktree: target.path.clone(),
+                    selected_file: None,
+                };
+                let mut empty_state = app.card_state(original).unwrap().clone();
+                empty_state.id = empty;
+                empty_state.kind = CardKind::Repository(view.clone());
+                Arc::make_mut(&mut app.durable).cards.push(empty_state);
+                app.cards.insert(
+                    empty,
+                    CardRuntime::Repository(Box::new(
+                        repository_widget::RepositoryRuntime::file_list_fixture(view, &[]),
+                    )),
+                );
+                let capture = app.capture_worktree_removal(&target);
+                let (successor, new_doc) = removal_editor(&mut app, &target, false);
+                let before = app.card_state(successor).unwrap().clone();
+                let scope = app.durable.card_scopes[&successor].clone();
+                let action = if automatic {
+                    Action::AutomaticallyDeleted {
+                        capture,
+                        removed: Some(RemovedWorktree {
+                            common_dir: target.repository.join(".git"),
+                            admin_dir: target.repository.join(".git/worktrees/feature"),
+                            path: target.path.clone(),
+                            branch: Some("refs/heads/feature".into()),
+                        }),
+                        target,
+                    }
+                } else {
+                    Action::Deleted {
+                        target,
+                        capture,
+                        result: Ok(()),
+                    }
+                };
+                drop(app.update(Message::ProjectUi(action)));
+                assert_eq!(app.lsp.status(old_doc), LspStatus::Disabled);
+                assert!(
+                    !app.card_state(empty).unwrap().existence.is_open(),
+                    "unchanged captured empty card is retired"
+                );
+                assert!(!app.cards.contains_key(&empty));
+                assert_eq!(app.lsp_document(original), None);
+                assert!(
+                    app.card_state(original).unwrap().existence.is_open(),
+                    "the original loaded buffer remains recoverable"
+                );
+                assert_eq!(app.lsp.status(new_doc), LspStatus::Starting);
+                assert_eq!(app.lsp_document(successor), Some(new_doc));
+                let current = app.card_state(successor).unwrap();
+                assert_eq!(current.kind, before.kind);
+                assert_eq!(current.generation, before.generation);
+                assert!(current.existence.is_open());
+                assert_eq!(app.durable.card_scopes.get(&successor), Some(&scope));
+                let Some(CardRuntime::Repository(runtime)) = app.cards.get(&successor) else {
+                    panic!("successor runtime")
+                };
+                assert_eq!(runtime.lsp_document(), Some(new_doc));
+                assert_eq!(
+                    runtime.editor_text().as_deref(),
+                    Some("replacement buffer\n")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn worktree_removal_callback_retains_dirty_buffer_but_clears_original_language_state() {
+        removal_callback_test(|| {
+            let (mut app, _root, target) = removal_lsp_app();
+            let (card, doc) = removal_editor(&mut app, &target, true);
+            let capture = app.capture_worktree_removal(&target);
+            app.lsp_contexts.get_mut(&card).unwrap().failure =
+                Some("old attachment failure".into());
+            drop(app.update(Message::ProjectUi(Action::Deleted {
+                target,
+                capture,
+                result: Ok(()),
+            })));
+            assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
+            assert!(!app.lsp_documents.contains_key(&doc));
+            assert!(app.lsp_contexts[&card].failure.is_none());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("retained buffer")
+            };
+            assert!(runtime.is_dirty());
+            assert_eq!(runtime.editor_text().as_deref(), Some("unsaved\n"));
+            assert_eq!(runtime.lsp_document(), None);
+        });
+    }
+
+    #[test]
+    fn worktree_removal_callback_failure_retains_owner_and_old_success_cannot_clear_reopened_card()
+    {
+        removal_callback_test(|| {
+            let (mut app, _root, target) = removal_lsp_app();
+            let (card, original_doc) = removal_editor(&mut app, &target, false);
+            let capture = app.capture_worktree_removal(&target);
+            drop(app.update(Message::ProjectUi(Action::Deleted {
+                target: target.clone(),
+                capture: capture.clone(),
+                result: Err("removal refused".into()),
+            })));
+            assert_eq!(app.lsp.status(original_doc), LspStatus::Starting);
+            assert_eq!(app.lsp_document(card), Some(original_doc));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            drop(app.open_lsp_document(
+                card,
+                &target.path.join("main.rs"),
+                &target.path,
+                2,
+                &"new incarnation\n".into(),
+            ));
+            let reopened = app.lsp_document(card).unwrap();
+            assert_ne!(original_doc, reopened);
+            assert_eq!(app.lsp.status(original_doc), LspStatus::Disabled);
+            drop(app.update(Message::ProjectUi(Action::Deleted {
+                target,
+                capture,
+                result: Ok(()),
+            })));
+            assert_eq!(app.lsp.status(reopened), LspStatus::Starting);
+            assert_eq!(app.lsp_document(card), Some(reopened));
+            assert_eq!(app.lsp_documents.get(&reopened), Some(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("reopened card")
+            };
+            assert_eq!(runtime.lsp_document(), Some(reopened));
+        });
+    }
+
+    #[test]
+    fn worktree_removal_callback_retires_original_terminal_after_normal_exit() {
+        removal_callback_test(|| {
+            for (changed_source, changed_generation) in
+                [(false, false), (true, false), (false, true)]
+            {
+                let (mut app, _root, target) = removal_lsp_app();
+                let mut card = super::super::tests::terminal_card_state();
+                let id = card.id;
+                let CardKind::Terminal(session) = &mut card.kind else {
+                    panic!("terminal fixture")
+                };
+                session.launch.working_directory = target.path.clone();
+                session.continuity = TerminalContinuity::Live {
+                    host_session_id: "removal-fixture".into(),
+                    boot_id: "removal-boot".into(),
+                    host_incarnation: "removal-host".into(),
+                };
+                card.residency = Residency::Hot;
+                let original = card.kind.clone();
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards.push(card);
+                durable.card_scopes.insert(id, target.path.clone());
+                app.cards.insert(id, CardRuntime::Loading);
+                app.workspace = Cagents::rebuild_workspace(&app.durable);
+                let capture = app.capture_worktree_removal(&target);
+                assert_eq!(capture.cards.len(), 1);
+
+                if changed_source {
+                    let CardKind::Terminal(session) = &mut app.card_state_mut(id).unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    session.id = TerminalId::new();
+                }
+                if changed_generation {
+                    app.card_state_mut(id).unwrap().generation += 1;
+                }
+                // This is the production transition used by Completed and
+                // nonclean Exited events, before the queued Deleted callback.
+                app.retire_ended_terminal(id, 0, None, true);
+                assert_ne!(app.card_state(id).unwrap().kind, original);
+                assert!(matches!(app.cards.get(&id), Some(CardRuntime::Loading)));
+                assert!(matches!(
+                    app.card_state(id).unwrap().kind,
+                    CardKind::Terminal(TerminalSession {
+                        continuity: TerminalContinuity::RelaunchAvailable { .. },
+                        ..
+                    })
+                ));
+                drop(app.update(Message::ProjectUi(Action::Deleted {
+                    target: target.clone(),
+                    capture,
+                    result: Ok(()),
+                })));
+                let replacement = changed_source || changed_generation;
+                assert_eq!(app.card_state(id).unwrap().existence.is_open(), replacement);
+                assert_eq!(app.cards.contains_key(&id), replacement);
+                assert_eq!(app.durable.card_scopes.contains_key(&id), replacement);
+                if replacement {
+                    assert_eq!(app.durable.card_scopes.get(&id), Some(&target.path));
+                }
+            }
+        });
+    }
+
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.
     fn deletable_app(
@@ -2725,7 +3186,10 @@ mod tests {
                 failure: None,
             },
         );
-        drop(app.handle_project_action(Action::AwaitSessions(target)));
+        drop(app.handle_project_action(Action::AwaitSessions(
+            target.clone(),
+            app.capture_worktree_removal(&target),
+        )));
         assert!(app.project_ui.deletions[&linked.id].failure.is_some());
         assert!(!app.project_ui.is_deleting(linked.id));
     }
@@ -2770,6 +3234,7 @@ mod tests {
                 existence: Existence::Open,
             }]);
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Ok(()),
         });
@@ -2828,6 +3293,7 @@ mod tests {
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
         let _ = app.handle_project_action(Action::ConfirmDelete);
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Ok(()),
         });
@@ -2879,6 +3345,7 @@ mod tests {
 
         let target = app.project_ui.deletions[&id].target.clone();
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target: target.clone(),
             result: Err("fatal: cannot remove".into()),
         });
@@ -2903,6 +3370,7 @@ mod tests {
         let _ = app.handle_project_action(Action::RetryDelete(id));
         assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Err("fatal: cannot remove".into()),
         });
@@ -2990,6 +3458,7 @@ mod tests {
         let _ = app.select_channel(channel);
         let target = app.project_ui.deletions[&id].target.clone();
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Ok(()),
         });
@@ -3368,6 +3837,7 @@ mod tests {
         );
         let target = app.project_ui.deletions[&id].target.clone();
         let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Ok(()),
         });

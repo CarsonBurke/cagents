@@ -269,7 +269,7 @@ async fn explicit_save_seals_typing_even_when_an_existing_save_is_in_flight() {
     }
     insert(&mut runtime, card, 'a');
     let before_save = runtime.editor_text().unwrap();
-    let save = runtime.request_save_inner(card, false, false);
+    let save = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
     assert!(runtime.is_saving());
     assert_eq!(runtime.request_save(card, false).units(), 0);
     insert(&mut runtime, card, 'b');
@@ -292,7 +292,7 @@ async fn automatic_save_does_not_seal_an_ongoing_typing_group() {
         document.history_time = Some(Instant::now());
     }
     insert(&mut runtime, card, 'a');
-    let save = runtime.request_save_inner(card, false, false);
+    let save = runtime.request_save_inner(card, false, SaveTrigger::Automatic);
     assert!(runtime.is_saving());
     insert(&mut runtime, card, 'b');
     drop(runtime.update(RepositoryAction::Undo { card }));
@@ -521,7 +521,8 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
     let SaveOutcome::Saved {
         content_hash,
         durability,
-    } = saved.outcome() else {
+    } = saved.outcome()
+    else {
         panic!("write/search permission must permit publication");
     };
     assert_eq!(*content_hash, blake3::hash(submitted.as_bytes()));
