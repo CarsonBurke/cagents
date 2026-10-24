@@ -444,7 +444,7 @@ os.write(1, b'PAIR_DONE')
         expected.extend(ctrl_down);
         expected.extend(ctrl_up);
         fs::write(home.path().join("expected_len"), expected.len().to_string()).unwrap();
-        close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
+        close_processes::signal(&root.pidfd, libc::SIGCONT).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let actual = loop {
             worker.flush_pty_input();
@@ -645,7 +645,7 @@ fn continuous_scroll_refill_yields_after_the_initial_bounded_batch() {
         }),
     };
     for _ in 0..3 {
-        handle.scroll_delta(1).unwrap();
+        handle.scroll_lines(1).unwrap();
     }
     let first = receiver.try_recv().unwrap();
     let mut carried = None;
@@ -653,7 +653,7 @@ fn continuous_scroll_refill_yields_after_the_initial_bounded_batch() {
     let combined = coalesce_scroll_command_with(first, &receiver, &mut carried, || {
         refills += 1;
         handle
-            .scroll_delta(1)
+            .scroll_lines(1)
             .expect("folded credits allow an actual concurrent-style refill");
     });
     assert_eq!(
@@ -820,7 +820,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        let recovery = holder::Recovery {
+        let recovery = crate::terminal::holder::Recovery {
             source: session.clone(),
             previous_sources: Vec::new(),
             relaunches: Vec::new(),
@@ -863,7 +863,7 @@ fn wrapped_handoff_retains_coalesced_input_and_refuses_before_transfer() {
             .join(format!("unreached-input-carry-{operation}.sock"));
         assert!(!socket.exists());
         let bytes = b"same accepted coalesced input".to_vec();
-        handle.scroll_delta(1).unwrap();
+        handle.scroll_lines(1).unwrap();
         handle.input(bytes.clone()).unwrap();
         let (command, response) = control(operation, socket.clone());
         handle.try_command(command).unwrap();
@@ -1282,7 +1282,7 @@ while True: time.sleep(1)
         boot_id: proof.boot_id.clone(),
         host_incarnation: proof.host_incarnation.clone(),
     };
-    let recovery = holder::Recovery {
+    let recovery = crate::terminal::holder::Recovery {
         source: session.clone(),
         previous_sources: Vec::new(),
         relaunches: Vec::new(),

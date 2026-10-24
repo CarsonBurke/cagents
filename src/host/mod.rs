@@ -329,7 +329,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                     tracing::error!(%error, "startup retained original ownership; recovery-only listener remains available");
                     Ok(())
                 } else {
-                    Err(error)
+                    Err(error.into())
                 }
             }
         }
