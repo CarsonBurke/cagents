@@ -1790,7 +1790,11 @@ enum FileListState {
 
 enum DocumentState {
     None,
-    Loading,
+    Loading {
+        // A dirty/conflicted Reload is only a proposed replacement. Keep its
+        // exact buffer and history until an editable read can replace it.
+        predecessor: Option<EditorDocument>,
+    },
     Editable(EditorDocument),
     Image {
         /// The worktree-relative file the pixels came from, which is not the
@@ -4599,7 +4603,7 @@ impl RepositoryRuntime {
             DocumentState::Image { source, .. }
             | DocumentState::Pdf { source, .. }
             | DocumentState::ReadOnly { path: source, .. } => source,
-            DocumentState::None | DocumentState::Loading | DocumentState::Failed { .. } => {
+            DocumentState::None | DocumentState::Loading { .. } | DocumentState::Failed { .. } => {
                 return None;
             }
         };
@@ -4655,7 +4659,7 @@ impl RepositoryRuntime {
     }
 
     pub fn preview_fragment(&mut self, card: CardId, fragment: &str) -> Task<RepositoryAction> {
-        if matches!(self.document, DocumentState::Loading) {
+        if matches!(self.document, DocumentState::Loading { .. }) {
             self.pending_fragment = Some(fragment.to_owned());
             return Task::none();
         }
@@ -5280,7 +5284,10 @@ impl RepositoryRuntime {
     }
 
     pub fn is_dirty(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.dirty)
+        matches!(&self.document,
+            DocumentState::Editable(document)
+                | DocumentState::Loading { predecessor: Some(document) }
+                if document.dirty)
     }
 
     pub fn can_save(&self) -> bool {
@@ -5288,7 +5295,9 @@ impl RepositoryRuntime {
     }
 
     fn can_discard_edits(&self) -> bool {
-        self.is_dirty() && !self.is_saving() && !self.has_editor_recovery()
+        matches!(&self.document, DocumentState::Editable(document) if document.dirty)
+            && !self.is_saving()
+            && !self.has_editor_recovery()
     }
 
     pub fn can_open_external(&self) -> bool {
@@ -5303,6 +5312,12 @@ impl RepositoryRuntime {
         self.has_editor_recovery()
             || self.is_dirty()
             || self.is_saving()
+            || matches!(
+                &self.document,
+                DocumentState::Loading {
+                    predecessor: Some(_)
+                }
+            )
             || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning().is_some())
     }
 
@@ -5336,7 +5351,7 @@ impl RepositoryRuntime {
         let selected_status = self.selected.as_ref().and_then(|file| file.status.clone());
         let document = match &self.document {
             DocumentState::None => "No file selected",
-            DocumentState::Loading => "Loading",
+            DocumentState::Loading { .. } => "Loading",
             DocumentState::Editable(_) if self.is_saving() => "Saving",
             DocumentState::Editable(document) if document.conflict => "Save conflict",
             DocumentState::Editable(document) if document.durability_warning().is_some() => {
@@ -5479,7 +5494,7 @@ impl RepositoryRuntime {
             FileListState::Ready(_) => {}
         }
         match &self.document {
-            DocumentState::Loading => RepositoryRuntimeStatus::Loading,
+            DocumentState::Loading { .. } => RepositoryRuntimeStatus::Loading,
             DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
             _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
                 Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
@@ -5955,7 +5970,9 @@ impl RepositoryRuntime {
                     )),
                     Err(error) => Err(error),
                 };
-                let attested = result.is_ok();
+                // A refused noneditable replacement does not attest the old
+                // retained buffer merely because its read succeeded.
+                let attested = result.is_ok() && !self.rejects_reload_replacement(&result);
                 let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
                 self.original_read_attested = attested;
                 task
@@ -5965,6 +5982,38 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.original_read_attested = false;
+                if self.rejects_reload_replacement(&result) {
+                    let detail = match &result {
+                        Err(error) => {
+                            local_file_error_detail(&identity.worktree.join(&identity.path), error)
+                        }
+                        Ok(LoadedFile {
+                            source,
+                            content: FileContent::ReadOnly(reason),
+                        }) => read_only_detail(source, reason),
+                        Ok(_) => "The file no longer opens as editable text.".into(),
+                    };
+                    let DocumentState::Loading { predecessor } = &mut self.document else {
+                        unreachable!("only a retained reload rejects its replacement");
+                    };
+                    let mut document = predecessor
+                        .take()
+                        .expect("the rejected reload retains its buffer");
+                    document.error = Some(format!(
+                        "Reload did not replace the editor buffer; your edits were kept. {detail}"
+                    ));
+                    self.document = DocumentState::Editable(document);
+                    // A location requested for the rejected disk read must not
+                    // move the retained buffer's original caret or selection.
+                    self.pending_editor_navigation = None;
+                    self.pending_editor_focus = None;
+                    self.pending_fragment = None;
+                    self.push_lsp_open(&identity.worktree);
+                    return Task::batch([
+                        self.restore_visible_scroll(),
+                        self.focus_editor(identity.card),
+                    ]);
+                }
                 let restored_focus = self
                     .restores_editor_navigation(&identity)
                     .then(|| identity.clone());
@@ -6535,7 +6584,14 @@ impl RepositoryRuntime {
                 }
             }
             RepositoryAction::Reload { card } => {
-                if self.is_saving() {
+                if self.is_saving()
+                    || matches!(
+                        &self.document,
+                        DocumentState::Loading {
+                            predecessor: Some(_)
+                        }
+                    )
+                {
                     return Task::none();
                 }
                 let Some(path) = self.selected.as_ref().map(|file| file.path.clone()) else {
@@ -7339,7 +7395,21 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.original_read_attested = false;
-        self.document = DocumentState::Loading;
+        let predecessor = match std::mem::replace(&mut self.document, DocumentState::None) {
+            DocumentState::Editable(mut document)
+                if reopening && (document.dirty || document.conflict) =>
+            {
+                // Its old-generation callback can never be admitted after
+                // Reload. Retain finished previews, not a permanently busy slot.
+                if let Some(cancel) = document.diagram_cancel.take() {
+                    cancel.0.cancel();
+                }
+                document.diagram_pending = None;
+                Some(document)
+            }
+            _ => None,
+        };
+        self.document = DocumentState::Loading { predecessor };
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -7620,6 +7690,21 @@ impl RepositoryRuntime {
             FileListState::Ready(files) => files.iter().find(|file| file.path == path),
             _ => None,
         }
+    }
+
+    fn rejects_reload_replacement(&self, result: &Result<LoadedFile, FileIoError>) -> bool {
+        matches!(
+            &self.document,
+            DocumentState::Loading {
+                predecessor: Some(_)
+            }
+        ) && !matches!(
+            result,
+            Ok(LoadedFile {
+                content: FileContent::Editable { .. },
+                ..
+            })
+        )
     }
 
     fn next_identity(&mut self, card: CardId, path: PathBuf) -> AsyncIdentity {
@@ -9348,7 +9433,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             "No file selected",
             "Choose a file from the repository list.",
         ),
-        DocumentState::Loading => loading(),
+        DocumentState::Loading { .. } => loading(),
         DocumentState::Failed { path, message } => {
             let name = path.file_name().unwrap_or(path.as_os_str());
             information_state(
@@ -13133,7 +13218,7 @@ mod tests {
             identity: stale,
             result: loaded(),
         }));
-        assert!(matches!(runtime.document, DocumentState::Loading));
+        assert!(matches!(runtime.document, DocumentState::Loading { .. }));
         let identity = runtime.current_identity(card, "notes.md".into());
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
@@ -14346,6 +14431,280 @@ mod tests {
         assert!(context.can_save);
     }
 
+    /// A real file read without opening any save/recovery authority.
+    fn reload_read_fixture(card: CardId) -> (tempfile::TempDir, RepositoryRuntime, AsyncIdentity) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("notes.txt"),
+            "original line\nsecond line\n",
+        )
+        .unwrap();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().to_owned(),
+            worktree: directory.path().to_owned(),
+            selected_file: Some("notes.txt".into()),
+        });
+        drop(runtime.initial_load(card));
+        let identity = runtime.current_identity(card, "notes.txt".into());
+        finish_reload_read(&mut runtime, identity.clone());
+        assert!(runtime.original_read_attested);
+        drop(runtime.take_lsp_intents());
+        (directory, runtime, identity)
+    }
+
+    fn finish_reload_read(runtime: &mut RepositoryRuntime, identity: AsyncIdentity) {
+        let result = crate::editor::read_file_at(
+            &identity.worktree,
+            &identity.path,
+            crate::editor::PdfTone::Original,
+            runtime.original_editor_root.clone(),
+        );
+        drop(runtime.update(RepositoryAction::FileLoadedAt { identity, result }));
+    }
+
+    #[test]
+    fn failed_or_noneditable_reload_keeps_unsaved_text_selection_and_history() {
+        for replacement in ["deleted", "binary", "invalid utf8", "oversize"] {
+            let card = CardId::new();
+            let (directory, mut runtime, stale) = reload_read_fixture(card);
+            move_to_start(&mut runtime, card);
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            let edited = runtime.editor_text().unwrap();
+            let DocumentState::Editable(document) = &mut runtime.document else {
+                panic!()
+            };
+            // The conflict state exposes the ordinary Reload control.
+            let conflict = replacement != "invalid utf8";
+            document.conflict = conflict;
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 0, column: 5 },
+                selection: Some(text_editor::Position { line: 0, column: 1 }),
+            });
+            let cursor = document.content.cursor();
+            let revision = document.revision;
+            let version = document.lsp_version;
+            let saved = document.saved_text.clone();
+            let hash = document.disk_hash;
+            assert!(document.history.can_undo());
+            assert!(!document.history.can_redo());
+            drop(runtime.take_lsp_intents());
+            let stale_read = crate::editor::read_file_at(
+                directory.path(),
+                Path::new("notes.txt"),
+                crate::editor::PdfTone::Original,
+                runtime.original_editor_root.clone(),
+            )
+            .unwrap();
+            let path = directory.path().join("notes.txt");
+            match replacement {
+                "deleted" => std::fs::remove_file(&path).unwrap(),
+                "binary" => std::fs::write(&path, b"whole\0binary").unwrap(),
+                "invalid utf8" => std::fs::write(&path, b"valid prefix\xff").unwrap(),
+                "oversize" => std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(crate::editor::MAX_EDITABLE_FILE_BYTES + 1)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            drop(runtime.update(RepositoryAction::Reload { card }));
+            let pending = runtime.current_identity(card, "notes.txt".into());
+            assert_ne!(pending.generation, stale.generation);
+            assert!(runtime.is_dirty() && runtime.blocks_navigation());
+            assert!(!runtime.can_abandon_unsaved_changes());
+            assert!(!runtime.can_save() && !runtime.can_discard_edits());
+            assert!(runtime.editor_focus_target(card).is_none());
+            assert_eq!(runtime.take_lsp_intents(), vec![LspIntent::Close]);
+
+            // Repeat Reload, navigation, typing and history callbacks may not
+            // replace or mutate the predecessor while its read is pending.
+            for action in [
+                RepositoryAction::Reload { card },
+                RepositoryAction::OpenFile {
+                    card,
+                    path: "other.txt".into(),
+                },
+                RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(text_editor::Edit::Insert('q')),
+                },
+                RepositoryAction::Undo { card },
+                RepositoryAction::DiscardEdits { card },
+            ] {
+                drop(runtime.update(action));
+            }
+            assert_eq!(runtime.current_identity(card, "notes.txt".into()), pending);
+            let DocumentState::Loading {
+                predecessor: Some(document),
+            } = &runtime.document
+            else {
+                panic!("the same unsaved buffer must remain retained")
+            };
+            assert_eq!(document.content.text(), edited);
+            assert_eq!(document.content.cursor(), cursor);
+            assert_eq!(document.revision, revision);
+
+            // A late old-document callback cannot steal the retained buffer.
+            drop(runtime.update(RepositoryAction::FileLoadedAt {
+                identity: stale,
+                result: Ok(stale_read),
+            }));
+            assert!(!runtime.original_read_attested);
+            assert!(runtime.is_dirty() && runtime.blocks_navigation());
+            drop(runtime.preview_fragment(card, "L2:6"));
+            assert!(runtime.pending_fragment.is_some());
+            finish_reload_read(&mut runtime, pending.clone());
+            assert!(
+                !runtime.original_read_attested,
+                "rejected disk bytes cannot attest the old text: {replacement}"
+            );
+            assert_eq!(runtime.current_identity(card, "notes.txt".into()), pending);
+            assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+            assert!(runtime.pending_fragment.is_none());
+            assert!(runtime.pending_editor_navigation.is_none());
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("failed {replacement} reload must keep the editor")
+            };
+            assert_eq!(document.content.text(), edited, "{replacement}");
+            assert_eq!(document.content.cursor(), cursor, "{replacement}");
+            assert_eq!(
+                (document.revision, document.lsp_version),
+                (revision, version)
+            );
+            assert_eq!(document.saved_text, saved);
+            assert_eq!(document.disk_hash, hash);
+            assert_eq!(document.conflict, conflict);
+            assert!(document.dirty);
+            assert!(document.history.can_undo() && !document.history.can_redo());
+            let detail = runtime.save_error().unwrap();
+            assert!(detail.contains("your edits were kept"), "{detail}");
+            let expected = match replacement {
+                "deleted" => "on this device",
+                "binary" => "binary data",
+                "invalid utf8" => "not valid UTF-8",
+                "oversize" => "editable files are limited",
+                _ => unreachable!(),
+            };
+            assert!(detail.contains(expected), "{replacement}: {detail}");
+            assert!(runtime.is_dirty() && runtime.blocks_navigation());
+            assert!(
+                matches!(runtime.take_lsp_intents().as_slice(), [LspIntent::Open { text, version: open_version, .. }] if text == &LspChangeText::from(edited.as_str()) && *open_version == version)
+            );
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some("original line\nsecond line\n")
+            );
+            drop(runtime.update(RepositoryAction::Redo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+        }
+    }
+
+    #[test]
+    fn successful_reload_still_replaces_clean_and_explicitly_reloaded_dirty_documents() {
+        for dirty in [false, true] {
+            let card = CardId::new();
+            let (directory, mut runtime, stale) = reload_read_fixture(card);
+            if dirty {
+                move_to_start(&mut runtime, card);
+                drop(runtime.update(RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+                }));
+            }
+            std::fs::write(directory.path().join("notes.txt"), "replacement text\n").unwrap();
+            drop(runtime.update(RepositoryAction::Reload { card }));
+            let current = runtime.current_identity(card, "notes.txt".into());
+            assert_ne!(current.generation, stale.generation);
+            assert_eq!(runtime.is_dirty(), dirty);
+            // A result for another selected path with this generation is refused too.
+            let mut foreign = current.clone();
+            foreign.path = "other.txt".into();
+            drop(runtime.update(RepositoryAction::FileLoaded {
+                identity: foreign,
+                result: Err(FileIoError::Io("unrelated".into())),
+            }));
+            assert!(matches!(runtime.document, DocumentState::Loading { .. }));
+            finish_reload_read(&mut runtime, current);
+            assert_eq!(runtime.editor_text().as_deref(), Some("replacement text\n"));
+            assert!(runtime.original_read_attested);
+            assert!(!runtime.is_dirty() && !runtime.blocks_navigation());
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!()
+            };
+            assert!(!document.history.can_undo() && !document.history.can_redo());
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some("replacement text\n"));
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
+                "replacement text\n"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_reload_releases_obsolete_diagram_work_without_forgetting_the_buffer() {
+        let card = CardId::new();
+        let (directory, mut runtime, stale) = reload_read_fixture(card);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!()
+        };
+        document.markdown = true;
+        document.conflict = true;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::SelectAll,
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "```mermaid\nflowchart LR; A-->B\n```\n".into(),
+            ))),
+        }));
+        runtime.markdown_mode = MarkdownMode::Preview;
+        drop(runtime.diagram_task(card));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        let revision = document.revision;
+        let tone_generation = document.diagram_tone_generation;
+        let cancel = document.diagram_cancel.as_ref().unwrap().0.clone();
+        assert!(document.diagram_pending.is_some());
+        std::fs::remove_file(directory.path().join("notes.txt")).unwrap();
+        drop(runtime.update(RepositoryAction::Reload { card }));
+        assert!(cancel.is_cancelled());
+        let current = runtime.current_identity(card, "notes.txt".into());
+        finish_reload_read(&mut runtime, current);
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity: stale,
+            revision,
+            tone_generation,
+            result: vec![(
+                blake3::hash(b"flowchart LR; A-->B"),
+                preview::Diagram::Error("obsolete".into()),
+            )],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.diagram_pending, None);
+        assert!(document.diagram_cancel.is_none() && document.diagrams.is_empty());
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.diagram_pending, Some(revision));
+        assert!(!document.diagram_cancel.as_ref().unwrap().0.is_cancelled());
+        assert!(document.content.text().contains("flowchart LR; A-->B"));
+        assert!(document.history.can_undo());
+    }
+
     #[test]
     fn reload_and_overwrite_resolve_post_persist_durability_warning_explicitly() {
         if super::retained_save_tests::isolated_test(
@@ -14743,7 +15102,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        runtime.document = DocumentState::Loading;
+        runtime.document = DocumentState::Loading { predecessor: None };
 
         let _refresh = runtime.update(RepositoryAction::RefreshFiles { card });
         assert_eq!(runtime.generation, 4);
@@ -15510,7 +15869,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        runtime.document = DocumentState::Loading;
+        runtime.document = DocumentState::Loading { predecessor: None };
         let stale = AsyncIdentity {
             card: CardId::new(),
             worktree: PathBuf::from("/repo"),
@@ -15529,7 +15888,7 @@ mod tests {
             }),
         });
         assert!(
-            matches!(runtime.document, DocumentState::Loading),
+            matches!(runtime.document, DocumentState::Loading { .. }),
             "a stale load neither fills nor clears the document still on its way"
         );
         assert_eq!(
@@ -19749,7 +20108,7 @@ mod tests {
             path: path.clone(),
         }));
         assert_eq!(runtime.selected_path(), Some(path.as_path()));
-        assert!(matches!(runtime.document, DocumentState::Loading));
+        assert!(matches!(runtime.document, DocumentState::Loading { .. }));
         assert!(
             !runtime.selected.as_ref().unwrap().changed(),
             "ignored files are not working changes"
