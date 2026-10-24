@@ -1944,6 +1944,7 @@ mod tests {
         assert!(app.adopt_execution_agent(&agent).is_none());
         drop(app.update(Message::ProjectUi(
             crate::app::project_ui::Action::Deleted {
+                capture: app.capture_worktree_removal(&deletion),
                 target: deletion,
                 result: Err("fixture deletion refused".into()),
             },
