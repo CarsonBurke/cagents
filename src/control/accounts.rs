@@ -1,6 +1,7 @@
 use super::*;
 use crate::account::info::{Query, Report};
 
+mod check;
 mod link;
 mod list;
 mod preferences;
@@ -8,6 +9,8 @@ mod removal;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountCommand {
+    /// Observe one Codex account's default policy and explicitly requested capabilities.
+    Check(check::Args),
     /// Register an existing provider home on this device, or on --device.
     /// Does not transfer credentials or verify coding access.
     Link {
@@ -56,6 +59,7 @@ pub enum AccountCommand {
 
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
+        AccountCommand::Check(args) => return check::execute(args),
         AccountCommand::Link { provider, home } => return link::execute(provider, home),
         AccountCommand::Default {
             provider,

@@ -175,7 +175,9 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
-pub const PROTOCOL_VERSION: u16 = 105;
+/// Version 106 adds selected-account capability check request/report frames.
+/// A matched set refuses an older daemon instead of inventing readiness.
+pub const PROTOCOL_VERSION: u16 = 106;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
