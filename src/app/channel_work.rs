@@ -1651,8 +1651,8 @@ mod tests {
             );
             assert_eq!(repository_state(&frame), (PREFIX.into(), 46, 46));
             let cache = frame.into_cache();
-            // /pull/ remains incomplete. Typing the first numeric PR digit
-            // enters the current URL-normalization path, a separate UX issue.
+            // Keep this poll diagnostic at the incomplete /pull/ boundary.
+            // The separate full-URL typing parent covers all numeric digits.
             let cache = repository_characters(
                 &mut app,
                 cache,
@@ -1733,7 +1733,7 @@ mod tests {
             drop(app.update(message));
             let mut frame = mount(&app, cache, &mut renderer);
             assert!(same(&active(&mut frame, &renderer), &repository));
-            assert_eq!(repository_state(&frame).0, "nativefixturefork/cagents");
+            assert_eq!(repository_state(&frame).0, URL);
             let (_, submit) = labelled(&mut frame, &renderer, "Track PR");
             let messages = click(&mut frame, &mut renderer, submit.center());
             let _ = frame.into_cache();

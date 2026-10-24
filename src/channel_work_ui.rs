@@ -188,6 +188,31 @@ impl Form {
                     || !self.repository.is_empty()
                     || !self.number.is_empty()))
     }
+    // Parsing must not rewrite the edited field: a typed /pull/1 can still
+    // become /pull/1568. Only an explicit edit to a split identity field
+    // switches a complete URL back to the split-field representation.
+    fn repository_url(&self) -> Option<PullRequestKey> {
+        if self.repository.trim() != self.repository
+            || self.repository.chars().any(char::is_control)
+        {
+            return None;
+        }
+        let Target::PullRequest(key) =
+            Target::PullRequest(PullRequestKey::from_url(&self.repository).ok()?)
+                .canonicalized()
+                .ok()?
+        else {
+            return None;
+        };
+        Some(key)
+    }
+
+    fn use_split_repository(&mut self) {
+        if let Some(key) = self.repository_url() {
+            self.repository = format!("{}/{}", key.repository.owner, key.repository.name);
+        }
+    }
+
     fn target(&self) -> Result<Target, &'static str> {
         if let Some(target) = &self.fixed {
             return Ok(target.clone());
@@ -197,6 +222,14 @@ impl Form {
             || self.number.trim() != self.number
         {
             return Err("Remove leading or trailing spaces from the PR identity.");
+        }
+        if self.repository.contains("://") {
+            return Target::PullRequest(
+                self.repository_url()
+                    .ok_or("Enter a complete HTTPS pull request URL.")?,
+            )
+            .canonicalized()
+            .map_err(|_| "Enter a valid PR identity.");
         }
         let (owner, name) = self
             .repository
@@ -786,23 +819,21 @@ impl State {
                     return None;
                 }
                 match field {
-                    Field::Host => form.host = value,
+                    Field::Host => {
+                        form.use_split_repository();
+                        form.host = value;
+                    }
                     Field::Repository => {
-                        if let Some(Target::PullRequest(key)) = (value.trim() == value
-                            && !value.chars().any(char::is_control))
-                        .then(|| PullRequestKey::from_url(&value).ok())
-                        .flatten()
-                        .and_then(|key| Target::PullRequest(key).canonicalized().ok())
-                        {
+                        form.repository = value;
+                        if let Some(key) = form.repository_url() {
                             form.host = key.repository.authority();
-                            form.repository =
-                                format!("{}/{}", key.repository.owner, key.repository.name);
                             form.number = key.number.to_string();
-                        } else {
-                            form.repository = value;
                         }
                     }
-                    Field::Number => form.number = value,
+                    Field::Number => {
+                        form.use_split_repository();
+                        form.number = value;
+                    }
                 }
             }
             Action::Role(owner, index) if self.writable(owner.view) => {

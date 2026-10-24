@@ -1787,7 +1787,7 @@ fn repository_native_url_paste_fills_full_fork_port_and_u64_then_explicit_submit
     let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
     assert_eq!(form.owner, owner);
     assert_eq!(form.host, "forge.example:8443");
-    assert_eq!(form.repository, "fork/repository");
+    assert_eq!(form.repository, url, "the edited URL remains intact");
     assert_eq!(form.number, u64::MAX.to_string());
     assert_eq!(form.role, Role::Review);
     assert_eq!(form.expected_revision, 0);
@@ -2098,4 +2098,131 @@ fn role_choice_queued_callback_and_native_hold_cannot_move_to_a_replaced_form() 
         assert_role_choices(&ui, width, "Reference");
         let _ = ui.into_cache();
     }
+}
+
+#[test]
+fn explicit_host_and_number_edits_detach_raw_url_and_submit_only_the_overridden_identity() {
+    const URL: &str = "https://Forge.Example:8443/Fork/Repository/pull/18446744073709551615/";
+    for (field, replacement, host, port, number) in [
+        (
+            Field::Host,
+            "another.example:9443",
+            "another.example",
+            Some(9443),
+            u64::MAX,
+        ),
+        (Field::Number, "1568", "forge.example", Some(8443), 1568),
+    ] {
+        let mut state = ready(home(10), vec![]);
+        state.update(Action::Attach(state.owner().unwrap()));
+        let owner = state.view.as_ref().unwrap().form.as_ref().unwrap().owner;
+        state.update(Action::Field(owner, Field::Repository, URL.into()));
+        state.update(Action::Role(owner, 3));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+        let point = bounds(&ui, "Track PR").center();
+        let old_submit = click(&mut ui, &mut renderer, point).remove(0);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(form_input_id(owner, field)),
+        );
+        let messages = repository_paste(&mut ui, &mut renderer, replacement);
+        let cache = ui.into_cache();
+        assert!(
+            matches!(messages.as_slice(), [Action::Field(actual, kind, value)] if *actual == owner && std::mem::discriminant(kind) == std::mem::discriminant(&field) && value == replacement)
+        );
+        assert!(state.update(messages.into_iter().next().unwrap()).is_none());
+        let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+        assert_eq!(
+            form.repository, "fork/repository",
+            "an explicit split edit detaches the raw URL"
+        );
+        assert_eq!(form.role, Role::Reference);
+        assert!(
+            state.update(old_submit).is_none(),
+            "a captured pre-override Submit cannot claim the old URL"
+        );
+        assert!(state.pending.is_empty());
+        let mut ui = cached(&state, cache, &mut renderer, 800.0, 1800.0);
+        let point = bounds(&ui, "Track PR").center();
+        let messages = click(&mut ui, &mut renderer, point);
+        let _ = ui.into_cache();
+        let expected = Target::PullRequest(
+            PullRequestKey::new(
+                GitHubRepoKey::new(host, port, "fork", "repository").unwrap(),
+                number,
+            )
+            .unwrap(),
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Submit { owner: actual, target, role: Role::Reference, revision: 0 }] if *actual == owner && target == &expected)
+        );
+        let Some(Effect::Mutate { mutation, .. }) =
+            state.update(messages.into_iter().next().unwrap())
+        else {
+            panic!("the explicit current split identity must submit");
+        };
+        assert_eq!(mutation.home, home(10));
+        assert_eq!(mutation.expected_revision, 0);
+        assert_eq!(
+            mutation.change,
+            Change::Claim {
+                target: expected,
+                role: Role::Reference
+            }
+        );
+    }
+}
+
+#[test]
+fn incomplete_url_edit_disables_submit_and_refuses_a_previously_captured_complete_target() {
+    const URL: &str = "https://Forge.Example:8443/Fork/Repository/pull/1568";
+    let mut state = ready(home(10), vec![]);
+    let owner = filled_form(&mut state);
+    state.update(Action::Field(owner, Field::Repository, URL.into()));
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let point = bounds(&ui, "Track PR").center();
+    let old_submit = click(&mut ui, &mut renderer, point).remove(0);
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(form_input_id(owner, Field::Repository)),
+    );
+    let incomplete = URL.trim_end_matches("1568");
+    let messages = repository_paste(&mut ui, &mut renderer, incomplete);
+    let cache = ui.into_cache();
+    assert!(
+        matches!(messages.as_slice(), [Action::Field(actual, Field::Repository, value)] if *actual == owner && value == incomplete)
+    );
+    state.update(messages.into_iter().next().unwrap());
+    assert!(state.update(old_submit).is_none());
+    assert!(state.pending.is_empty());
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    assert_eq!(form.repository, incomplete);
+    assert_eq!(form.host, "forge.example:8443");
+    assert_eq!(
+        form.number, "1568",
+        "last derived fields are not permission to submit an incomplete URL"
+    );
+    assert!(form.target().is_err());
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1800.0);
+    let point = bounds(&ui, "Track PR").center();
+    assert!(click(&mut ui, &mut renderer, point).is_empty());
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(form_input_id(owner, Field::Repository)),
+    );
+    let messages = repository_paste(&mut ui, &mut renderer, URL);
+    let cache = ui.into_cache();
+    state.update(messages.into_iter().next().unwrap());
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1800.0);
+    let point = bounds(&ui, "Track PR").center();
+    let messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let expected = Target::PullRequest(PullRequestKey::from_url(URL).unwrap())
+        .canonicalized()
+        .unwrap();
+    assert!(
+        matches!(messages.as_slice(), [Action::Submit { owner: actual, target, role: Role::Contribute, revision: 0 }] if *actual == owner && target == &expected)
+    );
 }
