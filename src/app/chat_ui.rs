@@ -15308,6 +15308,17 @@ mod tests {
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        // Client publications retire independently from presentation/parser
+        // state. Observe this exact old body leaving both ownership graphs;
+        // the presentation barrier alone cannot acknowledge client disposal.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while old_answer.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the selected child's client retirement did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(old_answer.upgrade().is_none());
         assert_eq!(runtime.selected_subagent.as_deref(), Some("child"));
         assert_eq!(runtime.composer.text(), "Unsent draft");
