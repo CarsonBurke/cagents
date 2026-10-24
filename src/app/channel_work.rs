@@ -604,6 +604,7 @@ impl Cagents {
                 })
                 .map(|channel| channel.title.clone());
             if let Some(title) = current {
+                self.channel_work.view.set_title(home, title.clone());
                 self.channel_work.title = title;
                 if changed_view {
                     let task = self.select_channel(home.channel);
@@ -1166,6 +1167,7 @@ mod tests {
 
     #[test]
     fn background_work_poll_invalidation_and_pages_preserve_the_accepted_workspace_scope() {
+        let mut renderer = super::super::tests::headless_renderer();
         for source in ["poll", "invalidation", "earlier", "latest"] {
             let (mut app, home) = main_fixture();
             let (other, _, target) = two_channels(&mut app, home);
@@ -1240,6 +1242,9 @@ mod tests {
             );
             assert_eq!(app.channel_work.view.owner(), Some(owner));
             assert_eq!(app.channel_home().unwrap().1, "Renamed while reading");
+            let labels = leaf_labels(&app, &mut renderer);
+            assert!(labels.iter().any(|label| label == "Renamed while reading"));
+            assert!(!labels.iter().any(|label| label == "Original"));
             assert!(
                 app.channel_work.view.refresh().is_none(),
                 "{source} really began a read, and coalesces another"
@@ -1327,6 +1332,101 @@ mod tests {
             drop(app.update_channel_work(ui::Action::Close(owner)));
             assert_eq!(app.channel_work.view.has_confirmation(), dirty);
         }
+    }
+
+    #[test]
+    fn exact_home_title_refresh_preserves_dirty_draft_and_inflight_read() {
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = main_fixture();
+        dirty_native_form(&mut app, &mut renderer);
+        let owner = app.channel_work.view.owner().unwrap();
+        let Some(Effect::Read { ticket, .. }) = app.channel_work.view.refresh() else {
+            panic!("fixture inflight read")
+        };
+        let before = (
+            app.channel_work.generation,
+            app.workspace_view_generation,
+            app.channel_work.restore_card,
+            app.durable.active_channel,
+        );
+        for wrong_home in [
+            Home {
+                registry: uuid::Uuid::new_v4(),
+                ..home
+            },
+            Home {
+                channel: ChannelId::new(),
+                ..home
+            },
+            Home {
+                creation_ordinal: home.creation_ordinal + 1,
+                ..home
+            },
+        ] {
+            app.channel_work
+                .view
+                .set_title(wrong_home, "Wrong channel".into());
+            let labels = leaf_labels(&app, &mut renderer);
+            assert!(labels.iter().any(|label| label == "Original"));
+            assert!(!labels.iter().any(|label| label == "Wrong channel"));
+        }
+        app.channel_work
+            .view
+            .set_title(home, "Canonical rename".into());
+        let labels = leaf_labels(&app, &mut renderer);
+        assert!(labels.iter().any(|label| label == "Canonical rename"));
+        assert!(!labels.iter().any(|label| label == "Original"));
+        assert_eq!(app.channel_work.view.owner(), Some(owner));
+        assert!(!app.channel_work.view.has_confirmation());
+        assert!(
+            app.channel_work.view.refresh().is_none(),
+            "the original read is still loading"
+        );
+        drop(app.update_channel_work(ui::Action::Loaded {
+            ticket,
+            result: Ok(history_snapshot(home, None)),
+        }));
+        assert!(
+            app.channel_work.view.refresh().is_some(),
+            "the original matching reply still settles the read"
+        );
+        assert_eq!(
+            (
+                app.channel_work.generation,
+                app.workspace_view_generation,
+                app.channel_work.restore_card,
+                app.durable.active_channel,
+            ),
+            before,
+        );
+        // The title update neither discards the real edited draft nor turns
+        // closing into an unguarded navigation.
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        assert!(app.channel_work.view.has_confirmation());
+    }
+
+    fn leaf_labels(app: &Cagents, renderer: &mut cosmic::Renderer) -> Vec<String> {
+        // Mount only the Work leaf: Chrome's separate title must not satisfy
+        // the rendered heading assertion.
+        let mut ui = iced::runtime::UserInterface::build(
+            app.channel_work.view.view(700.0, 600.0),
+            iced::Size::new(700.0, 600.0),
+            Cache::new(),
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
     }
 
     fn discard_native(app: &mut Cagents, renderer: &mut cosmic::Renderer) {

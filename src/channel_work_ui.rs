@@ -299,6 +299,13 @@ impl State {
     pub fn home(&self) -> Option<Home> {
         self.view.as_ref().map(|view| view.owner.home)
     }
+    /// Refresh presentation metadata for the exact open channel incarnation.
+    /// This does not open a view or change its draft, tickets or navigation.
+    pub fn set_title(&mut self, home: Home, title: String) {
+        if let Some(view) = self.view.as_mut().filter(|view| view.owner.home == home) {
+            view.title = title;
+        }
+    }
     pub fn pending_homes(&self) -> impl Iterator<Item = Home> + '_ {
         self.pending.iter().map(|pending| pending.mutation.home)
     }
