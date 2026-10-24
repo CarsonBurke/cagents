@@ -168,6 +168,30 @@ impl ExecutionContext {
     pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
         self.directory.clone()
     }
+    /// Return the descriptor used by spawn, never a new lookup of its pathname.
+    pub(crate) fn pinned_launch_directory(
+        &self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            std::sync::Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        let directory = self
+            .directory_descriptor()
+            .ok_or("This provider has no original launch-directory descriptor")?;
+        let identity = directory.metadata().map_err(|error| error.to_string())?;
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(&identity);
+        validate_launch_directory(&directory, identity)?;
+        if self
+            .expected_directory
+            .is_some_and(|expected| expected != identity)
+        {
+            return Err("Original launch-directory identity changed".into());
+        }
+        Ok((identity, directory))
+    }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
     pub(crate) fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) {
@@ -256,6 +280,26 @@ impl ExecutionContext {
         Ok(())
     }
 }
+/// Validate both local and received pins without reopening a filesystem path.
+pub(crate) fn validate_launch_directory(
+    directory: &std::fs::File,
+    expected: crate::agent_execution::DirectoryIdentity,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != expected
+    {
+        return Err("Launch-directory descriptor does not match its original identity".into());
+    }
+    // Received descriptors must not escape through a subsequent provider exec.
+    let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err("Launch-directory descriptor is not close-on-exec".into());
+    }
+    Ok(())
+}
+
 impl ProcessSpec {
     pub(crate) fn remove_unset_environment(&mut self) {
         self.environment
