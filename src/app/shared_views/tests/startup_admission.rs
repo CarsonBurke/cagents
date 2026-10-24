@@ -10,7 +10,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixListener},
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -71,6 +71,8 @@ struct ScriptedDaemon {
     resolutions: Arc<Mutex<Vec<Session>>>,
     connections: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
     stopped: Arc<AtomicBool>,
+    visibility_cancellations: Arc<AtomicUsize>,
+    visibility_canceled: std::sync::mpsc::Receiver<u64>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -88,6 +90,9 @@ impl ScriptedDaemon {
         let resolutions = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
+        let visibility_cancellations = Arc::new(AtomicUsize::new(0));
+        let (visibility_canceled_tx, visibility_canceled) = std::sync::mpsc::channel();
+        let cancellations = visibility_cancellations.clone();
         let recorded = providers.clone();
         let resolved = resolutions.clone();
         let sockets = connections.clone();
@@ -121,6 +126,8 @@ impl ScriptedDaemon {
                 let proof = proof.clone();
                 let upgrade = upgrade.clone();
                 let stop = stop.clone();
+                let cancellations = cancellations.clone();
+                let visibility_canceled_tx = visibility_canceled_tx.clone();
                 clients.push(std::thread::spawn(move || {
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
@@ -132,6 +139,11 @@ impl ScriptedDaemon {
                             Err(_) if stop.load(Ordering::Acquire) => break,
                             Err(error) => panic!("scripted client read: {error}"),
                         };
+                        let replaceable_visibility = matches!(
+                            &request.request,
+                            ClientRequest::ChatVisibility { chat_id, .. }
+                                if upgrade.as_ref().is_some_and(|script| *chat_id == script.canonical.id)
+                        );
                         let message = match request.request {
                             ClientRequest::Connect { .. } => ServerMessage::Response {
                                 response: ServerResponse::Connected {
@@ -229,6 +241,17 @@ impl ScriptedDaemon {
                             if stop.load(Ordering::Acquire) {
                                 break;
                             }
+                            if replaceable_visibility
+                                && matches!(&error, crate::terminal_ipc::FrameError::Io(io)
+                                    if matches!(io.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset))
+                            {
+                                // The offscreen attachment queues replaceable visibility
+                                // before Ready. A retired target drops that late handle,
+                                // shutting down its socket without awaiting this reply.
+                                cancellations.fetch_add(1, Ordering::AcqRel);
+                                let _ = visibility_canceled_tx.send(request.request_id);
+                                break;
+                            }
                             panic!("scripted client write: {error}");
                         }
                     }
@@ -243,6 +266,8 @@ impl ScriptedDaemon {
             resolutions,
             connections,
             stopped,
+            visibility_cancellations,
+            visibility_canceled,
             worker: Some(worker),
         }
     }
@@ -1323,4 +1348,151 @@ fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignore
         return;
     }
     exercise_canonical_upgrade(false, true);
+}
+
+#[test]
+fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission() {
+    if isolated("an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission") {
+        return;
+    }
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    fn exchange(
+        stream: &mut UnixStream,
+        proof: &HostSessionProof,
+        request_id: u64,
+        request: ClientRequest,
+    ) -> ServerResponse {
+        let connecting = matches!(&request, ClientRequest::Connect { .. });
+        write_frame(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                proof: (!connecting).then(|| proof.clone()),
+                request,
+            },
+        )
+        .unwrap();
+        let reply = read_frame::<ServerEnvelope>(stream).unwrap().unwrap();
+        assert_eq!(reply.version, PROTOCOL_VERSION);
+        assert_eq!(reply.request_id, Some(request_id));
+        assert_eq!(&reply.proof, proof);
+        match reply.message {
+            ServerMessage::Response { response } => response,
+            other => panic!("expected actual handshake reply: {other:?}"),
+        }
+    }
+
+    let (_app, _, _, pane, _) = cached_chat();
+    let CardKind::Chat(source) = pane.kind else {
+        unreachable!()
+    };
+    let mut canonical = source.clone();
+    let proof = HostSessionProof {
+        host_session_id: "live-host".into(),
+        boot_id: "boot".into(),
+        host_incarnation: "live-incarnation".into(),
+    };
+    canonical.proof = Some(proof.clone());
+    let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: source.clone(),
+        canonical: canonical.clone(),
+        refuse_lineage: false,
+    }));
+    for close_reader in [true, false] {
+        let mut stream =
+            UnixStream::connect(crate::terminal_ipc::daemon_socket_path().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        match exchange(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: None,
+                resume: vec![],
+            },
+        ) {
+            ServerResponse::Connected {
+                proof: connected,
+                resumed,
+            } => {
+                assert_eq!(connected, proof);
+                assert!(resumed.is_empty());
+            }
+            other => panic!("Connect must succeed: {other:?}"),
+        }
+        match exchange(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::ResolveUpgradeChat {
+                source: source.clone(),
+            },
+        ) {
+            ServerResponse::UpgradeChatResolved { session } => assert_eq!(session, canonical),
+            other => panic!("exact lineage must succeed: {other:?}"),
+        }
+        match exchange(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::ChatAttach {
+                session: canonical.clone(),
+            },
+        ) {
+            ServerResponse::ChatAttached { session, snapshot } => {
+                assert_eq!(session, canonical);
+                assert!(snapshot.ready);
+                assert_eq!(snapshot.session_id, canonical.launch.session_id);
+            }
+            other => panic!("exact attachment must succeed: {other:?}"),
+        }
+        let visibility = ClientRequest::ChatVisibility {
+            chat_id: canonical.id,
+            visible: false,
+        };
+        if close_reader {
+            // Keep the write half live so the real server receives the whole
+            // request after its peer has already stopped accepting replies.
+            stream.shutdown(Shutdown::Read).unwrap();
+            write_frame(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 4,
+                    proof: Some(proof.clone()),
+                    request: visibility,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                daemon
+                    .visibility_canceled
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap(),
+                4
+            );
+        } else {
+            assert!(matches!(
+                exchange(&mut stream, &proof, 4, visibility),
+                ServerResponse::Accepted
+            ));
+        }
+        assert_eq!(daemon.visibility_cancellations.load(Ordering::Acquire), 1);
+    }
+    assert_eq!(daemon.resolutions(), vec![source.clone(), source]);
+    assert_eq!(daemon.requests(), vec![canonical.clone(), canonical]);
+    assert!(matches!(
+        daemon.visibility_canceled.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    // Drop must join both actual server connections without masking a panic.
+    drop(daemon);
 }
