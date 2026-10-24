@@ -216,6 +216,22 @@ impl Handle {
             _ => Err("This actor has no retained source authority".into()),
         }
     }
+    /// Physical launch-directory evidence. The service caller must separately
+    /// validate that this is still its current exact actor before using it.
+    pub(crate) fn pinned_launch_directory(
+        &self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            std::sync::Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        match &self.0 {
+            Owner::Local(local) => local.pinned_launch_directory(),
+            Owner::Remote(remote) => remote.pinned_launch_directory(),
+        }
+    }
     pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         match &self.0 {
             Owner::Local(local) => local.provider_process(),
