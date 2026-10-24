@@ -17985,7 +17985,13 @@ mod tests {
         let _admission = attachment_draft::test_admission();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
         let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
         write(&mut app, card, "accepted ");
         let bookmark = app
             .chat_runtime_mut(target)
@@ -18014,16 +18020,43 @@ mod tests {
             "the previously accepted send continues"
         );
         assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert_eq!(
+            runtime.pending.as_ref().unwrap().sent.as_deref(),
+            Some("accepted paste")
+        );
 
         settle(&mut app, card, Ok(()));
         let runtime = chat_runtime(&app, card);
         assert!(runtime.pending.is_none());
         assert_eq!(runtime.composer.text(), "");
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(app.channel_work_is_main());
+
+        // Hidden transcript-derived history is disposable. The daemon hydrates
+        // it again only after the reader returns to the actual visible pane.
+        return_to_chat(&mut app);
+        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.visible.load(Ordering::Relaxed));
+        assert_eq!(runtime.target, target);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        let mut hydrated = (*handle.snapshot()).clone();
+        hydrated.generation = hydrated.generation.checked_add(1).unwrap();
+        hydrated.items = vec![Arc::new(chat::Item {
+            id: "accepted-paste".into(),
+            role: chat::Role::User,
+            content: text("accepted paste"),
+            started_at: None,
+            at: None,
+        })];
+        handle.replace_snapshot_for_test(hydrated);
+        drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        preparation::drain_fixture(runtime);
         assert_eq!(
             runtime.history.last().map(String::as_str),
             Some("accepted paste")
         );
-        assert!(app.channel_work_is_main());
     }
 
     #[test]
@@ -20867,6 +20900,12 @@ mod tests {
     /// either order, including when its chat never got as far as starting.
     #[test]
     fn a_channel_closes_when_its_last_pane_does() {
+        use crate::workspace_model::{
+            ModelChannel, ModelEdit, ModelProject,
+            views::{Pane, Scope, View},
+        };
+        use super::super::workspace_model_sync::ModelUpdate;
+
         for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
             let mut app = crate::app::tests::context_inspector_test_app(true);
             let terminal = app.workspace.focused().unwrap();
@@ -20874,14 +20913,24 @@ mod tests {
             app.cards
                 .insert(terminal, CardRuntime::Failed("fixture".into()));
             let channel = crate::model::ChannelId::new();
+            let project = ProjectId::new();
+            let repository = PathBuf::from(FIXTURE_DIRECTORY);
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "Fixture project".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            ));
             let durable = Arc::make_mut(&mut app.durable);
             durable.channels.push(crate::model::ProjectChannel {
                 title_source: Default::default(),
                 id: channel,
-                project_id: crate::model::ProjectId::new(),
+                project_id: project,
                 title: String::new(),
-                ordinal: 0,
-                shared: false,
+                ordinal: 4,
+                shared: true,
                 cards: vec![terminal],
                 focused: Some(terminal),
             });
@@ -20893,6 +20942,47 @@ mod tests {
                 1 => failed_chat(&mut app),
                 _ => live_chat(&mut app, Some("thread")),
             };
+            // A confirmed canonical Home, rather than an unregistered local
+            // channel: only its authoritative disappearance permits retirement.
+            let home = crate::channel_work::Home {
+                registry: uuid::Uuid::new_v4(),
+                channel,
+                creation_ordinal: 4,
+            };
+            let scope = Scope::Channel(channel);
+            app.workspace_model.identity = home.registry;
+            app.workspace_model.sequence = 10;
+            app.workspace_model.projects.push(ModelProject {
+                repository: repository.clone(),
+                name: "Fixture project".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            });
+            app.workspace_model.channels.push(ModelChannel {
+                id: channel,
+                repository,
+                title: String::new(),
+                title_source: Default::default(),
+                ordinal: home.creation_ordinal,
+            });
+            let panes = [terminal, chat]
+                .into_iter()
+                .map(|card| Pane::from_card(app.card_state(card).unwrap(), None).unwrap())
+                .collect();
+            app.workspace_model.views.push(View {
+                scope: scope.clone(),
+                revision: 7,
+                panes,
+                retired: Vec::new(),
+            });
+            let (publish, published) = async_channel::unbounded();
+            app.workspace_model_tx = publish;
+            let occupied = app.workspace_model.clone();
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: scope.clone(),
+                operation: None,
+                model: occupied,
+            }));
             let channel_exists = |app: &Cagents| {
                 app.durable
                     .channels
@@ -20904,7 +20994,7 @@ mod tests {
             } else {
                 (terminal, chat)
             };
-            for (index, card) in [first, second].into_iter().enumerate() {
+            for card in [first, second] {
                 if card == chat {
                     close_chat(&mut app, card);
                 } else {
@@ -20912,12 +21002,59 @@ mod tests {
                     let _ = app.update(Message::CommitClose(card));
                     assert!(!app.workspace.order().any(|id| id == card));
                 }
-                assert_eq!(
+                assert!(
                     channel_exists(&app),
-                    index == 0,
-                    "chat first: {chat_first}, chat state: {chat_state}"
+                    "no eager deletion before canonical empty-view proof: chat first: {chat_first}, chat state: {chat_state}"
                 );
             }
+            assert!(!app.channel_ui.was_deleted(channel));
+            assert!(app.channel_work.retire_candidates.contains(&home));
+            let mut before_ack = Vec::new();
+            while let Ok(edit) = published.try_recv() {
+                before_ack.push(edit);
+            }
+            assert!(
+                !before_ack.iter().any(|edit| matches!(edit, ModelEdit::RetireEmptyChannel { .. })),
+                "the occupied canonical view cannot authorize retirement: {before_ack:?}"
+            );
+
+            let mut settled = app.workspace_model.clone();
+            settled.sequence = 11;
+            let view = settled.views.iter_mut().find(|view| view.scope == scope).unwrap();
+            view.panes.clear();
+            view.retired = vec![terminal, chat];
+            view.revision = 8;
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model: settled.clone(),
+            }));
+            let mut after_ack = Vec::new();
+            while let Ok(edit) = published.try_recv() {
+                after_ack.push(edit);
+            }
+            let retire_requests = after_ack.iter().filter_map(|edit| match edit {
+                ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
+                    Some((*home, *expected_view_revision))
+                }
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(retire_requests, vec![(home, 8)], "{after_ack:?}");
+
+            // These are explicit App model-reply fixtures, not an executed
+            // daemon or Work DB. HOST integration owns the actual ledger check.
+            // A retained-Work reply preserves the confirmed empty Home.
+            settled.sequence = 12;
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(settled.clone())));
+            assert!(channel_exists(&app));
+            assert!(!app.channel_ui.was_deleted(channel));
+            assert!(!app.channel_has_open_card(channel));
+            // An authoritative no-work retirement reply removes that same Home.
+            settled.sequence = 13;
+            settled.channels.retain(|entry| entry.id != channel);
+            settled.views.retain(|view| view.scope != Scope::Channel(channel));
+            drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
+            assert!(!channel_exists(&app));
             assert!(app.channel_ui.was_deleted(channel));
         }
     }
