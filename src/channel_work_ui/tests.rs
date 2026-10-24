@@ -1513,6 +1513,100 @@ fn home_native_pr_hold_rejects_same_number_other_repository_and_keeps_current_ta
 
 #[test]
 fn narrow_home_keeps_wrapped_channel_identity_outside_scroll_and_partial_page_claims_honest() {
+    #[derive(Clone, Copy)]
+    struct Body {
+        viewport: iced::Rectangle,
+        content: iced::Rectangle,
+        translation: iced::Vector,
+    }
+    fn body(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, name: &str) -> (Body, iced::Rectangle) {
+        use iced::advanced::widget::Operation;
+        use iced_accessibility::{A11yId, IdEq};
+        // Accessibility identifies the semantic control, never its geometry.
+        let target = {
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(name))
+                .expect("the real PR button is named")
+                .id()
+                .clone()
+        };
+        struct Probe {
+            scrolls: Vec<Body>,
+            target: A11yId,
+            buttons: Vec<iced::Rectangle>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                viewport: iced::Rectangle,
+                content: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.scrolls.push(Body {
+                    viewport,
+                    content,
+                    translation,
+                });
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id.is_some_and(|id| IdEq::eq(&A11yId::from(id.clone()), &self.target)) {
+                    self.buttons.push(bounds);
+                }
+            }
+        }
+        let mut probe = Probe {
+            scrolls: Vec::new(),
+            target,
+            buttons: Vec::new(),
+        };
+        ui.operate(renderer, &mut probe);
+        assert_eq!(
+            probe.scrolls.len(),
+            1,
+            "the mounted leaf has one content scroller"
+        );
+        assert_eq!(
+            probe.buttons.len(),
+            1,
+            "the operation finds the exact PR button"
+        );
+        (probe.scrolls[0], probe.buttons[0])
+    }
+    fn rendered(bounds: iced::Rectangle, translation: iced::Vector) -> iced::Rectangle {
+        // Scrollable draws and hit-tests with this translation. Button's
+        // operation exposes layout geometry, independent of AX bounds policy.
+        iced::Rectangle {
+            x: bounds.x - translation.x,
+            y: bounds.y - translation.y,
+            ..bounds
+        }
+    }
+    fn assert_accessible_bounds(actual: iced::Rectangle, rendered: iced::Rectangle) {
+        let differences = [
+            actual.x - rendered.x,
+            actual.y - rendered.y,
+            actual.width - rendered.width,
+            actual.height - rendered.height,
+        ];
+        assert!(
+            differences.iter().all(|difference| difference.abs() <= 0.01),
+            "the named accessible control must match its painted and hit-tested bounds: {actual:?} vs {rendered:?}"
+        );
+    }
     let title =
         "Parser delivery and follow-up across the core library and its downstream integrations";
     let mut state = State::default();
@@ -1541,25 +1635,67 @@ fn narrow_home_keeps_wrapped_channel_identity_outside_scroll_and_partial_page_cl
     assert!(!text.iter().any(|s| s == "No ongoing work is tracked here"));
     assert!(text.iter().any(|s| s == "Reviews and references"));
     assert!(text.iter().any(|s| s == "Next current page"));
-    let first_before = bounds(&ui, &open_name(1));
+    let (before, button_before) = body(&mut ui, &renderer, &open_name(1));
+    assert!(before.viewport.height > 0.0 && before.viewport.height < 600.0);
+    assert!(before.viewport.y >= title_bounds.y + title_bounds.height);
+    assert!(before.viewport.x >= 0.0 && before.viewport.y >= 0.0);
+    assert!(before.viewport.x + before.viewport.width <= 300.01);
+    assert!(before.viewport.y + before.viewport.height <= 600.01);
+    assert!(
+        before.content.height > before.viewport.height,
+        "the actual mounted content must overflow its bounded body"
+    );
+    let first_before = rendered(button_before, before.translation);
+    assert_accessible_bounds(bounds(&ui, &open_name(1)), first_before);
+    // Place the first real PR control near the body's center without assuming
+    // a font-dependent content height or scrolling past that control.
+    let distance = (first_before.center_y() - before.viewport.center_y())
+        .max(1.0)
+        .min(before.content.height - before.viewport.height);
     assert!(
         events(
             &mut ui,
             &mut renderer,
-            iced::Point::new(150.0, 580.0),
+            before.viewport.center(),
             &[mouse::Event::WheelScrolled {
-                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -6.0 }
+                delta: mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: -distance
+                }
             }]
         )
         .is_empty()
     );
     assert_eq!(bounds(&ui, title), title_bounds);
     assert_eq!(bounds(&ui, "Refresh channel work"), refresh_bounds);
-    let first_after = bounds(&ui, &open_name(1));
+    assert_eq!(bounds(&ui, "Close channel work"), close_bounds);
+    let (after, button_after) = body(&mut ui, &renderer, &open_name(1));
+    assert_eq!(after.viewport, before.viewport);
+    assert!(
+        after.translation.y > before.translation.y,
+        "the native wheel must change the real scroll offset"
+    );
+    let first_after = rendered(button_after, after.translation);
+    assert_accessible_bounds(bounds(&ui, &open_name(1)), first_after);
     assert!(
         first_after.y < first_before.y,
         "the real content scrolls independently of the channel header"
     );
+    assert!(first_after.y >= after.viewport.y);
+    assert!(first_after.y + first_after.height <= after.viewport.y + after.viewport.height);
+    let hit = first_after.center();
+    assert!(after.viewport.contains(hit));
+    let mut messages = click(&mut ui, &mut renderer, hit);
+    assert!(matches!(messages.as_slice(), [Action::Open(owner)] if owner.target == target(1)));
+    let _ = ui.into_cache();
+    let Some(Effect::OpenPullRequest {
+        home: actual, key, ..
+    }) = state.update(messages.remove(0))
+    else {
+        panic!("the translated native hit must open its exact PR")
+    };
+    assert_eq!(actual, home(10));
+    assert_eq!(Target::PullRequest(key), target(1));
 }
 
 struct PasteClipboard(String);
