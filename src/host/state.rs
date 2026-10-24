@@ -6412,6 +6412,9 @@ for line in sys.stdin:
                 .unwrap();
             assert!(saved.terminals.is_empty());
             assert_eq!(saved.carried[0].source, carried_source);
+            // An anonymous carry listens until a successor adopts it. Verify
+            // the real handoff endpoint before either restore consumes it.
+            assert!(holders.join(source.id.to_string()).exists());
 
             if invalid_successor {
                 // Preserve the malformed successor as the real post-adoption failure.
@@ -6496,7 +6499,9 @@ for line in sys.stdin:
                 // SAFETY: the cloned original pidfd stays owned across poll.
                 assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
                 assert!(original_root.is_current());
-                assert!(holders.join(source.id.to_string()).exists());
+                // Anonymous adoption intentionally unlinks its old listener;
+                // the retained current worker is the reachable Close surface.
+                handle.observe_agent().unwrap();
                 let retained_store = Store::open(directory.path()).unwrap();
                 assert_eq!(
                     retained_store.load().unwrap().unwrap().phase,
