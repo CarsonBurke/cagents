@@ -78,6 +78,10 @@ impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let registry = agent_execution::registry(host)?;
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .maintain_automation_history(service::now()?)?;
         let attention = initial_attention(&registry.lock().unwrap_or_else(|p| p.into_inner()))?;
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
@@ -218,11 +222,17 @@ impl Handle {
             return Ok(());
         }
         if let Err(error) = crate::host::client::ensure_control_open(host) {
-            self.0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(claim.firing.id, error.message, service::now()?, false)?;
+            let now = service::now()?;
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry.fail_automation_start(claim.firing.id, error.message, now, false)?;
+            if claim.definition.precheck.is_some() {
+                // This branch precedes any Worker::launch attempt or proof file.
+                registry.confirm_unlaunched_automation_precheck(
+                    claim.firing.id,
+                    claim.firing.revision,
+                    now,
+                )?;
+            }
             return Ok(());
         }
         let directory =
@@ -232,11 +242,17 @@ impl Handle {
                 }) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .fail_automation_start(claim.firing.id, error, service::now()?, true)?;
+                    let now = service::now()?;
+                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                    registry.fail_automation_start(claim.firing.id, error, now, true)?;
+                    if claim.definition.precheck.is_some() {
+                        // Target/account refusal happened before Worker::launch.
+                        registry.confirm_unlaunched_automation_precheck(
+                            claim.firing.id,
+                            claim.firing.revision,
+                            now,
+                        )?;
+                    }
                     return Ok(());
                 }
             };
@@ -278,6 +294,22 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        drop(registry);
+                        // Failed launch may have written partial private proof.
+                        // Retain actual Worker::retire custody even if no child
+                        // spawned; directory absence alone is not our ACK.
+                        self.0
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                claim.firing.id,
+                                Worker::recover(
+                                    &self.0.root,
+                                    claim.firing.id,
+                                    claim.firing.revision,
+                                ),
+                            );
                     }
                 }
             }
@@ -361,23 +393,35 @@ impl Handle {
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
-            if self
+            let revision = self
                 .0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?
-                .is_none()
-            {
+                .retired_automation_precheck(id)?;
+            let Some(revision) = revision else {
                 continue;
-            }
+            };
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
             match worker.retire() {
                 Ok(true) => {
-                    workers.remove(&id);
+                    // Keep this reaped Worker until the SQLite ACK commits.
+                    // On ACK error the next tick retries retire(true), without
+                    // launching anything or losing cleanup custody.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
                 }
                 Ok(false) => {} // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
@@ -662,7 +706,25 @@ impl Handle {
             };
             let mut worker = Worker::recover(&self.0.root, id, revision);
             match worker.retire() {
-                Ok(true) => {}
+                Ok(true) => {
+                    // Retain retry custody before ACK; no workers lock crosses SQL.
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(id)
+                        .or_insert(worker);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
+                }
                 Ok(false) => {
                     self.0
                         .workers

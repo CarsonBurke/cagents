@@ -284,7 +284,11 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"automation": automation}), human)
         }
         Response::Firing(firing) => {
-            let human = format!("{}\t{}", firing.id, state_label(firing.state));
+            let mut human = format!("{}\t{}", firing.id, state_label(firing.state));
+            if let Some(skipped) = skipped_occurrences_human(&firing, now_ms()) {
+                human.push('\n');
+                human.push_str(&skipped);
+            }
             (json!({"firing": firing}), human)
         }
         Response::History(history) => {
@@ -296,7 +300,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"audit": page}), human)
         }
         Response::Detail(detail) => {
-            let human = format!(
+            let mut human = format!(
                 "{}\t{}\n{}",
                 detail.firing.id,
                 state_label(detail.firing.state),
@@ -307,6 +311,10 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
                     .or(detail.firing.diagnostic.as_deref())
                     .unwrap_or_default()
             );
+            if let Some(skipped) = skipped_occurrences_human(&detail.firing, now_ms()) {
+                human.push('\n');
+                human.push_str(&skipped);
+            }
             (json!({"run": detail}), human)
         }
         Response::Removed => (
@@ -442,6 +450,12 @@ fn history_human(history: &crate::automations::HistoryPage, now_ms: u64) -> Stri
                     }
                     detail.push_str("session release pending");
                 }
+                if let Some(skipped) = skipped_occurrences_human(run, now_ms) {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&skipped);
+                }
                 [
                     run.id.to_string(),
                     run.automation.to_string(),
@@ -460,6 +474,36 @@ fn history_human(history: &crate::automations::HistoryPage, now_ms: u64) -> Stri
         );
     }
     human
+}
+
+fn skipped_occurrences_human(firing: &crate::automations::Firing, now_ms: u64) -> Option<String> {
+    let skipped = firing.skipped_occurrences.as_ref()?;
+    let span_ms = skipped
+        .last_occurrence_ms
+        .saturating_sub(skipped.first_occurrence_ms);
+    let span = if span_ms % 60_000 == 0 {
+        format!("{} min", span_ms / 60_000)
+    } else if span_ms % 1_000 == 0 {
+        format!("{} min {} sec", span_ms / 60_000, span_ms / 1_000 % 60)
+    } else {
+        format!(
+            "{} min {}.{:03} sec",
+            span_ms / 60_000,
+            span_ms / 1_000 % 60,
+            span_ms % 1_000,
+        )
+    };
+    Some(format!(
+        "{} skipped {} (first {}; last {}; span {span})",
+        skipped.count,
+        if skipped.count == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        },
+        super::format::relative_time(skipped.first_occurrence_ms, now_ms),
+        super::format::relative_time(skipped.last_occurrence_ms, now_ms),
+    ))
 }
 
 fn poll_proposal(
@@ -678,6 +722,7 @@ mod tests {
             run: None,
             skip: Some(SkipReason::Capacity),
             diagnostic: Some("Try later".into()),
+            skipped_occurrences: None,
         };
         let page = HistoryPage {
             firings: vec![firing],
@@ -702,6 +747,84 @@ mod tests {
         );
         assert_eq!(state_label(FiringState::Interrupted), "Outcome uncertain");
         assert_eq!(state_label(FiringState::Waiting), "Waiting for input");
+
+        // Old stored JSON has no aggregation field and keeps the old output.
+        let mut old_record = serde_json::to_value(&page.firings[0]).unwrap();
+        old_record
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_occurrences");
+        let old: Firing = serde_json::from_value(old_record).unwrap();
+        assert!(old.skipped_occurrences.is_none());
+        assert_eq!(
+            history_human(
+                &HistoryPage {
+                    firings: vec![old],
+                    next: page.next.clone(),
+                },
+                120_000,
+            ),
+            human,
+        );
+        for (count, last, now, expected) in [
+            (
+                1,
+                60_000,
+                240_000,
+                "1 skipped occurrence (first 3 min ago; last 3 min ago; span 0 min)",
+            ),
+            (
+                3,
+                180_000,
+                240_000,
+                "3 skipped occurrences (first 3 min ago; last 1 min ago; span 2 min)",
+            ),
+            (
+                100,
+                6_000_000,
+                178_800_000,
+                "100 skipped occurrences (first 2 days ago; last 2 days ago; span 99 min)",
+            ),
+        ] {
+            let mut grouped = page.firings[0].clone();
+            grouped.trigger = Trigger::Scheduled {
+                occurrence: crate::automations::Occurrence {
+                    due_ms: 60_000,
+                    local: "fixture-first".into(),
+                },
+            };
+            grouped.skipped_occurrences = Some(crate::automations::SkippedOccurrences {
+                count,
+                first_occurrence_ms: 60_000,
+                last_occurrence_ms: last,
+            });
+            let grouped_page = HistoryPage {
+                firings: vec![grouped],
+                next: page.next.clone(),
+            };
+            let grouped_human = history_human(&grouped_page, now);
+            assert!(grouped_human.contains(expected), "{grouped_human}");
+            assert!(grouped_human.contains("At capacity: Try later; session release pending"));
+            assert!(grouped_human.contains(&page.firings[0].id.to_string()));
+            assert!(grouped_human.contains("Morning check"));
+            assert!(grouped_human.ends_with("use the cursor in --json output for the next page."));
+            assert_eq!(
+                grouped_page.firings.len(),
+                1,
+                "occurrences are not extra history rows"
+            );
+            for raw in ["Some(", "first_occurrence_ms", "60000", "SkipReason", "{ "] {
+                assert!(
+                    !grouped_human.contains(raw),
+                    "raw value {raw}: {grouped_human}"
+                );
+            }
+            assert_eq!(
+                skipped_occurrences_human(&grouped_page.firings[0], now).as_deref(),
+                Some(expected),
+                "the same readable summary is used by direct firing and detail inspection",
+            );
+        }
     }
 
     #[test]

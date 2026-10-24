@@ -2131,6 +2131,7 @@ mod tests {
                 agent: Some(automated.id),
                 run: None,
                 skip: None,
+                skipped_occurrences: None,
                 diagnostic: None,
             },
             agent: Some(automated),
