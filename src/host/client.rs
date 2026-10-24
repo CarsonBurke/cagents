@@ -474,6 +474,7 @@ fn ensure_startup_recovery_request(
     let inspection = matches!(
         request,
         ClientRequest::List
+            | ClientRequest::ChatList
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
             | ClientRequest::Snapshot { .. }
@@ -482,6 +483,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::ChatCloseRetained { .. }
     );
     let shutdown = matches!(
         request,
@@ -493,7 +495,7 @@ fn ensure_startup_recovery_request(
     Err(ProtocolError::new(
         ProtocolErrorCode::TerminalUnavailable,
         format!(
-            "Startup recovery retained original terminal ownership; inspect/List or explicitly Close the original actor: {detail}"
+            "Startup recovery retained original ownership; inspect available sessions or explicitly Close the original actor: {detail}"
         ),
         false,
     ))
@@ -1650,6 +1652,76 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences() {
+        for ordinary_exit in [true, false] {
+            let (proof, host) = panic_test_host("recovery-chat-exit-fence");
+            host.lock()
+                .unwrap()
+                .retain_startup_recovery("original owner requires explicit Close".into());
+            // The new read-only request crosses the real dispatch path before
+            // shutdown, without requiring an actor, adoption or transcript.
+            assert!(matches!(
+                process_request(&host, 0, ClientRequest::ChatList).unwrap().0,
+                ServerResponse::ChatListed { sessions } if sessions.is_empty()
+            ));
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "/must-not-execute".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            {
+                let mut state = host.lock().unwrap();
+                if ordinary_exit {
+                    state.begin_ordinary_exit_cleanup();
+                } else {
+                    // No live originals exist in this local gate fixture, so
+                    // the real request_shutdown transition may commit.
+                    state.request_shutdown();
+                }
+                assert!(state.shutting_down);
+            }
+            for request in [
+                ClientRequest::ChatList,
+                ClientRequest::ChatCloseRetained { session: source },
+            ] {
+                let failure = process_request(&host, 0, request).unwrap_err();
+                assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+                assert_eq!(
+                    failure.message,
+                    if ordinary_exit {
+                        "Ordinary daemon exit is waiting for exact original child cleanup; only inspection and explicit checked Close remain available"
+                    } else {
+                        "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
+                    }
+                );
+                let state = host.lock().unwrap();
+                assert!(state.shutting_down);
+                assert_eq!(state.ordinary_exit_cleanup_pending(), ordinary_exit);
+                assert_eq!(
+                    state.startup_recovery(),
+                    Some("original owner requires explicit Close")
+                );
+                assert!(state.chats.is_empty());
+                assert!(state.chat_spawning.is_empty());
+                assert!(state.native_closing.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn resident_release_drains_admitted_control_operations_before_retirement() {
