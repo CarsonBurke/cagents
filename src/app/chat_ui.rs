@@ -16493,6 +16493,10 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
         open_work_over_chat(&mut app);
         assert_eq!(
             app.workspace.visibility(card),
@@ -16533,6 +16537,10 @@ mod tests {
         app.cards.insert(card, CardRuntime::Loading);
         drop(app.open_chat(card, session, chat::Intent::Restore));
         let target = chat_runtime_attempt(&app, card);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
         open_work_over_chat(&mut app);
         assert_eq!(
             app.workspace.visibility(card),
@@ -16551,6 +16559,68 @@ mod tests {
 
         return_to_chat(&mut app);
         assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        for _ in 0..5 {
+            draft_chat(&mut app);
+        }
+        // Advance ordinary frames so native scrolling observes settled pane
+        // geometry, rather than guessing a width or changing exposure flags.
+        let frame = Instant::now();
+        for step in 0..=4 {
+            drop(app.update(Message::Frame(frame + Duration::from_millis(step * 250))));
+        }
+        let width = app.workspace.viewport_width();
+        let offset = app.workspace.geometry().max_offset(width);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
+                offset,
+                width,
+                user_input: true,
+            }),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
+
+        open_work_over_chat(&mut app);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert!(chat_runtime(&app, card).pending.is_some());
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        settle(&mut app, card, Ok(()));
+
+        return_to_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        assert!(!handle.is_visible_for_test());
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     /// A new conversation whose start, for its first message, is still in
