@@ -1548,13 +1548,13 @@ mod tests {
         drop(app.update(Message::WorkUi(BoardAction::Refreshed(Err(
             "fixture refresh completed".into(),
         )))));
-        let ui = workboard_native(&app, &mut renderer);
-        let labels = native_labels(&ui);
+        let mut ui = workboard_native(&app, &mut renderer);
         assert!(
-            labels
+            rendered_text(&mut ui, &renderer)
                 .iter()
-                .any(|label| label == "fixture refresh completed")
+                .any(|text| text == "fixture refresh completed")
         );
+        let labels = native_labels(&ui);
         assert!(
             labels
                 .iter()
@@ -1679,12 +1679,14 @@ mod tests {
                 result: Arc::new(Err("fixture automation read completed".into())),
             })),
         );
-        let tree = utility_native(&app, &mut renderer, false);
+        let mut tree = utility_native(&app, &mut renderer, false);
+        let text = rendered_text(&mut tree, &renderer);
+        assert!(text.iter().any(|text| text == "Couldn't load automations"));
         assert!(
-            native_labels(&tree)
-                .iter()
-                .any(|label| label == "fixture automation read completed")
+            text.iter()
+                .any(|text| text == "fixture automation read completed")
         );
+        assert!(native_labels(&tree).iter().any(|label| label == "Retry"));
     }
 
     #[test]
@@ -1833,8 +1835,7 @@ mod tests {
                 .add_managed_fixture(crate::agent::Provider::Claude, 989);
             drop(app.update(Message::AccountUi(account_ui::Action::Popover(Some(id)))));
             let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
-            let point =
-                workboard_popup_button(&mut tree, &renderer, "Open in the Accounts pane").center();
+            let point = bounds(&tree, "Open in the Accounts pane").center();
             let mut messages = click(&mut tree, &mut renderer, point);
             assert!(matches!(
                 messages.as_slice(),
@@ -1874,6 +1875,10 @@ mod tests {
         use account_ui::Action as AccountAction;
         let mut renderer = super::super::tests::headless_renderer();
         for modal in [false, true] {
+            let link_heading = format!(
+                "Use an existing {} home",
+                crate::agent::Provider::Claude.label(),
+            );
             let (mut app, home) = main_fixture();
             drop(app.update(Message::AccountUi(AccountAction::OpenPane)));
             assert!(!app.channel_work_is_main());
@@ -1933,15 +1938,15 @@ mod tests {
             );
             drop(app.update(queued_input));
             drop(app.update(queued_cancel));
-            let tree = accounts_native(&app, &mut renderer);
+            let mut tree = accounts_native(&app, &mut renderer);
             assert_eq!(
                 native_field_value(&tree, "Absolute path to the provider home"),
                 ""
             );
             assert!(
-                native_labels(&tree)
+                rendered_text(&mut tree, &renderer)
                     .iter()
-                    .any(|label| label == "Use an existing Claude home")
+                    .any(|text| text == &link_heading)
             );
             let _ = tree.into_cache();
             assert_eq!(
@@ -1991,11 +1996,11 @@ mod tests {
             ));
             let _ = tree.into_cache();
             drop(app.update(messages.remove(0)));
-            let tree = accounts_native(&app, &mut renderer);
+            let mut tree = accounts_native(&app, &mut renderer);
             assert!(
-                !native_labels(&tree)
+                !rendered_text(&mut tree, &renderer)
                     .iter()
-                    .any(|label| label == "Use an existing Claude home")
+                    .any(|text| text == &link_heading)
             );
         }
     }
@@ -2044,7 +2049,7 @@ mod tests {
         drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
         drop(app.update(Message::SettingsSearchChanged("Command palette".into())));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Command palette").center();
+        let point = bounds(&tree, "Record shortcut for Open command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
@@ -2058,7 +2063,7 @@ mod tests {
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
         let mut tree = utility_native(&app, &mut renderer, true);
-        let point = bounds(&tree, "Record shortcut for Command palette").center();
+        let point = bounds(&tree, "Record shortcut for Open command palette").center();
         let mut messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
@@ -2186,6 +2191,23 @@ mod tests {
         tree
     }
 
+    fn rendered_text(tree: &mut Native<'_>, renderer: &cosmic::Renderer) -> Vec<String> {
+        use iced::advanced::widget::Operation;
+        #[derive(Default)]
+        struct Text(Vec<String>);
+        impl Operation for Text {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let mut text = Text::default();
+        tree.operate(renderer, &mut text);
+        text.0
+    }
+
     fn native_field_value(tree: &Native<'_>, label: &str) -> String {
         let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
         nodes
@@ -2209,17 +2231,21 @@ mod tests {
     ) -> Message {
         let mut tree = utility_native(app, renderer, settings);
         let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
-        let b = nodes
+        let id = nodes
             .root()
             .iter()
             .chain(nodes.children())
             .find(|node| node.node().label() == Some(label) && node.node().value().is_some())
             .unwrap_or_else(|| panic!("missing mounted native input {label}"))
-            .node()
-            .bounds()
-            .unwrap();
-        let point = iced::Point::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
-        assert!(click(&mut tree, renderer, point).is_empty());
+            .id()
+            .clone();
+        let iced_accessibility::A11yId::Widget(id) = id else {
+            panic!("mounted input must own a native widget ID: {label}");
+        };
+        tree.operate(
+            renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+        );
         let mut messages = events(
             &mut tree,
             renderer,
