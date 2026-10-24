@@ -1966,16 +1966,21 @@ mod tests {
                     assert!(app.utility_card(&CardKind::Accounts).is_none());
                     let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
                     let point = bounds(&tree, "Keep editing").center();
-                    let mut messages = click(&mut tree, &mut renderer, point);
+                    let messages = click(&mut tree, &mut renderer, point);
                     assert!(
                         matches!(
                             messages.as_slice(),
-                            [Message::ChannelWork(ui::Action::Keep(..))]
+                            [
+                                Message::AccountUi(account_ui::Action::Popover(None)),
+                                Message::ChannelWork(ui::Action::Keep(..)),
+                            ]
                         ),
                         "actual Keep callbacks after popout dirty={dirty} at {point:?}: {messages:?}"
                     );
                     let _ = tree.into_cache();
-                    drop(app.update(messages.remove(0)));
+                    for message in messages {
+                        drop(app.update(message));
+                    }
                     assert!(app.channel_work_is_main());
                     assert!(app.utility_card(&CardKind::Accounts).is_none());
                     drop(app.update(open));
