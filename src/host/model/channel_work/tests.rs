@@ -568,25 +568,91 @@ fn retired_native_authority_cannot_replay_and_duplicate_canonical_session_cannot
     assert_eq!(snapshot(&registry, &home), before);
 
     let origin = native_origin(&mut registry, home);
+    let scope = crate::workspace_model::views::Scope::Channel(home.channel);
+    let original_view = views::read(&registry.db, &scope).unwrap();
     publish_native(
         &mut registry,
         home,
         &origin.proof.as_ref().unwrap().source,
         CardId::new(),
     );
+    // The normal publication path deduplicates an existing session. Prove
+    // that positive contract rather than mistaking it for duplicate state.
+    assert_eq!(views::read(&registry.db, &scope).unwrap(), original_view);
     let mut proof = origin.proof.unwrap();
-    proof.view_revision = registry
-        .view_revision(&crate::workspace_model::views::Scope::Channel(home.channel))
+    let resolved = registry
+        .resolve_channel_work_source(&proof.authority, &proof.source)
         .unwrap();
+    assert_eq!(resolved.origin, origin.origin);
+    assert_eq!(resolved.proof.as_ref().unwrap().card, proof.card);
+    let mut damaged_view = original_view.clone();
+    let mut duplicate_pane = damaged_view
+        .panes
+        .iter()
+        .find(|pane| pane.id == proof.card)
+        .unwrap()
+        .clone();
+    duplicate_pane.id = CardId::new();
+    let duplicate_card = duplicate_pane.id;
+    damaged_view.panes.push(duplicate_pane);
+    damaged_view.revision += 1;
+    // Only this test's private Registry is given retained/legacy duplicate
+    // data. Ordinary SeedView/ChangeView correctly cannot produce it.
+    let scope_key = encode(&scope).unwrap();
+    let tx = registry.db.transaction().unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE shared_views SET panes=?2,revision=?3 WHERE scope=?1",
+            params![
+                scope_key,
+                encode(&damaged_view.panes).unwrap(),
+                damaged_view.revision
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    tx.execute(
+        "INSERT INTO shared_view_panes(id,scope) VALUES (?1,?2)",
+        params![duplicate_card.to_string(), scope_key],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let duplicate_count = views::all(&registry.db)
+        .unwrap()
+        .iter()
+        .flat_map(|view| &view.panes)
+        .filter(
+            |pane| matches!(&pane.kind, CardKind::Chat(session) if session.id == proof.source.id()),
+        )
+        .count();
+    assert_eq!(
+        duplicate_count, 2,
+        "negative fixture must actually expose two canonical panes"
+    );
+    proof.view_revision = registry.view_revision(&scope).unwrap();
+    assert_eq!(proof.view_revision, damaged_view.revision);
     let duplicate = TrustedResolvedOrigin {
         origin: origin.origin,
         proof: Some(proof),
     };
-    assert!(matches!(
-        registry.apply_channel_work(&duplicate, &claim(home, 2, 0)),
-        Err(ApplyError::Refused(_))
-    ));
+    let request = claim(home, 2, 0);
+    let sequence = registry.model().unwrap().sequence;
+    match registry.apply_channel_work(&duplicate, &request) {
+        Err(ApplyError::Refused(reason)) => assert!(
+            reason.contains("one exact canonical channel pane"),
+            "{reason}"
+        ),
+        result => panic!("an actual duplicate canonical source must refuse: {result:?}"),
+    }
     assert_eq!(snapshot(&registry, &home), before);
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    assert!(
+        registry
+            .channel_work_receipt(&user(), &home, request.operation)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
