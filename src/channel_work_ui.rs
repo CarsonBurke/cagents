@@ -1357,8 +1357,7 @@ impl State {
                     ROLE_VALUES.iter().position(|role| *role == form.role),
                     move |index| Action::Role(owner, index),
                 )
-                .id(role_id(owner))
-                .into(),
+                .id(role_id(owner)),
             )
         } else {
             design::body(form.role.label()).into()
