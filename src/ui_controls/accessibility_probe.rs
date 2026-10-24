@@ -308,6 +308,183 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_inputs_retain_identity_and_activate_at_accessible_bounds_after_nested_scroll() {
+        use cosmic::iced::advanced::{clipboard, mouse, widget::Operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Rectangle, Vector, keyboard};
+        use iced_accessibility::{A11yId, accesskit::Role};
+
+        const NAMES: [&str; 6] = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"];
+        type Message = (usize, String);
+        type Ui<'a> = UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
+        fn view(inner: &widget::Id, outer: &widget::Id) -> Element<'static, Message> {
+            let fields =
+                widget::row::with_children(NAMES.into_iter().enumerate().map(|(index, name)| {
+                    crate::ui_controls::field::text(name, "")
+                        .width(160)
+                        .on_input(move |value| (index, value))
+                        .into()
+                }))
+                .spacing(8)
+                .wrap();
+            widget::scrollable(widget::column::with_children(vec![
+                cosmic::iced::widget::Space::new().height(32).into(),
+                widget::scrollable(fields)
+                    .id(inner.clone())
+                    .height(90)
+                    .into(),
+                cosmic::iced::widget::Space::new().height(200).into(),
+            ]))
+            .id(outer.clone())
+            .height(140)
+            .into()
+        }
+        fn fields(ui: &Ui<'_>) -> Vec<(String, A11yId, Rect)> {
+            let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            tree.root()
+                .iter()
+                .chain(tree.children())
+                .filter(|node| node.node().role() == Role::TextInput)
+                .map(|node| {
+                    (
+                        node.node().label().unwrap().to_owned(),
+                        node.id().clone(),
+                        node.node().bounds().unwrap(),
+                    )
+                })
+                .collect()
+        }
+        #[derive(Default)]
+        struct Scrolls(Vec<(widget::Id, Rectangle, Rectangle, Vector)>);
+        impl Operation for Scrolls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+            ) {
+                self.0
+                    .push((id.unwrap().clone(), bounds, content, translation));
+            }
+        }
+        let inner = widget::Id::unique();
+        let outer = widget::Id::unique();
+        let mut renderer = super::headless_renderer();
+        let mut ui = UserInterface::build(
+            view(&inner, &outer),
+            Size::new(420.0, 140.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        ui.draw(
+            &mut renderer,
+            &cosmic::theme::active(),
+            &cosmic::iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        let wide = fields(&ui);
+        assert_eq!(wide.len(), NAMES.len());
+        assert_eq!(wide[0].2.y0, wide[1].2.y0, "wide fields share a row");
+        let cache = ui.into_cache();
+        ui = UserInterface::build(
+            view(&inner, &outer),
+            Size::new(220.0, 140.0),
+            cache,
+            &mut renderer,
+        );
+        ui.draw(
+            &mut renderer,
+            &cosmic::theme::active(),
+            &cosmic::iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        let narrow = fields(&ui);
+        assert_eq!(narrow.len(), NAMES.len());
+        for (before, after) in wide.iter().zip(&narrow) {
+            assert_eq!((&before.0, &before.1), (&after.0, &after.1));
+        }
+        assert!(narrow[1].2.y0 > narrow[0].2.y0, "narrow fields reflow");
+        let mut messages = Vec::new();
+        for (point, distance) in [
+            (Point::new(80.0, 70.0), 80.0),
+            (Point::new(15.0, 4.0), 24.0),
+        ] {
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    Event::Mouse(mouse::Event::WheelScrolled {
+                        delta: mouse::ScrollDelta::Pixels {
+                            x: 0.0,
+                            y: -distance,
+                        },
+                    }),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+        }
+        assert!(messages.is_empty(), "scroll emitted {messages:?}");
+        let mut scrolls = Scrolls::default();
+        ui.operate(&renderer, &mut scrolls);
+        assert_eq!(scrolls.0.len(), 2);
+        for id in [&inner, &outer] {
+            let (_, viewport, content, offset) = scrolls.0.iter().find(|row| &row.0 == id).unwrap();
+            assert!(content.height > viewport.height && offset.y > 0.0);
+        }
+        ui.draw(
+            &mut renderer,
+            &cosmic::theme::active(),
+            &cosmic::iced::advanced::renderer::Style::default(),
+            mouse::Cursor::Unavailable,
+        );
+        let moved = fields(&ui);
+        for (before, after) in narrow.iter().zip(&moved) {
+            assert_eq!((&before.0, &before.1), (&after.0, &after.1));
+            assert!(after.2.y0 < before.2.y0);
+        }
+        let target = &moved[3];
+        assert_eq!(target.0, "Fourth");
+        let bounds = Rectangle {
+            x: target.2.x0 as f32,
+            y: target.2.y0 as f32,
+            width: (target.2.x1 - target.2.x0) as f32,
+            height: (target.2.y1 - target.2.y0) as f32,
+        };
+        assert!(bounds.y >= 0.0 && bounds.y + bounds.height <= 140.0);
+        // AX geometry is checked by real hit testing, not by reproducing the
+        // forwarding offset calculation: this must focus Fourth, not a neighbor.
+        let point = bounds.center();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character("z".into()),
+                    modified_key: keyboard::Key::Character("z".into()),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyZ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: Some("z".into()),
+                    repeat: false,
+                }),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, vec![(3, "z".into())]);
+    }
+
+    #[test]
     fn tables_expose_their_cells_in_row_major_order() {
         use cosmic::iced::widget::table;
         let cells = [["Edit", "Pause"], ["Run now", "Remove"]];
