@@ -3,8 +3,7 @@ use cagents::{
     design,
     github::GitHubService,
     lsp::{
-        LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
-        LspStatus,
+        LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspRequestId, LspStatus,
     },
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     pull_request_review::{self, ReviewSource},
@@ -14,8 +13,8 @@ use cagents::{
         StageRequest, UnstageRequest,
     },
     repository_widget::{
-        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
-        RepositoryRuntime,
+        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, LspIntent, RepositoryAction,
+        RepositoryFile, RepositoryRuntime,
     },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
@@ -81,12 +80,13 @@ struct Tab {
     files_loaded: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
-    /// The document version the server computed `diagnostics` for, as it
-    /// stamped them. Compared against the manager's current version and never
-    /// against a count of this side's own edits: the manager re-opens a
-    /// document on a restart or respawn, neither of which is an edit here.
+    /// The manager version these diagnostics currently describe. Exact local
+    /// edits rebase the standing set to the manager's new version; publishes
+    /// replace it only when their version still matches that manager state.
     diagnostics_version: Option<i32>,
-    completions: Vec<LspCompletionItem>,
+    completions: Vec<CompletionTarget>,
+    completion_request: Option<(LspRequestId, LspPosition)>,
+    completion_intent: u64,
     hover: Option<String>,
     lsp_error: Option<String>,
     mutation: Option<MutationKind>,
@@ -96,6 +96,15 @@ struct Tab {
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
     review: pull_request_review::State,
+}
+
+impl Tab {
+    /// The diagnostics list and native editor marks/navigation share one set.
+    fn set_diagnostics(&mut self, items: Vec<LspDiagnostic>, version: Option<i32>) {
+        self.runtime.set_editor_diagnostics(items.clone());
+        self.diagnostics = items;
+        self.diagnostics_version = version;
+    }
 }
 
 /// The GitHub repository a worktree's remotes name, `origin` first, for the
@@ -173,10 +182,6 @@ pub enum Message {
     ResetSettings,
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
-    FindQueryChanged(String),
-    CloseFind,
-    FindNext,
-    FindPrevious,
     QuickOpen,
     QuickOpenQueryChanged(String),
     QuickOpenNext,
@@ -203,9 +208,9 @@ pub enum Message {
     OperationRecovery(cagents::operation_recovery::Action),
     Complete,
     Hover,
-    Completion(CardId, usize),
+    Completion(CardId, usize, CompletionTarget),
     Jump(CardId, LspPosition),
-    Key(keyboard::Event),
+    Key(keyboard::Event, bool),
     Notices,
     CloseNotices,
     Dismiss,
@@ -474,13 +479,6 @@ pub struct Editor {
     settings_open: bool,
     settings_writable: bool,
     quick_open_files: Option<Vec<PathBuf>>,
-    find_open: bool,
-    find_query: String,
-    find_match_index: usize,
-    /// Occurrences of `find_query` in the active buffer, recorded by the
-    /// search itself. Counting again in `view` re-materialized and
-    /// re-lowercased the whole rope on every animation frame.
-    find_match_total: usize,
     quick_open_generation: u64,
     quick_open: bool,
     quick_open_query: String,
@@ -687,6 +685,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
+            | RepositoryAction::FindReplacementLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::RetainedSaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
@@ -941,44 +940,6 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
     cagents::interaction::layer(backdrop, centered.into())
 }
 
-fn find_bar(editor: &Editor) -> Element<'_, Message> {
-    widget::container(
-        widget::row::with_children(vec![
-            cagents::ui_controls::passive_icon(Icon::Search, 16),
-            widget::text_input("Find in file", &editor.find_query)
-                .id(widget::Id::new("ceditor.find.query"))
-                .on_input(Message::FindQueryChanged)
-                .width(Length::Fill)
-                .into(),
-            design::caption(if editor.find_query.trim().is_empty() {
-                "Type to find".to_owned()
-            } else if editor.find_match_total == 0 {
-                "No matches".to_owned()
-            } else {
-                format!(
-                    "{} of {} matches",
-                    editor.find_match_index + 1,
-                    editor.find_match_total
-                )
-            })
-            .into(),
-            icon_button(Icon::ChevronUp, "Previous match (Shift+Enter)")
-                .on_press(Message::FindPrevious)
-                .into(),
-            icon_button(Icon::ChevronDown, "Next match (Enter)")
-                .on_press(Message::FindNext)
-                .into(),
-            icon_button(Icon::Close, "Close find")
-                .on_press(Message::CloseFind)
-                .into(),
-        ])
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-    )
-    .padding([4.0, 8.0])
-    .width(Length::Fill)
-    .into()
-}
 fn tab_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
@@ -1449,6 +1410,10 @@ impl Editor {
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -1525,6 +1490,8 @@ impl Editor {
             diagnostics: Vec::new(),
             diagnostics_version: None,
             completions: Vec::new(),
+            completion_request: None,
+            completion_intent: 0,
             hover: None,
             lsp_error: None,
             mutation,
@@ -1929,11 +1896,28 @@ impl Editor {
         cosmic::task::future(async move { Message::Lsp(generation, events.recv().await.ok()) })
     }
 
+    fn reconcile_completion_intent(&mut self, id: CardId) {
+        let pending = self.tab_mut(id).and_then(|tab| {
+            let intent = tab.runtime.editor_completion_intent();
+            if tab.completion_intent == intent {
+                return None;
+            }
+            tab.completion_intent = intent;
+            tab.completions.clear();
+            tab.completion_request.take()
+        });
+        if let Some((request, _)) = pending {
+            self.lsp.cancel(request);
+        }
+    }
+
     fn drain(&mut self, id: CardId) -> Task<Message> {
+        self.reconcile_completion_intent(id);
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
         let intents = tab.runtime.take_lsp_intents();
+        let edits = tab.runtime.take_lsp_edits();
         let autosave = repository_task(tab.runtime.auto_save_task(id));
         let working_diff = repository_task(tab.runtime.working_diff_task(id));
         for intent in intents {
@@ -1953,9 +1937,26 @@ impl Editor {
                     if let Some(language) = self.lsp.language_for(&absolute_path) {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
-                        let status =
-                            self.lsp
-                                .open(doc, &absolute_path, &worktree, language, version, &text);
+                        let status = match text {
+                            repository_widget::LspChangeText::Text(text) => self.lsp.open(
+                                doc,
+                                &absolute_path,
+                                &worktree,
+                                language,
+                                version,
+                                &text,
+                            ),
+                            repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.open_snapshot(
+                                    doc,
+                                    &absolute_path,
+                                    &worktree,
+                                    language,
+                                    version,
+                                    source,
+                                )
+                            }
+                        };
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
                             if let Some(error) = language_server_failure(status) {
@@ -1965,14 +1966,44 @@ impl Editor {
                     }
                 }
                 LspIntent::Change { version, text } => {
+                    let previous_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
-                        self.lsp.change(doc, version, &[], &text);
+                        match text {
+                            cagents::repository_widget::LspChangeText::Text(text) => {
+                                self.lsp.change(doc, version, &edits, &text)
+                            }
+                            cagents::repository_widget::LspChangeText::Snapshot(source) => {
+                                self.lsp.change_snapshot(doc, version, &edits, source)
+                            }
+                        }
                     }
-                    if let Some(tab) = self.tab_mut(id) {
+                    let synchronized_version = self
+                        .tab(id)
+                        .and_then(|tab| tab.runtime.lsp_document())
+                        .and_then(|doc| self.lsp.document_version(doc));
+                    let pending = if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        tab.diagnostics.clear();
-                        tab.diagnostics_version = None;
+                        if !edits.is_empty()
+                            && previous_version.is_some()
+                            && tab.diagnostics_version == previous_version
+                        {
+                            cagents::lsp::shift_diagnostics(&mut tab.diagnostics, &edits);
+                            tab.set_diagnostics(tab.diagnostics.clone(), synchronized_version);
+                        } else {
+                            // Unknown ranges cannot preserve either current diagnostics
+                            // or the native marks used by F8 navigation.
+                            tab.set_diagnostics(Vec::new(), None);
+                        }
+                        tab.completion_request.take()
+                    } else {
+                        None
+                    };
+                    if let Some((request, _)) = pending {
+                        self.lsp.cancel(request);
                     }
                 }
                 LspIntent::Save { text } => {
@@ -1992,9 +2023,9 @@ impl Editor {
         }
         if let Some(tab) = self.tab_mut(id) {
             tab.runtime.set_lsp_document(None);
-            tab.diagnostics.clear();
-            tab.diagnostics_version = None;
+            tab.set_diagnostics(Vec::new(), None);
             tab.completions.clear();
+            tab.completion_request = None;
             tab.hover = None;
         }
     }
@@ -2099,9 +2130,15 @@ impl Editor {
             for id in ids {
                 self.close_document(id);
             }
-            // The manager's shutdown owns its reaper even when this future is dropped.
-            drop(self.lsp.begin_shutdown());
-            self.lsp = LspManager::new(self.settings.language_servers.clone());
+            // Re-enabling assistance waits for these outgoing processes before
+            // launching replacements under a new admission cap.
+            let predecessor = self.lsp.begin_shutdown();
+            self.lsp = LspManager::new(self.settings.language_servers.clone())
+                .with_lifecycle(
+                    self.settings.lsp_idle_timeout_seconds,
+                    self.settings.lsp_max_sessions,
+                )
+                .after_shutdown(predecessor);
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
@@ -2480,31 +2517,8 @@ impl Editor {
         })
     }
 
-    fn focus_find_query(&self) -> Task<Message> {
-        iced::widget::operation::focus(widget::Id::new("ceditor.find.query"))
-            .map(cosmic::Action::App)
-    }
-
-    /// Releases the search hold on every tab.
-    ///
-    /// A tab in search mode ignores every editor action except scrolling, so a
-    /// tab that kept the hold after find moved elsewhere swallowed typing,
-    /// paste and IME commits with no indication and no way back.
-    fn clear_search_mode(&mut self) {
-        for tab in &mut self.tabs {
-            tab.runtime.set_search_mode(false);
-        }
-    }
-
-    /// Closes the find bar and releases the search hold.
-    ///
-    /// Find targets one buffer, so a tab switch closes it rather than silently
-    /// re-pointing the query and the match index at a different file.
-    fn close_find(&mut self) {
-        self.find_open = false;
-        self.find_match_index = 0;
-        self.find_match_total = 0;
-        self.clear_search_mode();
+    fn find_is_open(&self) -> bool {
+        self.current().is_some_and(|tab| tab.runtime.find_is_open())
     }
 
     /// Dismisses the palette and abandons the tree walk it started.
@@ -2516,62 +2530,41 @@ impl Editor {
         self.quick_open_cancel.cancel();
     }
 
-    /// Selects one occurrence in the active tab and records the occurrence
-    /// count, which is the only place it is ever computed.
-    fn select_find_match(&mut self, occurrence: usize) {
-        let Some(id) = self.active else {
-            return;
-        };
-        let query = self.find_query.clone();
-        let total = self.tab_mut(id).and_then(|tab| {
-            tab.runtime.set_search_mode(true);
-            tab.runtime.select_text_match(&query, occurrence)
-        });
-        match total {
-            Some(total) => {
-                self.find_match_index = occurrence % total;
-                self.find_match_total = total;
-            }
-            None => {
-                self.find_match_index = 0;
-                self.find_match_total = 0;
-            }
+    /// The shared query widget owns Return using actual native focus; the
+    /// shell only routes Find commands that remain outside native inputs.
+    fn handle_find_key(
+        &mut self,
+        event: &keyboard::Event,
+        captured: bool,
+    ) -> Option<Task<Message>> {
+        let tab = self.current()?;
+        if !tab.runtime.find_is_open() {
+            return None;
         }
-    }
-
-    /// The keys the find bar itself owns.
-    ///
-    /// Everything else returns `None` and falls through to the shortcut table:
-    /// find is deliberately not modal, so Ctrl+S must still save while it is
-    /// open. Navigation is Enter, Shift+Enter, Up and Down only — Left and
-    /// Right belong to the query input, where they move the caret.
-    fn handle_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let card = tab.id;
         let keyboard::Event::KeyPressed {
-            key,
+            key: keyboard::Key::Named(key),
             modifiers,
-            repeat: false,
             ..
         } = event
         else {
             return None;
         };
-        match key {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                Some(self.update(Message::CloseFind))
-            }
-            keyboard::Key::Named(keyboard::key::Named::Enter) => Some(if modifiers.shift() {
-                self.update(Message::FindPrevious)
-            } else {
-                self.update(Message::FindNext)
-            }),
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
-                Some(self.update(Message::FindPrevious))
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
-                Some(self.update(Message::FindNext))
-            }
-            _ => None,
+        if modifiers.control() || modifiers.alt() || modifiers.logo() {
+            return None;
         }
+        let action = match key {
+            keyboard::key::Named::Escape if !captured => RepositoryAction::CloseFind { card },
+            keyboard::key::Named::F3 => {
+                if modifiers.shift() {
+                    RepositoryAction::FindPrevious { card }
+                } else {
+                    RepositoryAction::FindNext { card }
+                }
+            }
+            _ => return None,
+        };
+        Some(self.update(Message::Repository(action)))
     }
 
     /// The keys the quick-open palette owns.
@@ -2978,7 +2971,8 @@ impl Application for Editor {
             notice = Some(format!("Cannot safely open editor folders yet: {error}"));
             startup_paths.clear();
         }
-        let lsp = LspManager::new(settings.language_servers.clone());
+        let lsp = LspManager::new(settings.language_servers.clone())
+            .with_lifecycle(settings.lsp_idle_timeout_seconds, settings.lsp_max_sessions);
         let line_height_draft = settings.terminal_line_height.to_string();
         let sidebar_open = saved_session.sidebar_open;
         let mut app = Self {
@@ -3002,10 +2996,6 @@ impl Application for Editor {
             settings_writable,
             quick_open_files: None,
             quick_open_generation: 0,
-            find_open: false,
-            find_query: String::new(),
-            find_match_index: 0,
-            find_match_total: 0,
             quick_open: false,
             quick_open_query: String::new(),
             quick_open_index: 0,
@@ -3129,7 +3119,8 @@ impl Application for Editor {
                 return Task::none();
             }
             if self.settings_open
-                && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) = &message
+                && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }, _) =
+                    &message
                 && modifiers.control()
                 && !modifiers.shift()
                 && !modifiers.alt()
@@ -3139,10 +3130,13 @@ impl Application for Editor {
                 return iced::widget::operation::focus(cagents::settings_widgets::search_id())
                     .map(cosmic::Action::App);
             }
-            if let Message::Key(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) = &message
+            if let Message::Key(
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                },
+                captured,
+            ) = &message
             {
                 if self.pending_discard().is_some() {
                     return self.update(Message::Sidebar(SidebarAction::CancelDiscard));
@@ -3159,15 +3153,16 @@ impl Application for Editor {
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
                 }
-                if self.find_open {
-                    return self.update(Message::CloseFind);
+                if !*captured && self.find_is_open() {
+                    let card = self.active.unwrap();
+                    return self.update(Message::Repository(RepositoryAction::CloseFind { card }));
                 }
             }
             // Quick open counts as a modal, and the guard below drops every
             // key while a modal is up. A palette whose whole point is staying
             // on the keyboard has to read its own keys first.
             if self.quick_open
-                && let Message::Key(event) = &message
+                && let Message::Key(event, _) = &message
                 && let Some(task) = self.handle_quick_open_key(event)
             {
                 return task;
@@ -3192,7 +3187,7 @@ impl Application for Editor {
                         | Message::Sidebar(_)
                         | Message::ToggleSidebar
                         | Message::NewTab
-                        | Message::Key(_)
+                        | Message::Key(_, _)
                 )
             {
                 return Task::none();
@@ -3607,6 +3602,11 @@ impl Application for Editor {
                         };
                         return Self::open_external_link(uri);
                     }
+                    let find_preferences_changed = matches!(
+                        &action,
+                        RepositoryAction::FindOptionsChanged { .. }
+                            | RepositoryAction::PreserveCaseChanged { .. }
+                    );
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
@@ -3681,6 +3681,18 @@ impl Application for Editor {
                     }
                     if focus_loaded {
                         tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                    }
+                    if find_preferences_changed {
+                        let (options, preserve) = self.tab(id).unwrap().runtime.find_preferences();
+                        self.settings.editor_find_options = options;
+                        self.settings.editor_replace_preserve_case = preserve;
+                        for tab in &mut self.tabs {
+                            tasks.push(repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            ));
+                        }
+                        tasks.push(self.save_settings());
                     }
                     tasks.push(self.drain(id));
                     if loaded || saved {
@@ -4153,6 +4165,18 @@ impl Application for Editor {
                         tab.runtime
                             .set_syntax_theme(self.settings.editor_syntax_theme);
                     }
+                    let options = self.settings.editor_find_options;
+                    let preserve = self.settings.editor_replace_preserve_case;
+                    let find_tasks = self
+                        .tabs
+                        .iter_mut()
+                        .map(|tab| {
+                            repository_task(
+                                tab.runtime
+                                    .update_find_preferences(tab.id, options, preserve),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let shortcuts =
                         self.capture_preference(PreferenceWrite::Shortcuts(self.shortcuts.clone()));
                     Task::batch([
@@ -4160,6 +4184,7 @@ impl Application for Editor {
                         self.appearance(),
                         self.save_settings(),
                         preference_task(shortcuts),
+                        Task::batch(find_tasks),
                     ])
                 }
                 Message::ShortcutChanged(action, value) => {
@@ -4178,40 +4203,9 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::FindInFile => {
-                    if self.find_open {
-                        self.close_find();
-                        return self.focus_active_editor();
-                    }
-                    self.find_open = true;
-                    self.select_find_match(0);
-                    self.focus_find_query()
-                }
-                Message::FindQueryChanged(query) => {
-                    self.find_query = query;
-                    self.select_find_match(0);
-                    Task::none()
-                }
-                Message::FindNext => {
-                    self.select_find_match(self.find_match_index.wrapping_add(1));
-                    self.focus_find_query()
-                }
-                Message::FindPrevious => {
-                    // Wrapping to `usize::MAX` and letting the search take it
-                    // modulo the total only lands on the last match when the
-                    // total divides 2^64: for 3 or 5 matches it re-selected the
-                    // first, for 7 the second.
-                    let previous = self
-                        .find_match_index
-                        .checked_sub(1)
-                        .unwrap_or_else(|| self.find_match_total.saturating_sub(1));
-                    self.select_find_match(previous);
-                    self.focus_find_query()
-                }
-                Message::CloseFind => {
-                    self.close_find();
-                    self.focus_active_editor()
-                }
+                Message::FindInFile => self.active.map_or_else(Task::none, |card| {
+                    self.update(Message::Repository(RepositoryAction::OpenFind { card }))
+                }),
                 Message::QuickOpen => {
                     let opening = !self.quick_open;
                     self.close_quick_open();
@@ -4410,8 +4404,25 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if let Some(event) = event {
+                        if !self.lsp.event_is_current(&event) {
+                            return self.lsp_next();
+                        }
+                        if let LspEvent::RootDiscovered { doc, ticket, root } = event {
+                            if let Some(status) = self.lsp.finish_discovery(doc, ticket, root)
+                                && let Some(error) = language_server_failure(status)
+                                && let Some(tab) = self
+                                    .tabs
+                                    .iter_mut()
+                                    .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                            {
+                                tab.lsp_error = Some(error);
+                            }
+                            return self.lsp_next();
+                        }
                         let doc = match &event {
-                            LspEvent::Diagnostics { doc, .. }
+                            LspEvent::RootDiscovered { doc, .. }
+                            | LspEvent::Resources { doc }
+                            | LspEvent::Diagnostics { doc, .. }
                             | LspEvent::Completion { doc, .. }
                             | LspEvent::Hover { doc, .. }
                             | LspEvent::Locations { doc, .. }
@@ -4420,17 +4431,37 @@ impl Application for Editor {
                             | LspEvent::RequestFailed { doc, .. }
                             | LspEvent::DocumentDesynced { doc, .. } => *doc,
                         };
+                        let current_version = self.lsp.document_version(doc);
+                        if let Some(id) = self
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                            .map(|tab| tab.id)
+                        {
+                            self.reconcile_completion_intent(id);
+                        }
                         if let Some(tab) = self
                             .tabs
                             .iter_mut()
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, version, .. } => {
-                                    tab.diagnostics = items;
-                                    tab.diagnostics_version = Some(version);
+                                LspEvent::Diagnostics { items, version, .. }
+                                    if current_version == Some(version) =>
+                                {
+                                    tab.set_diagnostics(items, Some(version));
                                 }
-                                LspEvent::Completion { items, .. } => tab.completions = items,
+                                LspEvent::Completion { request, items, .. } => {
+                                    if tab.completion_request.is_some_and(|(expected, at)| {
+                                        request == expected
+                                            && tab.runtime.cursor_position() == Some(at)
+                                    }) {
+                                        tab.completion_request = None;
+                                        tab.runtime.set_editor_completion_list(items);
+                                        tab.completions =
+                                            tab.runtime.editor_completion_targets(tab.id);
+                                    }
+                                }
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
                                 LspEvent::Status { status, .. } => {
                                     if let Some(error) = language_server_failure(status) {
@@ -4445,8 +4476,7 @@ impl Application for Editor {
                                 LspEvent::DocumentDesynced { error, .. } => {
                                     tab.completions.clear();
                                     tab.hover = None;
-                                    tab.diagnostics.clear();
-                                    tab.diagnostics_version = None;
+                                    tab.set_diagnostics(Vec::new(), None);
                                     tab.lsp_error = Some(error.to_string());
                                 }
                                 _ => {}
@@ -4461,27 +4491,37 @@ impl Application for Editor {
                     if self.modal_open() {
                         return Task::none();
                     }
-                    if let Some(tab) = self.current() {
-                        if let (Some(doc), Some(at)) =
-                            (tab.runtime.lsp_document(), tab.runtime.cursor_position())
-                        {
-                            if matches!(message, Message::Complete) {
-                                self.lsp.request_completion(doc, at);
-                            } else {
-                                self.lsp.request_hover(doc, at);
+                    let target = self.current().and_then(|tab| {
+                        Some((
+                            tab.id,
+                            tab.runtime.lsp_document()?,
+                            tab.runtime.cursor_position()?,
+                        ))
+                    });
+                    if let Some((id, doc, at)) = target {
+                        self.reconcile_completion_intent(id);
+                        if matches!(message, Message::Complete) {
+                            let request = self.lsp.request_completion(doc, at);
+                            if let Some(tab) = self.tab_mut(id) {
+                                tab.completion_request = Some((request, at));
                             }
+                        } else {
+                            self.lsp.request_hover(doc, at);
                         }
                     }
                     Task::none()
                 }
-                Message::Completion(id, index) => {
-                    if self.modal_open() {
+                Message::Completion(id, index, target) => {
+                    if self.active != Some(id) || self.modal_open() {
                         return Task::none();
                     }
                     if let Some(tab) = self.tab_mut(id) {
-                        if let Some(item) = tab.completions.get(index).cloned() {
-                            tab.runtime.apply_completion(&item);
+                        if tab.completions.get(index) == Some(&target)
+                            && tab.runtime.apply_completion_target(id, &target)
+                        {
                             tab.completions.clear();
+                            let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                            return Task::batch([self.drain(id), focus]);
                         }
                     }
                     self.drain(id)
@@ -4500,11 +4540,13 @@ impl Application for Editor {
                     }
                     if let Some(tab) = self.tab_mut(id) {
                         tab.runtime.move_cursor_to(at);
-                        return tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        self.reconcile_completion_intent(id);
+                        return focus;
                     }
                     Task::none()
                 }
-                Message::Key(event) => {
+                Message::Key(event, captured) => {
                     if cagents::tab_history::released(&event) {
                         self.tab_history.finish(self.active);
                     }
@@ -4520,9 +4562,7 @@ impl Application for Editor {
                         }
                         return Task::none();
                     }
-                    if self.find_open
-                        && let Some(task) = self.handle_find_key(&event)
-                    {
+                    if let Some(task) = self.handle_find_key(&event, captured) {
                         return task;
                     }
                     if let Some(task) = self.handle_shortcut(&event) {
@@ -4544,12 +4584,21 @@ impl Application for Editor {
                 }
             }
         })();
-        // Find owns one buffer. If the active tab changed under it, the
-        // outgoing tab would keep the search hold that makes its editor ignore
-        // every edit, recoverable only by closing the tab.
-        let find_closed = previous_tabs.0 != self.active && self.find_open;
+        // A tab switch dismisses the outgoing strip without moving either
+        // buffer's caret or carrying the query into another file.
+        let find_closed = previous_tabs.0 != self.active
+            && previous_tabs
+                .0
+                .and_then(|id| self.tab(id))
+                .is_some_and(|tab| tab.runtime.find_is_open());
         if find_closed {
-            self.close_find();
+            let id = previous_tabs.0.unwrap();
+            drop(
+                self.tab_mut(id)
+                    .unwrap()
+                    .runtime
+                    .update(RepositoryAction::CloseFind { card: id }),
+            );
         }
         let session = if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
             self.save_session()
@@ -4585,8 +4634,11 @@ impl Application for Editor {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let events = iced::event::listen_with(|event, _, window| match event {
-            iced::Event::Keyboard(event) => Some(Message::Key(event)),
+        let events = iced::event::listen_with(|event, status, window| match event {
+            iced::Event::Keyboard(event) => Some(Message::Key(
+                event,
+                matches!(status, iced::event::Status::Captured),
+            )),
             iced::Event::Window(window::Event::CloseRequested) => Some(Message::CloseWindow),
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
@@ -4668,15 +4720,6 @@ impl Application for Editor {
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
-            if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
-                toolbar_controls.push(
-                    widget::container(toolbar.map(Message::Repository))
-                        .width(Length::FillPortion(1))
-                        .into(),
-                );
-            } else {
-                toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
-            }
             if tab.review.is_open()
                 && let Some(control) = tab
                     .review
@@ -4702,37 +4745,23 @@ impl Application for Editor {
             }
             toolbar_controls.push(
                 icon_button(Icon::Search, "Find in file (Ctrl+F)")
-                    .selected(self.find_open)
+                    .selected(tab.runtime.find_is_open())
                     .on_press_maybe((!self.modal_open()).then_some(Message::FindInFile))
                     .into(),
             );
-            if !toolbar_controls.is_empty() {
-                editor.push(
-                    widget::container(
-                        widget::row::with_children(toolbar_controls)
-                            .spacing(design::TOOLBAR_GROUP_SPACING)
-                            .align_y(iced::Alignment::Center)
-                            .width(Length::Fill),
-                    )
-                    // The file toolbar carries the header's leading inset
-                    // itself, so this row adds none: a second inset here put
-                    // the file name at 20px while everything below it started
-                    // at 12. Only the trailing edge needs one, because the
-                    // controls this shell appends past the toolbar have no
-                    // container of their own to provide it.
-                    .padding(iced::Padding {
-                        right: design::TOOLBAR_INSET,
-                        ..iced::Padding::ZERO
-                    })
-                    .center_y(Length::Fill)
-                    .height(design::HEADER_CONTENT_HEIGHT)
-                    .width(Length::Fill)
-                    .into(),
-                );
-                editor.push(design::horizontal_rule().into());
-            }
-            if self.find_open {
-                editor.push(find_bar(self));
+            let trailing = widget::row::with_children(toolbar_controls)
+                .spacing(design::TOOLBAR_GROUP_SPACING)
+                .align_y(iced::Alignment::Center)
+                .into();
+            // Let the shared toolbar own its height: its Find/replace strip
+            // is a complete row below the file and shell action groups.
+            if let Some(toolbar) = repository_widget::selected_file_toolbar_mapped_with(
+                tab.id,
+                &tab.runtime,
+                Some(trailing),
+                Message::Repository,
+            ) {
+                editor.push(toolbar);
                 editor.push(design::horizontal_rule().into());
             }
             editor.push(
@@ -4745,12 +4774,10 @@ impl Application for Editor {
             );
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
-                for (index, item) in tab.completions.iter().enumerate() {
-                    results.push(
-                        widget::button::text(&item.label)
-                            .on_press(Message::Completion(tab.id, index))
-                            .into(),
-                    );
+                for index in 0..tab.completions.len() {
+                    if let Some(row) = completion_row(tab, index) {
+                        results.push(row);
+                    }
                 }
                 if let Some(hover) = &tab.hover {
                     results.push(widget::text::body(hover).into());
@@ -4766,7 +4793,7 @@ impl Application for Editor {
                         widget::button::custom(
                             widget::column::with_children(vec![
                                 design::caption(row.label).into(),
-                                design::body(row.message)
+                                design::body(row.message.into_owned())
                                     .wrapping(iced::widget::text::Wrapping::Word)
                                     .into(),
                             ])
@@ -4776,6 +4803,14 @@ impl Application for Editor {
                         .width(Length::Fill)
                         .on_press(Message::Jump(tab.id, row.at))
                         .into(),
+                    );
+                    results.push(
+                        widget::button::text("Copy full diagnostic")
+                            .on_press(Message::Repository(RepositoryAction::CopyDiagnostic {
+                                card: tab.id,
+                                diagnostic: row.diagnostic.clone(),
+                            }))
+                            .into(),
                     );
                 }
                 if withheld > 0 {
@@ -5397,10 +5432,258 @@ impl Editor {
     }
 }
 
+fn completion_row(tab: &Tab, index: usize) -> Option<Element<'_, Message>> {
+    let target = tab.completions.get(index)?;
+    let row = widget::button::text(&target.item().label).on_press(Message::Completion(
+        tab.id,
+        index,
+        target.clone(),
+    ));
+    Some(
+        widget::container(cagents::ui_controls::owned(target.native_key(), row))
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
+
+    // Kept byte-identical to the separately pinned native Find fixture by its
+    // offline preflight. This is tracked test data, never an external include.
+    const NATIVE_FIND_FIXTURE_SETTINGS: &str =
+        "schema_version = 3\neditor_auto_save = false\nlanguage_servers = []\n";
+
+    fn completion_pointer_step<M: Clone>(
+        mut row: Element<'_, M>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<M> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::{Event, Rectangle, Size, mouse};
+        struct Bounds(Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                assert!(
+                    self.0.replace(bounds).is_none(),
+                    "one actual completion button"
+                );
+            }
+        }
+        tree.diff(row.as_widget_mut());
+        let viewport = Rectangle::with_size(Size::new(360.0, 100.0));
+        let node = row.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut bounds = Bounds(None);
+        row.as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        let point = bounds
+            .0
+            .expect("production completion is a focusable button")
+            .center();
+        let mut messages = Vec::new();
+        row.as_widget_mut().update(
+            tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn standalone_completion_press_and_held_intent_cannot_cross_a_response() {
+        use cagents::lsp::LspCompletionItem;
+        use iced::advanced::{renderer::Headless, widget::Tree};
+        use iced::mouse::{Button, Event};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                iced::Font::default(),
+                iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        for replacement in [None, Some("old"), Some("new")] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("code.rs"), "foo\n").unwrap();
+            let mut app = editor();
+            let id = add(
+                &mut app,
+                directory.path().to_str().unwrap(),
+                Some("code.rs"),
+            );
+            load_selected(&mut app, id);
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                Some("foo\n")
+            );
+            let item = LspCompletionItem {
+                label: "same label".into(),
+                kind: None,
+                detail: None,
+                documentation: None,
+                sort_text: None,
+                filter_text: None,
+                preselect: false,
+                deprecated: false,
+                edit: cagents::lsp::LspCompletionEdit {
+                    range: cagents::lsp::LspRange {
+                        start: LspPosition::new(0, 0),
+                        end: LspPosition::new(0, 3),
+                    },
+                    replace_range: None,
+                    new_text: "old".into(),
+                    snippet: None,
+                },
+                additional_edits: vec![],
+            };
+            let install = |app: &mut Editor, item| {
+                let tab = app.tab_mut(id).unwrap();
+                tab.runtime.set_lsp_document(Some(LspDocumentId(41)));
+                tab.runtime.set_editor_completion_list(vec![item]);
+                tab.completions = tab.runtime.editor_completion_targets(id);
+            };
+            install(&mut app, item.clone());
+            let held = app.tab(id).unwrap().completions[0].clone();
+            let row = completion_row(app.tab(id).unwrap(), 0).unwrap();
+            let mut tree = Tree::new(row.as_widget());
+            drop(row);
+            assert!(
+                completion_pointer_step(
+                    completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            if let Some(text) = replacement {
+                let mut changed = item.clone();
+                changed.edit.new_text = text.into();
+                install(&mut app, changed);
+                drop(app.update(Message::Completion(id, 0, held)));
+                assert_eq!(
+                    app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                    Some("foo\n")
+                );
+            }
+            let messages = completion_pointer_step(
+                completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            let mut messages = if replacement.is_some() {
+                assert!(
+                    messages.is_empty(),
+                    "the old native press cannot select the replacement"
+                );
+                assert!(
+                    completion_pointer_step(
+                        completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left)
+                    )
+                    .is_empty()
+                );
+                completion_pointer_step(
+                    completion_row(app.tab(id).unwrap(), 0).unwrap(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonReleased(Button::Left),
+                )
+            } else {
+                messages
+            };
+            assert_eq!(messages.len(), 1);
+            drop(app.update(messages.pop().unwrap()));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.editor_text().as_deref(),
+                Some(if replacement == Some("new") {
+                    "new\n"
+                } else {
+                    "old\n"
+                })
+            );
+            assert!(app.tab(id).unwrap().completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_find_fixture_settings_load_and_disable_runtime_autosave() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(settings::SETTINGS_SCHEMA_VERSION, 3);
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let write = |document: &str| {
+            std::fs::write(&settings_path, document).unwrap();
+            std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        };
+        // Valid TOML alone did not qualify the original native fixture: the
+        // actual loader requires its schema header before decoding settings.
+        write("editor_auto_save = false\nlanguage_servers = []\n");
+        assert!(settings::load(&settings_path).is_err());
+        write(NATIVE_FIND_FIXTURE_SETTINGS);
+        let loaded =
+            settings::load(&settings_path).expect("native fixture must load, not fall back");
+        assert_eq!(loaded.schema_version, settings::SETTINGS_SCHEMA_VERSION);
+        assert!(!loaded.editor_auto_save);
+        assert!(loaded.language_servers.is_empty());
+
+        let root = directory.path().join("document");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("find.rs");
+        let original = "fn target() {}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut app = editor();
+        app.settings_path = settings_path;
+        app.settings = loaded;
+        // The local fixture keeps preference tasks disabled; all file load
+        // and edit actions below use the actual Ceditor/runtime boundary.
+        assert!(!app.settings_writable);
+        let id = add(&mut app, root.to_str().unwrap(), Some("find.rs"));
+        file_loaded(&mut app, id, &root, "find.rs");
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("changed".into()),
+                )),
+            })),
+        );
+        let runtime = &mut app.tab_mut(id).unwrap().runtime;
+        assert!(runtime.is_dirty());
+        assert!(iced::runtime::task::into_stream(runtime.auto_save_task(id)).is_none());
+        // A positive control distinguishes disabled scheduling from an editor
+        // that could never schedule a save. Neither task is polled here.
+        runtime.set_auto_save(true);
+        assert!(iced::runtime::task::into_stream(runtime.auto_save_task(id)).is_some());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
 
     fn git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
@@ -5506,8 +5789,93 @@ mod tests {
         assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
     }
 
+    // Like the shared checkout fixtures, isolate before Git/App state or a
+    // native operation lease exists. CLOEXEC does not stop a parallel fork
+    // from briefly inheriting that lease before its exec.
+    fn isolated_checkout_fixture_case(case: &str) -> bool {
+        use cagents::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var("CAGENTS_CEDITOR_CHECKOUT_CASE").as_deref() == Ok(case) {
+            assert!(
+                std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")),
+                "the owning child must precede ambient Git configuration capture"
+            );
+            for marker in ["XDG_RUNTIME_DIR", "XDG_DATA_HOME"] {
+                let path = std::env::var_os(marker).expect("owned checkout fixture directory");
+                let metadata = std::fs::metadata(path).unwrap();
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            return false;
+        }
+        let private = || {
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap()
+        };
+        let runtime = private();
+        let data = private();
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap())
+            .args([
+                case,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env("CAGENTS_CEDITOR_CHECKOUT_CASE", case)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_DATA_HOME", data.path())
+            .timeout(Duration::from_secs(90))
+            .output_limits(1024 * 1024, 1024 * 1024);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        let (success, stdout, stderr, status) =
+            match SystemProcessExecutor.execute(&command, &CancellationToken::default()) {
+                Ok(output) => (
+                    output.success,
+                    output.stdout,
+                    output.stderr,
+                    format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
+                ),
+                Err(failure) => (
+                    false,
+                    failure.stdout,
+                    failure.stderr,
+                    format!("{:?}: {}", failure.kind, failure.message),
+                ),
+            };
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(success, "owning case {case}: {status}\n{stdout}\n{stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.contains(&format!("test {case} ... ok"))),
+            "actual named owning test did not pass: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "exact selector must run one owning case: {stdout}\n{stderr}"
+        );
+        print!("{stdout}");
+        eprint!("{stderr}");
+        true
+    }
+
     #[test]
     fn ceditor_checkout_rejects_inflight_same_head_review_identity_changes() {
+        if isolated_checkout_fixture_case(
+            "app::tests::ceditor_checkout_rejects_inflight_same_head_review_identity_changes",
+        ) {
+            return;
+        }
         use cagents::{
             github::{GitHubRepoKey, PullRequestKey},
             repository::{
@@ -5637,7 +6005,14 @@ mod tests {
                     run_tasks(&mut app, task);
                     assert_eq!(
                         app.checkout_dialog.as_ref().unwrap().completed_for_test(),
-                        Some(root.as_path())
+                        Some(root.as_path()),
+                        "phase={phase}, changed_source={changed_source}, error={:?}, busy={}, receipt={:?}",
+                        app.checkout_dialog.as_ref().unwrap().error_for_test(),
+                        app.checkout_dialog.as_ref().unwrap().busy(),
+                        app.checkout_dialog
+                            .as_ref()
+                            .unwrap()
+                            .retained_receipt_for_test(),
                     );
                 }
                 let completed_receipt = if phase == 4 {
@@ -5993,10 +6368,10 @@ mod tests {
         drop(app.update(Message::Settings));
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.settings_open);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Escape,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert!(!app.modal_open());
         assert!(root.join("new.txt").exists());
 
@@ -6203,10 +6578,6 @@ mod tests {
             settings_reset_confirm: false,
             settings_path: PathBuf::new(),
             settings_open: false,
-            find_open: false,
-            find_match_index: 0,
-            find_match_total: 0,
-            find_query: String::new(),
             quick_open: false,
             quick_open_query: String::new(),
             quick_open_index: 0,
@@ -6357,19 +6728,22 @@ mod tests {
             drop(app.update(Message::Select(id)));
         }
         let next = || {
-            Message::Key(named_key(
-                keyboard::key::Named::Tab,
-                keyboard::Modifiers::CTRL,
-            ))
+            Message::Key(
+                named_key(keyboard::key::Named::Tab, keyboard::Modifiers::CTRL),
+                false,
+            )
         };
         drop(app.update(next()));
         assert_eq!(app.active, Some(second));
         drop(app.update(next()));
         assert_eq!(app.active, Some(first));
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Tab,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-        ))));
+        drop(app.update(Message::Key(
+            named_key(
+                keyboard::key::Named::Tab,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            ),
+            false,
+        )));
         assert_eq!(app.active, Some(second));
         drop(app.update(Message::WindowFocused(window::Id::RESERVED, false)));
         drop(app.update(next()));
@@ -6451,15 +6825,15 @@ mod tests {
         file_loaded(&mut app, second, root, "b.rs");
         drop(app.update(Message::Select(first)));
         drop(app.update(Message::FindInFile));
-        assert!(app.find_open);
+        assert!(app.find_is_open());
         // Clicking another tab's title while find is open used to leave the
         // outgoing tab holding search mode, where it drops every edit.
         drop(app.update(Message::Select(second)));
-        assert!(!app.find_open);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Escape,
-            keyboard::Modifiers::empty(),
-        ))));
+        assert!(!app.find_is_open());
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
         drop(app.update(Message::Select(first)));
         drop(
             app.update(Message::Repository(RepositoryAction::EditorAction {
@@ -6491,17 +6865,31 @@ mod tests {
             let id = add(&mut app, root.to_str().unwrap(), Some(&file));
             file_loaded(&mut app, id, root, &file);
             drop(app.update(Message::FindInFile));
-            drop(app.update(Message::FindQueryChanged("hit".into())));
-            assert_eq!(app.find_match_total, total);
-            assert_eq!(app.find_match_index, 0);
-            drop(app.update(Message::FindPrevious));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                    card: id,
+                    query: "hit".into(),
+                })),
+            );
             assert_eq!(
-                app.find_match_index,
-                total - 1,
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, total))
+            );
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindPrevious {
+                    card: id,
+                })),
+            );
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((total - 1, total)),
                 "previous from the first match did not wrap for {total} matches",
             );
-            drop(app.update(Message::FindNext));
-            assert_eq!(app.find_match_index, 0);
+            drop(app.update(Message::Repository(RepositoryAction::FindNext { card: id })));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, total))
+            );
         }
     }
 
@@ -6516,7 +6904,7 @@ mod tests {
         drop(app.update(Message::FindInFile));
         let save = character_key("s", keyboard::key::Code::KeyS);
         assert!(
-            app.handle_find_key(&save).is_none(),
+            app.handle_find_key(&save, true).is_none(),
             "find claimed Ctrl+S, which reads as a data-loss risk",
         );
         // Left and Right belong to the query input's caret.
@@ -6525,17 +6913,130 @@ mod tests {
             keyboard::key::Named::ArrowRight,
         ] {
             assert!(
-                app.handle_find_key(&named_key(arrow, keyboard::Modifiers::empty()))
+                app.handle_find_key(&named_key(arrow, keyboard::Modifiers::empty()), true)
                     .is_none(),
             );
         }
         let sidebar_open = app.sidebar_open;
-        drop(app.update(Message::Key(character_key("b", keyboard::key::Code::KeyB))));
+        drop(app.update(Message::Key(
+            character_key("b", keyboard::key::Code::KeyB),
+            false,
+        )));
         assert_ne!(
             app.sidebar_open, sidebar_open,
             "no shortcut reached the shortcut table while the find bar was open",
         );
-        assert!(app.find_open, "an unrelated chord closed the find bar");
+        assert!(app.find_is_open(), "an unrelated chord closed the find bar");
+    }
+
+    #[test]
+    fn standalone_find_tracks_real_edits_undo_redo_and_preserves_selection_on_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "hit hit\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, root, "a.rs");
+        drop(app.update(Message::FindInFile));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card: id,
+                query: "hit".into(),
+            })),
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 2))
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("changed".into()),
+                )),
+            })),
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("changed hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 1))
+        );
+        drop(app.update(Message::Repository(RepositoryAction::Undo { card: id })));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("hit hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 2))
+        );
+        drop(app.update(Message::Repository(RepositoryAction::Redo { card: id })));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.editor_text().as_deref(),
+            Some("changed hit\n")
+        );
+        assert_eq!(
+            app.tab(id).unwrap().runtime.find_match_position(),
+            Some((0, 1))
+        );
+        assert!(app.find_is_open());
+        drop(app.update(Message::Repository(RepositoryAction::FindNext { card: id })));
+        let cursor = app.tab(id).unwrap().runtime.cursor_position();
+        let selection = app.tab(id).unwrap().runtime.selected_text();
+        assert_eq!(selection.as_deref(), Some("hit"));
+        drop(app.update(Message::Repository(RepositoryAction::CloseFind {
+            card: id,
+        })));
+        assert!(!app.find_is_open());
+        assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), cursor);
+        assert_eq!(app.tab(id).unwrap().runtime.selected_text(), selection);
+    }
+
+    #[test]
+    fn standalone_find_leaves_captured_buffer_keys_to_their_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "hit\nhit\nhit\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, root, "a.rs");
+        drop(app.update(Message::FindInFile));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card: id,
+                query: "hit".into(),
+            })),
+        );
+        for key in [
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            let event = named_key(key, keyboard::Modifiers::empty());
+            assert!(
+                app.handle_find_key(&event, true).is_none(),
+                "captured buffer key was claimed: {key:?}"
+            );
+            let cursor = app.tab(id).unwrap().runtime.cursor_position();
+            let selection = app.tab(id).unwrap().runtime.selected_text();
+            drop(app.update(Message::Key(event, true)));
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_match_position(),
+                Some((0, 3))
+            );
+            assert_eq!(app.tab(id).unwrap().runtime.cursor_position(), cursor);
+            assert_eq!(app.tab(id).unwrap().runtime.selected_text(), selection);
+            assert!(app.find_is_open());
+        }
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Escape, keyboard::Modifiers::empty()),
+            false,
+        )));
+        assert!(!app.find_is_open());
     }
 
     #[test]
@@ -6546,15 +7047,18 @@ mod tests {
         // Layouts that shift the digit row report a symbol as the logical key,
         // which is why the canonical matcher consults the physical digit.
         let key = keyboard::Key::Character("!".into());
-        drop(app.update(Message::Key(keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL,
-            text: None,
-            repeat: false,
-        })));
+        drop(app.update(Message::Key(
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            },
+            false,
+        )));
         assert_ne!(
             app.sidebar_open, sidebar_open,
             "the configured digit chord never fired",
@@ -6707,21 +7211,21 @@ mod tests {
             keyboard::key::Named::ArrowDown,
             keyboard::Modifiers::empty(),
         );
-        drop(app.update(Message::Key(down.clone())));
+        drop(app.update(Message::Key(down.clone(), false)));
         assert_eq!(app.quick_open_selection(results.len()), 1);
         // Down from the last row wraps, and Up from the first row wraps back.
-        drop(app.update(Message::Key(down)));
+        drop(app.update(Message::Key(down, false)));
         assert_eq!(app.quick_open_selection(results.len()), 0);
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::ArrowUp,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::ArrowUp, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert_eq!(app.quick_open_selection(results.len()), 1);
         let selected = results[1].clone();
-        drop(app.update(Message::Key(named_key(
-            keyboard::key::Named::Enter,
-            keyboard::Modifiers::empty(),
-        ))));
+        drop(app.update(Message::Key(
+            named_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty()),
+            false,
+        )));
         assert!(!app.quick_open, "Enter did not open the selected result");
         assert_eq!(
             app.tab(id)
@@ -6731,6 +7235,392 @@ mod tests {
                 .map(|pending| pending.path.clone()),
             Some(selected),
         );
+    }
+
+    fn completion_find_fixture() -> (Editor, tempfile::TempDir, CardId, LspDocumentId) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("code.rs"), "tail tail\n").unwrap();
+        let mut app = editor();
+        let card = add(
+            &mut app,
+            directory.path().to_str().unwrap(),
+            Some("code.rs"),
+        );
+        load_selected(&mut app, card);
+        app.lsp = LspManager::new(AppSettings::default().language_servers);
+        app.language_server_assistance = true;
+        app.tab_mut(card).unwrap().runtime.resync_lsp();
+        drop(app.drain(card));
+        let doc = app.tab(card).unwrap().runtime.lsp_document().unwrap();
+        assert!(app.lsp.document_version(doc).is_some());
+        (app, directory, card, doc)
+    }
+
+    fn completion_item_for_find(label: &str) -> cagents::lsp::LspCompletionItem {
+        cagents::lsp::LspCompletionItem {
+            label: label.into(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            preselect: false,
+            deprecated: false,
+            edit: cagents::lsp::LspCompletionEdit {
+                range: cagents::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                replace_range: None,
+                new_text: label.into(),
+                snippet: None,
+            },
+            additional_edits: Vec::new(),
+        }
+    }
+
+    fn request_completion_for_find(app: &mut Editor, card: CardId) -> (LspRequestId, LspPosition) {
+        drop(app.update(Message::Complete));
+        app.tab(card).unwrap().completion_request.unwrap()
+    }
+
+    fn completion_reply_for_find(
+        app: &mut Editor,
+        doc: LspDocumentId,
+        request: LspRequestId,
+        label: &str,
+    ) {
+        drop(app.update(Message::Lsp(
+            app.lsp.generation(),
+            Some(LspEvent::Completion {
+                request,
+                doc,
+                items: vec![completion_item_for_find(label)],
+            }),
+        )));
+    }
+
+    fn navigate_find_key(app: &mut Editor, backwards: bool) {
+        let key = keyboard::Key::Named(keyboard::key::Named::F3);
+        drop(app.update(Message::Key(
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F3),
+                location: keyboard::Location::Standard,
+                modifiers: if backwards {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                },
+                text: None,
+                repeat: false,
+            },
+            false,
+        )));
+    }
+
+    #[test]
+    fn standalone_completion_callback_cannot_apply_to_an_inactive_tab() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, directory, card, doc) = completion_find_fixture();
+        std::fs::write(directory.path().join("other.rs"), "other buffer\n").unwrap();
+        let other = add(
+            &mut app,
+            directory.path().to_str().unwrap(),
+            Some("other.rs"),
+        );
+        load_selected(&mut app, other);
+        drop(app.update(Message::Select(card)));
+        let request = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, request.0, "queued");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        let version = app.lsp.document_version(doc);
+        drop(app.update(Message::Select(other)));
+        assert_eq!(app.active, Some(other));
+        assert_eq!(app.tab(card).unwrap().completions, vec![target.clone()]);
+        drop(app.update(Message::Completion(card, 0, target.clone())));
+        assert_eq!(app.active, Some(other));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("tail tail\n")
+        );
+        assert_eq!(
+            app.tab(other).unwrap().runtime.editor_text().as_deref(),
+            Some("other buffer\n")
+        );
+        assert!(!app.tab(card).unwrap().runtime.is_dirty());
+        assert!(!app.tab(other).unwrap().runtime.is_dirty());
+        assert_eq!(app.lsp.document_version(doc), version);
+        assert_eq!(app.tab(card).unwrap().completions, vec![target]);
+
+        // Returning to A and requesting a fresh answer still applies normally.
+        drop(app.update(Message::Select(card)));
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(app.active, Some(card));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshtail tail\n")
+        );
+        assert_eq!(
+            app.tab(other).unwrap().runtime.editor_text().as_deref(),
+            Some("other buffer\n")
+        );
+    }
+
+    #[test]
+    fn standalone_find_round_trip_refuses_old_completion_and_preserves_fresh_scroll_application() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, _directory, card, doc) = completion_find_fixture();
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            })),
+        );
+        let shown = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, shown.0, "shown");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        let old = request_completion_for_find(&mut app, card);
+        let version = app.lsp.document_version(doc);
+        navigate_find_key(&mut app, false);
+        assert_ne!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(old.1)
+        );
+        assert!(app.tab(card).unwrap().completion_request.is_none());
+        assert!(app.tab(card).unwrap().completions.is_empty());
+        navigate_find_key(&mut app, true);
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(old.1)
+        );
+        assert_eq!(app.lsp.document_version(doc), version);
+        completion_reply_for_find(&mut app, doc, old.0, "late");
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("tail tail\n")
+        );
+        assert!(app.tab(card).unwrap().completions.is_empty());
+
+        let superseded = request_completion_for_find(&mut app, card);
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, superseded.0, "older");
+        assert_eq!(app.tab(card).unwrap().completion_request, Some(fresh));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Scroll { lines: 2 },
+            })),
+        );
+        assert_eq!(app.tab(card).unwrap().completion_request, Some(fresh));
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Scroll { lines: 2 },
+            })),
+        );
+        assert_eq!(app.tab(card).unwrap().completions, vec![target.clone()]);
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshtail tail\n")
+        );
+    }
+
+    #[test]
+    fn standalone_history_change_retires_queued_completion_at_the_same_caret() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        let (mut app, _directory, card, doc) = completion_find_fixture();
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::FindQueryChanged {
+                card,
+                query: "tail".into(),
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card,
+                action: EditorAction::Edit(widget::text_editor::Edit::Paste(Arc::new(
+                    "head".into(),
+                ))),
+            })),
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("head tail\n")
+        );
+        assert_eq!(
+            app.tab(card).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(0, 4))
+        );
+        for (action, text, dirty) in [
+            (RepositoryAction::Undo { card }, "tail tail\n", false),
+            (RepositoryAction::Redo { card }, "head tail\n", true),
+        ] {
+            let pending = request_completion_for_find(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            let intent = app.tab(card).unwrap().runtime.editor_completion_intent();
+            // This answer was already queued against the pre-history version.
+            // The manager has no version proof in Completion itself.
+            let queued = Message::Lsp(
+                app.lsp.generation(),
+                Some(LspEvent::Completion {
+                    request: pending.0,
+                    doc,
+                    items: vec![completion_item_for_find("old-version")],
+                }),
+            );
+            drop(app.update(Message::Repository(action)));
+            let tab = app.tab(card).unwrap();
+            assert_eq!(tab.runtime.editor_text().as_deref(), Some(text));
+            assert_eq!(tab.runtime.cursor_position(), Some(pending.1));
+            assert_eq!(tab.runtime.is_dirty(), dirty);
+            assert_eq!(tab.runtime.editor_completion_intent(), intent);
+            assert!(app.lsp.document_version(doc) > version);
+            assert!(tab.completion_request.is_none());
+            drop(app.update(queued));
+            assert!(app.tab(card).unwrap().completions.is_empty());
+            assert_eq!(
+                app.tab(card).unwrap().runtime.editor_text().as_deref(),
+                Some(text)
+            );
+        }
+        let fresh = request_completion_for_find(&mut app, card);
+        completion_reply_for_find(&mut app, doc, fresh.0, "fresh");
+        let target = app.tab(card).unwrap().completions[0].clone();
+        drop(app.update(Message::Completion(card, 0, target)));
+        assert_eq!(
+            app.tab(card).unwrap().runtime.editor_text().as_deref(),
+            Some("freshhead tail\n")
+        );
+    }
+
+    #[test]
+    fn standalone_deferred_find_admission_preserves_rejected_callbacks_and_retires_real_selection()
+    {
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for hidden in [false, true] {
+            let (mut app, _directory, card, doc) = completion_find_fixture();
+            drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+            drop(
+                app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+                    card,
+                    option: cagents::ui_controls::FindOption::Regex,
+                    enabled: true,
+                })),
+            );
+            let shown = request_completion_for_find(&mut app, card);
+            completion_reply_for_find(&mut app, doc, shown.0, "shown");
+            let targets = app.tab(card).unwrap().completions.clone();
+            let pending = request_completion_for_find(&mut app, card);
+            let version = app.lsp.document_version(doc);
+            app.settings_open = true;
+            assert!(app.modal_open());
+            drop(app.update(Message::Repository(RepositoryAction::FindNext { card })));
+            app.settings_open = false;
+            assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+            let task =
+                app.tab_mut(card)
+                    .unwrap()
+                    .runtime
+                    .update(RepositoryAction::FindQueryChanged {
+                        card,
+                        query: "tail".into(),
+                    });
+            let mut stream =
+                iced::runtime::task::into_stream(task).expect("real deferred regex worker");
+            // Only the Find future is polled; manager tasks remain on the
+            // entered but undriven runtime, with no server process execution.
+            let result = block_on(async {
+                loop {
+                    let event = stream.next().await.expect("Find produces its callback");
+                    if let iced::runtime::Action::Output(
+                        result @ RepositoryAction::FindLoaded { .. },
+                    ) = event
+                    {
+                        break result;
+                    }
+                }
+            });
+            let mut stale = result.clone();
+            let RepositoryAction::FindLoaded { ticket, .. } = &mut stale else {
+                unreachable!()
+            };
+            *ticket = Default::default();
+            drop(app.update(Message::Repository(stale)));
+            let mut foreign = result.clone();
+            let RepositoryAction::FindLoaded {
+                card: foreign_card, ..
+            } = &mut foreign
+            else {
+                unreachable!()
+            };
+            *foreign_card = CardId::new();
+            drop(app.update(Message::Repository(foreign)));
+            assert_eq!(app.tab(card).unwrap().completions, targets);
+            assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+            if hidden {
+                drop(app.tab_mut(card).unwrap().runtime.update(
+                    RepositoryAction::ApplyMarkdownMode {
+                        card,
+                        preview: true,
+                    },
+                ));
+                assert!(
+                    app.tab(card)
+                        .unwrap()
+                        .runtime
+                        .editor_focus_target(card)
+                        .is_none()
+                );
+            }
+            drop(app.update(Message::Repository(result)));
+            assert_eq!(
+                app.tab(card).unwrap().runtime.editor_text().as_deref(),
+                Some("tail tail\n")
+            );
+            assert_eq!(app.lsp.document_version(doc), version);
+            if hidden {
+                assert_eq!(
+                    app.tab(card).unwrap().runtime.cursor_position(),
+                    Some(pending.1)
+                );
+                assert_eq!(app.tab(card).unwrap().completion_request, Some(pending));
+                assert_eq!(app.tab(card).unwrap().completions, targets);
+            } else {
+                assert_ne!(
+                    app.tab(card).unwrap().runtime.cursor_position(),
+                    Some(pending.1)
+                );
+                assert!(app.tab(card).unwrap().completion_request.is_none());
+                assert!(app.tab(card).unwrap().completions.is_empty());
+                completion_reply_for_find(&mut app, doc, pending.0, "late");
+                assert!(app.tab(card).unwrap().completions.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -6925,6 +7815,217 @@ mod tests {
     }
 
     #[test]
+    fn lsp_diagnostics_reach_standalone_editor_navigation_and_follow_edits() {
+        use cagents::lsp::{LspError, LspRange, LspSeverity};
+        use cagents::repository_widget::EditorLspAction;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        let original = "first\nsecond\nthird\n";
+        std::fs::write(directory.path().join("a.rs"), original).unwrap();
+        let mut app = editor();
+        app.language_server_assistance = true;
+        app.lsp = LspManager::new(app.settings.language_servers.clone());
+        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, directory.path(), "a.rs");
+        let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+        // Discovery stays pending: this tests real application routing and
+        // protocol version fences without launching any language server.
+        assert_eq!(app.lsp.document_version(doc), Some(1));
+        let generation = app.lsp.generation();
+        let diagnostic = |line| {
+            LspDiagnostic::new(
+                LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 3)),
+                LspSeverity::Error,
+                "standing error".into(),
+                None,
+                None,
+            )
+        };
+        let publish = |version, line| {
+            Message::Lsp(
+                generation,
+                Some(LspEvent::Diagnostics {
+                    doc,
+                    version,
+                    items: vec![diagnostic(line)],
+                }),
+            )
+        };
+        let next = || {
+            Message::Repository(RepositoryAction::Language {
+                card: id,
+                action: EditorLspAction::Diagnostic(true),
+            })
+        };
+        drop(app.update(publish(1, 2)));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(2, 0))
+        );
+
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .move_cursor_to(LspPosition::new(0, 0));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("// before\n".into()),
+                )),
+            })),
+        );
+        assert_eq!(app.lsp.document_version(doc), Some(2));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(3, 0))
+        );
+
+        drop(app.update(publish(1, 0)));
+        assert_eq!(
+            app.tab(id).unwrap().diagnostics[0].range.start,
+            LspPosition::new(3, 0)
+        );
+        drop(app.update(publish(2, 1)));
+        drop(app.update(next()));
+        assert_eq!(
+            app.tab(id).unwrap().runtime.cursor_position(),
+            Some(LspPosition::new(1, 0))
+        );
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::DocumentDesynced {
+                doc,
+                version: 2,
+                error: LspError::InconsistentEdits,
+            }),
+        )));
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        drop(app.update(publish(2, 1)));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+        app.close_document(id);
+        assert!(app.tab(id).unwrap().diagnostics.is_empty());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .runtime
+                .diagnostic_navigation_available()
+        );
+    }
+
+    #[test]
+    fn inexact_editor_changes_invalidate_standalone_diagnostics_through_the_real_drain() {
+        use cagents::lsp::{LspRange, LspSeverity};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = executor.enter();
+        for (original, published_version, preserves) in [
+            ("first\nerror\r", 1, false),
+            ("first\nerror\n", 0, false),
+            ("first\nerror\n", 1, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.rs"), original).unwrap();
+            let mut app = editor();
+            app.language_server_assistance = true;
+            app.lsp = LspManager::new(app.settings.language_servers.clone());
+            let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+            file_loaded(&mut app, id, directory.path(), "a.rs");
+            let doc = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+            let generation = app.lsp.generation();
+            let publish = |version| {
+                Message::Lsp(
+                    generation,
+                    Some(LspEvent::Diagnostics {
+                        doc,
+                        version,
+                        items: vec![LspDiagnostic::new(
+                            LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 5)),
+                            LspSeverity::Error,
+                            "standing error".into(),
+                            None,
+                            None,
+                        )],
+                    }),
+                )
+            };
+            drop(app.update(publish(1)));
+            app.tab_mut(id).unwrap().diagnostics_version = Some(published_version);
+            app.tab_mut(id)
+                .unwrap()
+                .runtime
+                .move_cursor_to(LspPosition::new(0, 0));
+            drop(
+                app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: id,
+                    action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                        Arc::new("\n".into()),
+                    )),
+                })),
+            );
+            assert_eq!(app.lsp.document_version(doc), Some(2));
+            assert_eq!(app.tab(id).unwrap().diagnostics.is_empty(), !preserves);
+            assert_eq!(
+                app.tab(id).unwrap().diagnostics_version,
+                preserves.then_some(2)
+            );
+            if preserves {
+                assert_eq!(
+                    app.tab(id).unwrap().diagnostics[0].range.start,
+                    LspPosition::new(2, 0)
+                );
+            }
+            assert_eq!(
+                app.tab(id)
+                    .unwrap()
+                    .runtime
+                    .diagnostic_navigation_available(),
+                preserves
+            );
+            drop(app.update(publish(1)));
+            assert_eq!(app.tab(id).unwrap().diagnostics.is_empty(), !preserves);
+            drop(app.update(publish(2)));
+            assert!(
+                app.tab(id)
+                    .unwrap()
+                    .runtime
+                    .diagnostic_navigation_available()
+            );
+            assert!(app.diagnostics_are_current(id));
+        }
+    }
+
+    #[test]
     fn a_jump_into_stale_diagnostics_is_refused_and_explained() {
         let mut app = editor();
         let id = add(&mut app, "/workspace", Some("a.rs"));
@@ -6940,6 +8041,83 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("these diagnostics describe an earlier version of the file"),
+        );
+    }
+
+    #[test]
+    fn find_preferences_load_share_persist_and_reset_across_standalone_tabs() {
+        use cagents::ui_controls::FindOption;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(root.join(name), "foo FOO\n").unwrap();
+        }
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        app.settings.editor_find_options.case_sensitive = true;
+        app.settings.editor_replace_preserve_case = true;
+        let first = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        load_selected(&mut app, first);
+        let second = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        load_selected(&mut app, second);
+        for id in [first, second] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (app.settings.editor_find_options, true)
+            );
+        }
+        let task = app.update(Message::Repository(RepositoryAction::FindOptionsChanged {
+            card: first,
+            option: FindOption::Regex,
+            enabled: true,
+        }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::Repository(RepositoryAction::PreserveCaseChanged {
+            card: first,
+            enabled: false,
+        }));
+        run_tasks(&mut app, task);
+        let persisted = settings::load(&app.settings_path).unwrap();
+        assert!(persisted.editor_find_options.case_sensitive);
+        assert!(persisted.editor_find_options.regex);
+        assert!(!persisted.editor_replace_preserve_case);
+        let third = add(&mut app, root.to_str().unwrap(), Some("c.rs"));
+        load_selected(&mut app, third);
+        for id in [first, second, third] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (persisted.editor_find_options, false)
+            );
+        }
+        let mut reopened = configured(&directory);
+        reopened.settings_writable = true;
+        reopened.settings = persisted;
+        let fourth = add(&mut reopened, root.to_str().unwrap(), Some("d.rs"));
+        load_selected(&mut reopened, fourth);
+        assert_eq!(
+            reopened.tab(fourth).unwrap().runtime.find_preferences(),
+            (app.settings.editor_find_options, false)
+        );
+        app.settings_open = true;
+        drop(app.update(Message::ResetSettings));
+        let task = app.update(Message::ResetSettings);
+        run_tasks(&mut app, task);
+        let defaults = AppSettings::default();
+        for id in [first, second, third] {
+            assert_eq!(
+                app.tab(id).unwrap().runtime.find_preferences(),
+                (
+                    defaults.editor_find_options,
+                    defaults.editor_replace_preserve_case
+                )
+            );
+        }
+        let reset = settings::load(&app.settings_path).unwrap();
+        assert_eq!(reset.editor_find_options, defaults.editor_find_options);
+        assert_eq!(
+            reset.editor_replace_preserve_case,
+            defaults.editor_replace_preserve_case
         );
     }
 
@@ -7032,23 +8210,25 @@ mod tests {
         let id = add(&mut app, "/workspace", Some("a.rs"));
         let doc = LspDocumentId(1);
         app.tab_mut(id).unwrap().runtime.set_lsp_document(Some(doc));
+        app.lsp = LspManager::new(cagents::settings::AppSettings::default().language_servers);
+        let language = app.lsp.language_for(Path::new("/workspace/a.rs")).unwrap();
+        // With no async runtime, the real manager refuses registration. Its
+        // reason has no SessionHandle and must survive the delivery fence.
+        let status = app.lsp.open(
+            doc,
+            Path::new("/workspace/a.rs"),
+            Path::new("/workspace"),
+            language,
+            1,
+            "",
+        );
+        let expected = language_server_failure(status).expect("real admission refusal");
+        assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
+        let event = app.lsp.events().try_recv().unwrap();
         let generation = app.lsp.generation();
-        drop(app.update(Message::Lsp(
-            generation,
-            Some(LspEvent::Status {
-                doc,
-                status: LspStatus::Failed {
-                    reason: "initialize failed".into(),
-                    stderr_tail: vec![
-                        "toolchain unavailable".into(),
-                        "infinite recursion detected".into(),
-                    ],
-                },
-            }),
-        )));
+        drop(app.update(Message::Lsp(generation, Some(event.clone()))));
         let evidence = app.tab(id).unwrap().lsp_error.clone().unwrap();
-        assert!(evidence.contains("initialize failed"));
-        assert!(evidence.contains("toolchain unavailable\ninfinite recursion detected"));
+        assert_eq!(evidence, expected);
         drop(app.update(Message::Notices));
         assert!(app.modal_open());
         drop(app.update(Message::CloseNotices));
@@ -7058,14 +8238,26 @@ mod tests {
         drop(app.update(Message::Dismiss));
         assert!(app.tab(id).unwrap().lsp_error.is_none());
         assert!(!app.modal_open());
-        drop(app.update(Message::Lsp(
-            generation,
-            Some(LspEvent::Status {
-                doc,
-                status: LspStatus::Ready,
-            }),
-        )));
-        assert!(app.tab(id).unwrap().lsp_error.is_none());
+        app.lsp.close(doc);
+        drop(app.update(Message::Lsp(generation, Some(event))));
+        assert!(
+            app.tab(id).unwrap().lsp_error.is_none(),
+            "closed producer cannot restore a dismissed error"
+        );
+    }
+
+    #[test]
+    fn language_server_failure_preserves_the_full_stderr_evidence() {
+        let failure = language_server_failure(LspStatus::Failed {
+            reason: "initialize failed".into(),
+            stderr_tail: vec![
+                "toolchain unavailable".into(),
+                "infinite recursion detected".into(),
+            ],
+        })
+        .unwrap();
+        assert!(failure.contains("initialize failed"));
+        assert!(failure.contains("toolchain unavailable\ninfinite recursion detected"));
     }
 
     #[test]
@@ -7862,10 +9054,17 @@ mod tests {
     fn a_modal_refuses_editor_input_but_never_an_async_completion() {
         let card = CardId::new();
         assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::FindReplacementLoaded {
+                card,
+                ticket: card.as_uuid(),
+                result: Ok(None)
+            }
+        ));
+        assert!(repository_action_allowed_while_modal(
             &RepositoryAction::FindLoaded {
                 card,
                 ticket: card.as_uuid(),
-                result: Ok(Some(Vec::new())),
+                result: Ok(Some(Default::default())),
             }
         ));
         assert!(!repository_action_allowed_while_modal(

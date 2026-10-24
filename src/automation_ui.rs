@@ -1199,6 +1199,7 @@ impl State {
             }
             Action::Search(value) => self.search = value,
             Action::New => {
+                self.notice = None;
                 self.draft = Some(Draft::new(&self.targets, &self.accounts, None));
                 self.run = None;
             }
@@ -1224,7 +1225,10 @@ impl State {
                         accounts.push(saved.clone());
                     }
                     Draft::new(&self.targets, &accounts, Some(value))
-                })
+                });
+                if self.draft.is_some() {
+                    self.notice = None;
+                }
             }
             Action::CancelEdit => self.draft = None,
             Action::KeepDraft(_) | Action::DiscardDraft(_) => {}
@@ -3434,6 +3438,143 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label:?} is drawn"))
                 .1
         }
+    }
+
+    /// Completes a real Save action/reply rather than seeding a notice string.
+    fn saved_notice_state() -> State {
+        let (mut state, mut saved) = editing(None, None);
+        state.update(Action::Field(Field::Name, "Saved automation A".into()));
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::Edit {
+                    id,
+                    revision,
+                    definition,
+                },
+        }) = state.update(Action::Save)
+        else {
+            panic!("the valid draft sends its explicit Save");
+        };
+        assert_eq!(id, saved.id);
+        assert_eq!(revision, saved.revision);
+        assert_eq!(definition.name, "Saved automation A");
+        // Navigation cannot replace a draft while that Save is in flight.
+        for action in [Action::New, Action::Edit] {
+            assert!(state.update(action).is_none());
+            assert!(matches!(state.pending, Some((pending, Pending::Save)) if pending == sequence));
+            assert_eq!(state.draft.as_ref().unwrap().name, "Saved automation A");
+        }
+        saved.revision += 1;
+        saved.definition = definition;
+        let id = saved.id;
+        let Some(Effect::Request {
+            sequence: history_sequence,
+            request: Request::History {
+                id: Some(observed), ..
+            },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(saved))),
+        })
+        else {
+            panic!("the saved detail requests its own history");
+        };
+        assert_eq!(observed, id);
+        state.update(Action::Received {
+            sequence: history_sequence,
+            result: std::sync::Arc::new(Ok(Response::History(crate::automations::HistoryPage {
+                firings: vec![],
+                next: None,
+            }))),
+        });
+        assert!(state.pending.is_none());
+        assert!(!state.has_draft());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Saved."))
+        );
+        let outline = Outline::of(&state, 900.0, 700.0);
+        assert!(outline.texts.iter().any(
+            |(text, _)| text == "Saved. Review the launch settings before enabling or running."
+        ));
+        state
+    }
+
+    fn assert_unsaved_form(state: &State) {
+        let outline = Outline::of(state, 900.0, 700.0);
+        assert!(
+            !outline
+                .texts
+                .iter()
+                .any(|(text, _)| text
+                    == "Saved. Review the launch settings before enabling or running."),
+            "the previous success must not label this draft saved"
+        );
+        outline.text("Save automation");
+    }
+
+    #[test]
+    fn saved_confirmation_retires_when_new_opens_an_unsaved_blank_draft() {
+        let mut state = saved_notice_state();
+        assert!(
+            state.update(Action::New).is_none(),
+            "opening a form sends no mutation"
+        );
+        let draft = state.draft.as_ref().unwrap();
+        assert!(draft.base.is_none());
+        assert_eq!(draft.name, "");
+        assert!(draft.prompt.text().is_empty());
+        assert!(!state.draft_dirty());
+        assert!(state.notice.is_none());
+        assert_unsaved_form(&state);
+        state.update(Action::Field(Field::Name, "Unsaved automation B".into()));
+        assert!(state.draft_dirty());
+        assert_unsaved_form(&state);
+        state.update(Action::CancelEdit);
+        assert!(
+            state.draft_dialog_open(),
+            "closing still protects the new unsaved work"
+        );
+        state.update(state.keep_draft_action().unwrap());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved automation B");
+        assert_unsaved_form(&state);
+    }
+
+    #[test]
+    fn saved_confirmation_retires_only_after_edit_enters_a_draft() {
+        let mut state = saved_notice_state();
+        // An Edit action without a selection cannot enter an editor and must
+        // not retire the completed operation's notice.
+        let selected = state.selected.take();
+        let notice = state.notice.clone();
+        assert!(state.update(Action::Edit).is_none());
+        assert!(!state.has_draft());
+        assert_eq!(state.notice, notice);
+        state.selected = selected;
+        assert!(state.update(Action::Edit).is_none());
+        assert!(state.draft.as_ref().unwrap().base.is_some());
+        assert!(!state.draft_dirty());
+        assert!(state.notice.is_none());
+        assert_unsaved_form(&state);
+        state.update(Action::Field(Field::Name, "Unsaved revision of A".into()));
+        assert!(state.draft_dirty());
+        assert_unsaved_form(&state);
+        // Rejected and canceled discard answers cannot replace the edit or
+        // revive a save confirmation from the previous revision.
+        state.update(Action::New);
+        let generation = state.discard_generation;
+        assert!(state.draft_dialog_open());
+        state.update(Action::DiscardDraft(generation.wrapping_add(1)));
+        assert!(state.draft_dialog_open());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved revision of A");
+        state.update(Action::KeepDraft(generation));
+        assert!(!state.draft_dialog_open());
+        assert!(state.draft_dirty());
+        assert_eq!(state.draft.as_ref().unwrap().name, "Unsaved revision of A");
+        assert_unsaved_form(&state);
     }
 
     #[test]
