@@ -746,23 +746,48 @@ impl Cagents {
         self.resume_ui.error = None;
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
-            self.close_resume();
-            let scope = if let Some(channel) = self
+            let (selected, scope) = if let Some(channel) = self
                 .durable
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| channel.id)
             {
-                self.select_channel(channel)
+                (true, self.select_channel(channel))
             } else {
-                let owner = self
-                    .card_state(card)
-                    .and_then(|card| self.card_worktree(card))
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
+                let Some(target) = self.card_state(card) else {
+                    self.resume_error("The original conversation card is no longer available.");
+                    return Task::none();
+                };
+                let owner = self.card_worktree(target).map(Path::to_path_buf);
+                // The catalog identifies a conversation, not its currently
+                // retained owner or presentation kind. Classify the actual
+                // target before selecting a possibly unleased History view.
+                let target_session = match &target.kind {
+                    CardKind::Chat(session) => Some(session.clone()),
+                    CardKind::Terminal(_) => None,
+                    _ => {
+                        self.resume_error("The original conversation card is no longer available.");
+                        return Task::none();
+                    }
+                };
+                let Some(owner) = owner else {
+                    self.resume_error(
+                        "The original conversation's worktree is no longer available.",
+                    );
+                    return Task::none();
+                };
+                match target_session {
+                    Some(session) => self.select_conversation_worktree(&session, owner),
+                    None => self.select_worktree_checked(owner, false),
+                }
             };
+            if !selected || !self.workspace.order().any(|id| id == card) {
+                self.resume_error("This conversation's original project could not be selected. Resolve its worktree protection error before reopening it.");
+                return scope;
+            }
+            self.close_resume();
+            self.persist();
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
         let local_pending = self.chat_awaiting_admission(entry.card)
@@ -805,6 +830,15 @@ impl Cagents {
             self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
             return Task::none();
         }
+        let replace = self.resume_ui.replace;
+        let (selected, scope) = self.select_conversation_worktree(
+            &session,
+            session.launch.recipe.working_directory.clone(),
+        );
+        if !selected {
+            self.resume_error("This conversation's original project could not be selected. Resolve its worktree protection error before reopening it.");
+            return scope;
+        }
         if !matches!(
             session.native_continuity,
             chat::NativeContinuity::Durable { .. }
@@ -814,11 +848,9 @@ impl Cagents {
             session.proof = None;
             session.terminal = None;
         }
-        let replace = self.resume_ui.replace;
         self.close_resume();
         self.recently_closed
             .retain(|(card, _)| card.id != entry.card);
-        let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
@@ -1062,6 +1094,239 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    /// Exercise the same protection call that an initialized native window
+    /// uses, rather than its intentionally uninitialized test shortcut.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_directory_history_keeps_its_scope_through_public_resume_and_restore() {
+        for nested in [false, true] {
+            let directories = tempfile::tempdir().unwrap();
+            let protections = tempfile::tempdir().unwrap();
+            let existing = directories.path().join("existing");
+            std::fs::create_dir(&existing).unwrap();
+            std::fs::write(existing.join("unrelated"), b"keep other project").unwrap();
+            let owner = directories.path().join("removed");
+            let missing = if nested {
+                owner.join("subdir")
+            } else {
+                owner.clone()
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            if nested {
+                std::fs::create_dir_all(&missing).unwrap();
+                // Native startup retains this indexed boundary even after the
+                // deleted worktree record leaves visible sidebar navigation.
+                app.known_worktree_roots.insert(owner.clone());
+                std::fs::remove_dir_all(&owner).unwrap();
+            }
+            assert!(matches!(std::fs::metadata(&owner), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound));
+            drop(app.resume_saved_conversation(saved(&existing)));
+            let other = app.workspace.focused().unwrap();
+            let other_before = app.card_state(other).unwrap().clone();
+            let (selected, task) = app.select_worktree_checked(missing.clone(), false);
+            drop(task);
+            assert!(
+                !selected,
+                "ordinary selection must still require a directory lease"
+            );
+            assert_eq!(app.active_workspace.as_deref(), Some(existing.as_path()));
+
+            let mut entry = saved(&missing);
+            entry.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            let launch = entry.session.launch.clone();
+            let title = entry.title.clone();
+            app.resume_ui.open = true;
+            drop(app.resume_saved_conversation(entry));
+            let history = app.workspace.focused().unwrap();
+            assert_ne!(history, other);
+            assert!(!app.resume_ui.open && app.resume_ui.error.is_none());
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            assert_eq!(
+                app.durable.active_worktree.as_deref(),
+                Some(owner.as_path())
+            );
+            let card = app.card_state(history).unwrap();
+            assert_eq!(card.title, title);
+            let CardKind::Chat(session) = &card.kind else {
+                panic!("a saved History chat");
+            };
+            assert_eq!(session.launch, launch);
+            assert!(session.launch.needs_read_only_history());
+            assert!(session.proof.is_none() && session.terminal.is_none());
+            assert_eq!(app.card_worktree(card), Some(owner.as_path()));
+            let session = session.clone();
+            assert!(app.workspace.card(other).is_none());
+            assert_eq!(app.card_state(other).unwrap().kind, other_before.kind);
+            assert_eq!(app.card_state(other).unwrap().title, other_before.title);
+
+            // Reopening the existing actual target receives its owner root,
+            // not its nested launch cwd, and must keep the same card/session.
+            drop(app.select_worktree(existing.clone(), false));
+            app.resume_ui.open = true;
+            drop(app.resume_saved_conversation(SavedConversation {
+                card: history,
+                title: title.clone(),
+                session: session.clone(),
+                open: true,
+                updated_at_unix_ms: 2,
+            }));
+            assert!(!app.resume_ui.open && app.resume_ui.error.is_none());
+            assert_eq!(app.active_workspace.as_deref(), Some(owner.as_path()));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), [history]);
+            assert_eq!(app.durable.cards.len(), 2);
+
+            // Use the normal saved descriptor and its real serialization, without
+            // changing a path, card ID, pending admission, or readiness bit.
+            let snapshot = app.persistent_workspace();
+            let serialized = serde_json::to_vec(snapshot.as_ref()).unwrap();
+            let mut reopened = crate::app::tests::context_inspector_test_app(false);
+            reopened
+                .worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            if nested {
+                // Match startup's independent persisted WorktreeState index; the
+                // WorkspaceState codec must not invent a new leaf owner.
+                reopened.known_worktree_roots.insert(owner.clone());
+            }
+            reopened.durable = Arc::new(serde_json::from_slice(&serialized).unwrap());
+            drop(reopened.restore_worktree_scope());
+            assert_eq!(reopened.active_workspace.as_deref(), Some(owner.as_path()));
+            assert_eq!(reopened.workspace.focused(), Some(history));
+            assert!(reopened.workspace.card(history).is_some());
+            assert!(reopened.workspace.card(other).is_none());
+            let CardKind::Chat(restored) = &reopened.card_state(history).unwrap().kind else {
+                panic!("the original saved History descriptor");
+            };
+            assert_eq!(restored, &session);
+            assert_eq!(
+                reopened.card_worktree(reopened.card_state(history).unwrap()),
+                Some(owner.as_path())
+            );
+            assert_eq!(restored.launch.recipe.working_directory, missing);
+            assert!(!owner.exists());
+            assert!(
+                !missing.exists(),
+                "reading History must not create its old cwd"
+            );
+            assert_eq!(
+                std::fs::read(existing.join("unrelated")).unwrap(),
+                b"keep other project"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resume_protection_refusal_retains_picker_scope_and_saved_conversation() {
+        for nested in [false, true] {
+            let directories = tempfile::tempdir().unwrap();
+            let protections = tempfile::tempdir().unwrap();
+            let existing = directories.path().join("existing");
+            std::fs::create_dir(&existing).unwrap();
+            let target = directories.path().join("returned");
+            let cwd = if nested {
+                target.join("missing-subdir")
+            } else {
+                target.clone()
+            };
+            let mut entry = saved(&cwd);
+            entry.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            assert!(entry.session.launch.needs_read_only_history());
+            // A directory returning is NOT permission to reuse a History-only
+            // admission. Its real existing-directory protection is now mandatory.
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("foreign"), b"do not change").unwrap();
+            assert_eq!(
+                entry.session.launch.needs_read_only_history(),
+                nested,
+                "a missing leaf must not waive its existing owner's protection"
+            );
+            let held =
+                crate::worktree_cleanup::fixture_protection(protections.path(), &target, true)
+                    .unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            if nested {
+                app.known_worktree_roots.insert(target.clone());
+            }
+            drop(app.resume_saved_conversation(saved(&existing)));
+            let focused = app.workspace.focused();
+            let cards = app.durable.cards.clone();
+            app.resume_ui.open = true;
+            app.resume_ui.query = "keep exact query".into();
+            drop(app.resume_saved_conversation(entry));
+            assert!(app.resume_ui.open && app.resume_ui.error.is_some());
+            assert_eq!(app.resume_ui.query, "keep exact query");
+            assert_eq!(app.active_workspace.as_deref(), Some(existing.as_path()));
+            assert_eq!(app.workspace.focused(), focused);
+            assert_eq!(app.durable.cards, cards);
+            assert!(
+                app.status
+                    .as_ref()
+                    .is_some_and(|notice| notice.message.contains("Cannot open this worktree yet"))
+            );
+            assert_eq!(
+                std::fs::read(target.join("foreign")).unwrap(),
+                b"do not change"
+            );
+            if nested {
+                assert!(!cwd.exists());
+            }
+            drop(held);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_directory_resume_refuses_nonhistory_launches_without_changing_scope() {
+        let directories = tempfile::tempdir().unwrap();
+        let protections = tempfile::tempdir().unwrap();
+        let missing = directories.path().join("missing");
+        for kind in 0..5 {
+            let mut entry = saved(&missing);
+            match kind {
+                0 => entry.session.launch.provider = Provider::Codex,
+                1 => entry.session.launch.session_id = None,
+                2 => entry.session.launch.session_id = Some("not-an-exact-UUID".into()),
+                3 => {
+                    entry.session.launch.recipe.working_directory =
+                        PathBuf::from(format!("relative-history-{}", uuid::Uuid::new_v4()))
+                }
+                _ => entry.session.launch.recipe.working_directory = missing.join("../missing"),
+            }
+            assert!(!entry.session.launch.needs_read_only_history());
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            let (selected, task) = app.select_worktree_checked(directories.path().into(), false);
+            drop(task);
+            assert!(selected);
+            app.resume_ui.open = true;
+            drop(app.resume_saved_conversation(entry));
+            assert!(app.resume_ui.open && app.resume_ui.error.is_some());
+            assert_eq!(app.active_workspace.as_deref(), Some(directories.path()));
+            assert!(app.durable.cards.is_empty());
+            assert!(!missing.exists());
+        }
+        let mut retained = saved(&missing).session;
+        retained.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+        assert!(retained.launch.needs_read_only_history());
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.worktree_protections
+            .use_fixture_runtime(protections.path().into());
+        let (selected, task) = app.select_conversation_worktree(&retained, missing.clone());
+        drop(task);
+        assert!(
+            !selected,
+            "a retained live owner cannot borrow History-only admission"
+        );
+        assert!(app.active_workspace.is_none() && app.durable.cards.is_empty());
     }
 
     #[test]
