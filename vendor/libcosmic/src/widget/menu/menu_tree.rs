@@ -38,6 +38,9 @@ pub struct MenuTree<Message> {
     pub(crate) width: Option<u16>,
     /// The height of the menu tree
     pub(crate) height: Option<u16>,
+    /// The same action as the generated button, for keyboard activation.
+    /// Custom widgets, disabled items and separators have no implicit action.
+    pub(crate) keyboard_action: Option<Rc<Message>>,
 }
 
 impl<Message: Clone + 'static> MenuTree<Message> {
@@ -49,6 +52,7 @@ impl<Message: Clone + 'static> MenuTree<Message> {
             children: Vec::new(),
             width: None,
             height: None,
+            keyboard_action: None,
         }
     }
 
@@ -63,7 +67,17 @@ impl<Message: Clone + 'static> MenuTree<Message> {
             children: children.into_iter().map(Into::into).collect(),
             width: None,
             height: None,
+            keyboard_action: None,
         }
+    }
+
+    /// Preferred width used by context-menu placement.
+    pub fn preferred_width(&self) -> u16 {
+        self.width.unwrap_or(240)
+    }
+
+    pub(crate) fn keyboard_selectable(&self) -> bool {
+        self.keyboard_action.is_some() || !self.children.is_empty()
     }
 
     /// Sets the width of the menu tree.
@@ -252,6 +266,8 @@ pub fn menu_items<
                 MenuItem::Button(label, icon, action) => {
                     let l: Cow<'static, str> = label.into();
                     let key = find_key(&action, key_binds);
+                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0)
+                        .clamp(240.0, 480.0) as u16;
                     let mut items = vec![
                         widget::text(l)
                             .ellipsize(iced_core::text::Ellipsize::Middle(
@@ -273,16 +289,27 @@ pub fn menu_items<
                             1,
                             widget::space::horizontal().width(spacing.space_xxs).into(),
                         );
+                    } else {
+                        items.insert(0, widget::space::horizontal().width(14).into());
+                        items.insert(
+                            1,
+                            widget::space::horizontal().width(spacing.space_xxs).into(),
+                        );
                     }
 
-                    let menu_button = menu_button(items).on_press(action.message());
-
-                    trees.push(MenuTree::<Message>::from(Element::from(menu_button)));
+                    let message = action.message();
+                    let menu_button = menu_button(items).on_press(message.clone());
+                    let mut tree =
+                        MenuTree::<Message>::from(Element::from(menu_button)).width(width);
+                    tree.keyboard_action = Some(Rc::new(message));
+                    trees.push(tree);
                 }
                 MenuItem::ButtonDisabled(label, icon, action) => {
                     let l: Cow<'static, str> = label.into();
 
                     let key = find_key(&action, key_binds);
+                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0)
+                        .clamp(240.0, 480.0) as u16;
 
                     let mut items = vec![
                         widget::text(l)
@@ -301,6 +328,12 @@ pub fn menu_items<
 
                     if let Some(icon) = icon {
                         items.insert(0, widget::icon::icon(icon).size(14).into());
+                        items.insert(
+                            1,
+                            widget::space::horizontal().width(spacing.space_xxs).into(),
+                        );
+                    } else {
+                        items.insert(0, widget::space::horizontal().width(14).into());
                         items.insert(
                             1,
                             widget::space::horizontal().width(spacing.space_xxs).into(),
@@ -309,7 +342,7 @@ pub fn menu_items<
 
                     let menu_button = menu_button(items);
 
-                    trees.push(MenuTree::<Message>::from(Element::from(menu_button)));
+                    trees.push(MenuTree::<Message>::from(Element::from(menu_button)).width(width));
                 }
                 MenuItem::CheckBox(label, icon, value, action) => {
                     let key = find_key(&action, key_binds);
@@ -354,9 +387,11 @@ pub fn menu_items<
                         items.insert(2, widget::icon::icon(icon).size(14).into());
                     }
 
-                    trees.push(MenuTree::from(Element::from(
-                        menu_button(items).on_press(action.message()),
-                    )));
+                    let message = action.message();
+                    let mut tree =
+                        MenuTree::from(Element::from(menu_button(items).on_press(message.clone())));
+                    tree.keyboard_action = Some(Rc::new(message));
+                    trees.push(tree);
                 }
                 MenuItem::Folder(label, children) => {
                     let l: Cow<'static, str> = label.into();
