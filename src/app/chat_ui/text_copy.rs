@@ -242,6 +242,21 @@ impl Cagents {
     }
 }
 
+/// A native code button retains immutable raw bytes, never a view-time String.
+/// It supersedes older logical reads and checks newer clipboard intent at the
+/// actual effect boundary before materializing bytes exactly once.
+pub(super) fn write_shared_literal(text: Arc<str>) -> Task<Message> {
+    let context = current_context();
+    let intent = context.advance();
+    iced::Task::done(()).then(move |_| {
+        if context.is_current(intent) {
+            iced::clipboard::write(text.to_string()).map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
+    })
+}
+
 /// Check again when the returned task is polled, not just when completion is
 /// handled: clipboard intent or source authority may change while this effect
 /// is still pending. Keep both checks next to the emitted clipboard effect.

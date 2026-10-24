@@ -68,6 +68,7 @@ ui = [
     "dep:libcosmic",
     "dep:lsp-types",
     "dep:mermaid-rs-renderer",
+    "dep:unicase",
     "dep:notify",
     "dep:resvg",
     "dep:regex",
@@ -248,6 +249,7 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Shared bounded notification excerpts use the same CommonMark parser as the UI.
 pulldown-cmark = { version = "0.12.2", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
+unicase = { version = "2.9", optional = true }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
@@ -341,6 +343,8 @@ iced_winit = { path = "vendor/iced-winit" }
 [patch.crates-io]
 # Keep rusqlite/Servo compatibility while backporting upstream SQLite 3.50.7.
 libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+# Display-only immutable full-context layout snapshots; see vendor/cosmic-text/LOCAL_CHANGES.md.
+cosmic-text = { path = "vendor/cosmic-text" }
 harfrust = { path = "vendor/harfrust" }
 
 # Editable fields require the Linux string-editing interface, absent in the pinned adapter.
