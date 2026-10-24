@@ -175,7 +175,11 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
-pub const PROTOCOL_VERSION: u16 = 105;
+/// Version 110 bounds channel-work projections with independent current/history
+/// cursors and adds exact-target and metadata-only home reads for safe recovery.
+/// Version 113 appends exact skipped-occurrence count/ranges to Firing;
+/// these positional postcard fields require a matched executable set.
+pub const PROTOCOL_VERSION: u16 = 113;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -525,6 +529,10 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
+    ChannelWork {
+        authority: crate::agent_execution::Authority,
+        request: crate::channel_work_api::Request,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,6 +864,7 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
+    ChannelWork(crate::channel_work_api::Response),
 }
 
 /// Maximum compact inventory rows in one capacity response.
