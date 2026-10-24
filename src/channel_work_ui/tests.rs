@@ -1926,3 +1926,176 @@ fn url_paste_invalid_inputs_do_not_partially_retarget_and_old_form_or_fixed_targ
     assert!(form.host.is_empty() && form.repository.is_empty() && form.number.is_empty());
     assert!(state.pending.is_empty());
 }
+
+fn role_enter(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer) -> Vec<Action> {
+    let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        })],
+        mouse::Cursor::Unavailable,
+        renderer,
+        &mut iced::advanced::clipboard::Null,
+        &mut messages,
+    );
+    draw(ui, renderer);
+    messages
+}
+
+fn assert_role_choices(ui: &Ui<'_>, width: f32, selected: &str) {
+    let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    let mut rectangles = Vec::new();
+    for name in ROLES {
+        let choices = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(choices.len(), 1, "one actual role button for {name}");
+        let description = choices[0]
+            .node()
+            .description()
+            .expect("role meaning and selection announced");
+        assert_eq!(description.starts_with("Selected role. "), name == selected);
+        assert!(description.contains(
+            ROLE_VALUES[ROLES.iter().position(|label| *label == name).unwrap()].description()
+        ));
+        let b = bounds(ui, name);
+        assert!(b.x.is_finite() && b.y.is_finite() && b.width.is_finite() && b.height.is_finite());
+        assert!(
+            b.x >= 0.0 && b.x + b.width <= width && b.y >= 0.0 && b.y + b.height <= 1600.0,
+            "role choice remains visible at {width}: {name}: {b:?}"
+        );
+        for previous in &rectangles {
+            assert!(!b.intersects(previous), "role choices overlap at {width}");
+        }
+        rectangles.push(b);
+    }
+}
+
+#[test]
+fn visible_role_choices_pointer_and_retained_keyboard_select_reference_for_the_actual_submit() {
+    for width in [300.0, 520.0, 900.0] {
+        for keyboard in [false, true] {
+            let mut state = ready(home(10), vec![]);
+            let owner = filled_form(&mut state);
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut ui = cached(&state, Cache::new(), &mut renderer, width, 1600.0);
+            assert_role_choices(&ui, width, "Contributing");
+            let actions = if keyboard {
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(role_id(owner, Role::Reference)),
+                );
+                let cache = ui.into_cache();
+                // A normal unchanged cached frame preserves this native focus.
+                ui = cached(&state, cache, &mut renderer, width, 1600.0);
+                role_enter(&mut ui, &mut renderer)
+            } else {
+                let point = bounds(&ui, "Reference").center();
+                click(&mut ui, &mut renderer, point)
+            };
+            let cache = ui.into_cache();
+            assert!(
+                matches!(actions.as_slice(), [Action::Role(actual, 3)] if *actual == owner),
+                "width={width}, keyboard={keyboard}: {actions:?}"
+            );
+            for action in actions {
+                assert!(state.update(action).is_none());
+            }
+            let mut ui = cached(&state, cache, &mut renderer, width, 1600.0);
+            assert_role_choices(&ui, width, "Reference");
+            let point = bounds(&ui, "Track PR").center();
+            let submit = click(&mut ui, &mut renderer, point);
+            let _ = ui.into_cache();
+            assert!(
+                matches!(submit.as_slice(), [Action::Submit { owner: actual, role: Role::Reference, target: actual_target, revision: 0 }]
+                if *actual == owner && *actual_target == target(7)),
+                "{submit:?}"
+            );
+            let effect = state.update(submit.into_iter().next().unwrap()).unwrap();
+            assert!(matches!(effect, Effect::Mutate { mutation, .. }
+                if mutation.home == home(10) && mutation.expected_revision == 0
+                && mutation.change == Change::Claim { target: target(7), role: Role::Reference }));
+        }
+    }
+}
+
+#[test]
+fn role_choice_queued_callback_and_native_hold_cannot_move_to_a_replaced_form() {
+    for width in [300.0, 900.0] {
+        let mut state = ready(home(10), vec![]);
+        let old = filled_form(&mut state);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached(&state, Cache::new(), &mut renderer, width, 1600.0);
+        let point = bounds(&ui, "Reference").center();
+        let queued = click(&mut ui, &mut renderer, point);
+        assert!(matches!(queued.as_slice(), [Action::Role(owner, 3)] if *owner == old));
+        assert!(
+            events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[mouse::Event::ButtonPressed(mouse::Button::Left)]
+            )
+            .is_empty()
+        );
+        let cache = ui.into_cache();
+        state.update(Action::Dismiss(old));
+        let confirmation = state
+            .view
+            .as_ref()
+            .unwrap()
+            .confirmation
+            .as_ref()
+            .unwrap()
+            .id;
+        state.update(Action::Discard(state.owner().unwrap(), confirmation));
+        let current = filled_form(&mut state);
+        assert_ne!(old, current);
+        for action in queued {
+            assert!(state.update(action).is_none());
+        }
+        let mut ui = cached(&state, cache, &mut renderer, width, 1600.0);
+        assert_role_choices(&ui, width, "Contributing");
+        assert!(bounds(&ui, "Reference").contains(point));
+        assert!(
+            events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[mouse::Event::ButtonReleased(mouse::Button::Left)]
+            )
+            .is_empty(),
+            "replacement cannot borrow the old native role press"
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(role_id(old, Role::Reference)),
+        );
+        assert!(
+            role_enter(&mut ui, &mut renderer).is_empty(),
+            "retired role ID cannot focus the new form"
+        );
+        let fresh = click(&mut ui, &mut renderer, point);
+        let cache = ui.into_cache();
+        assert!(matches!(fresh.as_slice(), [Action::Role(owner, 3)] if *owner == current));
+        for action in fresh {
+            assert!(state.update(action).is_none());
+        }
+        let ui = cached(&state, cache, &mut renderer, width, 1600.0);
+        assert_role_choices(&ui, width, "Reference");
+        let _ = ui.into_cache();
+    }
+}

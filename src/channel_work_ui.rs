@@ -583,7 +583,7 @@ impl State {
                 if let Some(form) = self.view.as_ref()?.form.as_ref() {
                     return Some(Effect::Focus {
                         owner,
-                        id: role_id(form.owner),
+                        id: role_id(form.owner, form.role),
                     });
                 }
             }
@@ -757,7 +757,7 @@ impl State {
                 if let Some(form) = self.view.as_ref()?.form.as_ref() {
                     return Some(Effect::Focus {
                         owner,
-                        id: role_id(form.owner),
+                        id: role_id(form.owner, form.role),
                     });
                 }
                 self.view.as_mut()?.notice = None;
@@ -877,7 +877,7 @@ impl State {
                 });
                 return Some(Effect::Focus {
                     owner: owner.view,
-                    id: role_id(self.view.as_ref()?.form.as_ref()?.owner),
+                    id: role_id(self.view.as_ref()?.form.as_ref()?.owner, role),
                 });
             }
             Action::End(owner) => {
@@ -1357,15 +1357,42 @@ impl State {
         }
         rows.push(design::caption("Your role").into());
         rows.push(if enabled {
-            ui_controls::owned(
-                (owner, "role", true),
-                field::select(
-                    ROLES.to_vec(),
-                    ROLE_VALUES.iter().position(|role| *role == form.role),
-                    move |index| Action::Role(owner, index),
+            let mut choices = ROLE_VALUES.iter().enumerate().map(|(index, role)| {
+                let selected = *role == form.role;
+                ui_controls::owned(
+                    (owner, *role),
+                    widget::button::custom(design::body(ROLES[index]))
+                        .name(ROLES[index])
+                        .description(format!(
+                            "{}{}",
+                            if selected {
+                                "Selected role. "
+                            } else {
+                                "Select role. "
+                            },
+                            role.description()
+                        ))
+                        .id(role_id(owner, *role))
+                        .selected(selected)
+                        .class(ui_controls::control_style(selected, None))
+                        .padding([space::XS, space::S])
+                        .width(Length::Fill)
+                        .on_press(Action::Role(owner, index)),
                 )
-                .id(role_id(owner)),
-            )
+            });
+            if narrow {
+                widget::column::with_children((0..2).map(|_| {
+                    widget::row::with_children(choices.by_ref().take(2).collect::<Vec<_>>())
+                        .spacing(space::S)
+                        .into()
+                }))
+                .spacing(space::S)
+                .into()
+            } else {
+                widget::row::with_children(choices.collect::<Vec<_>>())
+                    .spacing(space::S)
+                    .into()
+            }
         } else {
             design::body(form.role.label()).into()
         });
@@ -1732,8 +1759,8 @@ mod tests;
 fn attach_id(owner: ViewOwner) -> widget::Id {
     widget::Id::new(format!("channel-work-attach-{}", owner.generation))
 }
-fn role_id(owner: FormOwner) -> widget::Id {
-    widget::Id::new(format!("channel-work-role-{}", owner.draft))
+fn role_id(owner: FormOwner, role: Role) -> widget::Id {
+    widget::Id::new(format!("channel-work-role-{}-{role:?}", owner.draft))
 }
 fn form_input_id(owner: FormOwner, field: Field) -> widget::Id {
     widget::Id::new(format!(
