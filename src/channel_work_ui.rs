@@ -1783,7 +1783,7 @@ fn mount<'a>(
     _height: f32,
 ) -> Element<'a, Action> {
     let region_spacing = if status.is_empty() || rows.is_empty() {
-        0
+        0.0
     } else {
         space::M
     };
