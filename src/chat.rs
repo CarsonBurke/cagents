@@ -1191,12 +1191,12 @@ impl PermissionDenial {
 
 impl QueuedMessage {
     pub const LIMIT: usize = 128;
+    pub const PREVIEW_BYTES: usize = 16 * 1024;
     pub fn new(mut id: String, mut text: String) -> Self {
         id.truncate(id.floor_char_boundary(256));
-        const PREVIEW_BYTES: usize = 16 * 1024;
-        let whole = text.len() <= PREVIEW_BYTES;
+        let whole = text.len() <= Self::PREVIEW_BYTES;
         if !whole {
-            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.truncate(text.floor_char_boundary(Self::PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
         Self {
@@ -1286,6 +1286,29 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
 }
 
 impl Snapshot {
+    /// Drop renderable history while retaining provider continuity, controls,
+    /// activity and pending interactions. Only the UI client's disposable copy
+    /// uses this: the daemon still owns paging and the authoritative transcript.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn evict_transcript(&mut self) {
+        self.items = Vec::new();
+        for child in &mut self.subagents {
+            child.items = Vec::new();
+        }
+    }
+
+    /// Logical body bytes referenced by this owner, not unique heap bytes:
+    /// immutable items can be Arc-shared with other snapshots and caches.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn transcript_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .chain(self.subagents.iter().flat_map(|child| &child.items))
+            .fold(0usize, |bytes, item| {
+                bytes.saturating_add(item.content.byte_len())
+            })
+    }
+
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy

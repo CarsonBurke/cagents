@@ -1,7 +1,7 @@
 //! An answer's Markdown as the parser has to be handed it.
 //!
-//! iced's Markdown parser is written for documents, and three of the choices
-//! it makes for a document lose text from an agent's answer:
+//! The local Markdown parser preserves the pinned document semantics, and
+//! three document-oriented choices would lose text from an agent's answer:
 //!
 //! - a `---` or `+++` line with text straight after it opens a front-matter
 //!   block, and everything up to the next such line is discarded - which is
@@ -11,9 +11,8 @@
 //! - an indented code block comes out as an empty box, with its lines run into
 //!   the paragraph that follows.
 //!
-//! The parser's item types cannot be built from outside it, so it cannot be
-//! replaced for these three cases without carrying a copy of the whole widget
-//! crate. What reaches it is rewritten instead: a separator is given a fourth
+//! Source normalization keeps these product choices separate from CommonMark
+//! parsing: a separator is given a fourth
 //! dash, which is still a separator and no longer front matter; a `<` that is
 //! neither an autolink nor a line break is escaped, which is how Markdown
 //! spells a literal one; and an indented block is fenced. Text inside a fence
@@ -50,7 +49,7 @@ pub(super) enum Step {
 }
 
 /// The rewrite of one answer, resumable from the last line it was sure of.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct Source {
     blocks: Blocks,
     /// The bytes of the answer that were whole lines read for good, which is
@@ -64,9 +63,39 @@ pub(super) struct Source {
     /// Continuation was released; the next supplied body must replace the
     /// parser's prior text rather than append a second copy of its prefix.
     suspended: bool,
+    seen: usize,
+    literal_tail: bool,
+    #[cfg(test)]
+    rewritten_bytes: usize,
 }
 
 impl Source {
+    /// The caller has verified that the previously seen source is an exact
+    /// prefix. Ordinary single-line appends cannot change the source rewrite;
+    /// retain the unfinished tail without rescanning or cloning its old bytes.
+    pub(super) fn advance_append(&mut self, body: &str, open: bool) -> Step {
+        if open
+            && self.literal_tail
+            && let Some(suffix) = body.get(self.seen..)
+            && suffix.chars().all(|ch| {
+                ch.is_alphanumeric()
+                    || matches!(
+                        ch,
+                        ' ' | '.' | ',' | ':' | ';' | '?' | '!' | '/' | '(' | ')' | '=' | '+' | '-'
+                    )
+            })
+        {
+            self.tail.push_str(suffix);
+            self.seen = body.len();
+            return Step::Append(suffix.to_owned());
+        }
+        self.advance(body, open)
+    }
+
+    pub(super) fn retained_capacity(&self) -> usize {
+        self.tail.capacity() + self.blocks.items.capacity() * std::mem::size_of::<usize>()
+    }
+
     /// Takes `body`, the answer so far, of which everything up to the bytes
     /// seen last time is unchanged. `open` is whether more may follow.
     pub(super) fn advance(&mut self, body: &str, open: bool) -> Step {
@@ -84,6 +113,10 @@ impl Source {
         let (mut at, mut settled, mut sure) = (0, 0, true);
         self.provisional = false;
         for line in rest.split_inclusive('\n') {
+            #[cfg(test)]
+            {
+                self.rewritten_bytes += line.len();
+            }
             at += line.len();
             let complete = line.ends_with('\n');
             let beyond = Beyond {
@@ -108,6 +141,12 @@ impl Source {
         let tail = text[settled..].to_owned();
         text.drain(..self.tail.len());
         self.tail = tail;
+        self.seen = body.len();
+        self.literal_tail = body.get(self.consumed..).is_some_and(|raw| {
+            raw == self.tail
+                && !raw.contains('\n')
+                && raw.chars().next().is_some_and(char::is_alphabetic)
+        });
         Step::Append(text)
     }
 
@@ -788,6 +827,49 @@ mod tests {
     }
 
     /// What the reader loses today, and what the parser is given instead.
+    #[test]
+    fn verified_plain_appends_do_not_rewrite_the_unfinished_line_again() {
+        let mut source = Source::default();
+        let mut body = "Answer".to_owned();
+        let mut given = match source.advance(&body, true) {
+            Step::Append(text) | Step::Restart(text) => text,
+        };
+        let rewritten = source.rewritten_bytes;
+        for _ in 0..10000 {
+            body.push_str(" ordinary α text");
+            match source.advance_append(&body, true) {
+                Step::Append(text) => given.push_str(&text),
+                Step::Restart(text) => given = text,
+            }
+        }
+        assert_eq!(source.rewritten_bytes, rewritten);
+        assert_eq!(given, body);
+        for suffix in [
+            " <",
+            "Type",
+            ">",
+            " `code",
+            " span`",
+            "\n",
+            "    indented",
+            "\n\n",
+            "---\nnext",
+        ] {
+            body.push_str(suffix);
+            match source.advance_append(&body, true) {
+                Step::Append(text) => given.push_str(&text),
+                Step::Restart(text) => given = text,
+            }
+            let expected = match Source::default().advance(&body, true) {
+                Step::Append(text) | Step::Restart(text) => text,
+            };
+            assert_eq!(
+                given, expected,
+                "syntax/newlines return to the normal rewrite: {suffix:?}"
+            );
+        }
+    }
+
     #[test]
     fn text_the_parser_would_drop_is_rewritten_so_it_is_kept() {
         for (source, expected) in [
