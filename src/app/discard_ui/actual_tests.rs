@@ -292,6 +292,7 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
         key: &ActiveWorktreeKey,
     ) -> Message {
         let mut discard = None;
+        let mut selection_clears = [false; 2];
         for message in messages {
             match &message {
                 Message::SidebarSnapshot { source, action }
@@ -316,6 +317,52 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
                     // Reduce only the real mounted lists' layout callbacks.
                     // No emitted work or unrelated input is discarded.
                     assert_no_app_work(app.update(message));
+                    assert_eq!(app.discard_ui.source().unwrap().id, original);
+                    assert!(!app.modal_is_open());
+                }
+                Message::SidebarSnapshot { source, action }
+                    if *source == original
+                        && matches!(&**action,
+                            SidebarAction::CommitSubjectEditorAction { key: observed,
+                                action: cosmic::iced::widget::text_editor::Action::ClearSelection }
+                            | SidebarAction::CommitEditorAction { key: observed,
+                                action: cosmic::iced::widget::text_editor::Action::ClearSelection }
+                            if observed == key) =>
+                {
+                    // Focusing the real composer unfocuses both Changes
+                    // editors. Each publishes its deferred selection clear on
+                    // the next event; reduce that exact current bookkeeping.
+                    let editor = match &**action {
+                        SidebarAction::CommitSubjectEditorAction { .. } => 0,
+                        SidebarAction::CommitEditorAction { .. } => 1,
+                        _ => unreachable!(),
+                    };
+                    assert!(!selection_clears[editor], "one clear per mounted editor");
+                    selection_clears[editor] = true;
+                    let commit = app.sidebar_state.commit_message().to_owned();
+                    let revision = app
+                        .sidebar_state
+                        .submitted_commit_revision(key, &commit, false)
+                        .expect("the current fixture commit draft is bound");
+                    let focused = app.workspace.focused().expect("mounted chat focus");
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&focused) else {
+                        panic!("selection bookkeeping must retain the focused chat");
+                    };
+                    let target = runtime.target;
+                    assert_eq!(runtime.unsent_text(), DRAFT);
+                    assert_no_app_work(app.update(message));
+                    assert_eq!(app.sidebar_state.commit_message(), commit);
+                    assert_eq!(
+                        app.sidebar_state
+                            .submitted_commit_revision(key, &commit, false),
+                        Some(revision)
+                    );
+                    assert_eq!(app.workspace.focused(), Some(focused));
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&focused) else {
+                        panic!("selection bookkeeping must retain the mounted chat");
+                    };
+                    assert_eq!(runtime.target, target);
+                    assert_eq!(runtime.unsent_text(), DRAFT);
                     assert_eq!(app.discard_ui.source().unwrap().id, original);
                     assert!(!app.modal_is_open());
                 }
