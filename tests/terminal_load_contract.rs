@@ -126,6 +126,9 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
             Ok(TerminalEvent::InputRejected { operation, message }) => {
                 panic!("synchronization input rejected during {operation}: {message}")
             }
+            Ok(TerminalEvent::InputNotice { operation, message }) => {
+                panic!("synchronization input delivery uncertain during {operation}: {message}")
+            }
             Ok(TerminalEvent::Error { operation, message }) => {
                 panic!("terminal error during {operation}: {message}")
             }

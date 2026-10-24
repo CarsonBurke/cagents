@@ -9226,6 +9226,17 @@ impl Cagents {
                         )));
                     }
                 }
+                TerminalEvent::InputNotice { message, .. } => {
+                    // This typed worker notice may follow partial delivery.
+                    // Preserve the live attachment without replaying input or
+                    // treating an acknowledged nonfatal condition as failure.
+                    if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                        && ended_terminal(self.card_state(card)).is_none()
+                        && !self.terminal_close_pending(card)
+                    {
+                        self.status = Some(TransientNotice::warning(message));
+                    }
+                }
                 TerminalEvent::Error { operation, message } => {
                     metadata_changed = true;
                     if matches!(

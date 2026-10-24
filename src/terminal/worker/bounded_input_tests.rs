@@ -270,6 +270,162 @@ fn nonreading_child_keeps_publishing_and_interrupt_bypasses_backpressure() {
 }
 
 #[test]
+fn inherited_bracketed_paste_preserves_delivery_and_priority_interrupt_is_nonfatal() {
+    if isolated_input_case(
+        "inherited_bracketed_paste_preserves_delivery_and_priority_interrupt_is_nonfatal",
+    ) {
+        return;
+    }
+    let directory = std::env::current_dir().unwrap();
+    let script = directory.join("bracketed-input-peer.py");
+    fs::write(
+        &script,
+        r#"import os, signal, termios, time
+from pathlib import Path
+attributes = termios.tcgetattr(0)
+attributes[0] = 0
+attributes[1] = 0
+attributes[3] = (attributes[3] & ~(termios.ECHO | termios.ICANON)) | termios.ISIG
+attributes[6][termios.VMIN] = 1
+attributes[6][termios.VTIME] = 0
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+interrupts = 0
+def interrupt(signum, frame):
+    global interrupts
+    interrupts += 1
+    os.write(1, b'SIGINT_OBSERVED\n')
+signal.signal(signal.SIGINT, interrupt)
+# A shell may leave this mode enabled when it launches a nonreading child.
+os.write(1, b'\x1b[?2004hBRACKETED_READY\n')
+reported = False
+while not interrupts:
+    if not reported and Path('output-gate').exists():
+        os.write(1, b'POST_PASTE_OUTPUT\n')
+        reported = True
+    time.sleep(0.005)
+Path('interrupts').write_text(str(interrupts))
+paste = b''
+while not paste.endswith(b'\x1b[201~'):
+    paste += os.read(0, 1)
+Path('paste.bin').write_bytes(paste)
+os.write(1, b'PASTE_FINISHED\n')
+following = b''
+while not following.endswith(b'\n'):
+    following += os.read(0, 1)
+Path('following.bin').write_bytes(following)
+os.write(1, b'NEXT_INPUT_OBSERVED\n')
+"#,
+    )
+    .unwrap();
+    let recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "/usr/bin/python3".into(),
+        arguments: vec!["-I".into(), "-u".into(), script.to_str().unwrap().into()],
+        working_directory: directory.clone(),
+        environment: BTreeMap::new(),
+    };
+    let (mut worker, events) = capture_worker_for(recipe);
+    let mut root = InputRootGuard::new(&worker.published);
+    let (commands, receiver) = command_channel(1);
+    worker.commands = receiver;
+    let handle = TerminalHandle {
+        inner: Arc::new(HandleInner {
+            commands,
+            events: events.clone(),
+            published: worker.published.clone(),
+            worker: joins::JoinOwner::empty(worker.published.clone()),
+        }),
+    };
+    // Drive the actual PTY, including finishing protocol bytes while its
+    // reader resumes. A timeout can never stand in for observing a marker.
+    let observe = |worker: &mut Worker, marker: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        loop {
+            assert!(worker.flush_pty_input());
+            match worker.pty_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(PtyMessage::Bytes(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    worker.process_output(bytes);
+                    if output.windows(marker.len()).any(|bytes| bytes == marker) {
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                other => panic!("PTY closed before {marker:?}: {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "missing PTY marker {marker:?}");
+        }
+    };
+    observe(&mut worker, b"BRACKETED_READY");
+    assert!(worker.terminal.mode(Mode::BRACKETED_PASTE).unwrap());
+    handle
+        .paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard)
+        .unwrap();
+    worker.handle_command(worker.commands.try_recv().unwrap());
+    assert!(!worker.pending_input.is_empty());
+    assert!(!worker.pending_input.can_flush_kernel());
+    assert_eq!(
+        handle.paste("not accepted", PasteOrigin::Clipboard),
+        Err(TerminalSendError::Full)
+    );
+    fs::write(directory.join("output-gate"), b"emit").unwrap();
+    observe(&mut worker, b"POST_PASTE_OUTPUT");
+    let activity = Some(crate::agent::Activity {
+        provider: crate::agent::Provider::Claude,
+        state: crate::agent::ActivityState::Working,
+    });
+    worker.set_agent_activity(activity);
+    let mut interrupt = key_input(
+        KeyAction::Press,
+        TerminalKey::Character('c'),
+        Some("c"),
+        Some('c'),
+    );
+    interrupt.modifiers.control = true;
+    handle.key(interrupt).unwrap();
+    worker.interrupt_input();
+    assert_eq!(handle.agent_activity(), activity);
+    observe(&mut worker, b"PASTE_FINISHED");
+    assert_eq!(fs::read(directory.join("interrupts")).unwrap(), b"1");
+    let received = fs::read(directory.join("paste.bin")).unwrap();
+    assert!(received.starts_with(b"\x1b[200~"));
+    assert!(received.ends_with(b"\x1b[201~"));
+    assert!(
+        received[6..received.len() - 6]
+            .iter()
+            .all(|byte| *byte == b'x')
+    );
+    assert!(received.len() > 12 && received.len() < 1024 * 1024 + 12);
+    assert!(worker.pending_input.is_empty());
+    assert!(!worker.pending_input.can_flush_kernel());
+    handle.input(b"NEXT_INPUT\n".to_vec()).unwrap();
+    worker.handle_command(worker.commands.try_recv().unwrap());
+    observe(&mut worker, b"NEXT_INPUT_OBSERVED");
+    assert_eq!(
+        fs::read(directory.join("following.bin")).unwrap(),
+        b"NEXT_INPUT\n"
+    );
+    let notices = events.try_iter().collect::<Vec<_>>();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|event| matches!(event,
+            TerminalEvent::InputNotice { operation: "cancel terminal input", message }
+                if message == "Unsent input was canceled. Previously sent input was preserved."))
+            .count(),
+        1
+    );
+    assert!(
+        !notices
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::Error { .. }))
+    );
+    assert!(!worker.writer_failed);
+    finish_captured_input_worker(worker, &handle, &mut root);
+}
+
+#[test]
 fn nonreading_child_shutdown_is_bounded_with_a_full_pending_paste() {
     if isolated_input_case("nonreading_child_shutdown_is_bounded_with_a_full_pending_paste") {
         return;

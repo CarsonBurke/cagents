@@ -4866,8 +4866,8 @@ impl Worker {
     }
 
     fn input_backpressure(&self, operation: &'static str) {
-        self.error(operation, format!(
-            "Terminal isn't reading input; {} KiB pending. Ctrl+C cancels unsent bulk input; protocol key pairs remain ordered.",
+        self.input_notice(operation, format!(
+            "Terminal is not reading input; {} KiB pending. Some input may already have been sent. Ctrl+C cancels input that has not been sent.",
             self.pending_input.len().div_ceil(1024),
         ));
     }
@@ -5005,7 +5005,13 @@ impl Worker {
             self.cancel_kernel_input();
         } else if !self.kernel_preservation_warned {
             self.kernel_preservation_warned = true;
-            self.error("cancel terminal input", "Preserved kernel input: started terminal protocol delivery cannot be discarded safely without a child acknowledgement. Unsent bulk input was canceled.".into());
+            // A started protocol frame is deliberately preserved, not a
+            // failed transport. Keep activity and the attachment live while
+            // the original endings/releases remain ordered before new input.
+            self.input_notice(
+                "cancel terminal input",
+                "Unsent input was canceled. Previously sent input was preserved.".into(),
+            );
         }
         // The flush above may discard only the old cancelable kernel input.
         // Retry original blocked replies AFTER that flush, before a newer
@@ -5095,6 +5101,10 @@ impl Worker {
     fn error(&self, operation: &'static str, message: String) {
         self.set_agent_activity(None);
         self.emit(TerminalEvent::Error { operation, message });
+    }
+
+    fn input_notice(&self, operation: &'static str, message: String) {
+        self.emit(TerminalEvent::InputNotice { operation, message });
     }
 }
 

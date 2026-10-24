@@ -628,3 +628,172 @@ fn delayed_input_rejection_cannot_replace_a_newer_fatal_or_completed_terminal_ou
         );
     }
 }
+
+#[test]
+fn input_notice_preserves_the_actual_live_app_original_and_next_input() {
+    let (mut app, card, mut peer) = fixture();
+    let proof = peer.handle.proof().unwrap();
+    let continuity = terminal_continuity(app.card_state(card)).unwrap().clone();
+    let recovery_attempts = app.terminal_recovery_attempts.clone();
+    let uncertain = app.uncertain_terminal_proofs.clone();
+    let mut requests = peer.observed.try_iter().collect::<Vec<_>>();
+    peer.handle.input(b"accepted prefix".to_vec()).unwrap();
+    loop {
+        let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let accepted =
+            matches!(&request, ObservedInput::Input(bytes) if bytes == b"accepted prefix");
+        requests.push(request);
+        if accepted {
+            break;
+        }
+    }
+    let durable = Arc::clone(&app.durable);
+    reset();
+    const MESSAGE: &str = "Unsent input was canceled. Previously sent input was preserved.";
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::InputNotice {
+            operation: "cancel terminal input".into(),
+            message: MESSAGE.into(),
+        }),
+    );
+    assert_eq!(counts(), (0, 0), "input notice changes only presentation");
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
+    assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
+    assert_eq!(app.uncertain_terminal_proofs, uncertain);
+    assert!(matches!(
+        app.cards.get(&card),
+        Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id()
+                && surface.host_proof() == Some(proof.clone())
+    ));
+    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.notices.entries.iter().any(|entry| {
+        entry.notice.severity == NoticeSeverity::Warning && entry.notice.message == MESSAGE
+    }));
+    // A different output generation and a new user interrupt still use the
+    // original open connection; the accepted prefix must never be replayed.
+    peer.sequence += 1;
+    let generation = peer.sequence;
+    let mut output = RenderSnapshot::empty();
+    output.generation = generation;
+    output.columns = 1;
+    output.rows = 1;
+    output.scroll.total = 1;
+    output.scroll.len = 1;
+    output.lines = vec![Arc::new(crate::terminal::RowSnapshot {
+        cells: vec![crate::terminal::CellSnapshot {
+            text: crate::terminal::CellText::new("Z"),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })]
+    .into();
+    peer.send
+        .send(ServerMessage::Snapshot {
+            terminal_id: peer.handle.terminal_id(),
+            snapshot: TerminalSnapshot::full(&output),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while peer.handle.generation() < generation {
+        assert!(
+            Instant::now() < deadline,
+            "output after the nonfatal notice"
+        );
+        thread::yield_now();
+    }
+    drop(app.update(Message::TerminalWake { card, generation }));
+    assert_eq!(peer.handle.snapshot().generation, generation);
+    assert_eq!(peer.handle.snapshot().lines[0].cells[0].text.as_str(), "Z");
+    peer.handle.input(vec![3]).unwrap();
+    loop {
+        let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let interrupt = matches!(&request, ObservedInput::Input(bytes) if bytes == &[3]);
+        requests.push(request);
+        if interrupt {
+            break;
+        }
+    }
+    requests.extend(peer.observed.try_iter());
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, ObservedInput::Connect))
+            .count(),
+        1,
+        "the nonfatal notice must not reconnect the original attachment"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request,
+            ObservedInput::Input(bytes) if bytes == b"accepted prefix"))
+            .count(),
+        1,
+        "never replay previously delivered input"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request,
+            ObservedInput::Input(bytes) if bytes == &[3]))
+            .count(),
+        1,
+        "one new user interrupt, no automatic retry"
+    );
+    assert!(!peer.worker.as_ref().unwrap().is_finished());
+    assert_eq!(peer.handle.proof(), Some(proof));
+}
+
+#[test]
+fn late_input_notice_cannot_replace_a_fatal_or_completed_original() {
+    for completed in [false, true] {
+        let (mut app, card, mut peer) = fixture();
+        let outcome = if completed {
+            WireTerminalEvent::Completed {
+                exit_code: 7,
+                signal: None,
+                intentional: false,
+            }
+        } else {
+            // Even identical recovery wording is fatal when the trusted
+            // producer classified it as Error. App never matches error text.
+            WireTerminalEvent::Error {
+                operation: "cancel terminal input".into(),
+                message: "Unsent input was canceled. Previously sent input was preserved.".into(),
+            }
+        };
+        peer.publish(Some(outcome));
+        let generation = peer.publish(Some(WireTerminalEvent::InputNotice {
+            operation: "cancel terminal input".into(),
+            message: "late notice must not replace the original outcome".into(),
+        }));
+        drop(app.update(Message::TerminalWake { card, generation }));
+        if completed {
+            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(app.notices.entries.iter().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Error
+                    && entry.notice.message == "terminal exited with status 7"
+            }));
+        } else {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert!(app.notices.entries.iter().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Error
+                    && entry
+                        .notice
+                        .message
+                        .contains("Previously sent input was preserved")
+            }));
+        }
+        assert!(!app.notices.entries.iter().any(|entry| {
+            entry
+                .notice
+                .message
+                .contains("late notice must not replace")
+        }));
+    }
+}
