@@ -153,7 +153,7 @@ where
     ) -> layout::Node {
         let limits = limits.width(self.width).height(self.height);
 
-        let available = 
+        let available =
             if self.overflow {
                 limits.max()
             } else {

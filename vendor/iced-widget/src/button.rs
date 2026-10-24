@@ -777,11 +777,11 @@ impl Default for Style {
 ///
 /// impl Catalog for MyTheme {
 ///     type Class<'a> = ButtonClass;
-///     
+///
 ///     fn default<'a>() -> Self::Class<'a> {
 ///         ButtonClass::default()
 ///     }
-///     
+///
 ///
 ///     fn style(&self, class: &Self::Class<'_>, status: Status) -> Style {
 ///         let mut style = Style::default();
