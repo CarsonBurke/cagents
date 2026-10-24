@@ -426,6 +426,195 @@ os.write(1, b'NEXT_INPUT_OBSERVED\n')
 }
 
 #[test]
+fn an_interrupt_notice_distinguishes_consumed_from_unsent_input() {
+    if isolated_input_case("an_interrupt_notice_distinguishes_consumed_from_unsent_input") {
+        return;
+    }
+    for queued in [None, Some(0), Some(1), Some(2)] {
+        let label = match queued {
+            None => "consumed",
+            Some(0) => "inbox",
+            Some(1) => "retained",
+            Some(2) => "carried",
+            Some(_) => unreachable!(),
+        };
+        let directory = std::env::current_dir().unwrap().join(label);
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("consumed-paste-peer.py");
+        fs::write(
+            &script,
+            r#"import os, signal, termios, time
+from pathlib import Path
+attributes = termios.tcgetattr(0)
+attributes[0] = 0
+attributes[1] = 0
+attributes[3] = (attributes[3] & ~(termios.ECHO | termios.ICANON)) | termios.ISIG
+attributes[6][termios.VMIN] = 1
+attributes[6][termios.VTIME] = 0
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+interrupts = 0
+def interrupt(signum, frame):
+    global interrupts
+    interrupts += 1
+    os.write(1, b'SIGINT_OBSERVED\n')
+signal.signal(signal.SIGINT, interrupt)
+os.write(1, b'\x1b[?2004hCONSUMED_PASTE_READY\n')
+paste = b''
+while not paste.endswith(b'\x1b[201~'):
+    paste += os.read(0, 1)
+Path('paste.bin').write_bytes(paste)
+os.write(1, b'PASTE_CONSUMED\n')
+while not interrupts:
+    time.sleep(0.005)
+Path('interrupts').write_text(str(interrupts))
+following = b''
+while not following.endswith(b'\n'):
+    following += os.read(0, 1)
+Path('following.bin').write_bytes(following)
+os.write(1, b'NEXT_INPUT_OBSERVED\n')
+"#,
+        )
+        .unwrap();
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-I".into(), "-u".into(), script.to_str().unwrap().into()],
+            working_directory: directory.clone(),
+            environment: BTreeMap::new(),
+        };
+        let (mut worker, events) = capture_worker_for(recipe);
+        let mut root = InputRootGuard::new(&worker.published);
+        let (commands, receiver) = command_channel(if queued == Some(2) { 2 } else { 1 });
+        worker.commands = receiver;
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: events.clone(),
+                published: worker.published.clone(),
+                worker: joins::JoinOwner::empty(worker.published.clone()),
+            }),
+        };
+        let observe = |worker: &mut Worker, marker: &[u8]| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut output = Vec::new();
+            loop {
+                assert!(worker.flush_pty_input());
+                match worker.pty_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(PtyMessage::Bytes(bytes)) => {
+                        output.extend_from_slice(&bytes);
+                        worker.process_output(bytes);
+                        if output.windows(marker.len()).any(|bytes| bytes == marker) {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    other => panic!("PTY closed before {marker:?}: {other:?}"),
+                }
+                assert!(Instant::now() < deadline, "missing PTY marker {marker:?}");
+            }
+        };
+        observe(&mut worker, b"CONSUMED_PASTE_READY");
+        handle
+            .paste("already read", PasteOrigin::Clipboard)
+            .unwrap();
+        worker.handle_command(worker.commands.try_recv().unwrap());
+        observe(&mut worker, b"PASTE_CONSUMED");
+        assert_eq!(
+            fs::read(directory.join("paste.bin")).unwrap(),
+            b"\x1b[200~already read\x1b[201~"
+        );
+        assert!(worker.pending_input.is_empty());
+        assert!(!worker.pending_input.can_flush_kernel());
+        assert!(worker.retained_commands.is_empty());
+        assert!(worker.commands.is_empty());
+        // Queue actual older-generation input without encoding it. Each
+        // owner must count even when the encoded backlog is empty.
+        let mut carried = None;
+        if queued == Some(2) {
+            handle.scroll_lines(1).unwrap();
+            handle.input(b"DISCARD_ME".to_vec()).unwrap();
+            let first = worker.commands.try_recv().unwrap();
+            let scroll = coalesce_scroll_command(first, &worker.commands, &mut carried);
+            worker.handle_command(scroll);
+            assert!(carried.is_some());
+            assert!(worker.pending_input.is_empty());
+            assert!(worker.retained_commands.is_empty());
+            assert!(worker.commands.is_empty());
+            assert_eq!(handle.command_budget().used(), 1);
+        } else if let Some(retained) = queued {
+            handle.input(b"DISCARD_ME".to_vec()).unwrap();
+            if retained == 1 {
+                worker
+                    .retained_commands
+                    .push_back(worker.commands.try_recv().unwrap());
+            }
+        }
+        let mut interrupt = key_input(
+            KeyAction::Press,
+            TerminalKey::Character('c'),
+            Some("c"),
+            Some('c'),
+        );
+        interrupt.modifiers.control = true;
+        handle.key(interrupt).unwrap();
+        let boundary = worker.interrupt_input_with_carried(carried.as_ref());
+        if queued == Some(2) {
+            assert_eq!(handle.command_budget().used(), 1);
+            assert!(
+                carried
+                    .as_ref()
+                    .is_some_and(|command| is_cancelable_input_before(command, boundary))
+            );
+            // Match the run loop: retain the exact owner through interruption,
+            // then drop it at the same captured generation boundary.
+            carried = None;
+            assert!(carried.is_none());
+            assert_eq!(handle.command_budget().used(), 0);
+        }
+        observe(&mut worker, b"SIGINT_OBSERVED");
+        assert!(worker.pending_input.is_empty());
+        assert!(!worker.pending_input.can_flush_kernel());
+        handle.input(b"NEXT_INPUT\n".to_vec()).unwrap();
+        worker.handle_command(worker.commands.try_recv().unwrap());
+        observe(&mut worker, b"NEXT_INPUT_OBSERVED");
+        assert_eq!(fs::read(directory.join("interrupts")).unwrap(), b"1");
+        assert_eq!(
+            fs::read(directory.join("following.bin")).unwrap(),
+            b"NEXT_INPUT\n"
+        );
+        let notices = events.try_iter().collect::<Vec<_>>();
+        let expected = if queued.is_some() {
+            "Unsent input was canceled. Previously sent input was preserved."
+        } else {
+            "Previously sent input was preserved."
+        };
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|event| matches!(event,
+                TerminalEvent::InputNotice { operation: "cancel terminal input", message }
+                    if message == expected))
+                .count(),
+            1
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|event| matches!(event, TerminalEvent::InputNotice { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::Error { .. }))
+        );
+        assert!(!worker.writer_failed);
+        finish_captured_input_worker(worker, &handle, &mut root);
+    }
+}
+
+#[test]
 fn nonreading_child_shutdown_is_bounded_with_a_full_pending_paste() {
     if isolated_input_case("nonreading_child_shutdown_is_bounded_with_a_full_pending_paste") {
         return;

@@ -3173,7 +3173,7 @@ impl Worker {
                 break;
             }
             if self.published.interrupt_requested.load(Ordering::Acquire) {
-                let boundary = self.interrupt_input();
+                let boundary = self.interrupt_input_with_carried(carried_command.as_ref());
                 if carried_command
                     .as_ref()
                     .is_some_and(|command| is_cancelable_input_before(command, boundary))
@@ -4943,7 +4943,12 @@ impl Worker {
         true
     }
 
+    #[cfg(test)]
     fn interrupt_input(&mut self) -> u64 {
+        self.interrupt_input_with_carried(None)
+    }
+
+    fn interrupt_input_with_carried(&mut self, carried: Option<&Command>) -> u64 {
         let (boundary, mut key, interrupt_claim, _interrupt_ticket) = {
             let mut order = self
                 .published
@@ -4978,16 +4983,26 @@ impl Worker {
             None => vec![3],
         };
         let can_flush_kernel = self.pending_input.can_flush_kernel();
+        let pending_before_cancel = self.pending_input.len();
         self.pending_input.cancel();
-        self.retained_commands
-            .retain(|command| !is_cancelable_input_before(command, boundary));
+        // The loop drops its coalesced local owner after this call. Account
+        // for that exact older-generation input without moving its custody.
+        let mut discarded_unsent = self.pending_input.len() < pending_before_cancel
+            || carried.is_some_and(|command| is_cancelable_input_before(command, boundary));
+        self.retained_commands.retain(|command| {
+            let keep = !is_cancelable_input_before(command, boundary);
+            discarded_unsent |= !keep;
+            keep
+        });
         // A producer may keep filling the bounded inbox. Drain only the
         // commands present at this boundary so cancellation itself is bounded.
         for _ in 0..self.commands.len() {
             let Ok(command) = self.commands.try_recv() else {
                 break;
             };
-            if !is_cancelable_input_before(&command, boundary) {
+            if is_cancelable_input_before(&command, boundary) {
+                discarded_unsent = true;
+            } else {
                 self.retained_commands.push_back(command);
             }
         }
@@ -5008,10 +5023,12 @@ impl Worker {
             // A started protocol frame is deliberately preserved, not a
             // failed transport. Keep activity and the attachment live while
             // the original endings/releases remain ordered before new input.
-            self.input_notice(
-                "cancel terminal input",
-                "Unsent input was canceled. Previously sent input was preserved.".into(),
-            );
+            let message = if discarded_unsent {
+                "Unsent input was canceled. Previously sent input was preserved."
+            } else {
+                "Previously sent input was preserved."
+            };
+            self.input_notice("cancel terminal input", message.into());
         }
         // The flush above may discard only the old cancelable kernel input.
         // Retry original blocked replies AFTER that flush, before a newer
