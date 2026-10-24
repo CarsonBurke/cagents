@@ -1392,6 +1392,354 @@ mod tests {
             (app, home, form, cache)
         }
 
+        fn repository_state(frame: &Frame<'_>) -> (String, usize, usize) {
+            let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let fields = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::TextInput
+                        && node.node().label() == Some("owner/repository or PR URL")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(fields.len(), 1, "one actual Repository field");
+            let field = fields[0].node();
+            let selection = field.text_selection().expect("native input selection");
+            assert_eq!(selection.anchor.node, selection.focus.node);
+            (
+                field.value().unwrap_or_default().to_owned(),
+                selection.anchor.character_index,
+                selection.focus.character_index,
+            )
+        }
+
+        fn updating_caption(frame: &mut Frame<'_>, renderer: &cosmic::Renderer) -> bool {
+            #[derive(Default)]
+            struct Text(Vec<String>);
+            impl Operation for Text {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, value: &str) {
+                    self.0.push(value.to_owned());
+                }
+            }
+            let mut text = Text::default();
+            frame.operate(renderer, &mut text);
+            text.0
+                .iter()
+                .any(|value| value == "Updating the current view…")
+        }
+
+        fn loaded(home: Home, revision: u64) -> crate::channel_work::Snapshot {
+            crate::channel_work::Snapshot {
+                home,
+                lifecycle: crate::channel_work::HomeLifecycle::Active,
+                revision,
+                entries: Vec::new(),
+                history: Vec::new(),
+                next_current: None,
+                next_history: None,
+            }
+        }
+
+        fn repository_characters(
+            app: &mut Cagents,
+            mut cache: Cache,
+            renderer: &mut cosmic::Renderer,
+            repository: &widget::Id,
+            form: &mut Option<ui::FormOwner>,
+            initial: &str,
+            characters: &str,
+        ) -> Cache {
+            let mut value = initial.to_owned();
+            for character in characters.chars() {
+                let mut frame = mount(app, cache, renderer);
+                assert!(same(&active(&mut frame, renderer), repository));
+                assert_eq!(
+                    repository_state(&frame),
+                    (value.clone(), value.len(), value.len())
+                );
+                let text = character.to_string();
+                value.push(character);
+                let (messages, _) = event(
+                    &mut frame,
+                    renderer,
+                    &[key(
+                        keyboard::Key::Character(text.clone()),
+                        keyboard::key::Code::KeyA,
+                        Some(&text),
+                    )],
+                    iced::mouse::Cursor::Unavailable,
+                );
+                let [
+                    cosmic::Action::App(Message::ChannelWork(ui::Action::Field(
+                        actual,
+                        ui::Field::Repository,
+                        received,
+                    ))),
+                ] = messages.as_slice()
+                else {
+                    panic!(
+                        "native character {character:?} must emit one whole Repository value: {messages:?}"
+                    );
+                };
+                assert_eq!(received, &value, "no missing or duplicated character");
+                if let Some(original) = *form {
+                    assert_eq!(*actual, original);
+                } else {
+                    *form = Some(*actual);
+                }
+                assert_eq!(
+                    repository_state(&frame),
+                    (value.clone(), value.len(), value.len())
+                );
+                cache = frame.into_cache();
+                let cosmic::Action::App(message) = messages.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                drop(app.update(message));
+            }
+            cache
+        }
+
+        fn command_key(value: &str, code: keyboard::key::Code) -> iced::Event {
+            let mut event = key(keyboard::Key::Character(value.into()), code, None);
+            if let iced::Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. }) = &mut event
+            {
+                *modifiers = keyboard::Modifiers::COMMAND;
+            }
+            event
+        }
+
+        struct RepositoryClipboard(String);
+        impl iced::advanced::Clipboard for RepositoryClipboard {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, value: String) {
+                self.0 = value;
+            }
+        }
+
+        #[test]
+        fn repository_native_focus_and_selection_survive_poll_loading_and_matching_reply() {
+            const URL: &str = "https://github.com/NativeFixtureFork/cagents/pull/1568";
+            const PREFIX: &str = "https://github.com/NativeFixtureFork/cagents/p";
+            let (mut app, home) = main_fixture();
+            app.window_width = 1280.0;
+            app.window_height = 900.0;
+            app.core.set_main_window_id(Some(window::Id::RESERVED));
+            let owner = app.channel_work.view.owner().unwrap();
+            assert!(matches!(
+                app.channel_work.view.update(ui::Action::Attach(owner)),
+                Some(Effect::Focus { .. })
+            ));
+            let mut renderer = super::super::super::tests::headless_renderer();
+            let mut frame = mount(&app, Cache::new(), &mut renderer);
+            let repository = input(&mut frame, &renderer, "-repo");
+            let focus = probe(&mut frame, &renderer);
+            let point = focus
+                .0
+                .iter()
+                .find(|node| node.id.as_ref().is_some_and(|id| same(id, &repository)))
+                .unwrap()
+                .bounds
+                .center();
+            assert!(click(&mut frame, &mut renderer, point).is_empty());
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            let cache = frame.into_cache();
+            let mut form = None;
+            let cache = repository_characters(
+                &mut app,
+                cache,
+                &mut renderer,
+                &repository,
+                &mut form,
+                "",
+                PREFIX,
+            );
+            assert_eq!(
+                PREFIX.len(),
+                46,
+                "the observed native interruption boundary"
+            );
+
+            // This is the same State::refresh used by Message::ChannelWorkPoll.
+            // Keep the ticket rather than running its transport, so the reply
+            // is exact and the test stays entirely in the actual cached UI.
+            let Some(Effect::Read {
+                ticket,
+                home: read_home,
+                ..
+            }) = app.channel_work.view.refresh()
+            else {
+                panic!("poll must start a fresh read");
+            };
+            assert_eq!(read_home, home);
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(updating_caption(&mut frame, &renderer));
+            assert!(
+                same(&active(&mut frame, &renderer), &repository),
+                "adding the poll caption must not blur Repository"
+            );
+            assert_eq!(repository_state(&frame), (PREFIX.into(), 46, 46));
+            let cache = frame.into_cache();
+            // /pull/ remains incomplete. Typing the first numeric PR digit
+            // enters the current URL-normalization path, a separate UX issue.
+            let cache = repository_characters(
+                &mut app,
+                cache,
+                &mut renderer,
+                &repository,
+                &mut form,
+                PREFIX,
+                "ull/",
+            );
+            drop(app.update(Message::ChannelWork(ui::Action::Loaded {
+                ticket,
+                result: Ok(loaded(home, 2)),
+            })));
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(!updating_caption(&mut frame, &renderer));
+            assert!(
+                same(&active(&mut frame, &renderer), &repository),
+                "removing the poll caption must not blur Repository"
+            );
+            let incomplete = format!("{PREFIX}ull/");
+            assert_eq!(repository_state(&frame), (incomplete.clone(), 50, 50));
+            let (messages, _) = event(
+                &mut frame,
+                &mut renderer,
+                &[command_key("a", keyboard::key::Code::KeyA)],
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                messages.is_empty(),
+                "select-all must not edit the field: {messages:?}"
+            );
+            assert_eq!(repository_state(&frame), (incomplete.clone(), 0, 50));
+            let cache = frame.into_cache();
+
+            let Some(Effect::Read { ticket, .. }) = app.channel_work.view.refresh() else {
+                panic!("second poll");
+            };
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(updating_caption(&mut frame, &renderer));
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            assert_eq!(repository_state(&frame), (incomplete.clone(), 0, 50));
+            let cache = frame.into_cache();
+            drop(app.update(Message::ChannelWork(ui::Action::Loaded {
+                ticket,
+                result: Ok(loaded(home, 3)),
+            })));
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(!updating_caption(&mut frame, &renderer));
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            assert_eq!(repository_state(&frame), (incomplete, 0, 50));
+            let mut messages = Vec::new();
+            let mut clipboard = RepositoryClipboard(URL.into());
+            let _ = frame.update(
+                &[
+                    command_key("v", keyboard::key::Code::KeyV),
+                    iced::Event::Keyboard(keyboard::Event::KeyReleased {
+                        key: keyboard::Key::Character("v".into()),
+                        modified_key: keyboard::Key::Character("v".into()),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyV),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::COMMAND,
+                    }),
+                ],
+                iced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            draw(&mut frame, &mut renderer);
+            assert!(
+                matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Field(actual, ui::Field::Repository, value)))] if Some(*actual) == form && value == URL),
+                "native paste must replace the retained full selection: {messages:?}"
+            );
+            let cache = frame.into_cache();
+            let cosmic::Action::App(message) = messages.into_iter().next().unwrap() else {
+                unreachable!()
+            };
+            drop(app.update(message));
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            assert_eq!(repository_state(&frame).0, "nativefixturefork/cagents");
+            let (_, submit) = labelled(&mut frame, &renderer, "Track PR");
+            let messages = click(&mut frame, &mut renderer, submit.center());
+            let _ = frame.into_cache();
+            let expected = crate::channel_work::Target::PullRequest(
+                crate::github_identity::PullRequestKey::from_url(URL).unwrap(),
+            )
+            .canonicalized()
+            .unwrap();
+            assert!(
+                matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Submit { owner: actual, target, role: crate::channel_work::Role::Contribute, revision: 0 }))] if Some(*actual) == form && target == &expected),
+                "native submit must still capture the exact complete target: {messages:?}"
+            );
+            assert_eq!(app.channel_work.view.home(), Some(home));
+            assert!(
+                app.channel_work.view.pending_homes().next().is_none(),
+                "paste/captured Submit is not dispatched by this focus test"
+            );
+        }
+
+        #[test]
+        fn role_native_focus_and_next_tab_survive_poll_loading_and_matching_reply() {
+            for index in 0..4 {
+                let mut renderer = super::super::super::tests::headless_renderer();
+                let (mut app, home, _, cache) = fixture(&mut renderer);
+                let mut frame = mount(&app, cache, &mut renderer);
+                let roles = ["Contributing", "Stewarding", "Review only", "Reference"]
+                    .map(|label| labelled(&mut frame, &renderer, label).0);
+                let submit = labelled(&mut frame, &renderer, "Track PR").0;
+                // Ordinary Tab from the real retained input reaches the role;
+                // no direct role focus operation or reset masks restoration.
+                seek(&mut frame, &mut renderer, &roles[index]);
+                let cache = frame.into_cache();
+                let mut frame = mount(&app, cache, &mut renderer);
+                assert!(
+                    same(&active(&mut frame, &renderer), &roles[index]),
+                    "unchanged cached frame is a positive control"
+                );
+                let cache = frame.into_cache();
+                let Some(Effect::Read { ticket, .. }) = app.channel_work.view.refresh() else {
+                    panic!("poll");
+                };
+                let mut frame = mount(&app, cache, &mut renderer);
+                assert!(updating_caption(&mut frame, &renderer));
+                assert!(
+                    same(&active(&mut frame, &renderer), &roles[index]),
+                    "quiet loading-row insertion must retain role{index} native focus"
+                );
+                let cache = frame.into_cache();
+                drop(app.update(Message::ChannelWork(ui::Action::Loaded {
+                    ticket,
+                    result: Ok(loaded(home, 2)),
+                })));
+                let mut frame = mount(&app, cache, &mut renderer);
+                assert!(!updating_caption(&mut frame, &renderer));
+                assert!(
+                    same(&active(&mut frame, &renderer), &roles[index]),
+                    "quiet matching reply must retain role{index} native focus"
+                );
+                let next = if index == 3 {
+                    &submit
+                } else {
+                    &roles[index + 1]
+                };
+                assert!(
+                    same(&tab(&mut frame, &mut renderer, false), next),
+                    "next Tab must advance inside the form, not restart at global chrome"
+                );
+                assert_eq!(app.channel_work.view.home(), Some(home));
+            }
+        }
+
         #[test]
         fn full_window_tab_cycle_reaches_work_fields_roles_and_submit_after_cached_frames() {
             for number_click in [false, true] {
