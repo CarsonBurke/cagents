@@ -192,7 +192,7 @@ fn inspect_and_refuse_mutation(rpc: &mut Rpc, original: &Original, root: &Path) 
         })
         .unwrap_err()
         .code,
-        ProtocolErrorCode::TerminalNotFound
+        ProtocolErrorCode::PermissionDenied
     );
     assert!(original.owner.root.is_current() && original.owner.holder.is_current());
 }

@@ -588,6 +588,38 @@ fn late_child_reply_survives_committed_carry_and_final_save_failures_without_rec
         assert_eq!(adopted.holder_identity(), Some(&owner));
         wait_file(&case.join("reply-received"));
         assert_eq!(fs::read(case.join("reply-received")).unwrap(), b"\x1b[1;1R");
+        // Restoration detaches its internal subscriber and keeps parsing while
+        // hidden. Reattach and reveal through HOST before asking for a rendered
+        // grid; reading the cached snapshot alone does not request a capture.
+        assert!(
+            !successor
+                .lock()
+                .unwrap()
+                .subscriptions
+                .attached(0, source.id)
+        );
+        let (response, _, _) = super::super::client::process_request(
+            &successor,
+            0,
+            ClientRequest::Attach {
+                terminal_id: source.id,
+                after_generation: 0,
+                after_event_sequence: 0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::Attached { terminal }
+                if terminal.session.id == source.id && terminal.session.launch == source.launch));
+        let (response, _, _) = super::super::client::process_request(
+            &successor,
+            0,
+            ClientRequest::SetVisibility {
+                terminal_id: source.id,
+                visibility: crate::terminal_ipc::TerminalVisibility::Visible,
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::Accepted));
         wait_text(&adopted, "REPLY_CONSUMED");
         assert_eq!(
             fs::read_to_string(case.join("launches")).unwrap(),
