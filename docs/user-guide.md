@@ -414,9 +414,10 @@ Open a channel and choose **Work** beside **Conversations** to see the PRs
 tracked in that channel. Return to **Conversations** to use its terminals and
 chats. Changing this view keeps those sessions running.
 
-Use **Track PR…** to enter the forge host, repository and PR number, or paste a
-full PR URL into **Repository** to fill those fields. Review the identity and
-choose the channel's role before submitting:
+Use **Track PR…** to enter the forge host, repository and PR number, or type or
+paste a full PR URL into **Repository**. The URL stays editable while the host
+and number update. Editing the host or number switches to separate identity
+fields. Review the identity and choose the channel's role before submitting:
 
 | Role | Meaning |
 | --- | --- |
