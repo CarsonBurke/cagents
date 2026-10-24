@@ -667,14 +667,21 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
     else {
         return;
     };
-    if !runtime.presentation_cache().contains_key(id) {
+    // Load is a retry of the prepared source, not a publication. A queued
+    // request may arrive after a same-ID snapshot replacement but before
+    // preparation has retired its old pixels.
+    if runtime
+        .presentation_cache()
+        .get(id)
+        .and_then(|cached| cached.image_item.as_ref())
+        .is_none_or(|prepared| !Arc::ptr_eq(prepared, &item) && prepared.content != item.content)
+    {
         return;
     }
     runtime.preview_request = Some(id.to_owned());
     if let Some(cached) = runtime.presentation_cache_mut().get_mut(id) {
-        cached.image_item = Some(item.clone());
         if cached.image.is_none() {
-            cached.image_source = Some(item);
+            cached.image_source = cached.image_item.clone();
         }
         cached.image_attempt = cached.image_attempt.wrapping_add(1);
         cached.image_wait = None;
@@ -963,6 +970,14 @@ impl Gallery {
                 else {
                     return None;
                 };
+                let cached = runtime.presentation_cache().get(&item.id)?;
+                // Neighbors can change before preparation even when the
+                // clicked preview is current. Never pair their new source or
+                // external path with pixels decoded for the old publication.
+                let source = cached.image_item.as_ref()?;
+                if !Arc::ptr_eq(source, item) && source.content != item.content {
+                    return None;
+                }
                 Some(Entry {
                     id: item.id.clone(),
                     managed: reference.is_some(),
@@ -983,7 +998,7 @@ impl Gallery {
                     } else {
                         description.clone()
                     },
-                    handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+                    handle: cached.image.clone()?,
                 })
             })
             .collect();
@@ -1937,6 +1952,247 @@ mod tests {
             assert_eq!(gallery.entries[gallery.selected].id, current.id);
             assert_eq!(gallery.entries[gallery.selected].handle.id(), expected);
         }
+    }
+
+    #[test]
+    fn gallery_neighbors_require_pixels_from_their_current_immutable_source() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        use iced::widget::image::Handle;
+        let renderer = crate::app::tests::headless_renderer();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Codex, Some("/fixture/images".into())));
+        let card = app.workspace.focused().unwrap();
+        let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+            panic!("draft chat");
+        };
+        runtime.visible.store(true, Ordering::Relaxed);
+        let first = Arc::new(image_item("/fixture/a.png".into()));
+        let mut neighbor = image_item("/fixture/b-old.png".into());
+        neighbor.id = "neighbor".into();
+        let neighbor = Arc::new(neighbor);
+        let prepare = |runtime: &mut Runtime| {
+            Runtime::prepare_items(
+                &mut runtime.cache,
+                &runtime.snapshot.items,
+                false,
+                &HashSet::new(),
+                runtime.syntax_theme,
+                Provider::Codex,
+            );
+        };
+        Arc::make_mut(&mut runtime.snapshot).items = vec![first.clone(), neighbor.clone()];
+        prepare(runtime);
+        let load_click = |runtime: &Runtime, item: &Arc<chat::Item>| {
+            let view = || runtime.image_preview(item, &runtime.cache[&item.id]);
+            let mut tree = Tree::new(view().as_widget());
+            assert!(
+                button_pointer_step(
+                    view(),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left),
+                )
+                .is_empty()
+            );
+            let mut messages = button_pointer_step(
+                view(),
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::ChatUi(Action::LoadImage(target, id))]
+                if *target == runtime.target && id == &item.id)
+            );
+            messages.pop().unwrap()
+        };
+        retire(runtime.cache.get_mut(&neighbor.id).unwrap(), true);
+        let queued_load = load_click(runtime, &neighbor);
+        request(runtime, &neighbor.id);
+        assert!(Arc::ptr_eq(
+            runtime.cache[&neighbor.id].image_source.as_ref().unwrap(),
+            &neighbor,
+        ));
+        let red = Handle::from_rgba(1, 1, vec![255, 0, 0, 255]);
+        let green = Handle::from_rgba(1, 1, vec![0, 255, 0, 255]);
+        for (item, handle) in [(&first, red.clone()), (&neighbor, green.clone())] {
+            let attempt = runtime.cache[&item.id].image_attempt;
+            complete(runtime, item, attempt, Loaded::Ready(handle));
+        }
+        let mut tree = {
+            let preview = runtime.image_preview(&first, &runtime.cache[&first.id]);
+            Tree::new(preview.as_widget())
+        };
+        let click = |runtime: &Runtime, tree: &mut Tree| {
+            assert!(
+                preview_pointer_step(
+                    runtime,
+                    &first,
+                    tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left),
+                )
+                .is_empty()
+            );
+            let mut messages = preview_pointer_step(
+                runtime,
+                &first,
+                tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            assert_eq!(messages.len(), 1, "the unchanged A preview remains usable");
+            messages.pop().unwrap()
+        };
+        let initial_open = click(runtime, &mut tree);
+        let target = runtime.target;
+        drop(app.update(initial_open));
+        let original = app.chat_ui.image_viewer.as_ref().unwrap();
+        assert_eq!(original.entries.len(), 2);
+        let mut navigation = Tree::new(original.navigation_button(true).as_widget());
+        assert!(
+            button_pointer_step(
+                original.navigation_button(true),
+                &mut navigation,
+                &renderer,
+                Event::ButtonPressed(Button::Left),
+            )
+            .is_empty()
+        );
+        let mut old_next = button_pointer_step(
+            original.navigation_button(true),
+            &mut navigation,
+            &renderer,
+            Event::ButtonReleased(Button::Left),
+        );
+        assert_eq!(old_next.len(), 1, "retain a real old-gallery action");
+        drop(app.handle_chat_ui(Action::CloseImage));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        // An equivalent immutable snapshot remains eligible without a prepare.
+        Arc::make_mut(&mut runtime.snapshot).items[1] = Arc::new((*neighbor).clone());
+        let unchanged = Gallery::from_preview(
+            runtime,
+            &PreviewTarget::capture(runtime.target, &first, &runtime.cache[&first.id]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unchanged.entries.len(), 2);
+        assert_eq!(unchanged.entries[1].handle.id(), green.id());
+        let owner = runtime.cache[&neighbor.id]
+            .image_item
+            .as_ref()
+            .unwrap()
+            .clone();
+        request(runtime, &neighbor.id);
+        assert!(
+            Arc::ptr_eq(
+                runtime.cache[&neighbor.id].image_item.as_ref().unwrap(),
+                &owner
+            ),
+            "an equivalent snapshot retry does not republish the pixel owner"
+        );
+        let mut replacement = (*neighbor).clone();
+        if let ItemContent::Image {
+            path, description, ..
+        } = &mut replacement.content
+        {
+            *path = "/fixture/b-new.png".into();
+            *description = "New B".into();
+        }
+        let replacement = Arc::new(replacement);
+        Arc::make_mut(&mut runtime.snapshot).items[1] = replacement.clone();
+        assert_eq!(
+            runtime.cache[&neighbor.id].image.as_ref().unwrap().id(),
+            green.id()
+        );
+        let attempt = runtime.cache[&neighbor.id].image_attempt;
+        let interest = runtime.preview_request.clone();
+        drop(app.update(queued_load));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(
+            Arc::ptr_eq(
+                runtime.cache[&neighbor.id].image_item.as_ref().unwrap(),
+                &owner
+            ),
+            "queued Load cannot relabel the old Ready pixels"
+        );
+        assert_eq!(
+            runtime.cache[&neighbor.id].image.as_ref().unwrap().id(),
+            green.id()
+        );
+        assert_eq!(runtime.cache[&neighbor.id].image_attempt, attempt);
+        assert_eq!(runtime.preview_request, interest);
+        let queued = click(runtime, &mut tree);
+        drop(app.update(queued));
+        let pending = app.chat_ui.image_viewer.as_ref().unwrap();
+        assert_eq!(
+            pending.entries.len(),
+            1,
+            "stale B pixels must not borrow B's new source"
+        );
+        assert_eq!(pending.entries[0].id, first.id);
+        assert_eq!(pending.entries[0].handle.id(), red.id());
+        drop(app.handle_chat_ui(Action::CloseImage));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        prepare(runtime);
+        assert!(runtime.cache[&replacement.id].image.is_none());
+        retire(runtime.cache.get_mut(&replacement.id).unwrap(), true);
+        let fresh_load = load_click(runtime, &replacement);
+        drop(app.update(fresh_load));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(Arc::ptr_eq(
+            runtime.cache[&replacement.id]
+                .image_source
+                .as_ref()
+                .unwrap(),
+            &replacement
+        ));
+        let blue = Handle::from_rgba(1, 1, vec![0, 0, 255, 255]);
+        let attempt = runtime.cache[&replacement.id].image_attempt;
+        complete(runtime, &replacement, attempt, Loaded::Ready(blue.clone()));
+        let current = click(runtime, &mut tree);
+        drop(app.update(current));
+        let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+        assert_eq!(gallery.entries.len(), 2);
+        let publication = gallery.publication;
+        drop(app.update(old_next.pop().unwrap()));
+        let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+        assert_eq!(
+            (gallery.publication, gallery.selected, gallery.reset),
+            (publication, 0, 0)
+        );
+        let mut navigation = Tree::new(gallery.navigation_button(true).as_widget());
+        assert!(
+            button_pointer_step(
+                gallery.navigation_button(true),
+                &mut navigation,
+                &renderer,
+                Event::ButtonPressed(Button::Left),
+            )
+            .is_empty()
+        );
+        let mut fresh_next = button_pointer_step(
+            gallery.navigation_button(true),
+            &mut navigation,
+            &renderer,
+            Event::ButtonReleased(Button::Left),
+        );
+        assert_eq!(fresh_next.len(), 1);
+        drop(app.update(fresh_next.pop().unwrap()));
+        let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
+        assert_eq!(gallery.selected, 1);
+        let entry = &gallery.entries[gallery.selected];
+        assert_eq!(entry.id, replacement.id);
+        assert_eq!(entry.label, "New B");
+        assert_eq!(entry.handle.id(), blue.id());
+        let Handle::Rgba { pixels, .. } = &entry.handle else {
+            panic!("decoded pixels")
+        };
+        assert_eq!(pixels.as_ref(), &[0, 0, 255, 255]);
+        assert_eq!(
+            gallery.external_url(gallery.target()).unwrap().as_str(),
+            "file:///fixture/b-new.png"
+        );
     }
 
     #[test]
