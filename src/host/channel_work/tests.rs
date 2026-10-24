@@ -10,7 +10,7 @@ use crate::{
     terminal_ipc::{ClientRequest, ServerResponse},
     workspace_model::ModelEdit,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn fixture() -> (SharedHost, tempfile::TempDir, Home) {
     let directory = tempfile::tempdir().unwrap();
@@ -44,8 +44,7 @@ fn fixture() -> (SharedHost, tempfile::TempDir, Home) {
         boot_id: crate::model::BootId::new("fixture"),
         host_incarnation: crate::model::HostIncarnation::new("fixture"),
     });
-    state.model = Some(registry.execution_connection().unwrap());
-    state.execution_registry = Some(Arc::new(Mutex::new(registry)));
+    state.install_model(registry);
     (Arc::new(HostLock::new(state)), directory, home)
 }
 

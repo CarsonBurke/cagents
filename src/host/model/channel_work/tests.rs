@@ -1067,7 +1067,7 @@ fn enlarge_context_provenance(registry: &mut Registry, home: Home) {
         assert!(bytes * 2 > work::MAX_BUCKET_BYTES);
         registry.db.execute(
             "UPDATE channel_work_entries SET entry=?4 WHERE channel=?1 AND incarnation=?2 AND target=?3",
-            params![home.channel.to_string(),home.creation_ordinal,key,encode(&entry).unwrap()],
+            params![home.channel.to_string(),home.creation_ordinal,key.as_str(),encode(&entry).unwrap()],
         ).unwrap();
     }
 }
