@@ -30939,13 +30939,98 @@ mod tests {
         }
     }
 
+    fn captured_discard_confirmation() -> (tempfile::TempDir, Cagents, Task<Message>) {
+        use crate::process::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |arguments: &[&str]| {
+            let mut command = CommandSpec::new("git")
+                .cwd(&root)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(arguments.iter().copied())
+                .timeout(Duration::from_secs(10));
+            for (name, _) in std::env::vars_os() {
+                if name.as_encoded_bytes().starts_with(b"GIT_") {
+                    command = command.env_remove(name);
+                }
+            }
+            command = command
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap()
+                .require_success(&command.program)
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("tracked"), b"indexed original\n").unwrap();
+        git(&["add", "--all"]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(root.join("notes.txt"), b"precious untracked\n").unwrap();
+        let mut app = context_inspector_test_app(false);
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: root.clone(),
+        };
+        app.active_workspace = Some(root.clone());
+        app.sidebar_model = SidebarModel::ready(
+            SidebarMode::Expanded,
+            vec![SidebarProject::new(
+                key.project_id,
+                RepositoryId::new(),
+                "Discard focus fixture".into(),
+                root.clone(),
+                vec![SidebarWorktree::from_durable(
+                    key.worktree_id,
+                    root.clone(),
+                    None,
+                )],
+                Vec::new(),
+            )],
+        )
+        .with_source_control(Some(SourceControlModel::loading(key.clone())));
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &SidebarFocus::Repository {
+                worktree: root.clone()
+            },
+        ));
+        let loaded = task_app_message(app.source_control_snapshot_task(key.clone()));
+        assert!(matches!(
+            &loaded,
+            Message::SourceControlLoaded { result: Ok(_), .. }
+        ));
+        drop(app.update(loaded));
+        let source = app.discard_ui.source().unwrap().id;
+        let opening = app.update(Message::SidebarSnapshot {
+            source,
+            action: Box::new(SidebarAction::RequestDiscard {
+                key,
+                request: crate::repository::DiscardRequest {
+                    worktree: root,
+                    ..discard_request(false)
+                },
+            }),
+        });
+        assert!(app.modal_is_open());
+        (directory, app, opening)
+    }
+
     #[test]
     fn discard_confirmation_starts_on_cancel_and_enter_does_not_admit_a_mutation() {
-        let mut app = context_inspector_test_app(false);
-        let opening = app.update(Message::Sidebar(SidebarAction::RequestDiscard {
-            key: discard_key(),
-            request: discard_request(false),
-        }));
+        let (directory, mut app, opening) = captured_discard_confirmation();
+        let index = std::fs::read(directory.path().join(".git/index")).unwrap();
         let cancel = sidebar::discard_cancel_id();
         assert_eq!(
             focused_element(app.dialog().unwrap(), opening),
@@ -30953,21 +31038,29 @@ mod tests {
         );
         let message = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
         assert!(matches!(
-            message,
-            Message::Sidebar(SidebarAction::CancelDiscard)
+            &message,
+            Message::SidebarSnapshot { source, action }
+                if Some(*source) == app.discard_ui.intent_id()
+                    && matches!(&**action, SidebarAction::CancelDiscard)
         ));
         drop(app.update(message));
         assert!(app.sidebar_state.pending_discard().is_none());
         assert!(app.source_control_mutations.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"precious untracked\n"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(".git/index")).unwrap(),
+            index
+        );
     }
 
     #[test]
     fn discard_reexposed_after_transient_close_still_focuses_cancel() {
-        let mut app = context_inspector_test_app(false);
-        drop(app.update(Message::Sidebar(SidebarAction::RequestDiscard {
-            key: discard_key(),
-            request: discard_request(false),
-        })));
+        let (directory, mut app, opening) = captured_discard_confirmation();
+        drop(opening);
+        let index = std::fs::read(directory.path().join(".git/index")).unwrap();
         // The transient close owner is drawn above discard. Its actual Cancel
         // reducer must restore the lower confirmation's safe focus target.
         app.transient_work_close = Some(window::Id::unique());
@@ -30985,12 +31078,22 @@ mod tests {
         );
         let enter = dialog_ui::tests::enter_control(app.dialog().unwrap(), cancel);
         assert!(matches!(
-            enter,
-            Message::Sidebar(SidebarAction::CancelDiscard)
+            &enter,
+            Message::SidebarSnapshot { source, action }
+                if Some(*source) == app.discard_ui.intent_id()
+                    && matches!(&**action, SidebarAction::CancelDiscard)
         ));
         drop(app.update(enter));
         assert!(app.sidebar_state.pending_discard().is_none());
         assert!(app.source_control_mutations.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("notes.txt")).unwrap(),
+            b"precious untracked\n"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(".git/index")).unwrap(),
+            index
+        );
     }
 
     #[test]
