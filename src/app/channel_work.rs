@@ -155,6 +155,12 @@ impl Cagents {
         let title = channel.title.clone();
         let was_main = self.channel_work_is_main();
         let effect = self.channel_work.view.open(home, title);
+        if matches!(&effect, Some(Effect::Read { home: accepted, .. }) if *accepted == home) {
+            // An explicit accepted open selects its destination even when the
+            // existing view owner is unchanged. Coalesced reads and draft
+            // Keep/Focus effects do not change navigation ownership.
+            self.channel_work.navigation_view = None;
+        }
         // The leaf may still own the old Home while a dirty draft asks Keep /
         // Discard. Mount that original view, without changing source or route.
         if self.channel_work.view.is_open() {
@@ -576,9 +582,9 @@ impl Cagents {
             Effect::Mutate { mutation, .. } => mutation.home,
             Effect::Focus { owner, .. } => owner.home,
         };
-        if self.channel_work_is_main()
-            && self.channel_work.navigation_view != self.channel_work.view.owner()
-        {
+        let changed_view = self.channel_work_is_main()
+            && self.channel_work.navigation_view != self.channel_work.view.owner();
+        if changed_view {
             self.channel_work.navigation_view = self.channel_work.view.owner();
             self.channel_work.generation = uuid::Uuid::new_v4();
         }
@@ -586,8 +592,9 @@ impl Cagents {
             && self.channel_work_is_main()
             && self.channel_work.view.home() == Some(home)
         {
-            // Only an accepted open (including Discard's deferred destination)
-            // reaches here. Keep never selects a channel or resolves its route.
+            // Only a newly accepted open (including Discard's destination)
+            // selects scope. Polls, invalidations and page reads do not revisit
+            // channel selection or replace its captured focus destination.
             let current = self
                 .workspace_model
                 .channel(home.channel)
@@ -598,9 +605,13 @@ impl Cagents {
                 .map(|channel| channel.title.clone());
             if let Some(title) = current {
                 self.channel_work.title = title;
-                let task = self.select_channel(home.channel);
-                self.channel_work.restore_card = self.workspace.focused();
-                task
+                if changed_view {
+                    let task = self.select_channel(home.channel);
+                    self.channel_work.restore_card = self.workspace.focused();
+                    task
+                } else {
+                    Task::none()
+                }
             } else {
                 Task::none()
             }
@@ -1116,6 +1127,206 @@ mod tests {
         app.cards.insert(a, CardRuntime::Loading);
         app.cards.insert(b, CardRuntime::Loading);
         (other, a, b)
+    }
+
+    fn history_snapshot(home: Home, next_history: Option<u64>) -> crate::channel_work::Snapshot {
+        crate::channel_work::Snapshot {
+            home,
+            lifecycle: crate::channel_work::HomeLifecycle::Active,
+            revision: 1,
+            entries: vec![],
+            history: vec![crate::channel_work::Entry {
+                id: uuid::Uuid::new_v4(),
+                target: crate::channel_work::Target::PullRequest(
+                    crate::github_identity::PullRequestKey::new(
+                        crate::github_identity::GitHubRepoKey::new(
+                            "github.com",
+                            None,
+                            "fixture",
+                            "work",
+                        )
+                        .unwrap(),
+                        1,
+                    )
+                    .unwrap(),
+                ),
+                claims: vec![],
+                contexts: vec![],
+                suppressed: false,
+                user_ended: true,
+                observation: None,
+                last_terminal_generation: 0,
+                ever_claimed: true,
+                revision: 1,
+            }],
+            next_current: None,
+            next_history,
+        }
+    }
+
+    #[test]
+    fn background_work_poll_invalidation_and_pages_preserve_the_accepted_workspace_scope() {
+        for source in ["poll", "invalidation", "earlier", "latest"] {
+            let (mut app, home) = main_fixture();
+            let (other, _, target) = two_channels(&mut app, home);
+            let owner = app.channel_work.view.owner().unwrap();
+            app.workspace_model.channels[0].title = "Renamed while reading".into();
+            let snapshot = history_snapshot(home, Some(42));
+            assert!(snapshot.validate().is_ok());
+            let Some(Effect::Read { ticket, .. }) = app.channel_work.view.refresh() else {
+                panic!("fixture read")
+            };
+            app.channel_work.view.update(ui::Action::Loaded {
+                ticket,
+                result: Ok(snapshot.clone()),
+            });
+            if matches!(source, "earlier" | "latest") {
+                app.channel_work
+                    .view
+                    .update(ui::Action::Tab(owner, crate::channel_work::Bucket::History));
+            }
+            if source == "latest" {
+                let Some(Effect::Read { ticket, .. }) =
+                    app.channel_work.view.update(ui::Action::Earlier(owner, 42))
+                else {
+                    panic!("fixture earlier page")
+                };
+                let mut earlier = snapshot;
+                earlier.next_history = None;
+                app.channel_work.view.update(ui::Action::Loaded {
+                    ticket,
+                    result: Ok(earlier),
+                });
+            }
+            // A canonical scope reconciliation can be accepted while a Work
+            // view remains open. Fetching that view must not reinstall its old
+            // scope or recapture the pane the user will return to.
+            drop(app.select_channel(other));
+            assert_eq!(app.durable.active_channel, Some(other));
+            assert_eq!(app.workspace.focused(), Some(target));
+            let before = (
+                app.active_workspace.clone(),
+                app.durable.active_channel,
+                app.workspace.order().collect::<Vec<_>>(),
+                app.workspace.focused(),
+                app.workspace_view_generation,
+                app.channel_work.generation,
+                app.channel_work.restore_card,
+            );
+            match source {
+                "poll" => drop(app.update(Message::ChannelWorkPoll)),
+                "invalidation" => drop(app.apply_workspace_model_update(
+                    super::super::workspace_model_sync::ModelUpdate::Edited {
+                        sequence: app.workspace_model.sequence + 1,
+                        edit: ModelEdit::ChannelWorkChanged { home },
+                    },
+                )),
+                "earlier" => drop(app.update(Message::ChannelWork(ui::Action::Earlier(owner, 42)))),
+                "latest" => drop(app.update(Message::ChannelWork(ui::Action::Latest(owner)))),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                (
+                    app.active_workspace.clone(),
+                    app.durable.active_channel,
+                    app.workspace.order().collect::<Vec<_>>(),
+                    app.workspace.focused(),
+                    app.workspace_view_generation,
+                    app.channel_work.generation,
+                    app.channel_work.restore_card,
+                ),
+                before,
+                "{source} fetch must not select or refocus a channel"
+            );
+            assert_eq!(app.channel_work.view.owner(), Some(owner));
+            assert_eq!(app.channel_home().unwrap().1, "Renamed while reading");
+            assert!(
+                app.channel_work.view.refresh().is_none(),
+                "{source} really began a read, and coalesces another"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_new_work_home_and_dirty_discard_still_select_and_reopen_the_destination() {
+        let mut renderer = super::super::tests::headless_renderer();
+        for dirty in [false, true] {
+            let (mut app, home) = main_fixture();
+            let (other, original, target) = two_channels(&mut app, home);
+            let owner = app.channel_work.view.owner().unwrap();
+            if dirty {
+                dirty_native_form(&mut app, &mut renderer);
+            }
+            drop(app.open_channel_work(other));
+            if dirty {
+                assert!(app.channel_work.view.has_confirmation());
+                assert_eq!(app.channel_work.view.owner(), Some(owner));
+                assert_eq!(app.durable.active_channel, Some(home.channel));
+                assert_eq!(app.workspace.focused(), Some(original));
+                let mut ui = native(&app, Cache::new(), &mut renderer, 700.0);
+                let point = bounds(&ui, "Keep editing").center();
+                let keep = click(&mut ui, &mut renderer, point)
+                    .into_iter()
+                    .find(|message| matches!(message, Message::ChannelWork(ui::Action::Keep(..))))
+                    .unwrap();
+                let _ = ui.into_cache();
+                drop(app.update(keep));
+                assert!(!app.channel_work.view.has_confirmation());
+                assert_eq!(app.durable.active_channel, Some(home.channel));
+                assert_eq!(app.workspace.focused(), Some(original));
+                drop(app.open_channel_work(other));
+                discard_native(&mut app, &mut renderer);
+            }
+            let accepted = app.channel_work.view.owner().unwrap();
+            assert_ne!(accepted, owner);
+            assert_eq!(accepted.home.channel, other);
+            assert_eq!(app.durable.active_channel, Some(other));
+            assert_eq!(app.workspace.focused(), Some(target));
+
+            drop(app.update_channel_work(ui::Action::Close(accepted)));
+            assert!(!app.channel_work_is_main());
+            drop(app.select_channel(home.channel));
+            assert_eq!(app.workspace.focused(), Some(original));
+            drop(app.open_channel_work(other));
+            assert_ne!(app.channel_work.view.owner(), Some(accepted));
+            assert_eq!(app.durable.active_channel, Some(other));
+            assert_eq!(app.workspace.focused(), Some(target));
+        }
+        // Same-Home explicit opens keep the leaf/form owner. Unlike a
+        // background read, that accepted user navigation must select Home A
+        // again after another canonical scope B was installed.
+        for dirty in [false, true] {
+            let (mut app, home) = main_fixture();
+            let (other, original, target) = two_channels(&mut app, home);
+            let owner = app.channel_work.view.owner().unwrap();
+            let effect = app
+                .channel_work
+                .view
+                .refresh()
+                .expect("fixture background read");
+            let Effect::Read { ticket, .. } = &effect else {
+                panic!("fixture background read")
+            };
+            let ticket = *ticket;
+            drop(app.channel_work_effect(effect));
+            drop(app.update_channel_work(ui::Action::Loaded {
+                ticket,
+                result: Ok(history_snapshot(home, None)),
+            }));
+            if dirty {
+                dirty_native_form(&mut app, &mut renderer);
+            }
+            drop(app.select_channel(other));
+            assert_eq!(app.workspace.focused(), Some(target));
+            drop(app.open_channel_work(home.channel));
+            assert_eq!(app.channel_work.view.owner(), Some(owner));
+            assert_eq!(app.durable.active_channel, Some(home.channel));
+            assert_eq!(app.workspace.focused(), Some(original));
+            assert!(!app.channel_work.view.has_confirmation());
+            // A preserved dirty form still asks for confirmation on close.
+            drop(app.update_channel_work(ui::Action::Close(owner)));
+            assert_eq!(app.channel_work.view.has_confirmation(), dirty);
+        }
     }
 
     fn discard_native(app: &mut Cagents, renderer: &mut cosmic::Renderer) {
