@@ -237,6 +237,77 @@ mod tests {
     }
 
     #[test]
+    fn hidden_hover_buttons_accept_only_their_targeted_accessibility_click() {
+        use cosmic::iced::Event;
+        use cosmic::iced::advanced::{clipboard, mouse};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{Action, ActionRequest, Role, TreeId},
+        };
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum Message {
+            Base,
+            Top,
+        }
+
+        let element = cosmic::iced::widget::hover(
+            crate::ui_controls::button::secondary("Base").on_press(Message::Base),
+            crate::ui_controls::button::secondary("Top").on_press(Message::Top),
+        );
+        let mut renderer = super::headless_renderer();
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(300.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        // No mouse, focus operation, or redraw precedes either Click. A fresh
+        // Hover therefore keeps its top hidden throughout this sequence.
+        let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let target = |label: &str| {
+            let nodes = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node().role() == Role::Button && node.node().label() == Some(label)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(nodes.len(), 1, "one advertised {label} button");
+            assert!(nodes[0].node().supports_action(Action::Click));
+            let A11yId::Widget(id) = nodes[0].id() else {
+                panic!("button must expose a widget ID");
+            };
+            id.clone()
+        };
+        let top = target("Top");
+        let base = target("Base");
+        assert_ne!(top, base);
+
+        for (id, expected) in [(top, Message::Top), (base, Message::Base)] {
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::A11y(
+                    id.clone(),
+                    ActionRequest {
+                        action: Action::Click,
+                        target_tree: TreeId::ROOT,
+                        target_node: A11yId::from(id).into(),
+                        data: None,
+                    },
+                )],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages, vec![expected]);
+        }
+    }
+
+    #[test]
     fn tables_expose_their_cells_in_row_major_order() {
         use cosmic::iced::widget::table;
         let cells = [["Edit", "Pause"], ["Run now", "Remove"]];

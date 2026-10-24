@@ -907,14 +907,19 @@ where
             let is_visible =
                 is_hovered || self.is_top_focused || self.is_top_overlay_active;
 
-            if matches!(
-                event,
+            let forward_while_hidden = match event {
                 Event::Mouse(
                     mouse::Event::CursorMoved { .. }
-                        | mouse::Event::ButtonReleased(_)
-                )
-            ) || is_visible
-            {
+                    | mouse::Event::ButtonReleased(_),
+                ) => true,
+                // Hidden top controls are advertised in the accessibility tree.
+                // Their exact target IDs must remain actionable without hover.
+                #[cfg(feature = "a11y")]
+                Event::A11y(..) => true,
+                _ => false,
+            };
+
+            if forward_while_hidden || is_visible {
                 let redraw_request = shell.redraw_request();
 
                 self.top.as_widget_mut().update(
