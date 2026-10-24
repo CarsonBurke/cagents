@@ -1879,77 +1879,115 @@ mod tests {
     #[test]
     fn visible_account_pop_out_leaves_work_only_after_the_dirty_draft_guard_accepts() {
         let mut renderer = super::super::tests::headless_renderer();
-        for dirty in [false, true] {
-            let (mut app, _) = main_fixture();
-            if dirty {
-                dirty_native_form(&mut app, &mut renderer);
-            }
-            let id = app
-                .account_ui
-                .add_managed_fixture(crate::agent::Provider::Claude, 989);
-            drop(app.update(Message::AccountUi(account_ui::Action::Popover(Some(id)))));
-            let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
-            // Build the real overlay layout before asking for its AX controls.
-            let initial = events(
-                &mut tree,
-                &mut renderer,
-                &[],
-                iced::mouse::Cursor::Unavailable,
-            );
-            assert!(
-                initial.is_empty(),
-                "popup frame emitted messages: {initial:?}"
-            );
-            let rect = bounds(&tree, "Open in the Accounts pane");
-            let candidates = {
-                let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
-                nodes
-                    .root()
-                    .iter()
-                    .chain(nodes.children())
-                    .filter(|node| node.node().label() == Some("Open in the Accounts pane"))
-                    .map(|node| (node.id().clone(), node.node().bounds()))
-                    .collect::<Vec<_>>()
-            };
-            let point = rect.center();
-            let mut messages = click(&mut tree, &mut renderer, point);
-            assert!(
-                matches!(
-                    messages.as_slice(),
-                    [Message::AccountUi(account_ui::Action::OpenPane)]
-                ),
-                "actual popout dirty={dirty} rect={rect:?} point={point:?} viewport=1400x600 candidates({})={candidates:?}; all callbacks: {messages:?}",
-                candidates.len()
-            );
-            let open = messages.remove(0);
-            let _ = tree.into_cache();
-            drop(app.update(open.clone()));
-            if dirty {
-                assert!(app.channel_work_is_main());
-                assert!(app.utility_card(&CardKind::Accounts).is_none());
+        for label in [
+            None,
+            Some("Work".to_owned()),
+            Some("W".repeat(crate::account::LABEL_LIMIT)),
+        ] {
+            for dirty in [false, true] {
+                let (mut app, _) = main_fixture();
+                if dirty {
+                    dirty_native_form(&mut app, &mut renderer);
+                }
+                let id = app
+                    .account_ui
+                    .add_managed_fixture(crate::agent::Provider::Claude, 989);
+                app.account_ui.set_fixture_label(&id, label.as_deref());
+                drop(app.update(Message::AccountUi(account_ui::Action::Popover(Some(id)))));
                 let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
-                let point = bounds(&tree, "Keep editing").center();
+                // Build the real overlay layout before asking for its AX controls.
+                let initial = events(
+                    &mut tree,
+                    &mut renderer,
+                    &[],
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(
+                    initial.is_empty(),
+                    "popup frame emitted messages: {initial:?}"
+                );
+                if let Some(label) = &label {
+                    let text = rendered_text(&mut tree, &renderer);
+                    assert!(
+                        text.iter().any(|value| value == label),
+                        "full semantic account label retained: {label:?}; {text:?}"
+                    );
+                }
+                let viewport = account_popup_viewport(&mut tree, &renderer);
+                let rect = bounds(&tree, "Open in the Accounts pane");
+                let refresh = bounds(&tree, "Check now");
+                for control in [rect, refresh] {
+                    assert!(
+                        control.x.is_finite()
+                            && control.y.is_finite()
+                            && control.width.is_finite()
+                            && control.height.is_finite()
+                            && control.width > 0.0
+                            && control.height > 0.0,
+                        "usable control label={label:?} dirty={dirty}: {control:?}"
+                    );
+                    assert!(
+                        control.x >= viewport.x
+                            && control.y >= viewport.y
+                            && control.x + control.width <= viewport.x + viewport.width
+                            && control.y + control.height <= viewport.y + viewport.height,
+                        "control inside actual popup label={label:?} dirty={dirty}: {control:?}; viewport {viewport:?}"
+                    );
+                }
+                assert!(
+                    refresh.x + refresh.width <= rect.x || rect.x + rect.width <= refresh.x,
+                    "separate trailing controls label={label:?}: refresh={refresh:?} popout={rect:?}"
+                );
+                let candidates = {
+                    let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                    nodes
+                        .root()
+                        .iter()
+                        .chain(nodes.children())
+                        .filter(|node| node.node().label() == Some("Open in the Accounts pane"))
+                        .map(|node| (node.id().clone(), node.node().bounds()))
+                        .collect::<Vec<_>>()
+                };
+                let point = rect.center();
                 let mut messages = click(&mut tree, &mut renderer, point);
                 assert!(
                     matches!(
                         messages.as_slice(),
-                        [Message::ChannelWork(ui::Action::Keep(..))]
+                        [Message::AccountUi(account_ui::Action::OpenPane)]
                     ),
-                    "actual Keep callbacks after popout dirty={dirty} at {point:?}: {messages:?}"
+                    "actual popout dirty={dirty} rect={rect:?} point={point:?} viewport=1400x600 candidates({})={candidates:?}; all callbacks: {messages:?}",
+                    candidates.len()
                 );
+                let open = messages.remove(0);
                 let _ = tree.into_cache();
-                drop(app.update(messages.remove(0)));
-                assert!(app.channel_work_is_main());
-                assert!(app.utility_card(&CardKind::Accounts).is_none());
-                drop(app.update(open));
-                discard_native(&mut app, &mut renderer);
+                drop(app.update(open.clone()));
+                if dirty {
+                    assert!(app.channel_work_is_main());
+                    assert!(app.utility_card(&CardKind::Accounts).is_none());
+                    let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+                    let point = bounds(&tree, "Keep editing").center();
+                    let mut messages = click(&mut tree, &mut renderer, point);
+                    assert!(
+                        matches!(
+                            messages.as_slice(),
+                            [Message::ChannelWork(ui::Action::Keep(..))]
+                        ),
+                        "actual Keep callbacks after popout dirty={dirty} at {point:?}: {messages:?}"
+                    );
+                    let _ = tree.into_cache();
+                    drop(app.update(messages.remove(0)));
+                    assert!(app.channel_work_is_main());
+                    assert!(app.utility_card(&CardKind::Accounts).is_none());
+                    drop(app.update(open));
+                    discard_native(&mut app, &mut renderer);
+                }
+                assert!(!app.channel_work_is_main());
+                let card = app
+                    .utility_card(&CardKind::Accounts)
+                    .expect("visible Accounts destination");
+                assert_eq!(app.workspace.focused(), Some(card));
+                assert!(matches!(app.cards.get(&card), Some(CardRuntime::Accounts)));
             }
-            assert!(!app.channel_work_is_main());
-            let card = app
-                .utility_card(&CardKind::Accounts)
-                .expect("visible Accounts destination");
-            assert_eq!(app.workspace.focused(), Some(card));
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Accounts)));
         }
     }
 
@@ -2181,6 +2219,40 @@ mod tests {
             iced::mouse::Cursor::Unavailable,
         );
         tree
+    }
+
+    fn account_popup_viewport(ui: &mut Native<'_>, renderer: &cosmic::Renderer) -> iced::Rectangle {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct Viewports(Vec<iced::Rectangle>);
+        impl Operation for Viewports {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                _: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id.is_some_and(|id| {
+                    iced_accessibility::IdEq::eq(id, &widget::Id::new("account-popover-claude"))
+                }) {
+                    self.0.push(bounds);
+                }
+            }
+        }
+        let mut viewports = Viewports::default();
+        ui.operate(renderer, &mut viewports);
+        assert_eq!(
+            viewports.0.len(),
+            1,
+            "one real account popup viewport: {:?}",
+            viewports.0
+        );
+        viewports.0[0]
     }
 
     fn account_pane_input_callback(app: &Cagents, renderer: &mut cosmic::Renderer) -> Message {
