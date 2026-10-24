@@ -504,8 +504,32 @@ mod tests {
                     };
                     match event {
                         Event::SelectionRequest(request) => {
-                            // Deliberately offer no TARGETS negotiation. Text
-                            // continues to request UTF8_STRING directly.
+                            // Advertise no TARGETS, including to private
+                            // desktop clients. Refusal must not consume the
+                            // next scripted direct UTF8_STRING offer.
+                            if request.target == context.atoms.targets {
+                                context
+                                    .connection
+                                    .send_event(
+                                        false,
+                                        request.requestor,
+                                        EventMask::NO_EVENT,
+                                        x11rb::protocol::xproto::SelectionNotifyEvent {
+                                            response_type: x11rb::protocol::xproto::SELECTION_NOTIFY_EVENT,
+                                            sequence: 0,
+                                            time: request.time,
+                                            requestor: request.requestor,
+                                            selection: request.selection,
+                                            target: request.target,
+                                            property: x11rb::NONE,
+                                        },
+                                    )
+                                    .unwrap()
+                                    .check()
+                                    .unwrap();
+                                context.connection.flush().unwrap();
+                                continue;
+                            }
                             assert_eq!(
                                 request.target,
                                 context.atoms.utf8_string
@@ -721,6 +745,14 @@ mod tests {
             ],
         );
         let reader = Reader { display };
+        // Real raw MIME negotiation is refused without consuming the next
+        // scripted text offer; subsequent UTF8 assertions verify the queue.
+        assert!(
+            reader
+                .read(Kind::Standard, &["image/png".into()])
+                .unwrap()
+                .is_none()
+        );
         for kind in [Kind::Standard, Kind::Primary] {
             for _ in 0..2 {
                 assert_eq!(
@@ -810,6 +842,14 @@ mod tests {
             vec![TextOffer::Stall, TextOffer::Direct(b"fresh text".to_vec())],
         );
         let reader = Reader { display };
+        // Real raw MIME negotiation is refused without consuming the next
+        // scripted text offer; subsequent UTF8 assertions verify the queue.
+        assert!(
+            reader
+                .read(Kind::Standard, &["image/png".into()])
+                .unwrap()
+                .is_none()
+        );
         let start = Instant::now();
         assert_eq!(
             reader
