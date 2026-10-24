@@ -3899,7 +3899,7 @@ exec /bin/sleep 60
         );
         let mut source = fixture_source();
         source.launch.recipe = crate::model::LaunchRecipe {
-            program: provider,
+            program: provider.to_str().unwrap().to_owned(),
             arguments: Vec::new(),
             working_directory: cwd.clone(),
             environment: BTreeMap::from([
