@@ -1220,6 +1220,7 @@ dependencies = [
  "postcard",
  "pulldown-cmark",
  "raw-window-handle",
+ "regex",
  "resvg",
  "roxmltree",
  "rusqlite",
