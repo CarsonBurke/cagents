@@ -1835,6 +1835,17 @@ mod tests {
                 .add_managed_fixture(crate::agent::Provider::Claude, 989);
             drop(app.update(Message::AccountUi(account_ui::Action::Popover(Some(id)))));
             let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+            // Build the real overlay layout before asking for its AX controls.
+            let initial = events(
+                &mut tree,
+                &mut renderer,
+                &[],
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(
+                initial.is_empty(),
+                "popup frame emitted messages: {initial:?}"
+            );
             let point = bounds(&tree, "Open in the Accounts pane").center();
             let mut messages = click(&mut tree, &mut renderer, point);
             assert!(matches!(
@@ -2256,7 +2267,11 @@ mod tests {
             )],
             iced::mouse::Cursor::Unavailable,
         );
-        assert_eq!(messages.len(), 1, "one actual field callback for {label}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "one actual field callback for {label}, typed {value:?}; all emitted messages: {messages:?}"
+        );
         messages.remove(0)
     }
 
