@@ -5789,8 +5789,93 @@ mod tests {
         assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
     }
 
+    // Like the shared checkout fixtures, isolate before Git/App state or a
+    // native operation lease exists. CLOEXEC does not stop a parallel fork
+    // from briefly inheriting that lease before its exec.
+    fn isolated_checkout_fixture_case(case: &str) -> bool {
+        use cagents::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var("CAGENTS_CEDITOR_CHECKOUT_CASE").as_deref() == Ok(case) {
+            assert!(
+                std::env::vars_os().all(|(name, _)| !name.as_encoded_bytes().starts_with(b"GIT_")),
+                "the owning child must precede ambient Git configuration capture"
+            );
+            for marker in ["XDG_RUNTIME_DIR", "XDG_DATA_HOME"] {
+                let path = std::env::var_os(marker).expect("owned checkout fixture directory");
+                let metadata = std::fs::metadata(path).unwrap();
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            return false;
+        }
+        let private = || {
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap()
+        };
+        let runtime = private();
+        let data = private();
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap())
+            .args([
+                case,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--color=never",
+            ])
+            .env("CAGENTS_CEDITOR_CHECKOUT_CASE", case)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_DATA_HOME", data.path())
+            .timeout(Duration::from_secs(90))
+            .output_limits(1024 * 1024, 1024 * 1024);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        let (success, stdout, stderr, status) =
+            match SystemProcessExecutor.execute(&command, &CancellationToken::default()) {
+                Ok(output) => (
+                    output.success,
+                    output.stdout,
+                    output.stderr,
+                    format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
+                ),
+                Err(failure) => (
+                    false,
+                    failure.stdout,
+                    failure.stderr,
+                    format!("{:?}: {}", failure.kind, failure.message),
+                ),
+            };
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(success, "owning case {case}: {status}\n{stdout}\n{stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.contains(&format!("test {case} ... ok"))),
+            "actual named owning test did not pass: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "exact selector must run one owning case: {stdout}\n{stderr}"
+        );
+        print!("{stdout}");
+        eprint!("{stderr}");
+        true
+    }
+
     #[test]
     fn ceditor_checkout_rejects_inflight_same_head_review_identity_changes() {
+        if isolated_checkout_fixture_case(
+            "app::tests::ceditor_checkout_rejects_inflight_same_head_review_identity_changes",
+        ) {
+            return;
+        }
         use cagents::{
             github::{GitHubRepoKey, PullRequestKey},
             repository::{
@@ -5920,7 +6005,14 @@ mod tests {
                     run_tasks(&mut app, task);
                     assert_eq!(
                         app.checkout_dialog.as_ref().unwrap().completed_for_test(),
-                        Some(root.as_path())
+                        Some(root.as_path()),
+                        "phase={phase}, changed_source={changed_source}, error={:?}, busy={}, receipt={:?}",
+                        app.checkout_dialog.as_ref().unwrap().error_for_test(),
+                        app.checkout_dialog.as_ref().unwrap().busy(),
+                        app.checkout_dialog
+                            .as_ref()
+                            .unwrap()
+                            .retained_receipt_for_test(),
                     );
                 }
                 let completed_receipt = if phase == 4 {
