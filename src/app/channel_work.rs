@@ -1617,7 +1617,9 @@ mod tests {
         ));
         let queued_field = utility_input_callbacks(&app, &mut renderer, false, "Name", "z");
         let mut tree = utility_native(&app, &mut renderer, false);
-        let point = bounds(&tree, "Save automation").center();
+        // Row::Wrapping currently omits AX children (issue1490). Inspect the
+        // real button layout through Operation, then activate it by pointer.
+        let point = workboard_popup_button(&mut tree, &renderer, "Save automation").center();
         let queued_save = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(
@@ -1629,18 +1631,24 @@ mod tests {
                     Message::AutomationUi(AutomationAction::Save),
                 ]
             ),
-            "exact queued Save click callbacks: {queued_save:?}"
+            "exact queued Save click callbacks at {point:?}: {queued_save:?}; AX names: {:?}",
+            native_labels(&tree)
         );
         let before = native_field_value(&tree, "Name");
         let prompt_selection = automation_prompt_selection(&tree);
         assert_ne!(prompt_selection.0, prompt_selection.1);
         let _ = tree.into_cache();
         drop(app.open_channel_work(home.channel));
-        let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+        let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
         assert!(
             !native_labels(&tree)
                 .iter()
                 .any(|label| label == "Save automation")
+        );
+        let hidden_text = rendered_text(&mut tree, &renderer);
+        assert!(
+            !hidden_text.iter().any(|text| text == "Save automation"),
+            "hidden utility footer must not be mounted: {hidden_text:?}"
         );
         let _ = tree.into_cache();
         for message in queued_field {
@@ -1670,7 +1678,9 @@ mod tests {
         assert_ne!(native_field_value(&tree, "Name"), before);
         let prompt_selection = automation_prompt_selection(&tree);
         assert_eq!(prompt_selection.0, prompt_selection.1);
-        let point = bounds(&tree, "Save automation").center();
+        // Row::Wrapping currently omits AX children (issue1490). Inspect the
+        // real button layout through Operation, then activate it by pointer.
+        let point = workboard_popup_button(&mut tree, &renderer, "Save automation").center();
         let messages = click(&mut tree, &mut renderer, point);
         assert!(
             matches!(
@@ -1682,7 +1692,8 @@ mod tests {
                     Message::AutomationUi(AutomationAction::Save),
                 ]
             ),
-            "exact visible Save click callbacks: {messages:?}"
+            "exact visible Save click callbacks at {point:?}: {messages:?}; AX names: {:?}",
+            native_labels(&tree)
         );
         let _ = tree.into_cache();
         // Accepted tasks are dropped: no daemon/provider request is polled.
@@ -1889,12 +1900,27 @@ mod tests {
                 initial.is_empty(),
                 "popup frame emitted messages: {initial:?}"
             );
-            let point = bounds(&tree, "Open in the Accounts pane").center();
+            let rect = bounds(&tree, "Open in the Accounts pane");
+            let candidates = {
+                let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .filter(|node| node.node().label() == Some("Open in the Accounts pane"))
+                    .map(|node| (node.id().clone(), node.node().bounds()))
+                    .collect::<Vec<_>>()
+            };
+            let point = rect.center();
             let mut messages = click(&mut tree, &mut renderer, point);
-            assert!(matches!(
-                messages.as_slice(),
-                [Message::AccountUi(account_ui::Action::OpenPane)]
-            ));
+            assert!(
+                matches!(
+                    messages.as_slice(),
+                    [Message::AccountUi(account_ui::Action::OpenPane)]
+                ),
+                "actual popout dirty={dirty} rect={rect:?} point={point:?} viewport=1400x600 candidates({})={candidates:?}; all callbacks: {messages:?}",
+                candidates.len()
+            );
             let open = messages.remove(0);
             let _ = tree.into_cache();
             drop(app.update(open.clone()));
@@ -1904,10 +1930,13 @@ mod tests {
                 let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
                 let point = bounds(&tree, "Keep editing").center();
                 let mut messages = click(&mut tree, &mut renderer, point);
-                assert!(matches!(
-                    messages.as_slice(),
-                    [Message::ChannelWork(ui::Action::Keep(..))]
-                ));
+                assert!(
+                    matches!(
+                        messages.as_slice(),
+                        [Message::ChannelWork(ui::Action::Keep(..))]
+                    ),
+                    "actual Keep callbacks after popout dirty={dirty} at {point:?}: {messages:?}"
+                );
                 let _ = tree.into_cache();
                 drop(app.update(messages.remove(0)));
                 assert!(app.channel_work_is_main());
@@ -2157,7 +2186,11 @@ mod tests {
     fn account_pane_input_callback(app: &Cagents, renderer: &mut cosmic::Renderer) -> Message {
         let mut tree = accounts_native(app, renderer);
         let point = bounds(&tree, "Absolute path to the provider home").center();
-        assert!(click(&mut tree, renderer, point).is_empty());
+        let focus_messages = click(&mut tree, renderer, point);
+        assert!(
+            focus_messages.is_empty(),
+            "native focus click at {point:?} emitted: {focus_messages:?}"
+        );
         let mut messages = events(
             &mut tree,
             renderer,
@@ -2168,10 +2201,13 @@ mod tests {
             )],
             iced::mouse::Cursor::Unavailable,
         );
-        assert!(matches!(
-            messages.as_slice(),
-            [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::LinkInput(_)))
-        ));
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::LinkInput(_)))
+            ),
+            "actual account input callbacks: {messages:?}"
+        );
         messages.remove(0)
     }
 
@@ -2195,7 +2231,11 @@ mod tests {
         let row_height = 1.2 * design::TEXT_BODY + 2.0 * inset;
         let top = label.y + label.height + space::XS;
         let point = iced::Point::new(label.x + space::S, top + row_height / 2.0);
-        assert!(click(&mut tree, renderer, point).is_empty());
+        let focus_messages = click(&mut tree, renderer, point);
+        assert!(
+            focus_messages.is_empty(),
+            "native focus click at {point:?} emitted: {focus_messages:?}"
+        );
         // Dropdown's overlay List has the same row height and a native
         // container padding. Its index0 is Automatic; account indices follow.
         let point = iced::Point::new(
@@ -2204,7 +2244,8 @@ mod tests {
         );
         let mut messages = click(&mut tree, renderer, point);
         assert!(
-            matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::SetDefault(actual)) if actual == id))
+            matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::SetDefault(actual)) if actual == id)),
+            "actual account choice {id:?} callbacks at {point:?}: {messages:?}"
         );
         messages.remove(0)
     }
@@ -2269,7 +2310,12 @@ mod tests {
             .iter()
             .chain(nodes.children())
             .find(|node| node.node().label() == Some(label) && node.node().value().is_some())
-            .unwrap_or_else(|| panic!("missing mounted native field {label}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing mounted native field {label}; available AX names: {:?}",
+                    native_labels(tree)
+                )
+            })
             .node()
             .value()
             .unwrap()
@@ -2283,10 +2329,20 @@ mod tests {
             .iter()
             .chain(nodes.children())
             .find(|node| node.node().label() == Some("Automation instructions"))
-            .expect("mounted instructions editor")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing mounted instructions editor; AX names: {:?}",
+                    native_labels(tree)
+                )
+            })
             .node()
             .text_selection()
-            .expect("instructions editor exposes its selection");
+            .unwrap_or_else(|| {
+                panic!(
+                    "instructions editor has no AX selection; AX names: {:?}",
+                    native_labels(tree)
+                )
+            });
         assert_eq!(
             selection.anchor.node, selection.focus.node,
             "single-line fixture prompt"
@@ -2312,7 +2368,12 @@ mod tests {
             .iter()
             .chain(nodes.children())
             .find(|node| node.node().label() == Some(label) && node.node().value().is_some())
-            .unwrap_or_else(|| panic!("missing mounted native input {label}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing mounted native input {label}; available AX names: {:?}",
+                    native_labels(&tree)
+                )
+            })
             .id()
             .clone();
         let iced_accessibility::A11yId::Widget(id) = id else {
@@ -2464,7 +2525,11 @@ mod tests {
     fn workboard_query_callback(app: &Cagents, renderer: &mut cosmic::Renderer) -> Message {
         let mut ui = workboard_native(app, renderer);
         let point = bounds(&ui, "Filter cards").center();
-        assert!(click(&mut ui, renderer, point).is_empty());
+        let focus_messages = click(&mut ui, renderer, point);
+        assert!(
+            focus_messages.is_empty(),
+            "native focus click at {point:?} emitted: {focus_messages:?}"
+        );
         let mut messages = events(
             &mut ui,
             renderer,
@@ -2476,7 +2541,8 @@ mod tests {
             iced::mouse::Cursor::Unavailable,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::WorkUi(crate::work_ui::Action::Query(value))] if value == "z")
+            matches!(messages.as_slice(), [Message::WorkUi(crate::work_ui::Action::Query(value))] if value == "z"),
+            "actual Workboard query callbacks: {messages:?}"
         );
         messages.remove(0)
     }
@@ -2490,10 +2556,10 @@ mod tests {
             let mut ui = workboard_native(app, renderer);
             let point = bounds(&ui, "Card actions").center();
             let mut messages = click(&mut ui, renderer, point);
-            assert!(matches!(
-                messages.as_slice(),
-                [Message::WorkUi(BoardAction::Menu(_))]
-            ));
+            assert!(
+                matches!(messages.as_slice(), [Message::WorkUi(BoardAction::Menu(_))]),
+                "actual Workboard menu callbacks at {point:?}: {messages:?}"
+            );
             opened = matches!(
                 messages.as_slice(),
                 [Message::WorkUi(BoardAction::Menu(Some(_)))]
@@ -2508,13 +2574,16 @@ mod tests {
         let mut ui = workboard_native(app, renderer);
         let point = workboard_popup_button(&mut ui, renderer, "Stale").center();
         let mut messages = click(&mut ui, renderer, point);
-        assert!(matches!(
-            messages.as_slice(),
-            [Message::WorkUi(BoardAction::Pin(
-                _,
-                Some(crate::work::Column::Stale)
-            ))]
-        ));
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::WorkUi(BoardAction::Pin(
+                    _,
+                    Some(crate::work::Column::Stale)
+                ))]
+            ),
+            "actual Workboard Pin callbacks at {point:?}: {messages:?}"
+        );
         messages.remove(0)
     }
 
@@ -2549,26 +2618,36 @@ mod tests {
         ui.operate(renderer, &mut outline);
         outline
             .buttons
-            .into_iter()
+            .iter()
             .filter(|button| {
                 outline
                     .text
                     .iter()
                     .any(|(text, bounds)| text == label && button.contains(bounds.center()))
             })
+            .copied()
             .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
-            .unwrap_or_else(|| panic!("missing actual popup button {label}"))
+            .unwrap_or_else(|| panic!(
+                "missing real text button {label}; rendered text/bounds: {:?}; focusable bounds: {:?}; AX names: {:?}",
+                outline.text, outline.buttons, native_labels(ui)
+            ))
     }
 
     fn discard_native(app: &mut Cagents, renderer: &mut cosmic::Renderer) {
         let mut ui = native(app, Cache::new(), renderer, 700.0);
         let point = bounds(&ui, "Discard draft").center();
-        let action = click(&mut ui, renderer, point)
-            .into_iter()
-            .find(|message| matches!(message, Message::ChannelWork(ui::Action::Discard(..))))
-            .unwrap();
+        let messages = click(&mut ui, renderer, point);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::ChannelWork(ui::Action::Discard(..))]
+            ),
+            "actual Discard callbacks at {point:?}: {messages:?}"
+        );
         let _ = ui.into_cache();
-        drop(app.update(action));
+        for message in messages {
+            drop(app.update(message));
+        }
     }
 
     fn native<'a>(
@@ -2607,8 +2686,20 @@ mod tests {
             .iter()
             .chain(nodes.children())
             .find(|node| node.node().label() == Some(name))
-            .unwrap_or_else(|| panic!("missing actual native control {name}"));
-        let b = node.node().bounds().unwrap();
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing actual native control {name}; available AX: {:?}",
+                    nodes
+                        .root()
+                        .iter()
+                        .chain(nodes.children())
+                        .map(|node| (node.id(), node.node().label(), node.node().bounds()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let b = node.node().bounds().unwrap_or_else(|| {
+            panic!("actual native control {name} has no bounds; node: {node:?}")
+        });
         iced::Rectangle {
             x: b.x0 as f32,
             y: b.y0 as f32,
@@ -2697,12 +2788,11 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| matches!(message, Message::ChannelWork(ui::Action::Field(..))))
+                .any(|message| matches!(message, Message::ChannelWork(ui::Action::Field(..)))),
+            "actual dirty Work form callbacks: {messages:?}"
         );
         for message in messages {
-            if let Message::ChannelWork(action) = message {
-                drop(app.update_channel_work(action));
-            }
+            drop(app.update(message));
         }
     }
 
