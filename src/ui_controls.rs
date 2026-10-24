@@ -6,6 +6,8 @@ pub mod button;
 mod display;
 mod editable;
 pub mod field;
+mod find_options;
+pub use find_options::{FindOption, find_options};
 mod gauge;
 mod icon;
 mod icon_button;
