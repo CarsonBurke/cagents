@@ -80,7 +80,7 @@ dependencies = [
  "futures-lite",
  "serde",
  "tokio",
- "tokio-stream",
+ "tracing",
  "zbus 5.19.0",
 ]
 
@@ -1181,6 +1181,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "cagents"
 version = "0.1.3"
 dependencies = [
+ "accesskit_unix",
  "arc-swap",
  "ashpd 0.12.3",
  "async-channel",
@@ -1219,6 +1220,7 @@ dependencies = [
  "postcard",
  "pulldown-cmark",
  "raw-window-handle",
+ "regex",
  "resvg",
  "roxmltree",
  "rusqlite",
@@ -1267,6 +1269,13 @@ dependencies = [
  "tempfile",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "cagents-iced-contracts"
+version = "0.1.0"
+dependencies = [
+ "iced_core",
 ]
 
 [[package]]
@@ -4384,7 +4393,6 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic.git?rev=caec74c2559924443f12fc6faf97a5bcefe6271d#caec74c2559924443f12fc6faf97a5bcefe6271d"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -4523,6 +4531,7 @@ name = "iced_winit"
 version = "0.14.0"
 dependencies = [
  "build_helpers",
+ "clipboard_x11",
  "cosmic-client-toolkit",
  "cursor-icon",
  "dnd",
@@ -4546,6 +4555,7 @@ dependencies = [
  "window_clipboard",
  "winit",
  "winit-core",
+ "x11rb",
  "xkbcommon 0.7.0",
  "xkbcommon-dl",
  "xkeysym",

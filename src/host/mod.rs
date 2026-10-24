@@ -13,6 +13,8 @@ mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod service;
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests;
 mod state;
 mod work;
 mod worktree_removal;
@@ -212,6 +214,20 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+/// Reserve and configure the serving socket before restore can take ownership
+/// of an original holder. The caller still holds HostLease and admission, and
+/// does not accept clients or publish readiness until restoration finishes.
+fn listener_before_restore(
+    paths: &RuntimePaths,
+    restore: impl FnOnce() -> Result<(), HostError>,
+) -> Result<UnixListener, HostError> {
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    restore()?;
+    Ok(listener)
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -261,28 +277,28 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-    let retained_runs = chat::retained_actor::retained_runs(&host);
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(&host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )
-            .map_err(io::Error::other)?;
-    }
+    let listener = listener_before_restore(&paths, || {
+        let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+        state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+        chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+        let retained_runs = chat::retained_actor::retained_runs(&host);
+        // A committed acceptance is not proof of provider delivery. Until a
+        // restored actor supplies exact run evidence, never authorize a resend.
+        if let Ok(registry) = agent_execution::registry(&host) {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupt_unproven_agent_runs_except(
+                    crate::chat::now_ms().unwrap_or(0),
+                    &retained_runs,
+                )
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    })?;
     let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
@@ -437,11 +453,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -463,6 +476,22 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     }
 }
 
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    // Request and register every original before waiting on any one worker.
+    // One absolute deadline bounds the whole batch, including pending joins;
+    // an unfinished owner cannot consume another five seconds per sibling.
+    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles
+        .iter()
+        .map(|handle| handle.shutdown_until(deadline))
+        .collect()
+}
+
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
     let (chats, upgrading) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -480,14 +509,20 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
-            chat.close()
+            chat.close().and_then(|()| {
+                if !upgrading {
+                    // Closing the provider leaves its retained helper alive
+                    // until final outcomes are durably committed and ACKed.
+                    // Preserve that ownership on failure, before retiring the
+                    // delegated session record below.
+                    chat::retained_actor::finish_close(host, &chat, &session)
+                } else {
+                    Ok(())
+                }
+            })
         };
         match closed {
             Ok(()) if !upgrading => {

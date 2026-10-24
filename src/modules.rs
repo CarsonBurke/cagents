@@ -30,6 +30,8 @@ pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
@@ -46,6 +48,8 @@ pub mod editor;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
+pub mod editor_search;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;
@@ -53,6 +57,8 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod file_url;
 mod filesystem_recovery_context;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]

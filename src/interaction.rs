@@ -16,6 +16,7 @@ use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 mod context_menu;
+mod keyed_list;
 mod list_navigation;
 pub use list_navigation::reveal_list_selection;
 
@@ -31,11 +32,30 @@ pub fn focused_escape<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     on_escape: impl Fn() -> Message + 'a,
 ) -> Element<'a, Message> {
+    focused_key(content, move |event| {
+        matches!(
+            event,
+            cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+                ..
+            }
+        )
+        .then(|| on_escape())
+    })
+}
+
+/// Route a key from the field that actually owns native focus, before the
+/// native input consumes it. Other fields and already captured events keep
+/// their own keyboard handling, including after programmatic focus changes.
+pub fn focused_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
     Effect {
         content: content.into(),
-        kind: Kind::FocusedEscape,
+        kind: Kind::FocusedKey,
         tip: None,
-        on_escape: Some(Box::new(on_escape)),
+        on_focused_key: Some(Box::new(on_key)),
     }
     .into()
 }
@@ -66,7 +86,7 @@ pub fn keyboard_list<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::KeyboardList(enabled),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -78,18 +98,43 @@ pub fn keyboard_list_row<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::ListRow,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
 
-struct ListRowMarker;
+/// Keyed row state with the standard column's accessibility traversal.
+pub fn keyed_list_rows<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+) -> Element<'a, Message> {
+    keyed_list::view(rows)
+}
+
+/// A filter field at the head of a keyboard list. Down enters its first
+/// result; editing keys (including Home/End) remain the field's own.
+pub fn keyboard_list_entry<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ListEntry,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+struct ListRowMarker {
+    entry: bool,
+}
 
 #[derive(Default)]
 struct ListFocus {
     rows: Vec<Rectangle>,
     focused: Option<usize>,
     active: Option<usize>,
+    active_entry: bool,
+    focused_entry: bool,
 }
 
 impl Operation for ListFocus {
@@ -97,7 +142,8 @@ impl Operation for ListFocus {
         operate(self);
     }
     fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if state.is::<ListRowMarker>() {
+        if let Some(marker) = state.downcast_ref::<ListRowMarker>() {
+            self.active_entry = marker.entry;
             self.active = Some(self.rows.len());
             self.rows.push(bounds);
         }
@@ -112,6 +158,7 @@ impl Operation for ListFocus {
             && state.is_focused()
         {
             self.focused = Some(index);
+            self.focused_entry = self.active_entry;
         }
     }
 }
@@ -209,7 +256,7 @@ pub fn reserve_tab_history<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::TabHistory(enabled),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -221,7 +268,7 @@ pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         content: content.into(),
         kind: Kind::Hover,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -235,7 +282,7 @@ pub fn drive_animation<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::DriveAnimation(active),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -328,7 +375,7 @@ fn reveal_width_aligned<'a, Message: 'a>(
             leading,
         },
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -348,7 +395,7 @@ pub fn fade<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Fade(progress.clamp(0.0, 1.0)),
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -385,7 +432,7 @@ fn tooltip_positioned<'a, Message: 'a>(
             prefer_above,
             content: None,
         }),
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -403,7 +450,7 @@ pub fn context_menu<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::surface(menu)),
         kind: Kind::ContextMenu,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -418,7 +465,7 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::lazy_surface(builder)),
         kind: Kind::ContextMenu,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -433,7 +480,7 @@ pub fn keyboard_modal<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::KeyboardModal,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -444,7 +491,7 @@ pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
         content: content.into(),
         kind: Kind::Opaque,
         tip: None,
-        on_escape: None,
+        on_focused_key: None,
     }
     .into()
 }
@@ -457,11 +504,29 @@ pub fn layer<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     Element::new(Layers {
         children: [base, front],
+        front_exclusive: false,
+    })
+}
+
+/// Retain the base tree while a pane-local chooser owns input and accessibility.
+/// A stable second slot prevents opening/closing it from replacing the transcript.
+pub fn exclusive_layer<'a, Message: 'a>(
+    base: Element<'a, Message>,
+    front: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let front_exclusive = front.is_some();
+    Element::new(Layers {
+        children: [
+            base,
+            front.unwrap_or_else(|| cosmic::iced::widget::Space::new().into()),
+        ],
+        front_exclusive,
     })
 }
 
 struct Layers<'a, Message> {
     children: [Element<'a, Message>; 2],
+    front_exclusive: bool,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
@@ -500,11 +565,20 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
     ) {
         operation.container(None, layout.bounds());
         operation.traverse(&mut |operation| {
-            for ((child, tree), layout) in self.children.iter_mut().zip(&mut tree.children).zip(
-                layout
-                    .children()
-                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
-            ) {
+            for (index, ((child, tree), layout)) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(
+                    layout
+                        .children()
+                        .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+                )
+                .enumerate()
+            {
+                if self.front_exclusive && index == 0 {
+                    continue;
+                }
                 child
                     .as_widget_mut()
                     .operate(tree, layout, renderer, operation);
@@ -523,6 +597,15 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
         viewport: &Rectangle,
     ) {
         let over = cursor.is_over(layout.bounds());
+        let exclusive_viewport = layout.bounds().intersection(viewport).unwrap_or_default();
+        if self.front_exclusive && !over {
+            cursor = mouse::Cursor::Unavailable;
+        }
+        let viewport = if self.front_exclusive {
+            &exclusive_viewport
+        } else {
+            viewport
+        };
         for ((child, tree), layout) in self
             .children
             .iter_mut()
@@ -538,7 +621,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             child.as_widget_mut().update(
                 tree, event, layout, cursor, renderer, clipboard, shell, viewport,
             );
-            if shell.is_event_captured() {
+            if self.front_exclusive || shell.is_event_captured() {
                 return;
             }
             if over
@@ -616,7 +699,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             },
             viewport,
         );
-        renderer.with_layer(*viewport, |renderer| {
+        let front_viewport = if self.front_exclusive {
+            layout.bounds().intersection(viewport).unwrap_or_default()
+        } else {
+            *viewport
+        };
+        renderer.with_layer(front_viewport, |renderer| {
             self.children[1].as_widget().draw(
                 &tree.children[1],
                 renderer,
@@ -624,7 +712,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                 style,
                 front,
                 cursor,
-                viewport,
+                &front_viewport,
             )
         });
     }
@@ -636,6 +724,15 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        if self.front_exclusive {
+            return self.children[1].as_widget_mut().overlay(
+                &mut tree.children[1],
+                layout.children().nth(1).expect("front layer"),
+                renderer,
+                viewport,
+                translation,
+            );
+        }
         overlay::from_children(
             &mut self.children,
             tree,
@@ -660,7 +757,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                         .children()
                         .map(|child| child.with_virtual_offset(layout.virtual_offset())),
                 )
-                .map(|((child, tree), layout)| child.as_widget().a11y_nodes(layout, tree, cursor)),
+                .enumerate()
+                .filter(|(index, _)| !self.front_exclusive || *index == 1)
+                .map(|(_, ((child, tree), layout))| {
+                    child.as_widget().a11y_nodes(layout, tree, cursor)
+                }),
         )
     }
     fn drag_destinations(
@@ -670,12 +771,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
         renderer: &Renderer,
         destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
     ) {
-        for ((child, tree), child_layout) in self
+        for (index, ((child, tree), child_layout)) in self
             .children
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
+            .enumerate()
         {
+            if self.front_exclusive && index == 0 {
+                continue;
+            }
             child.as_widget().drag_destinations(
                 tree,
                 child_layout.with_virtual_offset(layout.virtual_offset()),
@@ -1135,8 +1240,9 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 #[derive(Clone, Copy)]
 enum Kind {
     KeyboardList(bool),
-    FocusedEscape,
+    FocusedKey,
     ListRow,
+    ListEntry,
     TabHistory(bool),
     Hover,
     ContextMenu,
@@ -1156,7 +1262,7 @@ struct Effect<'a, Message> {
     content: Element<'a, Message>,
     kind: Kind,
     tip: Option<Tip<'a, Message>>,
-    on_escape: Option<Box<dyn Fn() -> Message + 'a>>,
+    on_focused_key: Option<Box<dyn Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a>>,
 }
 
 struct Tip<'a, Message> {
@@ -1190,7 +1296,7 @@ impl<'a, Message: 'a> Tip<'a, Message> {
 struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
-struct FocusedEscapeTag;
+struct FocusedKeyTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1244,8 +1350,8 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
-            Kind::FocusedEscape => tree::Tag::of::<FocusedEscapeTag>(),
-            Kind::ListRow => tree::Tag::of::<ListRowTag>(),
+            Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
@@ -1328,11 +1434,13 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        if matches!(self.kind, Kind::ListRow) {
+        if matches!(self.kind, Kind::ListRow | Kind::ListEntry) {
             operation.custom(
                 None,
                 layout.bounds() - layout.virtual_offset(),
-                &mut ListRowMarker,
+                &mut ListRowMarker {
+                    entry: matches!(self.kind, Kind::ListEntry),
+                },
             );
         }
         self.content.as_widget_mut().operate(
@@ -1353,18 +1461,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Some(on_escape) = &self.on_escape
-            && matches!(
-                event,
-                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
-                    key: cosmic::iced::keyboard::Key::Named(
-                        cosmic::iced::keyboard::key::Named::Escape
-                    ),
-                    ..
-                })
-            )
-            && !shell.is_event_captured()
+        if let Some(on_key) = &self.on_focused_key
+            && let Event::Keyboard(event) = event
         {
+            if shell.is_event_captured() {
+                return;
+            }
             let mut focus = ChildFocus::default();
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -1372,8 +1474,10 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 renderer,
                 &mut focus,
             );
-            if focus.0 {
-                shell.publish(on_escape());
+            if focus.0
+                && let Some(message) = on_key(event)
+            {
+                shell.publish(message);
                 shell.capture_event();
                 return;
             }
@@ -1400,7 +1504,9 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                 renderer,
                 &mut focus,
             );
-            if let Some(current) = focus.focused {
+            if let Some(current) = focus.focused
+                && (!focus.focused_entry || *key == cosmic::iced::keyboard::key::Named::ArrowDown)
+            {
                 use cosmic::iced::keyboard::key::Named;
                 let target = match key {
                     Named::ArrowUp => current.saturating_sub(1),
@@ -1987,6 +2093,89 @@ mod tests {
             );
         }
         assert_eq!(published, [2]);
+    }
+
+    #[test]
+    fn filter_entry_keeps_editing_keys_and_down_enters_the_first_result() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let entry = Id::from("filter.entry");
+        let mut element = keyboard_list(
+            widget::column::with_children(vec![
+                keyboard_list_entry(
+                    crate::ui_controls::field::search("Filter", "long query")
+                        .id(entry.clone())
+                        .on_input(|_| 99_u8)
+                        .on_submit(|_: String| 100_u8),
+                ),
+                keyboard_list_row(crate::ui_controls::button::quiet("First").on_press(1_u8)),
+                keyboard_list_row(crate::ui_controls::button::quiet("Second").on_press(2_u8)),
+            ]),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 240.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(entry),
+        );
+        let mut published = Vec::new();
+        for key in [
+            keyboard::key::Named::Home,
+            keyboard::key::Named::End,
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Enter,
+        ] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &bounds,
+            );
+        }
+        assert_eq!(
+            published,
+            [100, 1, 2],
+            "editing keys keep search focus; Down moves to results"
+        );
     }
 
     #[test]

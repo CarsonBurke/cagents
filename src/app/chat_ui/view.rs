@@ -1,6 +1,21 @@
 use super::coordination::Coordinated;
 use super::*;
 
+/// Bind a link to the surface that rendered it, before another pane, project,
+/// or child conversation can become selected.
+pub(super) fn capture_document_link(
+    message: Message,
+    target: Target,
+    document: &Option<PathBuf>,
+) -> Message {
+    match message {
+        Message::ChatUi(Action::OpenDocument(found, raw)) if found == target => {
+            action(Action::OpenDocumentFrom(target, document.clone(), raw))
+        }
+        message => message,
+    }
+}
+
 pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
         .size(design::TEXT_BODY)
@@ -1004,6 +1019,12 @@ struct Place {
 }
 
 impl Runtime {
+    pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
+        self.selected_subagent
+            .is_none()
+            .then(|| self.session.launch.recipe.working_directory.join(".chat"))
+    }
+
     // Provider descriptions can contain a whole prompt. Keep status controls
     // compact while the full transcript remains available on selection.
     pub(super) fn short_description(raw: &str, limit: usize) -> String {
@@ -1025,9 +1046,9 @@ impl Runtime {
             .unwrap_or("Subagent")
     }
 
-    fn native_child_status(agent: &chat::Subagent) -> &'static str {
+    pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
         match agent.status {
-            chat::ToolStatus::Running if agent.waiting => "Waiting for you",
+            chat::ToolStatus::Running if agent.waiting => "Waiting",
             chat::ToolStatus::Running => "Working",
             chat::ToolStatus::Succeeded => "Finished",
             chat::ToolStatus::Failed => "Failed",
@@ -1036,7 +1057,7 @@ impl Runtime {
         }
     }
 
-    fn native_child_identity(&self, agent: &chat::Subagent) -> String {
+    pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
@@ -1061,9 +1082,96 @@ impl Runtime {
         identity
     }
 
-    /// Completion requires provider evidence; an idle, attached conversation
-    /// without that evidence is ready, while an unattached one is connecting.
-    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    /// Completion requires provider evidence. An unstarted conversation is a
+    /// draft; an idle attached one is ready, while an attachment is connecting.
+    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
+        let (glyph, label) = self.conversation_status_base(transitioning);
+        let snapshot = &self.snapshot;
+        if self.closed_elsewhere
+            || self.queued.is_some()
+            || transitioning
+            || self.attachment_chooser_pending.is_some()
+            || self.pending.is_some()
+            || self.disconnected
+            || snapshot.exited
+        {
+            return (glyph, label.to_owned());
+        }
+        let working = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && !child.waiting)
+            .count();
+        let waiting = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
+            .count();
+        let failed = snapshot
+            .subagents
+            .iter()
+            .filter(|child| {
+                matches!(
+                    child.status,
+                    chat::ToolStatus::Failed | chat::ToolStatus::Denied
+                )
+            })
+            .count();
+        let active = self
+            .error
+            .as_deref()
+            .into_iter()
+            .chain(snapshot.error.as_deref())
+            .find_map(|message| {
+                chat::failure::Failure::parse(self.session.launch.provider, message)
+            });
+        let failure_label = active.map(|failure| match failure.kind {
+            chat::failure::FailureKind::AccountLimit => "Account limit reached",
+            chat::failure::FailureKind::Authentication => "Sign-in required",
+            chat::failure::FailureKind::Capacity => "Provider at capacity",
+            chat::failure::FailureKind::Connection => "Connection interrupted",
+            chat::failure::FailureKind::Interrupted => "Interrupted",
+        });
+        let mut parts = Vec::new();
+        if let Some(label) = failure_label {
+            parts.push(label.to_owned());
+        } else if snapshot.busy
+            || snapshot.waiting
+            || !snapshot.requests.is_empty()
+            || (working == 0 && waiting == 0)
+        {
+            parts.push(Self::short_description(label, 72));
+        }
+        if failure_label.is_some()
+            || snapshot.subagents.len() > 1
+            || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
+        {
+            if working > 0 {
+                parts.push(format!("{working} working"));
+            }
+            if waiting > 0 {
+                parts.push(format!("{waiting} waiting"));
+            }
+            if failed > 0 {
+                parts.push(format!("{failed} failed"));
+            }
+            if !parts.is_empty() {
+                return (
+                    if working > 0 || snapshot.busy {
+                        Some(Icon::AgentWorking)
+                    } else if failure_label.is_some() || failed > 0 {
+                        Some(Icon::Warning)
+                    } else {
+                        glyph
+                    },
+                    parts.join(" · "),
+                );
+            }
+        }
+        (glyph, Self::short_description(label, 100))
+    }
+
+    fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
             (
@@ -1078,7 +1186,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Starting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending {
+        } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
         } else if self.pending.is_some() {
             (Some(Icon::AgentWorking), "Sending")
@@ -1095,6 +1203,10 @@ impl Runtime {
                 .subagents
                 .iter()
                 .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running)
+            && !snapshot
+                .subagents
+                .iter()
+                .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
         } else if snapshot.is_working() {
@@ -1119,6 +1231,8 @@ impl Runtime {
             }
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
+        } else if self.is_draft() {
+            (None, "Draft")
         } else if snapshot.ready {
             (None, "Ready")
         } else {
@@ -1239,7 +1353,32 @@ impl Runtime {
                     target,
                 ));
             }
+            for incident in self
+                .failure_ui
+                .incidents
+                .iter()
+                .filter(|incident| self.incident_has_child_detail(incident, &agent.id))
+            {
+                let has_item = agent.items.iter().any(|item| {
+                    self.failure_ui
+                        .child_item(&agent.id, &item.id)
+                        .is_some_and(|(found, _)| found.key == incident.key)
+                });
+                if !has_item {
+                    transcript.push(self.failure_view(incident));
+                }
+            }
             for item in &agent.items {
+                if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
+                    if first {
+                        transcript.push(
+                            widget::container(self.failure_view(incident))
+                                .id(self.find_anchor(&item.id))
+                                .into(),
+                        );
+                    }
+                    continue;
+                }
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
@@ -1312,12 +1451,16 @@ impl Runtime {
                     .into(),
                 );
             }
-            for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                anchor.is_none()
-                    && !self.expected_remote_close_error(error)
-                    && !self.active_auth_notice(anchor, error)
+            for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.is_none()
             }) {
-                transcript.push(notice_entry(error, target));
+                transcript.push(
+                    widget::container(self.failure_view(incident))
+                        .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                        .into(),
+                );
             }
             for turn in &self.turns {
                 transcript.push_with_gap(
@@ -1329,12 +1472,16 @@ impl Runtime {
                     },
                     self.turn_trailing_footer(turn),
                 );
-                for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.as_ref() == Some(&turn.key)
-                        && !self.expected_remote_close_error(error)
-                        && !self.active_auth_notice(anchor, error)
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    !incident.active_recovery
+                        && incident.child_scope.is_none()
+                        && incident.anchor.as_ref() == Some(&turn.key)
                 }) {
-                    transcript.push(notice_entry(error, target));
+                    transcript.push(
+                        widget::container(self.failure_view(incident))
+                            .id(self.find_anchor(&format!("failure:{}", incident.key)))
+                            .into(),
+                    );
                 }
             }
             if !snapshot.has_later
@@ -1392,13 +1539,6 @@ impl Runtime {
         // entry in the transcript rather than a line pinned above the
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
-        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
-            && !self.expected_remote_close_error(error)
-            && !chat::requires_sign_in(self.session.launch.provider, error)
-            && !self.failures.iter().any(|(_, recorded)| recorded == error)
-        {
-            transcript.push(notice_entry(error, target));
-        }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
             content.push(
@@ -1451,7 +1591,7 @@ impl Runtime {
             .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
-        content.push(selection::transcript(
+        let transcript_layer = selection::transcript(
             scroll::transcript(
                 transcript,
                 target,
@@ -1478,6 +1618,12 @@ impl Runtime {
             ),
             target,
             self.selected_subagent.as_deref(),
+        );
+        // Keep the transcript mounted in its original layer slot while the
+        // chooser is open, preserving its native scroll and selection state.
+        content.push(crate::interaction::exclusive_layer(
+            transcript_layer,
+            self.child_picker_view(),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
@@ -1499,7 +1645,7 @@ impl Runtime {
         } else if self.capacity_refused {
             let enabled = !transitioning
                 && self.pending.is_none()
-                && !self.attachment_chooser_pending
+                && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
                     || !self.attachments.is_empty());
@@ -1522,8 +1668,9 @@ impl Runtime {
             );
         } else if (self.disconnected || snapshot.exited) && self.auth_error().is_none() {
             let unresumable = self.offers_fresh_conversation();
-            let enabled =
-                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let enabled = !transitioning
+                && self.pending.is_none()
+                && self.attachment_chooser_pending.is_none();
             let mut controls = vec![
                 crate::design::caption(if unresumable {
                     // The provider's own sentence is already above this line,
@@ -1604,6 +1751,11 @@ impl Runtime {
                                 .requests
                                 .iter()
                                 .map(|request| {
+                                    // Requests belong to the parent even while
+                                    // its child transcript is being inspected.
+                                    let document = Some(
+                                        self.session.launch.recipe.working_directory.join(".chat"),
+                                    );
                                     request_view(
                                         self.target,
                                         request,
@@ -1611,6 +1763,9 @@ impl Runtime {
                                         available,
                                         RequestSurface::Transcript,
                                     )
+                                    .map(move |message| {
+                                        capture_document_link(message, target, &document)
+                                    })
                                 })
                                 .collect::<Vec<_>>(),
                         )
@@ -1627,60 +1782,7 @@ impl Runtime {
             );
         }
         if !snapshot.subagents.is_empty() {
-            let mut tabs = vec![crate::ui_controls::view_tab(
-                crate::ui_controls::ViewTab {
-                    label: "Conversation".into(),
-                    description: "Main conversation".into(),
-                    count: None,
-                    selected: selected.is_none(),
-                    id: None,
-                    on_press: Some(action(Action::SelectSubagent(target, None))),
-                },
-                true,
-                None,
-            )];
-            for agent in snapshot.subagents.iter().rev() {
-                let label = Self::native_child_name(agent);
-                let marker = if agent.status == chat::ToolStatus::Running && agent.waiting {
-                    crate::ui_controls::passive_icon(Icon::AgentWaiting, design::COMPACT_ICON_SIZE)
-                } else if agent.status == chat::ToolStatus::Running {
-                    crate::ui_controls::activity_spinner(
-                        f32::from(design::COMPACT_ICON_SIZE),
-                        design::accent_color,
-                    )
-                } else {
-                    crate::ui_controls::passive_icon(
-                        match agent.status {
-                            chat::ToolStatus::Succeeded => Icon::Check,
-                            chat::ToolStatus::Failed => Icon::Warning,
-                            _ => Icon::Cancel,
-                        },
-                        design::COMPACT_ICON_SIZE,
-                    )
-                };
-                tabs.push(crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: format!("Native · {}", Self::short_description(label, 48)).into(),
-                        description: self.native_child_identity(agent).into(),
-                        count: None,
-                        selected: selected.is_some_and(|active| active.id == agent.id),
-                        id: None,
-                        on_press: Some(action(Action::SelectSubagent(
-                            target,
-                            Some(agent.id.clone()),
-                        ))),
-                    },
-                    true,
-                    Some(marker),
-                ));
-            }
-            let height = crate::ui_controls::view_tab_height(true);
-            content.push(crate::tab_strip::horizontal(
-                widget::Id::new(format!("chat.subagents.{}", target.card)),
-                tabs,
-                height,
-                height + design::BORDER_WIDTH,
-            ));
+            content.push(self.child_navigation(content_width));
         }
         if let Some(identity) = selected_identity {
             content.push(
@@ -1779,16 +1881,15 @@ impl Runtime {
                 } else {
                     crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
                 },
-                crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
-                    "Pasted image".to_owned()
-                } else {
-                    attachment
-                        .path
-                        .file_name()
-                        .unwrap_or(attachment.path.as_os_str())
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                crate::design::caption(
+                    if attachment.reference.is_none()
+                        && clipboard_image::is_pasted(&attachment.path)
+                    {
+                        "Pasted image".into()
+                    } else {
+                        attachment.label()
+                    },
+                )
                 .width(Length::Fill)
                 .into(),
                 icon(
@@ -1803,7 +1904,10 @@ impl Runtime {
             attachment_chips.push(
                 widget::tooltip(
                     chip,
-                    design::caption(attachment.path.display().to_string()),
+                    design::caption(attachment.reference.as_ref().map_or_else(
+                        || attachment.path.display().to_string(),
+                        |reference| reference.name.clone(),
+                    )),
                     widget::tooltip::Position::Top,
                 )
                 .into(),
@@ -2065,7 +2169,7 @@ impl Runtime {
             actions.push(icon(
                 Icon::Attachment,
                 "Attach files",
-                available && !self.attachment_chooser_pending,
+                available && self.attachment_chooser_pending.is_none(),
                 Action::Attach(target),
             ));
         }
@@ -2230,7 +2334,7 @@ impl Runtime {
                         cosmic::theme::Text::default()
                     },
                 )
-                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Shrink)
                 .into(),
             );
         }
@@ -2437,6 +2541,7 @@ impl Runtime {
         // The whole pane takes a drop, not just the composer: the transcript
         // is most of what a reader aims at, and a drop lands in the draft
         // wherever it was aimed.
+        let document = self.document_link_origin();
         crate::file_drop::target_with_hover(
             pane,
             ("chat", target.card),
@@ -2444,6 +2549,7 @@ impl Runtime {
             move |payload| action(Action::Dropped(target, payload)),
             move |hovering| action(Action::DropHover(target, hovering)),
         )
+        .map(move |message| capture_document_link(message, target, &document))
     }
 
     /// The page of history this conversation is waiting on, if any.
@@ -3147,7 +3253,19 @@ impl Runtime {
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        (
+            self.target,
+            dark,
+            self.syntax_theme as u8,
+            self.failure_ui.revision,
+        )
+            .hash(&mut hasher);
+        for incident in &self.failure_ui.incidents {
+            self.failure_ui
+                .expanded
+                .contains(&incident.key)
+                .hash(&mut hasher);
+        }
         (
             &turn.key,
             &turn.summary,
@@ -3319,12 +3437,21 @@ impl Runtime {
                 );
             }
         }
-        if !turn.steps.is_empty() {
+        if turn.steps.iter().any(|placed| {
+            items
+                .get(placed.index)
+                .is_some_and(|item| self.failure_ui.item(&item.id).is_none())
+        }) {
             let mut strip = self.step_strip(turn, || {
                 turn.steps
                     .iter()
                     .filter_map(|placed_step| placed(placed_step.index))
-                    .map(|(item, cached)| scroll::item(&item.id, step(item, cached)))
+                    .filter_map(|(item, cached)| {
+                        if self.failure_ui.item(&item.id).is_some() {
+                            return None;
+                        }
+                        Some(scroll::item(&item.id, step(item, cached)))
+                    })
                     .collect()
             });
             // One measured strip supplies aliases for folded steps; expanded
@@ -3340,6 +3467,9 @@ impl Runtime {
             let Some((item, cached)) = placed(prose.index) else {
                 continue;
             };
+            if self.failure_ui.item(&item.id).is_some() {
+                continue;
+            }
             if let Some(coordinated) = cached.coordination.as_deref()
                 && prose.slot == turn::Slot::Card
             {
@@ -3703,14 +3833,18 @@ impl Runtime {
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
-            ItemContent::Text { text, .. } => text.as_str(),
-            ItemContent::Image { path, description } => Self::attachment_label(path, description),
-            content => turn::step_label(content),
-        }
-        .to_owned();
-        // An attachment sits under its prompt as an outlined chip rather than
-        // another filled bubble, so a message with two images does not read as
-        // three separate things the reader said.
+            ItemContent::Text { text, .. } => text.clone(),
+            ItemContent::Image {
+                reference: Some(reference),
+                ..
+            } => reference.label(),
+            ItemContent::Image {
+                path, description, ..
+            } => Self::attachment_label(path, description).to_owned(),
+            content => turn::step_label(content).to_owned(),
+        };
+        // Images stay beneath their prompt on its own side of the transcript,
+        // with the same bounded preview and viewer used for other images.
         let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
         let expanded = self.item_expanded(&item.id);
         let text = if long && !expanded {
@@ -3725,18 +3859,27 @@ impl Runtime {
             text
         };
         let body: Element<'static, Message> = if attachment {
-            widget::row::with_children(vec![
-                widget::icon(Icon::Attachment.handle()).size(12).into(),
-                selectable_prose::plain(
-                    text,
-                    design::TEXT_CAPTION,
-                    iced::Font::default(),
-                    self.target,
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .into()
+            // Empty unowned paths also represent documents and refused image
+            // receipts. Keep their descriptor instead of a generic read error.
+            if let Some(cached) = self.presentation_cache().get(&item.id)
+                && matches!(&item.content, ItemContent::Image { path, reference, .. }
+                    if reference.is_some() || !path.is_empty())
+            {
+                self.image_preview(item, cached)
+            } else {
+                widget::row::with_children(vec![
+                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    selectable_prose::plain(
+                        text,
+                        design::TEXT_CAPTION,
+                        iced::Font::default(),
+                        self.target,
+                    ),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into()
+            }
         } else {
             let text = selectable_prose::plain(
                 text,
@@ -3826,6 +3969,83 @@ impl Runtime {
                 })))
                 .into()
         };
+        if *kind == chat::DeliveryKind::Report {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // Preserve an explicit task outcome even when its name needs to
+            // shorten. This is report presentation, not failure inference:
+            // arbitrary report prose never becomes a parent account error.
+            let short = [" was stopped", " finished", " failed"]
+                .into_iter()
+                .find_map(|ending| {
+                    heading
+                        .strip_suffix(ending)
+                        .map(|subject| format!("{}{ending}", Self::short_description(subject, 72)))
+                })
+                .unwrap_or_else(|| Self::short_description(&heading, 96));
+            let disclosure = widget::button::custom(design::caption(if expanded {
+                "Hide details"
+            } else {
+                "Details"
+            }))
+            .name(format!(
+                "{} report details: {heading}",
+                if expanded { "Hide" } else { "Show" }
+            ))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(action(Action::Toggle(self.target, item.id.clone())));
+            let copy = widget::button::custom(design::caption("Copy report"))
+                .name(format!("Copy original report: {heading}"))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Copy(
+                    self.target,
+                    item.id.clone(),
+                    CopyPart::Text,
+                )));
+            let mut rows = vec![
+                widget::row::with_children(vec![
+                    glyph(Icon::Chat),
+                    crate::interaction::tooltip(
+                        design::caption(short).width(Length::Fill),
+                        heading.clone(),
+                    )
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+                widget::row::with_children(vec![disclosure.into(), copy.into()])
+                    .spacing(step::GAP_S)
+                    .into(),
+            ];
+            if expanded {
+                if !sender.is_empty() && !heading.contains(sender) {
+                    rows.push(selectable_prose::plain(
+                        format!("Sender: {sender}"),
+                        design::TEXT_CAPTION,
+                        iced::Font::MONOSPACE,
+                        self.target,
+                    ));
+                }
+                rows.push(selectable_prose::plain(
+                    heading,
+                    design::TEXT_CAPTION,
+                    iced::Font::default(),
+                    self.target,
+                ));
+                if !body.is_empty() {
+                    rows.push(prose::view(
+                        cached,
+                        settings,
+                        self.target,
+                        self.find.as_deref(),
+                    ));
+                }
+            }
+            return widget::container(widget::column::with_children(rows).spacing(step::GAP_XS))
+                .max_width(design::READABLE_MEASURE)
+                .width(Length::Fill)
+                .into();
+        }
         if *kind == chat::DeliveryKind::Notice {
             let mut rows = vec![
                 widget::row::with_children(vec![
@@ -4213,6 +4433,16 @@ pub(super) fn request_view<'a>(
     }
     for field in &request.fields {
         rows.push(field_view(target, request, field, answers, available));
+    }
+    for (label, uri) in artifacts::links(request) {
+        rows.push(
+            crate::interaction::tooltip(
+                widget::button::link(format!("Open artifact: {label}"))
+                    .on_press(action(Action::OpenDocument(target, uri.clone()))),
+                uri,
+            )
+            .into(),
+        );
     }
     rows.push(answers_view(target, request, available, surface));
     widget::container(
@@ -4752,10 +4982,110 @@ fn model_list<'a>(
 
 #[cfg(test)]
 mod frame_cost;
+#[cfg(test)]
+mod issue1506_tests;
+
+#[cfg(test)]
+mod user_image_preview_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
+        use iced::advanced::{Layout, Shell, Widget, clipboard, layout, mouse, widget::Tree};
+        use iced::{Event, Point, Rectangle, Size};
+        let question = "Compare tree-real-*.png and [Expanded](docs/tree%20expanded.png).";
+        let request = chat::Request {
+            kind: chat::RequestKind::Question,
+            id: "review".into(),
+            title: "Review".into(),
+            description: String::new(),
+            fields: vec![chat::Field {
+                id: question.into(),
+                label: question.into(),
+                description: "Screenshots".into(),
+                choices: vec![],
+                multiple: false,
+                secret: false,
+                initial: String::new(),
+            }],
+            actions: vec![],
+        };
+        let answers = Answers::new();
+        let target = Target {
+            card: CardId::new(),
+            generation: 17,
+        };
+        let document = Some(PathBuf::from("/producing/worktree/.chat"));
+        let mut element =
+            request_view(target, &request, &answers, true, RequestSurface::Transcript)
+                .map(move |message| capture_document_link(message, target, &document));
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(520.0, 1000.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let buttons: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Open artifact:"))
+            })
+            .collect();
+        assert_eq!(
+            buttons.len(),
+            1,
+            "the bare pattern never becomes a file action"
+        );
+        assert_eq!(buttons[0].node().label(), Some("Open artifact: Expanded"));
+        let bounds = buttons[0].node().bounds().unwrap();
+        let cursor = mouse::Cursor::Available(Point::new(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        ));
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocumentFrom(found, Some(origin), uri))]
+            if *found == target && origin == Path::new("/producing/worktree/.chat") && uri == "docs/tree%20expanded.png")
+        );
+        assert_eq!(
+            request.fields[0].id, question,
+            "the provider answer key stays literal"
+        );
+        assert!(
+            answers.is_empty(),
+            "opening an artifact must not answer the question"
+        );
+    }
 
     #[test]
     fn recorded_message_timestamp_format_uses_message_metadata() {
@@ -5529,6 +5859,74 @@ mod tests {
     }
 
     #[test]
+    fn unstarted_conversation_footer_is_a_neutral_draft_not_a_pending_connection() {
+        for provider in [Provider::Claude, Provider::Codex, Provider::Omp] {
+            let target = Target {
+                card: CardId::new(),
+                generation: 0,
+            };
+            let session = chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe::shell(PathBuf::from("/unused")).unwrap(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: chat::NativeContinuity::ReconnectOnly,
+            };
+            let mut draft = Runtime::draft(
+                target,
+                session.clone(),
+                Snapshot::default(),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(draft.is_draft());
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert!(!draft.snapshot.ready);
+            assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
+
+            draft
+                .composer
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new("Unsent local draft".into()),
+                )));
+            assert_eq!(draft.composer.text(), "Unsent local draft");
+            assert!(draft.handle().is_none());
+            assert!(draft.queued.is_none());
+            assert_eq!(draft.conversation_status(false), (None, "Draft".into()));
+            assert_eq!(draft.conversation_status(true).1, "Switching session");
+            draft.error = Some("Local attachment could not be read".into());
+            assert_eq!(
+                draft.conversation_status(false),
+                (Some(Icon::Warning), "Error".into())
+            );
+
+            let connecting = Runtime::new(
+                target,
+                session,
+                Connection::Connecting,
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            assert!(!connecting.is_draft());
+            assert!(connecting.handle().is_none());
+            assert_eq!(
+                connecting.conversation_status(false),
+                (Some(Icon::AgentWorking), "Connecting".into())
+            );
+        }
+        let (live, _handle) = frame_cost::live_runtime(&[]);
+        assert!(!live.is_draft());
+        assert!(live.handle().is_some());
+        assert_eq!(live.conversation_status(false), (None, "Ready".into()));
+    }
+
+    #[test]
     fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         assert_eq!(runtime.conversation_status(false).1, "Ready");
@@ -5839,7 +6237,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_native_child_renders_identity_channel_and_distinct_tab() {
+    fn selected_native_child_renders_identity_channel_and_bounded_selector() {
         use iced::advanced::{Layout, layout, widget::Tree};
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         let mut child = native_child_fixture();
@@ -5893,7 +6291,8 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label.contains("Native · Inspect repository")),
+                .any(|label| label.starts_with("Choose subagent:")
+                    && label.contains("Inspect repository")),
             "{labels:?}"
         );
         assert!(
@@ -5907,7 +6306,8 @@ mod tests {
     }
 
     #[test]
-    fn native_child_tabs_select_both_transcripts_through_real_runtime_rebuild_with_approval() {
+    fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebuild_with_approval()
+     {
         use iced::advanced::clipboard;
         use iced::runtime::user_interface::{Cache, UserInterface};
         fn runtime(app: &Cagents, target: Target) -> &Runtime {
@@ -5922,7 +6322,7 @@ mod tests {
                 false,
                 true,
                 &app.settings.keyboard_shortcuts,
-                620.0,
+                360.0,
                 Place {
                     name: "native-fixture".into(),
                     branch: None,
@@ -5956,7 +6356,6 @@ mod tests {
         child.waiting = true;
         child.model = Some("gpt-fixture-mini".into());
         child.detail = "Waiting for your approval".into();
-        let child_name = live.native_child_identity(&child);
         let snapshot = Arc::make_mut(&mut live.snapshot);
         snapshot.busy = true;
         snapshot.subagents.push(child);
@@ -5983,12 +6382,9 @@ mod tests {
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(live)));
         let mut renderer = crate::app::tests::headless_renderer();
-        let size = iced::Size::new(620.0, 720.0);
+        let size = iced::Size::new(360.0, 720.0);
         let mut cache = Cache::new();
-        for (name, selected) in [
-            (child_name.as_str(), Some("native-child")),
-            ("Main conversation", None),
-        ] {
+        for step in 0..3 {
             let mut ui = UserInterface::build(view(&app, target), size, cache, &mut renderer);
             let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
             let bounds = accessible
@@ -5997,10 +6393,33 @@ mod tests {
                 .chain(accessible.children())
                 .find(|node| {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
-                        && node.node().label() == Some(name)
+                        && node.node().label().is_some_and(|label| match step {
+                            0 => label.starts_with("Choose subagent:"),
+                            1 => {
+                                label.contains("Inspect repository")
+                                    && label.ends_with(" · native-child")
+                            }
+                            _ => label == "Main conversation",
+                        })
                 })
                 .and_then(|node| node.node().bounds())
-                .expect("the transcript tab is mounted");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "chooser step {step}: {:?}",
+                        accessible
+                            .root()
+                            .iter()
+                            .chain(accessible.children())
+                            .filter_map(|node| node.node().label())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            if step == 1 {
+                assert!(
+                    bounds.x0 >= 0.0 && bounds.x1 <= f64::from(size.width),
+                    "actual chooser bounds {bounds:?} must fit the narrow pane"
+                );
+            }
             let pointer = iced::Point::new(
                 (bounds.x0 + bounds.x1) as f32 / 2.0,
                 (bounds.y0 + bounds.y1) as f32 / 2.0,
@@ -6040,14 +6459,29 @@ mod tests {
             let selection = messages
                 .into_iter()
                 .find_map(|message| match message {
-                    Message::ChatUi(action @ Action::SelectSubagent(..)) => Some(action),
+                    Message::ChatUi(
+                        action @ (Action::SelectSubagent(..) | Action::SubagentPicker(..)),
+                    ) => Some(action),
                     _ => None,
                 })
                 .expect(
-                    "native transcript tab publishes selection through the full chat hierarchy",
+                    "native selector and chooser publish actions through the full chat hierarchy",
                 );
             drop(app.handle_chat_ui(selection));
-            assert_eq!(runtime(&app, target).selected_subagent.as_deref(), selected);
+            if step == 0 {
+                assert!(runtime(&app, target).child_picker.is_some());
+                assert!(runtime(&app, target).selected_subagent.is_none());
+            } else {
+                assert_eq!(
+                    runtime(&app, target).selected_subagent.as_deref(),
+                    if step == 1 {
+                        Some("native-child")
+                    } else {
+                        None
+                    }
+                );
+                assert!(runtime(&app, target).child_picker.is_none());
+            }
         }
     }
 
@@ -7608,6 +8042,7 @@ mod tests {
             content: ItemContent::Image {
                 path: "/image.png".into(),
                 description: "Image".into(),
+                reference: None,
             },
             started_at: None,
             at: None,

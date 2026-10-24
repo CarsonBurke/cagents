@@ -331,6 +331,10 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
+
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 38] {
         [
@@ -800,6 +804,9 @@ impl DefaultPane {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub schema_version: u32,
+    /// Stable palette entry keys, newest first. Old settings default to empty.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     #[serde(default = "default_focus_follows_mouse")]
@@ -920,6 +927,14 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Seconds to keep a language server warm after its last document closes.
+    #[serde(default = "default_lsp_idle_timeout")]
+    pub lsp_idle_timeout_seconds: u64,
+    /// Maximum admitted servers; active documents are never evicted.
+    #[serde(default = "default_lsp_max_sessions")]
+    pub lsp_max_sessions: usize,
+    #[serde(default)]
+    pub editor_replace_preserve_case: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -931,6 +946,8 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
+    #[serde(default)]
+    pub editor_find_options: EditorFindOptions,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
     #[serde(default)]
@@ -942,6 +959,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
+            palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
@@ -988,10 +1006,30 @@ impl Default for AppSettings {
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
+            lsp_max_sessions: default_lsp_max_sessions(),
+            editor_find_options: EditorFindOptions::default(),
+            editor_replace_preserve_case: false,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+fn default_lsp_idle_timeout() -> u64 {
+    600
+}
+fn default_lsp_max_sessions() -> usize {
+    8
+}
+
+/// Persisted matching preferences shared by editor find surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFindOptions {
+    pub case_sensitive: bool,
+    pub regex: bool,
+    pub whole_word: bool,
 }
 
 /// One language a server handles, and the file extensions that select it.
@@ -1014,6 +1052,9 @@ pub struct LanguageServerSettings {
     /// Relative marker names that identify a project root.
     #[serde(default)]
     pub root_markers: Vec<String>,
+    /// Sent in initialize before the server begins loading its workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// The built-in language-server list. A `language_servers` key in the settings
@@ -1026,6 +1067,7 @@ pub fn default_language_servers() -> Vec<LanguageServerSettings> {
         root_markers: &[&str],
     ) -> LanguageServerSettings {
         LanguageServerSettings {
+            initialization_options: None,
             id: id.to_owned(),
             languages: languages
                 .iter()
@@ -1601,6 +1643,10 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let mut seen = std::collections::HashSet::new();
+        self.palette_recents
+            .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
+        self.palette_recents.truncate(24);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1733,6 +1779,16 @@ impl AppSettings {
                 "managed_worktree_directory must be a nonempty path without control characters",
             ));
         }
+        if !(1..=64).contains(&self.lsp_max_sessions) {
+            return Err(SettingsError::Invalid(
+                "lsp_max_sessions must be between 1 and 64",
+            ));
+        }
+        if !(1..=604800).contains(&self.lsp_idle_timeout_seconds) {
+            return Err(SettingsError::Invalid(
+                "lsp_idle_timeout_seconds must be between 1 and 604800",
+            ));
+        }
         self.keyboard_shortcuts.validate()?;
         validate_language_servers(&self.language_servers)?;
         Ok(self)
@@ -1747,6 +1803,14 @@ fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), S
     let mut extension_owners: HashMap<&str, &str> = HashMap::new();
 
     for server in servers {
+        if server.initialization_options.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 1024 * 1024)
+        }) {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {} initialization_options exceed 1 MiB",
+                server.id
+            )));
+        }
         let id = server.id.as_str();
         if id.is_empty() {
             return Err(SettingsError::LanguageServer(
@@ -2830,6 +2894,63 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn language_server_initialization_options_round_trip_and_are_bounded() {
+        let mut settings = AppSettings::default();
+        let options = serde_json::json!({
+            "checkOnSave": false,
+            "cargo": {"extraArgs": ["--locked", "--offline"]}
+        });
+        settings.language_servers[0].initialization_options = Some(options.clone());
+        let text = toml::to_string(&settings).unwrap();
+        let decoded: AppSettings = toml::from_str(&text).unwrap();
+        assert_eq!(
+            decoded.language_servers[0].initialization_options,
+            Some(options)
+        );
+        assert!(decoded.validate().is_ok());
+        settings.language_servers[0].initialization_options =
+            Some(serde_json::json!({"oversized": "x".repeat(1024 * 1024)}));
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn lsp_lifecycle_settings_reject_unbounded_or_zero_values() {
+        for cap in [0, 65, usize::MAX] {
+            let settings = AppSettings {
+                lsp_max_sessions: cap,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+        for timeout in [0, 604801, u64::MAX] {
+            let settings = AppSettings {
+                lsp_idle_timeout_seconds: timeout,
+                ..AppSettings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn editor_find_options_round_trip_with_disabled_language_servers() {
+        let settings = AppSettings {
+            language_servers: Vec::new(),
+            editor_find_options: EditorFindOptions {
+                case_sensitive: true,
+                regex: true,
+                whole_word: true,
+            },
+            editor_replace_preserve_case: true,
+            ..AppSettings::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+        assert!(restored.language_servers.is_empty());
+        assert_eq!(restored.editor_find_options, settings.editor_find_options);
+        assert!(restored.editor_replace_preserve_case);
+    }
+
+    #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
         previous_schema
@@ -3028,6 +3149,36 @@ mod tests {
             restored.editor_syntax_theme,
             EditorSyntaxTheme::InspiredGitHub
         );
+    }
+
+    #[test]
+    fn palette_recents_survive_save_and_old_settings_default_to_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        save(&path, &settings).unwrap();
+        assert_eq!(
+            load(&path).unwrap().palette_recents,
+            settings.palette_recents
+        );
+        let mut legacy = toml::Value::try_from(&settings).unwrap();
+        legacy.as_table_mut().unwrap().remove("palette_recents");
+        let restored: AppSettings = legacy.try_into().unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec![
+            String::new(),
+            "command:open_settings".into(),
+            "command:open_settings".into(),
+            "x".repeat(129),
+        ];
+        settings
+            .palette_recents
+            .extend((0..30).map(|i| format!("pane:{i}")));
+        let validated = settings.validate().unwrap();
+        assert_eq!(validated.palette_recents.len(), 24);
+        assert_eq!(validated.palette_recents[0], "command:open_settings");
+        assert_eq!(validated.palette_recents[1], "pane:0");
     }
 
     #[test]

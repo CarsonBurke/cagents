@@ -183,13 +183,16 @@ scripts/run-development --hot
 scripts/run-development --hot-integrated
 ```
 
-The helper builds three native Linux products separately using locked
-`dev-runtime` builds, then stages the matched CLI/daemon beside cargo-hot's
-private executable bundle. Cargo-hot always targets the native host triple,
-adds a linker and saved compilation objects, and may need a substantial first
-build even with the ordinary runner's warmed cache. `CARGO_BUILD_JOBS` controls
-its spawned build jobs. Only one hot session can run at a time: the upstream
-client/server uses localhost port1100, and all development sessions share state.
+The helper builds the native Linux CLI and daemon separately using locked
+`dev-runtime` builds, resolves and fetches the selected UI dependency graph with
+locked Cargo metadata, then stages the matched CLI/daemon beside cargo-hot's
+private executable bundle. Cargo-hot builds the UI directly; an ordinary UI
+preflight build would produce an unused executable. Cargo-hot always targets
+the native host triple, adds a linker and saved compilation objects, and may need
+a substantial first build even with the ordinary runner's warmed cache.
+`CARGO_BUILD_JOBS` controls its spawned build jobs. Only one hot session can run
+at a time: the upstream client/server uses localhost port 1100, and all development
+sessions share state.
 
 Every helper Cargo invocation runs with `Cargo.lock` mounted read-only in a
 private bubblewrap mount namespace. This also refuses atomic replacement/unlink
@@ -232,20 +235,21 @@ Worktrees can share Cargo's target and build directories. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
 otherwise reuse another checkout's code and version stamp. The local Cargo
 configuration supplies `CAGENTS_CHECKOUT_ROOT`; our workspace crates track it
-in compiler dep-info, and the version build script watches it as well. Switching
-checkouts rebuilds owned code while keeping the third-party cache warm. Keep
-this identity reference in new owned workspace crates. Cargo must run from
-this checkout or its descendants so it reads the local configuration.
+in compiler dep-info. The version build script tracks it at compilation and
+execution: a runtime watch alone can rerun another checkout's compiled script
+body. Switching checkouts rebuilds owned code while keeping the third-party
+cache warm. Keep this identity reference in new owned workspace crates. Run Cargo
+from this checkout or its descendants so it reads the local configuration.
 
 `python3 scripts/qualify-checkout-cache.py` verifies the boundary using a small,
 offline workspace in `/var/tmp`: an unfixed control reproduces stale reuse,
 then the actual configuration and build script follow A → B → A with the same
-commit, different dirty sources, and old timestamps. It also verifies that an
-unchanged dependency remains cached. Pass `--evidence PATH` to retain the
-fixture and Cargo logs in a new directory. Run it sequentially with other Cargo
-workloads. Its historical-producer control also demonstrates the supported
-package bootstrap below and checks that unrelated dependency bytes and mtimes
-remain unchanged.
+commit, different dirty sources and stamping-script bodies, and old timestamps.
+It also verifies that an unchanged dependency remains cached. Pass
+`--evidence PATH` to retain the fixture and Cargo logs in a new directory. Run it
+sequentially with other Cargo workloads. Its historical-producer control also
+demonstrates the supported package bootstrap below and checks that unrelated
+dependency bytes and mtimes remain unchanged.
 
 A historical checkout without the compile-time checkout anchor can replace a
 shared build-script executable. Returning to an anchored checkout can then
@@ -311,11 +315,37 @@ guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
 
+### Process scope isolation
+
+Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
+namespace. Before submitting one, the daemon connects to the fixed
+`/run/user/UID/systemd/private` peer and requires its kernel credentials, exact
+peer pidfd and active PID namespace to match this caller. The proof retains the
+connection, pidfd and namespace descriptor through the existing user-bus
+request. It does not infer the manager's identity from a bus broker, a nonzero
+peer PID, a hardcoded namespace inode or a numeric `/proc/PID` lookup.
+
+This relies on the existing trusted OS manager and its well-known user-bus
+service routing; it does not protect against a hostile same-user replacement
+of those OS services. The request's routing and launch authority are unchanged.
+If the peer, namespace ioctl or required access cannot be proved, no scope
+request is attempted and ordinary launch is retained without claiming separate
+OOM isolation. An actual request or membership failure in a proved context
+still reports failure. Scope-dependent tests report unqualified isolation when
+that same proof is unavailable, and keep their strict membership assertions
+when it is available. Kernel-peer regressions use private Unix sockets without
+submitting requests to the OS manager.
+
+See the [kernel pidfd namespace API](https://github.com/torvalds/linux/blob/master/include/uapi/linux/pidfd.h)
+and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
+
 ## Testing
 
 A bare `cargo test` runs only the shared CLI lane: under the default `full`
-feature, the `ui` and `host` unit tests and every gated integration target are
-compiled out. Cover the boundaries a change touches:
+feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
+targets whose required features are absent, rather than compiling and linking
+empty harnesses. The host-only terminal workload example is also skipped outside
+its lane. Cover the boundaries a change touches:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
@@ -330,6 +360,41 @@ cargo test --locked --no-default-features --features host --lib terminal::
 cargo test --locked --no-default-features --features host --test terminal_load_contract
 cargo test --locked --no-default-features --features ui --test session_restore_contract
 ```
+
+The four named-tree reconciliation contracts share their cases between the root
+UI target and a focused workspace package. For edits confined to vendored
+iced-core tree reconciliation, run the focused package first:
+
+```sh
+cargo test --locked -p cagents-iced-contracts
+```
+
+The package uses the UI's exact iced-core Git revision; the root Cargo patch
+resolves both targets to `vendor/iced-core`, with the production `a11y` Id
+implementation. It compiles without the application, libcosmic renderer, or
+native UI runtime. The cases do not render; the isolated harness uses an
+uninhabited renderer. Retain validation through the UI's concrete renderer when
+changing the tree contract or UI integration:
+
+```sh
+cargo test --locked --no-default-features --features ui --test iced_tree_reconciliation
+```
+
+Explicitly selecting a target with required features absent, including through a
+`--test '*'` glob, reports the missing feature instead of succeeding with zero
+tests. Use `--all-targets` to select all targets available in a feature lane.
+
+The 40,000-path mutation regression lives in `repository_scale_contract`, so a
+library-suite run does not also create and mutate that filesystem fixture.
+`--all-targets` still runs it in both HOST and UI lanes. When changing repository
+mutations or pathspec handling, include its explicit target:
+
+```sh
+cargo test --locked --no-default-features --features host --test repository_scale_contract
+```
+
+The fixture retains its disk-backed private namespace, subprocess deadline and
+process-family cleanup checks. Its test count and workload are unchanged.
 
 Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary

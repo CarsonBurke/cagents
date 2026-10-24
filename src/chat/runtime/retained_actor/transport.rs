@@ -18,7 +18,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     os::{
-        fd::{AsRawFd, FromRawFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::MetadataExt,
             net::{UnixListener, UnixStream},
@@ -848,6 +848,11 @@ impl RemoteActor {
         let attached: Result<Attached, String> = receive(&control, Duration::from_secs(30))?;
         let attached = attached?;
         let handle = Self::from_attached(attached, proof, Some(control), notify)?;
+        let record = handle.identity().record;
+        crate::daemon::process_scope::warn_if_shared(
+            record.holder.pid as u32,
+            record.root.pid as u32,
+        );
         if let Some(context) = spec.execution {
             context.claim_owner(Arc::new(handle.clone()));
         }
@@ -1235,6 +1240,51 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+    }
+    pub(in crate::chat::runtime) fn pinned_launch_directory(
+        &self,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if self.0.close_only {
+            return Err(close_only_refusal());
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "pinned_directory".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (response, mut descriptors) = crate::descriptor_frame::receive_json_with_fds_until::<
+            Result<crate::agent_execution::DirectoryIdentity, String>,
+        >(
+            &control,
+            deadline,
+            MAX_FRAME,
+            1,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match response {
+            Err(error) => Err(error),
+            Ok(identity) => {
+                if descriptors.len() != 1 {
+                    return Err(
+                        "Retained provider did not transfer exactly one directory descriptor"
+                            .into(),
+                    );
+                }
+                let directory = Arc::new(File::from(descriptors.remove(0)));
+                crate::chat::protocol::validate_launch_directory(&directory, identity)?;
+                Ok((identity, directory))
+            }
+        }
     }
     pub fn call<T: DeserializeOwned>(&self, method: &str, args: Value) -> Result<T, String> {
         self.call_until(method, args, Instant::now() + TIMEOUT)
@@ -1816,6 +1866,18 @@ struct Server {
     close_only: bool,
 }
 impl Server {
+    fn start_after_scope_enrollment(
+        startup: Startup,
+        control: &UnixStream,
+        enroll: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<Self, String> {
+        // This is optional OOM/cgroup isolation, not launch authorization.
+        // Keep the authenticated, descriptor-sealed process-group fallback
+        // used by terminal/native holders when the user manager rejects it.
+        let _ = enroll();
+        Self::start(startup, control)
+    }
+
     fn start(startup: Startup, control: &UnixStream) -> Result<Self, String> {
         if startup.protocol != PROTOCOL
             || startup.source.launch.provider != crate::agent::Provider::Claude
@@ -2215,6 +2277,24 @@ impl Server {
                 false
             } else {true}
         });
+    }
+    fn pinned_launch_directory(
+        &self,
+        request: &Invocation,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if request.epoch != Some(self.epoch) || request.proof != self.proof {
+            return Err(
+                "Retained actor attachment was superseded; stale directory queries are refused"
+                    .into(),
+            );
+        }
+        if self.close_only {
+            return Err(close_only_refusal());
+        }
+        if !self.installed || self.attachment_preserved || self.closed_snapshot.is_some() {
+            return Err("Retained provider has no current installed directory owner".into());
+        }
+        self.actor.pinned_launch_directory()
     }
     fn invoke(&mut self, request: Invocation) -> Result<Value, String> {
         if request.method == "inspect" {
@@ -2853,15 +2933,42 @@ impl Server {
             }
             match self.listener.accept() {
                 Ok((control, _)) => {
-                    let mut finished = false;
-                    let response = (|| {
+                    let request = (|| {
                         let request: Invocation = receive(&control, TIMEOUT)?;
                         authorize(&control, &request.proof)?;
+                        Ok::<_, String>(request)
+                    })();
+                    if let Ok(request) = &request
+                        && request.method == "pinned_directory"
+                    {
+                        let pin = self.pinned_launch_directory(request);
+                        let response = pin
+                            .as_ref()
+                            .map(|(identity, _)| *identity)
+                            .map_err(Clone::clone);
+                        let descriptors: Vec<_> = pin
+                            .as_ref()
+                            .ok()
+                            .map(|(_, file)| vec![file.as_fd()])
+                            .unwrap_or_default();
+                        let _ = crate::descriptor_frame::send_json_with_fds_until(
+                            &control,
+                            &response,
+                            &descriptors,
+                            Instant::now() + TIMEOUT,
+                            MAX_FRAME,
+                            1,
+                            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+                        );
+                        continue;
+                    }
+                    let mut finished = false;
+                    let response = request.and_then(|request| {
                         let close = request.method == "retire";
                         let result = self.invoke(request);
                         finished = close && result.is_ok();
                         result
-                    })();
+                    });
                     // Authentication failures use the same result boundary. Only an
                     // explicit retirement after durable semantic ACK exits the
                     // helper; a lost provider-close reply retains its journal.
@@ -3064,8 +3171,11 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
-            crate::daemon::process_scope::enroll_holder().map_err(|error| error.to_string())?;
-            let server = Server::start(startup, &control)?;
+            let server = Server::start_after_scope_enrollment(
+                startup,
+                &control,
+                crate::daemon::process_scope::enroll_holder,
+            )?;
             server.serve(control.try_clone().map_err(|error| error.to_string())?)
         })();
         if let Err(error) = result {
@@ -3146,6 +3256,171 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+        const CHILD: &str = "CAGENTS_RETAINED_SCOPE_FALLBACK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let marker = root.path().join("initialized");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        // The real caller/lease gate is independent of optional cgroup setup.
+        authorize(&control, &proof).unwrap();
+        let mut wrong = proof.clone();
+        wrong.host_incarnation = crate::model::HostIncarnation::new("another-owner");
+        assert!(authorize(&control, &wrong).is_err());
+        let startup = |protocol| {
+            let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+            let session_id = spec
+                .arguments
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--session-id="))
+                .expect("fresh Claude launch must issue a session ID")
+                .to_owned();
+            let prepared = adapter.prepared_launch_identity().unwrap();
+            Startup {
+                protocol,
+                source: source.clone(),
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf initialized > "$2"
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+printf '{"type":"assistant","uuid":"scope-output","message":{"id":"scope-output","role":"assistant","content":[{"type":"text","text":"scope fallback initialized"}]}}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}\n' "$1"
+"#
+                    .into(),
+                    "scope-fixture".into(),
+                    session_id,
+                    marker.to_string_lossy().into_owned(),
+                ],
+                prepared_identity: prepared,
+                environment: source.launch.recipe.environment.clone(),
+                working_directory: cwd.clone(),
+                directory_fd: None,
+                directory_identity: None,
+                mailbox_recognition: None,
+                provider_directory_observed: false,
+                recovery_environment: BTreeMap::new(),
+            }
+        };
+        let reject = || {
+            assert!(
+                !marker.exists(),
+                "enrollment must precede provider creation"
+            );
+            let error = crate::daemon::process_scope::tests::rejected_scope_request().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "user scope request failed: exit status: 1"
+            );
+            Err(error)
+        };
+        let error = Server::start_after_scope_enrollment(startup(0), &control, reject)
+            .err()
+            .unwrap();
+        assert!(error.contains("Incompatible retained Claude actor launch"));
+        assert!(!marker.exists(), "required startup failures remain fatal");
+        let server =
+            Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject).unwrap();
+        let socket = server.socket.clone();
+        let record = server.identity.record.clone();
+        let record_path = registry::directory(Kind::Native)
+            .unwrap()
+            .join(format!("{}.json", record.terminal));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = server.actor.snapshot(None).unwrap();
+            if server.actor.is_completed() {
+                assert!(snapshot.exited);
+                assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+                assert!(snapshot.items.iter().any(|item| matches!(
+                    &item.content,
+                    chat::ItemContent::Text { text, .. } if text == "scope fallback initialized"
+                )));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "finite native fixture did not exit"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"initialized");
+        assert!(
+            !record.root.is_current(),
+            "original provider must be reaped"
+        );
+        assert!(socket.exists() && record_path.exists());
+        struct Serving {
+            parent: Option<UnixStream>,
+            worker: Option<thread::JoinHandle<Result<(), String>>>,
+        }
+        impl Drop for Serving {
+            fn drop(&mut self) {
+                self.parent.take();
+                if let Some(worker) = self.worker.take() {
+                    // The explicit success path checks the result below.
+                    // Still join on unwind without causing a double panic.
+                    let _ = worker.join();
+                }
+            }
+        }
+        let mut serving = Serving {
+            parent: Some(parent),
+            worker: Some(thread::spawn(move || server.serve(control))),
+        };
+        let attached: Result<Attached, String> =
+            receive(serving.parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        assert_eq!(attached.unwrap().identity.record, record);
+        // No installation was committed: startup EOF performs the existing
+        // normal actor cleanup and removes only its exact socket/record.
+        serving.parent.take();
+        serving.worker.take().unwrap().join().unwrap().unwrap();
+        assert!(!socket.exists() && !record_path.exists());
+    }
+
     thread_local! {
         static INSPECT_SOURCES_CAPTURED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
@@ -3566,6 +3841,193 @@ mod tests {
             assert!(retired.paired_holder.is_none());
         }
     }
+    #[test]
+    fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
+        const CHILD: &str = "CAGENTS_RETAINED_DIRECTORY_PIN_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let name = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .env("CAGENTS_LOCAL_DEBUG", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(root.path().join("claude")).unwrap();
+        std::fs::write(cwd.join("marker"), "original").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let provider = cwd.join("fixture-claude");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > arguments
+session=
+for argument do
+    case "$argument" in --session-id=*) session=${argument#--session-id=} ;; esac
+done
+[ -n "$session" ] || exit 2
+printf '%s' "$session" > session-id
+/bin/cat marker > observed
+IFS= read -r frame || exit 3
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
+exec /bin/sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(&cwd).unwrap(),
+        );
+        let mut source = fixture_source();
+        source.launch.recipe = crate::model::LaunchRecipe {
+            program: provider.to_str().unwrap().to_owned(),
+            arguments: Vec::new(),
+            working_directory: cwd.clone(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().to_string_lossy().into_owned()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    root.path().join("claude").to_string_lossy().into_owned(),
+                ),
+            ]),
+            unset_environment: Default::default(),
+        };
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let issued_session = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .expect("real fresh Claude preparation must issue its exact session ID")
+            .to_owned();
+        uuid::Uuid::parse_str(&issued_session).unwrap();
+        let public_arguments = spec.arguments.clone();
+        assert!(spec.execution.is_none()); // ordinary, no inherited startup directory FD
+        let prepared = adapter.prepared_launch_identity().unwrap();
+        struct Owner(RemoteActor);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+                let _ = self.0.finish_close();
+            }
+        }
+        let original = Owner(
+            RemoteActor::spawn(spec, source.clone(), prepared, BTreeMap::new(), |_| {}).unwrap(),
+        );
+        original.0.commit_installation().unwrap();
+        let record = original.0.identity().record;
+        let deadline = Instant::now() + TIMEOUT;
+        while std::fs::read_to_string(cwd.join("observed"))
+            .ok()
+            .as_deref()
+            != Some("original")
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("arguments")).unwrap(),
+            public_arguments.join("\n") + "\n",
+            "the private executable receives the real adapter's complete public argv"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("session-id")).unwrap(),
+            issued_session
+        );
+        while original.0.state().session_id.as_deref() != Some(issued_session.as_str()) {
+            assert!(
+                Instant::now() < deadline,
+                "prepared session identity was not observed"
+            );
+            original.0.refresh_state().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::rename(&cwd, root.path().join("moved")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "replacement").unwrap();
+        assert_eq!(original.0.pinned_launch_directory().unwrap().0, expected);
+        let control = registry::connect(&original.0.0.socket).unwrap();
+        let mut wrong = proof.clone();
+        wrong.host_incarnation = crate::model::HostIncarnation::new("wrong-directory-query");
+        send(
+            &control,
+            &Invocation {
+                proof: wrong,
+                epoch: Some(original.0.0.epoch),
+                method: "pinned_directory".into(),
+                args: Value::Null,
+            },
+            TIMEOUT,
+        )
+        .unwrap();
+        let (refused, rights) = crate::descriptor_frame::receive_json_with_fds_until::<
+            Result<crate::agent_execution::DirectoryIdentity, String>,
+        >(
+            &control,
+            Instant::now() + TIMEOUT,
+            MAX_FRAME,
+            1,
+            crate::descriptor_frame::FrameByteOrder::LittleEndian,
+        )
+        .unwrap();
+        assert!(refused.is_err());
+        assert!(rights.is_empty());
+        let adopted =
+            Owner(RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap());
+        assert!(
+            original.0.pinned_launch_directory().is_err(),
+            "stale epoch cannot receive directory authority"
+        );
+        let (identity, pin) = adopted.0.pinned_launch_directory().unwrap();
+        assert_eq!(identity, expected);
+        let fd = unsafe {
+            libc::openat(
+                pin.as_raw_fd(),
+                c"marker".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0);
+        let mut text = String::new();
+        use std::io::Read;
+        unsafe { File::from_raw_fd(fd) }
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "original");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("marker")).unwrap(),
+            "replacement"
+        );
+        let close = Owner(RemoteActor::adopt_for_close(&record, source, proof, |_| {}).unwrap());
+        assert!(close.0.pinned_launch_directory().is_err());
+        assert!(adopted.0.pinned_launch_directory().is_err());
+        close.0.close().unwrap();
+        close.0.finish_close().unwrap();
+        assert!(!record.root.is_current());
+    }
+
     #[test]
     fn helper_control_rejects_regular_files_and_unconnected_listeners() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();

@@ -73,6 +73,17 @@ enum ActorCommand {
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
+    PinnedLaunchDirectory(
+        crossbeam_channel::Sender<
+            Result<
+                (
+                    crate::agent_execution::DirectoryIdentity,
+                    Arc<std::fs::File>,
+                ),
+                String,
+            >,
+        >,
+    ),
     Interrupt {
         run: Option<crate::model::RunId>,
         including_subagents: bool,
@@ -668,6 +679,21 @@ impl LocalHandle {
             Err(_) => {} // The host publishes the still-owned interactive actor.
         }
         Ok(handle)
+    }
+    pub(super) fn pinned_launch_directory(
+        &self,
+    ) -> Result<
+        (
+            crate::agent_execution::DirectoryIdentity,
+            Arc<std::fs::File>,
+        ),
+        String,
+    > {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        let _acknowledgement = self.enqueue_actor(ActorCommand::PinnedLaunchDirectory(reply))?;
+        response
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Provider launch-directory owner did not respond".to_owned())?
     }
     pub(super) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         self.0
@@ -1571,11 +1597,35 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
     crate::host::descriptor_limit::inherit(&mut process);
-    if let Some(directory) = spec
+    let original = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .map(|context| {
+            let descriptor = context.directory_descriptor();
+            if descriptor.is_none() && context.directory_identity()?.is_some() {
+                return Err(
+                    "Admitted provider context has no original directory descriptor".to_owned(),
+                );
+            }
+            Ok(descriptor)
+        })
+        .transpose()?
+        .flatten();
+    let directory = match original {
+        Some(directory) => directory,
+        None => {
+            use std::os::unix::fs::OpenOptionsExt;
+            Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(&spec.working_directory)
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+    };
     {
+        let directory = directory.clone();
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
         unsafe {
@@ -1596,8 +1646,9 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     let child = process
         .spawn()
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
-    let child = ChildGuard::new(child)
+    let mut child = ChildGuard::new(child)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    child.directory = Some(directory);
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -1615,6 +1666,7 @@ struct ChildGuard {
     child: Child,
     identity: OwnedFd,
     terminated: bool,
+    directory: Option<Arc<std::fs::File>>,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -1696,6 +1748,7 @@ impl ChildGuard {
             child,
             identity,
             terminated: false,
+            directory: None,
         })
     }
 
@@ -2243,6 +2296,42 @@ impl Actor {
             let (run, command) = match command {
                 ActorCommand::RetainedProvider { .. } => {
                     unreachable!("retained inputs normalized above")
+                }
+                ActorCommand::PinnedLaunchDirectory(response) => {
+                    let result = if let Some(holder) = self.native_holder.as_mut() {
+                        holder.pinned_launch_directory()
+                    } else if let Some(child) = self.child.as_ref() {
+                        match child.observed_exit_status() {
+                            Ok(None) => child
+                                .directory
+                                .as_ref()
+                                .ok_or(
+                                    "This provider has no original launch-directory descriptor"
+                                        .to_owned(),
+                                )
+                                .and_then(|directory| {
+                                    let identity =
+                                        crate::agent_execution::DirectoryIdentity::from_metadata(
+                                            &directory
+                                                .metadata()
+                                                .map_err(|error| error.to_string())?,
+                                        );
+                                    super::protocol::validate_launch_directory(
+                                        directory, identity,
+                                    )?;
+                                    Ok((identity, directory.clone()))
+                                }),
+                            Ok(Some(_)) => Err("Original provider process has exited".into()),
+                            Err(error) => {
+                                Err(format!("Cannot prove original provider is live: {error}"))
+                            }
+                        }
+                    } else {
+                        Err("This provider has no live owned launch-directory descriptor".into())
+                    };
+                    let _ = response.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
                 }
                 ActorCommand::Provider {
                     run,
@@ -3672,6 +3761,212 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
+        let mut store = Store::new().unwrap();
+        let raw =
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)\noriginal diagnostics";
+        for (prompt, failure) in [("prompt-one", "failure-one"), ("prompt-two", "failure-two")] {
+            store
+                .apply(Event::Item(Item {
+                    id: prompt.into(),
+                    role: Role::User,
+                    content: ItemContent::Text {
+                        text: "Explain the limit notice".into(),
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    at: None,
+                    started_at: None,
+                }))
+                .unwrap();
+            let mut item = Item {
+                id: failure.into(),
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: raw.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            };
+            assert!(super::super::failure::mark_provider_error(
+                crate::agent::Provider::Claude,
+                &mut item
+            ));
+            store.apply(Event::Item(item)).unwrap();
+        }
+        let window = store.window().unwrap();
+        let failures: Vec<_> = window
+            .items
+            .iter()
+            .filter_map(|item| {
+                super::super::failure::provider_error_text(crate::agent::Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        assert_eq!(failures, [("failure-one", raw), ("failure-two", raw)]);
+        assert_eq!(
+            window
+                .items
+                .iter()
+                .filter(|item| item.role == Role::User)
+                .count(),
+            2
+        );
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let quote = Item {
+            id: "child-user-quotation".into(),
+            role: Role::System,
+            content: ItemContent::Text {
+                text: raw.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+            at: None,
+            started_at: None,
+        };
+        for event in store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: quote,
+            })
+            .unwrap()
+        {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let quoted = &state.subagents[0].items[0];
+        assert_eq!(quoted.role, Role::System);
+        assert!(
+            super::super::failure::provider_error_text(crate::agent::Provider::Claude, quoted)
+                .is_none()
+        );
+        assert!(matches!(&quoted.content, ItemContent::Text { text, .. } if text==raw));
+    }
+
+    #[test]
+    fn mixed_child_failure_and_background_notice_preserve_real_activity_through_store() {
+        let mut store = Store::new().unwrap();
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let mut apply = |state: &mut Snapshot, event| {
+            for event in store.apply(event).unwrap() {
+                apply_event(state, &mut indices, event);
+            }
+        };
+        let child = |id: &str, status, waiting, detail: &str| Event::Subagent {
+            id: id.into(),
+            kind: "Review".into(),
+            description: id.into(),
+            status: Some(status),
+            background: Some(true),
+            model: None,
+            waiting: Some(waiting),
+            detail: Some(detail.into()),
+        };
+        apply(&mut state, Event::Ready(true));
+        apply(
+            &mut state,
+            Event::Status {
+                busy: false,
+                detail: "Parent turn ended".into(),
+            },
+        );
+        apply(
+            &mut state,
+            Event::Error {
+                message: "You've hit your limit · resets 1:30pm".into(),
+                fatal: false,
+            },
+        );
+        apply(
+            &mut state,
+            child(
+                "failed",
+                ToolStatus::Failed,
+                false,
+                "connection reset by peer",
+            ),
+        );
+        apply(&mut state, child("live", ToolStatus::Running, false, ""));
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Running, true, "quota exceeded"),
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert!(state.is_working());
+        let error = state.error.clone();
+        apply(
+            &mut state,
+            Event::Item(Item {
+                id: "actual-background-completion".into(),
+                role: Role::User,
+                content: ItemContent::Delivery {
+                    kind: super::super::DeliveryKind::Notice,
+                    from: String::new(),
+                    sender: "bash-task".into(),
+                    summary: "Background command completed (exit code 0)".into(),
+                    body: String::new(),
+                },
+                at: None,
+                started_at: None,
+            }),
+        );
+        assert!(!state.busy);
+        assert_eq!(state.error, error);
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .filter(|child| child.status == ToolStatus::Running)
+                .count(),
+            2
+        );
+        apply(
+            &mut state,
+            child("blocked", ToolStatus::Failed, false, "quota exceeded"),
+        );
+        assert_eq!(
+            state.activity(),
+            ActivityState::Working,
+            "A distinct live child still owns work"
+        );
+        // A replayed failed child's diagnostic is not a new launch or a parent
+        // status update. Its terminal status and the live sibling survive.
+        apply(
+            &mut state,
+            Event::Subagent {
+                id: "failed".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some("connection reset by peer".into()),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Working);
+        assert_eq!(
+            state
+                .subagents
+                .iter()
+                .find(|child| child.id == "failed")
+                .unwrap()
+                .status,
+            ToolStatus::Failed
+        );
+        apply(&mut state, child("live", ToolStatus::Succeeded, false, ""));
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert_eq!(
+            state.error, error,
+            "An unrelated completion cannot clear the parent's limit"
+        );
+    }
+
     #[test]
     fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
         struct Frames(VecDeque<Vec<Event>>);
@@ -5518,6 +5813,150 @@ mod tests {
         );
         assert_eq!(state.selected_model.as_deref(), Some("model"));
         assert!(state.reasoning.is_none());
+    }
+
+    #[test]
+    fn original_launch_directory_survives_rename_and_replacement_without_recapture() {
+        use std::os::unix::fs::PermissionsExt;
+        for (admitted, relative_path, symlinked, cleanup_only, traverse_only) in [
+            (true, false, false, false, false),
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (false, true, false, false, true),
+            (false, true, true, true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let original = root.path().join("original");
+            let moved = root.path().join("moved");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("marker"), b"{\"text\":\"original cwd\"}\n").unwrap();
+            std::fs::write(
+                original.join("provider"),
+                "#!/bin/sh\n/bin/cat marker\nexec /bin/cat\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                original.join("provider"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            struct RestorePermissions([std::path::PathBuf; 2]);
+            impl Drop for RestorePermissions {
+                fn drop(&mut self) {
+                    for path in &self.0 {
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                    }
+                }
+            }
+            let _permissions = RestorePermissions([original.clone(), moved.clone()]);
+            if traverse_only {
+                std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o111))
+                    .unwrap();
+            }
+            let selected = if symlinked {
+                let link = root.path().join("selected");
+                std::os::unix::fs::symlink(&original, &link).unwrap();
+                link
+            } else {
+                original.clone()
+            };
+            let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(&original).unwrap(),
+            );
+            let spec = ProcessSpec {
+                execution: if cleanup_only {
+                    Some(Arc::new(super::super::protocol::ExecutionContext::default()))
+                } else {
+                    admitted.then(|| {
+                        Arc::new(
+                            super::super::protocol::ExecutionContext::capture(&selected).unwrap(),
+                        )
+                    })
+                },
+                messages: None,
+                transport: TransportSpec::JsonLines,
+                program: if relative_path {
+                    "provider"
+                } else {
+                    "./provider"
+                }
+                .into(),
+                arguments: Vec::new(),
+                working_directory: selected,
+                environment: BTreeMap::from([("PATH".into(), ".".into())]),
+                unset_environment: Default::default(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let initial = adapter.initialize().unwrap();
+            let handle =
+                LocalHandle::start(spec, adapter, initial, Store::new().unwrap(), None, |_| {})
+                    .unwrap();
+            until(&handle, |snapshot| {
+                snapshot.items.iter().any(|item|
+                matches!(&item.content, ItemContent::Text { text, .. } if text.contains("original cwd")))
+            });
+            std::fs::rename(&original, &moved).unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("marker"), "replacement").unwrap();
+            let (identity, pin) = handle.pinned_launch_directory().unwrap();
+            assert_eq!(identity, expected);
+            if !admitted {
+                assert_ne!(
+                    unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+                    0,
+                    "ordinary launch pins require traversal, not directory-list permission"
+                );
+            }
+
+            let fd = unsafe {
+                libc::openat(
+                    pin.as_raw_fd(),
+                    c"marker".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0);
+            let mut contents = String::new();
+            unsafe { std::fs::File::from_raw_fd(fd) }
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert_eq!(contents, "{\"text\":\"original cwd\"}\n");
+            assert_eq!(
+                std::fs::read_to_string(original.join("marker")).unwrap(),
+                "replacement"
+            );
+            handle.command(Command::Refresh).unwrap();
+            until(&handle, |snapshot| {
+                snapshot.items.iter().any(|item|
+                matches!(&item.content, ItemContent::Text { text, .. } if text.contains(" world")))
+            });
+            handle.close().unwrap();
+            assert!(handle.pinned_launch_directory().is_err());
+        }
+    }
+
+    #[test]
+    fn identity_only_context_never_recaptures_a_replacement_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(root.path()).unwrap(),
+        );
+        let context = Arc::new(super::super::protocol::ExecutionContext::restored(expected));
+        assert!(context.pinned_launch_directory().is_err());
+        let spec = ProcessSpec {
+            execution: Some(context),
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        assert!(spawn_provider(&spec, &AtomicBool::new(false)).is_err());
     }
 
     struct Echo;

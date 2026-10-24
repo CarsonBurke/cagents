@@ -444,9 +444,12 @@ struct Claude {
     tool_order: VecDeque<ScopedId>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
-    /// Report-producing tasks, oldest first. Preserve their explicit native
-    /// kind through progress frames, which omit it, until final notification.
+    /// Bounded origin metadata, not running state. Preserve the explicit
+    /// native kind through progress and terminal-notification replay.
     report_tasks: VecDeque<(String, ReportTask)>,
+    /// Exact successful child failure/result and task-notification receipts,
+    /// not bodies or running work. Changed payloads remain observable.
+    failure_receipts: VecDeque<[u8; 32]>,
     /// Agents whose report was handed back as a peer message, newest last,
     /// so the notification that follows it does not show it again.
     handed_back: VecDeque<String>,
@@ -489,6 +492,15 @@ struct Claude {
     forced_history: bool,
 }
 impl Claude {
+    fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
+        if let Some(receipt) = receipt {
+            self.failure_receipts.push_back(receipt);
+            if self.failure_receipts.len() > MAX_TOOLS {
+                self.failure_receipts.pop_front();
+            }
+        }
+    }
+
     fn observe_title(&mut self, step: &mut Step) {
         if let Some(id) = self.session_id.clone()
             && let Some(titles) = &mut self.titles
@@ -712,13 +724,28 @@ impl Claude {
         }
         let mut content = vec![json!({"type":"text", "text":text})];
         let mut payload_size = encoded_len(&content)?;
-        for attachment in &attachments {
+        for attachment in super::image_references::ordered(&text, &attachments)? {
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             let block = attachment_block(&self.cwd, &attachment.path)?;
             payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
             if payload_size >= MAX_PAYLOAD {
                 return Err(
                     "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
                 );
+            }
+            if let Some(reference) = &attachment.reference {
+                if block["type"] != "image" {
+                    return Err("An image reference must accompany an actual image".into());
+                }
+                let marker =
+                    json!({"type":"text", "text":super::image_references::marker(reference)?});
+                payload_size = payload_size.saturating_add(encoded_len(&marker)? + 1);
+                if payload_size >= MAX_PAYLOAD {
+                    return Err(
+                        "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
+                    );
+                }
+                content.push(marker);
             }
             content.push(block);
         }
@@ -752,6 +779,9 @@ impl Claude {
         } else {
             0
         };
+        for attachment in &attachments {
+            crate::chat::attachment_assets::retain(attachment)?;
+        }
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
@@ -1183,6 +1213,9 @@ impl Claude {
         if self.retracted.contains(carrier) {
             return Ok(());
         }
+        // Capture provenance before this carrier updates correlation state.
+        // Replaying an old answer is not evidence that a blocked child resumed.
+        let fresh_live_carrier = !history && !self.carrier_items.contains_key(carrier);
         self.retract(&frame["supersedes"], step)?;
         let child = frame["parent_tool_use_id"]
             .as_str()
@@ -1194,6 +1227,54 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        if let Some(parent) = child
+            && fresh_live_carrier
+            && role == Role::Assistant
+            && frame["error"].is_null()
+            && frame["isMeta"].as_bool() != Some(true)
+            && (frame["message"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+                || frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| match string(block, "type") {
+                            "text" => !string(block, "text").trim().is_empty(),
+                            "thinking" => !string(block, "thinking").trim().is_empty(),
+                            "redacted_thinking" => !string(block, "data").trim().is_empty(),
+                            "tool_use" | "server_tool_use" => {
+                                !string(block, "id").trim().is_empty()
+                                    && !string(block, "name").trim().is_empty()
+                            }
+                            "tool_result" => !string(block, "tool_use_id").trim().is_empty(),
+                            "image" => match string(&block["source"], "type") {
+                                "url" => !string(&block["source"], "url").trim().is_empty(),
+                                "base64" => {
+                                    matches!(
+                                        string(&block["source"], "media_type"),
+                                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                                    ) && !string(&block["source"], "data").trim().is_empty()
+                                }
+                                _ => false,
+                            },
+                            "document" => ["data", "url", "text"]
+                                .iter()
+                                .any(|field| !string(&block["source"], field).trim().is_empty()),
+                            _ => false,
+                        })
+                    }))
+        {
+            step.events.push(Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(false),
+                detail: Some(String::new()),
+            });
+        }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
         let delivered = if role == Role::User && !model_only(frame) {
@@ -1261,7 +1342,35 @@ impl Claude {
                     }
                 }
             }
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
+            if role == Role::User {
+                for (index, pair) in content.windows(2).enumerate() {
+                    let marker = string(&pair[0], "text");
+                    if string(&pair[0], "type") == "text"
+                        && string(&pair[1], "type") == "image"
+                        && let ItemContent::Image { path, .. } = image_content(&pair[1])
+                        && super::image_references::claims_reference(marker)
+                    {
+                        if let Some(reference) = super::image_references::restore(marker, &path) {
+                            synthetic.insert(index);
+                            references.insert(index + 1, reference);
+                        } else if !path.starts_with("data:image/") {
+                            // A structured owned-image claim cannot authorize
+                            // a coincident local path after receipt failure.
+                            // Self-contained actual inline pixels remain safe.
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        }
+                    }
+                }
+            }
             for (index, block) in content.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
+                let reference = references.get(&index).cloned();
+                let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
                 let index = self
                     .blocks
@@ -1479,7 +1588,25 @@ impl Claude {
                     "image" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
                         role,
-                        content: image_content(block),
+                        content: match image_content(block) {
+                            ItemContent::Image {
+                                path, description, ..
+                            } => ItemContent::Image {
+                                path: if unavailable.is_some() {
+                                    String::new()
+                                } else {
+                                    path
+                                },
+                                description: unavailable.cloned().unwrap_or_else(|| {
+                                    reference
+                                        .as_ref()
+                                        .map(|reference| reference.label())
+                                        .unwrap_or(description)
+                                }),
+                                reference,
+                            },
+                            content => content,
+                        },
                         started_at: None,
                         at: None,
                     })),
@@ -1487,6 +1614,7 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: ItemContent::Image {
+                            reference: None,
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
@@ -1503,6 +1631,13 @@ impl Claude {
             }
         }
         if role == Role::Assistant {
+            if frame["error"].as_str().is_some() {
+                for event in &mut step.events[event_start..] {
+                    if let Event::Item(item) = event {
+                        chat::failure::mark_provider_error(Provider::Claude, item);
+                    }
+                }
+            }
             if child.is_none()
                 && let Some(usage) = frame["context_usage"].as_object()
             {
@@ -1518,7 +1653,14 @@ impl Claude {
             }
             if let Some(error) = frame["error"].as_str() {
                 step.events.push(Event::Error {
-                    message: format!("Claude: {error}"),
+                    message: {
+                        let body = content_text(&message["content"]);
+                        if body.is_empty() {
+                            format!("Claude: {error}")
+                        } else {
+                            format!("Claude: {error}\n{body}")
+                        }
+                    },
                     fatal: false,
                 });
             }
@@ -1812,7 +1954,10 @@ impl Adapter for Claude {
                 for mut frame in frames {
                     frame["parent_tool_use_id"] = json!(parent);
                     let mut child_step = Step::default();
-                    if self.message(&frame, &mut child_step).is_ok() {
+                    if self
+                        .message_with_tools(&frame, &mut child_step, &HashMap::new(), true)
+                        .is_ok()
+                    {
                         history_step.events.extend(child_step.events);
                     }
                 }
@@ -2077,6 +2222,29 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // Reject only exact previously accepted receipts, before metadata or
+        // lifecycle bookkeeping. An old child failure cannot re-block fresh
+        // activity; parent result and unrelated SDK frames are untouched.
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+        let guarded = match string(&frame, "type") {
+            "result" => child,
+            "stream_event" => child && string(&frame["event"], "type") == "error",
+            "system" => string(&frame, "subtype") == "task_notification",
+            _ => false,
+        };
+        let receipt = if guarded {
+            scoped_failure_receipt(&frame)?
+        } else {
+            None
+        };
+        if receipt
+            .as_ref()
+            .is_some_and(|key| self.failure_receipts.contains(key))
+        {
+            return Ok(step);
+        }
         if frame["parent_tool_use_id"].is_null() {
             self.fast_mode_metadata(&frame, &mut step);
         }
@@ -2139,6 +2307,7 @@ impl Adapter for Claude {
                 self.tool_order.clear();
                 self.tasks.clear();
                 self.report_tasks.clear();
+                self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.stopped_agents.clear();
                 self.handed_back.clear();
@@ -2371,7 +2540,7 @@ impl Adapter for Claude {
                 }
             }
             "stream_event" => {
-                if let Some(id) = frame["uuid"].as_str() {
+                if !guarded && let Some(id) = frame["uuid"].as_str() {
                     if self.stream_events.iter().any(|seen| seen == id) {
                         return Ok(step);
                     }
@@ -2390,14 +2559,8 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
-                if frame["parent_tool_use_id"].is_null() {
-                    self.observe_title(&mut step);
-                }
-                let can_suggest = frame["parent_tool_use_id"].is_null()
-                    && frame["is_error"] != true
-                    && frame["subtype"] == "success"
-                    && self.interruption.is_none()
-                    && self.started_generation == Some(self.attention_generation);
+                // A delegated result still carries scoped permission evidence,
+                // even though it must never settle the parent turn.
                 for denial in frame["permission_denials"]
                     .as_array()
                     .into_iter()
@@ -2410,6 +2573,73 @@ impl Adapter for Claude {
                         &mut step,
                     )?;
                 }
+                if let Some(parent) = frame["parent_tool_use_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                {
+                    // A child result settles this exact delegated turn, not the
+                    // parent's prompt, usage, interrupt or accepted execution.
+                    let errors = content_text(&frame["errors"]);
+                    let detail = if !errors.is_empty() {
+                        errors
+                    } else {
+                        string(&frame, "result").to_owned()
+                    };
+                    let status = if self.stopped_agents.iter().any(|id| id == parent) {
+                        ToolStatus::Stopped
+                    } else if frame["is_error"].as_bool() == Some(true) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    self.background_agents.remove(parent);
+                    if let Some(Item {
+                        content: ItemContent::Tool { status: known, .. },
+                        ..
+                    }) = self.tools.get_mut(&ScopedId::new(None, parent))
+                    {
+                        *known = status;
+                    }
+                    self.tasks.retain(|task| {
+                        !self
+                            .agent_task_calls
+                            .iter()
+                            .any(|(tool, known)| tool == parent && known == task)
+                            && !self
+                                .agent_calls
+                                .iter()
+                                .any(|(known, tool)| tool == parent && known == task)
+                    });
+                    if let Some(stream) = self.streams.remove(parent) {
+                        self.settle(Some(parent), &stream.message);
+                    }
+                    if frame["is_error"].as_bool() == Some(true) && !detail.is_empty() {
+                        step.events.push(Event::SubagentItem {
+                            id: parent.into(),
+                            item: child_failure_item(&frame, "result-error", detail.clone()),
+                        });
+                    }
+                    step.events.push(Event::Subagent {
+                        id: parent.into(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(status),
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(detail),
+                    });
+                    self.remember_failure_receipt(receipt);
+                    return Ok(step);
+                }
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
+                let can_suggest = frame["parent_tool_use_id"].is_null()
+                    && frame["is_error"] != true
+                    && frame["subtype"] == "success"
+                    && self.interruption.is_none()
+                    && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
                 if had_turn || frame["uuid"].as_str().is_some() {
@@ -2635,6 +2865,7 @@ impl Adapter for Claude {
             "keep_alive" => {}
             other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
+        self.remember_failure_receipt(receipt);
         Ok(step)
     }
 }
@@ -2796,6 +3027,50 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
 }
+/// Explicit child API/result failures retain their original diagnostic in
+/// history as well as transient status. A carrier identifies exact replay;
+/// without one, distinct actual receipts must never share a fabricated ID.
+fn child_failure_item(frame: &Value, source: &str, message: String) -> Item {
+    let carrier = frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut item = text_item(
+        format!("claude-{source}:{carrier}:0"),
+        Role::System,
+        message,
+        false,
+    );
+    chat::failure::mark_provider_error(Provider::Claude, &mut item);
+    item
+}
+
+/// Hash the already parsed frame without allocating another full diagnostic.
+/// UUID-less receipts have no replay authority and are always processed.
+fn scoped_failure_receipt(frame: &Value) -> Result<Option<[u8; 32]>, String> {
+    if frame["uuid"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    struct HashWriter(sha2::Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            sha2::Digest::update(&mut self.0, bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(<sha2::Sha256 as sha2::Digest>::new());
+    serde_json::to_writer(&mut writer, frame).map_err(|error| error.to_string())?;
+    Ok(Some(sha2::Digest::finalize(writer.0).into()))
+}
+
 /// A child frame belongs to its agent's transcript, even when Claude gives it
 /// the wire role `user` for an internal prompt or tool result.
 fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
@@ -2836,6 +3111,18 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
             Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
                 id: parent.into(),
                 ids,
+            },
+            Event::Error { message, .. } => Event::Subagent {
+                id: parent.into(),
+                kind: String::new(),
+                description: String::new(),
+                // A retryable API error is not proof that the task stopped.
+                // Keep its exact status, but expose that it needs attention.
+                status: None,
+                background: None,
+                model: None,
+                waiting: Some(true),
+                detail: Some(message),
             },
             event => event,
         })
@@ -3584,6 +3871,7 @@ fn image_content(block: &Value) -> ItemContent {
         _ => String::new(),
     };
     ItemContent::Image {
+        reference: None,
         path,
         description: "Claude image attachment".into(),
     }
@@ -3612,6 +3900,9 @@ fn content_text(value: &Value) -> String {
         value.to_string()
     }
 }
+// Question and option strings are provider-authored text, not attachment
+// descriptors. Preserve them verbatim: they also serve as answer-map keys.
+// A filename or shell pattern in a question does not authorize a file read.
 fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
     let questions = input["questions"]
         .as_array()
@@ -3761,6 +4052,19 @@ impl Claude {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
+                } else {
+                    // Only actual new child API activity clears a retryable
+                    // child failure; an unrelated background notice cannot.
+                    step.events.push(Event::Subagent {
+                        id: parent.clone(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: None,
+                        background: None,
+                        model: None,
+                        waiting: Some(false),
+                        detail: Some(String::new()),
+                    });
                 }
             }
             "content_block_start" => {
@@ -3955,10 +4259,23 @@ impl Claude {
                 }
             }
             "ping" => {}
-            "error" => step.events.push(Event::Error {
-                message: content_text(&event["error"]),
-                fatal: false,
-            }),
+            "error" => {
+                let message = content_text(&event["error"]);
+                if !parent.is_empty() {
+                    // Transient child detail is cleared by terminal task
+                    // notifications. Keep explicit API failures in that child's
+                    // transcript as well, with the same exact original cause.
+                    step.events.push(Event::Item(child_failure_item(
+                        frame,
+                        "stream-error",
+                        message.clone(),
+                    )));
+                }
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
             other => step.events.push(Event::Error {
                 message: format!("Unsupported Claude API stream event {other}"),
                 fatal: false,
@@ -4220,18 +4537,20 @@ impl Claude {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
                 }
-                if string(frame, "subtype") == "task_started"
-                    && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
-                {
-                    let kind = if string(frame, "task_type") == "local_workflow" {
-                        ReportTask::Workflow
-                    } else {
-                        ReportTask::Agent
-                    };
+                if string(frame, "subtype") == "task_started" {
+                    // A new task identity binding retires any prior native
+                    // origin, including reuse for a Bash or unknown task.
                     self.report_tasks.retain(|(known, _)| known != task);
-                    self.report_tasks.push_back((task.into(), kind));
-                    if self.report_tasks.len() > MAX_TOOLS {
-                        self.report_tasks.pop_front();
+                    if matches!(string(frame, "task_type"), "local_agent" | "local_workflow") {
+                        let kind = if string(frame, "task_type") == "local_workflow" {
+                            ReportTask::Workflow
+                        } else {
+                            ReportTask::Agent
+                        };
+                        self.report_tasks.push_back((task.into(), kind));
+                        if self.report_tasks.len() > MAX_TOOLS {
+                            self.report_tasks.pop_front();
+                        }
                     }
                 }
                 // Headless Claude Code tells the model a task finished in a turn
@@ -4249,7 +4568,6 @@ impl Claude {
                         .report_tasks
                         .iter()
                         .find_map(|(known, kind)| (known == task).then_some(*kind));
-                    self.report_tasks.retain(|(known, _)| known != task);
                     let recorded = ["skip_transcript", "ambient"]
                         .iter()
                         .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
@@ -5280,9 +5598,884 @@ mod history_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.as_ref().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            let image_items = |frame: &Value| {
+                let mut step = Step::default();
+                Claude::default().message(frame, &mut step).unwrap();
+                step.events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for failure in 0..3 {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let mut frame = json!({"type":"user", "uuid":"unverified-image-history", "message":{"role":"user", "content":[
+                    {"type":"text", "text":marker},
+                    {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+                ]}});
+                let items = image_items(&frame);
+                assert_eq!(items.len(), 2, "unverified marker must remain literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference:None, description } if path.is_empty() && description.contains("originating device")),
+                    "a real coincident local PNG is not preview authority"
+                );
+                // The foreign claim still cannot create trusted metadata, but
+                // actual self-contained history pixels need no local path.
+                frame["message"]["content"][1]["source"] = json!({"type":"base64", "media_type":"image/png", "data":STANDARD.encode(&bytes)});
+                let inline = image_items(&frame);
+                assert!(
+                    matches!(&inline[1].content, ItemContent::Image { path, reference:None, .. } if path.starts_with("data:image/png;base64,"))
+                );
+            }
+            let legacy = json!({"type":"user", "uuid":"legacy-url", "message":{"role":"user", "content":[
+                {"type":"text", "text":"ordinary earlier [Image 77777] prose"},
+                {"type":"image", "source":{"type":"url", "url":image.path.to_str().unwrap()}}
+            ]}});
+            let items = image_items(&legacy);
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { path, reference:None, .. } if path == image.path.to_str().unwrap()),
+                "unclaimed legacy URL behavior stays unchanged"
+            );
+            assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn referenced_image_payload_history_and_queue_keep_real_bytes_and_identity() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let reference = attachment.reference.clone().unwrap();
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
+            let mut adapter = Claude {
+                ready: true,
+                async_input: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(text.clone(), vec![hinted.clone()], PromptMode::Queue)
+                .unwrap();
+            let frame = &submitted.writes[0];
+            let content = frame["message"]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 3);
+            assert_eq!(content[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(content[2]["source"]["type"], "base64");
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let queued = &adapter.queued[0];
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [hinted]);
+            assert!(queued.editable);
+            let mut retry = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let resent = retry
+                .send_prompt(
+                    queued.text.clone(),
+                    queued.attachments.clone(),
+                    PromptMode::Send,
+                )
+                .unwrap();
+            assert_eq!(
+                resent.writes[0]["message"]["content"],
+                frame["message"]["content"]
+            );
+            // A newly attached adapter parses the actual persisted provider
+            // frame, not a fabricated local image item.
+            let mut restored = Claude::default();
+            let mut history = Step::default();
+            restored.message(frame, &mut history).unwrap();
+            let items = history
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path.starts_with("data:image/png;base64,") && description == &reference.label())
+            );
+            assert!(
+                items[1].id.ends_with(":2"),
+                "stripping a marker never shifts provider block indices"
+            );
+
+            let mut foreign = frame.clone();
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            foreign["uuid"] = json!("forged-image-history");
+            foreign["message"]["content"][1]["text"] =
+                json!(super::super::image_references::marker(&forged).unwrap());
+            let mut visible = Step::default();
+            Claude::default().message(&foreign, &mut visible).unwrap();
+            assert_eq!(
+                visible
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Item(_)))
+                    .count(),
+                3
+            );
+            assert!(visible.events.iter().any(|event| matches!(
+                event,
+                Event::Item(Item {
+                    content: ItemContent::Image {
+                        reference: None,
+                        ..
+                    },
+                    ..
+                })
+            )));
+        });
+    }
+
+    #[test]
+    fn multiple_referenced_images_keep_caret_mapping_and_base64_order() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!("Use {} before {}", second_ref.token(), first_ref.token());
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(
+                    text.clone(),
+                    vec![first.clone(), second.clone()],
+                    PromptMode::Send,
+                )
+                .unwrap();
+            let content = &submitted.writes[0]["message"]["content"];
+            assert_eq!(content[0]["text"], text);
+            assert_eq!(
+                content[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(content[2]["type"], "image");
+            assert_eq!(
+                content[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(content[4]["type"], "image");
+            let first_bytes = std::fs::read(&first.path).unwrap();
+            let second_bytes = std::fs::read(&second.path).unwrap();
+            assert_ne!(
+                first_bytes, second_bytes,
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[2]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                second_bytes
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(content[4]["source"]["data"].as_str().unwrap())
+                    .unwrap(),
+                first_bytes
+            );
+            let mut restored = Step::default();
+            Claude::default()
+                .message(&submitted.writes[0], &mut restored)
+                .unwrap();
+            let identities = restored
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(Item {
+                        content:
+                            ItemContent::Image {
+                                reference: Some(reference),
+                                ..
+                            },
+                        ..
+                    }) => Some(reference.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(identities, [second_ref.id, first_ref.id]);
+        });
+    }
+
+    #[test]
+    fn referenced_image_only_and_foreign_attachment_failures_preserve_transport_rules() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .send_prompt(String::new(), vec![attachment.clone()], PromptMode::Send)
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["message"]["content"][2]["type"],
+                "image"
+            );
+            let mut foreign = attachment;
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            assert!(
+                adapter
+                    .send_prompt("compare".into(), vec![foreign], PromptMode::Send)
+                    .is_err()
+            );
+            assert!(adapter.submissions.is_empty());
+            assert!(!adapter.busy);
+        });
+    }
     use crate::agent::Provider;
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
+
+    #[test]
+    fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings() {
+        let run = crate::model::RunId::new();
+        let mut adapter = Claude {
+            busy: true,
+            execution: Some(run),
+            interruption: Some(false),
+            ..Default::default()
+        };
+        for (tool, task) in [("failed-child", "task-failed"), ("live-child", "task-live")] {
+            adapter.receive(json!({"type":"assistant","uuid":format!("launch-{tool}"),"message":{"id":format!("message-{tool}"),"content":[{"type":"tool_use","id":tool,"name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"})).unwrap();
+        }
+        let child_input =
+            json!({"file_path":"child.rs","old_string":"before","new_string":"after"});
+        adapter
+            .receive(scoped_call(
+                Some("failed-child"),
+                "child-edit",
+                "colliding-edit",
+                "Edit",
+                child_input.clone(),
+            ))
+            .unwrap();
+        let root_input = json!({"file_path":"root.rs","content":"root stays separate"});
+        adapter
+            .receive(scoped_call(
+                None,
+                "root-edit",
+                "colliding-edit",
+                "Write",
+                root_input.clone(),
+            ))
+            .unwrap();
+        let generation = adapter.attention_generation;
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let step = adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[failure],"usage":{"input_tokens":999},"permission_denials":[{"tool_use_id":"colliding-edit","tool_name":"Edit","decision_reason":"Child edit was refused"}]})).unwrap();
+        assert!(adapter.busy);
+        assert_eq!(adapter.execution, Some(run));
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(!adapter.background_agents.contains("failed-child"));
+        assert!(adapter.background_agents.contains("live-child"));
+        assert!(!adapter.tasks.iter().any(|task| task == "task-failed"));
+        assert!(adapter.tasks.iter().any(|task| task == "task-live"));
+        assert!(
+            matches!(step.events.as_slice(), [Event::PermissionDenied(denial), Event::SubagentItem { id:owner,item }, Event::Subagent { id, status:Some(ToolStatus::Failed), waiting:Some(false), detail:Some(detail), .. }]
+                if owner=="failed-child" && id=="failed-child" && detail==failure
+                && item.id=="claude-result-error:child-result:0"
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(failure)
+                && denial.tool_use_id=="colliding-edit" && denial.tool_name=="Edit"
+                && denial.reason=="Child edit was refused"
+                && denial.tool_input.as_deref().and_then(|input|serde_json::from_str::<Value>(input).ok())==Some(child_input))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(None, "colliding-edit"))
+                .and_then(|input| serde_json::from_str::<Value>(input).ok()),
+            Some(root_input),
+            "A child result cannot overwrite the colliding root permission input"
+        );
+        assert!(adapter.completed_tool(None, "failed-child"));
+        let replay = adapter.receive(json!({"type":"assistant","uuid":"launch-failed-child","message":{"id":"message-failed-child","content":[{"type":"tool_use","id":"failed-child","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        assert!(!replay.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Running),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
+        assert!(
+            matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }]
+                if owner=="waiting-child" && id=="waiting-child" && detail.contains(failure)
+                && chat::failure::provider_error_text(Provider::Claude,item)==Some(detail.as_str()))
+        );
+        assert!(adapter.busy);
+        let notice = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bash-done","status":"completed","summary":"Background command completed (exit code 0)","uuid":"bash-notice"})).unwrap();
+        assert!(!notice.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::Subagent { .. }
+        )));
+        assert!(adapter.busy);
+        let resumed = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"message_start","message":{"id":"recovered-child"}}})).unwrap();
+        assert!(resumed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:None, waiting:Some(false), detail:Some(detail), .. } if id=="waiting-child" && detail.is_empty())));
+        assert!(
+            !resumed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarted | Event::Status { .. }))
+        );
+    }
+
+    #[test]
+    fn child_api_failures_survive_terminal_task_notifications_and_replay_through_runtime_store() {
+        let first = json!({"type":"connection_error","message":"Connection reset by peer\nrequest-id: original-network"});
+        let second = json!({"type":"rate_limit_error","message":"You've hit your limit · resets 1:30pm\nrequest-id: distinct-quota"});
+        let error = |carrier: &str, cause: &Value| json!({"type":"stream_event","uuid":carrier,"parent_tool_use_id":"failed-child","event":{"type":"error","error":cause}});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+        }
+        frames.push(json!({"type":"assistant","uuid":"retained-child-answer","parent_tool_use_id":"failed-child","message":{"id":"retained-child-answer","content":[{"type":"text","text":"Original child work remains visible"}]}}));
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        frames.push(json!({"type":"system","subtype":"task_notification","uuid":"terminal-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":"The child task failed"}));
+        // Exact old API frames after the terminal notification cannot erase or
+        // multiply history, or put this failed child back into waiting.
+        frames.push(error("first-failure", &first));
+        frames.push(error("second-failure", &second));
+        // The helper requires a real outcome callback, then returns the actual
+        // resident Actor/Store snapshot and proves its cat process teardown.
+        frames.push(json!({"type":"result","uuid":"parent-settlement","subtype":"success","is_error":false}));
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert!(
+            child.detail.is_empty(),
+            "terminal transient-detail cleanup remains unchanged"
+        );
+        assert!(child.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text=="Original child work remains visible")));
+        let failures: Vec<_> = child
+            .items
+            .iter()
+            .filter_map(|item| {
+                chat::failure::provider_error_text(Provider::Claude, item)
+                    .map(|body| (item.id.as_str(), body))
+            })
+            .collect();
+        let first_raw = content_text(&first);
+        let second_raw = content_text(&second);
+        assert_eq!(
+            failures,
+            [
+                ("claude-stream-error:first-failure:0", first_raw.as_str()),
+                ("claude-stream-error:second-failure:0", second_raw.as_str()),
+            ]
+        );
+        assert_eq!(
+            child.items.len(),
+            3,
+            "one original answer plus two errors; replay adds no entries"
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|item| chat::failure::provider_error_text(Provider::Claude, item).is_some()),
+            "child diagnostic originals must not enter the parent transcript"
+        );
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state.error.is_none(),
+            "child API errors must never become parent failures"
+        );
+        assert!(
+            !state.busy,
+            "only the explicit parent result settles parent busy"
+        );
+        assert!(state.is_working(), "the live sibling remains genuine work");
+
+        // Without a provider carrier ID, preserve distinct actual receipts
+        // rather than guessing that identical unkeyed errors are replay.
+        let mut adapter = Claude::default();
+        let mut unkeyed = error("discarded", &first);
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let item = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(item(&a), item(&b));
+        for carrier in ["", " \t\n"] {
+            let blank = error(carrier, &first);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(
+                item(&a),
+                item(&b),
+                "a blank carrier is not replay authority"
+            );
+        }
+        let parent = adapter.receive(json!({"type":"stream_event","uuid":"root-error","event":{"type":"error","error":first}})).unwrap();
+        assert!(
+            matches!(parent.events.as_slice(), [Event::Error { .. }]),
+            "ordinary parent API errors keep their existing event representation"
+        );
+    }
+
+    #[test]
+    fn child_result_failures_keep_exact_history_across_terminal_notifications_without_parent_failure()
+     {
+        let raw = "Authentication failed: invalid_api_key\nrequest-id: exact-child-result";
+        let result = json!({"type":"result","uuid":"failed-result","parent_tool_use_id":"failed-child","is_error":true,"errors":[raw],"usage":{"input_tokens":9000}});
+        let terminal = json!({"type":"system","subtype":"task_notification","uuid":"failed-notification","task_id":"failed-task","tool_use_id":"failed-child","status":"failed","summary":raw});
+        let mut frames = vec![
+            json!({"type":"stream_event","uuid":"actual-parent-start","event":{"type":"message_start","message":{"id":"live-parent-message"}}}),
+        ];
+        for (tool, task) in [("failed-child", "failed-task"), ("live-child", "live-task")] {
+            frames.push(scoped_call(
+                None,
+                &format!("launch-{tool}"),
+                tool,
+                "Agent",
+                json!({"run_in_background":true}),
+            ));
+            frames.push(json!({"type":"system","subtype":"task_started","task_id":task,"tool_use_id":tool,"task_type":"local_agent"}));
+            // Keep accepted async-result metadata alongside task_started.
+            // The child result itself owns its terminal diagnostic; a later
+            // notification need not emit another child status patch.
+            frames.push(json!({"type":"user","uuid":format!("async-{tool}"),"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":task},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Async agent launched successfully.","is_error":false}]}}));
+        }
+        frames.extend([result.clone(), terminal.clone(), result.clone(), terminal,
+            json!({"type":"result","uuid":"only-parent-settlement","subtype":"success","is_error":false})]);
+        let (_, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(Claude {
+                busy: true,
+                ..Default::default()
+            }),
+            frames,
+            false,
+        );
+        let child = state
+            .subagents
+            .iter()
+            .find(|child| child.id == "failed-child")
+            .unwrap();
+        assert_eq!(child.status, ToolStatus::Failed);
+        assert!(!child.waiting);
+        assert_eq!(
+            child.detail, raw,
+            "without a later child status patch, the result's exact diagnostic remains"
+        );
+        assert_eq!(
+            child.items.len(),
+            1,
+            "stable result replay upserts only its original failure"
+        );
+        assert_eq!(child.items[0].id, "claude-result-error:failed-result:0");
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Claude, &child.items[0]),
+            Some(raw)
+        );
+        assert!(state.error.is_none());
+        assert!(!state.busy);
+        assert!(state.is_working());
+        assert!(
+            state
+                .subagents
+                .iter()
+                .any(|child| child.id == "live-child" && child.status == ToolStatus::Running)
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .all(|item| chat::failure::provider_error_text(Provider::Claude, item).is_none())
+        );
+
+        let mut adapter = Claude {
+            busy: true,
+            interruption: Some(false),
+            ..Default::default()
+        };
+        let generation = adapter.attention_generation;
+        let mut unkeyed = result.clone();
+        unkeyed.as_object_mut().unwrap().remove("uuid");
+        let a = adapter.receive(unkeyed.clone()).unwrap();
+        let b = adapter.receive(unkeyed).unwrap();
+        let id = |step: &Step| {
+            step.events
+                .iter()
+                .find_map(|event| match event {
+                    Event::SubagentItem { item, .. } => Some(item.id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(id(&a), id(&b));
+        for carrier in ["", " \t\n"] {
+            let mut blank = result.clone();
+            blank["uuid"] = json!(carrier);
+            let a = adapter.receive(blank.clone()).unwrap();
+            let b = adapter.receive(blank).unwrap();
+            assert_ne!(id(&a), id(&b));
+        }
+        assert!(adapter.busy);
+        assert_eq!(adapter.interruption, Some(false));
+        assert_eq!(adapter.attention_generation, generation);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(a.events.iter().chain(&b.events).all(|event| !matches!(
+            event,
+            Event::Error { .. }
+                | Event::TurnStarted
+                | Event::TurnSettled
+                | Event::TurnFinished { .. }
+                | Event::Status { .. }
+        )));
+    }
+
+    #[test]
+    fn exact_child_failure_receipts_cannot_rollback_fresh_activity_but_changed_payloads_remain_visible()
+     {
+        for source in ["stream", "result"] {
+            let mut adapter = Claude {
+                busy: true,
+                ..Default::default()
+            };
+            adapter
+                .receive(scoped_call(
+                    None,
+                    "launch-receipt-child",
+                    "child",
+                    "Agent",
+                    json!({"run_in_background":true}),
+                ))
+                .unwrap();
+            let started = json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"child","task_type":"local_agent"});
+            adapter.receive(started.clone()).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"async-receipt-child","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"task"},"message":{"content":[{"type":"tool_result","tool_use_id":"child","content":"Async agent launched successfully."}]}})).unwrap();
+            let mut failure = if source == "stream" {
+                json!({"type":"stream_event","uuid":"actual-failure","parent_tool_use_id":"child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})
+            } else {
+                json!({"type":"result","uuid":"actual-failure","parent_tool_use_id":"child","is_error":true,"errors":["quota exceeded"]})
+            };
+            failure["session_id"] = json!("00000000-0000-4000-8000-000000000001");
+            adapter.receive(failure.clone()).unwrap();
+            let terminal = json!({"type":"system","subtype":"task_notification","task_id":"task","tool_use_id":"child","uuid":"actual-terminal","status":"failed","summary":"quota exceeded"});
+            adapter.receive(terminal.clone()).unwrap();
+            adapter.receive(started).unwrap();
+            let fresh = adapter.receive(json!({"type":"stream_event","uuid":"actual-new-work","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"new-child-message"}}})).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Subagent { id, waiting:Some(false),.. } if id=="child")));
+            let generation = adapter.attention_generation;
+            for replay in [failure.clone(), terminal] {
+                assert!(
+                    adapter.receive(replay).unwrap().events.is_empty(),
+                    "an exact old failure/result/notification cannot re-block or settle fresh child work"
+                );
+            }
+            assert!(adapter.tasks.iter().any(|task| task == "task"));
+            assert_eq!(adapter.streams["child"].message, "new-child-message");
+            assert!(adapter.busy);
+            assert_eq!(adapter.attention_generation, generation);
+            if source == "stream" {
+                failure["event"]["error"]["message"] = json!("quota exceeded; revised diagnostics");
+            } else {
+                failure["errors"] = json!(["quota exceeded; revised diagnostics"]);
+            }
+            let changed = adapter.receive(failure).unwrap();
+            assert!(changed.events.iter().any(|event| matches!(event,Event::SubagentItem { id,item }
+                if id=="child" && chat::failure::provider_error_text(Provider::Claude,item).is_some_and(|body|body.contains("revised diagnostics")))),
+                "a reused UUID with new payload remains observable");
+        }
+    }
+
+    #[test]
+    fn replayed_and_historical_child_answers_do_not_clear_a_later_retry_failure() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let answer = |uuid: &str| json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":"blocked-child","message":{"id":uuid,"content":[{"type":"text","text":"Earlier child answer"}]}});
+        adapter.receive(answer("old-live-carrier")).unwrap();
+        let failure = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"blocked-child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})).unwrap();
+        assert!(failure.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                waiting: Some(true),
+                ..
+            }
+        )));
+        let clears = |events: &[Event]| {
+            events.iter().any(|event| matches!(event, Event::Subagent { id, waiting:Some(false), detail:Some(detail), .. } if id=="blocked-child" && detail.is_empty()))
+        };
+        let replay = adapter.receive(answer("old-live-carrier")).unwrap();
+        assert!(
+            !clears(&replay.events),
+            "An identical already-seen live carrier is not recovery"
+        );
+        let mut history = Step::default();
+        adapter
+            .message_with_tools(
+                &answer("previously-unseen-history-carrier"),
+                &mut history,
+                &HashMap::new(),
+                true,
+            )
+            .unwrap();
+        assert!(
+            !clears(&history.events),
+            "An unseen saved sidecar carrier is still history"
+        );
+        let replay_history = adapter
+            .receive(answer("previously-unseen-history-carrier"))
+            .unwrap();
+        assert!(
+            !clears(&replay_history.events),
+            "Previously imported history cannot become fresh through replay"
+        );
+        let mut meta = answer("new-model-only-carrier");
+        meta["isMeta"] = json!(true);
+        assert!(!clears(&adapter.receive(meta).unwrap().events));
+        for (index, content) in [
+            json!([]),
+            json!("   \n\t"),
+            json!([{"type":"text","text":"   \n\t"}]),
+            json!([{"type":"thinking","thinking":" "}]),
+            json!([{"type":"image","source":{}}]),
+            json!([{"type":"unknown-content","text":"not proven activity"}]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut empty = answer(&format!("fresh-empty-envelope-{index}"));
+            empty["message"]["content"] = content;
+            assert!(
+                !clears(&adapter.receive(empty).unwrap().events),
+                "A new envelope without meaningful assistant activity cannot clear the blocked child"
+            );
+        }
+        let fresh = adapter
+            .receive(answer("genuinely-new-live-carrier"))
+            .unwrap();
+        assert!(clears(&fresh.events));
+        for (index, content) in [
+            json!("Actual live child response"),
+            json!([{"type":"thinking","thinking":"Considering the current change"}]),
+            json!([{"type":"tool_use","id":"new-child-tool","name":"Read","input":{"file_path":"current.rs"}}]),
+            json!([{"type":"image","source":{"type":"url","url":"https://example.test/current.png"}}]),
+        ].into_iter().enumerate() {
+            let mut active = answer(&format!("fresh-meaningful-envelope-{index}"));
+            active["message"]["content"] = content;
+            assert!(clears(&adapter.receive(active).unwrap().events),
+                "Fresh parsed assistant activity still clears its exact child failure");
+        }
+        assert!(
+            adapter.busy,
+            "Child recovery does not settle or restart the parent"
+        );
+        assert!(!fresh.events.iter().any(|event| matches!(
+            event,
+            Event::Status { .. } | Event::TurnStarted | Event::TurnSettled
+        )));
+    }
+
+    #[test]
+    fn explicit_assistant_failure_keeps_raw_text_system_identity_and_reset_cause() {
+        let mut adapter = Claude::default();
+        let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)\nrequest diagnostics retained";
+        let step = adapter.receive(json!({"type":"assistant","uuid":"quota-carrier","error":"rate_limit","message":{"id":"quota-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Item(item) if item.id=="quota-message:0" && chat::failure::provider_error_text(Provider::Claude, item)==Some(failure))));
+        let current = step
+            .events
+            .iter()
+            .find_map(|event| {
+                if let Event::Error { message, .. } = event {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(current.contains("Claude: rate_limit") && current.contains(failure));
+        assert_eq!(
+            chat::failure::Failure::parse(Provider::Claude, current)
+                .unwrap()
+                .key,
+            chat::failure::Failure::parse(Provider::Claude, failure)
+                .unwrap()
+                .key
+        );
+        let quote = adapter.receive(json!({"type":"assistant","uuid":"quote-carrier","message":{"id":"quote-message","content":[{"type":"text","text":failure}]}})).unwrap();
+        assert!(quote.events.iter().any(|event| matches!(
+            event,
+            Event::Item(Item {
+                role: Role::Assistant,
+                ..
+            })
+        )));
+        assert!(
+            !quote
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn explicit_child_failure_blocks_share_only_their_proven_carrier() {
+        let mut adapter = Claude::default();
+        let bodies = [
+            "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+            "request-id: same-provider-envelope\nOriginal details stay separate and exact.",
+        ];
+        for carrier in ["first-error-message", "next-error-message"] {
+            let step = adapter.receive(json!({"type":"assistant","uuid":carrier,"parent_tool_use_id":"same-child","error":"rate_limit","message":{"id":carrier,"content":[{"type":"text","text":bodies[0]},{"type":"text","text":bodies[1]}]}})).unwrap();
+            let items: Vec<_> = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SubagentItem { id, item } if id == "same-child" => Some(item),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(items.len(), 2);
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.id, format!("{carrier}:{index}"));
+                assert_eq!(
+                    chat::failure::provider_error_text(Provider::Claude, item),
+                    Some(bodies[index])
+                );
+                assert_eq!(
+                    chat::failure::provider_error_carrier(Provider::Claude, item),
+                    Some(carrier)
+                );
+            }
+            assert!(!step.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+    }
+
+    #[test]
+    fn child_user_quotations_are_not_provider_errors_and_followup_failures_keep_their_ids() {
+        let mut adapter = Claude::default();
+        let quota = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
+        let frame = |kind: &str, id: &str, error: bool| {
+            let mut value = json!({"type":kind,"uuid":id,"parent_tool_use_id":"same-child","message":{"id":id,"content":[{"type":"text","text":quota}]}});
+            if error {
+                value["error"] = json!("rate_limit");
+            }
+            value
+        };
+        for id in ["original-child-prompt", "followup-child-prompt"] {
+            let quote = adapter.receive(frame("user", id, false)).unwrap();
+            assert!(quote.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id=="same-child" && item.role==Role::System && matches!(&item.content,ItemContent::Text{text,..} if text==quota) && chat::failure::provider_error_text(Provider::Claude,item).is_none())));
+            let error_id = format!("{id}-error");
+            let error = adapter
+                .receive(frame("assistant", &error_id, true))
+                .unwrap();
+            assert!(error.events.iter().any(|event| matches!(event, Event::SubagentItem { id,item } if id=="same-child" && item.id==format!("{error_id}:0") && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+            assert!(!error.events.iter().any(|event| matches!(
+                event,
+                Event::Error { .. } | Event::TurnStarted | Event::TurnSettled
+            )));
+        }
+        let replay = adapter
+            .receive(frame("assistant", "original-child-prompt-error", true))
+            .unwrap();
+        assert!(replay.events.iter().any(|event| matches!(event, Event::SubagentItem { item,.. } if item.id=="original-child-prompt-error:0" && chat::failure::provider_error_text(Provider::Claude,item)==Some(quota))));
+    }
 
     #[test]
     fn confirmed_claude_session_observes_only_its_saved_names_at_result_boundaries() {
@@ -6412,6 +7605,7 @@ mod tests {
             .send_prompt(
                 text.clone(),
                 vec![Attachment {
+                    reference: None,
                     path: attachment.clone(),
                 }],
                 PromptMode::Queue,
@@ -6430,7 +7624,7 @@ mod tests {
             Event::QueueChanged(messages)
                 if messages.len() == 1
                     && !messages[0].editable
-                    && messages[0].attachments == [Attachment { path: attachment.clone() }]
+                    && messages[0].attachments == [Attachment { path: attachment.clone(), reference: None }]
         )));
         let frame = submitted.writes[0].clone();
         let id = frame["uuid"].clone();
@@ -6750,6 +7944,55 @@ mod tests {
             step.writes,
             vec![reply(
                 "q1",
+                json!({"behavior":"allow","updatedInput":expected})
+            )]
+        );
+    }
+
+    #[test]
+    fn question_artifact_shorthand_remains_text_and_round_trips_exactly() {
+        let question = "Compare .worktrees/v2review-related-sites-redesign/docs/local/v2review/tree-fixture-dark-{collapsed,expanded,expanded-11,search}.png and tree-real-*.png";
+        let description = "Inspect [expanded](docs/local/v2review/tree-fixture-dark-expanded.png)";
+        let input = json!({"questions":[{
+            "question":question,
+            "header":"Artifacts",
+            "options":[
+                {"label":"Use fixtures", "description":description},
+                {"label":"Use tree-real-*.png", "description":"Keep the literal filename"}
+            ]
+        }]});
+        let mut adapter = Claude::default();
+        let requested = adapter
+            .receive(approval("artifacts", "AskUserQuestion", input.clone()))
+            .unwrap();
+        // The request supplies no image blocks. In particular, neither the
+        // question nor an option description becomes a filesystem attachment.
+        assert!(requested.writes.is_empty());
+        assert_eq!(requested.events.len(), 1);
+        let Event::Request(request) = &requested.events[0] else {
+            panic!("question request");
+        };
+        assert_eq!(request.fields[0].id, question);
+        assert_eq!(request.fields[0].label, question);
+        assert_eq!(request.fields[0].choices[0].description, description);
+        assert_eq!(request.fields[0].choices[1].id, "Use tree-real-*.png");
+
+        let answered = adapter
+            .answer(
+                "artifacts".into(),
+                "allow".into(),
+                vec![Answer {
+                    field: question.into(),
+                    values: vec!["Use tree-real-*.png".into()],
+                }],
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({question:"Use tree-real-*.png"});
+        assert_eq!(
+            answered.writes,
+            vec![reply(
+                "artifacts",
                 json!({"behavior":"allow","updatedInput":expected})
             )]
         );
@@ -8063,8 +9306,107 @@ mod tests {
             let mut adapter = Claude::default();
             adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
             adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Making progress"}})).unwrap();
-            let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"})).unwrap();
+            let notification = json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Findings","uuid":"report"});
+            let done = adapter.receive(notification.clone()).unwrap();
             assert!(done.events.iter().any(|event| matches!(event, Event::Item(Item {content:ItemContent::Delivery {kind, summary, body, .. }, .. }) if summary == heading && if report { *kind == DeliveryKind::Report && body == "Findings" } else { *kind == DeliveryKind::Notice && body.is_empty() })));
+            assert!(
+                adapter.tasks.is_empty(),
+                "origin retention is never running work"
+            );
+            assert_eq!(adapter.report_tasks.len(), usize::from(report));
+            let replay = adapter.receive(notification.clone()).unwrap();
+            assert!(
+                replay.events.is_empty(),
+                "exact replay cannot replace the original role/ID/kind/heading/raw body"
+            );
+            let mut changed = notification;
+            changed["summary"] = json!("Revised findings");
+            let changed = adapter.receive(changed).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind,summary,body,..},.. })
+                if if report { *kind==DeliveryKind::Report && summary==heading && body=="Revised findings" } else { *kind==DeliveryKind::Notice && summary=="Revised findings" && body.is_empty() })),
+                "same UUID with changed payload must still be processed");
+            // Same task ID reused for a nonreport producer must not inherit an
+            // old native-agent/workflow origin.
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":"local_bash","description":"New command"})).unwrap();
+            let command = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task","status":"completed","summary":"Command finished","uuid":"new-command-report"})).unwrap();
+            assert!(command.events.iter().any(|event|matches!(event, Event::Item(Item { content:ItemContent::Delivery {kind:DeliveryKind::Notice, summary,body,..},.. }) if summary=="Command finished" && body.is_empty())));
+            assert!(adapter.report_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_task_receipts_do_not_reexpose_a_handed_back_report_and_cache_stays_bounded() {
+        for kind in ["local_agent", "local_workflow"] {
+            let mut adapter = Claude::default();
+            adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","task_type":kind,"description":"Review"})).unwrap();
+            adapter.receive(json!({"type":"user","uuid":"actual-handback","isMeta":true,
+                "origin":{"kind":"peer","from":"task","senderTaskId":"task","body":format!("{HANDBACK_PREAMBLE}\n  Original findings"),"handback":true},
+                "message":{"role":"user","content":"unused"}})).unwrap();
+            let mut notification = json!({"type":"system","subtype":"task_notification","task_id":"task","uuid":"terminal-after-handback","status":"completed","summary":"Original findings"});
+            let done = adapter.receive(notification.clone()).unwrap();
+            assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Notice,body,..},..}) if body.is_empty())));
+            assert!(
+                adapter
+                    .receive(notification.clone())
+                    .unwrap()
+                    .events
+                    .is_empty(),
+                "exact replay must not consume handoff state again or re-expose its body"
+            );
+            notification["summary"] = json!("Revised findings");
+            let changed = adapter.receive(notification.clone()).unwrap();
+            assert!(changed.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification["uuid"] = json!("fresh-report");
+            let fresh = adapter.receive(notification.clone()).unwrap();
+            assert!(fresh.events.iter().any(|event|matches!(event,Event::Item(Item {content:ItemContent::Delivery {kind:DeliveryKind::Report,body,..},..}) if body=="Revised findings")));
+            notification.as_object_mut().unwrap().remove("uuid");
+            for _ in 0..2 {
+                assert!(
+                    adapter
+                        .receive(notification.clone())
+                        .unwrap()
+                        .events
+                        .iter()
+                        .any(|event| matches!(
+                            event,
+                            Event::Item(Item {
+                                content: ItemContent::Delivery { .. },
+                                ..
+                            })
+                        )),
+                    "missing UUID never authorizes global replay suppression"
+                );
+            }
+            for carrier in ["", " \t\n"] {
+                notification["uuid"] = json!(carrier);
+                for _ in 0..2 {
+                    assert!(
+                        adapter
+                            .receive(notification.clone())
+                            .unwrap()
+                            .events
+                            .iter()
+                            .any(|event| matches!(
+                                event,
+                                Event::Item(Item {
+                                    content: ItemContent::Delivery { .. },
+                                    ..
+                                })
+                            )),
+                        "blank UUID does not suppress an actual notification"
+                    );
+                }
+            }
+            for index in 0..=MAX_TOOLS {
+                notification["uuid"] = json!(format!("bounded-{index}"));
+                adapter.receive(notification.clone()).unwrap();
+            }
+            assert_eq!(adapter.failure_receipts.len(), MAX_TOOLS);
+            assert!(adapter.tasks.is_empty());
+            adapter
+                .receive(json!({"type":"conversation_reset"}))
+                .unwrap();
+            assert!(adapter.failure_receipts.is_empty());
             assert!(adapter.report_tasks.is_empty());
         }
     }
@@ -10171,6 +11513,46 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
+        );
+    }
+
+    #[test]
+    fn attachment_paths_are_exact_and_relative_to_the_provider_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_cwd = directory.path().join("child-worktree");
+        std::fs::create_dir(&provider_cwd).unwrap();
+        std::fs::write(
+            directory.path().join("tree-real-expanded.png"),
+            "wrong root",
+        )
+        .unwrap();
+        std::fs::write(
+            provider_cwd.join("tree-real-expanded.png"),
+            b"\x89PNG\r\n\x1a\nchild image",
+        )
+        .unwrap();
+        let concrete =
+            attachment_block(&provider_cwd, Path::new("tree-real-expanded.png")).unwrap();
+        assert_eq!(concrete["type"], "image");
+        assert_eq!(
+            concrete["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nchild image")
+        );
+        for shorthand in ["tree-real-*.png", "tree-real-{expanded,collapsed}.png"] {
+            let error = attachment_block(&provider_cwd, Path::new(shorthand)).unwrap_err();
+            assert!(error.contains(&provider_cwd.join(shorthand).display().to_string()));
+        }
+        // Pattern characters can be valid literal filenames. Do not reject or
+        // expand them when an explicitly selected attachment exists verbatim.
+        std::fs::write(
+            provider_cwd.join("tree-real-*.png"),
+            b"\x89PNG\r\n\x1a\nliteral image",
+        )
+        .unwrap();
+        let literal = attachment_block(&provider_cwd, Path::new("tree-real-*.png")).unwrap();
+        assert_eq!(
+            literal["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nliteral image")
         );
     }
 

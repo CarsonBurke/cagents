@@ -1113,6 +1113,12 @@ impl HostedTerminalHandle {
         self.inner.published.desired_visibility()
     }
 
+    /// Ends the connection for good, as giving up on a lost daemon does.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.inner.stop.request();
+    }
+
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();
@@ -2639,11 +2645,38 @@ mod tests {
 
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
+        use std::io::{Read, Seek};
+
         if !systemd_user_manager_available() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        // Regular files avoid waiting for the background holder to close a pipe.
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let diagnostic = |file: &mut std::fs::File| {
+            const LIMIT: u64 = 4096;
+            let mut bytes = Vec::new();
+            if file
+                .rewind()
+                .and_then(|_| file.take(LIMIT + 1).read_to_end(&mut bytes))
+                .is_err()
+            {
+                return "[fixture output could not be read]".to_owned();
+            }
+            let truncated = bytes.len() as u64 > LIMIT;
+            bytes.truncate(LIMIT as usize);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&bytes),
+                if truncated {
+                    "\n[truncated after 4096 bytes]"
+                } else {
+                    ""
+                }
+            )
+        };
         let mut command = daemon_launch_command(
             Path::new("/bin/sh"),
             crate::notifications::Application::Cagents,
@@ -2656,8 +2689,16 @@ mod tests {
             .args(["-c", "cat /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
+        command
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap());
         let status = command.status().unwrap();
-        assert!(status.success(), "scope launch failed: {status}");
+        assert!(
+            status.success(),
+            "scope launch failed: {status}; fixed fixture stdout prefix: {:?}; stderr prefix: {:?}",
+            diagnostic(&mut stdout),
+            diagnostic(&mut stderr)
+        );
         let evidence = std::fs::read_to_string(output).unwrap();
         // A detached holder must survive a daemon handoff. Scope launchers
         // return when the main process exits and leave its children in place.
