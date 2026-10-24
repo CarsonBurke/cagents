@@ -189,7 +189,7 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
             );
         }
         let mut focus = ComposerFocus {
-            id: composer_id,
+            id: composer_id.clone(),
             found: 0,
             focused: false,
         };
@@ -197,18 +197,23 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
         assert_eq!(focus.found, 1, "one real mounted composer focus owner");
         assert!(focus.focused, "the real composer owns keyboard focus");
         let accessible = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let composer_ax_id = iced_accessibility::A11yId::from(composer_id);
         let composers = accessible
             .root()
             .iter()
             .chain(accessible.children())
-            .filter(|node| node.node().role() == Role::MultilineTextInput)
+            .filter(|node| {
+                node.node().role() == Role::MultilineTextInput
+                    && iced_accessibility::IdEq::eq(node.id(), &composer_ax_id)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             composers.len(),
             1,
-            "the chat composer is exported by App.view"
+            "the current chat composer is exported exactly once by App.view"
         );
         assert!(!composers[0].node().is_disabled());
+        assert!(!composers[0].node().is_hidden());
         let composer_bounds = composers[0]
             .node()
             .bounds()
