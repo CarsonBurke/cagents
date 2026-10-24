@@ -1467,7 +1467,7 @@ mod tests {
                     &mut frame,
                     renderer,
                     &[key(
-                        keyboard::Key::Character(text.clone()),
+                        keyboard::Key::Character(text.clone().into()),
                         keyboard::key::Code::KeyA,
                         Some(&text),
                     )],
