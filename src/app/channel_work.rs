@@ -1432,6 +1432,31 @@ mod tests {
                 .any(|value| value == "Updating the current view…")
         }
 
+        fn refresh_feedback(
+            frame: &mut Frame<'_>,
+            renderer: &cosmic::Renderer,
+            loading: bool,
+        ) -> iced::Rectangle {
+            let name = if loading {
+                "Updating channel work…"
+            } else {
+                "Refresh channel work"
+            };
+            let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let buttons = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 1, "one actual progress/refresh control");
+            assert_eq!(buttons[0].node().is_disabled(), loading);
+            labelled(frame, renderer, name).1
+        }
+
         fn loaded(home: Home, revision: u64) -> crate::channel_work::Snapshot {
             crate::channel_work::Snapshot {
                 home,
@@ -1521,6 +1546,188 @@ mod tests {
             fn write(&mut self, _: iced::advanced::clipboard::Kind, value: String) {
                 self.0 = value;
             }
+        }
+
+        #[test]
+        fn open_form_polling_keeps_native_fields_and_roles_stationary_with_header_progress() {
+            fn sized<'a>(
+                app: &'a Cagents,
+                cache: Cache,
+                renderer: &mut cosmic::Renderer,
+                size: iced::Size,
+            ) -> Frame<'a> {
+                let mut frame = iced::runtime::UserInterface::build(
+                    cosmic::ApplicationExt::view_main(app),
+                    size,
+                    cache,
+                    renderer,
+                );
+                draw(&mut frame, renderer);
+                frame
+            }
+            fn geometry(
+                frame: &mut Frame<'_>,
+                renderer: &cosmic::Renderer,
+                ids: &[widget::Id],
+            ) -> Vec<iced::Rectangle> {
+                let focus = probe(frame, renderer);
+                ids.iter()
+                    .map(|id| {
+                        focus
+                            .0
+                            .iter()
+                            .find(|node| node.id.as_ref().is_some_and(|actual| same(actual, id)))
+                            .unwrap_or_else(|| panic!("actual control disappeared: {id:?}"))
+                            .bounds
+                    })
+                    .collect()
+            }
+            fn unchanged(before: &[iced::Rectangle], after: &[iced::Rectangle]) {
+                assert_eq!(before.len(), after.len());
+                for (before, after) in before.iter().zip(after) {
+                    assert!(
+                        [
+                            before.x - after.x,
+                            before.y - after.y,
+                            before.width - after.width,
+                            before.height - after.height,
+                        ]
+                        .into_iter()
+                        .all(|delta| delta.abs() <= 0.01),
+                        "poll must not move a mounted field/role/Submit: {before:?} -> {after:?}"
+                    );
+                }
+            }
+            for size in [
+                iced::Size::new(1280.0, 900.0),
+                iced::Size::new(500.0, 1200.0),
+            ] {
+                let mut renderer = super::super::super::tests::headless_renderer();
+                let (mut app, home, form, cache) = fixture(&mut renderer);
+                app.window_width = size.width;
+                app.window_height = size.height;
+                let mut frame = sized(&app, cache, &mut renderer, size);
+                let repository = input(&mut frame, &renderer, "-repo");
+                let mut ids = vec![
+                    input(&mut frame, &renderer, "-host"),
+                    repository.clone(),
+                    input(&mut frame, &renderer, "-number"),
+                ];
+                ids.extend(
+                    ["Contributing", "Stewarding", "Review only", "Reference"]
+                        .map(|name| labelled(&mut frame, &renderer, name).0),
+                );
+                ids.push(labelled(&mut frame, &renderer, "Track PR").0);
+                let before = geometry(&mut frame, &renderer, &ids);
+                if size.width < 560.0 {
+                    assert!(
+                        before[5].y > before[3].y,
+                        "the mounted roles actually use the narrow layout"
+                    );
+                    assert_eq!(
+                        before[3].y, before[4].y,
+                        "first row is Contributing/Stewarding"
+                    );
+                    assert_eq!(before[5].y, before[6].y, "second row is Review/Reference");
+                }
+                let refresh = refresh_feedback(&mut frame, &renderer, false);
+                assert!(iced::Rectangle::with_size(size).contains(before[1].center()));
+                assert!(click(&mut frame, &mut renderer, before[1].center()).is_empty());
+                assert!(same(&active(&mut frame, &renderer), &repository));
+                let (messages, _) = event(
+                    &mut frame,
+                    &mut renderer,
+                    &[command_key("a", keyboard::key::Code::KeyA)],
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(messages.is_empty());
+                let selection = repository_state(&frame);
+                assert_eq!(selection, ("fixture/work".into(), 0, 12));
+                let cache = frame.into_cache();
+                let Some(Effect::Read {
+                    ticket,
+                    home: read_home,
+                    ..
+                }) = app.channel_work.view.refresh()
+                else {
+                    panic!("background read");
+                };
+                assert_eq!(read_home, home);
+                let mut frame = sized(&app, cache, &mut renderer, size);
+                assert!(!updating_caption(&mut frame, &renderer));
+                assert_eq!(refresh_feedback(&mut frame, &renderer, true), refresh);
+                unchanged(&before, &geometry(&mut frame, &renderer, &ids));
+                assert!(same(&active(&mut frame, &renderer), &repository));
+                assert_eq!(repository_state(&frame), selection);
+                let cache = frame.into_cache();
+                drop(app.update(Message::ChannelWork(ui::Action::Loaded {
+                    ticket,
+                    result: Ok(loaded(home, 2)),
+                })));
+                let mut frame = sized(&app, cache, &mut renderer, size);
+                assert!(!updating_caption(&mut frame, &renderer));
+                assert_eq!(refresh_feedback(&mut frame, &renderer, false), refresh);
+                unchanged(&before, &geometry(&mut frame, &renderer, &ids));
+                assert!(same(&active(&mut frame, &renderer), &repository));
+                assert_eq!(repository_state(&frame), selection);
+                let (_, submit) = labelled(&mut frame, &renderer, "Track PR");
+                assert!(
+                    iced::Rectangle::with_size(size).contains(submit.center()),
+                    "actual Submit remains in the test viewport: {submit:?}"
+                );
+                let messages = click(&mut frame, &mut renderer, submit.center());
+                let cache = frame.into_cache();
+                let expected = crate::channel_work::Target::PullRequest(
+                    crate::github_identity::PullRequestKey::from_url(
+                        "https://github.com/fixture/work/pull/17",
+                    )
+                    .unwrap(),
+                )
+                .canonicalized()
+                .unwrap();
+                assert!(
+                    matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Submit { owner, target, role: crate::channel_work::Role::Contribute, revision: 0 }))]
+                    if *owner == form && target == &expected)
+                );
+                // Do not dispatch the captured mutation. Manual refresh still
+                // uses its existing network-typed callback, unlike the Read above.
+                let mut frame = sized(&app, cache, &mut renderer, size);
+                let messages = click(&mut frame, &mut renderer, refresh.center());
+                let _ = frame.into_cache();
+                let [
+                    cosmic::Action::App(Message::ChannelWork(action @ ui::Action::Refresh(actual))),
+                ] = messages.as_slice()
+                else {
+                    panic!("actual manual refresh: {messages:?}");
+                };
+                assert_eq!(*actual, app.channel_work.view.owner().unwrap());
+                assert!(
+                    matches!(app.channel_work.view.update(action.clone()), Some(Effect::Refresh { home: actual, .. }) if actual == home)
+                );
+                assert!(app.channel_work.view.pending_homes().next().is_none());
+            }
+            // Without an editor, retain the existing body loading message.
+            let (mut app, home) = main_fixture();
+            app.core.set_main_window_id(Some(window::Id::RESERVED));
+            let Some(Effect::Read { ticket, .. }) = app.channel_work.view.refresh() else {
+                panic!("read");
+            };
+            let mut renderer = super::super::super::tests::headless_renderer();
+            let mut frame = mount(&app, Cache::new(), &mut renderer);
+            assert!(updating_caption(&mut frame, &renderer));
+            let refresh = refresh_feedback(&mut frame, &renderer, true);
+            assert!(
+                click(&mut frame, &mut renderer, refresh.center()).is_empty(),
+                "busy refresh has no callback"
+            );
+            let cache = frame.into_cache();
+            drop(app.update(Message::ChannelWork(ui::Action::Loaded {
+                ticket,
+                result: Ok(loaded(home, 2)),
+            })));
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(!updating_caption(&mut frame, &renderer));
+            assert_eq!(refresh_feedback(&mut frame, &renderer, false), refresh);
         }
 
         #[test]
@@ -1644,7 +1851,8 @@ mod tests {
             };
             assert_eq!(read_home, home);
             let mut frame = mount(&app, cache, &mut renderer);
-            assert!(updating_caption(&mut frame, &renderer));
+            assert!(!updating_caption(&mut frame, &renderer));
+            refresh_feedback(&mut frame, &renderer, true);
             assert!(
                 same(&active(&mut frame, &renderer), &repository),
                 "adding the poll caption must not blur Repository"
@@ -1668,6 +1876,7 @@ mod tests {
             })));
             let mut frame = mount(&app, cache, &mut renderer);
             assert!(!updating_caption(&mut frame, &renderer));
+            refresh_feedback(&mut frame, &renderer, false);
             assert!(
                 same(&active(&mut frame, &renderer), &repository),
                 "removing the poll caption must not blur Repository"
@@ -1691,7 +1900,8 @@ mod tests {
                 panic!("second poll");
             };
             let mut frame = mount(&app, cache, &mut renderer);
-            assert!(updating_caption(&mut frame, &renderer));
+            assert!(!updating_caption(&mut frame, &renderer));
+            refresh_feedback(&mut frame, &renderer, true);
             assert!(same(&active(&mut frame, &renderer), &repository));
             assert_eq!(repository_state(&frame), (incomplete.clone(), 0, 50));
             let cache = frame.into_cache();
@@ -1701,6 +1911,7 @@ mod tests {
             })));
             let mut frame = mount(&app, cache, &mut renderer);
             assert!(!updating_caption(&mut frame, &renderer));
+            refresh_feedback(&mut frame, &renderer, false);
             assert!(same(&active(&mut frame, &renderer), &repository));
             assert_eq!(repository_state(&frame), (incomplete, 0, 50));
             let mut messages = Vec::new();
@@ -1776,7 +1987,8 @@ mod tests {
                     panic!("poll");
                 };
                 let mut frame = mount(&app, cache, &mut renderer);
-                assert!(updating_caption(&mut frame, &renderer));
+                assert!(!updating_caption(&mut frame, &renderer));
+                refresh_feedback(&mut frame, &renderer, true);
                 assert!(
                     same(&active(&mut frame, &renderer), &roles[index]),
                     "quiet loading-row insertion must retain role{index} native focus"
@@ -1788,6 +2000,7 @@ mod tests {
                 })));
                 let mut frame = mount(&app, cache, &mut renderer);
                 assert!(!updating_caption(&mut frame, &renderer));
+                refresh_feedback(&mut frame, &renderer, false);
                 assert!(
                     same(&active(&mut frame, &renderer), &roles[index]),
                     "quiet matching reply must retain role{index} native focus"

@@ -1002,8 +1002,19 @@ impl State {
         );
         let refresh = ui_controls::owned(
             (owner, "refresh"),
-            ui_controls::icon_button(Icon::Refresh, "Refresh channel work")
-                .on_press_maybe(view.loading.is_none().then_some(Action::Refresh(owner))),
+            ui_controls::icon_button(
+                if view.loading.is_some() {
+                    Icon::Loading
+                } else {
+                    Icon::Refresh
+                },
+                if view.loading.is_some() {
+                    "Updating channel work…"
+                } else {
+                    "Refresh channel work"
+                },
+            )
+            .on_press_maybe(view.loading.is_none().then_some(Action::Refresh(owner))),
         );
         let title = widget::column::with_children(vec![
             design::caption("Channel work").into(),
@@ -1076,7 +1087,9 @@ impl State {
             );
             return mount(header, status, body, height);
         };
-        if view.loading.is_some() {
+        // Background reads must not move fields under the pointer while editing.
+        // The fixed-size header control still announces progress during a form.
+        if view.loading.is_some() && view.form.is_none() {
             status.push(design::caption("Updating the current view…").into());
         }
         if snapshot.lifecycle != HomeLifecycle::Active {
