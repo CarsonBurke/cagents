@@ -2042,13 +2042,28 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let task = app.find_highlight(target, id);
-        let effects = executor.block_on(async {
-            iced::runtime::task::into_stream(task)
-                .unwrap()
-                .collect::<Vec<_>>()
-                .await
-        });
+        // The real process-wide slot can belong to another mounted reader.
+        // Subscribe before attempting admission so release-before-wait is not
+        // lost; only an actual availability edge permits a deferred retry.
+        let mut capacity = available().subscribe();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let effects = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the real Find executor did not become available within five seconds"
+            );
+            capacity.borrow_and_update();
+            let task = app.find_highlight(target, id);
+            if let Some(stream) = iced::runtime::task::into_stream(task) {
+                break executor.block_on(stream.collect::<Vec<_>>());
+            }
+            executor.block_on(async {
+                tokio::time::timeout_at(deadline, capacity.changed())
+                    .await
+                    .expect("actual Find availability must arrive within five seconds")
+                    .expect("the process-owned availability sender remains live");
+            });
+        };
         let mut accepted = false;
         for effect in effects {
             if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
