@@ -319,6 +319,25 @@ fn discard_app_accessibility_click_uses_current_rendered_source_and_opens_confir
                     assert_eq!(app.discard_ui.source().unwrap().id, original);
                     assert!(!app.modal_is_open());
                 }
+                Message::ChatUi(chat_ui::Action::Scrolled(target, None, _, false))
+                    if app.workspace.focused() == Some(target.card)
+                        && matches!(app.cards.get(&target.card),
+                            Some(CardRuntime::Chat(runtime)) if runtime.target == *target) =>
+                {
+                    // The mounted transcript reports its initial geometry on
+                    // the first event, including a foreign inspector AX Click.
+                    // Reduce only this exact current, non-user layout report.
+                    let target = *target;
+                    assert_no_app_work(app.update(message));
+                    assert_eq!(app.workspace.focused(), Some(target.card));
+                    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&target.card) else {
+                        panic!("layout bookkeeping must retain the mounted chat");
+                    };
+                    assert_eq!(runtime.target, target);
+                    assert_eq!(runtime.unsent_text(), DRAFT);
+                    assert_eq!(app.discard_ui.source().unwrap().id, original);
+                    assert!(!app.modal_is_open());
+                }
                 _ => panic!("unexpected actual A11y message: {message:?}"),
             }
         }
