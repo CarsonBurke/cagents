@@ -502,6 +502,20 @@ pub(super) fn process_request(
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
     super::account_readiness::admit(host, &request)?;
+    // Retained originals are outside the session inventory. Refuse before
+    // publishing a preflight capability or requesting termination. This only
+    // observes custody already published now; quarantine can publish later.
+    // A malformed wire revision keeps its existing UnsupportedVersion result.
+    let shutdown_admission = matches!(&request, ClientRequest::Shutdown)
+        || matches!(&request, ClientRequest::ShutdownV1 { version, .. }
+            if *version == SHUTDOWN_VERSION);
+    if shutdown_admission && crate::daemon::child_reaper::has_retained_ownership() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            super::state::RETAINED_CHILD_CLEANUP_MESSAGE,
+            true,
+        ));
+    }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
