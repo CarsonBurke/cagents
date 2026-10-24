@@ -25,6 +25,7 @@ struct Residency;
 /// Called after reclaiming named state, before parking a tree. Traversal stops
 /// at each boundary: dropping its children releases the whole presentation.
 pub(crate) fn release_parked(tree: &mut Tree) {
+    trace_allocator("before_workspace_park");
     if release_parked_children(tree) {
         trace_global_font_sources();
     }
@@ -104,6 +105,56 @@ fn trace_global_font_sources() {
             shared_references,
         );
     }
+}
+
+/// Read allocator accounting only at existing presentation retirement boundaries.
+/// These are reserved/used allocation bytes, not resident or reclaimable bytes;
+/// native smaps observations supply that separate measurement.
+pub(crate) fn trace_allocator(boundary: &'static str) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if !tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+            return;
+        }
+        type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
+        static OBSERVE: std::sync::OnceLock<Option<Mallinfo2>> = std::sync::OnceLock::new();
+        let Some(observe) = OBSERVE.get_or_init(|| {
+            // Resolve optionally: a diagnostic must not require GLIBC_2.33 on
+            // systems which supported this executable before it was added.
+            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+            if symbol.is_null() {
+                None
+            } else {
+                // SAFETY: the GNU libc symbol has this exact C signature; its
+                // library remains loaded for the process lifetime.
+                Some(unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2>(symbol) })
+            }
+        }) else {
+            tracing::trace!(
+                target: "cagents::memory",
+                owner = "glibc_allocator",
+                boundary,
+                status = "unavailable",
+            );
+            return;
+        };
+        // SAFETY: the resolved function has no pointer arguments and returns a
+        // value snapshot. It neither releases pages nor changes allocator policy.
+        let info = unsafe { observe() };
+        tracing::trace!(
+            target: "cagents::memory",
+            process_id = std::process::id(),
+            owner = "glibc_allocator",
+            boundary,
+            status = "observed",
+            arena_bytes = info.arena,
+            used_arena_bytes = info.uordblks,
+            free_arena_bytes = info.fordblks,
+            mmap_bytes = info.hblkhd,
+        );
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = boundary;
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Gate<'_, Message> {

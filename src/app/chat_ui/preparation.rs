@@ -1332,6 +1332,11 @@ fn enqueue_retirement(retired: Retirement) {
             }
             let remaining = RETIRING.fetch_sub(1, Ordering::AcqRel) - 1;
             tracing::trace!(target: "cagents::memory", owner = "chat_retirement", pending_items = remaining);
+            if remaining == 0 {
+                // A new enqueue may race this observation; this is not a
+                // global quiescence or resident-memory assertion.
+                crate::ui_memory::trace_allocator("retirement_queue_observed_zero");
+            }
           }
         }).expect("start presentation retirement worker");
         owner
