@@ -1359,25 +1359,41 @@ impl State {
         rows.push(if enabled {
             let mut choices = ROLE_VALUES.iter().enumerate().map(|(index, role)| {
                 let selected = *role == form.role;
+                let action = Action::Role(owner, index);
                 ui_controls::owned(
                     (owner, *role),
-                    widget::button::custom(design::body(ROLES[index]))
-                        .name(ROLES[index])
-                        .description(format!(
-                            "{}{}",
-                            if selected {
-                                "Selected role. "
-                            } else {
-                                "Select role. "
-                            },
-                            role.description()
-                        ))
-                        .id(role_id(owner, *role))
-                        .selected(selected)
-                        .class(ui_controls::control_style(selected, None))
-                        .padding([space::XS, space::S])
-                        .width(Length::Fill)
-                        .on_press(Action::Role(owner, index)),
+                    crate::interaction::focused_key(
+                        widget::button::custom(design::body(ROLES[index]))
+                            .name(ROLES[index])
+                            .description(format!(
+                                "{}{}",
+                                if selected {
+                                    "Selected role. "
+                                } else {
+                                    "Select role. "
+                                },
+                                role.description()
+                            ))
+                            .id(role_id(owner, *role))
+                            .selected(selected)
+                            .class(ui_controls::control_style(selected, None))
+                            .padding([space::XS, space::S])
+                            .width(Length::Fill)
+                            .on_press(action.clone()),
+                        // Handle Enter before Button sets a lingering native press.
+                        move |event| {
+                            matches!(
+                                event,
+                                cosmic::iced::keyboard::Event::KeyPressed {
+                                    key: cosmic::iced::keyboard::Key::Named(
+                                        cosmic::iced::keyboard::key::Named::Enter
+                                    ),
+                                    ..
+                                }
+                            )
+                            .then(|| action.clone())
+                        },
+                    ),
                 )
             });
             if narrow {
