@@ -1593,7 +1593,11 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 signal,
                 intentional,
             },
-            TerminalEvent::Error { operation, message } => Self::Error {
+            // InputRejected is client-local. If serialized by a future caller,
+            // preserve the conservative existing wire Error semantics; a bare
+            // wire event must never issue trusted nonfatal admission evidence.
+            TerminalEvent::Error { operation, message }
+            | TerminalEvent::InputRejected { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
             },
