@@ -164,40 +164,60 @@ fn require_current_home(db: &Connection, home: &Home) -> Result<u64, String> {
 /// lifecycle transaction retires many entries. Root bumps metadata.sequence
 /// once for the enclosing model edit, not once per affected relation.
 fn retire_entries_in(tx: &Transaction<'_>, home: &Home, mut revision: u64) -> Result<u64, String> {
-    let rows = {
-        let mut statement = tx.prepare(
-            "SELECT target,entry FROM channel_work_entries WHERE channel=?1 AND incarnation=?2 ORDER BY sequence",
-        ).map_err(|error| error.to_string())?;
-        statement
-            .query_map(
-                params![home.channel.to_string(), home.creation_ordinal],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .map_err(|error| error.to_string())?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| error.to_string())?
-    };
-    for (target, raw) in rows {
-        let mut entry: Entry = decode(&raw)?;
-        entry.validate().map_err(|error| error.to_string())?;
-        if entry.user_ended && entry.claims.iter().all(|claim| !claim.active) {
-            continue;
+    // Sequence changes as rows retire, so walk the immutable canonical target
+    // key instead. Keep at most one small batch of decoded JSON in memory.
+    let mut after: Option<String> = None;
+    loop {
+        let rows = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT target,entry FROM channel_work_entries
+                 WHERE channel=?1 AND incarnation=?2
+                   AND (?3 IS NULL OR target COLLATE BINARY > ?3)
+                 ORDER BY target COLLATE BINARY LIMIT 8",
+                )
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map(
+                    params![home.channel.to_string(), home.creation_ordinal, after],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+        if rows.is_empty() {
+            break;
         }
-        entry.user_ended = true;
-        for claim in &mut entry.claims {
-            claim.active = false;
+        for (target, raw) in rows {
+            // Advance even when this row was already ended; otherwise an
+            // all-ended batch would repeat forever or hide later live work.
+            after = Some(target.clone());
+            let mut entry: Entry = decode(&raw)?;
+            entry.validate().map_err(|error| error.to_string())?;
+            if encode(&entry.target)? != target {
+                return Err("The channel work target key is inconsistent".into());
+            }
+            if entry.user_ended && entry.claims.iter().all(|claim| !claim.active) {
+                continue;
+            }
+            entry.user_ended = true;
+            for claim in &mut entry.claims {
+                claim.active = false;
+            }
+            entry.revision = entry
+                .revision
+                .checked_add(1)
+                .ok_or("The work entry revision is exhausted")?;
+            revision = revision
+                .checked_add(1)
+                .ok_or("The channel work revision is exhausted")?;
+            entry.validate().map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE channel_work_entries SET entry=?4,sequence=?5,bucket='history' WHERE channel=?1 AND incarnation=?2 AND target=?3",
+                params![home.channel.to_string(),home.creation_ordinal,target,encode(&entry)?,revision],
+            ).map_err(|error| error.to_string())?;
         }
-        entry.revision = entry
-            .revision
-            .checked_add(1)
-            .ok_or("The work entry revision is exhausted")?;
-        revision = revision
-            .checked_add(1)
-            .ok_or("The channel work revision is exhausted")?;
-        tx.execute(
-            "UPDATE channel_work_entries SET entry=?4,sequence=?5,bucket='history' WHERE channel=?1 AND incarnation=?2 AND target=?3",
-            params![home.channel.to_string(),home.creation_ordinal,target,encode(&entry)?,revision],
-        ).map_err(|error| error.to_string())?;
     }
     revision
         .checked_add(1)
@@ -519,87 +539,132 @@ fn read_entry(target: String, raw: String, bucket: String) -> Result<Entry, Stri
     Ok(entry)
 }
 
-fn read_in(db: &Connection, home: &Home, page: Page) -> Result<Snapshot, String> {
-    home.validate().map_err(|error| error.to_string())?;
-    page.validate().map_err(|error| error.to_string())?;
-    let upper = match page.before {
-        Some(before) => {
-            i64::try_from(before).map_err(|_| "The channel work history cursor is invalid")? - 1
-        }
-        None => i64::MAX,
-    };
-    let (lifecycle, revision) = home_state(db, home)?;
+/// Current and historical projections have independent strict keyset cursors
+/// and budgets. A lookahead row is consumed once and is never skipped: the
+/// continuation always names the last INCLUDED row, not the lookahead.
+fn read_bucket(
+    db: &Connection,
+    home: &Home,
+    before: Option<u64>,
+    limit: u16,
+    historical: bool,
+) -> Result<(Vec<Entry>, Option<u64>), String> {
+    let before = before
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| "The channel work cursor is invalid")?;
     let mut statement = db
         .prepare(
-            "SELECT target,entry,bucket FROM channel_work_entries
-         WHERE channel=?1 AND incarnation=?2 AND bucket IN ('ongoing','needs_confirmation')
-         ORDER BY sequence DESC",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(
-            params![home.channel.to_string(), home.creation_ordinal],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let mut entries = Vec::new();
-    for row in rows {
-        let (target, raw, bucket) = row.map_err(|error| error.to_string())?;
-        entries.push(read_entry(target, raw, bucket)?);
-    }
-    let mut statement = db
-        .prepare(
-            "SELECT target,entry,bucket,sequence FROM channel_work_entries
-         WHERE channel=?1 AND incarnation=?2 AND bucket='history' AND sequence<=?3
+            "SELECT target,sequence FROM channel_work_entries
+         WHERE channel=?1 AND incarnation=?2
+           AND ((?5 AND bucket='history') OR
+                (NOT ?5 AND bucket IN ('ongoing','needs_confirmation')))
+           AND (?3 IS NULL OR sequence<?3)
          ORDER BY sequence DESC LIMIT ?4",
         )
         .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(
-            params![
-                home.channel.to_string(),
-                home.creation_ordinal,
-                upper,
-                u32::from(page.limit) + 1
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            },
+    let mut rows = statement
+        .query(params![
+            home.channel.to_string(),
+            home.creation_ordinal,
+            before,
+            u32::from(limit) + 1,
+            historical,
+        ])
+        .map_err(|error| error.to_string())?;
+    // Sort only small canonical keys. Selecting Entry JSON here would let
+    // SQLite's combined-current-bucket sorter retain an unbounded payload.
+    let mut point = db
+        .prepare(
+            "SELECT entry,bucket FROM channel_work_entries
+         WHERE channel=?1 AND incarnation=?2 AND target=?3",
         )
         .map_err(|error| error.to_string())?;
-    let mut history = Vec::new();
+    let mut entries = Vec::new();
+    let mut bytes = 0_usize;
     let mut last = None;
-    let mut next_history = None;
-    for row in rows {
-        let (target, raw, bucket, sequence) = row.map_err(|error| error.to_string())?;
-        if history.len() == usize::from(page.limit) {
-            next_history = last;
+    let mut next = None;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        if entries.len() == usize::from(limit) {
+            next = last;
             break;
         }
-        history.push(read_entry(target, raw, bucket)?);
+        let target: String = row.get(0).map_err(|error| error.to_string())?;
+        let sequence: u64 = row.get(1).map_err(|error| error.to_string())?;
+        let (raw, bucket): (String, String) = point
+            .query_row(
+                params![home.channel.to_string(), home.creation_ordinal, target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        let entry = read_entry(target, raw, bucket)?;
+        let size = work::encoded_size(&entry).map_err(|error| error.to_string())?;
+        let combined = bytes
+            .checked_add(size)
+            .ok_or("The channel work projection is too large")?;
+        if combined > work::MAX_BUCKET_BYTES {
+            if entries.is_empty() {
+                return Err("A channel work entry exceeds the projection budget".into());
+            }
+            next = last;
+            break;
+        }
+        bytes = combined;
+        entries.push(entry);
         last = Some(sequence);
     }
+    Ok((entries, next))
+}
+
+fn read_in(db: &Connection, home: &Home, page: Page) -> Result<Snapshot, String> {
+    home.validate().map_err(|error| error.to_string())?;
+    page.validate().map_err(|error| error.to_string())?;
+    let (lifecycle, revision) = home_state(db, home)?;
+    let (entries, next_current) = read_bucket(db, home, page.current_before, page.limit, false)?;
+    let (history, next_history) = read_bucket(db, home, page.before, page.limit, true)?;
     let snapshot = Snapshot {
         home: *home,
         lifecycle,
         revision,
         entries,
+        next_current,
         history,
         next_history,
     };
     snapshot.validate().map_err(|error| error.to_string())?;
     Ok(snapshot)
+}
+
+fn read_target_in(
+    db: &Connection,
+    home: &Home,
+    target: &work::Target,
+) -> Result<work::TargetSnapshot, String> {
+    home.validate().map_err(|error| error.to_string())?;
+    let target = target.canonicalized().map_err(|error| error.to_string())?;
+    let (lifecycle, revision) = home_state(db, home)?;
+    let key = encode(&target)?;
+    let raw: Option<(String, String)> = db
+        .query_row(
+            "SELECT entry,bucket FROM channel_work_entries
+         WHERE channel=?1 AND incarnation=?2 AND target=?3",
+            params![home.channel.to_string(), home.creation_ordinal, key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let entry = raw
+        .map(|(raw, bucket)| read_entry(key, raw, bucket))
+        .transpose()?;
+    let result = work::TargetSnapshot {
+        home: *home,
+        lifecycle,
+        revision,
+        target,
+        entry,
+    };
+    result.validate().map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 fn operation_in(
@@ -658,6 +723,115 @@ impl Registry {
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         let result = read_in(&tx, home, page)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    /// Metadata-only recovery read. Retained archived/deleted homes still own
+    /// original receipts; projection availability is unrelated to lookup.
+    pub(crate) fn read_channel_work_home(&self, home: &Home) -> Result<HomeState, String> {
+        home.validate().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let (lifecycle, revision) = home_state(&tx, home)?;
+        let result = HomeState {
+            home: *home,
+            lifecycle,
+            revision,
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    /// Select across every tracked PR, independently of visible projection
+    /// pages. JSON ranking scans this home's rows (O(N)); it returns at most
+    /// four small keys, then decodes at most four bounded Entries.
+    /// This read does not create ownership or advance observation attempts.
+    pub(crate) fn read_channel_work_refresh_candidates(
+        &self,
+        home: &Home,
+    ) -> Result<Vec<Entry>, String> {
+        home.validate().map_err(|error| error.to_string())?;
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let revision = require_current_home(&tx, home)?;
+        // -> returns JSON integer text, preserving full u64 precision.
+        // json_extract/->> can round adjacent values above i64::MAX to REAL.
+        // Decimal length and binary order compare canonical unsigned fields
+        // exactly; the selected Entries undergo typed validation below.
+        let keys = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT target FROM (
+                   SELECT target,
+                          COALESCE(entry -> '$.observation.generation','0') AS generation,
+                          COALESCE(entry -> '$.observation.observed_at_ms','0') AS observed
+                   FROM channel_work_entries
+                   WHERE channel=?1 AND incarnation=?2
+                     AND json_type(target,'$.PullRequest')='object'
+                 ) ORDER BY length(generation),generation COLLATE BINARY,
+                            length(observed),observed COLLATE BINARY,
+                            target COLLATE BINARY LIMIT 4",
+                )
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map(
+                    params![home.channel.to_string(), home.creation_ordinal],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+        let entries = {
+            let mut point = tx
+                .prepare(
+                    "SELECT entry,bucket FROM channel_work_entries
+                 WHERE channel=?1 AND incarnation=?2 AND target=?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in keys {
+                let (raw, bucket): (String, String) = point
+                    .query_row(
+                        params![home.channel.to_string(), home.creation_ordinal, key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let entry = read_entry(key, raw, bucket)?;
+                if !matches!(entry.target, work::Target::PullRequest(_))
+                    || entry.revision > revision
+                    || entry
+                        .contexts
+                        .iter()
+                        .any(|context| context.registry != home.registry)
+                {
+                    return Err("The refresh candidate has inconsistent channel context".into());
+                }
+                entries.push(entry);
+            }
+            entries
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(entries)
+    }
+
+    /// Exact canonical target lookup for mutation CAS. Absence is explicit;
+    /// it never follows from a bounded projection page omitting the target.
+    pub(crate) fn read_channel_work_target(
+        &self,
+        home: &Home,
+        target: &work::Target,
+    ) -> Result<work::TargetSnapshot, String> {
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let result = read_target_in(&tx, home, target)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }

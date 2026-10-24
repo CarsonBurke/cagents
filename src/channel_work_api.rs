@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    channel_work::{Home, Mutation, Page, Receipt, Reply, Snapshot},
+    channel_work::{
+        Home, HomeLifecycle, Mutation, Page, Receipt, Reply, Snapshot, Target, TargetSnapshot,
+    },
     model::{CardId, ChannelId, RunId, TerminalId},
 };
 
@@ -48,6 +50,14 @@ pub enum Request {
     Refresh {
         home: Home,
     },
+    ReadTarget {
+        home: Home,
+        target: Target,
+    },
+    /// Reconcile an original durable home without loading any work projection.
+    ReadHome {
+        home: Home,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,4 +76,10 @@ pub enum Response {
     Applied(Reply),
     Receipt(Option<Receipt>),
     Failed(Failure),
+    Target(TargetSnapshot),
+    Home {
+        home: Home,
+        lifecycle: HomeLifecycle,
+        revision: u64,
+    },
 }

@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_BYTES: u64 = 64 * 1024;
-const HISTORY_PAGES: usize = 100;
 
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
@@ -25,6 +24,8 @@ pub enum WorkCommand {
         channel: Option<ChannelId>,
         #[arg(long)]
         before: Option<u64>,
+        #[arg(long)]
+        current_before: Option<u64>,
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
@@ -195,9 +196,14 @@ impl Prepared {
             WorkCommand::Show {
                 channel,
                 before,
+                current_before,
                 limit,
             } => {
-                let page = Page { before, limit };
+                let page = Page {
+                    current_before,
+                    before,
+                    limit,
+                };
                 page.validate().map_err(invalid)?;
                 Self::Show(channel, page)
             }
@@ -313,6 +319,19 @@ where
     match send(Request::Read { home, page }).map_err(protocol_error)? {
         Response::Snapshot(snapshot) if snapshot.home == home => {
             snapshot.validate().map_err(|_| contract())?;
+            if snapshot.entries.len() > usize::from(page.limit)
+                || snapshot.history.len() > usize::from(page.limit)
+                || snapshot
+                    .next_current
+                    .zip(page.current_before)
+                    .is_some_and(|(next, before)| next >= before)
+                || snapshot
+                    .next_history
+                    .zip(page.before)
+                    .is_some_and(|(next, before)| next >= before)
+            {
+                return Err(contract());
+            }
             Ok(snapshot)
         }
         Response::Failed(Failure::Refused(reason)) => {
@@ -345,7 +364,7 @@ where
             let selected = context(channel, send)?;
             let snapshot = read(selected.home, page, send)?;
             let mut lines = vec![format!(
-                "{} · {} declared ongoing work",
+                "{} · {} declared ongoing work shown on this page",
                 format::plain(&selected.title),
                 snapshot
                     .entries
@@ -370,6 +389,9 @@ where
                     },
                     entry.role().map_or("No current declaration", Role::label)
                 ));
+            }
+            if let Some(cursor) = snapshot.next_current {
+                lines.push(format!("More current relations: --current-before {cursor}"));
             }
             if let Some(cursor) = snapshot.next_history {
                 lines.push(format!("More history: --before {cursor}"));
@@ -436,46 +458,27 @@ fn target_revision<F>(home: Home, target: &Target, send: &mut F) -> Result<Optio
 where
     F: FnMut(Request) -> Result<Response, ControlError>,
 {
-    let mut page = Page {
-        before: None,
-        limit: crate::channel_work::MAX_PAGE,
-    };
-    let mut revision = None;
-    for _ in 0..HISTORY_PAGES {
-        let snapshot = read(home, page, send)?;
-        if snapshot.lifecycle != crate::channel_work::HomeLifecycle::Active {
-            return Err(AppError::new(
-                "channel_work_inactive",
-                "This channel work home is archived or deleted; no mutation was sent",
-            ));
+    match send(Request::ReadTarget {
+        home,
+        target: target.clone(),
+    })
+    .map_err(protocol_error)?
+    {
+        Response::Target(snapshot) if snapshot.home == home && &snapshot.target == target => {
+            snapshot.validate().map_err(|_| contract())?;
+            if snapshot.lifecycle != crate::channel_work::HomeLifecycle::Active {
+                return Err(AppError::new(
+                    "channel_work_inactive",
+                    "This channel work home is archived or deleted; no mutation was sent",
+                ));
+            }
+            Ok(snapshot.entry.map(|entry| entry.revision))
         }
-        if revision.is_some_and(|old| old != snapshot.revision) {
-            return Err(AppError::new(
-                "channel_work_changed",
-                "The work list changed while locating this PR; inspect it before trying again",
-            ));
+        Response::Failed(Failure::Refused(reason)) => {
+            Err(AppError::new("channel_work_refused", reason))
         }
-        revision = Some(snapshot.revision);
-        if let Some(entry) = snapshot
-            .entries
-            .iter()
-            .chain(&snapshot.history)
-            .find(|entry| &entry.target == target)
-        {
-            return Ok(Some(entry.revision));
-        }
-        let Some(next) = snapshot.next_history else {
-            return Ok(None);
-        };
-        if next == 0 || page.before.is_some_and(|before| next >= before) {
-            return Err(contract());
-        }
-        page.before = Some(next);
+        _ => Err(contract()),
     }
-    Err(AppError::new(
-        "channel_work_history_limit",
-        "This target could not be resolved within 100 history pages; no mutation was sent",
-    ))
 }
 
 fn submit<F>(request: Request, send: &mut F) -> Result<CommandOutput, AppError>
@@ -621,7 +624,9 @@ fn load_request(path: &Path) -> Result<Request, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel_work::{Entry, HomeLifecycle, HomeState, Origin, Receipt, reduce_entry};
+    use crate::channel_work::{
+        Entry, HomeLifecycle, HomeState, Origin, Receipt, TargetSnapshot, reduce_entry,
+    };
     use crate::channel_work_api::Caller;
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -657,7 +662,17 @@ mod tests {
             revision: 0,
             entries: vec![],
             history: vec![],
+            next_current: None,
             next_history: None,
+        }
+    }
+    fn target_value(target: Target, entry: Option<Entry>) -> TargetSnapshot {
+        TargetSnapshot {
+            home: home(),
+            lifecycle: HomeLifecycle::Active,
+            revision: 100,
+            target,
+            entry,
         }
     }
     fn request() -> Request {
@@ -690,6 +705,14 @@ mod tests {
                 .is_err()
         );
         assert!(Grammar::try_parse_from(["work", "show", "--limit", "101"]).is_err());
+        let show =
+            Grammar::try_parse_from(["work", "show", "--before", "20", "--current-before", "30"])
+                .unwrap();
+        let Prepared::Show(_, page) = Prepared::new(show.command).unwrap() else {
+            panic!("show")
+        };
+        assert_eq!(page.before, Some(20));
+        assert_eq!(page.current_before, Some(30));
         for url in [
             "http://github.com/a/b/pull/1",
             "https://token@github.com/a/b/pull/1",
@@ -736,8 +759,17 @@ mod tests {
                 sent.push(r.clone());
                 Ok(match r {
                     Request::Context { .. } => Response::Context(context_value()),
-                    Request::Read { .. } => Response::Snapshot(snapshot_value()),
-                    Request::Mutate { .. } => return Err(ControlError::ConnectionClosed),
+                    Request::ReadTarget { target, .. } => {
+                        Response::Target(target_value(target, None))
+                    }
+                    Request::Mutate { mutation, caller } => {
+                        assert_eq!(
+                            mutation.expected_revision, 0,
+                            "only an exact absent target creates revision zero"
+                        );
+                        assert_eq!(caller, context_value().caller);
+                        return Err(ControlError::ConnectionClosed);
+                    }
                     _ => panic!("unexpected request"),
                 })
             },
@@ -790,45 +822,54 @@ mod tests {
     }
 
     #[test]
-    fn wrong_scope_or_changed_history_revision_stops_before_any_mutation() {
-        let mut count = 0;
-        let result = run(
-            Prepared::Change {
-                channel: Some(home().channel),
-                change: Change::End {
-                    target: parse_pull_request("https://github.com/a/b/pull/1").unwrap(),
+    fn wrong_scope_target_or_unavailable_lookup_stops_before_any_mutation() {
+        let target = parse_pull_request("https://github.com/a/b/pull/1").unwrap();
+        for case in 0..5 {
+            let mut count = 0;
+            let result = run(
+                Prepared::Change {
+                    channel: Some(home().channel),
+                    change: Change::End {
+                        target: target.clone(),
+                    },
+                    save: None,
                 },
-                save: None,
-            },
-            &mut |r| {
-                count += 1;
-                match r {
-                    Request::Context { .. } => Ok(Response::Context(context_value())),
-                    Request::Read { .. } => {
-                        let mut s = snapshot_value();
-                        s.home.registry = Uuid::from_u128(99);
-                        Ok(Response::Snapshot(s))
-                    }
-                    _ => panic!("scope mismatch must not mutate"),
-                }
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(count, 2);
-        let mut count = 0;
-        let result = target_revision(
-            home(),
-            &parse_pull_request("https://github.com/a/b/pull/1").unwrap(),
-            &mut |_| {
-                count += 1;
-                let mut s = snapshot_value();
-                s.revision = count;
-                s.next_history = Some(100 - count);
-                Ok(Response::Snapshot(s))
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(count, 2);
+                &mut |request| {
+                    count += 1;
+                    Ok(match request {
+                        Request::Context { .. } => Response::Context(context_value()),
+                        Request::ReadTarget {
+                            home: selected,
+                            target: requested,
+                        } => {
+                            assert_eq!(selected, home());
+                            assert_eq!(requested, target);
+                            let mut value = target_value(target.clone(), None);
+                            match case {
+                                0 => value.home.registry = Uuid::from_u128(99),
+                                1 => {
+                                    value.target =
+                                        parse_pull_request("https://github.com/fork/b/pull/1")
+                                            .unwrap()
+                                }
+                                2 => return Err(ControlError::ConnectionClosed),
+                                3 => {
+                                    return Ok(Response::Failed(Failure::Refused(
+                                        "Unavailable".into(),
+                                    )));
+                                }
+                                4 => value.lifecycle = HomeLifecycle::Archived,
+                                _ => unreachable!(),
+                            }
+                            Response::Target(value)
+                        }
+                        _ => panic!("failed lookup must not mutate: {case}"),
+                    })
+                },
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(count, 2, "case {case}");
+        }
     }
 
     #[test]
@@ -932,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn target_beyond_first_history_page_uses_its_exact_entry_revision_and_caller() {
+    fn exact_target_lookup_uses_its_entry_revision_and_captured_caller_without_page_scans() {
         let target = parse_pull_request("https://github.com/owner/repo/pull/1").unwrap();
         let mut sent = Vec::new();
         let output = run(
@@ -947,17 +988,13 @@ mod tests {
                 sent.push(request.clone());
                 Ok(match request {
                     Request::Context { .. } => Response::Context(context_value()),
-                    Request::Read { page, .. } => {
-                        let mut snapshot = snapshot_value();
-                        snapshot.revision = 100;
-                        if page.before.is_none() {
-                            snapshot.history.push(historical_entry(2));
-                            snapshot.next_history = Some(50);
-                        } else {
-                            assert_eq!(page.before, Some(50));
-                            snapshot.history.push(historical_entry(1));
-                        }
-                        Response::Snapshot(snapshot)
+                    Request::ReadTarget {
+                        home: selected,
+                        target: requested,
+                    } => {
+                        assert_eq!(selected, home());
+                        assert_eq!(requested, target);
+                        Response::Target(target_value(target.clone(), Some(historical_entry(1))))
                     }
                     Request::Mutate { mutation, caller } => {
                         assert_eq!(mutation.change.target(), &target);
@@ -970,13 +1007,84 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(sent.len(), 4, "two read pages and exactly one mutation");
+        assert_eq!(
+            sent.len(),
+            3,
+            "one exact target lookup and exactly one mutation"
+        );
         assert_eq!(output.data["outcome"], "failed");
         assert!(
             output
                 .human
                 .contains("an earlier attempt with this UUID may already be recorded")
         );
+    }
+
+    #[test]
+    fn show_pages_current_and_history_independently_without_claiming_global_totals() {
+        let page = Page {
+            current_before: Some(30),
+            before: Some(20),
+            limit: 2,
+        };
+        let mut sent = Vec::new();
+        let output = run(Prepared::Show(None, page), &mut |request| {
+            sent.push(request.clone());
+            Ok(match request {
+                Request::Context { .. } => Response::Context(context_value()),
+                Request::Read {
+                    home: selected,
+                    page: requested,
+                } => {
+                    assert_eq!(selected, home());
+                    assert_eq!(requested, page);
+                    let mut value = snapshot_value();
+                    value.revision = 100;
+                    let mut current = historical_entry(1);
+                    current.user_ended = false;
+                    current.claims[0].active = true;
+                    value.entries.push(current);
+                    value.history.push(historical_entry(2));
+                    value.next_current = Some(10);
+                    value.next_history = Some(5);
+                    Response::Snapshot(value)
+                }
+                _ => panic!("show does not mutate"),
+            })
+        })
+        .unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(
+            output
+                .human
+                .contains("1 declared ongoing work shown on this page")
+        );
+        assert!(output.human.contains("--current-before 10"));
+        assert!(output.human.contains("--before 5"));
+        for invalid in 0..3 {
+            let result = read(home(), page, &mut |_| {
+                let mut value = snapshot_value();
+                value.revision = 100;
+                value.history.push(historical_entry(1));
+                match invalid {
+                    0 => value.next_history = Some(20),
+                    1 => {
+                        value.history.push(historical_entry(2));
+                        value.history.push(historical_entry(3));
+                    }
+                    2 => {
+                        let mut row = historical_entry(2);
+                        row.user_ended = false;
+                        row.claims[0].active = true;
+                        value.entries.push(row);
+                        value.next_current = Some(31);
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(Response::Snapshot(value))
+            });
+            assert!(result.is_err(), "page contract case {invalid}");
+        }
     }
 
     #[test]

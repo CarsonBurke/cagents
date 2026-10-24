@@ -96,6 +96,7 @@ fn snapshot(entry: Entry, revision: u64) -> Snapshot {
             vec![entry.clone()]
         },
         history: if historical { vec![entry] } else { Vec::new() },
+        next_current: None,
         next_history: None,
     }
 }
@@ -634,6 +635,7 @@ fn snapshot_partition_and_wire_grammar_reject_authority_or_status_fabrication() 
     assert_eq!(page.validate(), Err(Error::InvalidSnapshot));
     assert_eq!(
         Page {
+            current_before: None,
             before: None,
             limit: 101
         }
@@ -839,4 +841,200 @@ fn malformed_metadata_and_duplicate_row_identity_are_refused_at_snapshot_boundar
     assert_eq!(context.validate(), Err(Error::InvalidMetadata));
     context.path = "/repo/\0other".into();
     assert_eq!(context.validate(), Err(Error::InvalidMetadata));
+}
+
+// Maximal bounded fields exercise the actual serializer, not an estimated row size.
+fn maximum_entry(number: u64) -> Entry {
+    let repository = GitHubRepoKey::new(
+        "h".repeat(253),
+        Some(u16::MAX),
+        "o".repeat(256),
+        "r".repeat(256),
+    )
+    .unwrap();
+    let target = Target::PullRequest(PullRequestKey::new(repository.clone(), number).unwrap());
+    let mut entry = claim(
+        None,
+        target,
+        Role::Contribute,
+        &Origin::User,
+        8000 + u128::from(number),
+    );
+    entry.revision = u64::MAX;
+    entry.claims = (0..MAX_CLAIMS)
+        .map(|index| Claim {
+            source: Source::Session(Contributor {
+                session: TerminalId::from_uuid(uuid(10000 + index as u128)),
+                lineage: Lineage(TerminalId::from_uuid(uuid(20000 + index as u128))),
+                agent: Some(AgentId::from_uuid(uuid(30000 + index as u128))),
+                run: Some(RunId::from_uuid(uuid(40000 + index as u128))),
+            }),
+            role: Role::Contribute,
+            active: true,
+            confirmed_generation: u64::MAX,
+        })
+        .collect();
+    let path = PathBuf::from(format!(
+        "/{}x",
+        "é".repeat((MAX_CONTEXT_PATH_BYTES - 2) / 2)
+    ));
+    assert_eq!(
+        path.as_os_str().as_encoded_bytes().len(),
+        MAX_CONTEXT_PATH_BYTES
+    );
+    entry.contexts = (0..MAX_CONTEXTS)
+        .map(|index| CheckoutContext {
+            id: uuid(50000 + index as u128),
+            registry: home().registry,
+            repository: path.clone(),
+            path: path.clone(),
+            branch: Some("b".repeat(1024)),
+            head: Some("f".repeat(64)),
+            generation: u64::MAX,
+            dirty: true,
+        })
+        .collect();
+    entry.observation = Some(Observation {
+        generation: u64::MAX,
+        state: PrState::Open { draft: true },
+        freshness: Freshness::Current,
+        title: Some("t".repeat(512)),
+        node_id: Some("n".repeat(256)),
+        head: Some(Head {
+            repository,
+            branch: "b".repeat(1024),
+            oid: "f".repeat(64),
+        }),
+        observed_at_ms: u64::MAX,
+    });
+    entry
+}
+
+#[test]
+fn maximum_valid_entry_fits_a_wire_bucket_and_encoded_path_limit_is_exact() {
+    let entry = maximum_entry(u64::MAX);
+    entry.validate().unwrap();
+    let bytes = postcard::to_stdvec(&entry).unwrap();
+    assert_eq!(encoded_size(&entry).unwrap(), bytes.len());
+    assert!(bytes.len() < MAX_BUCKET_BYTES);
+    let mut too_long = entry.contexts[0].clone();
+    too_long.path.push("x");
+    assert_eq!(too_long.validate(), Err(Error::InvalidMetadata));
+    let mut row = entry.clone();
+    row.contexts.push(too_long);
+    assert_eq!(row.validate(), Err(Error::Capacity));
+    let point = TargetSnapshot {
+        home: home(),
+        lifecycle: HomeLifecycle::Active,
+        revision: u64::MAX,
+        target: entry.target.clone(),
+        entry: Some(entry),
+    };
+    point.validate().unwrap();
+    assert!(encoded_size(&point).unwrap() < 2 * 1024 * 1024);
+}
+
+#[test]
+fn current_and_history_pages_enforce_independent_count_and_byte_budgets() {
+    let first = maximum_entry(1);
+    let mut second = maximum_entry(2);
+    second.id = uuid(90000);
+    let mut page = snapshot(first.clone(), u64::MAX);
+    page.entries.push(second.clone());
+    assert!(page.entries.len() < usize::from(MAX_PAGE));
+    assert!(encoded_size(&first).unwrap() + encoded_size(&second).unwrap() > MAX_BUCKET_BYTES);
+    assert_eq!(
+        page.validate(),
+        Err(Error::Capacity),
+        "current bytes, not row count"
+    );
+    second.user_ended = true;
+    page.entries.pop();
+    page.history.push(second.clone());
+    page.next_current = Some(40);
+    page.next_history = Some(20);
+    page.validate().unwrap();
+    assert!(encoded_size(&page).unwrap() <= MAX_SNAPSHOT_BYTES);
+    let mut third = first.clone();
+    third.id = uuid(90001);
+    third.user_ended = true;
+    page.history.push(third);
+    assert_eq!(
+        page.validate(),
+        Err(Error::Capacity),
+        "history has its own byte budget"
+    );
+
+    let mut small = snapshot(
+        claim(None, pr(10), Role::Review, &Origin::User, 91000),
+        1000,
+    );
+    small.entries = (0..=MAX_PAGE)
+        .map(|number| {
+            let mut entry = claim(
+                None,
+                pr(100 + u64::from(number)),
+                Role::Review,
+                &Origin::User,
+                92000 + u128::from(number),
+            );
+            entry.id = uuid(93000 + u128::from(number));
+            entry
+        })
+        .collect();
+    assert_eq!(small.validate(), Err(Error::Capacity));
+    for entry in &mut small.entries {
+        entry.user_ended = true;
+    }
+    small.history = std::mem::take(&mut small.entries);
+    assert_eq!(small.validate(), Err(Error::Capacity));
+}
+
+#[test]
+fn independent_page_cursors_and_point_target_echo_cannot_hide_invalid_scope() {
+    let mut page = Page {
+        current_before: Some(30),
+        before: Some(20),
+        limit: MAX_PAGE,
+    };
+    page.validate().unwrap();
+    page.current_before = Some(0);
+    assert!(page.validate().is_err());
+    page.current_before = None;
+    page.before = Some(0);
+    assert!(page.validate().is_err());
+    let entry = claim(None, pr(1), Role::Steward, &Origin::User, 95000);
+    let mut point = TargetSnapshot {
+        home: home(),
+        lifecycle: HomeLifecycle::Active,
+        revision: entry.revision,
+        target: pr(1),
+        entry: Some(entry.clone()),
+    };
+    point.validate().unwrap();
+    point.target = pr(2);
+    assert_eq!(point.validate(), Err(Error::InvalidSnapshot));
+    point.target = pr(1);
+    point
+        .entry
+        .as_mut()
+        .unwrap()
+        .contexts
+        .push(context(96000, "branch", uuid(99)));
+    assert_eq!(point.validate(), Err(Error::InvalidSnapshot));
+    point.entry = Some(entry.clone());
+    point.revision = 0;
+    assert_eq!(point.validate(), Err(Error::InvalidSnapshot));
+    point.revision = entry.revision;
+    point.lifecycle = HomeLifecycle::Archived;
+    assert_eq!(point.validate(), Err(Error::InvalidSnapshot));
+    point.entry = None;
+    point.validate().unwrap(); // Exact validated absence is distinct from unavailable lookup.
+    let mut snapshot = snapshot(entry, 10);
+    snapshot.next_history = Some(10);
+    assert_eq!(
+        snapshot.validate(),
+        Err(Error::InvalidSnapshot),
+        "empty bucket cannot advertise a continuation"
+    );
 }

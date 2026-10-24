@@ -2,8 +2,8 @@
 //! queued messages and native child state retain the exact home and target.
 use crate::{
     channel_work::{
-        Bucket, Change, Entry, Freshness, Home, HomeLifecycle, Mutation, Page, PrState, Reply,
-        Role, Snapshot, Source, Target,
+        Bucket, Change, Entry, Freshness, Home, HomeLifecycle, Mutation, Page, PrState, Receipt,
+        Reply, Role, Snapshot, Source, Target,
     },
     design::{self, space},
     github_identity::{GitHubRepoKey, PullRequestKey},
@@ -88,6 +88,8 @@ pub enum Action {
     Close(ViewOwner),
     Tab(ViewOwner, Bucket),
     Refresh(ViewOwner),
+    NextCurrent(ViewOwner, u64),
+    LatestCurrent(ViewOwner),
     Earlier(ViewOwner, u64),
     Latest(ViewOwner),
     More(ViewOwner),
@@ -121,7 +123,7 @@ pub enum Action {
     LookedUp {
         ticket: Ticket,
         operation: Uuid,
-        result: Result<Option<Reply>, Failure>,
+        result: Result<Option<Receipt>, Failure>,
     },
 }
 impl Action {
@@ -332,6 +334,7 @@ impl State {
             title,
             snapshot: None,
             page: Page {
+                current_before: None,
                 before: None,
                 limit: PAGE_SIZE,
             },
@@ -491,16 +494,19 @@ impl State {
             }
         }
     }
-    fn valid_reply(pending: &Pending, reply: &Reply) -> bool {
-        reply.snapshot.validate().is_ok()
-            && reply.snapshot.home == pending.mutation.home
-            && reply.receipt.home == pending.mutation.home
-            && reply.receipt.operation == pending.mutation.operation
+    fn valid_receipt(pending: &Pending, receipt: &Receipt) -> bool {
+        receipt.home == pending.mutation.home
+            && receipt.operation == pending.mutation.operation
             && pending
                 .mutation
                 .expected_revision
-                .checked_add(u64::from(reply.receipt.changed))
-                == Some(reply.receipt.revision)
+                .checked_add(u64::from(receipt.changed))
+                == Some(receipt.revision)
+    }
+    fn valid_reply(pending: &Pending, reply: &Reply) -> bool {
+        Self::valid_receipt(pending, &reply.receipt)
+            && reply.snapshot.validate().is_ok()
+            && reply.snapshot.home == pending.mutation.home
             && reply.receipt.revision <= reply.snapshot.revision
     }
     fn applied(&mut self, index: usize, result: Result<Reply, Failure>) {
@@ -519,6 +525,7 @@ impl State {
                         .as_ref()
                         .is_some_and(|snapshot| snapshot.revision == reply_revision)
                     {
+                        view.page.current_before = None;
                         view.page.before = None;
                         view.read_page = None;
                         // The mutation reply contains a fresh latest page. A read
@@ -593,7 +600,11 @@ impl State {
                     Ok(snapshot)
                         if snapshot.home == ticket.home
                             && snapshot.validate().is_ok()
+                            && snapshot.entries.len() <= usize::from(page.limit)
                             && snapshot.history.len() <= usize::from(page.limit)
+                            && page.current_before.is_none_or(|before| {
+                                snapshot.next_current.is_none_or(|next| next < before)
+                            })
                             && page.before.is_none_or(|before| {
                                 snapshot.next_history.is_none_or(|next| next < before)
                             }) =>
@@ -635,7 +646,28 @@ impl State {
                     pending.lookup == Some(ticket) && pending.mutation.operation == operation
                 })?;
                 match result {
-                    Ok(Some(reply)) => self.applied(index, Ok(reply)),
+                    Ok(Some(receipt)) if Self::valid_receipt(&self.pending[index], &receipt) => {
+                        let pending = self.pending.remove(index);
+                        if let Some(view) = self
+                            .view
+                            .as_mut()
+                            .filter(|view| view.owner.home == pending.mutation.home)
+                        {
+                            view.form = None;
+                            view.notice = Some("The original tracking change is confirmed. Refreshing the current view…".into());
+                            // A receipt settles an operation, not its current state.
+                            // Retire any older page read and request a separate latest
+                            // projection. Failure of that read cannot undo confirmation.
+                            view.loading = None;
+                            view.read_page = Some(Page {
+                                current_before: None,
+                                before: None,
+                                limit: PAGE_SIZE,
+                            });
+                            let owner = view.owner;
+                            return self.read(owner);
+                        }
+                    }
                     _ => {
                         self.pending[index].lookup = None;
                         self.pending[index].delivery = Delivery::Unknown;
@@ -653,6 +685,7 @@ impl State {
                     return None;
                 }
                 self.view.as_mut()?.read_page = Some(Page {
+                    current_before: None,
                     before: None,
                     limit: PAGE_SIZE,
                 });
@@ -662,6 +695,30 @@ impl State {
                 };
                 return Some(Effect::Refresh { ticket, home });
             }
+            Action::NextCurrent(owner, before) if self.current(owner) => {
+                let view = self.view.as_mut()?;
+                if view.loading.is_some() || view.snapshot.as_ref()?.next_current != Some(before) {
+                    return None;
+                }
+                view.read_page = Some(Page {
+                    current_before: Some(before),
+                    ..view.page
+                });
+                view.visible = VISIBLE_ROWS;
+                return self.read(owner);
+            }
+            Action::LatestCurrent(owner) if self.current(owner) => {
+                let view = self.view.as_mut()?;
+                if view.loading.is_some() {
+                    return None;
+                }
+                view.read_page = Some(Page {
+                    current_before: None,
+                    ..view.page
+                });
+                view.visible = VISIBLE_ROWS;
+                return self.read(owner);
+            }
             Action::Earlier(owner, before) if self.current(owner) => {
                 let view = self.view.as_mut()?;
                 if view.loading.is_some() || view.snapshot.as_ref()?.next_history != Some(before) {
@@ -669,7 +726,7 @@ impl State {
                 }
                 view.read_page = Some(Page {
                     before: Some(before),
-                    limit: PAGE_SIZE,
+                    ..view.page
                 });
                 view.visible = VISIBLE_ROWS;
                 return self.read(owner);
@@ -681,7 +738,7 @@ impl State {
                 }
                 view.read_page = Some(Page {
                     before: None,
-                    limit: PAGE_SIZE,
+                    ..view.page
                 });
                 return self.read(owner);
             }
@@ -988,7 +1045,12 @@ impl State {
         }
         counts[2] = snapshot.history.len();
         let tabs: Vec<_> = [
-            (Bucket::Ongoing, "Ongoing", "Ongoing tracking", counts[0]),
+            (
+                Bucket::Ongoing,
+                "Ongoing",
+                "Ongoing tracking on this page",
+                counts[0],
+            ),
             (
                 Bucket::NeedsConfirmation,
                 if narrow {
@@ -996,7 +1058,7 @@ impl State {
                 } else {
                     "Needs confirmation"
                 },
-                "Work needing confirmation",
+                "Work needing confirmation on this page",
                 counts[1],
             ),
             (Bucket::History, "History", "Loaded work history", counts[2]),
@@ -1023,7 +1085,7 @@ impl State {
             ui_controls::view_tabs(tabs, narrow)
         };
         body.push(ui_controls::owned((owner, "tabs"), navigation));
-        body.push(flow(vec![design::caption("Tracked roles describe intent. PR state and checkout observations remain separate.").width(Length::Fill).into(),
+        body.push(flow(vec![design::caption("Counts describe the loaded pages, not all channel work. Tracked roles describe intent; PR state and checkout observations remain separate.").width(Length::Fill).into(),
             ui_controls::owned((owner, "attach", self.writable(owner)), button::secondary("Track PR…").icon(Icon::PullRequest).id(attach_id(owner))
                 .on_press_maybe(self.writable(owner).then_some(Action::Attach(owner))))], narrow));
         if let Some(form) = &view.form {
@@ -1039,7 +1101,17 @@ impl State {
                 .collect()
         };
         if entries.is_empty() {
+            let has_more_current =
+                view.page.current_before.is_some() || snapshot.next_current.is_some();
             let (title, detail) = match view.tab {
+                Bucket::Ongoing if has_more_current => (
+                    "No ongoing work on this page",
+                    "Other current pages may contain ongoing work. Use Next current page or Latest current work.",
+                ),
+                Bucket::NeedsConfirmation if has_more_current => (
+                    "No confirmation needed on this page",
+                    "Other current pages may contain relations that need confirmation.",
+                ),
                 Bucket::Ongoing => (
                     "No ongoing work is tracked here",
                     "Track a PR explicitly or review a suggested relation. A checkout alone is not a contribution.",
@@ -1067,7 +1139,7 @@ impl State {
                 .count();
             body.push(
                 design::caption(format!(
-                    "{work} work relations · {} review or reference relations",
+                    "On this page: {work} work relations · {} review or reference relations",
                     entries.len() - work
                 ))
                 .into(),
@@ -1105,6 +1177,33 @@ impl State {
                 ))
                 .on_press(Action::More(owner)),
             ));
+        }
+        if view.tab != Bucket::History {
+            let mut navigation = Vec::new();
+            if view.page.current_before.is_some() {
+                navigation.push(ui_controls::owned(
+                    (owner, "latest-current"),
+                    button::secondary("Latest current work").on_press_maybe(
+                        view.loading
+                            .is_none()
+                            .then_some(Action::LatestCurrent(owner)),
+                    ),
+                ));
+            }
+            if let Some(before) = snapshot.next_current {
+                navigation.push(ui_controls::owned(
+                    (owner, before, "next-current"),
+                    button::secondary("Next current page").on_press_maybe(
+                        view.loading
+                            .is_none()
+                            .then_some(Action::NextCurrent(owner, before)),
+                    ),
+                ));
+            }
+            if !navigation.is_empty() {
+                body.push(flow(navigation, narrow));
+            }
+            body.push(design::caption("Ongoing and confirmation share a current page. Pages replace the loaded relations; counts describe this page only.").into());
         }
         if view.tab == Bucket::History {
             let mut navigation = Vec::new();

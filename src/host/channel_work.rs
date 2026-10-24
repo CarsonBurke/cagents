@@ -89,6 +89,24 @@ fn process_inner(
                 .read_channel_work(&home, page)?;
             Ok(Response::Snapshot(snapshot))
         }
+        Request::ReadTarget { home, target } => {
+            let target = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read_channel_work_target(&home, &target)?;
+            Ok(Response::Target(target))
+        }
+        Request::ReadHome { home } => {
+            let state = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read_channel_work_home(&home)?;
+            Ok(Response::Home {
+                home: state.home,
+                lifecycle: state.lifecycle,
+                revision: state.revision,
+            })
+        }
         Request::Receipt { home, operation } => {
             let receipt = registry
                 .lock()
@@ -139,36 +157,16 @@ pub(super) fn refresh(host: &SharedHost, authority: &Authority, home: Home) -> R
         require_refresh_home(&captured, home)?;
         let captured_caller = caller(&captured);
         let registry = agent_execution::registry(host)?;
-        let snapshot = registry
+        // Candidate selection is independent of display pages: polling a row
+        // advances its display sequence and must not starve older relations.
+        // The store returns at most four validated rows from the exact home.
+        let entries = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .read_channel_work(
-                &home,
-                Page {
-                    before: None,
-                    limit: work::MAX_PAGE,
-                },
-            )?;
-        if snapshot.lifecycle != work::HomeLifecycle::Active {
-            return Err("The channel work home is no longer active".into());
-        }
-        let mut entries = snapshot
-            .entries
-            .iter()
-            .chain(&snapshot.history)
-            .filter(|entry| matches!(entry.target, Target::PullRequest(_)))
-            .collect::<Vec<_>>();
-        // Every attempted observation advances its own generation, including
-        // failures. Prefer least-attempted rows so one offline PR cannot
-        // permanently starve the rest of this bounded refresh.
-        entries.sort_by_key(|entry| {
-            entry.observation.as_ref().map_or((0, 0), |observation| {
-                (observation.generation, observation.observed_at_ms)
-            })
-        });
+            .read_channel_work_refresh_candidates(&home)?;
         let budget = RefreshBudget::start()?;
         let github = crate::github::GitHubService::system("gh");
-        for entry in entries.into_iter().take(4) {
+        for entry in entries {
             if budget.cancellation.is_cancelled() {
                 break;
             }

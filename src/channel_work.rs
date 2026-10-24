@@ -16,6 +16,15 @@ use crate::{
 pub const MAX_PAGE: u16 = 100;
 pub const MAX_CLAIMS: usize = 128;
 pub const MAX_CONTEXTS: usize = 128;
+pub const MAX_CONTEXT_PATH_BYTES: usize = 4096;
+/// Entry payload budget per independently paged current/history collection.
+pub const MAX_BUCKET_BYTES: usize = 2 * 1024 * 1024 - 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Measure the wire representation without allocating an encoded buffer.
+pub fn encoded_size<T: Serialize + ?Sized>(value: &T) -> Result<usize, Error> {
+    postcard::experimental::serialized_size(value).map_err(|_| Error::Capacity)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Home {
@@ -411,6 +420,9 @@ impl Entry {
         {
             return Err(Error::InvalidMetadata);
         }
+        if encoded_size(self)? > MAX_BUCKET_BYTES {
+            return Err(Error::Capacity);
+        }
         Ok(())
     }
 
@@ -490,6 +502,7 @@ impl Entry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
+    pub current_before: Option<u64>,
     pub before: Option<u64>,
     pub limit: u16,
 }
@@ -497,6 +510,7 @@ pub struct Page {
 impl Default for Page {
     fn default() -> Self {
         Self {
+            current_before: None,
             before: None,
             limit: 25,
         }
@@ -507,6 +521,9 @@ impl Page {
     pub fn validate(self) -> Result<(), Error> {
         if self.limit == 0 || self.limit > MAX_PAGE {
             return Err(Error::Capacity);
+        }
+        if self.before == Some(0) || self.current_before == Some(0) {
+            return Err(Error::InvalidSnapshot);
         }
         Ok(())
     }
@@ -520,19 +537,36 @@ pub struct Snapshot {
     pub entries: Vec<Entry>,
     /// Latest historical relations, not a repeated snapshot per mutation.
     pub history: Vec<Entry>,
+    pub next_current: Option<u64>,
     pub next_history: Option<u64>,
 }
 
 impl Snapshot {
     pub fn validate(&self) -> Result<(), Error> {
         self.home.validate()?;
-        if self.history.len() > usize::from(MAX_PAGE) {
+        if self.entries.len() > usize::from(MAX_PAGE) || self.history.len() > usize::from(MAX_PAGE)
+        {
             return Err(Error::Capacity);
+        }
+        for (entries, cursor) in [
+            (&self.entries, self.next_current),
+            (&self.history, self.next_history),
+        ] {
+            if cursor.is_some_and(|value| value == 0) || (cursor.is_some() && entries.is_empty()) {
+                return Err(Error::InvalidSnapshot);
+            }
         }
         let mut targets = std::collections::HashSet::new();
         let mut ids = std::collections::HashSet::new();
         for (entries, historical) in [(&self.entries, false), (&self.history, true)] {
+            let mut bytes = 0usize;
             for entry in entries {
+                bytes = bytes
+                    .checked_add(encoded_size(entry)?)
+                    .ok_or(Error::Capacity)?;
+                if bytes > MAX_BUCKET_BYTES {
+                    return Err(Error::Capacity);
+                }
                 entry.validate()?;
                 if entry.revision > self.revision
                     || (self.lifecycle != HomeLifecycle::Active
@@ -548,6 +582,47 @@ impl Snapshot {
                     return Err(Error::InvalidSnapshot);
                 }
             }
+        }
+        if encoded_size(self)? > MAX_SNAPSHOT_BYTES {
+            return Err(Error::Capacity);
+        }
+        Ok(())
+    }
+}
+
+/// Exact target lookup; absence is meaningful only in this validated home/target echo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetSnapshot {
+    pub home: Home,
+    pub lifecycle: HomeLifecycle,
+    /// Home ledger ordering; the optional entry carries its own CAS revision.
+    pub revision: u64,
+    pub target: Target,
+    pub entry: Option<Entry>,
+}
+
+impl TargetSnapshot {
+    pub fn validate(&self) -> Result<(), Error> {
+        self.home.validate()?;
+        if self.target.canonicalized()? != self.target {
+            return Err(Error::InvalidTarget);
+        }
+        if let Some(entry) = &self.entry {
+            entry.validate()?;
+            if entry.target != self.target
+                || entry.revision > self.revision
+                || (self.lifecycle != HomeLifecycle::Active && entry.bucket() != Bucket::History)
+                || entry
+                    .contexts
+                    .iter()
+                    .any(|context| context.registry != self.home.registry)
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+        }
+        // The row budget reserves room for the home, target and DTO framing.
+        if encoded_size(self)? > MAX_BUCKET_BYTES + 1024 {
+            return Err(Error::Capacity);
         }
         Ok(())
     }
@@ -779,6 +854,7 @@ pub(crate) fn reduce_entry(
             .checked_add(1)
             .ok_or(Error::RevisionExhausted)?;
     }
+    entry.validate()?;
     Ok(EntryTransition { entry, changed })
 }
 
@@ -871,6 +947,7 @@ pub(crate) fn observe_entry(
         .revision
         .checked_add(1)
         .ok_or(Error::RevisionExhausted)?;
+    updated.validate()?;
     Ok(EntryTransition {
         entry: updated,
         changed: true,
@@ -883,7 +960,7 @@ fn text(value: &str, limit: usize) -> bool {
 
 fn context_path(path: &std::path::Path) -> bool {
     path.is_absolute()
-        && path.as_os_str().len() <= 4096
+        && path.as_os_str().as_encoded_bytes().len() <= MAX_CONTEXT_PATH_BYTES
         && !path.as_os_str().as_encoded_bytes().contains(&0)
         && !path
             .components()

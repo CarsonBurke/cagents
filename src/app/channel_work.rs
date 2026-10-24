@@ -131,17 +131,7 @@ impl Cagents {
                 let result = tokio::task::spawn_blocking(move || {
                     let mut client = connect(route.as_ref(), home, true)?;
                     match send(&mut client, api::Request::Receipt { home, operation })? {
-                        api::Response::Receipt(Some(receipt)) => {
-                            let snapshot = snapshot(send(
-                                &mut client,
-                                api::Request::Read {
-                                    home,
-                                    page: Default::default(),
-                                },
-                            )?)?;
-                            Ok(Some(crate::channel_work::Reply { receipt, snapshot }))
-                        }
-                        api::Response::Receipt(None) => Ok(None),
+                        api::Response::Receipt(receipt) => Ok(receipt),
                         _ => Err(Failure::Unavailable),
                     }
                 })
@@ -241,15 +231,13 @@ fn connect(
             if model.identity != home.registry {
                 return Err(Failure::Unavailable);
             }
-            let current = snapshot(send(
-                &mut client,
-                api::Request::Read {
-                    home,
-                    page: Default::default(),
-                },
-            )?)?;
+            let api::Response::Home { home: current, .. } =
+                send(&mut client, api::Request::ReadHome { home })?
+            else {
+                return Err(Failure::Unavailable);
+            };
             current.validate().map_err(|_| Failure::Unavailable)?;
-            if current.home != home {
+            if current != home {
                 return Err(Failure::Unavailable);
             }
             *proof = Some(client.proof().clone());
@@ -427,6 +415,7 @@ mod tests {
                 revision: 0,
                 entries: vec![],
                 history: vec![],
+                next_current: None,
                 next_history: None,
             }),
         });

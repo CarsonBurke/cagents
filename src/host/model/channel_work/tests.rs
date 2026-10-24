@@ -213,6 +213,7 @@ fn latest_history_pages_are_unique_targets_and_survive_reopening() {
         .read_channel_work(
             &home,
             Page {
+                current_before: None,
                 before: None,
                 limit: 2,
             },
@@ -224,6 +225,7 @@ fn latest_history_pages_are_unique_targets_and_survive_reopening() {
         .read_channel_work(
             &home,
             Page {
+                current_before: None,
                 before: first.next_history,
                 limit: 2,
             },
@@ -703,6 +705,7 @@ fn archive_retires_claims_with_unique_history_cursors_and_one_enclosing_model_ed
             .read_channel_work(
                 &home,
                 Page {
+                    current_before: None,
                     before: cursor,
                     limit: 1,
                 },
@@ -925,4 +928,675 @@ fn retained_connection_refuses_future_layout_before_mutation_replay_or_observati
         future,
         "an old admitted writer must never downgrade a newer header"
     );
+}
+
+#[test]
+fn current_keyset_pages_include_needs_confirmation_and_point_lookup_is_not_page_absence() {
+    let (mut registry, _directory, home) = fixture();
+    for number in 1..=103 {
+        registry
+            .apply_channel_work(&user(), &claim(home, number, 0))
+            .unwrap();
+    }
+    for number in [1, 2] {
+        registry
+            .observe_channel_work(
+                &home,
+                &target(number),
+                1,
+                1,
+                observation(1, PrState::Merged),
+            )
+            .unwrap();
+        registry
+            .observe_channel_work(
+                &home,
+                &target(number),
+                2,
+                2,
+                observation(2, PrState::Open { draft: false }),
+            )
+            .unwrap();
+    }
+    let first = registry
+        .read_channel_work(
+            &home,
+            Page {
+                current_before: None,
+                before: None,
+                limit: 100,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.entries.len(), 100);
+    assert!(first.next_current.is_some());
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .filter(|entry| entry.bucket() == Bucket::NeedsConfirmation)
+            .count(),
+        2,
+        "current includes both active presentation buckets"
+    );
+    let second = registry
+        .read_channel_work(
+            &home,
+            Page {
+                current_before: first.next_current,
+                before: None,
+                limit: 100,
+            },
+        )
+        .unwrap();
+    assert_eq!(second.entries.len(), 3);
+    assert!(second.next_current.is_none());
+    let keys = first
+        .entries
+        .iter()
+        .chain(&second.entries)
+        .map(|entry| entry.target.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        keys.len(),
+        103,
+        "strict continuation neither skips nor repeats the boundary"
+    );
+    let hidden = second.entries[0].target.clone();
+    assert!(!first.entries.iter().any(|entry| entry.target == hidden));
+    let exact = registry.read_channel_work_target(&home, &hidden).unwrap();
+    assert_eq!(exact.home, home);
+    assert_eq!(exact.target, hidden);
+    assert_eq!(exact.entry.as_ref().unwrap().target, hidden);
+    assert_eq!(exact.revision, second.revision);
+    assert_eq!(exact.entry.as_ref().unwrap().revision, 1);
+    let absent = registry
+        .read_channel_work_target(&home, &target(999))
+        .unwrap();
+    assert!(absent.entry.is_none());
+    assert_eq!(absent.target, target(999).canonicalized().unwrap());
+    assert!(
+        registry
+            .read_channel_work(
+                &home,
+                Page {
+                    current_before: Some(0),
+                    before: Some(0),
+                    limit: 100,
+                },
+            )
+            .is_err(),
+        "zero is not a valid keyset cursor"
+    );
+}
+
+/// Fixed model data, not real filesystem paths or claims about file authors.
+/// Each row remains valid but two such rows exceed a bucket's wire budget.
+fn enlarge_context_provenance(registry: &mut Registry, home: Home) {
+    let mut rows =
+        {
+            let mut statement = registry.db.prepare(
+            "SELECT target,entry FROM channel_work_entries WHERE channel=?1 AND incarnation=?2"
+        ).unwrap();
+            statement
+                .query_map(
+                    params![home.channel.to_string(), home.creation_ordinal],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+    for (key, raw) in &mut rows {
+        let mut entry: Entry = decode(raw).unwrap();
+        entry.contexts = (0..work::MAX_CONTEXTS)
+            .map(|_| work::CheckoutContext {
+                id: Uuid::new_v4(),
+                registry: home.registry,
+                repository: format!("/{}", "r".repeat(4095)).into(),
+                path: format!("/{}", "p".repeat(4095)).into(),
+                branch: Some("b".repeat(1024)),
+                head: Some("a".repeat(64)),
+                generation: 1,
+                dirty: true,
+            })
+            .collect();
+        entry.validate().unwrap();
+        let bytes = postcard::experimental::serialized_size(&entry).unwrap();
+        assert!(bytes <= work::MAX_BUCKET_BYTES);
+        assert!(bytes * 2 > work::MAX_BUCKET_BYTES);
+        registry.db.execute(
+            "UPDATE channel_work_entries SET entry=?4 WHERE channel=?1 AND incarnation=?2 AND target=?3",
+            params![home.channel.to_string(),home.creation_ordinal,key,encode(&entry).unwrap()],
+        ).unwrap();
+    }
+}
+
+#[test]
+fn byte_budget_continuations_preserve_the_first_unincluded_row_in_both_collections() {
+    let (mut registry, directory, home) = fixture();
+    for number in 1..=6 {
+        registry
+            .apply_channel_work(&user(), &claim(home, number, 0))
+            .unwrap();
+        if number % 2 == 0 {
+            registry
+                .apply_channel_work(
+                    &user(),
+                    &Mutation {
+                        home,
+                        expected_revision: 1,
+                        operation: Uuid::new_v4(),
+                        change: Change::End {
+                            target: target(number),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+    }
+    enlarge_context_provenance(&mut registry, home);
+    drop(registry);
+    let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+    for historical in [false, true] {
+        let mut cursor = None;
+        let mut keys = std::collections::HashSet::new();
+        for page_index in 0..3 {
+            let page = registry
+                .read_channel_work(
+                    &home,
+                    Page {
+                        current_before: if historical { None } else { cursor },
+                        before: if historical { cursor } else { None },
+                        limit: 100,
+                    },
+                )
+                .unwrap();
+            assert!(postcard::experimental::serialized_size(&page).unwrap() <= 4 * 1024 * 1024);
+            let (entries, next) = if historical {
+                (&page.history, page.next_history)
+            } else {
+                (&page.entries, page.next_current)
+            };
+            assert_eq!(
+                entries.len(),
+                1,
+                "byte limit must apply before the count limit"
+            );
+            assert!(
+                keys.insert(entries[0].target.clone()),
+                "a continuation repeated a target"
+            );
+            if page_index == 2 {
+                assert!(
+                    next.is_none(),
+                    "last included row is final; no phantom continuation"
+                );
+            } else {
+                assert!(next.is_some());
+                assert!(cursor.is_none_or(|old| next.unwrap() < old));
+            }
+            cursor = next;
+        }
+        assert_eq!(
+            keys.len(),
+            3,
+            "the lookahead row remains the next page's first row"
+        );
+    }
+    let exact = registry
+        .read_channel_work_target(&home, &target(1))
+        .unwrap();
+    assert_eq!(
+        exact.entry.as_ref().unwrap().contexts.len(),
+        work::MAX_CONTEXTS
+    );
+    exact.validate().unwrap();
+    let mutation = Mutation {
+        home,
+        expected_revision: exact.entry.as_ref().unwrap().revision,
+        operation: Uuid::new_v4(),
+        change: Change::Claim {
+            target: target(1),
+            role: Role::Steward,
+        },
+    };
+    let applied = registry.apply_channel_work(&user(), &mutation).unwrap();
+    assert!(applied.receipt.changed);
+    applied.snapshot.validate().unwrap();
+    assert!(work::encoded_size(&applied.snapshot).unwrap() <= work::MAX_SNAPSHOT_BYTES);
+    let replay = registry.apply_channel_work(&user(), &mutation).unwrap();
+    assert_eq!(replay.receipt, applied.receipt);
+    assert_eq!(replay.snapshot, applied.snapshot);
+}
+
+#[test]
+fn archive_and_delete_cross_ended_keyset_batches_without_losing_live_rows_or_receipts() {
+    for archive in [false, true] {
+        let (mut registry, _directory, home) = fixture();
+        let mut requests = Vec::new();
+        for number in 1..=35 {
+            let request = claim(home, number, 0);
+            registry.apply_channel_work(&user(), &request).unwrap();
+            requests.push(request);
+        }
+        requests.sort_by_key(|request| encode(request.change.target()).unwrap());
+        // Two complete batches and part of the third are already ended.
+        // A cursor based on mutable sequence or only changed rows fails here.
+        for request in requests.iter().take(17) {
+            registry
+                .apply_channel_work(
+                    &user(),
+                    &Mutation {
+                        home,
+                        expected_revision: 1,
+                        operation: Uuid::new_v4(),
+                        change: Change::End {
+                            target: request.change.target().clone(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let before = registry.model().unwrap().sequence;
+        let receipts: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                registry
+                    .channel_work_receipt(&user(), &home, request.operation)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        if archive {
+            let tx = registry
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(archived_in(&tx, &home).unwrap());
+            tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+                .unwrap();
+            tx.commit().unwrap();
+        } else {
+            registry
+                .apply(&ModelEdit::DeleteChannel { id: home.channel })
+                .unwrap();
+        }
+        assert_eq!(registry.model().unwrap().sequence, before + 1);
+        let mut cursor = None;
+        let mut keys = std::collections::HashSet::new();
+        for page_index in 0..5 {
+            let page = registry
+                .read_channel_work(
+                    &home,
+                    Page {
+                        current_before: None,
+                        before: cursor,
+                        limit: 7,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                page.lifecycle,
+                if archive {
+                    HomeLifecycle::Archived
+                } else {
+                    HomeLifecycle::Deleted
+                }
+            );
+            assert!(page.entries.is_empty());
+            assert_eq!(page.history.len(), 7);
+            for entry in page.history {
+                assert!(entry.user_ended && entry.claims.iter().all(|claim| !claim.active));
+                assert_eq!(
+                    entry.revision, 2,
+                    "already-ended rows must not be retired twice"
+                );
+                assert!(keys.insert(entry.target));
+            }
+            cursor = page.next_history;
+            assert_eq!(cursor.is_none(), page_index == 4);
+        }
+        assert_eq!(keys.len(), 35);
+        for (request, original) in requests.iter().zip(receipts) {
+            assert_eq!(
+                registry
+                    .channel_work_receipt(&user(), &home, request.operation)
+                    .unwrap(),
+                Some(original)
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_target_read_keeps_its_home_revision_and_entry_in_one_wal_snapshot() {
+    let (mut registry, _directory, home) = fixture();
+    registry
+        .apply_channel_work(&user(), &claim(home, 1, 0))
+        .unwrap();
+    let mut writer = registry.execution_connection().unwrap();
+    let tx = registry.db.unchecked_transaction().unwrap();
+    assert_eq!(home_state(&tx, &home).unwrap().1, 1);
+    let mut change = claim(home, 1, 1);
+    change.change = Change::Claim {
+        target: target(1),
+        role: Role::Review,
+    };
+    writer.apply_channel_work(&user(), &change).unwrap();
+    let old = read_target_in(&tx, &home, &target(1)).unwrap();
+    assert_eq!(old.revision, 1);
+    assert_eq!(old.entry.as_ref().unwrap().revision, 1);
+    assert_eq!(old.entry.as_ref().unwrap().role(), Some(Role::Contribute));
+    tx.commit().unwrap();
+    let fresh = registry
+        .read_channel_work_target(&home, &target(1))
+        .unwrap();
+    assert_eq!(fresh.revision, 2);
+    assert_eq!(fresh.entry.as_ref().unwrap().revision, 2);
+    assert_eq!(fresh.entry.as_ref().unwrap().role(), Some(Role::Review));
+    let mut foreign = home;
+    foreign.registry = Uuid::new_v4();
+    assert!(
+        registry
+            .read_channel_work_target(&foreign, &target(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn refresh_candidates_reach_hidden_current_and_history_and_rotate_attempts_without_mutating_on_read()
+ {
+    let (mut registry, _directory, home) = fixture();
+    for number in 1..=210 {
+        registry
+            .apply_channel_work(&user(), &claim(home, number, 0))
+            .unwrap();
+        if number <= 105 {
+            registry
+                .apply_channel_work(
+                    &user(),
+                    &Mutation {
+                        home,
+                        expected_revision: 1,
+                        operation: Uuid::new_v4(),
+                        change: Change::End {
+                            target: target(number),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        if number != 1 && number != 106 {
+            let revision = if number <= 105 { 2 } else { 1 };
+            registry
+                .observe_channel_work(
+                    &home,
+                    &target(number),
+                    revision,
+                    1,
+                    observation(1, PrState::Open { draft: false }),
+                )
+                .unwrap();
+        }
+    }
+    // A valid, unclaimed local candidate is not a forge refresh target. This
+    // fixture row grants no source authority or successful local Claim.
+    let local = Entry {
+        id: Uuid::new_v4(),
+        target: Target::Local(Uuid::new_v4()),
+        claims: vec![],
+        contexts: vec![],
+        suppressed: false,
+        user_ended: false,
+        observation: None,
+        last_terminal_generation: 0,
+        ever_claimed: false,
+        revision: 1,
+    };
+    local.validate().unwrap();
+    registry
+        .db
+        .execute(
+            "INSERT INTO channel_work_entries(channel,incarnation,target,entry,sequence,bucket)
+         VALUES(?1,?2,?3,?4,0,'needs_confirmation')",
+            params![
+                home.channel.to_string(),
+                home.creation_ordinal,
+                encode(&local.target).unwrap(),
+                encode(&local).unwrap()
+            ],
+        )
+        .unwrap();
+    let visible = registry
+        .read_channel_work(
+            &home,
+            Page {
+                current_before: None,
+                before: None,
+                limit: 100,
+            },
+        )
+        .unwrap();
+    assert_eq!(visible.entries.len(), 100);
+    assert_eq!(visible.history.len(), 100);
+    assert!(visible.next_current.is_some() && visible.next_history.is_some());
+    for hidden in [
+        target(1).canonicalized().unwrap(),
+        target(106).canonicalized().unwrap(),
+    ] {
+        assert!(
+            !visible
+                .entries
+                .iter()
+                .chain(&visible.history)
+                .any(|entry| entry.target == hidden)
+        );
+    }
+    let before = registry.model().unwrap().sequence;
+    let first = registry
+        .read_channel_work_refresh_candidates(&home)
+        .unwrap();
+    assert_eq!(first.len(), 4);
+    assert!(
+        first
+            .iter()
+            .all(|entry| matches!(entry.target, Target::PullRequest(_)))
+    );
+    assert!(
+        first
+            .iter()
+            .any(|entry| entry.target == target(1).canonicalized().unwrap())
+    );
+    assert!(
+        first
+            .iter()
+            .any(|entry| entry.target == target(106).canonicalized().unwrap())
+    );
+    assert_eq!(
+        registry.model().unwrap().sequence,
+        before,
+        "candidate read does not advance attempts"
+    );
+    assert_eq!(
+        registry
+            .read_channel_work_refresh_candidates(&home)
+            .unwrap(),
+        first
+    );
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let entries = registry
+            .read_channel_work_refresh_candidates(&home)
+            .unwrap();
+        assert_eq!(entries.len(), 4);
+        for entry in entries {
+            seen.insert(entry.target.clone());
+            let generation = entry
+                .observation
+                .as_ref()
+                .map_or(0, |value| value.generation)
+                + 1;
+            registry
+                .observe_channel_work(
+                    &home,
+                    &entry.target,
+                    entry.revision,
+                    generation,
+                    PollOutcome::Failure,
+                )
+                .unwrap();
+        }
+    }
+    assert!(
+        seen.len() >= 10,
+        "attempted rows must yield to other rows beyond visible pages"
+    );
+    let raw = registry.db.query_row(
+        "SELECT entry FROM channel_work_entries WHERE channel=?1 AND incarnation=?2 AND target=?3",
+        params![home.channel.to_string(),home.creation_ordinal,encode(&target(1).canonicalized().unwrap()).unwrap()],
+        |row| row.get::<_,String>(0),
+    ).unwrap();
+    registry.db.execute(
+        "UPDATE channel_work_entries SET entry='not-json' WHERE channel=?1 AND incarnation=?2 AND target=?3",
+        params![home.channel.to_string(),home.creation_ordinal,encode(&target(1).canonicalized().unwrap()).unwrap()],
+    ).unwrap();
+    let sequence = registry.model().unwrap().sequence;
+    let unchanged_home = registry.read_channel_work_home(&home).unwrap();
+    assert!(
+        registry
+            .read_channel_work_refresh_candidates(&home)
+            .is_err()
+    );
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    assert_eq!(
+        registry.read_channel_work_home(&home).unwrap(),
+        unchanged_home
+    );
+    assert_eq!(registry.db.query_row(
+        "SELECT entry FROM channel_work_entries WHERE channel=?1 AND incarnation=?2 AND target=?3",
+        params![home.channel.to_string(),home.creation_ordinal,encode(&target(1).canonicalized().unwrap()).unwrap()],
+        |row| row.get::<_,String>(0),
+    ).unwrap(), "not-json", "failed candidate read must never repair or rewrite data");
+    registry.db.execute(
+        "UPDATE channel_work_entries SET entry=?4 WHERE channel=?1 AND incarnation=?2 AND target=?3",
+        params![home.channel.to_string(),home.creation_ordinal,encode(&target(1).canonicalized().unwrap()).unwrap(),raw],
+    ).unwrap();
+    let mut foreign = home;
+    foreign.registry = Uuid::new_v4();
+    assert!(
+        registry
+            .read_channel_work_refresh_candidates(&foreign)
+            .is_err()
+    );
+    let tx = registry
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(archived_in(&tx, &home).unwrap());
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .read_channel_work_refresh_candidates(&home)
+            .is_err()
+    );
+}
+
+#[test]
+fn refresh_rank_preserves_adjacent_full_u64_generations_and_timestamps() {
+    let (mut registry, _directory, home) = fixture();
+    let base = i64::MAX as u64 + 1;
+    for (number, generation, observed_at_ms) in [
+        (1, base + 1, 0),
+        (2, base, base + 1),
+        (3, base, base),
+        (4, base + 2, 0),
+        (5, base, base + 2),
+    ] {
+        registry
+            .apply_channel_work(&user(), &claim(home, number, 0))
+            .unwrap();
+        let mut value = observation(generation, PrState::Open { draft: false });
+        let PollOutcome::Success(observation) = &mut value else {
+            unreachable!()
+        };
+        observation.observed_at_ms = observed_at_ms;
+        registry
+            .observe_channel_work(&home, &target(number), 1, generation, value)
+            .unwrap();
+    }
+    let entries = registry
+        .read_channel_work_refresh_candidates(&home)
+        .unwrap();
+    let ordered: Vec<_> = entries.iter().map(|entry| entry.target.clone()).collect();
+    assert_eq!(
+        ordered,
+        [3, 2, 5, 1].map(|number| target(number).canonicalized().unwrap())
+    );
+    assert_eq!(entries[0].observation.as_ref().unwrap().generation, base);
+    assert_eq!(
+        entries[3].observation.as_ref().unwrap().generation,
+        base + 1
+    );
+}
+
+#[test]
+fn metadata_only_home_read_preserves_retained_receipt_scope_without_decoding_projection_rows() {
+    for archive in [false, true] {
+        let (mut registry, _directory, home) = fixture();
+        let request = claim(home, 1, 0);
+        let receipt = registry
+            .apply_channel_work(&user(), &request)
+            .unwrap()
+            .receipt;
+        let active = registry.read_channel_work_home(&home).unwrap();
+        assert_eq!(active.home, home);
+        assert_eq!(active.lifecycle, HomeLifecycle::Active);
+        assert_eq!(active.revision, 1);
+        if archive {
+            let tx = registry
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(archived_in(&tx, &home).unwrap());
+            tx.commit().unwrap();
+        } else {
+            registry
+                .apply(&ModelEdit::DeleteChannel { id: home.channel })
+                .unwrap();
+        }
+        // Even an unavailable row projection cannot prevent exact metadata
+        // validation followed by the separate immutable receipt lookup.
+        registry.db.execute(
+            "UPDATE channel_work_entries SET entry='not-json' WHERE channel=?1 AND incarnation=?2",
+            params![home.channel.to_string(),home.creation_ordinal],
+        ).unwrap();
+        assert!(registry.read_channel_work(&home, Page::default()).is_err());
+        let retained = registry.read_channel_work_home(&home).unwrap();
+        assert_eq!(retained.home, home);
+        assert_eq!(
+            retained.lifecycle,
+            if archive {
+                HomeLifecycle::Archived
+            } else {
+                HomeLifecycle::Deleted
+            }
+        );
+        assert!(retained.revision > active.revision);
+        assert_eq!(
+            registry
+                .channel_work_receipt(&user(), &home, request.operation)
+                .unwrap(),
+            Some(receipt)
+        );
+        let mut wrong = home;
+        wrong.registry = Uuid::new_v4();
+        assert!(registry.read_channel_work_home(&wrong).is_err());
+        wrong = home;
+        wrong.creation_ordinal += 1;
+        assert!(registry.read_channel_work_home(&wrong).is_err());
+        wrong = home;
+        wrong.channel = ChannelId::new();
+        assert!(registry.read_channel_work_home(&wrong).is_err());
+    }
 }

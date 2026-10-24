@@ -56,6 +56,7 @@ fn snapshot(home: Home, entries: Vec<Entry>, revision: u64) -> Snapshot {
         revision,
         entries,
         history,
+        next_current: None,
         next_history: None,
     }
 }
@@ -414,12 +415,17 @@ fn close_unknown_lookup_missing_and_retry_retain_original_mutation_and_home() {
     else {
         panic!()
     };
-    state.update(Action::LookedUp {
-        ticket: lookup,
-        operation,
-        result: Ok(Some(reply)),
-    });
+    let projection = state
+        .update(Action::LookedUp {
+            ticket: lookup,
+            operation,
+            result: Ok(Some(reply.receipt)),
+        })
+        .unwrap();
     assert!(state.pending.is_empty());
+    // Confirmation does not carry a current projection. A separate read can
+    // observe later work without rewriting the immutable original receipt.
+    load(&mut state, projection, reply.snapshot);
     let current = state.view.as_ref().unwrap().snapshot.as_ref().unwrap();
     assert_eq!(current.revision, 7);
     assert!(current.history.is_empty());
@@ -455,13 +461,15 @@ fn mismatched_receipts_and_late_page_reads_never_clear_or_replace_current_state(
     ended.user_ended = true;
     ended.revision = 2;
     let fresh = completed(&original, 2, vec![ended]);
-    state.update(Action::LookedUp {
-        ticket: lookup,
-        operation,
-        result: Ok(Some(fresh.clone())),
-    });
+    let projection = state
+        .update(Action::LookedUp {
+            ticket: lookup,
+            operation,
+            result: Ok(Some(fresh.receipt.clone())),
+        })
+        .unwrap();
     assert!(state.pending.is_empty());
-    assert!(state.view.as_ref().unwrap().loading.is_none());
+    assert!(state.view.as_ref().unwrap().loading.is_some());
     // Same global revision is possible for different history pages. The old
     // read ticket must have been retired when the latest mutation reply won.
     let Effect::Read {
@@ -475,6 +483,12 @@ fn mismatched_receipts_and_late_page_reads_never_clear_or_replace_current_state(
         ticket: stale_ticket,
         result: Ok(snapshot(home(10), vec![entry(2, Role::Review)], 2)),
     });
+    assert_ne!(
+        state.view.as_ref().unwrap().snapshot.as_ref(),
+        Some(&fresh.snapshot),
+        "a receipt must not pretend to contain the current projection"
+    );
+    load(&mut state, projection, fresh.snapshot.clone());
     assert_eq!(
         state.view.as_ref().unwrap().snapshot.as_ref(),
         Some(&fresh.snapshot)
@@ -689,6 +703,7 @@ fn bounded_history_pages_validate_home_and_replace_instead_of_accumulating() {
     assert_eq!(
         page,
         Page {
+            current_before: None,
             before: Some(10),
             limit: 50
         }
@@ -757,7 +772,9 @@ fn narrow_render_separates_review_from_owned_work_and_exposes_real_controls() {
             .collect::<Vec<_>>();
         assert!(labels.contains(&"Working on"));
         assert!(labels.contains(&"Review and reference"));
-        assert!(labels.contains(&"1 work relations · 1 review or reference relations"));
+        assert!(
+            labels.contains(&"On this page: 1 work relations · 1 review or reference relations")
+        );
     }
 }
 
@@ -909,4 +926,240 @@ fn context_disclosure_captures_desired_state_and_retires_native_press_when_label
     state.update(collapse.clone());
     state.update(collapse);
     assert_eq!(state.view.as_ref().unwrap().details, None);
+}
+
+#[test]
+fn current_pages_replace_both_buckets_and_keep_history_cursor_independent() {
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    {
+        let view = state.view.as_mut().unwrap();
+        view.page.before = Some(90);
+        let snapshot = view.snapshot.as_mut().unwrap();
+        snapshot.revision = 100;
+        snapshot.next_current = Some(40);
+    }
+    let owner = state.owner().unwrap();
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 900.0, 1100.0);
+    let point = bounds(&ui, "Next current page").center();
+    let mut actions = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    assert!(matches!(actions.as_slice(), [Action::NextCurrent(_, 40)]));
+    let next = actions.remove(0);
+    let Effect::Read { ticket, page, .. } = state.update(next.clone()).unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.current_before, Some(40));
+    assert_eq!(
+        page.before,
+        Some(90),
+        "current navigation preserves history position"
+    );
+    let mut confirmation = entry(2, Role::Contribute);
+    confirmation.claims.clear();
+    confirmation.ever_claimed = false;
+    assert_eq!(confirmation.bucket(), Bucket::NeedsConfirmation);
+    let mut second = snapshot(home(10), vec![confirmation], 100);
+    second.next_current = Some(30);
+    assert!(second.validate().is_ok());
+    state.update(Action::Loaded {
+        ticket,
+        result: Ok(second.clone()),
+    });
+    assert!(
+        state.update(next).is_none(),
+        "queued old page navigation cannot skip the displayed cursor"
+    );
+    let current = state.view.as_ref().unwrap().snapshot.as_ref().unwrap();
+    assert_eq!(current.entries.len(), 1);
+    assert_eq!(
+        current.entries[0].target,
+        target(2),
+        "old page must not accumulate"
+    );
+    let ui = cached(&state, Cache::new(), &mut renderer, 900.0, 1100.0);
+    let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    let labels = nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .filter_map(|node| node.node().label())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"No ongoing work on this page"));
+    assert!(bounds(&ui, "Latest current work").width > 0.0);
+    drop(ui);
+    let Effect::Read { ticket, .. } = state.update(Action::NextCurrent(owner, 30)).unwrap() else {
+        panic!()
+    };
+    let mut nondecreasing = second.clone();
+    nondecreasing.next_current = Some(30);
+    state.update(Action::Loaded {
+        ticket,
+        result: Ok(nondecreasing),
+    });
+    assert_eq!(
+        state.view.as_ref().unwrap().snapshot.as_ref(),
+        Some(&second)
+    );
+    assert!(state.view.as_ref().unwrap().error.is_some());
+    let Effect::Read { page, ticket, .. } = state.update(Action::LatestCurrent(owner)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(page.current_before, None);
+    assert_eq!(page.before, Some(90));
+    state.update(Action::Loaded {
+        ticket,
+        result: Ok(snapshot(home(10), vec![entry(3, Role::Review)], 100)),
+    });
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .entries[0]
+            .target,
+        target(3)
+    );
+    let Effect::Refresh { ticket, .. } = state.update(Action::Refresh(owner)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        state.view.as_ref().unwrap().read_page.unwrap(),
+        Page {
+            current_before: None,
+            before: None,
+            limit: PAGE_SIZE
+        }
+    );
+    state.update(Action::Loaded {
+        ticket,
+        result: Err(Failure::Unavailable),
+    });
+    assert_eq!(
+        state.view.as_ref().unwrap().page.before,
+        Some(90),
+        "failed latest read preserves displayed page position"
+    );
+}
+
+#[test]
+fn receipt_confirmation_settles_without_projection_and_never_rebinds_offscreen() {
+    for wrong in 0..5 {
+        let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+        let (ticket, mutation) = begin_end(&mut state, 1);
+        state.update(Action::Applied {
+            ticket,
+            result: Err(Failure::Unavailable),
+        });
+        let owner = state.owner().unwrap();
+        let Effect::Lookup {
+            ticket, operation, ..
+        } = state
+            .update(Action::Check(owner, mutation.operation))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut receipt = completed(&mutation, 2, Vec::new()).receipt;
+        match wrong {
+            0 => receipt.home = home(11),
+            1 => receipt.operation = Uuid::new_v4(),
+            2 => receipt.revision = 3,
+            3 => receipt.changed = false,
+            _ => {}
+        }
+        let effect = state.update(Action::LookedUp {
+            ticket,
+            operation,
+            result: Ok(Some(receipt)),
+        });
+        if wrong < 4 {
+            assert!(effect.is_none());
+            assert_eq!(
+                state.pending_for(home(10)).unwrap().delivery,
+                Delivery::Unknown
+            );
+            assert!(!state.writable(owner));
+        } else {
+            assert!(state.pending.is_empty());
+            let Effect::Read {
+                ticket,
+                home: observed,
+                ..
+            } = effect.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(observed, mutation.home);
+            state.update(Action::Loaded {
+                ticket,
+                result: Err(Failure::Unavailable),
+            });
+            assert!(
+                state.pending.is_empty(),
+                "projection failure cannot undo a confirmed operation"
+            );
+            assert_eq!(
+                state
+                    .view
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .entries[0]
+                    .revision,
+                1,
+                "no receipt-derived current status"
+            );
+            assert!(
+                state
+                    .view
+                    .as_ref()
+                    .unwrap()
+                    .notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("confirmed")
+            );
+        }
+    }
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    let (ticket, mutation) = begin_end(&mut state, 1);
+    state.update(Action::Applied {
+        ticket,
+        result: Err(Failure::Unavailable),
+    });
+    let owner = state.owner().unwrap();
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let other_read = state.open(home(11), "Other".into()).unwrap();
+    load(
+        &mut state,
+        other_read,
+        snapshot(home(11), vec![entry(2, Role::Review)], 1),
+    );
+    assert!(
+        state
+            .update(Action::LookedUp {
+                ticket,
+                operation,
+                result: Ok(Some(completed(&mutation, 2, Vec::new()).receipt))
+            })
+            .is_none(),
+        "offscreen confirmation must not read/focus another home"
+    );
+    assert!(state.pending.is_empty());
+    assert_eq!(state.home(), Some(home(11)));
+    assert!(state.view.as_ref().unwrap().notice.is_none());
 }

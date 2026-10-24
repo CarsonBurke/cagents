@@ -101,6 +101,11 @@ fn public_handler_refuses_unknown_authority_instead_of_falling_back_to_user_and_
             home,
             page: Page::default(),
         },
+        Request::ReadHome { home },
+        Request::ReadTarget {
+            home,
+            target: mutation(home).change.target().clone(),
+        },
         Request::Mutate {
             mutation: mutation(home),
             caller: None,
@@ -147,6 +152,78 @@ fn public_handler_refuses_unknown_authority_instead_of_falling_back_to_user_and_
     assert!(
         !applied.snapshot.entries[0].is_ongoing_work(),
         "review-only is not implementation ownership"
+    );
+}
+
+#[test]
+fn public_point_and_home_reads_keep_exact_scope_and_recover_retired_home_without_projection() {
+    let (host, _directory, home) = fixture();
+    let original = mutation(home);
+    let target = original.change.target().clone();
+    let Response::Applied(applied) = wire(
+        &host,
+        Authority::default(),
+        Request::Mutate {
+            mutation: original.clone(),
+            caller: None,
+        },
+    ) else {
+        panic!("track work")
+    };
+    let Response::Target(point) = wire(
+        &host,
+        Authority::default(),
+        Request::ReadTarget {
+            home,
+            target: target.clone(),
+        },
+    ) else {
+        panic!("exact target read")
+    };
+    point.validate().unwrap();
+    assert_eq!(point.home, home);
+    assert_eq!(point.target, target);
+    assert_eq!(point.entry, applied.snapshot.entries.first().cloned());
+    let foreign = Home {
+        registry: uuid::Uuid::new_v4(),
+        ..home
+    };
+    for request in [
+        Request::ReadHome { home: foreign },
+        Request::ReadTarget {
+            home: foreign,
+            target,
+        },
+    ] {
+        assert!(matches!(
+            wire(&host, Authority::default(), request),
+            Response::Failed(Failure::Refused(_))
+        ));
+    }
+    let registry = agent_execution::registry(&host).unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::DeleteChannel { id: home.channel })
+        .unwrap();
+    assert!(matches!(
+        wire(&host, Authority::default(), Request::ReadHome { home }),
+        Response::Home {
+            home: exact,
+            lifecycle: work::HomeLifecycle::Deleted,
+            revision
+        } if exact == home && revision > applied.snapshot.revision
+    ));
+    assert_eq!(
+        wire(
+            &host,
+            Authority::default(),
+            Request::Receipt {
+                home,
+                operation: original.operation,
+            },
+        ),
+        Response::Receipt(Some(applied.receipt))
     );
 }
 
