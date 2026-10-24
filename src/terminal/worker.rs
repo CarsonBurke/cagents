@@ -388,6 +388,7 @@ struct PublishedState {
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
+    launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -463,6 +464,7 @@ impl PublishedState {
             shutdown_requested: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
+            launch_directory: OnceLock::new(),
             original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
@@ -816,6 +818,40 @@ impl TerminalHandle {
     /// never rediscovered by a reusable terminal ID.
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
+    }
+    /// Physical provenance of the original PTY launch, not caller authority.
+    /// A caller must still revalidate its current Host record/source ownership;
+    /// these atomic worker checks do not make a source mutation atomic.
+    pub(crate) fn pinned_launch_directory(
+        &self,
+    ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
+        if self.is_completed()
+            || self
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        {
+            return Err("terminal worker is no longer active".into());
+        }
+        let ((identity, file), root) = self
+            .inner
+            .published
+            .launch_directory
+            .get()
+            .ok_or("this terminal holder cannot attest its original launch directory")?;
+        let mut original = libc::pollfd {
+            fd: root.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll observes the already-held original root, never a PID
+        // lookup. A kernel exit must refuse even before Completed is published.
+        let ready = unsafe { libc::poll(&mut original, 1, 0) };
+        if ready != 0 {
+            return Err("terminal original root is no longer live or cannot be observed".into());
+        }
+        holder::checked_launch_directory(*identity, Arc::clone(file))
     }
     pub(crate) fn transcript_location(&self) -> Option<crate::model::TranscriptLocationReceipt> {
         self.inner
@@ -2053,12 +2089,27 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
+        // Install only an already-held exact root identity, and allocate its
+        // CLOEXEC clone before adoption commit can transfer replay custody.
+        let launch_directory = held
+            .launch_directory
+            .as_ref()
+            .map(|(identity, file)| {
+                held.child
+                    .duplicate_pidfd()
+                    .map(|root| ((*identity, Arc::clone(file)), root))
+                    .map_err(|error| format!("pin original terminal root: {error}"))
+            })
+            .transpose()?;
         held.holder.commit_adoption()?;
         if let Some(role) = held.holder.original_role() {
             let _ = published.original_holder_role.set(role.clone());
         }
         if let Some(record) = held.holder.record() {
             let _ = published.holder_identity.set(record.clone());
+        }
+        if let Some(pin) = launch_directory {
+            let _ = published.launch_directory.set(pin);
         }
         reader.activate();
 
@@ -5171,6 +5222,115 @@ mod tests {
             Worker::start(session, config, None, commands, events, published).unwrap(),
             receiver,
         )
+    }
+
+    #[test]
+    fn terminal_handle_exposes_only_the_live_original_launch_pin_and_clones_keep_it_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("launch");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "echo PIN_HANDLE_READY; read line".into()],
+            working_directory: original.clone(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+        // Startup success itself guarantees installation; no later path lookup.
+        let (identity, file) = handle.pinned_launch_directory().unwrap();
+        wait_for_text(&handle, "PIN_HANDLE_READY");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let (again, cloned) = handle.pinned_launch_directory().unwrap();
+        assert_eq!(again, identity);
+        assert!(Arc::ptr_eq(&file, &cloned));
+        assert_ne!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(&original).unwrap()
+            ),
+            identity
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        handle.input(b"\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.pinned_launch_directory().is_err());
+        handle.shutdown().unwrap();
+        drop(handle);
+        drop(cloned);
+        assert_eq!(
+            crate::agent_execution::DirectoryIdentity::from_metadata(&file.metadata().unwrap()),
+            identity
+        );
+    }
+
+    #[test]
+    fn launch_pin_refuses_kernel_exit_before_worker_completion_publication() {
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; echo ROOT_EXIT_DONE".into()],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        });
+        let (commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: Arc::clone(&worker.published),
+                worker: joins::JoinOwner::empty(Arc::clone(&worker.published)),
+            }),
+        };
+        assert!(handle.pinned_launch_directory().is_ok());
+        let (_, original) = handle.inner.published.launch_directory.get().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        // The actual event loop is deliberately not running. The shell exits
+        // naturally while its queued exit report cannot publish Completed.
+        worker.writer.write_all(b"continue\n").unwrap();
+        assert!(worker.child.exited_within(Duration::from_secs(5)).unwrap());
+        assert!(!handle.is_completed());
+        assert!(
+            !handle
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            handle
+                .pinned_launch_directory()
+                .unwrap_err()
+                .contains("original root")
+        );
+        worker.run();
+        assert!(handle.is_completed());
+        assert!(handle.shutdown().is_ok());
     }
 
     #[test]
