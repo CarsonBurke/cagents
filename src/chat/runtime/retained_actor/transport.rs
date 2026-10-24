@@ -3871,16 +3871,36 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         std::fs::create_dir(&cwd).unwrap();
         std::fs::create_dir(root.path().join("claude")).unwrap();
         std::fs::write(cwd.join("marker"), "original").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let provider = cwd.join("fixture-claude");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > arguments
+session=
+for argument do
+    case "$argument" in --session-id=*) session=${argument#--session-id=} ;; esac
+done
+[ -n "$session" ] || exit 2
+printf '%s' "$session" > session-id
+/bin/cat marker > observed
+IFS= read -r frame || exit 3
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
+exec /bin/sleep 60
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         let expected = crate::agent_execution::DirectoryIdentity::from_metadata(
             &std::fs::metadata(&cwd).unwrap(),
         );
         let mut source = fixture_source();
         source.launch.recipe = crate::model::LaunchRecipe {
-            program: "/bin/sh".into(),
-            arguments: vec![
-                "-c".into(),
-                "/bin/cat marker > observed; exec /bin/sleep 60".into(),
-            ],
+            program: provider,
+            arguments: Vec::new(),
             working_directory: cwd.clone(),
             environment: BTreeMap::from([
                 ("HOME".into(), root.path().to_string_lossy().into_owned()),
@@ -3895,12 +3915,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         let proof = source.proof.clone().unwrap();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
-        let prepared = chat::protocol::create(&source.launch)
-            .unwrap()
-            .1
-            .prepared_launch_identity()
-            .unwrap();
-        let spec = ProcessSpec::from(&source.launch.recipe); // ordinary, no inherited startup directory FD
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let issued_session = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .expect("real fresh Claude preparation must issue its exact session ID")
+            .to_owned();
+        uuid::Uuid::parse_str(&issued_session).unwrap();
+        let public_arguments = spec.arguments.clone();
+        assert!(spec.execution.is_none()); // ordinary, no inherited startup directory FD
+        let prepared = adapter.prepared_launch_identity().unwrap();
         struct Owner(RemoteActor);
         impl Drop for Owner {
             fn drop(&mut self) {
@@ -3920,6 +3945,23 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             != Some("original")
         {
             assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("arguments")).unwrap(),
+            public_arguments.join("\n") + "\n",
+            "the private executable receives the real adapter's complete public argv"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("session-id")).unwrap(),
+            issued_session
+        );
+        while original.0.state().session_id.as_deref() != Some(issued_session.as_str()) {
+            assert!(
+                Instant::now() < deadline,
+                "prepared session identity was not observed"
+            );
+            original.0.refresh_state().unwrap();
             thread::sleep(Duration::from_millis(5));
         }
         std::fs::rename(&cwd, root.path().join("moved")).unwrap();
