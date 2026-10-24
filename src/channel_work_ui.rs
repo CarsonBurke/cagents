@@ -986,9 +986,10 @@ impl State {
         ])
         .spacing(space::XS)
         .align_y(Alignment::Center);
+        let mut status: Vec<Element<'_, Action>> = Vec::new();
         let mut body: Vec<Element<'_, Action>> = Vec::new();
         if let Some(confirmation) = &view.confirmation {
-            body.push(panel(vec![design::heading("Discard this tracking draft?").into(),
+            status.push(panel(vec![design::heading("Discard this tracking draft?").into(),
                 design::body("The unsaved PR identity or role will be lost. Submitted changes are tracked separately and will not be cancelled.").into(),
                 flow(vec![
                     ui_controls::owned((owner, confirmation.id, "keep"), button::primary("Keep editing").id(confirmation_id(confirmation.id)).on_press(Action::Keep(owner, confirmation.id))),
@@ -997,10 +998,10 @@ impl State {
             ]));
         }
         if let Some(error) = &view.error {
-            body.push(message(error, true));
+            status.push(message(error, true));
         }
         if let Some(notice) = &view.notice {
-            body.push(message(notice, false));
+            status.push(message(notice, false));
         }
         if let Some(pending) = self.pending_for(owner.home) {
             let text = match pending.delivery {
@@ -1025,9 +1026,9 @@ impl State {
                 ], narrow));
                 rows.push(design::caption("Retry sends the same target, role and operation. It does not apply a newly edited request.").into());
             }
-            body.push(panel(rows));
+            status.push(panel(rows));
         } else if self.pending.len() >= MAX_PENDING {
-            body.push(message("Other channels still have unconfirmed changes. Reads and navigation remain available; confirm a pending change before starting another.", true));
+            status.push(message("Other channels still have unconfirmed changes. Reads and navigation remain available; confirm a pending change before starting another.", true));
         }
         let Some(snapshot) = &view.snapshot else {
             body.push(
@@ -1042,13 +1043,13 @@ impl State {
                 )
                 .into(),
             );
-            return mount(header, body, height);
+            return mount(header, status, body, height);
         };
         if view.loading.is_some() {
-            body.push(design::caption("Updating the current view…").into());
+            status.push(design::caption("Updating the current view…").into());
         }
         if snapshot.lifecycle != HomeLifecycle::Active {
-            body.push(message(match snapshot.lifecycle {
+            status.push(message(match snapshot.lifecycle {
                 HomeLifecycle::Archived => "This channel is archived. Its work history is preserved; reopen the channel to change tracking.",
                 HomeLifecycle::Deleted => "This channel was deleted. Preserved work history is read-only.",
                 HomeLifecycle::Active => unreachable!(),
@@ -1286,7 +1287,7 @@ impl State {
             }
             body.push(design::caption("History shows each relation’s latest ended state. Earlier pages replace this page; they do not load an unbounded timeline.").into());
         }
-        mount(header, body, height)
+        mount(header, status, body, height)
     }
 
     fn form_view<'a>(
@@ -1746,23 +1747,34 @@ fn message<'a>(text: &'a str, warning: bool) -> Element<'a, Action> {
 }
 fn mount<'a>(
     header: impl Into<Element<'a, Action>>,
+    status: Vec<Element<'a, Action>>,
     rows: Vec<Element<'a, Action>>,
     _height: f32,
 ) -> Element<'a, Action> {
+    let region_spacing = if status.is_empty() || rows.is_empty() {
+        0
+    } else {
+        space::M
+    };
+    // Keep content ancestry stable when transient status rows come and go.
+    let body = widget::column::with_children(vec![
+        widget::column::with_children(status)
+            .spacing(space::M)
+            .into(),
+        widget::column::with_children(rows).spacing(space::M).into(),
+    ])
+    .spacing(region_spacing)
+    .padding(space::M);
     widget::column::with_children(vec![
         widget::container(header)
             .padding(space::M)
             .width(Length::Fill)
             .into(),
         design::horizontal_rule(),
-        widget::scrollable(
-            widget::column::with_children(rows)
-                .spacing(space::M)
-                .padding(space::M),
-        )
-        .height(Length::Fill)
-        .width(Length::Fill)
-        .into(),
+        widget::scrollable(body)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into(),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
