@@ -1480,7 +1480,7 @@ fn home_native_pr_hold_rejects_same_number_other_repository_and_keeps_current_ta
     let mut messages = click(&mut ui, &mut renderer, hit);
     let _ = ui.into_cache();
     assert!(
-        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { key, .. }) if Target::PullRequest(key) == fork.target)
+        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { key, .. }) if Target::PullRequest(key.clone()) == fork.target)
     );
     let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1200.0);
     let hit = bounds(&ui, &name).center();
@@ -1507,7 +1507,7 @@ fn home_native_pr_hold_rejects_same_number_other_repository_and_keeps_current_ta
     let _ = ui.into_cache();
     assert_eq!(messages.len(), 1);
     assert!(
-        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { home: actual, key, .. }) if actual == home(10) && Target::PullRequest(key) == fork.target)
+        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { home: actual, key, .. }) if actual == home(10) && Target::PullRequest(key.clone()) == fork.target)
     );
 }
 
