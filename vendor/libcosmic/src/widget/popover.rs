@@ -39,6 +39,160 @@ pub struct Popover<'a, Message, Renderer> {
     on_close: Option<Message>,
 }
 
+#[cfg(feature = "a11y")]
+#[derive(Default)]
+struct AccessibilityState {
+    // Geometry from the real overlay pass, paired with this popup's Tree.
+    // Base layout has no popup child and cannot stand in for its position.
+    popup_layout: Option<layout::Node>,
+    modal: bool,
+    order: usize,
+    scope: Option<std::rc::Rc<AccessibilityScope>>,
+    // Only native root IDs, refreshed during AX export. Never retain AX nodes,
+    // widgets or text; ancestors move the already-exported foreground nodes.
+    roots: std::cell::RefCell<Vec<iced_accessibility::accesskit::NodeId>>,
+}
+
+#[cfg(feature = "a11y")]
+#[derive(Default)]
+struct AccessibilityScope {
+    next: std::cell::Cell<usize>,
+    foreground: std::cell::Cell<Option<usize>>,
+}
+
+#[cfg(feature = "a11y")]
+fn share_accessibility_scope(tree: &mut Tree, scope: &std::rc::Rc<AccessibilityScope>) {
+    if tree.tag == iced_core::widget::tree::Tag::of::<AccessibilityState>() {
+        tree.state.downcast_mut::<AccessibilityState>().scope = Some(std::rc::Rc::clone(scope));
+    }
+    for child in &mut tree.children {
+        share_accessibility_scope(child, scope);
+    }
+}
+
+#[cfg(feature = "a11y")]
+fn accessibility_id(node: &iced_accessibility::A11yNode) -> iced_accessibility::accesskit::NodeId {
+    use iced_accessibility::{A11yId, id::Internal};
+    let id = match node.id() {
+        A11yId::Window(id) => *id,
+        A11yId::Widget(id) => match &id.0 {
+            Internal::Unique(id) | Internal::Custom(id, _) => *id,
+            Internal::Set(_) => unreachable!("AX nodes cannot have set IDs"),
+        },
+    };
+    iced_accessibility::accesskit::NodeId(id)
+}
+
+#[cfg(feature = "a11y")]
+fn clear_accessibility_roots(tree: &Tree) {
+    if tree.tag == iced_core::widget::tree::Tag::of::<AccessibilityState>() {
+        tree.state
+            .downcast_ref::<AccessibilityState>()
+            .roots
+            .borrow_mut()
+            .clear();
+    }
+    for child in &tree.children {
+        clear_accessibility_roots(child);
+    }
+}
+
+#[cfg(feature = "a11y")]
+fn modal_accessibility_state(tree: &Tree) -> Option<&AccessibilityState> {
+    // Actual overlay layout order, rather than widget-tree depth/order, owns
+    // the foreground. Groups can contain several overlays at the same depth.
+    if tree.tag == iced_core::widget::tree::Tag::of::<AccessibilityState>() {
+        let state = tree.state.downcast_ref::<AccessibilityState>();
+        if state.modal
+            && state.popup_layout.is_some()
+            && state
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.foreground.get() == Some(state.order))
+        {
+            return Some(state);
+        }
+    }
+    tree.children.iter().find_map(modal_accessibility_state)
+}
+
+#[cfg(feature = "a11y")]
+fn foreground_accessibility_roots(
+    tree: &Tree,
+    foreground: &AccessibilityState,
+    roots: &mut Vec<(usize, iced_accessibility::accesskit::NodeId)>,
+) {
+    if tree.tag == iced_core::widget::tree::Tag::of::<AccessibilityState>() {
+        let state = tree.state.downcast_ref::<AccessibilityState>();
+        if state.popup_layout.is_some()
+            && state.order >= foreground.order
+            && state
+                .scope
+                .as_ref()
+                .zip(foreground.scope.as_ref())
+                .is_some_and(|(a, b)| std::rc::Rc::ptr_eq(a, b))
+        {
+            roots.extend(state.roots.borrow().iter().map(|id| (state.order, *id)));
+        }
+    }
+    for child in &tree.children {
+        foreground_accessibility_roots(child, foreground, roots);
+    }
+}
+
+#[cfg(feature = "a11y")]
+fn modal_accessibility_tree(
+    mut nodes: iced_accessibility::A11yTree,
+    tree: &Tree,
+) -> iced_accessibility::A11yTree {
+    // This Popover already applies its own modal boundary. Only a nested
+    // modal requires promoting roots out of the ancestor popup's AX tree.
+    let Some(foreground) = tree.children.iter().find_map(modal_accessibility_state) else {
+        return nodes;
+    };
+    let mut candidates = Vec::new();
+    foreground_accessibility_roots(tree, foreground, &mut candidates);
+    candidates.sort_by_key(|(order, _)| *order);
+    let all = std::mem::take(nodes.root_mut())
+        .into_iter()
+        .chain(std::mem::take(nodes.children_mut()))
+        .collect::<Vec<_>>();
+    let edges = all
+        .iter()
+        .map(|node| (accessibility_id(node), node.node().children()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut retained = std::collections::HashSet::new();
+    let mut roots = Vec::new();
+    for (_, root) in candidates {
+        if retained.contains(&root) {
+            continue;
+        }
+        roots.push(root);
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if retained.insert(id) {
+                if let Some(children) = edges.get(&id) {
+                    pending.extend_from_slice(children);
+                }
+            }
+        }
+    }
+    drop(edges);
+    let mut root_nodes = Vec::new();
+    let mut children = Vec::new();
+    // Promote the real foreground roots out of ancestor AX containers while
+    // retaining original node order and the foreground's own child links.
+    for node in all {
+        let id = accessibility_id(&node);
+        if roots.contains(&id) {
+            root_nodes.push(node);
+        } else if retained.contains(&id) {
+            children.push(node);
+        }
+    }
+    iced_accessibility::A11yTree::new(root_nodes, children)
+}
+
 impl<'a, Message, Renderer> Popover<'a, Message, Renderer> {
     pub fn new(content: impl Into<Element<'a, Message, crate::Theme, Renderer>>) -> Self {
         Self {
@@ -90,6 +244,16 @@ impl<Message: Clone, Renderer> Widget<Message, crate::Theme, Renderer>
 where
     Renderer: iced_core::Renderer,
 {
+    #[cfg(feature = "a11y")]
+    fn tag(&self) -> iced_core::widget::tree::Tag {
+        iced_core::widget::tree::Tag::of::<AccessibilityState>()
+    }
+
+    #[cfg(feature = "a11y")]
+    fn state(&self) -> iced_core::widget::tree::State {
+        iced_core::widget::tree::State::new(AccessibilityState::default())
+    }
+
     fn id(&self) -> Option<widget::Id> {
         Some(self.id.clone())
     }
@@ -107,6 +271,10 @@ where
     }
 
     fn diff(&mut self, tree: &mut Tree) {
+        #[cfg(feature = "a11y")]
+        {
+            *tree.state.downcast_mut::<AccessibilityState>() = AccessibilityState::default();
+        }
         if let Some(popup) = &mut self.popup {
             tree.diff_children(&mut [&mut self.content, popup]);
         } else {
@@ -124,8 +292,17 @@ where
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let tree = &mut tree.children[0];
-        self.content.as_widget_mut().layout(tree, renderer, limits)
+        #[cfg(feature = "a11y")]
+        {
+            *tree.state.downcast_mut::<AccessibilityState>() = AccessibilityState::default();
+        }
+        let node = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        #[cfg(feature = "a11y")]
+        share_accessibility_scope(tree, &std::rc::Rc::default());
+        node
     }
 
     fn operate(
@@ -157,6 +334,13 @@ where
     ) {
         if self.popup.is_some() {
             if self.modal {
+                // The overlay already had first refusal. A stale accessibility
+                // target must not activate a control behind this modal.
+                #[cfg(feature = "a11y")]
+                if matches!(event, Event::A11y(..)) {
+                    shell.capture_event();
+                    return;
+                }
                 if matches!(event, Event::Mouse(_) | Event::Touch(_)) {
                     shell.capture_event();
                     return;
@@ -270,6 +454,8 @@ where
             translation.x += overlay_position.x;
             translation.y += overlay_position.y;
             Some(overlay::Element::new(Box::new(Overlay {
+                #[cfg(feature = "a11y")]
+                accessibility: tree.state.downcast_mut::<AccessibilityState>(),
                 tree: &mut tree.children[1],
                 content: popup,
                 position: self.position,
@@ -310,9 +496,35 @@ where
         state: &Tree,
         p: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content
-            .as_widget()
-            .a11y_nodes(layout, content_tree(state), p)
+        clear_accessibility_roots(state);
+        let content = || {
+            self.content
+                .as_widget()
+                .a11y_nodes(layout, content_tree(state), p)
+        };
+        let accessibility = state.state.downcast_ref::<AccessibilityState>();
+        let nodes = if let Some(popup) = &self.popup {
+            let popup = accessibility
+                .popup_layout
+                .as_ref()
+                .map(|node| {
+                    popup
+                        .as_widget()
+                        .a11y_nodes(Layout::new(node), &state.children[1], p)
+                })
+                .unwrap_or_default();
+            // Record this actual popup's roots before selecting a deeper modal.
+            // Its Tree remains the authority; no guessed geometry or IDs.
+            *accessibility.roots.borrow_mut() = popup.root().iter().map(accessibility_id).collect();
+            if self.modal {
+                popup
+            } else {
+                iced_accessibility::A11yTree::join([content(), popup].into_iter())
+            }
+        } else {
+            content()
+        };
+        modal_accessibility_tree(nodes, state)
     }
 }
 
@@ -328,6 +540,8 @@ where
 }
 
 pub struct Overlay<'a, 'b, Message, Renderer> {
+    #[cfg(feature = "a11y")]
+    accessibility: &'a mut AccessibilityState,
     tree: &'a mut Tree,
     content: &'a mut Element<'b, Message, crate::Theme, Renderer>,
     position: Position,
@@ -383,7 +597,26 @@ where
         position.x = position.x.round();
         position.y = position.y.round();
 
-        node.move_to(position)
+        let node = node.move_to(position);
+        #[cfg(feature = "a11y")]
+        {
+            let scope = self
+                .accessibility
+                .scope
+                .get_or_insert_with(Default::default);
+            let order = scope.next.get() + 1;
+            scope.next.set(order);
+            if self.modal {
+                scope.foreground.set(Some(order));
+            }
+            self.accessibility.order = order;
+            self.accessibility.popup_layout = Some(node.clone());
+            self.accessibility.modal = self.modal;
+            // Child base layout may have reset its state. Give every nested
+            // overlay this same layout family before Nested lays it out.
+            share_accessibility_scope(self.tree, scope);
+        }
+        node
     }
 
     fn operate(
@@ -406,6 +639,53 @@ where
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        #[cfg(feature = "a11y")]
+        if matches!(event, Event::A11y(..))
+            && self.accessibility.scope.as_ref().is_some_and(|scope| {
+                scope
+                    .foreground
+                    .get()
+                    .is_some_and(|foreground| self.accessibility.order < foreground)
+            })
+        {
+            // Group forwards to all of its children even after capture. An
+            // overlay below the actual modal foreground must never publish.
+            shell.capture_event();
+            return;
+        }
+        #[cfg(feature = "a11y")]
+        if matches!(event, Event::A11y(..))
+            && self
+                .accessibility
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.foreground.get().is_some())
+        {
+            // Group forwards the SAME Shell to every sibling, while COSMIC
+            // buttons refuse events already captured by a preceding modal.
+            // Eligible overlays must match their own actual native target
+            // before merging capture into that shared Shell. Overlays below
+            // the modal boundary returned above without updating content.
+            let mut messages = Vec::new();
+            let mut local = Shell::new(&mut messages);
+            self.content.as_widget_mut().update(
+                self.tree,
+                event,
+                layout,
+                cursor_position,
+                renderer,
+                clipboard,
+                &mut local,
+                &layout.bounds(),
+            );
+            if self.modal {
+                local.capture_event();
+            }
+            // Preserve messages, layout/widget invalidation, redraw, IME and
+            // event capture; never expose an unknown target to the base.
+            shell.merge(local, |message| message);
+            return;
+        }
         if self.modal
             && matches!(event, Event::Mouse(_) | Event::Touch(_))
             && !cursor_position.is_over(layout.bounds())
@@ -443,7 +723,13 @@ where
             clipboard,
             shell,
             &layout.bounds(),
-        )
+        );
+        // Nested::update will otherwise bubble an ignored AX target into the
+        // parent overlay, whose other controls are behind this modal too.
+        #[cfg(feature = "a11y")]
+        if self.modal && matches!(event, Event::A11y(..)) {
+            shell.capture_event();
+        }
     }
 
     fn mouse_interaction(
