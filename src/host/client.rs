@@ -309,6 +309,20 @@ fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
+pub(super) fn try_scoped_control_write(
+    gate: &RwLock<()>,
+) -> Result<std::sync::RwLockWriteGuard<'_, ()>, ProtocolError> {
+    match gate.try_write() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The daemon is finishing another operation. Wait for it and retry.",
+            true,
+        )),
+    }
+}
+
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
@@ -321,23 +335,31 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
 }
 
 fn disconnect_client(host: &SharedHost, client_id: ClientId) {
-    let gate = control_gate(host);
-    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-    let handles = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down {
-            // Shutdown owns the remaining session state. Removing delivery is
-            // safe, but unregistering would enqueue visibility/redraw effects
-            // after the upgrade's terminal snapshots have been committed.
-            state.forget_client_delivery(client_id);
-            Vec::new()
-        } else {
-            state.unregister_client(client_id)
+    {
+        let gate = control_gate(host);
+        let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+        let handles = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.shutting_down {
+                // Shutdown owns the remaining session state. Removing delivery is
+                // safe, but unregistering would enqueue visibility/redraw effects
+                // after the upgrade's terminal snapshots have been committed.
+                state.forget_client_delivery(client_id);
+                Vec::new()
+            } else {
+                state.unregister_client(client_id)
+            }
+        };
+        // Clear a disconnected GUI's outstanding redraw edge outside HostState.
+        for handle in handles {
+            handle.acknowledge_redraw(handle.generation());
         }
-    };
-    // Clear a disconnected GUI's outstanding redraw edge outside HostState.
-    for handle in handles {
-        handle.acknowledge_redraw(handle.generation());
+    }
+    // Outside the control gate: unwatching waits for a board being assembled,
+    // which must not hold up a writer queued at the gate.
+    let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
+    if let Some(work) = work {
+        work.unwatch(client_id);
     }
 }
 
@@ -364,6 +386,7 @@ pub(super) fn process_request(
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
+                super::account_lifecycle::ensure_idle(host)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -382,6 +405,30 @@ pub(super) fn process_request(
             false,
         ));
     }
+    // Install only the physical token under a short writer. Provider and
+    // registry work runs outside global admission while related starts refuse.
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountLifecycle { operation },
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
+        let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountLifecycle(value),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(
@@ -391,55 +438,74 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
+            | ClientRequest::ChatRelease { dry_run: false, .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
-            }
-            | ClientRequest::DeviceOperation {
-                operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
+    super::account_lifecycle::admit(host, &request)?;
+    super::worktree_removal::admit(host, &request)?;
+    // Retained originals are outside the session inventory. Refuse before
+    // publishing a preflight capability or requesting termination. This only
+    // observes custody already published now; quarantine can publish later.
+    // A malformed wire revision keeps its existing UnsupportedVersion result.
+    let shutdown_admission = matches!(&request, ClientRequest::Shutdown)
+        || matches!(&request, ClientRequest::ShutdownV1 { version, .. }
+            if *version == SHUTDOWN_VERSION);
+    if shutdown_admission && crate::daemon::child_reaper::has_retained_ownership() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            super::state::RETAINED_CHILD_CLEANUP_MESSAGE,
+            true,
+        ));
+    }
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
-            if let crate::device_service::Operation::AccountLifecycle { operation } = &operation {
-                let account =
-                    crate::account::remote::affected_account(operation).map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
-                if let Some(account) = account {
-                    let variable = crate::account::home_variable(account.provider).unwrap();
-                    let home = account.resolved_home().unwrap();
-                    let uses = |recipe: &crate::model::LaunchRecipe| {
-                        recipe
-                            .environment
-                            .get(variable)
-                            .is_some_and(|path| std::path::Path::new(path) == home)
-                    };
-                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    if state
-                        .terminals
-                        .values()
-                        .any(|record| !record.handle.is_completed() && uses(&record.session.launch))
-                        || state.chats.values().any(|record| {
-                            record.handle.owns_work() && uses(&record.session.launch.recipe)
-                        })
-                        || state
-                            .chat_spawning
-                            .values()
-                            .any(|session| uses(&session.launch.recipe))
-                    {
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
-                            false,
-                        ));
-                    }
+            match &operation {
+                crate::device_service::Operation::AccountLifecycle { .. } => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Account operations require daemon admission",
+                        false,
+                    ));
                 }
+                crate::device_service::Operation::Skills { launch } => {
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &Default::default(),
+                        true,
+                    )?;
+                    super::account_lifecycle::ensure_launch(
+                        host,
+                        &launch.recipe.working_directory,
+                        &launch.recipe.environment,
+                        &crate::account::launch_credential_overrides(&launch.recipe),
+                        true,
+                    )?;
+                }
+                crate::device_service::Operation::AccountsUpdate { registry, .. } => {
+                    let proposed = serde_json::from_value(registry.clone()).map_err(|error| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            format!("Invalid account preferences: {error}"),
+                            false,
+                        )
+                    })?;
+                    super::account_lifecycle::ensure_update(host, &proposed)?;
+                }
+                crate::device_service::Operation::AccountLogin { account }
+                | crate::device_service::Operation::AccountProbe { account, .. } => {
+                    super::account_lifecycle::ensure_paths(host, account.resolved_home())?;
+                }
+                _ => {}
             }
             let reply = crate::device_service::execute(operation).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -449,6 +515,56 @@ pub(super) fn process_request(
         ClientRequest::Authenticate { authority } => {
             super::agent_execution::terminals::authenticate(host, client_id, &authority)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::Work(request) => {
+            // Admission was checked above. A board may wait on scans and
+            // GitHub for its bound, which must not hold the fence that
+            // shutdown and upgrades take.
+            drop(_shared);
+            let work = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .work
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "The Work board is unavailable",
+                        false,
+                    )
+                })?;
+            let response = work.process(host, request).map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            Ok((ServerResponse::Work(response), Vec::new(), false))
+        }
+        ClientRequest::WatchWork => {
+            // Like a board read, the first answer may wait on scans.
+            drop(_shared);
+            let (work, delivery) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.work.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, board) = work
+                .watch(host, client_id, delivery)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::Work(crate::work::Response::Watching {
+                    revision,
+                    board: Box::new(board),
+                }),
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::Automation {
             authority,
@@ -648,7 +764,7 @@ pub(super) fn process_request(
             ))
         }
         ClientRequest::ResolveUpgradeChat { source } => {
-            let session = super::chat::resolve_upgrade(host, &source)?;
+            let session = super::chat::upgrade_resolution::resolve(host, client_id, &source)?;
             Ok((
                 ServerResponse::UpgradeChatResolved { session },
                 Vec::new(),
@@ -692,7 +808,11 @@ pub(super) fn process_request(
         | ClientRequest::ChatClose { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
-        | ClientRequest::ChatList) => Ok((
+        | ClientRequest::ChatList
+        | ClientRequest::ChatCapacityInspect
+        | ClientRequest::ChatCapacitySet { .. }
+        | ClientRequest::ChatReleaseInspect { .. }
+        | ClientRequest::ChatRelease { .. }) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
             false,
@@ -1166,6 +1286,7 @@ pub(super) fn process_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
+            super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
@@ -1251,6 +1372,9 @@ fn prepare_resume(
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
+        if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
+            continue;
+        }
         let (terminal, events) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
@@ -1386,6 +1510,80 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn resident_release_drains_admitted_control_operations_before_retirement() {
+        let (proof, host) = panic_test_host("resident-release-gate");
+        let gate = control_gate(&host);
+        // Model an admitted submission between authentication and acceptance.
+        let admitted = gate.read().unwrap();
+        let release = crate::terminal_ipc::ChatReleaseProof {
+            session: crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "/missing-never-started".into(),
+                        arguments: vec![],
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            },
+            execution_instance: uuid::Uuid::new_v4(),
+            generation: 0,
+        };
+        // Inspection stays a shared operation and promptly reports absence.
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ChatRelease {
+                    proof: release.clone(),
+                    dry_run: true
+                }
+            )
+            .is_err()
+        );
+        let worker_host = host.clone();
+        let (started, ready) = crossbeam_channel::bounded(1);
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(process_request(
+                    &worker_host,
+                    1,
+                    ClientRequest::ChatRelease {
+                        proof: release,
+                        dry_run: false,
+                    },
+                ))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                result.recv_timeout(Duration::from_millis(100)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "mutating release crossed an admitted operation before its acceptance completed"
+        );
+        drop(admitted);
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
@@ -2407,6 +2605,261 @@ mod tests {
             .handle(1, terminal_id)
             .unwrap();
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn transfer_requests_refuse_invalid_membership_without_acknowledging_or_mutating_it() {
+        use crate::{
+            model::{
+                BootId, BrowserId, BrowserSession, CardId, CardKind, ChannelId, HostIncarnation,
+                HostSessionId,
+            },
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        let other = directory.path().join("other");
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("transfer-session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            }),
+        ));
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+        }
+        let edit = |edit| process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit });
+        for path in [&repository, &other] {
+            std::fs::create_dir(path).unwrap();
+            edit(ModelEdit::OpenProject {
+                repository: path.clone(),
+                name: "project".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        }
+        let source = ChannelId::new();
+        let destination = ChannelId::new();
+        let foreign = ChannelId::new();
+        for (id, repository) in [
+            (source, repository.clone()),
+            (destination, repository),
+            (foreign, other),
+        ] {
+            edit(ModelEdit::CreateChannel {
+                id,
+                repository,
+                title: "channel".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        }
+        let pane = Pane {
+            id: CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        edit(ModelEdit::SeedView {
+            scope: Scope::Channel(source),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        let before = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read_model()
+            .unwrap();
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .revision;
+        for (scope, id, to) in [
+            (Scope::Channel(ChannelId::new()), pane.id, destination),
+            (Scope::Channel(source), pane.id, ChannelId::new()),
+            (Scope::Channel(source), CardId::new(), destination),
+            (Scope::Channel(source), pane.id, foreign),
+            (Scope::Channel(source), CardId::new(), source),
+        ] {
+            let error = edit(ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id,
+                    destination: Scope::Channel(to),
+                    before: None,
+                },
+            })
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert_eq!(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .read_model()
+                    .unwrap(),
+                before
+            );
+        }
+        let valid = ModelEdit::ChangeView {
+            scope: Scope::Channel(source),
+            expected_revision: revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Transfer {
+                id: pane.id,
+                destination: Scope::Channel(destination),
+                before: None,
+            },
+        };
+        let moved = edit(valid.clone()).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: moved } = moved else {
+            panic!("transfer must return its committed model")
+        };
+        let replayed = edit(valid).unwrap().0;
+        let ServerResponse::WorkspaceModel { model: replayed } = replayed else {
+            panic!("replay must return its committed model")
+        };
+        assert_eq!(
+            moved, replayed,
+            "successful replay must bypass the now-empty source pane check"
+        );
+    }
+
+    #[test]
+    fn stale_pane_source_updates_return_retryable_conflict_without_partial_success() {
+        use crate::{
+            model::{
+                BootId, BrowserId, BrowserSession, CardId, CardKind, ChannelId, HostIncarnation,
+                HostSessionId,
+            },
+            workspace_model::{
+                ModelEdit,
+                views::{Change, Pane, Scope},
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        std::fs::create_dir(&repository).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(
+            super::super::state::HostState::new(HostSessionProof {
+                host_session_id: HostSessionId::new("source-update"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            }),
+        ));
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            state.register_client(1);
+        }
+        let edit = |edit| process_request(&host, 1, ClientRequest::EditWorkspaceModel { edit });
+        edit(ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "project".into(),
+            kind: Default::default(),
+        })
+        .unwrap();
+        let channel = ChannelId::new();
+        edit(ModelEdit::CreateChannel {
+            id: channel,
+            repository,
+            title: "channel".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+        let original = Pane {
+            id: CardId::new(),
+            title: "browser".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        edit(ModelEdit::SeedView {
+            scope: Scope::Channel(channel),
+            panes: vec![original.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+        let read = || {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read_model()
+                .unwrap()
+        };
+        let revision = |model: &crate::workspace_model::WorkspaceModel| {
+            model
+                .views
+                .iter()
+                .find(|view| view.scope == Scope::Channel(channel))
+                .unwrap()
+                .revision
+        };
+        let mut current = original.clone();
+        if let CardKind::Browser(browser) = &mut current.kind {
+            browser.current_url = "https://example.com/newer".parse().unwrap();
+        }
+        edit(ModelEdit::ChangeView {
+            scope: Scope::Channel(channel),
+            expected_revision: revision(&read()),
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Update {
+                before: original.clone(),
+                pane: current,
+            },
+        })
+        .unwrap();
+        let mut stale = original.clone();
+        stale.title = "must not partly commit".into();
+        stale.scope = Some(directory.path().join("stale"));
+        let before = read();
+        let error = edit(ModelEdit::ChangeView {
+            scope: Scope::Channel(channel),
+            expected_revision: revision(&before),
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Update {
+                before: original,
+                pane: stale,
+            },
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ViewConflict);
+        assert!(error.retryable);
+        assert_eq!(read(), before);
     }
 
     /// A shared-model edit reaches every window watching the model and never

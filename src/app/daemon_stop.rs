@@ -33,7 +33,7 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
+        (Self { core, capability, pending: false, settled: false, detail: "Confirming stops these hosted terminal/chat sessions and all their background subagents. Background work will not resume automatically. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel")).map(cosmic::Action::App))
     }
     fn core(&self) -> &Core {
         &self.core
@@ -126,12 +126,8 @@ impl Application for DaemonStop {
                         self.report = Some(StopReport::Failed { error });
                     }
                 }
-                iced::widget::operation::focus(widget::Id::new(if self.settled {
-                    "daemon-stop.cancel"
-                } else {
-                    "daemon-stop.confirm"
-                }))
-                .map(cosmic::Action::App)
+                iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
+                    .map(cosmic::Action::App)
             }
             _ => Task::none(),
         }
@@ -152,30 +148,32 @@ impl Application for DaemonStop {
                 ))
                 .into(),
                 crate::design::body(&self.detail).into(),
-                widget::row::with_children(vec![
+                super::dialog_ui::confirmation_actions(
                     crate::ui_controls::button::secondary(if self.settled {
                         "Close"
                     } else {
                         "Cancel"
                     })
                     .id(widget::Id::new("daemon-stop.cancel"))
-                    .on_press_maybe((!self.pending).then_some(StopMessage::Cancel))
-                    .into(),
-                    crate::ui_controls::button::secondary("Refresh count")
-                        .on_press_maybe(
-                            (!self.pending && self.settled && self.failed.load(Ordering::Acquire))
+                    .on_press_maybe((!self.pending).then_some(StopMessage::Cancel)),
+                    widget::row::with_children(vec![
+                        crate::ui_controls::button::secondary("Refresh count")
+                            .on_press_maybe(
+                                (!self.pending
+                                    && self.settled
+                                    && self.failed.load(Ordering::Acquire))
                                 .then_some(StopMessage::Refresh),
-                        )
-                        .into(),
-                    crate::ui_controls::button::destructive("Stop daemon")
-                        .id(widget::Id::new("daemon-stop.confirm"))
-                        .on_press_maybe(
-                            (!self.pending && !self.settled).then_some(StopMessage::Confirm),
-                        )
-                        .into(),
-                ])
-                .spacing(space::S)
-                .into(),
+                            )
+                            .into(),
+                        crate::ui_controls::button::destructive("Stop daemon")
+                            .id(widget::Id::new("daemon-stop.confirm"))
+                            .on_press_maybe(
+                                (!self.pending && !self.settled).then_some(StopMessage::Confirm),
+                            )
+                            .into(),
+                    ])
+                    .spacing(space::S),
+                ),
             ])
             .spacing(space::L),
         )
@@ -253,6 +251,34 @@ mod tests {
             (capability, Arc::new(AtomicBool::new(false))),
         )
         .0
+    }
+
+    #[test]
+    fn shutdown_confirmation_initial_and_refreshed_focus_is_cancel() {
+        let mut app = confirmation(2);
+        let (_app, initial) = DaemonStop::init(
+            Core::default(),
+            (app.capability.clone(), Arc::new(AtomicBool::new(false))),
+        );
+        // Map only the UI message type to reuse the real focus-operation tree
+        // reader; no shutdown or refresh task is polled by this test.
+        let initial = initial.map(|_| cosmic::Action::App(Message::DismissStatus));
+        let view = app.view().map(|_| Message::DismissStatus);
+        assert_eq!(
+            super::super::tests::focused_element(view, initial),
+            Some(widget::Id::new("daemon-stop.cancel"))
+        );
+        let unpolled_refresh = app.update(StopMessage::Refresh);
+        assert!(app.pending);
+        let task = app
+            .update(StopMessage::Refreshed(Ok(app.capability.clone())))
+            .map(|_| cosmic::Action::App(Message::DismissStatus));
+        assert_eq!(
+            super::super::tests::focused_element(app.view().map(|_| Message::DismissStatus), task),
+            Some(widget::Id::new("daemon-stop.cancel"))
+        );
+        assert!(!app.pending);
+        drop(unpolled_refresh);
     }
 
     #[test]

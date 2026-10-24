@@ -9,6 +9,8 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub(crate) mod native_chat_capacity;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
@@ -51,8 +53,11 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod file_url;
+mod filesystem_recovery_context;
 pub mod fs_safety;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
@@ -78,14 +83,17 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -120,8 +128,14 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+pub mod work;
+#[cfg(feature = "ui")]
+pub mod work_ui;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
+pub mod worktree_content;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod worktree_setup;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;

@@ -109,6 +109,16 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
         })
 }
 
+/// Setup recipes are retained for an explicit reviewed run, never automatic
+/// upgrade replay. The marker is classification, not execution authority.
+#[cfg(any(feature = "host", test))]
+pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
+    recipe
+        .environment
+        .get("CAGENTS_WORKTREE_SETUP")
+        .is_some_and(|value| value == "1")
+}
+
 #[cfg(any(feature = "host", test))]
 pub(crate) fn checkpoint_recipe(
     session: &TerminalSession,
@@ -490,13 +500,42 @@ pub(crate) mod handoff {
     use std::{ffi::OsStr, path::PathBuf};
 
     /// Legacy relaunches use 1, carried terminals 2, retained native owners 3,
-    /// and consent that forbids carried recipe fallback 4.
-    const VERSION: u16 = 4;
+    /// consent that forbids carried recipe fallback 4, and retained Claude actors 5.
+    const VERSION: u16 = 5;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
-    const MAX_TERMINALS: usize = 1024;
-    const MAX_CHATS: usize = 128;
+    pub(crate) const MAX_TERMINALS: usize = 1024;
+    pub(crate) const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
+    pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
+
+    /// Enforce the durable limit while serializing, before allocating a full
+    /// report. Launch environments and recovery lineages are client supplied.
+    #[cfg(any(feature = "host", test))]
+    fn encode_bounded(value: &impl Serialize, overflow: &'static str) -> Result<Vec<u8>, String> {
+        struct Bounded {
+            bytes: Vec<u8>,
+            overflow: &'static str,
+        }
+        impl Write for Bounded {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() as u64 > MAX_BYTES - self.bytes.len() as u64 {
+                    return Err(io::Error::other(self.overflow));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Bounded {
+            bytes: Vec::new(),
+            overflow,
+        };
+        serde_json::to_writer(&mut output, value).map_err(|error| error.to_string())?;
+        Ok(output.bytes)
+    }
 
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,15 +637,23 @@ pub(crate) mod handoff {
 
         /// The oldest version that can hold this checkpoint.
         fn format(&self) -> u16 {
-            if self.preserve_carried {
-                // Older readers may relaunch a missing carried holder.
-                4
-            } else if self.chats.iter().any(|chat| {
+            if self.chats.iter().any(|chat| {
                 matches!(
                     chat.source.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
+                    chat::NativeContinuity::RetainedClaudeActor { .. }
                 )
             }) {
+                // Older readers cannot authenticate the retained reducer and
+                // must not relaunch its issued recipe, including before ID.
+                5
+            } else if self.preserve_carried {
+                // Older readers may relaunch a missing carried holder.
+                4
+            } else if self
+                .chats
+                .iter()
+                .any(|chat| chat.source.native_continuity.retains_provider())
+            {
                 // Older readers would ignore this metadata and relaunch a
                 // recipe while its native holder still owns the server.
                 3
@@ -645,7 +692,7 @@ pub(crate) mod handoff {
                 Ok(())
             }
             let mut ids = std::collections::BTreeSet::new();
-            let mut conversations = std::collections::BTreeSet::new();
+            let mut conversations = std::collections::BTreeMap::new();
             let mut chat_ids = std::collections::BTreeSet::new();
             // Each source daemon either relaunched its terminal from the
             // source's safe recipe, or carried it, launched as it was.
@@ -687,9 +734,26 @@ pub(crate) mod handoff {
                 Ok(())
             };
             for terminal in &self.terminals {
-                if !ids.insert(terminal.source.id)
-                    || checkpoint_recipe(&terminal.source, &terminal.relaunches)? != terminal.recipe
-                {
+                // An interrupted setup may be present in legacy checkpoint
+                // evidence even though its command is deliberately not safe
+                // to replay. Accept only its unchanged recipe; restore retains
+                // it for review without ever executing it.
+                let pair = self.chats.iter().find(|chat| {
+                    chat.launch.provider == crate::agent::Provider::Codex
+                        && chat
+                            .source
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|source| source.id == terminal.source.id)
+                });
+                let recipe_matches = if let Some(chat) = pair {
+                    paired_terminal_source(chat, terminal).is_ok()
+                } else if is_worktree_setup_recipe(&terminal.source.launch) {
+                    terminal.source.launch == terminal.recipe
+                } else {
+                    checkpoint_recipe(&terminal.source, &terminal.relaunches)? == terminal.recipe
+                };
+                if !ids.insert(terminal.source.id) || !recipe_matches {
                     return Err("Upgrade terminal source or safe recipe is inconsistent".into());
                 }
                 lineage(
@@ -698,7 +762,9 @@ pub(crate) mod handoff {
                     &terminal.relaunches,
                 )?;
                 if let Some((provider, id)) = exact_conversation(&terminal.recipe)
-                    && !conversations.insert((provider.executable(), id))
+                    && conversations
+                        .insert((provider.executable(), id), terminal.source.id)
+                        .is_some()
                 {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
@@ -726,14 +792,22 @@ pub(crate) mod handoff {
                     .map(|(provider, id)| (provider.executable(), id))
                     .collect::<Vec<_>>();
                 writes.dedup();
-                if writes
-                    .into_iter()
-                    .any(|conversation| !conversations.insert(conversation))
-                {
+                if writes.into_iter().any(|conversation| {
+                    conversations
+                        .insert(conversation, carried.source.id)
+                        .is_some()
+                }) {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
             }
             for chat in &self.chats {
+                let paired_carried = self
+                    .carried
+                    .iter()
+                    .find(|carried| carried.source.id == chat.source.id);
+                if let Some(carried) = paired_carried {
+                    paired_carried_source(chat, carried, &self.proof)?;
+                }
                 let paired_codex = chat.launch.provider == crate::agent::Provider::Codex
                     && self.terminals.iter().any(|terminal| {
                         terminal.source.id == chat.source.id
@@ -744,18 +818,23 @@ pub(crate) mod handoff {
                                 .is_some_and(|source| source.id == terminal.source.id)
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
+                if paired_codex {
+                    let terminal = self
+                        .terminals
+                        .iter()
+                        .find(|terminal| terminal.source.id == chat.source.id)
+                        .expect("checked paired terminal");
+                    paired_terminal_source(chat, terminal)?;
+                }
                 if !chat_ids.insert(chat.source.id)
-                    || (!ids.insert(chat.source.id) && !paired_codex)
+                    || (!ids.insert(chat.source.id) && !paired_codex && paired_carried.is_none())
                     || chat.source.proof.as_ref() != Some(&self.proof)
                     || chat.source.launch.provider != chat.launch.provider
                 {
                     return Err("Upgrade native source identity is inconsistent".into());
                 }
                 let mut proofs = Vec::new();
-                let durable = matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                );
+                let durable = chat.source.native_continuity.retains_provider();
                 let mut aliases = Vec::new();
                 for (previous, next) in chat.previous_sources.iter().zip(
                     chat.previous_sources
@@ -807,13 +886,24 @@ pub(crate) mod handoff {
                 }
                 source_proof(chat.source.proof.clone(), &mut proofs)?;
                 validate_chat_source(&chat.source, &chat.launch)?;
+                if chat.source.has_unnamed_retained_claude_actor()
+                    && chat.launch.session_id.is_none()
+                {
+                    // Exact actor adoption, never recipe replay, resolves pre-ID panes.
+                    continue;
+                }
                 let recipe = chat
                     .launch
                     .terminal_recipe()
                     .ok_or("Native chat has no exact resumable provider identity")?;
                 let (provider, id) = exact_conversation(&recipe)
                     .ok_or("Native chat has no exact resumable provider identity")?;
-                if !conversations.insert((provider.executable(), id)) && !paired_codex {
+                if conversations
+                    .insert((provider.executable(), id), chat.source.id)
+                    .is_some_and(|owner| {
+                        owner != chat.source.id || (!paired_codex && paired_carried.is_none())
+                    })
+                {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
             }
@@ -832,18 +922,112 @@ pub(crate) mod handoff {
         }
     }
 
+    /// A retained execution carries its console without replaying its recipe.
+    /// Only the live/detached presentation may differ from the issued pair;
+    /// every ownership and execution field must remain exactly the same.
     #[cfg(any(feature = "host", test))]
-    fn validate_chat_source(source: &chat::Session, launch: &chat::Launch) -> Result<(), String> {
-        if !source.has_valid_native_continuity() {
+    fn paired_carried_source(
+        chat: &Chat,
+        carried: &Carried,
+        proof: &HostSessionProof,
+    ) -> Result<(), String> {
+        validate_chat_source(&chat.source, &chat.launch)?;
+        let issued = chat
+            .source
+            .terminal
+            .as_ref()
+            .ok_or("Carried native console has no issued pair")?;
+        if !chat.source.native_continuity.retains_provider()
+            || issued.id != chat.source.id
+            || carried.source.id != chat.source.id
+            || issued.continuity.live_proof().as_ref() != Some(proof)
+            || carried.source.continuity.live_proof().as_ref() != Some(proof)
+        {
+            return Err("Carried native console has inconsistent ownership".into());
+        }
+        let mut owner = carried.source.clone();
+        owner.continuity = issued.continuity.clone();
+        if owner != *issued {
+            return Err("Carried native console differs from its exact issued source".into());
+        }
+        Ok(())
+    }
+
+    /// Keep the descriptor already issued to the chat while validating the
+    /// separate exact execution selected by its original daemon. Older writers
+    /// stored the derived resume hint on the checkpoint's terminal copy.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn paired_terminal_source(
+        chat: &Chat,
+        terminal: &Terminal,
+    ) -> Result<TerminalSession, String> {
+        validate_chat_source(&chat.source, &chat.launch)?;
+        let original = chat
+            .source
+            .terminal
+            .as_ref()
+            .ok_or("Upgrade pair is missing")?;
+        if chat.launch.provider != crate::agent::Provider::Codex
+            || chat.launch.terminal_recipe().as_ref() != Some(&terminal.recipe)
+            || (terminal.source.resume_hint != original.resume_hint
+                && terminal
+                    .source
+                    .resume_hint
+                    .as_deref()
+                    .and_then(crate::model::agent_recovery::recipe_from_hint)
+                    .as_ref()
+                    != Some(&terminal.recipe))
+        {
+            return Err("Paired Codex execution does not match its confirmed source".into());
+        }
+        let mut owner = terminal.source.clone();
+        owner.continuity = original.continuity.clone();
+        owner.resume_hint = original.resume_hint.clone();
+        if owner != *original {
+            return Err("Paired Codex terminal descriptor would change during restart".into());
+        }
+        let mut issued = original.clone();
+        issued.continuity = terminal.source.continuity.clone();
+        Ok(issued)
+    }
+
+    #[cfg(any(feature = "host", test))]
+    /// Check the immutable descriptor against the separate effective restart.
+    /// Call while the old provider and windows are still usable, before handoff.
+    pub(crate) fn validate_chat_source(
+        source: &chat::Session,
+        launch: &chat::Launch,
+    ) -> Result<(), String> {
+        if !source.has_valid_native_continuity()
+            || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
+        {
             return Err("Upgrade native continuity evidence is inconsistent".into());
         }
-        let mut confirmed = source.launch.clone();
-        confirmed.session_id = launch.session_id.clone();
-        let recipe = confirmed
-            .terminal_recipe()
-            .ok_or("Native chat has no exact resumable provider identity")?;
-        if source.launch.provider != launch.provider || Some(recipe) != launch.terminal_recipe() {
-            return Err("Upgrade native source recipe is inconsistent".into());
+        if matches!(
+            source.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) && source
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| Some(id) != launch.session_id.as_ref())
+        {
+            return Err("Upgrade native confirmed identity is inconsistent".into());
+        }
+        if source.has_unnamed_retained_claude_actor() && launch.session_id.is_none() {
+            if source.launch != *launch {
+                return Err("Unnamed retained Claude source recipe is inconsistent".into());
+            }
+        } else {
+            let mut confirmed = source.launch.clone();
+            confirmed.session_id = launch.session_id.clone();
+            let recipe = confirmed
+                .terminal_recipe()
+                .ok_or("Native chat has no exact resumable provider identity")?;
+            if source.launch.provider != launch.provider || Some(recipe) != launch.terminal_recipe()
+            {
+                return Err("Upgrade native source recipe is inconsistent".into());
+            }
         }
         if let Some(terminal) = &source.terminal
             && (terminal.id != source.id
@@ -855,7 +1039,60 @@ pub(crate) mod handoff {
         {
             return Err("Upgrade native terminal ownership is inconsistent".into());
         }
+        // Paired terminal execution is separate from its issued descriptor.
+        // Checkpoint validation binds both recipes; live preparation also
+        // rechecks the exact selected process, thread and account before stop.
         Ok(())
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
+        // Actor aliases are an explicit helper journal. A known issued source
+        // cannot synthesize an earlier unnamed capability.
+        (!matches!(
+            saved.native_continuity,
+            chat::NativeContinuity::RetainedClaudeActor { .. }
+        ) || (saved.has_valid_native_continuity()
+            && source.has_valid_native_continuity()
+            && saved.native_continuity == source.native_continuity
+            && source
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)))
+            && source.proof.is_some()
+            && saved.proof == source.proof
+            && saved.id == source.id
+            && saved.launch.provider == source.launch.provider
+            && saved.launch.recipe == source.launch.recipe
+            && saved.launch.session_id == source.launch.session_id
+            && saved.owned_codex_listener == source.owned_codex_listener
+            && saved.terminal == source.terminal
+    }
+
+    /// An early pane may have learned the exact effective thread after its
+    /// immutable descriptor was issued. Only identities recorded by this
+    /// authenticated source or its effective restart qualify as that alias.
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
+        if issued_chat_matches(&saved.source, source) {
+            return true;
+        }
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        issued_chat_matches(&confirmed, source)
+    }
+
+    /// Publish the descriptor windows were issued, with only its confirmed
+    /// presentation identity advanced. Resume argv belongs to `launch` alone.
+    #[cfg(feature = "host")]
+    pub(crate) fn restored_chat(
+        source: &chat::Session,
+        launch: &chat::Launch,
+    ) -> Result<chat::Session, String> {
+        validate_chat_source(source, launch)?;
+        let mut restored = source.clone();
+        restored.launch.session_id = launch.session_id.clone();
+        Ok(restored)
     }
 
     /// The durable record of retained native conversations that an upgrade
@@ -916,6 +1153,19 @@ pub(crate) mod handoff {
     struct UnattachedReport<T> {
         version: u16,
         conversations: T,
+    }
+
+    // Completed execution checkpoints are not replay authority. Keep their
+    // issued aliases beside the authenticated replacement until panes have
+    // attached or the conversation is explicitly closed.
+    const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
+    #[cfg(any(feature = "host", test))]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct RecoveredChat {
+        pub evidence: Chat,
+        pub replacement: chat::Session,
+        #[serde(default)]
+        pub aliases: Vec<chat::Session>,
     }
 
     /// Budget sequential provider confirmation without parsing session payloads.
@@ -1060,23 +1310,6 @@ pub(crate) mod handoff {
         #[cfg(any(feature = "host", test))]
         pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
             checkpoint.validate()?;
-            // Serialization is bounded independently of the number of records:
-            // launch environments and paths are supplied by clients.
-            struct Bounded(Vec<u8>);
-            impl Write for Bounded {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    if bytes.len() as u64 > MAX_BYTES - self.0.len() as u64 {
-                        return Err(io::Error::other(
-                            "Upgrade checkpoint exceeds durable byte limit",
-                        ));
-                    }
-                    self.0.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
             #[derive(Serialize)]
             struct Versioned<'a> {
                 version: u16,
@@ -1087,9 +1320,11 @@ pub(crate) mod handoff {
                 version: checkpoint.format(),
                 checkpoint,
             };
-            let mut bytes = Bounded(Vec::new());
-            serde_json::to_writer(&mut bytes, &versioned).map_err(|error| error.to_string())?;
-            self.write_named(FILE, &bytes.0)
+            let bytes = encode_bounded(
+                &versioned,
+                "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
+            )?;
+            self.write_named(FILE, &bytes)
         }
 
         /// Atomically and durably replaces `name` with `bytes`.
@@ -1108,6 +1343,188 @@ pub(crate) mod handoff {
                 let _ = fs_safety::unlink_within(&self.root, &temporary);
             }
             result
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn read_recovered(&self) -> Result<Vec<RecoveredChat>, String> {
+            let Some(bytes) = self.read_named(RECOVERED_FILE)? else {
+                return Ok(Vec::new());
+            };
+            let report: UnattachedReport<Vec<RecoveredChat>> =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if report.version != 1 || report.conversations.len() > MAX_CHATS {
+                return Err("Unsupported recovered conversation evidence; it was preserved".into());
+            }
+            Ok(report.conversations)
+        }
+
+        /// Preserve aliases after the replay checkpoint is consumed. This file
+        /// is read only to verify a live replacement, never to start a writer.
+        #[cfg(any(feature = "host", test))]
+        pub(crate) fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let bytes = self.recovered_bytes(entries)?;
+            self.write_named(RECOVERED_FILE, &bytes)
+        }
+
+        #[cfg(feature = "host")]
+        pub(crate) fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
+            let entries = chats
+                .iter()
+                .map(|chat| {
+                    let replacement = restored_chat(&chat.source, &chat.launch)?;
+                    Ok(RecoveredChat {
+                        evidence: chat.clone(),
+                        replacement,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let bytes = self.recovered_bytes(&entries)?;
+            // Exercise the actual evidence storage before stopping source
+            // owners, including permissions and available disk space. This
+            // temporary file never becomes recovery or replay authority.
+            let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
+                .map_err(|error| error.to_string())?;
+            let result = file
+                .write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| error.to_string());
+            let removed = fs_safety::unlink_within(&self.root, &temporary)
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                });
+            result.and(removed)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn recovered_bytes(&self, entries: &[RecoveredChat]) -> Result<Vec<u8>, String> {
+            let mut previous = self.read_recovered()?;
+            for entry in entries {
+                validate_chat_source(&entry.evidence.source, &entry.evidence.launch)?;
+                if entry.replacement.id != entry.evidence.source.id
+                    || entry.replacement.launch.provider != entry.evidence.launch.provider
+                    || entry.replacement.launch.session_id != entry.evidence.launch.session_id
+                    || entry.replacement.owned_codex_listener
+                        != entry.evidence.source.owned_codex_listener
+                    || (entry.replacement.launch.recipe != entry.evidence.source.launch.recipe
+                        && !chat::is_upgrade_recovery(&entry.evidence.source, &entry.replacement))
+                {
+                    return Err("Recovered conversation evidence changed its exact identity".into());
+                }
+                let mut entry = entry.clone();
+                if let Some(old) = previous
+                    .iter()
+                    .find(|old| old.replacement.id == entry.replacement.id)
+                {
+                    for previous in
+                        old.evidence
+                            .previous_sources
+                            .iter()
+                            .chain(std::iter::once(&ChatSource {
+                                source: old.evidence.source.clone(),
+                                launch: old.evidence.launch.clone(),
+                            }))
+                    {
+                        let mut confirmed = previous.source.clone();
+                        confirmed.launch.session_id = previous.launch.session_id.clone();
+                        if !entry.aliases.contains(&confirmed) {
+                            entry.aliases.push(confirmed);
+                        }
+                    }
+                    for alias in old
+                        .aliases
+                        .iter()
+                        .chain(
+                            old.evidence
+                                .previous_sources
+                                .iter()
+                                .map(|previous| &previous.source),
+                        )
+                        .chain([&old.evidence.source, &old.replacement])
+                    {
+                        if !entry.aliases.contains(alias) {
+                            entry.aliases.push(alias.clone());
+                        }
+                    }
+                }
+                previous.retain(|old| old.replacement.id != entry.replacement.id);
+                previous.push(entry);
+            }
+            if previous.len() > MAX_CHATS {
+                return Err("Unconfirmed pane recovery evidence reached its capacity; existing evidence was preserved".into());
+            }
+            encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: previous,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )
+        }
+
+        #[cfg(feature = "host")]
+        pub(crate) fn recovered_sources(
+            &self,
+            source: &chat::Session,
+            replacement: &chat::Session,
+        ) -> Result<Option<Vec<ChatSource>>, String> {
+            for entry in self.read_recovered()? {
+                if entry.replacement.id != replacement.id
+                    || entry.replacement.launch != replacement.launch
+                    || entry.replacement.owned_codex_listener != replacement.owned_codex_listener
+                    || !(entry.replacement == *replacement
+                        || chat::is_upgrade_recovery(&entry.replacement, replacement))
+                {
+                    continue;
+                }
+                let mut aliases = entry.evidence.previous_sources;
+                aliases.extend(entry.aliases.into_iter().map(|source| ChatSource {
+                    source,
+                    launch: entry.evidence.launch.clone(),
+                }));
+                aliases.push(ChatSource {
+                    source: entry.evidence.source,
+                    launch: entry.evidence.launch.clone(),
+                });
+                aliases.push(ChatSource {
+                    source: entry.replacement,
+                    launch: entry.evidence.launch,
+                });
+                if aliases
+                    .iter()
+                    .any(|alias| issued_chat_source_matches(alias, source))
+                {
+                    return Ok(Some(aliases));
+                }
+            }
+            Ok(None)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        pub(crate) fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let mut entries = self.read_recovered()?;
+            let before = entries.len();
+            entries.retain(|entry| entry.replacement.id != id);
+            if entries.len() == before {
+                return Ok(());
+            }
+            if entries.is_empty() {
+                fs_safety::unlink_within(&self.root, OsStr::new(RECOVERED_FILE))
+                    .map_err(|error| error.to_string())?;
+                return fs_safety::sync_directory(&self.root).map_err(|error| error.to_string());
+            }
+            let bytes = encode_bounded(
+                &UnattachedReport {
+                    version: 1,
+                    conversations: entries,
+                },
+                "Unconfirmed pane recovery evidence exceeds its 8 MiB byte limit; existing evidence was preserved",
+            )?;
+            self.write_named(RECOVERED_FILE, &bytes)
         }
 
         /// Where retained conversations that could not be reattached are
@@ -1143,9 +1560,9 @@ pub(crate) mod handoff {
 
         /// Adds conversations to the unattached record, replacing any earlier
         /// entry for the same conversation, and forgets `resolved` ones, in one
-        /// durable replacement. The record stays within its count and byte
-        /// bounds: the entries recorded longest ago give way first, because an
-        /// oversized record must never make a restore fail.
+        /// durable replacement. Entries beyond the supported inventory give
+        /// way oldest first. Byte overflow refuses the replacement, preserving
+        /// existing evidence and the replay checkpoint rather than losing entries.
         #[cfg(any(feature = "host", test))]
         pub fn record_unattached(
             &self,
@@ -1209,38 +1626,43 @@ pub(crate) mod handoff {
             self.write_unattached(conversations)
         }
 
-        /// Durably replaces the record, or removes it when empty, evicting the
-        /// oldest entries while it exceeds the durable byte limit.
+        /// Durably replaces the record, or removes it when empty. Refuse byte
+        /// overflow so even a large supported inventory retains every entry.
         #[cfg(any(feature = "host", test))]
-        fn write_unattached(&self, mut conversations: Vec<UnattachedChat>) -> Result<(), String> {
-            loop {
-                if conversations.is_empty() {
-                    return match fs_safety::unlink_within(&self.root, OsStr::new(UNATTACHED_FILE)) {
-                        Err(error) if error.is_not_found() => Ok(()),
-                        result => result.map_err(|error| error.to_string()).and_then(|()| {
-                            fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
-                        }),
-                    };
-                }
-                let bytes = serde_json::to_vec(&UnattachedReport {
+        fn write_unattached(&self, conversations: Vec<UnattachedChat>) -> Result<(), String> {
+            if conversations.is_empty() {
+                return match fs_safety::unlink_within(&self.root, OsStr::new(UNATTACHED_FILE)) {
+                    Err(error) if error.is_not_found() => Ok(()),
+                    result => result.map_err(|error| error.to_string()).and_then(|()| {
+                        fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                    }),
+                };
+            }
+            let bytes = encode_bounded(
+                &UnattachedReport {
                     version: UNATTACHED_VERSION,
                     conversations: &conversations,
-                })
-                .map_err(|error| error.to_string())?;
-                if bytes.len() as u64 <= MAX_BYTES {
-                    return self.write_named(UNATTACHED_FILE, &bytes);
-                }
-                let evicted = conversations.remove(0);
-                tracing::warn!(session = %evicted.summary.id,
-                    conversation = ?evicted.summary.conversation,
-                    working_directory = %evicted.summary.working_directory.display(),
-                    reason = %evicted.summary.reason,
-                    "unattached-conversation evidence exceeded its byte limit; forgot the oldest entry");
-            }
+                },
+                "Unattached conversation evidence exceeds the 8 MiB byte limit; existing evidence and the upgrade checkpoint were preserved",
+            )?;
+            self.write_named(UNATTACHED_FILE, &bytes)
         }
 
         pub fn archive(&self) -> Result<PathBuf, String> {
-            const ARCHIVE: &str = "daemon-upgrade.abandoned.json";
+            self.archive_as("daemon-upgrade.abandoned.json")
+        }
+
+        /// Preserve deferred setup evidence without leaving a replayable
+        /// checkpoint in the daemon's boot path or replacing older evidence.
+        #[cfg(feature = "host")]
+        pub fn archive_interrupted_setup(&self) -> Result<PathBuf, String> {
+            self.archive_as(&format!(
+                "daemon-upgrade.interrupted-setup.{}.json",
+                uuid::Uuid::new_v4()
+            ))
+        }
+
+        fn archive_as(&self, archive: &str) -> Result<PathBuf, String> {
             let file = fs_safety::open_beneath(&self.root, Path::new(FILE))
                 .map_err(|error| error.to_string())?;
             let metadata = file.metadata().map_err(|error| error.to_string())?;
@@ -1255,10 +1677,10 @@ pub(crate) mod handoff {
                     self.path.display()
                 ));
             }
-            fs_safety::rename_new_within(&self.root, OsStr::new(FILE), OsStr::new(ARCHIVE))
-                .map_err(|error| format!("Cannot archive checkpoint without replacing prior evidence: {error}. Preserve and explicitly move any existing {} first", self.path.with_file_name(ARCHIVE).display()))?;
+            fs_safety::rename_new_within(&self.root, OsStr::new(FILE), OsStr::new(archive))
+                .map_err(|error| format!("Cannot archive checkpoint without replacing prior evidence: {error}. Preserve and explicitly move any existing {} first", self.path.with_file_name(archive).display()))?;
             fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())?;
-            Ok(self.path.with_file_name(ARCHIVE))
+            Ok(self.path.with_file_name(archive))
         }
 
         /// Host-only: the daemon removes a checkpoint it has finished
@@ -1276,6 +1698,24 @@ pub(crate) mod handoff {
     mod timeout_tests {
         use super::*;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[test]
+        fn evidence_encoding_stops_before_serializing_the_tail_of_an_oversized_report() {
+            struct Oversized;
+            impl Serialize for Oversized {
+                fn serialize<S: serde::Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut sequence = serializer.serialize_seq(Some(2))?;
+                    sequence.serialize_element(&"x".repeat(MAX_BYTES as usize))?;
+                    panic!("the tail of an oversized report must never be visited");
+                }
+            }
+            let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
+            assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
 
         #[test]
         fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
@@ -1318,6 +1758,19 @@ pub(crate) mod handoff {
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());
+            for chats in [129, MAX_CHATS] {
+                save(
+                    &serde_json::to_vec(&serde_json::json!({
+                        "version": VERSION, "terminals": [],
+                        "chats": vec![serde_json::Value::Null; chats],
+                    }))
+                    .unwrap(),
+                );
+                assert_eq!(
+                    store.startup_timeout().unwrap(),
+                    std::time::Duration::from_secs(5 + 30 * chats as u64)
+                );
+            }
             for (terminals, chats) in [(MAX_TERMINALS + 1, 0), (0, MAX_CHATS + 1)] {
                 save(
                     &serde_json::to_vec(&serde_json::json!({
@@ -1359,6 +1812,214 @@ mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalId};
     use handoff::{Carried, Checkpoint, Phase, Store, Terminal};
+
+    fn retained_claude_checkpoint(directory: &Path) -> Checkpoint {
+        let mut checkpoint = checkpoint(directory);
+        checkpoint.terminals.clear();
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec!["--model".into(), "fixture-haiku".into()],
+                    working_directory: directory.into(),
+                    environment: [(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        directory.join("account").to_string_lossy().into_owned(),
+                    )]
+                    .into(),
+                    unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                },
+                session_id: None,
+            },
+            proof: Some(checkpoint.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        };
+        checkpoint.chats.push(handoff::Chat {
+            launch: source.launch.clone(),
+            source,
+            previous_sources: Vec::new(),
+        });
+        checkpoint
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn issued_retained_source_matches_only_recorded_raw_or_confirmed_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = retained_claude_checkpoint(directory.path());
+        let mut saved = handoff::ChatSource {
+            source: checkpoint.chats[0].source.clone(),
+            launch: checkpoint.chats[0].launch.clone(),
+        };
+        saved.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let raw = saved.source.clone();
+        let mut confirmed = raw.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        assert!(handoff::issued_chat_source_matches(&saved, &raw));
+        assert!(handoff::issued_chat_source_matches(&saved, &confirmed));
+        let known_only = handoff::ChatSource {
+            source: confirmed.clone(),
+            launch: saved.launch.clone(),
+        };
+        assert!(
+            !handoff::issued_chat_source_matches(&known_only, &raw),
+            "a known issued identity cannot manufacture a pre-ID alias"
+        );
+        for mutation in 0..8 {
+            let mut claimed = confirmed.clone();
+            match mutation {
+                0 => claimed.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => claimed.native_continuity = crate::chat::NativeContinuity::ReconnectOnly,
+                2 => {
+                    claimed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                3 => claimed.launch.recipe.working_directory = "/other-project".into(),
+                4 => claimed.launch.recipe.arguments.push("--other-model".into()),
+                5 => claimed.proof.as_mut().unwrap().host_incarnation = "other-daemon".into(),
+                6 => claimed.id = TerminalId::new(),
+                _ => {
+                    claimed.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                        socket: "/other-listener".into(),
+                        allocator: claimed.proof.clone().unwrap(),
+                    })
+                }
+            }
+            assert!(
+                !handoff::issued_chat_source_matches(&saved, &claimed),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn issued_generic_source_preserves_only_actual_pre_id_and_confirmed_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        for provider in [crate::agent::Provider::Codex, crate::agent::Provider::Omp] {
+            let checkpoint = retained_claude_checkpoint(directory.path());
+            let mut source = checkpoint.chats[0].source.clone();
+            source.launch.provider = provider;
+            source.launch.recipe.program = provider.executable().into();
+            source.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            let mut effective = source.launch.clone();
+            effective.session_id = Some(uuid::Uuid::new_v4().to_string());
+            let saved = handoff::ChatSource {
+                source: source.clone(),
+                launch: effective.clone(),
+            };
+            let mut confirmed = source.clone();
+            confirmed.launch.session_id = effective.session_id.clone();
+            assert!(handoff::issued_chat_source_matches(&saved, &source));
+            assert!(handoff::issued_chat_source_matches(&saved, &confirmed));
+            let known_only = handoff::ChatSource {
+                source: confirmed.clone(),
+                launch: effective,
+            };
+            assert!(handoff::issued_chat_source_matches(&known_only, &confirmed));
+            assert!(
+                !handoff::issued_chat_source_matches(&known_only, &source),
+                "{provider:?}: a known source cannot manufacture a pre-ID alias"
+            );
+            confirmed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            assert!(
+                !handoff::issued_chat_source_matches(&saved, &confirmed),
+                "{provider:?}: neither recorded alias authorizes another conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_claude_pre_id_checkpoint_requires_actor_aware_reader_and_exact_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let checkpoint = retained_claude_checkpoint(directory.path());
+        checkpoint.validate().unwrap();
+        store.save(&checkpoint).unwrap();
+        let restored = store.load().unwrap().unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.chats[0].source, checkpoint.chats[0].source);
+        assert_eq!(restored.chats[0].launch, checkpoint.chats[0].launch);
+        assert!(restored.chats[0].launch.terminal_recipe().is_none());
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 5);
+        saved["version"] = 4.into();
+        fs::write(&store.path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(
+            store.load().is_err(),
+            "old readers must not relaunch an unnamed retained actor"
+        );
+
+        for mutation in 0..6 {
+            let mut changed = checkpoint.clone();
+            let launch = &mut changed.chats[0].launch;
+            match mutation {
+                0 => launch.recipe.program = "another-claude".into(),
+                1 => launch.recipe.arguments.push("--different-option".into()),
+                2 => launch.recipe.working_directory = "/another-project".into(),
+                3 => {
+                    launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other-account".into());
+                }
+                4 => launch.recipe.unset_environment.clear(),
+                _ => launch.provider = crate::agent::Provider::Codex,
+            }
+            assert!(
+                changed.validate().is_err(),
+                "effective launch mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_claude_pre_id_checkpoint_rejects_invalid_owner_and_recipe_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = retained_claude_checkpoint(directory.path());
+        for mutation in 0..8 {
+            let mut changed = checkpoint.clone();
+            let chat = &mut changed.chats[0];
+            match mutation {
+                0 => {
+                    chat.source.native_continuity =
+                        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 }
+                }
+                1 => {
+                    chat.source.native_continuity =
+                        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 3 }
+                }
+                2 => chat.source.native_continuity = crate::chat::NativeContinuity::ReconnectOnly,
+                3 => chat.source.proof = None,
+                4 => {
+                    chat.source.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("")
+                }
+                5 => chat.source.launch.provider = crate::agent::Provider::Codex,
+                6 => chat.source.launch.recipe.program = "bash".into(),
+                _ => chat.source.proof.as_mut().unwrap().boot_id = "wrong-boot".into(),
+            }
+            chat.launch = chat.source.launch.clone();
+            assert!(
+                changed.validate().is_err(),
+                "owner/recipe mutation {mutation}"
+            );
+        }
+        let mut duplicate = checkpoint.clone();
+        duplicate.chats.push(duplicate.chats[0].clone());
+        assert!(
+            duplicate.validate().is_err(),
+            "one pane cannot describe two retained owners"
+        );
+    }
 
     #[test]
     fn upgrades_relaunch_agents_unless_settings_say_otherwise() {
@@ -1763,6 +2424,218 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "host")]
+    fn legacy_codex_migration_separates_issued_and_effective_recipes_and_refuses_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint(directory.path());
+        let mut source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![
+                        "--remote".into(),
+                        "unix://".into(),
+                        "--model".into(),
+                        "fixture-luna".into(),
+                    ],
+                    working_directory: directory.path().into(),
+                    environment: [("CODEX_HOME".into(), "/fixture/managed-account".into())].into(),
+                    unset_environment: ["OPENAI_API_KEY".into()].into(),
+                },
+                session_id: None,
+            },
+            proof: Some(checkpoint.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        assert!(source.claim_owned_codex_listener(directory.path(), &checkpoint.proof));
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut effective = source.launch.clone();
+        effective.recipe = effective.terminal_recipe().unwrap();
+        assert_ne!(effective.recipe, source.launch.recipe);
+        let restored = handoff::restored_chat(&source, &effective).unwrap();
+        assert_eq!(restored, source);
+        let store = Store::open(directory.path()).unwrap();
+        let mut replacement = restored.clone();
+        replacement.proof.as_mut().unwrap().host_incarnation = "second-daemon".into();
+        store
+            .record_recovered(&[handoff::RecoveredChat {
+                evidence: handoff::Chat {
+                    source: source.clone(),
+                    launch: effective.clone(),
+                    previous_sources: Vec::new(),
+                },
+                replacement: replacement.clone(),
+                aliases: Vec::new(),
+            }])
+            .unwrap();
+        let mut third = replacement.clone();
+        third.proof.as_mut().unwrap().host_incarnation = "third-daemon".into();
+        assert!(store.recovered_sources(&source, &third).unwrap().is_some());
+        assert!(
+            store
+                .recovered_sources(&replacement, &third)
+                .unwrap()
+                .is_some()
+        );
+        let mut unrelated = third.clone();
+        unrelated
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/another-account".into());
+        assert!(
+            store
+                .recovered_sources(&source, &unrelated)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.load().unwrap().is_none(),
+            "completed evidence cannot be replayed as an execution checkpoint"
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("daemon-upgrade.recovered.json"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        store.retire_recovered(source.id).unwrap();
+        assert!(store.recovered_sources(&source, &third).unwrap().is_none());
+        for mutation in 0..6 {
+            let mut changed = effective.clone();
+            match mutation {
+                0 => changed.recipe.program = "another-codex".into(),
+                1 => changed.recipe.working_directory = "/another-project".into(),
+                2 => {
+                    changed
+                        .recipe
+                        .environment
+                        .insert("CODEX_HOME".into(), "/another-account".into());
+                }
+                3 => {
+                    changed.recipe.unset_environment.clear();
+                }
+                4 => changed.recipe.arguments.push("--different-option".into()),
+                _ => changed.provider = crate::agent::Provider::Claude,
+            }
+            assert!(
+                handoff::restored_chat(&source, &changed).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let mut changed = source.clone();
+        changed.owned_codex_listener.as_mut().unwrap().socket = "/another-listener".into();
+        assert!(handoff::restored_chat(&changed, &effective).is_err());
+    }
+
+    #[test]
+    fn native_upgrade_capacity_round_trips_supported_inventory_without_evidence_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        checkpoint.terminals.clear();
+        let maximum = crate::native_chat_capacity::MAX_LIMIT as usize;
+        for _ in 0..maximum {
+            let thread = uuid::Uuid::new_v4().to_string();
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: vec!["--resume".into(), thread.clone()],
+                        working_directory: directory.path().into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(thread),
+                },
+                proof: Some(checkpoint.proof.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            checkpoint.chats.push(handoff::Chat {
+                launch: source.launch.clone(),
+                source,
+                previous_sources: Vec::new(),
+            });
+        }
+        for count in [129, maximum] {
+            let mut inventory = checkpoint.clone();
+            inventory.chats.truncate(count);
+            store.save(&inventory).unwrap();
+            let loaded = store.load().unwrap().unwrap();
+            assert_eq!(loaded.chats.len(), count);
+            assert_eq!(loaded.chats[0].source, inventory.chats[0].source);
+            assert_eq!(
+                loaded.chats[count - 1].source,
+                inventory.chats[count - 1].source
+            );
+            let recovered = inventory
+                .chats
+                .iter()
+                .map(|chat| handoff::RecoveredChat {
+                    evidence: chat.clone(),
+                    replacement: chat.source.clone(),
+                    aliases: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            store.record_recovered(&recovered).unwrap();
+            let unattached = inventory
+                .chats
+                .iter()
+                .map(|chat| handoff::UnattachedChat::new(chat.clone(), "holder unavailable".into()))
+                .collect::<Vec<_>>();
+            store.record_unattached(&unattached, &[]).unwrap();
+            assert_eq!(store.unattached().unwrap().len(), count);
+            assert_eq!(
+                store.unattached().unwrap()[0].id,
+                inventory.chats[0].source.id
+            );
+        }
+        let before = fs::read(&store.path).unwrap();
+        let mut overflow = checkpoint.clone();
+        overflow.chats.push(checkpoint.chats[0].clone());
+        assert!(
+            store
+                .save(&overflow)
+                .unwrap_err()
+                .contains("session limits")
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        // Byte overflow must refuse even a count-supported checkpoint atomically.
+        checkpoint.chats[0]
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("PAYLOAD".into(), "x".repeat(8 * 1024 * 1024));
+        checkpoint.chats[0].launch = checkpoint.chats[0].source.launch.clone();
+        assert!(store.save(&checkpoint).unwrap_err().contains("8 MiB"));
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        let recovered_file = directory.path().join("daemon-upgrade.recovered.json");
+        let previous = fs::read(&recovered_file).unwrap();
+        let oversized = handoff::RecoveredChat {
+            evidence: checkpoint.chats[0].clone(),
+            replacement: checkpoint.chats[0].source.clone(),
+            aliases: Vec::new(),
+        };
+        assert!(
+            store
+                .record_recovered(&[oversized])
+                .unwrap_err()
+                .contains("8 MiB")
+        );
+        assert_eq!(fs::read(&recovered_file).unwrap(), previous);
+    }
+
+    #[test]
     fn retained_native_checkpoint_requires_a_holder_aware_reader() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
@@ -1890,6 +2763,95 @@ mod tests {
         mislabelled["version"] = 1.into();
         fs::write(&store.path, serde_json::to_vec(&mislabelled).unwrap()).unwrap();
         assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn retained_chat_accepts_only_its_exact_carried_console() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = retained_claude_checkpoint(directory.path());
+        let mut console = carry(checkpoint(directory.path()).terminals.remove(0));
+        console.source.id = saved.chats[0].source.id;
+        let mut issued = console.source.clone();
+        issued.continuity = TerminalContinuity::Live {
+            host_session_id: saved.proof.host_session_id.clone(),
+            boot_id: saved.proof.boot_id.clone(),
+            host_incarnation: saved.proof.host_incarnation.clone(),
+        };
+        saved.chats[0].source.terminal = Some(issued);
+        saved.carried.push(console);
+        saved
+            .validate()
+            .expect("one retained execution may carry its exact console");
+        for mutation in 0..9 {
+            let mut forged = saved.clone();
+            match mutation {
+                0 => forged.carried[0]
+                    .source
+                    .launch
+                    .arguments
+                    .push("--other".into()),
+                1 => forged.carried[0].source.transcript_path = None,
+                2 => forged.carried[0].source.recovery_origin = Some(TerminalId::new()),
+                3 => forged.carried[0].source.resume_hint = Some("unissued".into()),
+                4 => forged.chats[0].source.terminal.as_mut().unwrap().id = TerminalId::new(),
+                5 => {
+                    forged.chats[0].source.terminal.as_mut().unwrap().continuity =
+                        TerminalContinuity::RelaunchAvailable {
+                            recipe: forged.carried[0].source.launch.clone(),
+                            last_exit: None,
+                        }
+                }
+                6 => {
+                    forged.chats[0].source.native_continuity =
+                        crate::chat::NativeContinuity::ReconnectOnly
+                }
+                7 => forged.chats[0].source.terminal = None,
+                8 => forged.carried.push(forged.carried[0].clone()),
+                _ => unreachable!(),
+            }
+            assert!(
+                forged.validate().is_err(),
+                "accepted forged console mutation {mutation}"
+            );
+        }
+        for provider in [
+            crate::agent::Provider::Claude,
+            crate::agent::Provider::Codex,
+        ] {
+            let mut known = saved.clone();
+            let source = &mut known.chats[0].source;
+            if provider == crate::agent::Provider::Codex {
+                source.launch.provider = provider;
+                source.launch.recipe.program = "codex".into();
+                source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                assert!(source.claim_owned_codex_listener(directory.path(), &known.proof));
+                source.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.157.1".into(),
+                };
+            }
+            source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            known.chats[0].launch = known.chats[0].source.launch.clone();
+            known
+                .validate()
+                .expect("a retained confirmed thread may carry its exact console");
+            let recipe = known.chats[0].launch.terminal_recipe().unwrap();
+            // A paired console does not excuse a second execution elsewhere
+            // that writes this same thread, even when the console has no hint.
+            let mut duplicate = known.clone();
+            let mut writer = checkpoint(directory.path()).terminals.remove(0);
+            writer.source.launch = recipe.clone();
+            writer.recipe = recipe.clone();
+            duplicate.terminals.push(writer);
+            assert!(duplicate.validate().is_err());
+            // The console's own exact observed thread is the same execution,
+            // not a second provider writer.
+            let hint = crate::model::agent_recovery::hint_from_launch(&recipe);
+            known.carried[0].source.resume_hint = hint.clone();
+            known.chats[0].source.terminal.as_mut().unwrap().resume_hint = hint;
+            known
+                .validate()
+                .expect("the paired execution may share its observed thread");
+        }
     }
 
     #[test]
@@ -2033,12 +2995,15 @@ mod tests {
         store.retire_unattached(second.summary.id).unwrap();
         assert_eq!(store.unattached().unwrap(), vec![again.summary.clone()]);
         // The record stays bounded, giving way oldest first.
-        let many = (0..130)
+        let many = (0..crate::native_chat_capacity::MAX_LIMIT + 2)
             .map(|_| unattached("unavailable"))
             .collect::<Vec<_>>();
         store.record_unattached(&many, &[]).unwrap();
         let listed = store.unattached().unwrap();
-        assert_eq!(listed.len(), 128);
+        assert_eq!(
+            listed.len(),
+            crate::native_chat_capacity::MAX_LIMIT as usize
+        );
         assert_eq!(listed[0], many[2].summary);
         // Resolution and new refusals land in one replacement.
         let resolved = many[2..]
@@ -2054,7 +3019,7 @@ mod tests {
             !store.unattached_path().exists(),
             "nothing left needs attention"
         );
-        // An oversized record gives way oldest first rather than failing.
+        // Byte overflow preserves all prior evidence and refuses the replacement.
         let bulky = |reason: &str| {
             let mut entry = unattached(reason);
             entry.evidence.launch.recipe.environment =
@@ -2062,16 +3027,17 @@ mod tests {
             entry
         };
         let (old, newer, newest) = (bulky("old"), bulky("newer"), bulky("newest"));
-        store.record_unattached(&[old, newer.clone()], &[]).unwrap();
         store
-            .record_unattached(std::slice::from_ref(&newest), &[])
+            .record_unattached(&[old.clone(), newer.clone()], &[])
             .unwrap();
-        assert_eq!(
-            store.unattached().unwrap(),
-            vec![newer.summary.clone(), newest.summary.clone()]
-        );
+        let before = fs::read(store.unattached_path()).unwrap();
+        let error = store
+            .record_unattached(std::slice::from_ref(&newest), &[])
+            .unwrap_err();
+        assert!(error.contains("8 MiB"), "{error}");
+        assert_eq!(fs::read(store.unattached_path()).unwrap(), before);
         store
-            .record_unattached(&[], &[newer.summary.id, newest.summary.id])
+            .record_unattached(&[], &[newer.summary.id, old.summary.id])
             .unwrap();
         assert!(!store.unattached_path().exists());
         // Unreadable evidence is an error, never an empty report.

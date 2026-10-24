@@ -1,3 +1,5 @@
+mod account_lifecycle;
+pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
@@ -8,8 +10,14 @@ pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
 mod notifications;
+#[cfg(all(test, target_os = "linux"))]
+mod provider_shutdown_tests;
 mod service;
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests;
 mod state;
+mod work;
+mod worktree_removal;
 
 use std::{
     fs, io,
@@ -169,10 +177,21 @@ impl From<PlatformError> for HostError {
     }
 }
 
+/// Private retained-provider owner mode. Invoke before ordinary daemon setup;
+/// its captured account context and cleanup status belong to the launch owner.
+pub fn run_retained_actor_helper() -> Option<Result<(), String>> {
+    crate::chat::runtime::run_retained_helper_if_requested()
+}
+
 /// Dedicated precheck owners must enter before tracing or runtime threads are
 /// started: their descendant cleanup relies on being the sole child reaper.
 pub fn run_automation_helper() -> Option<Result<(), String>> {
     automations::helper_entry()
+}
+
+mod upgrade_inspect;
+pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
+    upgrade_inspect::entry()
 }
 
 /// Holds launch exclusion until the daemon listener is ready.
@@ -195,6 +214,20 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+/// Reserve and configure the serving socket before restore can take ownership
+/// of an original holder. The caller still holds HostLease and admission, and
+/// does not accept clients or publish readiness until restoration finishes.
+fn listener_before_restore(
+    paths: &RuntimePaths,
+    restore: impl FnOnce() -> Result<(), HostError>,
+) -> Result<UnixListener, HostError> {
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    restore()?;
+    Ok(listener)
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -205,7 +238,9 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
-    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
+    let mut initial = HostState::new(proof);
+    initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .enable_holder_recovery();
@@ -238,22 +273,32 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Some(broker) = &notification_broker {
         host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
     }
-    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(&host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
-            .map_err(io::Error::other)?;
+    // Cache sweeps preserve unretired helper journals and live Store leases.
+    if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
+        tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
+    let listener = listener_before_restore(&paths, || {
+        let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+        state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+        chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+        let retained_runs = chat::retained_actor::retained_runs(&host);
+        // A committed acceptance is not proof of provider delivery. Until a
+        // restored actor supplies exact run evidence, never authorize a resend.
+        if let Ok(registry) = agent_execution::registry(&host) {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupt_unproven_agent_runs_except(
+                    crate::chat::now_ms().unwrap_or(0),
+                    &retained_runs,
+                )
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    })?;
     let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
@@ -267,6 +312,16 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         Ok(broker) => Some(broker),
         Err(error) => {
             tracing::warn!(%error, "scheduled automations are unavailable");
+            None
+        }
+    };
+    let work_board = match work::Service::start(&host) {
+        Ok(service) => {
+            host.lock().unwrap_or_else(|p| p.into_inner()).work = Some(service.handle());
+            Some(service)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the Work board is unavailable");
             None
         }
     };
@@ -374,6 +429,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
     drop(automation_broker);
     drop(courier);
+    host.lock().unwrap_or_else(|p| p.into_inner()).work = None;
+    drop(work_board);
     let proof = host
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -396,11 +453,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for result in finish_terminal_shutdown(&handles) {
+        if let Err(error) = result {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -410,10 +464,32 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     for client in clients {
         let _ = client.join();
     }
+    // Healthy originals deliberately handed to a successor may outlive us.
+    // A suspended or failed handoff must not be reported as proved cleanup.
+    if let Some(error) = crate::daemon::child_reaper::retained_custody_error() {
+        tracing::error!(%error, "daemon shutdown retained unconfirmed original child custody");
+        runtime_error.get_or_insert_with(|| io::Error::other(error));
+    }
     match runtime_error {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    // Request and register every original before waiting on any one worker.
+    // One absolute deadline bounds the whole batch, including pending joins;
+    // an unfinished owner cannot consume another five seconds per sibling.
+    let deadline = std::time::Instant::now() + crate::terminal::TerminalHandle::SHUTDOWN_TIMEOUT;
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles
+        .iter()
+        .map(|handle| handle.shutdown_until(deadline))
+        .collect()
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
@@ -433,14 +509,20 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
-            chat.close()
+            chat.close().and_then(|()| {
+                if !upgrading {
+                    // Closing the provider leaves its retained helper alive
+                    // until final outcomes are durably committed and ACKed.
+                    // Preserve that ownership on failure, before retiring the
+                    // delegated session record below.
+                    chat::retained_actor::finish_close(host, &chat, &session)
+                } else {
+                    Ok(())
+                }
+            })
         };
         match closed {
             Ok(()) if !upgrading => {
@@ -454,7 +536,15 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     }
                 }
             }
-            Err(error) => tracing::warn!(%error, "provider shutdown was not confirmed"),
+            Err(error) => {
+                tracing::warn!(%error, "provider shutdown was not confirmed");
+                if result.is_ok() {
+                    result = Err(format!(
+                        "Provider {} shutdown was not confirmed: {error}",
+                        session.id
+                    ));
+                }
+            }
             Ok(()) => {}
         }
     }

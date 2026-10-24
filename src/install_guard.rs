@@ -21,6 +21,25 @@ use std::{
 
 use crate::instance::UiUpdateGuard;
 
+mod companions;
+pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceInspectionRequest {
+    pub(crate) protocol: u16,
+    pub(crate) proof: Option<crate::model::HostSessionProof>,
+    pub(crate) require_resumable: bool,
+}
+
+pub(crate) fn preflight_source_panes(
+    guard: &UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+    require_resumable: bool,
+) -> io::Result<()> {
+    crate::update::inspect_source_panes(guard, proof, require_resumable).map_err(io::Error::other)
+}
+
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
@@ -206,7 +225,21 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        guard.prepare_and_close_windows(Duration::from_secs(45))?
+        if arguments
+            .iter()
+            .any(|argument| argument == "--restart-daemon")
+        {
+            preflight_editor_companions(None)?;
+        }
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            preflight_source_panes(
+                guard,
+                None,
+                arguments
+                    .iter()
+                    .any(|argument| argument == "--restart-daemon"),
+            )
+        })?
     };
     let fd = script.as_raw_fd();
     let mut result = ResultPipe::new()?;
@@ -465,8 +498,20 @@ pub(crate) fn staged_owner_bin(
     // Shared with every UI launch, exclusive against reviewed update/close.
     // Keep it through synchronous daemon recovery and ownership revalidation.
     let launch = crate::instance::LaunchFence::recovery()?;
-    let windows = crate::instance::verified_running_windows()?;
     let running = crate::daemon::running_executable().map_err(io::Error::other)?;
+    let (windows, _legacy) = if std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_some() {
+        // The reviewed updater also holds the shared legacy fence after all
+        // windows close. Authenticate its exact exclusive inherited guard;
+        // probing legacy exclusivity here would mistake our coordinator for UI.
+        (crate::instance::verified_staged_windows()?, None)
+    } else if running.as_deref() == Some(layout.version_root.join("bin/cagentsd").as_path()) {
+        let (windows, legacy) = crate::instance::verified_windows_for_daemon(
+            &layout.version_root.join("bin/cagentsd"),
+        )?;
+        (windows, Some(legacy))
+    } else {
+        (crate::instance::verified_running_windows()?, None)
+    };
     let window_bin = window_owner_bin(&layout.prefix, &windows)?;
     if running.as_ref() == Some(&layout.version_root.join("bin/cagentsd")) && windows.is_empty() {
         return Ok(None);

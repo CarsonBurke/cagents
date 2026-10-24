@@ -331,6 +331,10 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
+
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 38] {
         [
@@ -635,8 +639,11 @@ const fn default_terminal_scroll_speed() -> f32 {
     1.0
 }
 
+/// Clone-local default shared by the local and device creation paths.
+pub const DEFAULT_MANAGED_WORKTREE_DIRECTORY: &str = ".worktrees/";
+
 fn default_managed_worktree_directory() -> String {
-    "worktrees/".to_owned()
+    DEFAULT_MANAGED_WORKTREE_DIRECTORY.to_owned()
 }
 
 const fn default_focus_follows_mouse() -> bool {
@@ -676,6 +683,10 @@ const fn default_show_worktree_changes_icons() -> bool {
 
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
+}
+
+const fn default_work_stale_after_days() -> u16 {
+    crate::work::DEFAULT_STALE_AFTER_DAYS
 }
 
 const fn default_check_for_updates() -> bool {
@@ -793,6 +804,9 @@ impl DefaultPane {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub schema_version: u32,
+    /// Stable palette entry keys, newest first. Old settings default to empty.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     #[serde(default = "default_focus_follows_mouse")]
@@ -902,6 +916,10 @@ pub struct AppSettings {
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// Days without activity after which a Work board card is stale. The
+    /// daemon reads it from this file too; see `crate::work::stale_after_days`.
+    #[serde(default = "default_work_stale_after_days")]
+    pub work_stale_after_days: u16,
     /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
     /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
     /// without it is read as revision 1, and loading records the revision it
@@ -931,6 +949,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
+            palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
@@ -975,6 +994,7 @@ impl Default for AppSettings {
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
+            work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
@@ -1589,6 +1609,10 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let mut seen = std::collections::HashSet::new();
+        self.palette_recents
+            .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
+        self.palette_recents.truncate(24);
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1617,6 +1641,11 @@ impl AppSettings {
         if self.hibernation_delay_ms > MAX_TOML_INTEGER {
             return Err(SettingsError::Invalid(
                 "hibernation_delay_ms must not exceed 9223372036854775807",
+            ));
+        }
+        if !(1..=crate::work::MAX_STALE_AFTER_DAYS).contains(&self.work_stale_after_days) {
+            return Err(SettingsError::Invalid(
+                "work_stale_after_days must be between 1 and 365",
             ));
         }
         if !(0.8..=1.5).contains(&self.ui_scale) {
@@ -3014,6 +3043,36 @@ mod tests {
     }
 
     #[test]
+    fn palette_recents_survive_save_and_old_settings_default_to_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        save(&path, &settings).unwrap();
+        assert_eq!(
+            load(&path).unwrap().palette_recents,
+            settings.palette_recents
+        );
+        let mut legacy = toml::Value::try_from(&settings).unwrap();
+        legacy.as_table_mut().unwrap().remove("palette_recents");
+        let restored: AppSettings = legacy.try_into().unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec![
+            String::new(),
+            "command:open_settings".into(),
+            "command:open_settings".into(),
+            "x".repeat(129),
+        ];
+        settings
+            .palette_recents
+            .extend((0..30).map(|i| format!("pane:{i}")));
+        let validated = settings.validate().unwrap();
+        assert_eq!(validated.palette_recents.len(), 24);
+        assert_eq!(validated.palette_recents[0], "command:open_settings");
+        assert_eq!(validated.palette_recents[1], "pane:0");
+    }
+
+    #[test]
     fn browser_preference_and_both_gestures_are_independent_and_persist() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3180,7 +3239,7 @@ mod tests {
             .unwrap()
             .remove("managed_worktree_directory");
         let decoded: AppSettings = old.try_into().unwrap();
-        assert_eq!(decoded.managed_worktree_directory, "worktrees/");
+        assert_eq!(decoded.managed_worktree_directory, ".worktrees/");
         for path in ["", "  ", "trees\nelsewhere", "trees\0elsewhere"] {
             assert!(
                 AppSettings {

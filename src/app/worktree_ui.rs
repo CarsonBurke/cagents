@@ -100,9 +100,11 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
         CardKind::PullRequests(view) => Some(&view.repository),
-        CardKind::Browser(_) | CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
-            None
-        }
+        CardKind::Browser(_)
+        | CardKind::Settings
+        | CardKind::Accounts
+        | CardKind::Automations
+        | CardKind::Work => None,
     }
 }
 
@@ -190,12 +192,15 @@ fn scope_descriptor(
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
+        chat_draft_attachments: HashMap::new(),
+        agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
         local_only_cards: HashSet::new(),
+        pending_chat_admissions: Default::default(),
         pending_terminal_creations: HashSet::new(),
     }
 }
@@ -334,19 +339,11 @@ impl Cagents {
         }
     }
 
-    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(channel) = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.id == id)
-        else {
-            return Task::none();
-        };
-        let Some(project) = self.sidebar_model.project(channel.project_id) else {
-            return Task::none();
-        };
-        let path = project
+    /// The exact directory a channel enters, also used by navigation admission.
+    pub(super) fn channel_directory(&self, id: ChannelId) -> Option<PathBuf> {
+        let channel = self.durable.channels.iter().find(|channel| channel.id == id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(project
             .worktrees
             .iter()
             .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
@@ -358,7 +355,15 @@ impl Cagents {
                     .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
                     .unwrap_or(&project.repository)
                     .to_path_buf()
-            });
+            }))
+    }
+
+    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(path) = self.channel_directory(id) else {
+            return Task::none();
+        };
+        let channel = self.durable.channels.iter().find(|channel| channel.id == id)
+            .expect("the channel directory resolved this same channel");
         if self.durable.active_channel == Some(id)
             && self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
@@ -612,6 +617,17 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.select_worktree_checked(path, create_if_empty).1
+    }
+
+    /// A synchronous success witness for callers that expose a new draft only
+    /// after worktree protection and scope selection succeeded. A no-op selection
+    /// is successful; a refused protection is not.
+    pub(super) fn select_worktree_checked(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -619,7 +635,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(format!(
                 "Cannot open this worktree yet: {error}"
             )));
-            return Task::none();
+            return (false, Task::none());
         }
         let roots = self
             .known_worktree_roots
@@ -657,13 +673,16 @@ impl Cagents {
                 .map(|card| card.id))
         {
             if !create_if_empty {
-                return Task::none();
+                return (true, Task::none());
             }
-            return if !has_terminal {
-                self.add_default_pane(path, self.settings.default_worktree_pane)
-            } else {
-                Task::none()
-            };
+            return (
+                true,
+                if !has_terminal {
+                    self.add_default_pane(path, self.settings.default_worktree_pane)
+                } else {
+                    Task::none()
+                },
+            );
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {
@@ -723,7 +742,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        Task::batch([scope, terminal])
+        (true, Task::batch([scope, terminal]))
     }
 
     fn install_workspace_scope(
@@ -2342,8 +2361,10 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),
+            managed_ignore_root: None,
             destination: destination.clone(),
             branch: crate::repository::ValidatedBranchName::parse("zulu-new").unwrap(),
             base: crate::repository::BaseRevision::LocalBranch(

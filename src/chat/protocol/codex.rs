@@ -61,25 +61,81 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
-const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
+// Reserve for every possible byte count, leaving the rest for real output.
+const OUTPUT_MARKER_BYTES: usize =
+    "\n[...  bytes omitted ...]\n".len() + usize::MAX.ilog10() as usize + 1;
+/// Output keeps its first quarter and a rolling tail, with accounting kept
+/// separately from provider text so marker-like output cannot forge omission.
+#[derive(Default)]
+struct OutputWindow {
+    omitted: usize,
+    head: usize,
+}
 
-fn append_display_output(output: &mut String, delta: &str, limit: usize) -> bool {
-    if (output.ends_with(OUTPUT_TRUNCATED) && output.len().saturating_add(3) >= limit)
-        || delta.is_empty()
-    {
+fn append_display_output(
+    output: &mut String,
+    delta: &str,
+    limit: usize,
+    window: &mut OutputWindow,
+) -> bool {
+    if delta.is_empty() {
         return false;
     }
-    if output.len().saturating_add(delta.len()) <= limit {
+    if limit < OUTPUT_MARKER_BYTES + 4 {
+        // Large command identity fields can leave very little output budget.
+        // Preserve the newest UTF-8-safe suffix even when no marker fits.
+        if delta.len() >= limit {
+            *output = delta[delta.ceil_char_boundary(delta.len().saturating_sub(limit))..].into();
+        } else {
+            let keep = limit - delta.len();
+            let start = output.ceil_char_boundary(output.len().saturating_sub(keep));
+            output.drain(..start);
+            output.push_str(delta);
+        }
+        window.omitted = 0;
+        window.head = 0;
+        return true;
+    }
+    if window.omitted == 0 && output.len().saturating_add(delta.len()) <= limit {
         output.push_str(delta);
         return true;
     }
-    let budget = limit.saturating_sub(OUTPUT_TRUNCATED.len());
-    let end = output.floor_char_boundary(budget.min(output.len()));
-    output.truncate(end);
-    let end = delta.floor_char_boundary(budget.saturating_sub(output.len()).min(delta.len()));
-    output.push_str(&delta[..end]);
-    if limit >= OUTPUT_TRUNCATED.len() {
-        output.push_str(OUTPUT_TRUNCATED);
+    // Reserve enough space for the largest usize count and marker punctuation.
+    let budget = limit.saturating_sub(OUTPUT_MARKER_BYTES);
+    let (head, tail) = if window.omitted == 0 {
+        let mut whole = std::mem::take(output);
+        whole.push_str(delta);
+        let mut head = whole.floor_char_boundary((budget / 4).min(whole.len()));
+        if let Some(line) = whole[..head].rfind('\n') {
+            head = line + 1;
+        }
+        (whole[..head].to_owned(), whole[head..].to_owned())
+    } else {
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        let mut tail = output[window.head + marker.len()..].to_owned();
+        tail.push_str(delta);
+        (output[..window.head].to_owned(), tail)
+    };
+    let tail_budget = budget.saturating_sub(head.len());
+    let mut start = tail.ceil_char_boundary(tail.len().saturating_sub(tail_budget));
+    // A rolling tail begins on a complete line where possible. For long
+    // single-line output preserve a UTF-8-safe suffix instead.
+    if start > 0
+        && let Some(line) = tail[start..].find('\n')
+    {
+        if start + line + 1 < tail.len() {
+            start += line + 1;
+        }
+    }
+    window.omitted = window.omitted.saturating_add(start);
+    window.head = head.len();
+    *output = head;
+    let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+    if marker.len() <= limit.saturating_sub(output.len()) {
+        output.push_str(&marker);
+        output.push_str(&tail[start..]);
+    } else {
+        output.truncate(output.floor_char_boundary(limit));
     }
     true
 }
@@ -124,6 +180,21 @@ pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    let bytes = socket.as_os_str().as_encoded_bytes();
+    // Match the actual platform Unix address before any provider can start.
+    // All sockaddr_un fields are integers, so its all-zero value is valid.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    if socket.to_str().is_none()
+        || bytes.is_empty()
+        || bytes.contains(&0)
+        || bytes.len() >= capacity
+    {
+        return Err(format!(
+            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
+        ));
+    }
     create_inner(launch, Some(socket), None)
 }
 
@@ -359,6 +430,7 @@ fn create_inner(
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: Vec::new(),
             listing: Vec::new(),
             modalities: BTreeMap::new(),
@@ -372,6 +444,8 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            notification_turn: None,
+            notification_revision: 0,
             busy: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
@@ -416,11 +490,17 @@ enum Pending {
     Skills,
     History {
         earlier: bool,
+        initial_notification_binding: Option<(u64, u64)>,
     },
     Turn {
         revision: u64,
+        notification_revision: u64,
         model: Option<String>,
         tier: Option<String>,
+        /// Completion can precede this exact request's acknowledgement.
+        /// Only the reply's turn ID may promote one of these bounded frames.
+        early: BTreeMap<String, EarlyNotification>,
+        early_bytes: usize,
     },
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
@@ -498,6 +578,7 @@ struct Codex {
     /// start of an escape sequence the next delta finishes. An entry exists
     /// only for an item in `active_items`, and goes when the item does.
     output_streams: BTreeMap<String, super::terminal_output::Stream>,
+    output_windows: BTreeMap<String, OutputWindow>,
     models: Vec<Model>,
     /// The pages of a model listing still under way. The listing is
     /// reported whole, since a model missing from part of it reads as one
@@ -514,6 +595,10 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// Exact live notice authority. Scalar status and paged history must not
+    /// replace it; they can arrive after a newer turn's start.
+    notification_turn: Option<String>,
+    notification_revision: u64,
     busy: bool,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
@@ -545,6 +630,15 @@ struct Codex {
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
     child_buffer: BTreeMap<String, Vec<Value>>,
+}
+
+#[derive(Clone, Default)]
+struct EarlyNotification {
+    completed: Option<Value>,
+    /// Later activity cannot be undone by an old RPC reply after scalar idle.
+    superseded: bool,
+    preview: crate::chat::notification::Preview,
+    preview_transferred: bool,
 }
 
 struct Execution {
@@ -701,7 +795,12 @@ impl Codex {
         }
         Ok(())
     }
-    fn finish_execution(&mut self, turn: &Value, step: &mut Step) -> Result<(), String> {
+    fn finish_execution(
+        &mut self,
+        turn: &Value,
+        step: &mut Step,
+        publish_content: bool,
+    ) -> Result<(), String> {
         let Some(execution) = self.execution.as_mut() else {
             return Ok(());
         };
@@ -732,17 +831,19 @@ impl Codex {
             _ => return Err("Codex completed an accepted run with an unknown outcome".into()),
         };
         let execution = self.execution.take().unwrap();
-        // Full completed-turn items also cover output that arrived before the
-        // request acknowledgement. They upsert the same transcript identities.
-        for value in array(turn, "items")? {
-            step.events
-                .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
-        }
-        if let Some(message) = turn["error"]["message"].as_str() {
-            step.events.push(Event::Error {
-                message: message.into(),
-                fatal: false,
-            });
+        // An ACK can recover a completion whose content arrived before exact
+        // execution binding. Ordinary completed frames already publish it.
+        if publish_content {
+            for value in array(turn, "items")? {
+                step.events
+                    .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
+            }
+            if let Some(message) = turn["error"]["message"].as_str() {
+                step.events.push(Event::Error {
+                    message: message.into(),
+                    fatal: false,
+                });
+            }
         }
         execution_end(execution.run, outcome, step);
         Ok(())
@@ -805,12 +906,41 @@ impl Codex {
             let inputs = array(entry, "input")?;
             let mut parts = Vec::new();
             let mut attachments = Vec::new();
-            for input in inputs {
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashSet::new();
+            for (index, pair) in inputs.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && pair[1]["type"] == "localImage"
+                    && let (Some(marker), Some(path)) =
+                        (pair[0]["text"].as_str(), pair[1]["path"].as_str())
+                    && super::image_references::claims_reference(marker)
+                {
+                    if let Some(reference) = super::image_references::restore(marker, path) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else {
+                        // A canonical owned-image claim is not a legacy local
+                        // file. On another device the same path can mean
+                        // different pixels; never offer it for edit/replay.
+                        unverified.insert(index + 1);
+                    }
+                }
+            }
+            for (index, input) in inputs.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 parts.push(match input["type"].as_str() {
                     Some("text") => string(input, "text")?.to_owned(),
                     Some("localImage") => {
                         attachments.push(chat::Attachment {
-                            path: string(input, "path")?.into(),
+                            path: if unverified.contains(&index) {
+                                std::path::PathBuf::new()
+                            } else {
+                                string(input, "path")?.into()
+                            },
+                            reference: references.remove(&index),
                         });
                         continue;
                     }
@@ -831,14 +961,17 @@ impl Codex {
             // sent, and local images.
             let texts = inputs
                 .iter()
-                .filter(|input| input["type"] == "text")
+                .enumerate()
+                .filter(|(index, input)| input["type"] == "text" && !synthetic.contains(index))
+                .map(|(_, input)| input)
                 .collect::<Vec<_>>();
             let named = texts
                 .first()
                 .and_then(|input| input["text"].as_str())
                 .map(|text| self.named_skills(text))
                 .unwrap_or_default();
-            message.editable &= texts.len() <= 1
+            message.editable &= unverified.is_empty()
+                && texts.len() <= 1
                 && inputs.iter().all(|input| match input["type"].as_str() {
                     Some("text" | "localImage") => true,
                     Some("skill") => named.iter().any(|(name, path)| {
@@ -988,7 +1121,10 @@ impl Codex {
             return Err("Codex history is already loading".into());
         }
         let earlier = cursor.is_some();
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier })?;
+        let initial_notification_binding = (!self.history_initialized
+            && self.notification_turn.is_none())
+        .then_some((self.lifecycle_revision, self.notification_revision));
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
             Event::HistoryLoading(true)
@@ -1034,6 +1170,38 @@ impl Codex {
             && (self.active_items.len() < MAX_ACTIVE_ITEMS
                 || self.active_items.contains_key(&item.id))
     }
+    /// A native snapshot and its clipping/terminal decoder state have the same
+    /// owner. Replacement starts a new decoder and installs the window produced
+    /// by parsing THAT snapshot. History only seeds an absent active item.
+    fn track_snapshot_item(
+        &mut self,
+        value: &Value,
+        item: &Item,
+        window: Option<OutputWindow>,
+        replace: bool,
+    ) {
+        if self.tracks(value, item) {
+            if replace || !self.active_items.contains_key(&item.id) {
+                self.output_streams.remove(&item.id);
+                self.output_windows.remove(&item.id);
+                if value["type"] == "commandExecution" {
+                    let raw = value["aggregatedOutput"].as_str().unwrap_or_default();
+                    self.output_streams.insert(
+                        item.id.clone(),
+                        super::terminal_output::Stream::from_snapshot(raw),
+                    );
+                }
+                if let Some(window) = window {
+                    self.output_windows.insert(item.id.clone(), window);
+                }
+                self.active_items.insert(item.id.clone(), item.clone());
+            }
+        } else {
+            self.active_items.remove(&item.id);
+            self.output_streams.remove(&item.id);
+            self.output_windows.remove(&item.id);
+        }
+    }
     /// An idle thread says nothing about whether its last turn succeeded.
     /// Recover that outcome from the latest page, never an older page or while
     /// live work is running. Buffered live notifications are replayed afterward.
@@ -1065,7 +1233,7 @@ impl Codex {
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
-            if active && self.busy {
+            if active && self.busy && self.turn.is_none() {
                 self.turn = Some(turn_id.into());
             }
             if turn["itemsView"]
@@ -1114,18 +1282,15 @@ impl Codex {
                         self.discover_child(id, &metadata, step)?;
                     }
                 }
-                for item in parse_item(value, !active, turn_id)? {
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(value, !active, turn_id, |id, window| {
+                    windows.insert(id.to_owned(), window);
+                })?;
+                for item in parsed {
                     if active && self.busy {
-                        if self.tracks(value, &item) {
-                            self.active_items
-                                .entry(item.id.clone())
-                                .or_insert_with(|| item.clone());
-                        } else {
-                            // The page is newer than a completion this
-                            // adapter missed while it was not reading.
-                            self.active_items.remove(&item.id);
-                            self.output_streams.remove(&item.id);
-                        }
+                        // Completed history releases an unseen completion;
+                        // live history cannot replace a more recent stream.
+                        self.track_snapshot_item(value, &item, windows.remove(&item.id), false);
                     }
                     items.push(item);
                 }
@@ -1161,6 +1326,7 @@ impl Codex {
         // Each skill the text names goes with it as an input of its own, as
         // Codex's own composer sends one: the text names a skill only by its
         // name, which loads nothing when two skills share it.
+        let attachments = super::image_references::ordered(&text, &attachments)?;
         let skills = self.named_skills(&text);
         if !text.is_empty() {
             input.push(json!({"type":"text","text":text}));
@@ -1171,19 +1337,25 @@ impl Codex {
                 .map(|(name, path)| json!({"type":"skill","name":name,"path":path})),
         );
         for attachment in attachments {
+            let attachment = crate::chat::attachment_assets::resolve(attachment)?;
             if !self.capabilities().attachments {
                 return Err("The selected Codex model does not advertise image input".into());
             }
             let path = if attachment.path.is_absolute() {
-                attachment.path
+                attachment.path.clone()
             } else {
-                self.cwd.join(attachment.path)
+                self.cwd.join(&attachment.path)
             };
             if !crate::chat::is_image_path(&path) {
                 return Err("Codex native attachments support local images (PNG/JPEG/GIF/WebP), not arbitrary files".into());
             }
             if !path.is_file() {
                 return Err(format!("Attachment is not a file: {}", path.display()));
+            }
+            if let Some(reference) = &attachment.reference {
+                input.push(
+                    json!({"type":"text","text":super::image_references::marker(reference)?}),
+                );
             }
             input.push(json!({"type":"localImage","path":path.to_str().ok_or("Attachment path is not UTF-8")?}));
         }
@@ -1478,6 +1650,22 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn answer_declines(&self, request_id: &str, action: &str) -> bool {
+        let Some(request) = self.requests.get(request_id) else {
+            return false;
+        };
+        let Some(choice) = request.actions.get(action) else {
+            return false;
+        };
+        match request.kind {
+            RequestKind::Decision | RequestKind::Elicitation => {
+                matches!(choice.as_str(), Some("decline" | "cancel"))
+            }
+            RequestKind::Permissions => action == "deny",
+            RequestKind::Questions => false,
+        }
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -1538,13 +1726,22 @@ impl Adapter for Codex {
         match command {
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
-                let input = self.input(text, attachments)?;
+                let input = self.input(text, attachments.clone())?;
+                match mode {
+                    PromptMode::Send if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) => return Err("A Codex turn is active; explicitly steer or queue instead".into()),
+                    PromptMode::Steer if self.turn.is_none() => return Err("There is no known active Codex turn to steer".into()),
+                    _ => {}
+                }
+                for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
-                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, model: self.selected.clone(), tier: self.service_tier.clone() })?;
+                        self.notification_revision = self.notification_revision.wrapping_add(1);
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        self.notification_turn = None;
+                        step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
                         self.prediction_turn = None;
                         step.events.push(Event::PromptSuggestionCleared);
@@ -1654,6 +1851,8 @@ impl Adapter for Codex {
                 // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
+            Command::ReadTextCopy { .. } =>
+                return Err("Text copies are served by the transcript cache".into()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
@@ -1796,6 +1995,16 @@ impl Adapter for Codex {
                 // notification to release that optimistic state. Only repair
                 // the lifecycle this request observed: a newer genuine turn
                 // must retain its own activity and waiting state.
+                if let Pending::Turn {
+                    notification_revision,
+                    ..
+                } = &pending
+                    && *notification_revision != self.notification_revision
+                {
+                    // A rejected old start cannot replace a newer turn's
+                    // error. Its exact managed execution is handled below.
+                    step.suppress_current_notification = true;
+                }
                 if let Pending::Turn { revision, .. } = &pending
                     && *revision == self.lifecycle_revision
                 {
@@ -1954,6 +2163,14 @@ impl Adapter for Codex {
                     )?;
                     if result["initialTurnsPage"].is_object() {
                         self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        // Only the initial coherent attach response may bind
+                        // an active history turn. Later pages are display data.
+                        if self.lifecycle_revision == 0
+                            && self.notification_revision == 0
+                            && self.notification_turn.is_none()
+                        {
+                            self.notification_turn = self.turn.clone();
+                        }
                     } else {
                         self.history(&mut step, None)?;
                     }
@@ -2156,8 +2373,18 @@ impl Adapter for Codex {
                         self.skills(&mut step)?;
                     }
                 }
-                Pending::History { earlier } => {
+                Pending::History {
+                    earlier,
+                    initial_notification_binding,
+                } => {
                     self.page(result, &mut step, earlier)?;
+                    if initial_notification_binding
+                        == Some((self.lifecycle_revision, self.notification_revision))
+                        && self.notification_turn.is_none()
+                        && self.busy
+                    {
+                        self.notification_turn = self.turn.clone();
+                    }
                     self.finish_history(&mut step)?;
                 }
                 Pending::FastMode {
@@ -2179,14 +2406,34 @@ impl Adapter for Codex {
                 }
                 Pending::Turn {
                     revision,
+                    notification_revision,
                     model,
                     tier,
+                    mut early,
+                    ..
                 } => {
                     self.materialized = true;
                     let id = string(&result["turn"], "id")?;
+                    let owns_current = notification_revision == self.notification_revision
+                        || self.notification_turn.as_deref() == Some(id);
+                    let early_completion = early.remove(id);
+                    // An active-status update may announce newer work before
+                    // its turn ID arrives. The old request's correlation alone
+                    // cannot assign that lifecycle to its acknowledged turn.
+                    let owns_lifecycle = owns_current
+                        && (revision == self.lifecycle_revision
+                            || self.notification_turn.as_deref() == Some(id)
+                            // Scalar idle can follow this early completion.
+                            // It announces no newer work to protect from replay.
+                            || (!self.busy
+                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
+                    let early_completion = early_completion.filter(|_| owns_lifecycle);
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
+                    if owns_lifecycle {
+                        self.notification_turn = Some(id.to_owned());
+                    }
                     if revision == self.lifecycle_revision {
                         self.turn = Some(id.into());
                         self.busy = true;
@@ -2197,7 +2444,7 @@ impl Adapter for Codex {
                             detail: "Codex turn started".into(),
                         });
                     }
-                    if let Some(execution) = self.execution.as_mut()
+                    let execution_completion = if let Some(execution) = self.execution.as_mut()
                         && frame["id"].as_str() == Some(execution.request.as_str())
                     {
                         let turn = string(&result["turn"], "id")?.to_owned();
@@ -2205,16 +2452,41 @@ impl Adapter for Codex {
                         let completed = execution.early.remove(&turn);
                         execution.early.clear();
                         execution.early_bytes = 0;
-                        if let Some(completed) = completed {
-                            self.finish_execution(&completed, &mut step)?;
-                            if !self.busy || self.turn.as_deref() == Some(turn.as_str()) {
-                                self.busy = false;
-                                self.turn = None;
-                                step.events.push(Event::Status {
-                                    busy: false,
-                                    detail: turn_detail(&completed["status"]),
-                                });
-                            }
+                        completed
+                    } else {
+                        None
+                    };
+                    if let Some(early) = early_completion {
+                        if !early.preview_transferred {
+                            step.notification_preview = Some(early.preview);
+                        }
+                        if let Some(completed) = early.completed {
+                            // Preserve the original final frame's context, rather
+                            // than sampling whatever the actor currently shows.
+                            self.turn = Some(id.to_owned());
+                            self.notification_turn = Some(id.to_owned());
+                            let completion = self.receive(json!({"method":"turn/completed",
+                            "params":{"threadId":self.thread,"turn":completed}}))?;
+                            step.events.extend(completion.events);
+                            step.writes.extend(completion.writes);
+                        }
+                    } else if !owns_lifecycle {
+                        step.suppress_current_notification = true;
+                    }
+                    if let Some(completed) = execution_completion
+                        && self.execution.is_some()
+                    {
+                        // The replay above normally settles the exact managed
+                        // execution too. Otherwise retain its outcome without
+                        // changing a newer conversation lifecycle.
+                        self.finish_execution(&completed, &mut step, true)?;
+                        if !self.busy || self.turn.as_deref() == Some(id) {
+                            self.busy = false;
+                            self.turn = None;
+                            step.events.push(Event::Status {
+                                busy: false,
+                                detail: turn_detail(&completed["status"]),
+                            });
                         }
                     }
                 }
@@ -2299,6 +2571,15 @@ impl Adapter for Codex {
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
                             child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            // This is the child's coherent initial attachment;
+                            // buffered live frames have not been replayed yet.
+                            // Later history pages remain presentation only.
+                            if child.notification_revision == 0
+                                && child.notification_turn.is_none()
+                                && child.busy
+                            {
+                                child.notification_turn = child.turn.clone();
+                            }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
                                 for value in turn["items"].as_array().into_iter().flatten() {
@@ -2444,6 +2725,17 @@ impl Adapter for Codex {
             }
             return Ok(step);
         }
+        let notification_frame_turn = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str())
+            .map(str::to_owned);
+        if method != "turn/started"
+            && notification_frame_turn
+                .as_deref()
+                .is_some_and(|turn| self.notification_turn.as_deref() != Some(turn))
+        {
+            step.suppress_current_notification = true;
+        }
         match method {
             "thread/started" => {
                 if self.ready {
@@ -2512,13 +2804,51 @@ impl Adapter for Codex {
                 }
             }
             "turn/started" | "turn/completed" => {
+                let turn = &params["turn"];
+                let turn_id = string(turn, "id")?;
+                // A completed ID is current only when a start, active attach,
+                // or exact accepted request reply has established ownership.
+                let current =
+                    method == "turn/started" || self.notification_turn.as_deref() == Some(turn_id);
+                if !current {
+                    step.suppress_current_notification = true;
+                    if let Some(Pending::Turn { early, early_bytes, .. }) =
+                        self.pending.values_mut().find(|pending| matches!(pending,
+                            Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                    {
+                        let bytes = serde_json::to_vec(turn).map_err(|error| error.to_string())?.len();
+                        let previous = early.get(turn_id).and_then(|entry| entry.completed.as_ref()).map(serde_json::to_vec)
+                            .transpose().map_err(|error| error.to_string())?.map_or(0, |value| value.len());
+                        let next_bytes = early_bytes.saturating_sub(previous).saturating_add(bytes);
+                        if (!early.contains_key(turn_id) && early.len() >= 8)
+                            || next_bytes > crate::agent_execution::MAX_RESULT_BYTES
+                        {
+                            return Err("Codex notification completion exceeded pending request correlation capacity".into());
+                        }
+                        *early_bytes = next_bytes;
+                        early.entry(turn_id.to_owned()).or_default().completed = Some(turn.clone());
+                    }
+                }
                 if method == "turn/started" {
+                    // The observed start now proves the early stream's exact
+                    // owner. Transfer it once, before later live deltas, and
+                    // consume the saved preview so the RPC ACK cannot rewind
+                    // it. Retain any known terminal proof for that exact ACK.
+                    if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+                        matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                    {
+                        if let Some(context) = early.get_mut(turn_id) {
+                            step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
+                            context.preview_transferred = true;
+                        }
+                    }
+                    self.notification_revision = self.notification_revision.wrapping_add(1);
+                    self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
                     step.events.push(Event::TurnStarted);
                 }
                 self.materialized = true;
-                let turn = &params["turn"];
-                if method == "turn/completed" {
+                if method == "turn/completed" && current {
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -2537,7 +2867,6 @@ impl Adapter for Codex {
                         });
                     }
                 }
-                let turn_id = string(turn, "id")?;
                 if method == "turn/started" {
                     let (model, tier) = self
                         .pending
@@ -2559,8 +2888,6 @@ impl Adapter for Codex {
                 if prediction_turn {
                     self.prediction_turn = None;
                 }
-                let current =
-                    method == "turn/started" || self.turn.as_deref().is_none_or(|id| id == turn_id);
                 if current {
                     if method == "turn/completed" {
                         step.events.push(Event::TurnSettled);
@@ -2578,10 +2905,18 @@ impl Adapter for Codex {
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
                 for value in array(turn, "items")? {
-                    for item in parse_item(value, method == "turn/completed", string(turn, "id")?)?
-                    {
-                        if method == "turn/started" && self.tracks(value, &item) {
-                            self.active_items.insert(item.id.clone(), item.clone());
+                    let mut windows = BTreeMap::new();
+                    let parsed = parse_item_with_windows(
+                        value,
+                        method == "turn/completed",
+                        turn_id,
+                        |id, window| {
+                            windows.insert(id.to_owned(), window);
+                        },
+                    )?;
+                    for item in parsed {
+                        if method == "turn/started" {
+                            self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
                         }
                         step.events.push(Event::Item(item));
                     }
@@ -2592,6 +2927,7 @@ impl Adapter for Codex {
                     if !self.busy {
                         self.active_items.clear();
                         self.output_streams.clear();
+                        self.output_windows.clear();
                     }
                     step.events.push(Event::Status {
                         busy: self.busy,
@@ -2608,7 +2944,11 @@ impl Adapter for Codex {
                     });
                 }
                 if method == "turn/completed" {
-                    self.finish_execution(turn, &mut step)?;
+                    self.finish_execution(turn, &mut step, false)?;
+                    if current {
+                        self.notification_revision = self.notification_revision.wrapping_add(1);
+                        self.notification_turn = None;
+                    }
                     if current
                         && prediction_turn
                         && turn["status"] == "completed"
@@ -2644,12 +2984,27 @@ impl Adapter for Codex {
                         self.discover_child(id, &value["agentsStates"][id], &mut step)?;
                     }
                 }
-                for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
+                let mut windows = BTreeMap::new();
+                let parsed = parse_item_with_windows(
+                    &params["item"],
+                    done,
+                    string(params, "turnId")?,
+                    |id, window| {
+                        windows.insert(id.to_owned(), window);
+                    },
+                )?;
+                for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
                         self.output_streams.remove(&item.id);
-                    } else if self.tracks(&params["item"], &item) {
-                        self.active_items.insert(item.id.clone(), item.clone());
+                        self.output_windows.remove(&item.id);
+                    } else {
+                        self.track_snapshot_item(
+                            &params["item"],
+                            &item,
+                            windows.remove(&item.id),
+                            true,
+                        );
                     }
                     step.events.push(Event::Item(item));
                 }
@@ -2722,9 +3077,10 @@ impl Adapter for Codex {
                         let limit =
                             MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                         let offset = output.len();
-                        let preserves_prefix = offset.saturating_add(delta.len()) <= limit
-                            || offset <= limit.saturating_sub(OUTPUT_TRUNCATED.len());
-                        if append_display_output(output, delta, limit) {
+                        let window = self.output_windows.entry(id.clone()).or_default();
+                        let preserves_prefix =
+                            window.omitted == 0 && offset.saturating_add(delta.len()) <= limit;
+                        if append_display_output(output, delta, limit, window) {
                             if preserves_prefix {
                                 step.events.push(Event::OutputDelta {
                                     id,
@@ -2784,6 +3140,10 @@ impl Adapter for Codex {
                 }));
             }
             "thread/closed" | "thread/deleted" => {
+                // Close revokes current notification ownership. Pending exact
+                // managed outcomes may still settle independently at their ACK.
+                self.notification_revision = self.notification_revision.wrapping_add(1);
+                self.notification_turn = None;
                 self.ready = false;
                 self.attached = false;
                 self.subagent_waiting = false;
@@ -2810,7 +3170,11 @@ impl Adapter for Codex {
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
-                    step.events.push(session_notice(message));
+                    let mut notice = session_notice(message);
+                    if let Event::Item(item) = &mut notice {
+                        chat::failure::mark_provider_error(crate::agent::Provider::Codex, item);
+                    }
+                    step.events.push(notice);
                 } else {
                     step.events.push(Event::Error {
                         message,
@@ -2873,6 +3237,19 @@ impl Adapter for Codex {
             // requests are visibly rejected above.
             _ => {}
         }
+        if step.suppress_current_notification {
+            if let Some(turn) = notification_frame_turn {
+                if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+                    matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                {
+                    if !early.contains_key(&turn) && early.len() >= 8 {
+                        return Err("Codex notification context exceeded pending request correlation capacity".into());
+                    }
+                    let context = early.entry(turn).or_default();
+                    for event in &step.events { context.preview.observe(event); }
+                }
+            }
+        }
         Ok(step)
     }
 }
@@ -2895,6 +3272,15 @@ fn session_notice(text: String) -> Event {
 }
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
+        if matches!(status["type"].as_str(), Some("active" | "systemError")) {
+            for pending in self.pending.values_mut() {
+                if let Pending::Turn { early, .. } = pending {
+                    for entry in early.values_mut().filter(|entry| entry.completed.is_some()) {
+                        entry.superseded = true;
+                    }
+                }
+            }
+        }
         self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
         self.busy = status["type"] == "active";
         self.subagent_waiting = waiting_on_user(status);
@@ -3174,6 +3560,14 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     Ok(changes)
 }
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
+    parse_item_with_windows(value, done, turn, |_, _| {})
+}
+fn parse_item_with_windows(
+    value: &Value,
+    done: bool,
+    turn: &str,
+    mut parsed_window: impl FnMut(&str, OutputWindow),
+) -> Result<Vec<Item>, String> {
     let scoped_id = item_key(turn, string(value, "id")?);
     let id = scoped_id.as_str();
     let kind = string(value, "type")?;
@@ -3234,7 +3628,33 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         }],
         "userMessage" => {
             let mut items = Vec::new();
-            for (index, content) in array(value, "content")?.iter().enumerate() {
+            let contents = array(value, "content")?;
+            let mut synthetic = std::collections::HashSet::new();
+            let mut references = std::collections::HashMap::new();
+            let mut unverified = std::collections::HashMap::new();
+            for (index, pair) in contents.windows(2).enumerate() {
+                if pair[0]["type"] == "text"
+                    && matches!(pair[1]["type"].as_str(), Some("localImage" | "image"))
+                    && let (Some(marker), Some(source)) = (
+                        pair[0]["text"].as_str(),
+                        pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
+                    )
+                    && super::image_references::claims_reference(marker)
+                {
+                    if let Some(reference) = super::image_references::restore(marker, source) {
+                        synthetic.insert(index);
+                        references.insert(index + 1, reference);
+                    } else if !source.starts_with("data:image/") {
+                        // Keep the literal marker visible, but do not read a
+                        // possibly foreign device's coincident absolute path.
+                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                    }
+                }
+            }
+            for (index, content) in contents.iter().enumerate() {
+                if synthetic.contains(&index) {
+                    continue;
+                }
                 let part_id = format!("{id}/input/{index}");
                 match content["type"].as_str().unwrap_or_default() {
                     "text" => items.push(text(
@@ -3247,12 +3667,22 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         id: part_id,
                         role: Role::User,
                         content: ItemContent::Image {
-                            path: content["path"]
-                                .as_str()
-                                .or_else(|| content["url"].as_str())
-                                .ok_or("Missing image path")?
-                                .into(),
-                            description: "User attachment".into(),
+                            reference: references.get(&index).cloned(),
+                            path: if unverified.contains_key(&index) {
+                                String::new()
+                            } else {
+                                content["path"]
+                                    .as_str()
+                                    .or_else(|| content["url"].as_str())
+                                    .ok_or("Missing image path")?
+                                    .into()
+                            },
+                            description: unverified.get(&index).cloned().unwrap_or_else(|| {
+                                references
+                                    .get(&index)
+                                    .map(|reference| reference.label())
+                                    .unwrap_or_else(|| "User attachment".into())
+                            }),
                         },
                         started_at: None,
                         at: None,
@@ -3381,6 +3811,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             id: id.into(),
             role: Role::Assistant,
             content: ItemContent::Image {
+                reference: None,
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
@@ -3415,6 +3846,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         started_at: None,
                         at: None,
                         content: ItemContent::Image {
+                            reference: None,
                             path,
                             description: "Generated image".into(),
                         },
@@ -3452,6 +3884,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         other => tool(other.into(), String::new(), value.to_string()),
     };
     for item in &mut items {
+        let mut window = OutputWindow::default();
         let bytes = item.content.byte_len();
         let limit = if matches!(&item.content, ItemContent::Image { path, .. } if path.starts_with("data:image/"))
         {
@@ -3466,11 +3899,17 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
                 // Completed items replace streamed items, so apply the same bound.
                 let full = std::mem::take(output);
-                append_display_output(output, &full, limit);
+                append_display_output(output, &full, limit, &mut window);
             }
         }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());
+        }
+        if matches!(
+            &item.content,
+            ItemContent::Tool { .. } | ItemContent::Command { .. }
+        ) {
+            parsed_window(&item.id, window);
         }
     }
     Ok(items)
@@ -3696,6 +4135,582 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Provider;
+
+    fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
+        Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: home
+                    .join("never-executed-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+                arguments: vec!["--remote".into(), "unix://".into()],
+                working_directory: home.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    home.to_string_lossy().into_owned(),
+                )]),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_rejects_unusable_unix_addresses_before_preparation_or_spawn() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::new(),
+            PathBuf::from("/nul\0socket"),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff])),
+            PathBuf::from(format!("/{}", "x".repeat(107))),
+            PathBuf::from(format!("/{}", "x".repeat(108))),
+            PathBuf::from(format!("/{}x", "λ".repeat(53))),
+        ] {
+            let failure = create_with_listener(&launch, socket)
+                .err()
+                .expect("invalid address must fail before returning a spawn specification");
+            assert!(failure.contains("Owned Codex listener"), "{failure}");
+            assert!(failure.contains("shorter than 108 bytes"), "{failure}");
+            assert_eq!(launch.recipe, before);
+            assert_eq!(
+                std::fs::read_dir(home.path()).unwrap().count(),
+                0,
+                "invalid owned addresses must not create endpoint directories or execute the provider"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_listener_accepts_107_actual_bytes_without_changing_launch_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = owned_listener_test_launch(home.path());
+        let before = launch.recipe.clone();
+        for socket in [
+            PathBuf::from(format!("/{}", "x".repeat(106))),
+            PathBuf::from(format!("/{}", "λ".repeat(53))),
+        ] {
+            assert_eq!(socket.as_os_str().as_encoded_bytes().len(), 107);
+            let (spec, _adapter) = create_with_listener(&launch, socket.clone()).unwrap();
+            assert!(
+                matches!(&spec.transport, TransportSpec::OwnedUnixWebSocket { socket: actual } if actual == &socket)
+            );
+            assert_eq!(
+                spec.arguments,
+                [
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    format!("unix://{}", socket.display())
+                ]
+            );
+            assert_eq!(spec.program, launch.recipe.program);
+            assert_eq!(spec.working_directory, launch.recipe.working_directory);
+            assert_eq!(spec.environment, launch.recipe.environment);
+            assert_eq!(launch.recipe, before);
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_long_listener_keeps_its_existing_verified_alias_and_never_launches() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let original = std::fs::metadata(&socket).unwrap();
+        let long = home
+            .path()
+            .join("long-exact-socket-".to_owned() + &"x".repeat(108));
+        symlink(&socket, &long).unwrap();
+        assert!(long.as_os_str().as_encoded_bytes().len() >= 108);
+        let mut launch = owned_listener_test_launch(home.path());
+        launch.recipe.arguments = vec!["--remote".into(), format!("unix://{}", long.display())];
+        let before = launch.recipe.clone();
+        let (spec, adapter) = create(&launch).unwrap();
+        let TransportSpec::UnixWebSocket {
+            socket: alias,
+            device,
+            inode,
+        } = &spec.transport
+        else {
+            panic!(
+                "shared listener must remain a verified existing connection, never an owned launch"
+            );
+        };
+        assert!(alias.as_os_str().as_encoded_bytes().len() < 108);
+        assert_ne!(alias, &long);
+        assert_eq!((*device, *inode), (original.dev(), original.ino()));
+        let aliased = std::fs::metadata(alias).unwrap();
+        assert_eq!(
+            (aliased.dev(), aliased.ino()),
+            (original.dev(), original.ino())
+        );
+        assert!(spec.arguments.is_empty());
+        assert_eq!(launch.recipe, before);
+        let alias = alias.clone();
+        drop(adapter);
+        assert!(std::fs::symlink_metadata(&alias).is_err());
+        assert!(std::fs::metadata(&long).is_ok());
+        let unchanged = std::fs::metadata(&socket).unwrap();
+        assert_eq!(
+            (unchanged.dev(), unchanged.ino()),
+            (original.dev(), original.ino())
+        );
+    }
+
+    #[test]
+    fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_path() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let reference = image.reference.clone().unwrap();
+            let bytes = std::fs::read(&image.path).unwrap();
+            for failure in [0, 1, 2] {
+                let mut candidate = reference.clone();
+                if failure == 0 {
+                    candidate.device = uuid::Uuid::new_v4();
+                } else if failure == 1 {
+                    candidate.id = uuid::Uuid::new_v4();
+                }
+                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                if failure == 2 {
+                    marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
+                }
+                let inputs = json!([
+                    {"type":"text","text":marker},
+                    {"type":"localImage","path":image.path.to_str().unwrap()}
+                ]);
+                let items = parse_item(
+                    &json!({"type":"userMessage","id":"foreign","content":inputs}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert_eq!(items.len(), 2, "unverified marker remains literal");
+                assert!(
+                    matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker)
+                );
+                assert!(
+                    matches!(&items[1].content, ItemContent::Image { path, reference: None, description } if path.is_empty() && description.contains("originating device")),
+                    "even a real coincident local file is not preview authority"
+                );
+                let mut step = Step::default();
+                adapter().queue_page(&json!({"data":[{"id":"foreign-image-only","input":inputs}],"nextCursor":null}), &mut step).unwrap();
+                let queued = step
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(messages) => messages.first(),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    !queued.editable,
+                    "image-only canonical marker cannot become legacy path replay"
+                );
+                assert!(queued.attachments[0].path.as_os_str().is_empty());
+                assert!(queued.attachments[0].reference.is_none());
+                assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+                let inline = format!(
+                    "data:image/png;base64,{}",
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                );
+                let inline_items = parse_item(
+                    &json!({"type":"userMessage","id":"inline","content":[
+                        {"type":"text","text":marker}, {"type":"image","url":inline}
+                    ]}),
+                    true,
+                    "turn",
+                )
+                .unwrap();
+                assert!(
+                    matches!(&inline_items[1].content, ItemContent::Image { path, reference: None, .. } if path == &inline),
+                    "self-contained real image bytes remain viewable without borrowing image authority"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn referenced_image_is_real_provider_input_and_survives_history_and_queue() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let display = tempfile::tempdir().unwrap();
+            let other_pixels =
+                crate::chat::attachment_assets::test_image("display-side pixels.png");
+            let mut hinted = attachment.clone();
+            hinted.path = display.path().join(attachment.path.file_name().unwrap());
+            std::fs::copy(&other_pixels.path, &hinted.path).unwrap();
+            assert_ne!(
+                std::fs::read(&hinted.path).unwrap(),
+                std::fs::read(&attachment.path).unwrap()
+            );
+            let reference = attachment.reference.clone().unwrap();
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} after",
+                reference.token()
+            );
+            let input = adapter.input(text.clone(), vec![hinted.clone()]).unwrap();
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[0], json!({"type":"text","text":text}));
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(&reference).unwrap()
+            );
+            assert_eq!(
+                input[2],
+                json!({"type":"localImage","path":attachment.path.to_str().unwrap()})
+            );
+            assert_eq!(
+                std::fs::read(&attachment.path).unwrap()[..8],
+                [137, 80, 78, 71, 13, 10, 26, 10]
+            );
+            let items = parse_item(
+                &json!({"type":"userMessage","id":"images","content":input}),
+                true,
+                "turn",
+            )
+            .unwrap();
+            assert_eq!(items.len(), 2, "only the verified mapping is hidden");
+            assert!(
+                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            assert!(
+                matches!(&items[1].content, ItemContent::Image { reference: Some(restored), path, description } if restored == &reference && path == attachment.path.to_str().unwrap() && description == &reference.label())
+            );
+            let mut step = Step::default();
+            adapter
+                .queue_page(
+                    &json!({"data":[{"id":"queued-image","input":input}],"nextCursor":null}),
+                    &mut step,
+                )
+                .unwrap();
+            let queued = step
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    Event::QueueChanged(messages) => messages.first(),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(queued.editable);
+            assert_eq!(queued.text, text);
+            assert_eq!(queued.attachments, [attachment.clone()]);
+            let resent = adapter
+                .input(queued.text.clone(), queued.attachments.clone())
+                .unwrap();
+            assert_eq!(
+                resent, input,
+                "take-back and retry preserve identity and real image input"
+            );
+
+            let mut forged = reference.clone();
+            forged.id = uuid::Uuid::new_v4();
+            let forged = json!({"type":"userMessage","id":"forged","content":[
+                {"type":"text","text":super::super::image_references::marker(&forged).unwrap()},
+                {"type":"localImage","path":attachment.path.to_str().unwrap()}
+            ]});
+            let items = parse_item(&forged, true, "turn").unwrap();
+            assert_eq!(items.len(), 2, "unverified prose remains visible");
+            assert!(matches!(
+                &items[1].content,
+                ItemContent::Image {
+                    reference: None,
+                    ..
+                }
+            ));
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text,
+                    attachments: vec![hinted],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            assert_eq!(
+                submitted.writes[0]["params"]["input"][2]["path"],
+                attachment.path.to_str().unwrap()
+            );
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .find(|image| image.id == reference.id)
+                    .unwrap()
+                    .retained
+            );
+        });
+    }
+
+    #[test]
+    fn multiple_image_inputs_follow_caret_order_without_renumbering() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!(
+                "Compare {} before {} and again {}",
+                second_ref.token(),
+                first_ref.token(),
+                second_ref.token()
+            );
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let input = adapter
+                .input(text.clone(), vec![first.clone(), second.clone()])
+                .unwrap();
+            assert_eq!(input[0]["text"], text);
+            assert_eq!(
+                input[1]["text"],
+                super::super::image_references::marker(second_ref).unwrap()
+            );
+            assert_eq!(input[2]["path"], second.path.to_str().unwrap());
+            assert_eq!(
+                input[3]["text"],
+                super::super::image_references::marker(first_ref).unwrap()
+            );
+            assert_eq!(input[4]["path"], first.path.to_str().unwrap());
+            assert!(adapter.input(text, vec![first.clone(), first]).is_err());
+        });
+    }
+
+    #[test]
+    fn image_only_legacy_and_foreign_references_keep_their_distinct_contracts() {
+        crate::chat::attachment_assets::with_test_image(|attachment| {
+            let mut adapter = adapter();
+            adapter
+                .modalities
+                .insert("model".into(), vec!["image".into()]);
+            let image_only = adapter
+                .input(String::new(), vec![attachment.clone()])
+                .unwrap();
+            assert_eq!(image_only.len(), 2);
+            assert_eq!(image_only[1]["type"], "localImage");
+            let legacy = adapter
+                .input(
+                    "[Image 1] literal".into(),
+                    vec![Attachment::file(&attachment.path)],
+                )
+                .unwrap();
+            assert_eq!(
+                legacy.len(),
+                2,
+                "legacy files do not acquire a UUID from text"
+            );
+            let mut foreign = attachment.clone();
+            foreign.reference.as_mut().unwrap().device = uuid::Uuid::new_v4();
+            foreign.path = "/missing/foreign-image.png".into();
+            let error = adapter.input(String::new(), vec![foreign]).unwrap_err();
+            assert!(
+                !error.contains("Attachment is not a file"),
+                "foreign origin is refused before path access: {error}"
+            );
+            adapter.modalities.clear();
+            assert!(
+                adapter
+                    .input(String::new(), vec![attachment])
+                    .unwrap_err()
+                    .contains("does not advertise image")
+            );
+        });
+    }
+
+    fn output_window_command(output: &str) -> Value {
+        json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
+    }
+    fn output_window_started(output: &str) -> Value {
+        json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"window-turn","item":output_window_command(output)}})
+    }
+    fn output_window_delta(delta: &str) -> Value {
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"window-turn","itemId":"window-cmd","delta":delta}})
+    }
+    fn large_window_output() -> String {
+        format!(
+            "first🦀\n{}last🦀\n",
+            "middle🦀\n".repeat(MAX_ITEM_BYTES / 8)
+        )
+    }
+    fn assert_window_accounting(adapter: &Codex, source: &str) {
+        let key = item_key("window-turn", "window-cmd");
+        let item = adapter.active_items.get(&key).unwrap();
+        let ItemContent::Command { output, .. } = &item.content else {
+            panic!("missing command");
+        };
+        let window = adapter.output_windows.get(&key).unwrap();
+        assert!(window.omitted > 0);
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert!(output.starts_with("first🦀\n"));
+        assert!(source.ends_with(output.rsplit_once(&marker).unwrap().1));
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
+    }
+    #[test]
+    fn snapshot_output_preserves_its_partial_terminal_state_for_the_next_delta() {
+        for snapshot in ["item", "turn", "history"] {
+            for (raw, suffix, expected) in [
+                ("before🦀\u{1b}[", "31m-tail", "before🦀-tail"),
+                (
+                    "before🦀\u{1b}]8;;https://example.test/",
+                    "\u{7}tail",
+                    "before🦀tail",
+                ),
+                ("before🦀\u{1b}Ppayload\u{1b}", "\\tail", "before🦀tail"),
+                ("before🦀\r", "after", "before🦀\nafter"),
+            ] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                adapter.receive(output_window_started("")).unwrap();
+                adapter.receive(output_window_delta("old\u{1b}[")).unwrap();
+                match snapshot {
+                    "item" => {
+                        adapter.receive(output_window_started(raw)).unwrap();
+                    }
+                    "turn" => {
+                        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}}})).unwrap();
+                    }
+                    "history" => {
+                        let key = item_key("window-turn", "window-cmd");
+                        adapter.active_items.remove(&key);
+                        adapter.output_streams.remove(&key);
+                        adapter.output_windows.remove(&key);
+                        adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(raw)]}],"nextCursor":null}), &mut Step::default(), false).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                adapter.receive(output_window_delta(suffix)).unwrap();
+                let key = item_key("window-turn", "window-cmd");
+                let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                else {
+                    panic!("command output");
+                };
+                assert_eq!(
+                    output, expected,
+                    "{snapshot} snapshot must seed its own terminal continuation, not the old stream or default grammar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_marker_budgets_still_retain_the_latest_complete_utf8_tail() {
+        let source = format!("first🦀\n{}LAST🦀\n", "numbered🦀\n".repeat(100));
+        for limit in 64..=96 {
+            let mut output = String::new();
+            let mut window = OutputWindow::default();
+            append_display_output(&mut output, &source, limit, &mut window);
+            assert!(output.len() <= limit);
+            assert!(
+                output.ends_with("LAST🦀\n"),
+                "a {limit}-byte window has room for its marker and newest line"
+            );
+            let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+            assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+        }
+    }
+
+    #[test]
+    fn repeated_native_started_replaces_clipped_window_and_partial_decoder_together() {
+        for whole_turn in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            adapter.receive(output_window_started("")).unwrap();
+            let source = large_window_output();
+            adapter.receive(output_window_delta(&source)).unwrap();
+            assert_window_accounting(&adapter, &source);
+            adapter.receive(output_window_delta("\u{1b}[")).unwrap();
+            let key = item_key("window-turn", "window-cmd");
+            assert!(adapter.output_streams.contains_key(&key));
+            let replacement = "short🦀";
+            let frame = if whole_turn {
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(replacement)]}}})
+            } else {
+                output_window_started(replacement)
+            };
+            adapter.receive(frame).unwrap();
+            let window = adapter.output_windows.get(&key).unwrap();
+            assert_eq!((window.omitted, window.head), (0, 0));
+            let delta = "31m-tail🦀";
+            let step = adapter.receive(output_window_delta(delta)).unwrap();
+            assert!(step.events.iter().any(|event|matches!(event,Event::OutputDelta {offset,delta:seen,..} if *offset==replacement.len() && seen==delta)));
+            assert!(
+                matches!(&adapter.active_items[&key].content,ItemContent::Command {output,..} if output==&format!("{replacement}{delta}"))
+            );
+        }
+    }
+    #[test]
+    fn native_started_snapshot_retains_original_clipping_accounting_for_next_delta() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut source = large_window_output();
+        adapter.receive(output_window_started(&source)).unwrap();
+        assert_window_accounting(&adapter, &source);
+        let delta = "new-tail🦀\n";
+        source.push_str(delta);
+        adapter.receive(output_window_delta(delta)).unwrap();
+        assert_window_accounting(&adapter, &source);
+    }
+    #[test]
+    fn active_history_hydration_retains_clipping_window_without_replacing_live_owner() {
+        for existing in [false, true] {
+            let mut adapter = adapter();
+            adapter.busy = true;
+            let mut source = large_window_output();
+            if existing {
+                adapter.receive(output_window_started("")).unwrap();
+                adapter.receive(output_window_delta(&source)).unwrap();
+            }
+            let mut step = Step::default();
+            let page_output = if existing {
+                "older page must not replace the current stream"
+            } else {
+                &source
+            };
+            adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(page_output)]}],"nextCursor":null}),&mut step,false).unwrap();
+            assert_window_accounting(&adapter, &source);
+            let delta = "history-followed-by-tail🦀\n";
+            source.push_str(delta);
+            adapter.receive(output_window_delta(delta)).unwrap();
+            assert_window_accounting(&adapter, &source);
+        }
+    }
+
+    #[test]
+    fn rolling_output_preserves_first_last_lines_and_exact_omission_bytes() {
+        let source = (1..=200000)
+            .map(|line| format!("{line}:🦀\n"))
+            .collect::<String>();
+        let mut output = String::new();
+        let mut window = OutputWindow::default();
+        let mut start = 0;
+        while start < source.len() {
+            let end = source.floor_char_boundary((start + 1024).min(source.len()));
+            append_display_output(
+                &mut output,
+                &source[start..end],
+                MAX_ITEM_BYTES,
+                &mut window,
+            );
+            assert!(output.len() <= MAX_ITEM_BYTES);
+            start = end;
+        }
+        assert!(output.starts_with("1:🦀\n"));
+        assert!(output.ends_with("200000:🦀\n"));
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert!(output.contains(&marker));
+        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
+    }
 
     #[test]
     fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts() {
@@ -3884,6 +4899,555 @@ mod tests {
         }
     }
 
+    /// Official app-server Thread.name and thread/name/updated threadName are
+    /// metadata, not evidence that every thread receives a generated title.
+    #[test]
+    fn supported_thread_names_follow_only_the_exact_codex_conversation() {
+        let mut adapter = adapter();
+        let mut restored = Step::default();
+        adapter.thread_state(&json!({"id":"thread-exact","name":"Encrypted bundle review","status":{"type":"idle"}}), &mut restored).unwrap();
+        assert!(restored.events.iter().any(|event| matches!(event,
+            Event::Session {id, title: Some(title)} if id == "thread-exact" && title == "Encrypted bundle review")));
+        assert!(
+            restored.writes.is_empty(),
+            "reusing a provider name requires no inference request"
+        );
+        let foreign = adapter.receive(json!({"method":"thread/name/updated","params":{"threadId":"other","threadName":"Foreign name"}})).unwrap();
+        assert!(
+            !foreign
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { .. }))
+        );
+        for name in [
+            Some("Bundle throughput audit"),
+            Some("My custom bundle review"),
+            Some("1341"),
+            Some("🔐"),
+            None,
+        ] {
+            let mut params = json!({"threadId":"thread-exact"});
+            if let Some(name) = name {
+                params["threadName"] = json!(name);
+            }
+            let update = adapter
+                .receive(json!({"method":"thread/name/updated","params":params}))
+                .unwrap();
+            let names = update
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Session { id, title } => Some((id.as_str(), title.as_deref())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec![("thread-exact", name)]);
+            assert!(update.writes.is_empty());
+        }
+        // Identity-only None preservation is covered at the actual Runtime
+        // boundary, which owns the current displayed name and Reset behavior.
+    }
+
+    #[test]
+    fn notification_questions_use_real_codex_prompts_and_same_id_revisions() {
+        let question = |id: u64, text: &str| {
+            json!({
+                "id":id, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"migration", "header":"Migration", "question":text,
+                        "options":[{"label":"Keep","description":"Keep existing"},
+                            {"label":"Replace","description":"Use replacement"}]}]}
+            })
+        };
+        let frames = vec![
+            question(71, "Which config_file.rs strategy should A use?"),
+            question(72, "Which migration should B use?"),
+            json!({"method":"serverRequest/resolved",
+                "params":{"threadId":"thread-exact", "requestId":71}}),
+            question(72, "Updated B: preserve config_file.rs?"),
+            question(72, "Updated B: preserve config_file.rs?"),
+        ];
+        let receipts =
+            crate::chat::runtime::notification_frames_for_test(Box::new(adapter()), frames, false);
+        assert_eq!(
+            receipts.len(),
+            3,
+            "identical repeated metadata must not notify again"
+        );
+        for (index, expected) in [
+            "Which config_file.rs strategy should A use?",
+            "Which migration should B use?",
+            "Updated B: preserve config_file.rs?",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (evidence, content) = &receipts[index];
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert!(content.preview.contains(expected), "{}", content.preview);
+            assert!(!content.preview.contains("waiting for your answer"));
+        }
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        assert_ne!(receipts[1].0.key, receipts[2].0.key);
+    }
+
+    #[test]
+    fn notification_secret_question_revisions_notify_without_exposing_prompts() {
+        let question = |wording: &str| {
+            json!({
+                "id":73, "method":"item/tool/requestUserInput",
+                "params":{"threadId":"thread-exact", "turnId":"notification-turn",
+                    "questions":[{"id":"secret", "header":"PRIVATE_HEADER", "question":wording,
+                        "isSecret":true, "options":[]}]}
+            })
+        };
+        let receipts = crate::chat::runtime::notification_frames_for_test(
+            Box::new(adapter()),
+            vec![
+                question("PRIVATE_FIRST_QUESTION"),
+                question("PRIVATE_CHANGED_QUESTION"),
+                question("PRIVATE_CHANGED_QUESTION"),
+            ],
+            false,
+        );
+        assert_eq!(
+            receipts.len(),
+            2,
+            "changed secret prompts still need fresh attention"
+        );
+        assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        for (evidence, content) in receipts {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(
+                content.request,
+                Some(crate::notifications::RequestType::Question)
+            );
+            assert_eq!(content.preview, "Codex is waiting for your answer.");
+            assert!(!content.preview.contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn notification_old_completion_preserves_current_question_topic_and_error_state() {
+        let start = json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"new-b","status":"inProgress","items":[]}}});
+        let user = json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"new-b",
+            "item":{"id":"user-b","type":"userMessage","content":[{"type":"text","text":"Review the new B migration"}]}}});
+        let question = |text| {
+            json!({"id":71,"method":"item/tool/requestUserInput",
+            "params":{"threadId":"thread-exact","turnId":"new-b",
+                "questions":[{"id":"migration","header":"Migration","question":text,"options":[]}]}})
+        };
+        let old = json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"old-a","status":"failed","error":{"message":"Old A failure must not become B's error"},
+                "items":[{"id":"old-user","type":"userMessage","content":[{"type":"text","text":"Old A private topic"}]},
+                    {"id":"old-answer","type":"agentMessage","text":"Old A final response"}]}}});
+        let old_user = json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"old-a",
+            "item":{"id":"late-old-user","type":"userMessage","content":[{"type":"text","text":"Late old A topic"}]}}});
+        let old_delta = json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"old-a","itemId":"late-old-answer","delta":"Old A delta"}});
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "Old A".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let old_request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let old_rejection = json!({"id":old_request,"error":{"code":-32000,"message":"Old A rejected after B started"}});
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                start,
+                user,
+                question("Choose B migration"),
+                old_user,
+                old_delta,
+                old,
+                old_rejection,
+                question("Updated B migration question"),
+            ],
+            false,
+        );
+        assert_eq!(
+            callbacks.len(),
+            2,
+            "old A must not publish current completion or another waiting revision"
+        );
+        for (evidence, content) in &callbacks {
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(content.conversation, "Review the new B migration");
+            assert!(!content.preview.contains("Old A"));
+        }
+        assert!(
+            callbacks[1]
+                .1
+                .preview
+                .contains("Updated B migration question")
+        );
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.requests[0].id, "71");
+        assert!(state.error.is_none());
+        assert_eq!(state.activity(), crate::agent::ActivityState::Waiting);
+    }
+
+    #[test]
+    fn notification_exact_early_ack_restores_streamed_context_without_reappending_deltas() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+                "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":"Exact streamed B response."}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+                json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "Exact streamed B response.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "Exact streamed B response."
+        );
+    }
+
+    #[test]
+    fn notification_observed_start_transfers_early_context_before_live_deltas_and_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let delta = |text| json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":text}});
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+                "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
+                delta("First part. "),
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                delta("Second part."),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "First part. Second part.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "First part. Second part."
+        );
+    }
+
+    #[test]
+    fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        // A conservative decoder-order control, not a claim that a supported
+        // provider emits start after completion on one ordered connection.
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[
+                {"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]},
+                {"id":"b-answer","type":"agentMessage","text":"Already completed B response."}]}}}),
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "Already completed B response.");
+        assert!(!state.is_working());
+    }
+
+    #[test]
+    fn notification_history_and_scalar_idle_cannot_replace_exact_live_turn_proof() {
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
+        let mut adapter = adapter();
+        adapter.receive(start("old-a")).unwrap();
+        let mut request = Step::default();
+        adapter.history(&mut request, None).unwrap();
+        let id = request.writes[0]["id"].clone();
+        adapter.receive(start("new-b")).unwrap();
+        adapter.receive(json!({"id":id,"result":{"data":[{"id":"old-a","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+        assert_eq!(adapter.turn.as_deref(), Some("new-b"));
+        assert_eq!(adapter.notification_turn.as_deref(), Some("new-b"));
+        let old = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old-a","status":"completed","items":[]}}})).unwrap();
+        assert!(old.suppress_current_notification);
+        adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+        assert!(adapter.turn.is_none());
+        let current = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"new-b","status":"completed","items":[]}}})).unwrap();
+        assert!(!current.suppress_current_notification);
+        assert!(current.events.iter().any(|event| matches!(event, Event::TurnFinished { key, .. } if key.as_deref() == Some("codex:thread-exact:new-b"))));
+    }
+
+    #[test]
+    fn notification_pending_request_promotes_only_its_exact_early_completion() {
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
+        let finish = |id, text| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[{"id":format!("answer-{id}"),"type":"agentMessage","text":text}]}}})
+        };
+        let mut adapter = adapter();
+        adapter.receive(start("old-a")).unwrap();
+        adapter.receive(finish("old-a", "Old A completed")).unwrap();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "New B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let a = adapter.receive(finish("old-a", "Replayed A")).unwrap();
+        let b = adapter
+            .receive(finish("new-b", "Exact B final response"))
+            .unwrap();
+        for pending in [&a, &b] {
+            assert!(pending.suppress_current_notification);
+            assert!(
+                !pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            assert!(
+                pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_))),
+                "history still receives completed items"
+            );
+        }
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"new-b"}}}))
+            .unwrap();
+        assert!(!accepted.suppress_current_notification);
+        let outcomes = accepted
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![(
+                Some("codex:thread-exact:new-b"),
+                crate::notifications::Kind::Succeeded
+            )]
+        );
+        let projected =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&accepted.events);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].preview, "Exact B final response");
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn notification_early_completion_buffer_is_bounded_and_replay_replaces_in_place() {
+        let mut adapter = adapter();
+        adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let frame = |id: &str| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[]}}})
+        };
+        for _ in 0..32 {
+            adapter.receive(frame("same-old-turn")).unwrap();
+        }
+        let (count, bytes) = adapter
+            .pending
+            .values()
+            .find_map(|pending| match pending {
+                Pending::Turn {
+                    early, early_bytes, ..
+                } => Some((early.len(), *early_bytes)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let raw = frame("same-old-turn");
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&raw["params"]["turn"]).unwrap().len()
+        );
+        for index in 0..7 {
+            adapter
+                .receive(frame(&format!("unrelated-{index}")))
+                .unwrap();
+        }
+        let refused = adapter.receive(frame("ninth-unrelated-turn")).unwrap_err();
+        assert!(refused.contains("correlation capacity"));
+        assert!(
+            adapter
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Turn { early, .. } if early.len() == 8))
+        );
+    }
+
+    #[test]
+    fn notification_early_managed_result_cannot_replace_a_newer_current_turn() {
+        use crate::agent_execution::ProviderEvent;
+        let mut adapter = adapter();
+        let run = crate::model::RunId::new();
+        let submitted = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "B".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"early-b","status":"completed","items":[{"id":"b-answer","type":"agentMessage","text":"B result retained"}]}}})).unwrap();
+        adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"new-c","status":"inProgress","items":[]}}}),
+            )
+            .unwrap();
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"early-b"}}}))
+            .unwrap();
+        assert!(accepted.suppress_current_notification);
+        assert_eq!(adapter.turn.as_deref(), Some("new-c"));
+        assert!(adapter.busy);
+        assert!(!accepted.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
+        assert!(accepted.events.iter().any(|event| matches!(event, Event::Execution { run: current, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *current == run)));
+        assert!(accepted.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "B result retained"))));
+    }
+
+    #[test]
+    fn notification_callback_sees_completed_frame_text_and_failed_frame_diagnosis() {
+        for (status, expected_kind, error, expected) in [
+            (
+                "completed",
+                crate::notifications::Kind::Succeeded,
+                serde_json::Value::Null,
+                "Updated notification_preview in config_file.rs.",
+            ),
+            (
+                "failed",
+                crate::notifications::Kind::Failed,
+                json!({"message":"The provider rejected this request"}),
+                "The provider rejected this request",
+            ),
+        ] {
+            let frame = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"notification-turn","status":status,
+                "items":[{"id":"final-answer","type":"agentMessage","text":"Updated `notification_preview` in config_file.rs."}],"error":error}}});
+            for fail_store in [false, true] {
+                let mut callbacks = crate::chat::runtime::notification_frames_for_test(
+                    Box::new(adapter()),
+                    vec![
+                        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                        "turn":{"id":"notification-turn","status":"inProgress","items":[]}}}),
+                        frame.clone(),
+                    ],
+                    fail_store,
+                );
+                assert_eq!(callbacks.len(), 1);
+                let (evidence, content) = callbacks.pop().unwrap();
+                assert_eq!(
+                    evidence.kind, expected_kind,
+                    "storage failure cannot erase the provider's authoritative outcome"
+                );
+                assert_eq!(
+                    content.preview, expected,
+                    "immutable callback context must include validated final metadata independently of storage success"
+                );
+            }
+        }
+    }
+
     #[test]
     fn attention_requires_explicit_settlement_of_the_bound_thread() {
         use crate::notifications::Kind;
@@ -3901,6 +5465,7 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, Event::TurnFinished { .. }))
             );
+            adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
             let step = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":status,"items":[]}}})).unwrap();
             let outcome = step.events.iter().find_map(|event| match event {
                 Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
@@ -3995,7 +5560,7 @@ mod tests {
         );
         assert_eq!(page.writes[0]["params"]["cursor"], "page2");
         let last = adapter.receive(json!({"id":page.writes[0]["id"],"result":{"data":[{"id":"q2","input":[{"type":"localImage","path":"/fixture/image.png"}]}],"nextCursor":null}})).unwrap();
-        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into() }])));
+        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[0].editable && messages[1].text.is_empty() && messages[1].editable && messages[1].attachments == [Attachment { path: "/fixture/image.png".into(), reference: None }])));
         let changed = adapter
             .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
             .unwrap();
@@ -4256,6 +5821,7 @@ mod tests {
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             output_streams: BTreeMap::new(),
+            output_windows: BTreeMap::new(),
             models: vec![Model {
                 id: "model".into(),
                 label: "Model".into(),
@@ -4273,6 +5839,8 @@ mod tests {
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            notification_turn: None,
+            notification_revision: 0,
             busy: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
@@ -4313,13 +5881,63 @@ mod tests {
             panic!("{:?}", first.events)
         };
         assert_eq!(item.role, Role::System);
-        assert!(
-            matches!(&item.content, ItemContent::Text { text, thinking: false, phase: Phase::Commentary } if text == "Reconnecting... 1/2")
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
         let [Event::Item(next)] = second.events.as_slice() else {
             panic!("{:?}", second.events)
         };
         assert_ne!(item.id, next.id);
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, next),
+            Some("Reconnecting... 1/2")
+        );
+        for (cause, expected_kind) in [
+            (
+                "You've hit your limit · resets 1:30pm (America/Los_Angeles)",
+                chat::failure::FailureKind::AccountLimit,
+            ),
+            (
+                "Your access token could not be refreshed. Please sign in again.",
+                chat::failure::FailureKind::Authentication,
+            ),
+        ] {
+            let raw = format!(
+                "{cause}\nHTTP raw response: {}",
+                "retained diagnostic ".repeat(120_000)
+            );
+            assert!(raw.len() > 2 * 1024 * 1024);
+            let mut retry = frame.clone();
+            retry["params"]["error"]["message"] = json!(raw);
+            let retry = adapter.receive(retry).unwrap();
+            let [Event::Item(error)] = retry.events.as_slice() else {
+                panic!("retry must remain only a timeline item");
+            };
+            assert!(error.id.starts_with("codex-notice:"));
+            assert_ne!(error.id, item.id);
+            assert_eq!(
+                chat::failure::provider_error_text(Provider::Codex, error),
+                Some(raw.as_str())
+            );
+            assert_eq!(
+                chat::failure::Failure::parse(Provider::Codex, &raw)
+                    .unwrap()
+                    .kind,
+                expected_kind
+            );
+            let warning = adapter
+                .receive(
+                    json!({"method":"warning","params":{"threadId":"thread-exact","message":raw}}),
+                )
+                .unwrap();
+            let [Event::Item(warning)] = warning.events.as_slice() else {
+                panic!("warning must remain a timeline item");
+            };
+            assert!(chat::failure::provider_error_text(Provider::Codex, warning).is_none());
+            assert!(matches!(&warning.content, ItemContent::Text { text, .. } if text == &raw));
+        }
         for will_retry in [json!(false), Value::Null] {
             let mut failed = frame.clone();
             failed["params"]["willRetry"] = will_retry;
@@ -4343,9 +5961,17 @@ mod tests {
             .children
             .insert("child-thread".into(), Box::new(child));
         let step = parent.receive(json!({"method":"error","params":{"threadId":"child-thread","turnId":"child-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}}})).unwrap();
-        assert!(
-            matches!(step.events.as_slice(), [Event::SubagentItem { id, item: Item { role: Role::System, .. } }] if id == "child-thread")
+        let [Event::SubagentItem { id, item }] = step.events.as_slice() else {
+            panic!("A child retry must remain only in its exact child timeline");
+        };
+        assert_eq!(id, "child-thread");
+        assert_eq!(item.role, Role::System);
+        assert!(item.id.starts_with("codex-notice:"));
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, item),
+            Some("Reconnecting... 1/2")
         );
+        assert!(chat::failure::provider_error_text(Provider::Claude, item).is_none());
     }
 
     #[test]
@@ -4603,6 +6229,7 @@ mod tests {
         adapter.receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}})).unwrap();
         assert!(adapter.busy);
         assert_eq!(adapter.turn, None);
+        assert_eq!(adapter.notification_turn, None);
     }
 
     #[test]
@@ -4617,6 +6244,7 @@ mod tests {
             child.thread = Some("child".into());
             child.is_child = true;
             parent.children.insert("child".into(), Box::new(child));
+            parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"t","status":"inProgress","items":[]}}})).unwrap();
             parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"t","status":outcome,"items":[]}}})).unwrap();
             for frame in [
                 json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"idle"}}}),
@@ -4792,6 +6420,10 @@ mod tests {
         let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"child-exact","turnId":"turn","itemId":"answer","delta":" tail"}})).unwrap();
         assert!(live.events.is_empty());
         let hydrated = adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"turn","status":"inProgress","items":[{"id":"answer","type":"agentMessage","text":"head"}]}],"nextCursor":null}}})).unwrap();
+        assert_eq!(
+            adapter.children["child-exact"].notification_turn.as_deref(),
+            Some("turn")
+        );
         assert!(hydrated.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child-exact" && delta == " tail")));
         assert!(
             !hydrated
@@ -4808,6 +6440,15 @@ mod tests {
             .receive(json!({"id":invalidated.writes[0]["id"],"result":{"data":[]}}))
             .unwrap();
         assert!(replied.events.is_empty());
+        let stale = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"older","status":"failed","items":[]}}})).unwrap();
+        assert!(adapter.children["child-exact"].busy);
+        assert!(!stale.events.iter().any(|event| matches!(
+            event,
+            Event::Subagent {
+                status: Some(ToolStatus::Failed),
+                ..
+            }
+        )));
         let completed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
         assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "child-exact")));
         let foreign = adapter.receive(json!({"method":"turn/started","params":{"threadId":"unrelated","turn":{"id":"bad","items":[]}}})).unwrap();
@@ -5013,6 +6654,7 @@ mod tests {
         );
         let attached = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"model":"gpt-child","thread":{"id":"child","status":{"type":"active","activeFlags":["waitingOnApproval"]}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
         assert!(attached.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(true), detail:Some(detail), .. } if model == "gpt-child" && detail == "Waiting for your approval")));
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"latest","status":"inProgress","items":[]}}})).unwrap();
         let answered = parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":[]}}})).unwrap();
         assert!(answered.events.iter().any(|event| matches!(event, Event::Subagent { model:Some(model), waiting:Some(false), detail:Some(detail), status:Some(ToolStatus::Running), .. } if model == "gpt-child" && detail.is_empty())));
         parent.receive(json!({"method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}})).unwrap();
@@ -5071,6 +6713,7 @@ mod tests {
             .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
             .unwrap();
         adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"child-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
         let approval = |id| json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-exact","turnId":"turn","itemId":"tool","availableDecisions":["accept","decline"],"command":"echo requested"}});
         let requested = adapter.receive(approval(71)).unwrap();
         assert!(requested.events.iter().any(|event| matches!(event, Event::Request(request) if request.title.starts_with("Child agent"))));
@@ -5211,6 +6854,224 @@ mod tests {
         assert_eq!(texts, ["Owned answer"]);
         assert!(!adapter.busy);
         assert!(adapter.execution.is_none());
+    }
+
+    #[test]
+    fn initial_scalar_activation_before_early_completion_keeps_exact_ack_authority() {
+        for managed in [false, true] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let command = Command::Prompt {
+                text: "Owned prompt".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            };
+            let submitted = if managed {
+                adapter.command_for_run(run, command).unwrap()
+            } else {
+                adapter.command(command).unwrap()
+            };
+            adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+            adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"Owned answer"}]}}})).unwrap();
+            adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+            let acknowledged = adapter
+                .receive(json!({"id":submitted.writes[0]["id"],"result":{"turn":{"id":"owned"}}}))
+                .unwrap();
+            assert!(!acknowledged.suppress_current_notification);
+            assert!(acknowledged.events.iter().any(|event| matches!(event,
+                Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("codex:thread-exact:owned")
+            )));
+            assert!(!adapter.busy);
+            assert_eq!(acknowledged.events.iter().filter(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+            )).count(), usize::from(managed));
+        }
+    }
+
+    #[test]
+    fn superseded_early_completion_cannot_reclaim_notification_authority_after_idle() {
+        for supersession in ["active", "metadata-active", "systemError", "closed"] {
+            for managed in [false, true] {
+                let mut adapter = adapter();
+                let run = crate::model::RunId::new();
+                let command = Command::Prompt {
+                    text: "Old prompt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                };
+                let submitted = if managed {
+                    adapter.command_for_run(run, command).unwrap()
+                } else {
+                    adapter.command(command).unwrap()
+                };
+                let request = submitted.writes[0]["id"].clone();
+                adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"old","status":"completed","items":[{"id":"old-answer","type":"agentMessage","text":"Old answer"}]}}})).unwrap();
+                if supersession == "closed" {
+                    adapter
+                        .receive(
+                            json!({"method":"thread/closed","params":{"threadId":"thread-exact"}}),
+                        )
+                        .unwrap();
+                } else if supersession == "metadata-active" {
+                    let refresh = adapter.command(Command::Refresh).unwrap();
+                    let read = refresh
+                        .writes
+                        .iter()
+                        .find(|frame| frame["method"] == "thread/read")
+                        .unwrap();
+                    adapter.receive(json!({"id":read["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"active"}}}})).unwrap();
+                } else {
+                    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":supersession}}})).unwrap();
+                }
+                if matches!(supersession, "active" | "metadata-active") {
+                    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}})).unwrap();
+                }
+                let revision = adapter.lifecycle_revision;
+                let acknowledged = adapter
+                    .receive(json!({"id":request,"result":{"turn":{"id":"old"}}}))
+                    .unwrap();
+                assert!(
+                    acknowledged.suppress_current_notification,
+                    "{supersession}, managed={managed}"
+                );
+                assert!(
+                    acknowledged.notification_preview.is_none(),
+                    "{supersession}, managed={managed}"
+                );
+                assert!(
+                    !acknowledged.events.iter().any(|event| matches!(
+                        event,
+                        Event::TurnFinished { .. } | Event::TurnStarted | Event::TurnSettled
+                    )),
+                    "{supersession}, managed={managed}: {:?}",
+                    acknowledged.events
+                );
+                assert_eq!(adapter.lifecycle_revision, revision);
+                assert!(adapter.notification_turn.is_none());
+                assert!(!adapter.busy);
+                assert_eq!(acknowledged.events.iter().filter(|event| matches!(event,
+                    Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+                )).count(), usize::from(managed));
+                if managed {
+                    assert!(acknowledged.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Text { text, .. }, .. }) if text == "Old answer"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn managed_completion_publishes_final_content_once_per_step_in_either_ack_order() {
+        for completion_first in [false, true] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let sent = adapter
+                .command_for_run(
+                    run,
+                    Command::Prompt {
+                        text: "Owned prompt".into(),
+                        attachments: vec![],
+                        mode: PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            let request = sent.writes[0]["id"].clone();
+            let ack = json!({"id":request,"result":{"turn":{"id":"owned"}}});
+            let completion = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"failed","error":{"message":"Exact failure"},"items":[{"id":"answer","type":"agentMessage","text":"Partial answer"}]}}});
+            let final_step = if completion_first {
+                adapter.receive(completion).unwrap();
+                adapter.receive(ack).unwrap()
+            } else {
+                adapter.receive(ack).unwrap();
+                adapter.receive(completion).unwrap()
+            };
+            assert_eq!(final_step.events.iter().filter(|event| matches!(event,
+                Event::Item(Item { content: ItemContent::Text { text, .. }, .. }) if text == "Partial answer"
+            )).count(), 1, "{:?}", final_step.events);
+            assert_eq!(
+                final_step
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::Error { message, .. } if message == "Exact failure"
+                    ))
+                    .count(),
+                1,
+                "{:?}",
+                final_step.events
+            );
+            assert_eq!(final_step.events.iter().filter(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Failed } } if *actual == run
+            )).count(), 1, "{:?}", final_step.events);
+            assert!(adapter.execution.is_none());
+            assert!(!adapter.busy);
+        }
+    }
+
+    #[test]
+    fn managed_late_ack_settles_its_run_without_claiming_new_unidentified_work() {
+        let mut adapter = adapter();
+        let run = crate::model::RunId::new();
+        let sent = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "Owned prompt".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"Owned answer"}]}}})).unwrap();
+        adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active","activeFlags":["waitingOnApproval"]}}})).unwrap();
+        let revision = adapter.lifecycle_revision;
+        let ack = adapter
+            .receive(json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"owned"}}}))
+            .unwrap();
+        assert!(ack.events.iter().any(|event| matches!(event,
+            Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run
+        )));
+        assert!(ack.suppress_current_notification);
+        assert!(ack.notification_preview.is_none());
+        assert!(!ack.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
+        assert!(adapter.execution.is_none());
+        assert!(adapter.busy && adapter.subagent_waiting);
+        assert_eq!(adapter.lifecycle_revision, revision);
+        assert!(adapter.turn.is_none() && adapter.notification_turn.is_none());
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"new","status":"inProgress","items":[]}}})).unwrap();
+        let finished = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"new","status":"completed","items":[]}}})).unwrap();
+        assert!(!adapter.busy);
+        assert!(finished.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn child_buffered_new_turn_supersedes_its_initial_active_history_binding() {
+        let mut parent = adapter();
+        let mut discovered = Step::default();
+        parent
+            .discover_child("child", &json!({}), &mut discovered)
+            .unwrap();
+        parent.receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"new","status":"inProgress","items":[]}}})).unwrap();
+        parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}}})).unwrap();
+        assert_eq!(
+            parent.children["child"].notification_turn.as_deref(),
+            Some("new")
+        );
+        parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"old","status":"failed","items":[]}}})).unwrap();
+        assert!(parent.children["child"].busy);
+        let completed = parent.receive(json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"new","status":"completed","items":[]}}})).unwrap();
+        assert!(!parent.children["child"].busy);
+        assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == "child")));
     }
 
     fn account_fixture(name: &str) -> Value {
@@ -5737,6 +7598,146 @@ mod tests {
         );
     }
 
+    /// Exercise the real actor dispatch without a provider subprocess. The
+    /// history transport records protocol writes in memory instead of sending
+    /// them, while retaining Codex's actual pending-decision state machine.
+    #[test]
+    fn settled_indexed_declines_are_checked_on_the_actor_without_authorizing_work() {
+        use crate::chat::runtime::{Handle, preflight};
+        use std::sync::{Arc, Mutex};
+
+        struct Recorded {
+            adapter: Codex,
+            writes: Arc<Mutex<Vec<Value>>>,
+        }
+        impl Adapter for Recorded {
+            fn initialize(&mut self) -> Result<Step, String> {
+                unreachable!()
+            }
+            fn answer_declines(&self, id: &str, action: &str) -> bool {
+                self.adapter.answer_declines(id, action)
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let mut step = self.adapter.command(command)?;
+                self.writes.lock().unwrap().append(&mut step.writes);
+                Ok(step)
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                self.adapter.receive(frame)
+            }
+        }
+        for decisions in [json!(["accept", "decline"]), json!(["cancel", "accept"])] {
+            let mut adapter = adapter();
+            let run = crate::model::RunId::new();
+            let prompt = adapter
+                .command_for_run(
+                    run,
+                    Command::Prompt {
+                        text: "owned prompt".into(),
+                        attachments: vec![],
+                        mode: PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            let start = prompt
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "turn/start")
+                .unwrap();
+            adapter.receive(json!({"id":start["id"],"result":{"turn":{"id":"owned","status":"inProgress","items":[]}}})).unwrap();
+            let mut child = self::adapter();
+            child.thread = Some("child".into());
+            child.is_child = true;
+            adapter.children.insert("child".into(), Box::new(child));
+            let request = adapter.receive(json!({"id":"pending","method":"item/commandExecution/requestApproval","params":{
+                "threadId":"child","turnId":"child-turn","itemId":"tool","availableDecisions":decisions,"command":"requested"
+            }})).unwrap();
+            let completed = adapter
+                .receive(json!({"method":"turn/completed","params":{
+                    "threadId":"thread-exact","turn":{"id":"owned","status":"completed","items":[]}
+                }}))
+                .unwrap();
+            assert!(completed.events.iter().any(|event| matches!(event,
+                Event::Execution { run: actual, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded }} if *actual == run)));
+            let id = rpc_id(&json!("pending")).unwrap();
+            let decline_index = decisions
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|v| matches!(v.as_str(), Some("decline" | "cancel")))
+                .unwrap();
+            let decline = format!("decision-{decline_index}");
+            let accept = format!("decision-{}", 1 - decline_index);
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().join("approved");
+            std::fs::create_dir(&cwd).unwrap();
+            let context = super::super::ExecutionContext::new(Some(Arc::new(
+                std::fs::File::open(&cwd).unwrap(),
+            )));
+            let spec = ProcessSpec {
+                execution: Some(Arc::new(context)),
+                messages: None,
+                transport: TransportSpec::History,
+                program: "not-launched".into(),
+                arguments: vec![],
+                working_directory: cwd.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            };
+            let mut initial = Step {
+                writes: vec![],
+                events: vec![Event::Ready(true)],
+                ..Step::default()
+            };
+            initial.events.extend(prompt.events);
+            initial.events.extend(request.events);
+            initial.events.extend(completed.events);
+            let store = preflight(&spec, &mut initial).unwrap();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let handle = Handle::start(
+                spec,
+                Box::new(Recorded {
+                    adapter,
+                    writes: writes.clone(),
+                }),
+                initial,
+                store,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            // Command delivery is serialized after the initial snapshot.
+            let answer = |action: String| Command::Answer {
+                request_id: id.clone(),
+                action,
+                answers: vec![],
+            };
+            let refused = handle.decline_answer(answer(accept.clone())).unwrap_err();
+            assert!(refused.contains("only decline"), "{refused}");
+            assert!(
+                handle.decline_answer(answer("decline".into())).is_err(),
+                "literal action was never offered"
+            );
+            assert!(writes.lock().unwrap().is_empty());
+            std::fs::remove_dir(&cwd).unwrap();
+            assert!(
+                handle.command(answer(accept)).is_err(),
+                "authorization still requires its approved directory"
+            );
+            handle.decline_answer(answer(decline.clone())).unwrap();
+            assert!(handle.requests().is_empty());
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec![json!({"id":"pending","result":{"decision":decisions[decline_index]}})]
+            );
+            assert!(
+                handle.decline_answer(answer(decline)).is_err(),
+                "resolved requests cannot be answered twice"
+            );
+            handle.close().unwrap();
+        }
+    }
+
     #[test]
     fn request_ids_and_resolution_prevent_wrong_or_stale_approval() {
         let mut adapter = adapter();
@@ -5958,22 +7959,20 @@ mod tests {
     #[test]
     fn oversized_tool_output_keeps_stream_and_completion_alive() {
         let mut adapter = adapter();
-        adapter.busy = true;
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
         let mut item = json!({"id":"large","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":""});
         adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
         let delta = "🦀".repeat(MAX_ITEM_BYTES);
         let streamed = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"large","delta":delta}})).unwrap();
-        let Event::OutputDelta {
-            offset,
-            delta: suffix,
-            ..
-        } = &streamed.events[0]
-        else {
-            panic!("missing streamed append")
+        let Event::Item(streamed) = &streamed.events[0] else {
+            panic!("missing bounded output window")
         };
-        assert_eq!(*offset, 0);
+        let ItemContent::Command { output: suffix, .. } = &streamed.content else {
+            panic!("missing command")
+        };
         assert!(suffix.len() <= MAX_ITEM_BYTES);
-        assert!(suffix.ends_with(OUTPUT_TRUNCATED));
+        assert!(suffix.contains("bytes omitted"));
+        assert!(suffix.ends_with("🦀"));
         item["status"] = json!("completed");
         item["aggregatedOutput"] = json!(delta);
         let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();

@@ -1,11 +1,34 @@
 use super::*;
 use crate::interaction::tooltip;
 
+/// Shape once when cached chrome changes, with the same font and size as the tab.
+pub(super) fn measure_tab_title(title: &str) -> f32 {
+    use iced::{
+        Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
+    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
+        content: title,
+        bounds: Size::new(f32::INFINITY, f32::INFINITY),
+        size: Pixels(design::TEXT_BODY),
+        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
+        font: cosmic::font::default(),
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::default(),
+        wrapping: text::Wrapping::None,
+        ellipsize: text::Ellipsize::None,
+    });
+    paragraph.min_bounds().width
+}
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    pub(super) terminal_ordinals: HashMap<CardId, u32>,
+    pub(super) terminal_next_ordinals: HashMap<PathBuf, u32>,
     /// Tab visibility follows pane focus even when a creation path already
     /// updated durable focus before applying its viewport changes.
     pub(super) tabs_focus: Option<CardId>,
@@ -35,10 +58,217 @@ pub(super) struct State {
     /// the tab to the viewport edge - including a reveal triggered by merely
     /// hovering an already-visible tab under focus-follows-mouse.
     tabs_offset: f32,
+    /// The notices control kept on screen, at this severity, for the frame
+    /// after the last notice went: long enough to learn whether it held the
+    /// keyboard, which would otherwise go nowhere with it.
+    retiring_notice_control: Option<NoticeSeverity>,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn narrow_header_mounts_four_complete_tabs() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation::Focusable},
+        };
+        use iced::{Rectangle, Size};
+        struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                _: iced::Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("workspace.tabs")) {
+                    self.1 = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        for width in [640.0, 900.0, 1600.0] {
+            let app = tab_fixture(30, width);
+            let mut element =
+                app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)),
+            );
+            let mut bounds = Bounds(HashMap::new(), None);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width <= 900.0 {
+                let viewport = bounds.1.expect("native tab viewport");
+                let visible = app
+                    .workspace
+                    .order()
+                    .filter(|id| {
+                        let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                        tab.x >= viewport.x
+                            && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                    })
+                    .count();
+                assert!(
+                    visible >= 4,
+                    "only {visible} complete tabs fit in {viewport:?}"
+                );
+            }
+        }
+    }
+
+    fn tab_fixture(count: usize, width: f32) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let cards: Vec<_> = (0..count)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(width);
+        drop(app.sync_chrome());
+        app
+    }
+
+    #[test]
+    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+        let mut app = tab_fixture(30, 900.0);
+        let (available, width) = app.tab_strip_geometry();
+        assert!(
+            4.0 * (width + crate::tab_strip::SPACING) + 2.0 * crate::tab_strip::EDGE_INSET
+                <= available + 0.1
+        );
+        let id = app.durable.cards[0].id;
+        app.chrome_ui
+            .user_titles
+            .insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
+        app.workspace.resize_viewport(1600.0);
+        drop(app.sync_chrome());
+        let (_, width) = app.tab_strip_geometry();
+        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 144.0);
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == "WWWWWWWWWWWWWWWWWWWW" {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        let mut header = app.column_header(id, true, width);
+        let mut tree = Tree::new(header.as_widget());
+        let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+        let node =
+            header
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut title = TitleBounds(None);
+        header
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut title);
+        assert!(
+            title.0.expect("actual mounted title text").width
+                >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
+            "the real title allocation must fit, after its icon, padding and controls"
+        );
+    }
+
+    #[test]
+    fn new_terminal_after_worktree_move_keeps_existing_numbers_distinct() {
+        let mut app = tab_fixture(3, 1600.0);
+        let moved = PathBuf::from("/moved-worktree");
+        for card in &app.durable.cards {
+            app.worktree_owners.insert(card.id, moved.clone());
+        }
+        let card = super::super::tests::terminal_card_state();
+        let added = card.id;
+        app.worktree_owners.insert(added, moved);
+        Arc::make_mut(&mut app.durable).cards.insert(0, card);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(app.card_chrome[&added].title.ends_with("(4)"));
+    }
+
+    #[test]
+    fn reported_terminal_titles_keep_osc_precedence_over_launch_fallbacks() {
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        if let CardKind::Terminal(session) = &mut Arc::make_mut(&mut app.durable).cards[0].kind {
+            session.launch.working_directory = PathBuf::from("/repo/alpha");
+        }
+        for reported in ["alpha", "Terminal", "/repo/alpha"] {
+            app.apply_reported_title(id, reported.into());
+            drop(app.sync_chrome());
+            assert_eq!(app.card_chrome[&id].title, format!("{reported} (1)"));
+            assert!(app.core.window.header_title.starts_with(reported));
+        }
+    }
+
+    #[test]
+    fn terminal_ordinals_survive_an_unrelated_tab_closing() {
+        let mut app = tab_fixture(3, 1600.0);
+        let survivor = app.durable.cards[2].id;
+        let before = app.card_chrome[&survivor].title.clone();
+        assert!(before.ends_with("(3)"), "{before}");
+        assert!(
+            app.card_chrome[&survivor]
+                .compact_title
+                .as_deref()
+                .unwrap()
+                .starts_with("3 ")
+        );
+        Arc::make_mut(&mut app.durable).cards.remove(0);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&survivor].title, before);
+        assert_eq!(
+            app.chrome_ui.terminal_ordinals.len(),
+            2,
+            "retired pane IDs must not accumulate in the ordinal cache"
+        );
+        let added = super::super::tests::terminal_card_state();
+        let added_id = added.id;
+        Arc::make_mut(&mut app.durable).cards.push(added);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(
+            app.card_chrome[&added_id].title.ends_with("(4)"),
+            "retiring an ID must preserve the worktree's next ordinal"
+        );
+        assert_eq!(app.card_chrome[&survivor].title, before);
+    }
     use super::*;
 
     /// Retain the actual Settings pane while rename and palette modals change.
@@ -362,6 +592,403 @@ mod tests {
         assert!(app.context_inspector_overlay_active);
     }
 
+    fn focus_main_window(app: &mut Cagents, focused: bool) {
+        app.core
+            .set_main_window_id(Some(cosmic::iced::window::Id::RESERVED));
+        let _ = app.update(Message::RefreshUi(
+            super::super::refresh_ui::Action::Focused(cosmic::iced::window::Id::RESERVED, focused),
+        ));
+        assert_eq!(app.refresh_ui.focused, focused);
+    }
+
+    /// The expiry timer runs only while a confirmation is waiting to retire
+    /// and someone could be reading it: the window in the foreground and the
+    /// notices closed. Time spent otherwise is added back to the deadline. It
+    /// fires as a message that retires what is due.
+    #[test]
+    fn confirmations_retire_only_while_someone_could_read_them() {
+        // A measurable pause, so a resume that shifted nothing cannot pass.
+        let pause = || std::thread::sleep(Duration::from_millis(5));
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
+        app.notices.record(TransientNotice::error("Still failing."));
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "an idle window arms no timer"
+        );
+        let recorded = Instant::now();
+        app.notices
+            .record_at(TransientNotice::success("Account added."), recorded);
+        let due = recorded + NOTICE_SUCCESS_LIFETIME;
+        assert_eq!(app.notices.next_expiry(), Some(due));
+
+        let _ = app.update(Message::ChromeUi(Action::ToggleNotices));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(
+            app.notices.next_expiry(),
+            None,
+            "nothing retires while read"
+        );
+        let paused = app.notices.paused_at.expect("reading pauses the countdown");
+        // A timer that fired just before the popup opened changes nothing.
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        pause();
+        let before = Instant::now();
+        let _ = app.update(Message::ChromeUi(Action::Close));
+        let after = Instant::now();
+        let resumed = app.notices.next_expiry().expect("the countdown resumes");
+        // Moved on by exactly the pause, which ended inside the update.
+        assert!(
+            due + (before - paused) <= resumed && resumed <= due + (after - paused),
+            "the time spent reading is not counted"
+        );
+
+        focus_main_window(&mut app, false);
+        assert_eq!(app.notices.next_expiry(), None, "nothing retires unseen");
+        let paused = app.notices.paused_at.expect("the background pauses it");
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 2);
+        pause();
+        let before = Instant::now();
+        focus_main_window(&mut app, true);
+        let after = Instant::now();
+        let refocused = app.notices.next_expiry().expect("focus resumes it");
+        assert!(
+            resumed + (before - paused) <= refocused && refocused <= resumed + (after - paused),
+            "time in the background is not counted"
+        );
+
+        // Backdated, so the repeat is already due when the timer fires.
+        app.notices.record_at(
+            TransientNotice::success("Account added."),
+            recorded - NOTICE_SUCCESS_LIFETIME,
+        );
+        let _ = app.update(Message::ExpireNotices);
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices.severity(), Some(NoticeSeverity::Error));
+        assert_eq!(app.notices.next_expiry(), None);
+    }
+
+    /// The header's notices control beside the inspector toggle, as the
+    /// window header mounts them.
+    fn notice_header(app: &Cagents) -> Element<'_, Message> {
+        widget::row::with_children(vec![
+            app.sidebar_toggle(),
+            widget::row::with_children(app.notice_control()).into(),
+        ])
+        .into()
+    }
+
+    fn notice_focus_fixture(app: &Cagents) -> Element<'_, Message> {
+        widget::column::with_children(vec![
+            notice_header(app),
+            rename_fixture_view(app),
+            app.dialog()
+                .unwrap_or_else(|| widget::Space::new().width(1).height(1).into()),
+        ])
+        .into()
+    }
+
+    /// Mounts the header as `app` now draws it, then applies `task`'s widget
+    /// operations to it, as the runtime does once an update has been drawn.
+    /// Returns the messages the task produced and the ids holding focus after.
+    fn apply_to_header(
+        app: &Cagents,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        task: Task<Message>,
+    ) -> (Vec<Message>, Vec<String>) {
+        use iced::advanced::widget::operation::{Focusable, Outcome};
+        use iced::advanced::{Layout, layout, widget::Operation};
+        use iced::{Rectangle, Size, futures::StreamExt};
+
+        struct Focused(Vec<String>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id
+                    && state.is_focused()
+                {
+                    self.0.push(id.to_string());
+                }
+            }
+        }
+
+        let mut element = notice_focus_fixture(app);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1600.0)),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = Vec::new();
+        runtime.block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            while let Ok(Some(action)) =
+                tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                match action {
+                    iced::runtime::Action::Widget(operation) => {
+                        let mut next = Some(operation);
+                        while let Some(mut operation) = next.take() {
+                            element.as_widget_mut().operate(
+                                tree,
+                                Layout::new(&node),
+                                renderer,
+                                operation.as_mut(),
+                            );
+                            if let Outcome::Chain(chained) = operation.finish() {
+                                next = Some(chained);
+                            }
+                        }
+                    }
+                    iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        runtime.shutdown_background();
+        let mut focused = Focused(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(tree, Layout::new(&node), renderer, &mut focused);
+        (messages, focused.0)
+    }
+
+    /// The notices control goes with the last notice, whatever removes it.
+    /// When it held the keyboard, the keyboard moves to the inspector toggle
+    /// beside it rather than to nowhere; otherwise it stays where it is.
+    #[test]
+    fn the_last_notice_going_moves_the_keyboard_off_its_control() {
+        let toggle = context_inspector_toggle_id().to_string();
+        let control = widget::Id::new(NOTICES_CONTROL_ID).to_string();
+        // A confirmation retiring on its timer, and a failure withdrawn by
+        // the reader giving up on what failed.
+        let removals: [(&str, fn(&mut Cagents) -> Task<Message>); 2] = [
+            ("timer", |app| {
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                app.update(Message::ExpireNotices)
+            }),
+            ("link cancel", |app| {
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkStart(crate::agent::Provider::Claude),
+                ));
+                let _ = app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkReady {
+                        key: uuid::Uuid::new_v4(),
+                        result: Err("no credentials there".into()),
+                    },
+                ));
+                app.update(Message::AccountUi(
+                    super::super::account_ui::Action::LinkCancel,
+                ))
+            }),
+        ];
+        for (path, remove) in removals {
+            for holds_keyboard in [true, false] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                focus_main_window(&mut app, true);
+                app.notices.record(TransientNotice::warning("Placeholder."));
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = iced::advanced::widget::Tree::new(notice_header(&app).as_widget());
+                let target = if holds_keyboard {
+                    widget::Id::new(NOTICES_CONTROL_ID)
+                } else {
+                    widget::Id::new("elsewhere")
+                };
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(target),
+                );
+                assert_eq!(focused == [control.clone()], holds_keyboard, "{path}");
+                app.notices.clear();
+
+                let query = remove(&mut app);
+                assert!(!app.has_chrome_notices(), "{path}");
+                let (mut messages, _) = apply_to_header(&app, &mut tree, &renderer, query);
+                assert!(
+                    matches!(messages.as_slice(), [Message::NoticeControlRetired]),
+                    "{path}: {messages:?}"
+                );
+                let moved = app.update(messages.pop().unwrap());
+                assert!(app.notice_control().is_none(), "{path}");
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, moved);
+                if holds_keyboard {
+                    assert_eq!(focused, [toggle.clone()], "{path}");
+                } else {
+                    assert!(focused.is_empty(), "{path}: {focused:?}");
+                }
+            }
+        }
+
+        // A tree without the control answers nothing; the control still goes.
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let query = app.update(Message::ExpireNotices);
+        assert!(app.notice_control().is_some(), "kept for the query");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut messages = runtime.block_on(async {
+            use cosmic::iced::futures::StreamExt;
+            let mut messages = Vec::new();
+            let mut stream = cosmic::iced::runtime::task::into_stream(query).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    cosmic::iced::runtime::Action::Widget(operation) => drop(operation),
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message);
+                    }
+                    _ => {}
+                }
+            }
+            messages
+        });
+        assert!(
+            matches!(messages.as_slice(), [Message::NoticeControlRetired]),
+            "{messages:?}"
+        );
+        let _ = app.update(messages.pop().unwrap());
+        assert!(app.notice_control().is_none());
+    }
+
+    #[test]
+    fn retiring_notices_never_take_focus_from_a_newer_keyboard_owner() {
+        use iced::advanced::widget::Tree;
+
+        // Interleave both before the widget operation and after its reply:
+        // neither a stale focus query nor its cleanup may override new UI.
+        for before_operation in [false, true] {
+            for owner in ["palette", "rename", "dialog", "editor"] {
+                let mut app = rename_test_app();
+                focus_main_window(&mut app, true);
+                app.notices.record_at(
+                    TransientNotice::success("Copied."),
+                    Instant::now() - NOTICE_SUCCESS_LIFETIME,
+                );
+                let renderer = super::super::tests::headless_renderer();
+                let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+                let (_, focused) = apply_to_header(
+                    &app,
+                    &mut tree,
+                    &renderer,
+                    iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+                );
+                assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+                let mut retirement = Some(app.update(Message::ExpireNotices));
+                let mut replies = if before_operation {
+                    Vec::new()
+                } else {
+                    apply_to_header(&app, &mut tree, &renderer, retirement.take().unwrap()).0
+                };
+                let (open, destination) = match owner {
+                    "palette" => (
+                        app.update_palette(palette_ui::Action::Open),
+                        widget::Id::new("palette.query"),
+                    ),
+                    "rename" => (
+                        app.update_chrome(Action::Rename(app.workspace.focused().unwrap())),
+                        widget::Id::new("chrome.rename.input"),
+                    ),
+                    "dialog" => {
+                        // Mount the real confirmation without requesting any
+                        // daemon operation; Cancel is an actual dialog widget.
+                        app.daemon_health_ui.confirmation = true;
+                        let destination = widget::Id::new("daemon-health.cancel");
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                    _ => {
+                        let destination = crate::settings_widgets::search_id();
+                        (
+                            iced::widget::operation::focus(destination.clone()),
+                            destination,
+                        )
+                    }
+                };
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, open);
+                assert_eq!(focused, [destination.to_string()], "{owner}");
+                if let Some(retirement) = retirement {
+                    replies = apply_to_header(&app, &mut tree, &renderer, retirement).0;
+                }
+                assert!(matches!(
+                    replies.as_slice(),
+                    [Message::NoticeControlRetired]
+                ));
+                let cleanup = app.update(replies.pop().unwrap());
+                let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+                assert_eq!(
+                    focused,
+                    [destination.to_string()],
+                    "{owner}, before operation: {before_operation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_notice_cancels_the_pending_focus_handoff() {
+        use iced::advanced::widget::Tree;
+
+        let mut app = rename_test_app();
+        focus_main_window(&mut app, true);
+        app.notices.record_at(
+            TransientNotice::success("Copied."),
+            Instant::now() - NOTICE_SUCCESS_LIFETIME,
+        );
+        let renderer = super::super::tests::headless_renderer();
+        let mut tree = Tree::new(notice_focus_fixture(&app).as_widget());
+        let _ = apply_to_header(
+            &app,
+            &mut tree,
+            &renderer,
+            iced::widget::operation::focus(widget::Id::new(NOTICES_CONTROL_ID)),
+        );
+        let retirement = app.update(Message::ExpireNotices);
+        app.notices
+            .record(TransientNotice::warning("A newer report."));
+        let (mut replies, focused) = apply_to_header(&app, &mut tree, &renderer, retirement);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert!(matches!(
+            replies.as_slice(),
+            [Message::NoticeControlRetired]
+        ));
+        let cleanup = app.update(replies.pop().unwrap());
+        let (_, focused) = apply_to_header(&app, &mut tree, &renderer, cleanup);
+        assert_eq!(focused, [NOTICES_CONTROL_ID.to_owned()]);
+        assert_eq!(app.notices.len(), 1);
+    }
+
     #[test]
     fn showing_a_switch_failure_keeps_its_explanation_open() {
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -420,8 +1047,8 @@ mod tests {
             session.launch.program = "codex".into();
             card.title = title.into();
             drop(app.sync_chrome());
-            assert_eq!(app.card_chrome[&id].title, expected);
-            assert_eq!(app.core.window.header_title, expected);
+            assert_eq!(app.card_chrome[&id].title, format!("{expected} (1)"));
+            assert_eq!(app.core.window.header_title, format!("{expected} (1)"));
         }
         let custom = "[ ! ] Action Required documentation";
         app.chrome_ui.user_titles.insert(id, custom.into());
@@ -734,6 +1361,8 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    MoveTo(crate::model::ChannelId),
+    MoveToChannel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -752,8 +1381,18 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
+            PaneMenuCommand::MoveTo(channel) => {
+                return Message::MovePaneToChannel { card: id, channel };
+            }
+            PaneMenuCommand::MoveToChannel => {
+                return Message::Palette(palette_ui::Action::MovePane(id));
+            }
         })
     }
 }
@@ -848,8 +1487,71 @@ mod tab_style_tests {
     }
 }
 
+const NOTICES_CONTROL_ID: &str = "chrome.notices";
+const RETIRING_NOTICES_ID: &str = "chrome.notices.retiring";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
+
+/// Check ownership and transfer focus in one runtime operation chain. An
+/// asynchronous boolean reply would become stale if another field, dialog or
+/// popup took focus before the application handled it.
+struct RetireNoticeFocus {
+    source: widget::Id,
+    marker: widget::Id,
+    target: widget::Id,
+    retiring: bool,
+    focused: bool,
+    target_present: bool,
+}
+
+impl iced::advanced::widget::Operation for RetireNoticeFocus {
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        visit(self);
+    }
+
+    fn container(&mut self, id: Option<&widget::Id>, _: iced::Rectangle) {
+        self.retiring |= id == Some(&self.marker);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if id == Some(&self.source) {
+            self.focused |= state.is_focused();
+        }
+        self.target_present |= id == Some(&self.target);
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<()> {
+        use iced::advanced::widget::operation::{Outcome, focusable};
+        if self.retiring && self.focused && self.target_present {
+            // Iced applies chained operations synchronously, without an
+            // intervening application message that could change the owner.
+            Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+        } else {
+            Outcome::None
+        }
+    }
+}
+
+/// The deadline a notice expiry timer is armed for. As the subscription's
+/// identity, an earlier deadline replaces the timer and an unchanged one
+/// keeps it.
+#[derive(Hash)]
+struct NoticeExpiry(Instant);
+
+fn notice_expiry_stream(
+    expiry: &NoticeExpiry,
+) -> impl cosmic::iced::futures::Stream<Item = Message> + use<> {
+    let deadline = tokio::time::Instant::from_std(expiry.0);
+    cosmic::iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline).await;
+        Message::ExpireNotices
+    })
+}
 
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
@@ -1138,6 +1840,7 @@ impl Cagents {
                     .map(Path::to_path_buf),
             }
             .map_or_else(Task::none, |path| {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(path.display().to_string())
             }),
             Action::Reveal(id) => {
@@ -1222,7 +1925,7 @@ impl Cagents {
                 popup.map_or_else(Task::none, |popup| {
                     iced::widget::operation::focus(widget::Id::new(match popup {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
-                        Popup::Notices => "chrome.notices",
+                        Popup::Notices => NOTICES_CONTROL_ID,
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -1323,6 +2026,74 @@ impl Cagents {
                 .is_some_and(SaveHealthState::is_visible)
     }
 
+    /// Wakes the shell when the earliest confirmation is due to retire, and
+    /// never otherwise: with nothing waiting to retire, or the countdown
+    /// paused, there is no timer.
+    pub(super) fn notice_expiry_subscription(&self) -> Subscription<Message> {
+        self.notices
+            .next_expiry()
+            .map_or_else(Subscription::none, |deadline| {
+                Subscription::run_with(NoticeExpiry(deadline), notice_expiry_stream)
+            })
+    }
+
+    /// Confirmations count down only while someone could be reading them as
+    /// they appear: with the main window in the foreground and the notices
+    /// closed. While the notices are open nothing retires, so an entry does
+    /// not vanish from under the pointer or the keyboard; and a confirmation
+    /// raised behind another window is still there when the user returns.
+    /// Either way the countdown carries on from where it stopped.
+    pub(super) fn sync_notice_countdown(&mut self) {
+        let now = Instant::now();
+        if self.refresh_ui.focused && self.chrome_ui.popup != Some(Popup::Notices) {
+            self.notices.resume(now);
+        } else {
+            self.notices.pause(now);
+        }
+    }
+
+    /// The notices control goes with the last notice, whatever removed it:
+    /// a confirmation retiring, a dismissal, a success resolving a failure,
+    /// a pane closing. Holding the keyboard, it would take the keyboard with
+    /// it. So it stays until the widget operation conditionally hands focus
+    /// to the inspector toggle beside it. The cleanup reply never moves focus.
+    /// `before` is the control's severity before this update, if it showed.
+    ///
+    /// With the notices open, `reconcile_notice_popup` closes them and moves
+    /// focus the same way.
+    pub(super) fn retire_notice_control(
+        &mut self,
+        before: Option<NoticeSeverity>,
+    ) -> Task<Message> {
+        let Some(severity) = before else {
+            return Task::none();
+        };
+        if self.has_chrome_notices()
+            || self.chrome_ui.popup == Some(Popup::Notices)
+            || self.chrome_ui.retiring_notice_control.is_some()
+        {
+            return Task::none();
+        }
+        self.chrome_ui.retiring_notice_control = Some(severity);
+        // Collect even an empty operation outcome so an absent control still
+        // retires. Focus is settled in the widget tree, never by this reply.
+        iced::runtime::task::widget(RetireNoticeFocus {
+            source: widget::Id::new(NOTICES_CONTROL_ID),
+            marker: widget::Id::new(RETIRING_NOTICES_ID),
+            target: context_inspector_toggle_id(),
+            retiring: false,
+            focused: false,
+            target_present: false,
+        })
+        .collect()
+        .map(|_| cosmic::Action::App(Message::NoticeControlRetired))
+    }
+
+    pub(super) fn notice_control_retired(&mut self) -> Task<Message> {
+        self.chrome_ui.retiring_notice_control = None;
+        Task::none()
+    }
+
     pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
         if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
             self.chrome_ui.close();
@@ -1332,7 +2103,9 @@ impl Cagents {
         }
     }
 
-    fn notice_control(&self) -> Option<Element<'_, Message>> {
+    /// The severity the notices control shows, or `None` when there is no
+    /// control because there is nothing to show.
+    pub(super) fn notice_control_severity(&self) -> Option<NoticeSeverity> {
         if !self.has_chrome_notices() {
             return None;
         }
@@ -1351,7 +2124,13 @@ impl Cagents {
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
-        let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
+        Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
+    }
+
+    fn notice_control(&self) -> Option<Element<'_, Message>> {
+        let severity = self
+            .notice_control_severity()
+            .or(self.chrome_ui.retiring_notice_control)?;
         let control = crate::ui_controls::icon_button(
             severity.icon(),
             match severity {
@@ -1362,7 +2141,7 @@ impl Cagents {
         )
         .selected(self.chrome_ui.popup == Some(Popup::Notices))
         .on_press_maybe((!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)))
-        .id(widget::Id::new("chrome.notices"))
+        .id(widget::Id::new(NOTICES_CONTROL_ID))
         .tone(design::Tone::Themed(match severity {
             NoticeSeverity::Success => design::success_color,
             NoticeSeverity::Warning => design::warning_color,
@@ -1372,18 +2151,23 @@ impl Cagents {
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
                 for entry in self.notices.recent() {
-                    let body: Element<'_, Message> = if entry.repeats > 1 {
-                        widget::column::with_children(vec![
-                            super::notice_body(&entry.notice.message),
-                            super::notice_surface_detail(
-                                entry.notice.severity,
-                                format!("Repeated {} times", entry.repeats),
-                            ),
-                        ])
-                        .spacing(space::XS)
-                        .into()
+                    let severity = entry.notice.severity;
+                    let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    if let Some(details) = &entry.notice.details {
+                        lines.push(super::notice_surface_details(severity, details));
+                    }
+                    if entry.repeats > 1 {
+                        lines.push(super::notice_surface_detail(
+                            severity,
+                            format!("Repeated {} times", entry.repeats),
+                        ));
+                    }
+                    let body: Element<'_, Message> = if lines.len() > 1 {
+                        widget::column::with_children(lines)
+                            .spacing(space::XS)
+                            .into()
                     } else {
-                        super::notice_body(&entry.notice.message)
+                        lines.pop().expect("a notice has its message")
                     };
                     notices.push(super::notice_surface(
                         entry.notice.severity,
@@ -1459,7 +2243,22 @@ impl Cagents {
                 .into()
             });
         Some(crate::ui_controls::popover(
-            control,
+            // Keep the wrapper and button shape stable through retirement so
+            // their focus state survives. Only a still-retiring control with
+            // no newer keyboard layer advertises the handoff marker.
+            widget::container(control).id(widget::Id::new(
+                if self.chrome_ui.retiring_notice_control.is_some()
+                    && !self.has_chrome_notices()
+                    && !self.modal_is_open()
+                    && !self.palette.is_open()
+                    && self.chrome_ui.popup.is_none()
+                    && self.chrome_ui.rename.is_none()
+                {
+                    RETIRING_NOTICES_ID
+                } else {
+                    "chrome.notices.anchor"
+                },
+            )),
             content,
             widget::popover::Position::Bottom,
             Message::ChromeUi(Action::Close),
@@ -1570,17 +2369,39 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
+        let available = (self.workspace.viewport_width()
+            - self.workspace_header_width()
+            - design::PRIMARY_CONTROL_SIZE
+            - space::XXS)
+            .max(0.0);
         // Reordering uses one shared width. Derive that width from the titles
         // instead of giving every agent the same eight-character title budget.
         let desired = self
             .workspace
             .order()
             .filter_map(|id| self.card_chrome.get(&id))
-            .map(|chrome| 80.0 + chrome.title.chars().count().min(28) as f32 * 7.0)
+            .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        (available, desired)
+        let width = if self.workspace.viewport_width() > 0.0
+            && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
+        {
+            // Keep four compact tabs visible in a tiled workspace. Full names
+            // remain available in each tab's tooltip.
+            let visible = self.workspace.order().count().clamp(1, 4) as f32;
+            let fitting = (available / visible
+                - crate::tab_strip::SPACING
+                - 2.0 * crate::tab_strip::EDGE_INSET / visible)
+                .max(56.0);
+            if visible < 4.0 {
+                desired.min(fitting)
+            } else {
+                fitting.min(112.0)
+            }
+        } else {
+            desired
+        };
+        (available, width)
     }
 
     /// Scrolls the tab strip by the least amount that brings the focused tab
@@ -1859,20 +2680,41 @@ impl Cagents {
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
-        let title_control = widget::button::custom(
-            widget::row::with_children(vec![
-                self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
-                design::body(title)
+        let compact = width < design::TAB_MIN_WIDTH;
+        let suffix = (!compact)
+            .then(|| chrome.and_then(|chrome| chrome.terminal_ordinal_suffix.as_deref()))
+            .flatten();
+        let visible_title = if compact {
+            chrome
+                .and_then(|chrome| chrome.compact_title.as_deref())
+                .unwrap_or(title)
+        } else {
+            suffix
+                .and_then(|suffix| title.strip_suffix(suffix))
+                .unwrap_or(title)
+        };
+        let mut title_children = vec![
+            self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
+            design::body(visible_title)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(suffix) = suffix {
+            title_children.push(
+                design::caption(suffix.trim())
                     .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
                     .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
+            );
+        }
+        let title_control = widget::button::custom(
+            widget::row::with_children(title_children)
+                .spacing(if compact { space::XS } else { space::S })
+                .align_y(Alignment::Center)
+                .height(Length::Fill),
         )
         .id(focus_id)
         .name(chrome.map_or_else(
@@ -1900,8 +2742,25 @@ impl Cagents {
             },
             |chrome| Cow::Borrowed(chrome.tooltip.as_str()),
         );
+        let attention = self.sidebar_state.card_attention(id);
+        let tip = if attention != sidebar::AttentionSummary::default() {
+            let mut tip = format!("{tip}\n{}", attention.description());
+            if attention.unread != 0 && self.settings.notifications.message_previews {
+                if let Some(preview) = card
+                    .and_then(super::notification_ui::card_session)
+                    .and_then(|session| self.notification_ui.previews.get(&session))
+                {
+                    tip.push('\n');
+                    tip.push_str(&preview.text);
+                }
+            }
+            Cow::Owned(tip)
+        } else {
+            tip
+        };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -1932,30 +2791,8 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if self.sidebar_state.has_card_update(id) {
-            children.push(tooltip(
-                Icon::Attention
-                    .handle()
-                    .icon()
-                    .size(design::TAB_STATUS_ICON_SIZE),
-                "Needs attention",
-            ));
-        } else if let Some(activity) = self.sidebar_state.card_activity(id) {
-            match activity.state {
-                crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner(
-                        design::TAB_STATUS_ICON_SIZE as f32,
-                        design::warning_color,
-                    ),
-                    "Working",
-                )),
-                crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
-                    Icon::Warning,
-                    "Waiting for input",
-                    sidebar::BadgeTone::Warning,
-                )),
-                _ => {}
-            }
+        if let Some(indicator) = sidebar::attention_indicator(attention, false) {
+            children.push(indicator);
         }
         if focused && self.chat_switch_available(id) {
             let blocker = self.chat_switch_blocker(id);
@@ -1971,7 +2808,7 @@ impl Cagents {
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if focused || self.chrome_ui.hovered_tab == Some(id) {
+        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
             children.push(command(
                 Icon::Close,
                 {
@@ -2006,6 +2843,10 @@ impl Cagents {
             )
             .padding([0.0, space::XS])
             .height(design::PRIMARY_CONTROL_SIZE)
+            .id(chrome.map_or_else(
+                || card_control_id(id, "tab"),
+                |chrome| chrome.tab_id.clone(),
+            ))
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
                 column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
@@ -2072,6 +2913,25 @@ impl Cagents {
                     "Review file changes".into(),
                     None,
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
+                ));
+            }
+            let destinations = self.pane_move_destinations(id);
+            if !destinations.is_empty() {
+                entries.push(widget::menu::Item::Divider);
+            }
+            if destinations.len() <= 5 {
+                entries.extend(destinations.into_iter().map(|channel| {
+                    widget::menu::Item::Button(
+                        format!("Move to {}", self.pane_move_destination_label(channel)),
+                        None,
+                        PaneMenu(id, PaneMenuCommand::MoveTo(channel.id)),
+                    )
+                }));
+            } else {
+                entries.push(widget::menu::Item::Button(
+                    "Move to channel…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::MoveToChannel),
                 ));
             }
             widget::menu::items(&HashMap::new(), entries)

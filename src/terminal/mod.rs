@@ -2,6 +2,8 @@
 pub(crate) mod holder;
 mod hosted;
 pub mod ipc;
+#[cfg(feature = "host")]
+mod reactor;
 mod search;
 mod snapshot;
 pub use search::SearchMatch;
@@ -41,10 +43,14 @@ pub use types::{
 pub(crate) use widget::ReviewInputBarrier;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
+#[cfg(all(test, feature = "host"))]
+pub(crate) use worker::RenderStreamFixture;
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
 pub(crate) use worker::UpgradeSnapshot;
+#[cfg(feature = "host")]
+pub(crate) use worker::WeakTerminalHandle;
 #[cfg(all(test, feature = "host"))]
 pub(crate) use worker::flush_archived_notices;
 #[cfg(feature = "host")]

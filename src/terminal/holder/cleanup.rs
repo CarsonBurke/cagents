@@ -105,23 +105,53 @@ pub(crate) fn confirmed(
     if source.id != expected.terminal {
         return Ok(false);
     }
-    confirmed_receipt(expected, proof, Some(digest(source)?))
+    confirmed_with_role(source, expected, proof, None)
+}
+
+/// The worker retains this exact-record capability from live authenticated
+/// adoption; public source descriptors alone cannot authorize another role.
+pub(crate) fn confirmed_with_role(
+    source: &TerminalSession,
+    expected: &Record,
+    proof: &HostSessionProof,
+    role: Option<&crate::daemon::holder_registry::OriginalRole>,
+) -> Result<bool, String> {
+    if source.id != expected.terminal {
+        return Ok(false);
+    }
+    confirmed_receipt(expected, proof, Some(digest(source)?), role)
 }
 
 /// Used only when another authenticated owner (the native holder) retained this
 /// exact private Record. Public terminal IDs or launch recipes are insufficient.
 pub(crate) fn confirmed_owner(expected: &Record, proof: &HostSessionProof) -> Result<bool, String> {
-    confirmed_receipt(expected, proof, None)
+    confirmed_receipt(expected, proof, None, None)
+}
+
+/// The parent native holder authenticated this exact paired Record. Its
+/// retained role capability remains necessary even after the terminal exits.
+pub(crate) fn confirmed_owner_with_role(
+    expected: &Record,
+    proof: &HostSessionProof,
+    role: Option<&crate::daemon::holder_registry::OriginalRole>,
+) -> Result<bool, String> {
+    confirmed_receipt(expected, proof, None, role)
 }
 
 fn confirmed_receipt(
     expected: &Record,
     proof: &HostSessionProof,
     source: Option<[u8; 32]>,
+    role: Option<&crate::daemon::holder_registry::OriginalRole>,
 ) -> Result<bool, String> {
     authorize(proof)?;
     let directory = super::directory()?;
-    if super::evidence(&super::socket(&directory, expected.terminal))?.is_some() {
+    if crate::daemon::holder_registry::recovery_candidate(
+        &super::socket(&directory, expected.terminal),
+        Kind::Terminal,
+    )?
+    .is_some()
+    {
         return Ok(false);
     }
     let path = directory.join(format!(
@@ -144,7 +174,8 @@ fn confirmed_receipt(
     Ok(receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
         && receipt.record.version == 4
-        && receipt.record.application == crate::instance::APPLICATION_ID
+        && (receipt.record.application == crate::instance::APPLICATION_ID
+            || role.is_some_and(|role| role.matches(&receipt.record, proof)))
         && receipt.record.boot == proof.boot_id
         && holder_exited(&receipt.record.holder)?
         && !receipt.record.root.is_current()

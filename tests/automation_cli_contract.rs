@@ -1,5 +1,8 @@
 #![cfg(feature = "host")]
 
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -13,6 +16,7 @@ use std::{
 struct Fixture {
     root: tempfile::TempDir,
     daemon: Child,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -57,7 +61,11 @@ impl Fixture {
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         let daemon = Self::start(root.path());
-        let mut fixture = Self { root, daemon };
+        let mut fixture = Self {
+            root,
+            daemon,
+            agents: Default::default(),
+        };
         fixture.ready();
         fixture
     }
@@ -122,7 +130,9 @@ impl Fixture {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        self.agents.observe(&output);
+        output
     }
 
     fn cli(&self, arguments: &[&str]) -> Value {
@@ -344,8 +354,44 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.daemon.kill();
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+        }
+        // Fresh firings retire their execution through the scheduler. Cancel
+        // any still-active private firing only after contract assertions; the
+        // intentional stop/restart boundaries in the tests remain unchanged.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
+            }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
+            }
+        }
     }
 }
 
@@ -458,4 +504,99 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
         !fixture.output(&changed).status.success(),
         "retry identity cannot authorize another revision"
     );
+}
+
+#[test]
+fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
+    let mut fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    // This case owns lifecycle receipts, not discovery of a plain folder.
+    // Bind its project explicitly even when TMPDIR is inside another checkout.
+    let initialized = Fixture::command(fixture.root.path(), "git")
+        .args([
+            "init",
+            "--quiet",
+            "--template=",
+            "--initial-branch=lifecycle-fixture",
+        ])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    let discovered = Fixture::command(fixture.root.path(), "git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(discovered.status.success(), "{discovered:?}");
+    let discovered = String::from_utf8(discovered.stdout).unwrap();
+    assert_eq!(
+        Path::new(discovered.trim_end()).canonicalize().unwrap(),
+        project.canonicalize().unwrap(),
+        "the audit fixture must not discover an enclosing repository"
+    );
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/omp");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'unexpected provider\\n' >> \"$HOME/../unexpected-provider\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let definition = json!({
+        "name": "Lifecycle only", "prompt": "PRIVATE_LIFECYCLE_PROMPT",
+        "agent": {"provider": "Omp", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null},
+        "schedule": {"pattern": {"daily": {"hour": 3, "minute": 0}}, "timezone": "UTC"},
+        "session_mode": "fresh", "precheck": null
+    });
+    let path = fixture.root.path().join("audit-definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap().to_owned();
+    fixture.cli(&["automation", "disable", &id, "--revision", "1"]);
+    assert!(
+        !fixture
+            .output(&["automation", "disable", &id, "--revision", "1"])
+            .status
+            .success()
+    );
+    let first = fixture.cli(&["automation", "audit", &id, "--limit", "1"]);
+    assert_eq!(first["audit"]["events"][0]["cause"], "disabled");
+    assert_eq!(first["audit"]["events"][0]["actor"], "user_management");
+    assert_eq!(first["audit"]["events"][0]["revision"], 2);
+    let cursor = first["audit"]["next"].as_u64().unwrap().to_string();
+    let second = fixture.cli(&[
+        "automation",
+        "audit",
+        &id,
+        "--limit",
+        "1",
+        "--before",
+        &cursor,
+    ]);
+    assert_eq!(second["audit"]["events"][0]["cause"], "created");
+    assert!(second["audit"]["next"].is_null());
+    assert_eq!(second["audit"]["earlier_events_unavailable"], false);
+    let audit = fixture.cli(&["automation", "audit", &id]);
+    assert!(!audit.to_string().contains("PRIVATE_LIFECYCLE_PROMPT"));
+    fixture.restart();
+    assert_eq!(fixture.cli(&["automation", "audit", &id]), audit);
+    fixture.cli(&["automation", "remove", &id, "--revision", "2"]);
+    let removed = fixture.cli(&["automation", "audit", &id]);
+    assert_eq!(removed["audit"]["events"].as_array().unwrap().len(), 3);
+    assert_eq!(removed["audit"]["events"][0]["cause"], "removed");
+    assert_eq!(removed["audit"]["events"][0]["revision"], 3);
+    assert_eq!(
+        fixture.cli(&["automation", "history", &id])["history"]["firings"],
+        json!([])
+    );
+    assert!(!fixture.root.path().join("unexpected-provider").exists());
 }
