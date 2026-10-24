@@ -68,6 +68,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::DeviceOperation { .. }
         | R::Agent { .. }
         | R::Automation { .. }
+        | R::ChannelWork { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }

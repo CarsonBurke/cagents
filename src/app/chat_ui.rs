@@ -5603,7 +5603,8 @@ impl Cagents {
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
-        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
+        let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            && self.workspace_surfaces_visible();
         let mut runtime = Runtime::draft(
             target,
             session,
@@ -7769,7 +7770,8 @@ impl Cagents {
                         };
                         handle.take_observed();
                         let visible = self.workspace.visibility(target.card)
-                            == Some(VisibilityClass::Visible);
+                            == Some(VisibilityClass::Visible)
+                            && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.retarget(target);
                             runtime.connection = Connection::Live(handle);
@@ -16309,6 +16311,316 @@ mod tests {
             runtime.error.as_deref(),
             Some("The current model cannot accept images.")
         );
+    }
+
+    // Tasks are deliberately dropped: these fixtures only cross the actual
+    // app reducers and never connect to a daemon or start a provider.
+    fn open_work_over_chat(app: &mut Cagents) {
+        let channel = crate::model::ChannelId::new();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model
+            .channels
+            .push(crate::workspace_model::ModelChannel {
+                id: channel,
+                repository: FIXTURE_DIRECTORY.into(),
+                title: "Chat input fixture".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            });
+        drop(app.open_channel_work(channel));
+        assert!(app.channel_work_is_main());
+        assert!(!app.workspace_surfaces_visible());
+    }
+
+    fn return_to_chat(app: &mut Cagents) {
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(crate::channel_work_ui::Action::Close(owner)));
+        assert!(!app.channel_work_is_main());
+        assert!(app.workspace_surfaces_visible());
+    }
+
+    /// Retain a real composer callback before switching away from its pane.
+    fn queued_composer_key(
+        app: &Cagents,
+        card: CardId,
+        event: keyboard::Event,
+        renderer: &cosmic::Renderer,
+    ) -> Vec<Message> {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let viewport = iced::Rectangle::with_size(iced::Size::new(760.0, 720.0));
+        let mut element = app.chat_view(card);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                card,
+                "chat-composer",
+            )),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(event),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        messages
+    }
+
+    #[test]
+    fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
+        let renderer = crate::app::tests::headless_renderer();
+        for started in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = if started {
+                live_chat(&mut app, Some(KNOWN_THREAD))
+            } else {
+                draft_chat(&mut app)
+            };
+            write(&mut app, card, "unsent");
+            let character = || keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("x".into()),
+                modified_key: keyboard::Key::Character("x".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            };
+            let enter =
+                || permission_key(keyboard::key::Named::Enter, keyboard::Modifiers::empty());
+            let queued_edit = queued_composer_key(&app, card, character(), &renderer);
+            let queued_submit = queued_composer_key(&app, card, enter(), &renderer);
+            assert!(queued_edit.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Composer(_, action)) if action.is_edit()
+            )));
+            assert!(queued_submit.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::Submit(_, PromptMode::Send))
+            )));
+            let revision = chat_runtime(&app, card).revision;
+
+            open_work_over_chat(&mut app);
+            for message in queued_edit.into_iter().chain(queued_submit) {
+                drop(app.update(message));
+            }
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), "unsent");
+            assert_eq!(runtime.revision, revision);
+            assert!(runtime.pending.is_none() && runtime.queued.is_none());
+            assert!(!app.chat_start_pending(card));
+
+            return_to_chat(&mut app);
+            for message in queued_composer_key(&app, card, character(), &renderer) {
+                drop(app.update(message));
+            }
+            assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
+            for message in queued_composer_key(&app, card, enter(), &renderer) {
+                drop(app.update(message));
+            }
+            if started {
+                assert!(
+                    chat_runtime(&app, card).pending.is_some(),
+                    "the visible chat can send"
+                );
+            } else {
+                assert!(app.chat_start_pending(card), "the visible draft can start");
+                assert!(chat_runtime(&app, card).queued.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn main_work_keeps_accepted_paste_bookmarks_and_submission_completions_live() {
+        let _admission = attachment_draft::test_admission();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "accepted ");
+        let bookmark = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .begin_attachment_insert();
+        submit(&mut app, card);
+        assert_eq!(
+            chat_runtime(&app, card).submit_after_paste,
+            Some(PromptMode::Send)
+        );
+        assert!(chat_runtime(&app, card).pending.is_none());
+
+        open_work_over_chat(&mut app);
+        drop(app.update(Message::ChatUi(Action::PastedText(
+            target,
+            bookmark,
+            Some("paste".into()),
+        ))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachment_bookmarks.is_empty());
+        assert_eq!(runtime.submit_after_paste, None);
+        assert_eq!(runtime.composer.text(), "accepted paste");
+        assert!(
+            runtime.pending.is_some(),
+            "the previously accepted send continues"
+        );
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+
+        settle(&mut app, card, Ok(()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.pending.is_none());
+        assert_eq!(runtime.composer.text(), "");
+        assert_eq!(
+            runtime.history.last().map(String::as_str),
+            Some("accepted paste")
+        );
+        assert!(app.channel_work_is_main());
+    }
+
+    #[test]
+    fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        open_work_over_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(
+            runtime.pending.is_some(),
+            "the accepted first prompt continues"
+        );
+        // Accepted work can retain client updates while hidden. Once its
+        // original send settles, presentation must remain hidden too.
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).queued.is_none());
+        assert!(!handle.is_visible_for_test());
+
+        return_to_chat(&mut app);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        assert!(handle.is_visible_for_test());
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+    }
+
+    #[test]
+    fn a_draft_opened_by_late_recovery_stays_hidden_under_main_work() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let session = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, session, chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        open_work_over_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: no prior conversation")),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(!runtime.visible.load(Ordering::Relaxed));
+        assert!(!app.chat_start_pending(card));
+
+        return_to_chat(&mut app);
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn offscreen_late_ready_stays_hidden_when_main_work_returns_to_conversations() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        for _ in 0..5 {
+            draft_chat(&mut app);
+        }
+        // Advance ordinary frames so native scrolling observes settled pane
+        // geometry, rather than guessing a width or changing exposure flags.
+        let frame = Instant::now();
+        for step in 0..=4 {
+            drop(app.update(Message::Frame(frame + Duration::from_millis(step * 250))));
+        }
+        let width = app.workspace.viewport_width();
+        let offset = app.workspace.geometry().max_offset(width);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
+                offset,
+                width,
+                user_input: true,
+            }),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
+
+        open_work_over_chat(&mut app);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert!(app.chat_ui.attempt(card).is_none(), "Ready is consumed");
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert!(chat_runtime(&app, card).pending.is_some());
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        settle(&mut app, card, Ok(()));
+
+        return_to_chat(&mut app);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(!chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        assert!(!handle.is_visible_for_test());
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     /// A new conversation whose start, for its first message, is still in

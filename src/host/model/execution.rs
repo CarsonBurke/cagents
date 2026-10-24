@@ -2016,7 +2016,10 @@ mod tests {
                 registry
                     .db
                     .execute_batch(
-                        "DROP TABLE automation_lifecycle;
+                        "DROP TABLE channel_work_operations;
+                         DROP TABLE channel_work_entries;
+                         DROP TABLE channel_work_homes;
+                         DROP TABLE automation_lifecycle;
                          DROP TABLE native_actor_retirements;
                          DROP TABLE native_actor_ownerships;
                          DROP TABLE native_actor_cursors;
@@ -2883,7 +2886,10 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_lifecycle;
+                "DROP TABLE channel_work_operations;
+                 DROP TABLE channel_work_entries;
+                 DROP TABLE channel_work_homes;
+                 DROP TABLE automation_lifecycle;
                  DROP INDEX agents_by_name; PRAGMA user_version=9;",
             )
             .unwrap();
