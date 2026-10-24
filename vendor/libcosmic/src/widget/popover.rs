@@ -653,6 +653,39 @@ where
             shell.capture_event();
             return;
         }
+        #[cfg(feature = "a11y")]
+        if matches!(event, Event::A11y(..))
+            && self
+                .accessibility
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.foreground.get().is_some())
+        {
+            // Group forwards the SAME Shell to every sibling, while COSMIC
+            // buttons refuse events already captured by a preceding modal.
+            // Eligible overlays must match their own actual native target
+            // before merging capture into that shared Shell. Overlays below
+            // the modal boundary returned above without updating content.
+            let mut messages = Vec::new();
+            let mut local = Shell::new(&mut messages);
+            self.content.as_widget_mut().update(
+                self.tree,
+                event,
+                layout,
+                cursor_position,
+                renderer,
+                clipboard,
+                &mut local,
+                &layout.bounds(),
+            );
+            if self.modal {
+                local.capture_event();
+            }
+            // Preserve messages, layout/widget invalidation, redraw, IME and
+            // event capture; never expose an unknown target to the base.
+            shell.merge(local, |message| message);
+            return;
+        }
         if self.modal
             && matches!(event, Event::Mouse(_) | Event::Touch(_))
             && !cursor_position.is_over(layout.bounds())

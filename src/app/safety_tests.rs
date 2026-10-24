@@ -334,10 +334,42 @@ fn popover_accessibility_uses_actual_translated_layout_and_current_modal_tree() 
 
     // Rebuild and resize twice; each new frame must replace the old geometry,
     // then ordinary overlay layout must make the same current control visible.
-    for (resized, expected) in [
-        (bounds, (380.0, 360.0, 500.0, 400.0)),
+    for (resized, expected_native) in [
+        // Point placement flips an overflowing context menu UP by its own
+        // height before clamping. It does not always hug the bottom edge.
+        (bounds, (380.0, 330.0, 500.0, 370.0)),
         (Size::new(420.0, 320.0), (300.0, 280.0, 420.0, 320.0)),
     ] {
+        // Obtain the native drawing/event layout independently of AX export
+        // and of the UserInterface/cache under test. Exact equality below
+        // checks AX against the actual owning overlay, not guessed offsets.
+        let native_bounds = {
+            let mut reference = element(true, true, Point::new(450.0, 350.0), &base_id, &popup_id);
+            let mut reference_tree = iced::advanced::widget::Tree::new(reference.as_widget());
+            let base_layout = reference.as_widget_mut().layout(
+                &mut reference_tree,
+                &renderer,
+                &iced::advanced::layout::Limits::new(Size::ZERO, resized),
+            );
+            let mut overlay = reference
+                .as_widget_mut()
+                .overlay(
+                    &mut reference_tree,
+                    iced::advanced::Layout::new(&base_layout),
+                    &renderer,
+                    &iced::Rectangle::with_size(resized),
+                    iced::Vector::ZERO,
+                )
+                .expect("the actual widget owns a popup overlay");
+            let node = overlay.as_overlay_mut().layout(&renderer, resized);
+            let rect = iced::advanced::Layout::new(&node).bounds();
+            assert_eq!(
+                (rect.x, rect.y, rect.x + rect.width, rect.y + rect.height),
+                expected_native,
+                "native Point placement retains its context-menu flip semantics"
+            );
+            rect
+        };
         let mut ui = UserInterface::build(
             element(true, true, Point::new(450.0, 350.0), &base_id, &popup_id),
             resized,
@@ -361,7 +393,15 @@ fn popover_accessibility_uses_actual_translated_layout_and_current_modal_tree() 
             "ordinary rediff must preserve native identity"
         );
         let rect = current.node().bounds().unwrap();
-        assert_eq!((rect.x0, rect.y0, rect.x1, rect.y1), expected);
+        assert_eq!(
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+            (
+                f64::from(native_bounds.x),
+                f64::from(native_bounds.y),
+                f64::from(native_bounds.x + native_bounds.width),
+                f64::from(native_bounds.y + native_bounds.height),
+            )
+        );
         assert!(!tree.contains(base.id()));
         let (_, statuses) = ui.update(
             &[popover_click(&base)],
@@ -679,6 +719,22 @@ fn nested_modal_popover_accessibility_owns_foreground_and_rejects_ancestor_actio
     let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
     let modal_c = popover_button(&tree, "Foreground C");
     let above_d = popover_button(&tree, "Peer foreground D");
+    ui.draw(
+        &mut renderer,
+        &cosmic::theme::active(),
+        &iced::advanced::renderer::Style::default(),
+        mouse::Cursor::Unavailable,
+    );
+    ui.update(
+        &[],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let after_layout = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    assert_eq!(popover_button(&after_layout, "Foreground C"), modal_c);
+    assert_eq!(popover_button(&after_layout, "Peer foreground D"), above_d);
     assert!(!tree.contains(a.id()));
     assert!(!tree.contains(b.id()));
     ui.update(
@@ -755,6 +811,55 @@ fn nested_modal_popover_accessibility_owns_foreground_and_rejects_ancestor_actio
         &mut messages,
     );
     assert_eq!(messages, vec![expected]);
+
+    // Rediff/layout/export withdraw the removed higher popup's IDs. Its old
+    // action and a wholly unknown native target must remain blocked, while
+    // the current modal control still dispatches exactly once.
+    cache = ui.into_cache();
+    messages.clear();
+    let mut ui = UserInterface::build(
+        element(true, true, 10, Point::ORIGIN, &ids, None),
+        bounds,
+        cache,
+        &mut renderer,
+    );
+    ui.update(
+        &[],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    assert!(!tree.contains(d.id()));
+    let current = popover_button(&tree, "Foreground C");
+    let unknown = iced_accessibility::accesskit::NodeId(u64::MAX - 1);
+    let unknown_click = iced::Event::A11y(
+        widget::Id::from(unknown.0),
+        iced_accessibility::accesskit::ActionRequest {
+            action: iced_accessibility::accesskit::Action::Click,
+            target_tree: iced_accessibility::accesskit::TreeId::ROOT,
+            target_node: unknown,
+            data: None,
+        },
+    );
+    let (_, statuses) = ui.update(
+        &[popover_click(&d), unknown_click],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(statuses, vec![iced::event::Status::Captured; 2]);
+    assert!(messages.is_empty());
+    ui.update(
+        &[popover_click(&current)],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert_eq!(messages, vec![10]);
 }
 
 fn live_app() -> (Cagents, CardId, TerminalId, HostSessionProof) {
