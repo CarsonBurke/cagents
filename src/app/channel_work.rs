@@ -237,6 +237,9 @@ impl Cagents {
             Message::ChatUi(action) if !action.allowed_while_modal() => {
                 return Some(Task::none());
             }
+            Message::WorkUi(action) if !action.background() => {
+                return Some(Task::none());
+            }
             Message::RunCommand(command) => {
                 return Some(
                     self.channel_work_global_command(*command)
@@ -1427,6 +1430,326 @@ mod tests {
             .chain(nodes.children())
             .filter_map(|node| node.node().label().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn main_work_rejects_queued_workboard_query_but_newer_watch_and_visible_input_survive() {
+        use crate::work_ui::{Action as BoardAction, Watch};
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = visible_workboard_fixture();
+        let queued = workboard_query_callback(&app, &mut renderer);
+        drop(app.open_channel_work(home.channel));
+        assert!(app.channel_work_is_main());
+        let ui = native(&app, Cache::new(), &mut renderer, 1_400.0);
+        assert!(
+            !native_labels(&ui)
+                .iter()
+                .any(|label| label == "Filter cards")
+        );
+        let _ = ui.into_cache();
+        drop(app.update(queued));
+        let ui = workboard_native(&app, &mut renderer);
+        assert_eq!(workboard_query_value(&ui), "");
+        assert!(
+            native_labels(&ui)
+                .iter()
+                .any(|label| label == "Open branch")
+        );
+        let _ = ui.into_cache();
+
+        drop(
+            app.update(Message::WorkUi(BoardAction::Watched(Watch::Board {
+                revision: 2,
+                board: workboard_snapshot("updated-branch"),
+                first: false,
+            }))),
+        );
+        drop(app.update(Message::WorkUi(BoardAction::Tick)));
+        let ui = workboard_native(&app, &mut renderer);
+        assert_eq!(workboard_query_value(&ui), "");
+        let labels = native_labels(&ui);
+        assert!(labels.iter().any(|label| label == "Open updated-branch"));
+        assert!(!labels.iter().any(|label| label == "Open branch"));
+        let _ = ui.into_cache();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        assert!(!app.channel_work_is_main());
+        let fresh = workboard_query_callback(&app, &mut renderer);
+        drop(app.update(fresh));
+        let ui = workboard_native(&app, &mut renderer);
+        assert_eq!(workboard_query_value(&ui), "z");
+        assert!(
+            native_labels(&ui)
+                .iter()
+                .any(|label| label == "No cards match")
+        );
+        assert!(
+            !native_labels(&ui)
+                .iter()
+                .any(|label| label == "Open updated-branch")
+        );
+    }
+
+    #[test]
+    fn main_work_rejects_queued_workboard_pin_but_refresh_completion_and_visible_pin_survive() {
+        use crate::work_ui::Action as BoardAction;
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = visible_workboard_fixture();
+        let mut ui = workboard_native(&app, &mut renderer);
+        let point = bounds(&ui, "Rescan projects and poll GitHub").center();
+        let mut refresh = click(&mut ui, &mut renderer, point);
+        assert!(matches!(
+            refresh.as_slice(),
+            [Message::WorkUi(BoardAction::Refresh)]
+        ));
+        let _ = ui.into_cache();
+        // These tasks carry the real control requests but are never polled.
+        drop(app.update(refresh.remove(0)));
+        let ui = workboard_native(&app, &mut renderer);
+        assert!(
+            !native_labels(&ui)
+                .iter()
+                .any(|label| label == "Rescan projects and poll GitHub")
+        );
+        let before = bounds(&ui, "Open branch");
+        let _ = ui.into_cache();
+        let pin = workboard_pin_callback(&mut app, &mut renderer);
+        drop(app.open_channel_work(home.channel));
+        assert!(app.channel_work_is_main());
+        drop(app.update(pin));
+        let ui = workboard_native(&app, &mut renderer);
+        assert_eq!(
+            bounds(&ui, "Open branch"),
+            before,
+            "hidden Pin cannot optimistically move its card"
+        );
+        let _ = ui.into_cache();
+        drop(app.update(Message::WorkUi(BoardAction::Refreshed(Err(
+            "fixture refresh completed".into(),
+        )))));
+        let ui = workboard_native(&app, &mut renderer);
+        let labels = native_labels(&ui);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "fixture refresh completed")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Rescan projects and poll GitHub")
+        );
+        assert_eq!(bounds(&ui, "Open branch").x, before.x);
+        let _ = ui.into_cache();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        assert!(!app.channel_work_is_main());
+        let fresh = workboard_pin_callback(&mut app, &mut renderer);
+        drop(app.update(fresh));
+        let ui = workboard_native(&app, &mut renderer);
+        assert!(
+            bounds(&ui, "Open branch").x > before.x,
+            "the same visible native Pin still moves the card to Stale"
+        );
+    }
+
+    fn workboard_snapshot(branch: &str) -> Arc<crate::work::Board> {
+        use crate::work::{Board, Column, Comparison, Dirty, Forge, Item, ItemKey, Project};
+        let project = PathBuf::from("/fixture/project/.git");
+        Arc::new(Board {
+            generated_at_unix_ms: 1_000,
+            stale_after_days: 7,
+            projects: vec![Project {
+                repository: project.clone(),
+                name: "Fixture".into(),
+                root: None,
+                base: None,
+                scanned_at_unix_ms: None,
+                scan_error: None,
+                forge: Forge::NotGitHub,
+            }],
+            items: vec![Item {
+                project,
+                project_name: "Fixture".into(),
+                key: ItemKey::Branch(branch.into()),
+                branch: Some(branch.into()),
+                worktree: None,
+                head: None,
+                comparison: Some(Comparison {
+                    base: "main".into(),
+                    ahead: 1,
+                    behind: 0,
+                }),
+                dirty: Some(Dirty::default()),
+                pull_request: None,
+                linear: None,
+                sessions: Vec::new(),
+                last_activity: None,
+                error: None,
+                column: Column::InProgress,
+                derived: Column::InProgress,
+                pinned: false,
+            }],
+            linear_unavailable: None,
+        })
+    }
+
+    fn visible_workboard_fixture() -> (Cagents, Home) {
+        let (mut app, home) = main_fixture();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenWork)));
+        assert!(!app.channel_work_is_main());
+        assert!(
+            app.cards
+                .values()
+                .any(|card| matches!(card, CardRuntime::Work))
+        );
+        drop(app.update(Message::WorkUi(crate::work_ui::Action::Watched(
+            crate::work_ui::Watch::Board {
+                revision: 1,
+                board: workboard_snapshot("branch"),
+                first: true,
+            },
+        ))));
+        (app, home)
+    }
+
+    fn workboard_native<'a>(app: &'a Cagents, renderer: &mut cosmic::Renderer) -> Native<'a> {
+        let mut ui = iced::runtime::UserInterface::build(
+            app.work_ui.view().map(Message::WorkUi),
+            iced::Size::new(1_800.0, 900.0),
+            Cache::new(),
+            renderer,
+        );
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+
+    fn native_labels(ui: &Native<'_>) -> Vec<String> {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
+    fn workboard_query_value(ui: &Native<'_>) -> String {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Filter cards"))
+            .expect("mounted Workboard search")
+            .node()
+            .value()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn workboard_query_callback(app: &Cagents, renderer: &mut cosmic::Renderer) -> Message {
+        let mut ui = workboard_native(app, renderer);
+        let point = bounds(&ui, "Filter cards").center();
+        assert!(click(&mut ui, renderer, point).is_empty());
+        let mut messages = events(
+            &mut ui,
+            renderer,
+            &[key(
+                keyboard::Key::Character("z".into()),
+                keyboard::key::Code::KeyZ,
+                Some("z"),
+            )],
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::WorkUi(crate::work_ui::Action::Query(value))] if value == "z")
+        );
+        messages.remove(0)
+    }
+
+    fn workboard_pin_callback(app: &mut Cagents, renderer: &mut cosmic::Renderer) -> Message {
+        use crate::work_ui::Action as BoardAction;
+        // An earlier refused hidden Pin leaves its menu open. Toggle only by
+        // the actual anchor until a fresh popup is open; never inject Menu.
+        let mut opened = false;
+        for _ in 0..2 {
+            let mut ui = workboard_native(app, renderer);
+            let point = bounds(&ui, "Card actions").center();
+            let mut messages = click(&mut ui, renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::WorkUi(BoardAction::Menu(_))]
+            ));
+            opened = matches!(
+                messages.as_slice(),
+                [Message::WorkUi(BoardAction::Menu(Some(_)))]
+            );
+            let _ = ui.into_cache();
+            drop(app.update(messages.remove(0)));
+            if opened {
+                break;
+            }
+        }
+        assert!(opened);
+        let mut ui = workboard_native(app, renderer);
+        let point = workboard_popup_button(&mut ui, renderer, "Stale").center();
+        let mut messages = click(&mut ui, renderer, point);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::WorkUi(BoardAction::Pin(
+                _,
+                Some(crate::work::Column::Stale)
+            ))]
+        ));
+        messages.remove(0)
+    }
+
+    fn workboard_popup_button(
+        ui: &mut Native<'_>,
+        renderer: &cosmic::Renderer,
+        label: &str,
+    ) -> iced::Rectangle {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct Outline {
+            text: Vec<(String, iced::Rectangle)>,
+            buttons: Vec<iced::Rectangle>,
+        }
+        impl Operation for Outline {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.text.push((text.into(), bounds));
+            }
+            fn focusable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                self.buttons.push(bounds);
+            }
+        }
+        let mut outline = Outline::default();
+        ui.operate(renderer, &mut outline);
+        outline
+            .buttons
+            .into_iter()
+            .filter(|button| {
+                outline
+                    .text
+                    .iter()
+                    .any(|(text, bounds)| text == label && button.contains(bounds.center()))
+            })
+            .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+            .unwrap_or_else(|| panic!("missing actual popup button {label}"))
     }
 
     fn discard_native(app: &mut Cagents, renderer: &mut cosmic::Renderer) {
