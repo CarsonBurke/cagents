@@ -27,9 +27,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 use cosmic::iced::widget::{span, text};
 use cosmic::iced::{Font, font};
 pub use cosmic::widget::markdown::{HeadingLevel, Settings, Style};
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     borrow::BorrowMut,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, HashSet},
     mem,
     ops::Range,
@@ -628,10 +630,17 @@ pub struct Text {
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
     plain_source: std::cell::OnceCell<super::reader_source::Source>,
-    last_style: Cell<Option<Style>>,
-    last_styled_spans: RefCell<Arc<[text::Span<'static, Uri>]>>,
+    // Most parsed nodes are never styled. Keep the large Style and empty
+    // Arc allocation out of every cold Text (and therefore every Item).
+    styled_cache: RefCell<Option<Box<StyledCache>>>,
     lineage: Arc<std::sync::Mutex<StyledLineage>>,
 }
+#[derive(Debug, Clone)]
+struct StyledCache {
+    style: Style,
+    spans: Arc<[text::Span<'static, Uri>]>,
+}
+
 #[derive(Debug, Default)]
 struct StyledLineage {
     edges: std::collections::VecDeque<(std::sync::Weak<Spans>, std::sync::Weak<Spans>)>,
@@ -788,8 +797,7 @@ impl Text {
             starts: starts.into(),
             plain: std::cell::OnceCell::new(),
             plain_source: std::cell::OnceCell::new(),
-            last_style: Cell::default(),
-            last_styled_spans: RefCell::default(),
+            styled_cache: RefCell::default(),
             lineage: Default::default(),
         }
     }
@@ -815,8 +823,7 @@ impl Text {
         let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
         self.starts = Arc::from([0, length]);
         self.plain.take();
-        self.last_style.set(None);
-        *self.last_styled_spans.get_mut() = Arc::from([]);
+        *self.styled_cache.get_mut() = None;
         self.record_edge(previous);
     }
 
@@ -866,13 +873,17 @@ impl Text {
         if let Some(ready) = self.plain.get() {
             let _ = plain.set(ready.clone());
         }
+        let (style, styled) = match self.styled_cache.borrow().as_ref() {
+            Some(cached) => (Some(cached.style), cached.spans.clone()),
+            None => (None, Arc::from([])),
+        };
         FlowText {
             spans: self.spans.clone(),
             starts: self.starts.clone(),
             plain,
             _plain_source: self.plain_source.get().cloned(),
-            style: self.last_style.get(),
-            styled: self.last_styled_spans.borrow().clone(),
+            style,
+            styled,
             lineage: self.lineage.clone(),
         }
     }
@@ -941,16 +952,21 @@ impl Text {
     /// This method performs caching for you. It will only reallocate if the [`Style`]
     /// provided changes.
     pub fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
-        if Some(style) != self.last_style.get() {
+        let mut cached = self.styled_cache.borrow_mut();
+        if cached.as_ref().is_none_or(|cached| cached.style != style) {
             #[cfg(test)]
             MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
-            *self.last_styled_spans.borrow_mut() =
-                self.spans.iter().map(|span| span.view(&style)).collect();
-
-            self.last_style.set(Some(style));
+            *cached = Some(Box::new(StyledCache {
+                style,
+                spans: self.spans.iter().map(|span| span.view(&style)).collect(),
+            }));
         }
 
-        self.last_styled_spans.borrow().clone()
+        cached
+            .as_ref()
+            .expect("styled spans installed")
+            .spans
+            .clone()
     }
 }
 
@@ -1759,6 +1775,128 @@ mod tests {
     }
 
     #[test]
+    fn cold_parsed_graph_and_document_clone_keep_compact_unstyled_text() {
+        let source = "paragraph **λ linked [text](https://example.test)**\n\n![alt](image.png \"title\")\n\n".repeat(1024);
+        let content = Content::parse(&source);
+        assert!(content.items().len() >= 2048);
+        let Item::Paragraph(first) = &content.items()[0] else {
+            panic!("real parsed paragraph")
+        };
+        let materialized = materialized_bytes();
+        let cloned = content.clone();
+        let document = super::super::prose_document::Document::snapshot(&content);
+        assert_eq!(
+            materialized_bytes(),
+            materialized,
+            "cloning cold publications must not style text"
+        );
+        assert_eq!(
+            native_outline(content.items()),
+            native_outline(cloned.items())
+        );
+        assert_eq!(
+            native_outline(content.items()),
+            native_outline(document.items())
+        );
+        for items in [content.items(), cloned.items(), document.items()] {
+            let Item::Paragraph(copy) = &items[0] else {
+                panic!("same parsed shape")
+            };
+            assert!(
+                Arc::ptr_eq(&first.spans, &copy.spans),
+                "actual raw span ownership stays shared"
+            );
+            assert!(
+                copy.styled_cache.borrow().is_none(),
+                "cold clone has no styled allocation"
+            );
+        }
+        // Item's largest variant embeds two Text nodes. Bound the cold graph
+        // representation independently of whether a particular theme is used.
+        assert!(
+            std::mem::size_of::<Text>() <= 192,
+            "cold Text bytes: {}",
+            std::mem::size_of::<Text>()
+        );
+        assert!(
+            std::mem::size_of::<Item>() <= 448,
+            "cold Item bytes: {}",
+            std::mem::size_of::<Item>()
+        );
+    }
+
+    #[test]
+    fn parsed_style_cache_clone_flow_append_and_restyle_keep_exact_spans() {
+        let mut content = Content::parse("hello α");
+        let style = crate::design::markdown_settings(&cosmic::Theme::dark(), 14.0).style;
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("paragraph")
+        };
+        let original = text.spans(style);
+        assert!(Arc::ptr_eq(&original, &text.spans(style)));
+        let cloned = text.clone();
+        let flow = cloned.flow_source();
+        assert!(Arc::ptr_eq(&original, &cloned.spans(style)));
+        assert!(Arc::ptr_eq(&original, &flow.spans(style)));
+
+        content.push_str(" β");
+        let Item::Paragraph(text) = &content.items()[0] else {
+            panic!("appended paragraph")
+        };
+        assert!(
+            text.styled_cache.borrow().is_none(),
+            "append invalidates old presentation"
+        );
+        let appended = text.spans(style);
+        assert!(!Arc::ptr_eq(&original, &appended));
+        assert_eq!(
+            appended
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α β"
+        );
+        assert_eq!(
+            flow.spans(style)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α"
+        );
+
+        let mut changed = style;
+        changed.link_color = cosmic::iced::Color::from_rgb(0.8, 0.2, 0.1);
+        let restyled = text.spans(changed);
+        assert!(!Arc::ptr_eq(&appended, &restyled));
+        assert_eq!(
+            restyled
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello α β"
+        );
+        assert!(Arc::ptr_eq(&restyled, &text.spans(changed)));
+        assert_eq!(
+            text.spans_range(changed, 0..5)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>(),
+            "hello"
+        );
+        assert!(
+            Arc::ptr_eq(&restyled, &text.spans(changed)),
+            "range extraction preserves the full style cache"
+        );
+
+        let linked = Content::parse("[link](https://example.test)");
+        let Item::Paragraph(link) = &linked.items()[0] else {
+            panic!("parsed link")
+        };
+        assert_eq!(link.spans(style)[0].color, Some(style.link_color));
+        assert_eq!(link.spans(changed)[0].color, Some(changed.link_color));
+    }
+
+    #[test]
     fn cloned_code_descriptors_share_the_entire_body_and_release_it_together() {
         let content = Content::parse(&format!("```text\n{}\n```", "x".repeat(1024 * 1024)));
         let Item::CodeBlock { code, .. } = &content.items()[0] else {
@@ -2140,10 +2278,19 @@ mod tests {
                 .any(|span| span.link.as_deref() == Some("https://example.com"))
         );
         assert!(
-            text.last_style.get().is_none(),
+            text.styled_cache
+                .borrow()
+                .as_ref()
+                .map(|cache| cache.style)
+                .is_none(),
             "hidden text has no styled-span cache"
         );
-        assert!(text.last_styled_spans.borrow().is_empty());
+        assert!(
+            text.styled_cache
+                .borrow()
+                .as_ref()
+                .is_none_or(|cache| cache.spans.is_empty())
+        );
     }
 }
 
