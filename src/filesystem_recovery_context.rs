@@ -175,6 +175,56 @@ impl std::fmt::Debug for FilesystemRecoveryContext {
     }
 }
 impl FilesystemRecoveryContext {
+    /// General discard recovery retains its original strict, pre-effect
+    /// acquisition policy. Save's effectful sibling bootstrap has separate
+    /// cleanup authority and must not be entered by this receipt caller.
+    pub(crate) fn acquire(source: &Root, known: &[PathBuf]) -> io::Result<Self> {
+        Self::acquire_with_owner(source, known, (), 0)
+    }
+
+    pub(crate) fn acquire_with_owner(
+        source: &Root,
+        known: &[PathBuf],
+        owner: impl Send + Sync + 'static,
+        owner_descriptors: usize,
+    ) -> io::Result<Self> {
+        if known.len() > 256 {
+            return Err(io::Error::other(
+                "The known checkout census exceeds the bounded recovery inspection; no file was changed",
+            ));
+        }
+        let protection = crate::worktree_cleanup::protect_root_operation(source)?;
+        let source = Arc::new(source.try_clone()?);
+        let mut excluded = Vec::with_capacity(known.len());
+        for path in known {
+            match Root::open(path) {
+                Ok(root) => excluded.push(Arc::new(root)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let excluded: Arc<[Arc<Root>]> = excluded.into();
+        let mut last_error = None;
+        for parent in RecoveryParentCandidates::new(source.clone())? {
+            match RecoveryPlacement::acquire(parent?, source.clone(), excluded.clone()) {
+                Ok(placement) => {
+                    return Self::from_placement_counted(
+                        &source,
+                        protection,
+                        placement,
+                        owner,
+                        None,
+                        owner_descriptors,
+                    );
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other(
+            "No protected recovery parent outside the captured checkout roots exists on the source filesystem; no file was changed",
+        )))
+    }
+
     /// No recovery directory is created until a protected, same-filesystem
     /// parent outside the source and captured known checkout roots is held.
     fn acquire_outside(
@@ -502,6 +552,17 @@ impl FilesystemRecoveryContext {
         owner: impl Send + Sync + 'static,
         target: Option<Arc<SaveTargetAuthority>>,
     ) -> io::Result<Self> {
+        Self::from_placement_counted(source, protection, placement, owner, target, 0)
+    }
+
+    fn from_placement_counted(
+        source: &Root,
+        protection: Protection,
+        placement: Arc<RecoveryPlacement>,
+        owner: impl Send + Sync + 'static,
+        target: Option<Arc<SaveTargetAuthority>>,
+        owner_descriptors: usize,
+    ) -> io::Result<Self> {
         placement.validate_for_source(source)?;
         if !protection.protects_root(source)? {
             return Err(io::Error::other(
@@ -511,6 +572,7 @@ impl FilesystemRecoveryContext {
         let descriptors = placement
             .retained_descriptor_count()
             .checked_add(protection.retained_descriptor_count())
+            .and_then(|count| count.checked_add(owner_descriptors))
             .and_then(|count| {
                 count.checked_add(target.as_ref().map_or(0, |target| {
                     target.retained_descriptor_count().saturating_sub(1)
@@ -568,6 +630,20 @@ impl FilesystemRecoveryContext {
             slot,
         })
     }
+    /// Reuse a completed transaction's original charge only after its holding
+    /// has been removed and synced. A foreign context cannot donate capacity.
+    pub(crate) fn recycle_directory_slot(
+        &self,
+        slot: RecoverySlot,
+    ) -> Result<FilesystemRecoveryReservation, RecoverySlot> {
+        if !slot.belongs_to(&self.context) {
+            return Err(slot);
+        }
+        Ok(FilesystemRecoveryReservation {
+            context: self.clone(),
+            slot,
+        })
+    }
     pub(crate) fn reserve(&self) -> Result<RecoverySlot, String> {
         self.placement
             .validate()
@@ -580,6 +656,24 @@ impl FilesystemRecoveryContext {
 pub(crate) mod fixtures {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    pub(crate) fn fixture_context_at_runtime(
+        source: &Root,
+        runtime: &std::path::Path,
+    ) -> io::Result<FilesystemRecoveryContext> {
+        let outside = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let protection =
+            crate::worktree_cleanup::fixture_protection(runtime, source.path(), false)?;
+        let source = Arc::new(source.try_clone()?);
+        let placement = RecoveryPlacement::acquire(
+            Arc::new(Root::open(outside.path())?),
+            source.clone(),
+            Arc::from([source.clone()]),
+        )?;
+        FilesystemRecoveryContext::from_placement(&source, protection, placement, outside, None)
+    }
 
     pub(crate) fn fixture_context(source: &Root) -> io::Result<FilesystemRecoveryContext> {
         fixture_context_with_guard(source, ())
@@ -632,6 +726,63 @@ mod tests {
         let directory = tempfile::tempdir_in(parent.path()).unwrap();
         let sticky = StickyParent::acquire(Arc::new(Root::open(parent.path()).unwrap())).unwrap();
         (parent, directory, sticky)
+    }
+
+    #[test]
+    fn discard_batch_recycling_refuses_a_foreign_context_without_spending_its_slot() {
+        let source = tempfile::tempdir().unwrap();
+        let root = Root::open(source.path()).unwrap();
+        let original = fixtures::fixture_context(&root).unwrap();
+        let foreign = fixtures::fixture_context(&root).unwrap();
+        let (_, slot) = original.reserve_directory().unwrap().into_parts();
+        let refused = match foreign.recycle_directory_slot(slot) {
+            Err(slot) => slot,
+            Ok(_) => panic!("foreign context accepted original batch capacity"),
+        };
+        let reused = original
+            .recycle_directory_slot(refused)
+            .unwrap_or_else(|_| panic!("original context lost its reserved capacity"));
+        let (_, slot) = reused.into_parts();
+        assert!(slot.belongs_to(&original.context));
+        assert!(!slot.belongs_to(&foreign.context));
+    }
+
+    #[test]
+    fn discard_original_owner_descriptor_overflow_refuses_before_payload_creation() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let root = Arc::new(Root::open(source.path()).unwrap());
+        let placement = RecoveryPlacement::acquire(
+            Arc::new(Root::open(outside.path()).unwrap()),
+            root.clone(),
+            Arc::from([root.clone()]),
+        )
+        .unwrap();
+        let protection =
+            crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)
+                .unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let error = FilesystemRecoveryContext::from_placement_counted(
+            &root,
+            protection,
+            placement,
+            Charge(released.clone()),
+            None,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("descriptor accounting overflowed")
+        );
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), true)
+                .is_ok()
+        );
     }
 
     #[test]

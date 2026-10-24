@@ -9291,6 +9291,7 @@ mod tests {
         use cagents::repository::{RepositorySnapshot, StatusSnapshot, WorkingFiles};
         RepositorySnapshot {
             status: StatusSnapshot {
+                listing_truncated: false,
                 entries,
                 ..StatusSnapshot::default()
             },

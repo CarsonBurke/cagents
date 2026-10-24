@@ -100,6 +100,39 @@ fn whole_application_popover_exports_current_discard_controls_and_cancel_reduces
         (ui.into_cache(), tree, messages)
     }
 
+    fn git(root: &std::path::Path, arguments: &[&str]) {
+        use crate::process::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+        let mut command = CommandSpec::new("git")
+            .cwd(root)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(arguments.iter().copied())
+            .timeout(std::time::Duration::from_secs(10));
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command = command.env_remove(name);
+            }
+        }
+        command = command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap()
+            .require_success(&command.program)
+            .unwrap();
+    }
+
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let mut previous_source = None;
     let mut app = tests::context_inspector_test_app(false);
     let (mut cache, base, messages) = frame(&app, Cache::default(), None);
     assert!(messages.is_empty());
@@ -126,17 +159,61 @@ fn whole_application_popover_exports_current_discard_controls_and_cancel_reduces
             assert_eq!(messages.len(), 1);
             let cancel = messages.pop().unwrap();
             assert!(matches!(
-                cancel,
-                Message::Sidebar(SidebarAction::CancelDiscard)
+                &cancel,
+                Message::SidebarSnapshot { source, action }
+                    if Some(*source) == app.discard_ui.intent_id()
+                        && matches!(&**action, SidebarAction::CancelDiscard)
             ));
             drop(app.update(cancel));
             assert!(!app.modal_is_open());
         }
+        let root = roots[round].path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        let modified = root.join(format!("modified-{round}"));
+        let deleted = root.join(format!("deleted-{round}"));
+        std::fs::write(&modified, b"indexed modified\n").unwrap();
+        std::fs::write(&deleted, b"indexed deleted\n").unwrap();
+        git(&root, &["add", "--all"]);
+        git(&root, &["commit", "-qm", "base"]);
+        std::fs::write(&modified, b"precious modified\n").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        let index = std::fs::read(root.join(".git/index")).unwrap();
         let key = ActiveWorktreeKey {
-            project_id: ProjectId::default(),
+            project_id: ProjectId::new(),
             worktree_id: crate::model::WorktreeId::new(),
-            canonical_path: PathBuf::from(format!("/fixture-owner-{round}")),
+            canonical_path: root.clone(),
         };
+        app.active_workspace = Some(root.clone());
+        app.sidebar_model = sidebar::SidebarModel::ready(
+            sidebar::SidebarMode::Expanded,
+            vec![sidebar::SidebarProject::new(
+                key.project_id,
+                crate::repository::RepositoryId::new(),
+                "Popover discard fixture".into(),
+                root.clone(),
+                vec![sidebar::SidebarWorktree::from_durable(
+                    key.worktree_id,
+                    root.clone(),
+                    None,
+                )],
+                Vec::new(),
+            )],
+        )
+        .with_source_control(Some(SourceControlModel::loading(key.clone())));
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: root.clone()
+            },
+        ));
+        // The real read captures the original root before any discard event.
+        let loaded = tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        assert!(matches!(
+            &loaded,
+            Message::SourceControlLoaded { result: Ok(_), .. }
+        ));
+        drop(app.update(loaded));
+        let source = app.discard_ui.source().unwrap().id;
         let request = crate::repository::DiscardRequest {
             worktree: key.canonical_path.clone(),
             tracked: [format!("modified-{round}"), format!("deleted-{round}")]
@@ -146,10 +223,30 @@ fn whole_application_popover_exports_current_discard_controls_and_cancel_reduces
             untracked: Vec::new(),
             confirmed: false,
         };
+        // A bare message and a previous view's source remain unauthorized.
         drop(app.update(Message::Sidebar(SidebarAction::RequestDiscard {
             key: key.clone(),
             request: request.clone(),
         })));
+        assert!(!app.modal_is_open());
+        if let Some(old_source) = previous_source {
+            assert_ne!(source, old_source);
+            drop(app.update(Message::SidebarSnapshot {
+                source: old_source,
+                action: Box::new(SidebarAction::RequestDiscard {
+                    key: key.clone(),
+                    request: request.clone(),
+                }),
+            }));
+            assert!(!app.modal_is_open());
+        }
+        drop(app.update(Message::SidebarSnapshot {
+            source,
+            action: Box::new(SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: request.clone(),
+            }),
+        }));
         assert!(app.modal_is_open());
         let (next, modal, mut messages) = frame(&app, cache, Some("Discard"));
         cache = next;
@@ -174,10 +271,18 @@ fn whole_application_popover_exports_current_discard_controls_and_cancel_reduces
                     == Some("2 tracked paths will be restored from the index"))
         );
         assert_eq!(messages.len(), 1);
-        let Message::Sidebar(SidebarAction::ConfirmDiscard {
+        let Message::SidebarSnapshot {
+            source: actual_source,
+            action,
+        } = messages.pop().unwrap()
+        else {
+            panic!("actual popup did not preserve its captured source")
+        };
+        assert_eq!(actual_source, source);
+        let SidebarAction::ConfirmDiscard {
             key: actual,
             request: confirmed,
-        }) = messages.pop().unwrap()
+        } = *action
         else {
             panic!("actual popup did not deliver its confirmation")
         };
@@ -191,14 +296,20 @@ fn whole_application_popover_exports_current_discard_controls_and_cancel_reduces
         );
         // Inspect the actual owning confirmation without executing a mutation.
         assert!(app.source_control_mutations.is_empty());
+        assert_eq!(std::fs::read(&modified).unwrap(), b"precious modified\n");
+        assert!(!deleted.exists());
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        previous_source = Some(source);
     }
     let (next, _, mut messages) = frame(&app, cache, Some("Cancel"));
     cache = next;
     assert_eq!(messages.len(), 1);
     let cancel = messages.pop().unwrap();
     assert!(matches!(
-        cancel,
-        Message::Sidebar(SidebarAction::CancelDiscard)
+        &cancel,
+        Message::SidebarSnapshot { source, action }
+            if Some(*source) == app.discard_ui.intent_id()
+                && matches!(&**action, SidebarAction::CancelDiscard)
     ));
     drop(app.update(cancel));
     assert!(!app.modal_is_open());

@@ -8059,6 +8059,7 @@ fn resolve_basis(worktree: &Path, choice: CommittedChoice) -> Result<ResolvedBas
                 .snapshot_with_options(
                     worktree,
                     crate::repository::SnapshotOptions {
+                        status_limit: None,
                         untracked_changes: false,
                         untracked_files: false,
                     },
