@@ -379,7 +379,11 @@ impl State {
         None
     }
 
-    pub(super) fn view(&self, current: bool) -> Option<Element<'_, Action>> {
+    pub(super) fn view(
+        &self,
+        current: bool,
+        pane: super::ActivationLifetime,
+    ) -> Option<Element<'_, Action>> {
         let operation = self.operation.as_ref()?;
         let generation = self.generation;
         let mut content = widget::column::with_children(vec![
@@ -525,12 +529,23 @@ impl State {
                 .push(button::quiet("Close review").on_press(Action::Dismiss { generation }));
         }
         content = content.push(actions);
+        // Choices rotate the controller generation. Phase also changes on
+        // submission without rotating it, so the original completion still
+        // owns Pending. Pane replacement retires native input only. Watch
+        // UUIDs are excluded; current eligibility may
+        // retire controls without changing the controller or scroll position.
         Some(
-            widget::container(widget::scrollable(content).height(Length::Shrink))
-                .max_height(360.0)
-                .padding(space::M)
-                .width(Length::Fill)
-                .into(),
+            widget::container(
+                widget::scrollable(crate::ui_controls::owned(
+                    (pane, generation, operation.phase, current),
+                    content,
+                ))
+                .height(Length::Shrink),
+            )
+            .max_height(360.0)
+            .padding(space::M)
+            .width(Length::Fill)
+            .into(),
         )
     }
 }
@@ -1120,7 +1135,7 @@ mod tests {
             advanced::{Layout, layout, widget::Tree},
         };
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut element = state.view(true).expect("review shown");
+        let mut element = state.view(true, Default::default()).expect("review shown");
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
