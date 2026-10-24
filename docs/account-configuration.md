@@ -185,6 +185,106 @@ command. Use the provider's supported sign-in flow on the destination when
 needed. If a reply is lost or unclear, inspect `account list` on the same
 device before retrying; linking does not automatically retry.
 
+## Checking an account's default execution policy
+
+Check one explicit Codex account and workspace on the selected device:
+
+```sh
+cagents --device fw16 account check --account codex/ACCOUNT-UUID \
+  --workspace '~/project' --expect-email selected@example.com
+cagents --device fw16 --json account check --account codex/ACCOUNT-UUID \
+  --workspace '~/project' --expect-email selected@example.com \
+  --write --github-repository OWNER/REPO
+```
+
+Quote `~/...` so the selected device expands it. The command accepts an absolute
+workspace or that device-relative home spelling, one Codex account ID, the
+expected provider email, and the two optional capability checks. It accepts no
+provider-home override, environment values, arbitrary command or policy override.
+It authenticates the caller to the selected daemon and submits one check without
+automatic retries.
+
+Executable lookup uses the application's already discovered shell search path,
+or the daemon's inherited `PATH` when discovery has not completed. This check
+does not start an interactive shell to discover another executable location.
+
+Authentication, the reported default execution policy, workspace write access,
+and GitHub repository access are separate observations. The official Codex client
+reads its account and effective configuration without starting a model turn.
+`--write` explicitly permits one fixed scratch write/read/remove in the supplied
+workspace under that default policy; cleanup is reported separately, including
+unknown cleanup after an interrupted or missing helper receipt. Without `--write`
+the command does not request a scratch file. `--github-repository OWNER/REPO`
+explicitly permits one GitHub repository read under the same policy. Reported push
+permission is metadata; no push or repository mutation is performed. Omitting
+that option does not request the endpoint check.
+
+Provider cleanup is separate from scratch cleanup: success requires confirmation
+that the owned process group accepted its termination signal (or was absent) and
+the original provider leader was reaped. An uncertain cleanup keeps the account
+home and workspace occupied for destructive operations; it does not prevent
+ordinary launches. A failed group signal stays quarantined rather than allowing
+a later observation of leader exit to authorize directory removal.
+
+JSON uses the normal CLI envelope and retains each observation's status/reason,
+the selected account, requested and resolved workspace, expected identity,
+observation time, daemon proof, physical identities, and executable identity.
+An unsupported or failed measurement remains a scoped report, with `outcome`
+`failed` and exit status 4; it is not silently converted into a protocol failure
+or a claim that authentication failed. A refused request, lost reply or malformed
+response remains a command error and is not retried.
+
+The scope is **account default policy at the observation time**. A pass is not
+authorization for the current coding actor or a future launch, and it does not
+test cagents authority, import credentials, transfer browser sessions, change
+configuration/defaults, resume work automatically, or prove broader account
+readiness. Existing actors retain their own captured permissions and network
+policy. Linking a home, confirming its login and checking this default policy
+remain distinct operations.
+
+If the result reports a read-only default, you can request file edits for a new
+conversation through **Permissions → Workspace write**. This leaves account
+defaults unchanged, so the default-policy check can still report read-only.
+Existing conversations and network access have separate policies; this choice
+does not configure unattended agents.
+
+## Creating missing coding defaults
+
+An imported home can authenticate successfully while having no `config.toml`.
+After **Check coding access** confirms the selected login and provider cleanup,
+choose **Inspect coding defaults**. If that registered Codex home's configuration
+is absent, **Create coding defaults** offers workspace write with on-request
+approvals. Network access starts unchecked and requires an explicit choice.
+
+This creates an independent file on the selected device. Existing entries,
+System accounts and homes or configuration targets shared with another account
+are preserved. Busy accounts and uncertain independence refuse creation. No
+registration, account default, credential or existing conversation is changed.
+Setup also refuses a directory writable by other users; it does not change
+the directory's permissions.
+
+The configuration applies to new Codex processes. Run **Check** again to measure
+actual access; creation alone does not prove execution or network readiness.
+Closing the form leaves an outstanding request running and its result appears
+in a notice. If creation cannot be confirmed, inspect the account configuration
+before another request. Cagents does not retry or roll back an uncertain creation.
+
+For headless setup, use the same selected-device flow through the CLI:
+
+```sh
+cagents --device workstation account create-coding-defaults \
+  --account codex/00000000-0000-4000-8000-000000000001 \
+  --workspace '~/projects/example' --expect-email you@example.com
+```
+
+This checks the selected login without a scratch write or GitHub request, then
+inspects and creates only an absent configuration. Add `--allow-network` to
+include network access; it is disabled otherwise. The command preserves inherited
+caller authority, so hosted agents cannot use it to change their permissions.
+Existing entries are preserved. An uncertain creation is not retried: inspect
+the same account on the same device before another request. Created defaults
+apply to new Codex processes and do not establish actual execution readiness.
+
 ## Removing a linked account registration
 
 Use the stable account ID from `cagents account list` on the selected device:

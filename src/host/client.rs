@@ -371,6 +371,52 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
+    if let ClientRequest::DeviceOperation {
+        operation:
+            operation @ (crate::device_service::Operation::AccountCodingConfigInspect(_)
+            | crate::device_service::Operation::AccountCodingConfigCreate(_)),
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        // The user's admission precedes all account/filesystem work. Scoped
+        // reservation/Store checks run without a global guard over storage.
+        let reply = match operation {
+            crate::device_service::Operation::AccountCodingConfigInspect(inspect) => {
+                crate::device_service::Reply::AccountCodingConfigInspect(Box::new(
+                    super::coding_config::inspect(host, inspect.clone())?,
+                ))
+            }
+            crate::device_service::Operation::AccountCodingConfigCreate(create) => {
+                crate::device_service::Reply::AccountCodingConfigCreate(Box::new(
+                    super::coding_config::create(host, create.clone())?,
+                ))
+            }
+            _ => unreachable!("the early branch matches only fixed configuration operations"),
+        };
+        return Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false));
+    }
+    if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountCheck(check),
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let report = super::account_readiness::check(host, check.clone())?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountCheck(Box::new(report)),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
     if let ClientRequest::DeviceOperation {
@@ -387,6 +433,7 @@ pub(super) fn process_request(
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
+                super::account_readiness::ensure_unused(host, &request.path)?;
                 prepared
                     .remove(|windows| {
                         host.lock()
@@ -431,9 +478,13 @@ pub(super) fn process_request(
     }
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
+    // Account preference writes also retain this short local fence from the
+    // reader census through registry commit; they perform no provider RPC.
     let exclusive = matches!(
         &request,
-        ClientRequest::PrepareUpgrade { .. }
+        ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::AccountsUpdate { .. },
+        } | ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
@@ -450,6 +501,7 @@ pub(super) fn process_request(
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::account_lifecycle::admit(host, &request)?;
     super::worktree_removal::admit(host, &request)?;
+    super::account_readiness::admit(host, &request)?;
     // Retained originals are outside the session inventory. Refuse before
     // publishing a preflight capability or requesting termination. This only
     // observes custody already published now; quarantine can publish later.
@@ -1510,6 +1562,121 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn coding_config_operations_require_user_admission_before_request_or_filesystem_work() {
+        use crate::{
+            account::{
+                coding_config::{CreateRequest, InspectRequest, Observation, Presence},
+                readiness::PhysicalIdentity,
+            },
+            device_service::Operation,
+        };
+        let (proof, _) = panic_test_host("coding-config-admission");
+        // Malformed identity would be refused by the handler. Both operations
+        // must instead hit the existing agent/user boundary first, before a
+        // registry/home can be resolved or any storage can be touched.
+        let inspect = InspectRequest {
+            account: "codex/00000000-0000-4000-8000-000000000001"
+                .parse()
+                .unwrap(),
+            expected_home: PhysicalIdentity {
+                device: 1,
+                inode: 2,
+            },
+            expected_email: String::new(),
+        };
+        let create = CreateRequest {
+            observation: Observation {
+                account: inspect.account.clone(),
+                host: proof,
+                home: inspect.expected_home,
+                presence: Presence::Absent,
+                expected_email: String::new(),
+            },
+            network_access: true,
+        };
+        for operation in [
+            Operation::AccountCodingConfigInspect(inspect),
+            Operation::AccountCodingConfigCreate(create),
+        ] {
+            let (_, host) = panic_test_host("coding-config-admission");
+            host.lock()
+                .unwrap()
+                .agent_clients
+                .insert(1, crate::agent_execution::Lineage(TerminalId::new()));
+            let error = process_request(
+                &host,
+                1,
+                ClientRequest::DeviceOperation {
+                    operation: operation.clone(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+            host.lock().unwrap().request_shutdown();
+            let error = process_request(&host, 1, ClientRequest::DeviceOperation { operation })
+                .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        }
+    }
+
+    #[test]
+    fn account_preference_update_cannot_cross_an_admitted_reader() {
+        let (_proof, host) = panic_test_host("account-preferences-reader-gate");
+        let gate = control_gate(&host);
+        let reader = gate.read().unwrap();
+        let worker_host = host.clone();
+        let (started, ready) = crossbeam_channel::bounded(1);
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(process_request(
+                    &worker_host,
+                    1,
+                    ClientRequest::DeviceOperation {
+                        operation: crate::device_service::Operation::AccountsUpdate {
+                            expected_revision: 0,
+                            // Refuse after admission, before looking up or opening any
+                            // installation registry. The fixture touches no settings.
+                            registry: serde_json::Value::Null,
+                        },
+                    },
+                ))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let blocked = matches!(
+            result.recv_timeout(Duration::from_millis(100)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        drop(reader);
+        let error = if blocked {
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+        } else {
+            // Join before asserting so even a regressed early response leaves
+            // no fixture thread behind.
+            worker.join().unwrap();
+            panic!(
+                "account preference update crossed admitted reader before its census/commit fence"
+            );
+        };
+        worker.join().unwrap();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(error.message.starts_with("Invalid account preferences:"));
+        assert!(matches!(
+            process_request(&host, 1, ClientRequest::List).unwrap().0,
+            ServerResponse::Listed { .. }
+        ));
+        assert!(
+            gate.try_write().is_ok(),
+            "failed preference update retained admission"
+        );
+    }
 
     #[test]
     fn resident_release_drains_admitted_control_operations_before_retirement() {

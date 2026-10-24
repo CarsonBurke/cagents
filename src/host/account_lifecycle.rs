@@ -130,7 +130,10 @@ impl Home {
 
 /// Walk the actual directory parent chain through descriptors. Lexical
 /// aliases can change when a reserved home/provider parent is renamed.
-pub(super) fn physical_ancestors(path: &Path, pin: Option<&File>) -> Result<BTreeSet<(u64, u64)>, String> {
+pub(super) fn physical_ancestors(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, String> {
     let mut cursor = if let Some(pin) = pin {
         pin.try_clone().map_err(|error| error.to_string())?
     } else {
@@ -340,6 +343,13 @@ impl Reservation {
         }
         let writer = super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
+        for home in &homes {
+            if let Some(pin) = &home.pin {
+                super::account_readiness::ensure_unused_directory(host, &home.canonical, pin)?;
+            } else {
+                super::account_readiness::ensure_unused(host, &home.canonical)?;
+            }
+        }
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {
             return Err(refusal(
@@ -626,6 +636,13 @@ impl Reservation {
             .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.message))?;
         super::client::ensure_control_open(&host)
             .map_err(|error| io::Error::other(error.message))?;
+        let actual = &updated.homes[index];
+        super::account_readiness::ensure_unused_directory(
+            &host,
+            &actual.canonical,
+            actual.pin.as_deref().expect("created home is pinned"),
+        )
+        .map_err(|error| io::Error::other(error.message))?;
         let mut entries = self.map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&basis, &entries) {
             return Err(io::Error::other(
@@ -637,6 +654,61 @@ impl Reservation {
         drop(writer);
         created.revalidate()?;
         Ok(())
+    }
+
+    /// Clone the originally issued directory descriptor, never reopen a path.
+    /// The caller supplies its already locked latest registry; do not call
+    /// verify()/commit() here because those acquire another Store lease.
+    pub(crate) fn coding_config_root(
+        &self,
+        latest: &Registry,
+        id: &crate::account::AccountId,
+        expected: crate::account::readiness::PhysicalIdentity,
+    ) -> Result<crate::fs_safety::Root, String> {
+        self.verify_registry(latest)
+            .map_err(|_| "The selected account context changed")?;
+        let current = self.current()?;
+        let (account, home) = self
+            .accounts
+            .iter()
+            .zip(&current.homes)
+            .find(|(account, _)| account.id() == *id)
+            .ok_or("The selected account has no matching reservation")?;
+        let key = account
+            .registry_key()
+            .ok_or("Choose a registered Codex account")?;
+        if account.provider != crate::agent::Provider::Codex
+            || latest.is_archived(key)
+            || !latest
+                .find(key)
+                .is_some_and(|row| row.provider == account.provider)
+            || latest.pending().iter().any(|pending| pending.key == key)
+        {
+            return Err("The selected Codex account is unavailable".into());
+        }
+        let pin = home
+            .pin
+            .as_ref()
+            .ok_or("The selected account home is unavailable")?;
+        let metadata = pin
+            .metadata()
+            .map_err(|_| "The selected account home is unavailable")?;
+        if !metadata.is_dir()
+            || metadata.nlink() == 0
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || (metadata.dev(), metadata.ino()) != (expected.device, expected.inode)
+        {
+            return Err("The selected account home changed".into());
+        }
+        let directory = pin
+            .try_clone()
+            .map_err(|_| "The selected account home is unavailable")?;
+        let root =
+            crate::fs_safety::Root::from_retained_directory(directory, home.canonical.clone())
+                .map_err(|_| "The selected account home is unavailable")?;
+        self.verify_registry(latest)
+            .map_err(|_| "The selected account context changed")?;
+        Ok(root)
     }
 
     /// Match the exact request operand/provider/key captured by this host
@@ -909,6 +981,9 @@ pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<()
         .map_err(|error| refusal(error.to_string()))?;
     let homes = crate::account::home::Homes::installation();
     let changed = current.changed_account_homes(proposed, homes.as_ref());
+    for home in &changed {
+        super::account_readiness::ensure_unused(host, home)?;
+    }
     ensure_paths(host, changed)
 }
 
@@ -1501,5 +1576,77 @@ pub(crate) mod tests {
         drop(reservation);
         environment.insert("HOME".into(), "relative-home".into());
         ensure_launch(&host, &cwd, &environment, &unset, false).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod coding_config_tests {
+    use super::*;
+    use crate::{
+        account::{AccountHome, readiness::PhysicalIdentity, registry::Registered},
+        agent::Provider,
+    };
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn coding_config_accessor_keeps_the_issued_inode_and_rejects_replaced_operands() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        symlink(&original, &alias).unwrap();
+        let account = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), alias.clone());
+        let store = Store::at(directory.path().join("registry"));
+        store
+            .update(|registry| {
+                registry.begin(Provider::Codex, account.registry_key().unwrap(), 1);
+                registry
+                    .register(
+                        Registered {
+                            key: account.registry_key().unwrap(),
+                            provider: Provider::Codex,
+                            linked_home: Some(alias),
+                            label: None,
+                            email: Some("fixture@example.test".into()),
+                            organization: None,
+                            added_at: 1,
+                        },
+                        &[],
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("managed"));
+        let host = Reservation::test_host();
+        let reservation =
+            Reservation::test_install(&host, std::slice::from_ref(&account), store.clone(), &homes)
+                .unwrap();
+        let metadata = std::fs::metadata(&original).unwrap();
+        let expected = PhysicalIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let latest = store.load().unwrap();
+        let root = reservation
+            .coding_config_root(&latest, &account.id(), expected)
+            .unwrap();
+        std::fs::rename(&original, directory.path().join("moved-original")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert_eq!(
+            (
+                root.metadata().unwrap().dev(),
+                root.metadata().unwrap().ino()
+            ),
+            (expected.device, expected.inode)
+        );
+        assert_ne!(std::fs::metadata(&original).unwrap().ino(), expected.inode);
+        assert!(
+            reservation
+                .coding_config_root(&latest, &account.id(), expected)
+                .is_err()
+        );
+        assert!(std::fs::read_dir(&original).unwrap().next().is_none());
+        // The read-only descriptor is not a permit to initialize after drift.
+        assert!(matches!(account.home, AccountHome::Linked { .. }));
     }
 }

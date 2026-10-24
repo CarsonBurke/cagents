@@ -286,7 +286,7 @@ pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
     crate::ui_controls::responsive(move |size| table(app, size.width)).into()
 }
 
-fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
+pub(super) fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
     let mut sections: Vec<Element<'_, Message>> =
@@ -300,7 +300,9 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             .into(),
         );
     }
-    if let Some((provider, path)) = &state.table.link {
+    if let Some(form) = check::view(app) {
+        sections.push(form);
+    } else if let Some((provider, path)) = &state.table.link {
         sections.push(link_form(state, *provider, path));
     }
     for provider in Account::REPORTED {
@@ -382,77 +384,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     };
     let add = crate::ui_controls::popover(
         add_button,
-        state.table.add_menu.then(|| {
-            widget::container(
-                widget::column::with_children(vec![
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Claude),
-                        if state.installed.get(&Provider::Claude) == Some(&false) { "Install Claude" } else { "Claude" },
-                        if state.installed.get(&Provider::Claude) == Some(&false) { "CLI not found on PATH" } else { "Sign in with a Claude subscription" },
-                        action(if state.installed.get(&Provider::Claude) == Some(&false) { Action::Install(Provider::Claude) } else { Action::Add {
-                            provider: Provider::Claude,
-                            device: false,
-                        }}),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        if state.installed.get(&Provider::Codex) == Some(&false) { "Install Codex" } else { "ChatGPT (Codex)" },
-                        if crate::device::is_remote() {
-                            "Sign in on another device with a one-time code"
-                        } else if browser_busy {
-                            "A browser sign-in is pending; finish it or use a code"
-                        } else {
-                            "Sign in through your browser"
-                        },
-                        action(Action::Add {
-                            provider: Provider::Codex,
-                            device: false,
-                        }),
-                    )
-                    .on_press_maybe((!browser_busy).then(|| {
-                        action(if state.installed.get(&Provider::Codex) == Some(&false) { Action::Install(Provider::Codex) } else { Action::Add {
-                            provider: Provider::Codex,
-                            device: false,
-                        }})
-                    }))
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        "ChatGPT (Codex) with a code",
-                        "Sign in on another device with a one-time code",
-                        action(if state.installed.get(&Provider::Codex) == Some(&false) {
-                            Action::Install(Provider::Codex)
-                        } else { Action::Add { provider: Provider::Codex, device: true } }),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Claude),
-                        "Existing Claude home",
-                        "Use a Claude login and history already on this computer",
-                        action(Action::LinkStart(Provider::Claude)),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        "Existing Codex home",
-                        "Use a Codex login and history already on this computer",
-                        action(Action::LinkStart(Provider::Codex)),
-                    )
-                    .into(),
-                    design::horizontal_rule(),
-                    crate::ui_controls::field::checkbox(state.table.own_codex_config)
-                        .label("Keep a separate Codex configuration")
-                        .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
-                        .into(),
-                    design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
-                ])
-                .spacing(space::XXS),
-            )
-            .width(300)
-            .into()
-        }),
+        state.table.add_menu.then(|| add_menu(state, browser_busy)),
         widget::popover::Position::Bottom,
         action(Action::AddMenu(false)),
     );
@@ -485,6 +417,82 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
         .spacing(space::M)
         .align_y(Alignment::Center)
         .into()
+}
+
+/// Add-account choices, with existing-home selection paused during its commit.
+pub(super) fn add_menu(state: &State, browser_busy: bool) -> Element<'_, Message> {
+    let action = |action| Message::AccountUi(action);
+    widget::container(
+        widget::column::with_children(vec![
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Claude),
+                if state.installed.get(&Provider::Claude) == Some(&false) { "Install Claude" } else { "Claude" },
+                if state.installed.get(&Provider::Claude) == Some(&false) { "CLI not found on PATH" } else { "Sign in with a Claude subscription" },
+                action(if state.installed.get(&Provider::Claude) == Some(&false) { Action::Install(Provider::Claude) } else { Action::Add {
+                    provider: Provider::Claude,
+                    device: false,
+                }}),
+            )
+            .into(),
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                if state.installed.get(&Provider::Codex) == Some(&false) { "Install Codex" } else { "ChatGPT (Codex)" },
+                if crate::device::is_remote() {
+                    "Sign in on another device with a one-time code"
+                } else if browser_busy {
+                    "A browser sign-in is pending; finish it or use a code"
+                } else {
+                    "Sign in through your browser"
+                },
+                action(Action::Add {
+                    provider: Provider::Codex,
+                    device: false,
+                }),
+            )
+            .on_press_maybe((!browser_busy).then(|| {
+                action(if state.installed.get(&Provider::Codex) == Some(&false) { Action::Install(Provider::Codex) } else { Action::Add {
+                    provider: Provider::Codex,
+                    device: false,
+                }})
+            }))
+            .into(),
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                "ChatGPT (Codex) with a code",
+                "Sign in on another device with a one-time code",
+                action(if state.installed.get(&Provider::Codex) == Some(&false) {
+                    Action::Install(Provider::Codex)
+                } else { Action::Add { provider: Provider::Codex, device: true } }),
+            )
+            .into(),
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Claude),
+                "Existing Claude home",
+                "Use a Claude login and history already on this computer",
+                action(Action::LinkStart(Provider::Claude)),
+            )
+            .on_press_maybe((!state.table.linking).then_some(action(Action::LinkStart(Provider::Claude))))
+            .into(),
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                "Existing Codex home",
+                "Use a Codex login and history already on this computer",
+                action(Action::LinkStart(Provider::Codex)),
+            )
+            .on_press_maybe((!state.table.linking).then_some(action(Action::LinkStart(Provider::Codex))))
+            .into(),
+            design::horizontal_rule(),
+            crate::ui_controls::field::checkbox(state.table.own_codex_config)
+                .label("Keep a separate Codex configuration")
+                .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
+                .into(),
+            design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
+        ])
+        .spacing(space::XXS),
+    )
+    .width(300)
+    .into()
 }
 
 fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element<'a, Message> {
@@ -1046,7 +1054,7 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
     }
 }
 
-fn menu<'a>(
+pub(super) fn menu<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
     project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
@@ -1085,6 +1093,17 @@ fn menu<'a>(
         .into()
     } else {
         let mut items: Vec<Element<'a, Message>> = Vec::new();
+        if account.account.provider == Provider::Codex {
+            items.push(
+                crate::ui_controls::popover_item(
+                    Icon::Check,
+                    "Check coding access",
+                    "Observe this account's identity and default execution policy",
+                    action(Action::Check(check::Action::Open(id.clone()))),
+                )
+                .into(),
+            );
+        }
         if state.login_conflict(account).is_none() && !state.registry.is_default(&account.account) {
             items.push(
                 crate::ui_controls::popover_item(
