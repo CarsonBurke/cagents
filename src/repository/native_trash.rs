@@ -1148,6 +1148,14 @@ mod tests {
     use super::*;
     #[test]
     fn native_batch_capacity_refusal_precedes_trash_bootstrap_and_all_source_effects() {
+        // A 128-path batch needs 26 of the process-wide 32 recovery slots.
+        // Isolate before fixture setup so parallel tests cannot spend its headroom.
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::native_batch_capacity_refusal_precedes_trash_bootstrap_and_all_source_effects"
+        )) {
+            return;
+        }
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
@@ -1203,6 +1211,12 @@ mod tests {
 
     #[test]
     fn native_batch_128_compacts_only_completed_entries_and_keeps_shared_pins_through_clones() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::native_batch_128_compacts_only_completed_entries_and_keeps_shared_pins_through_clones"
+        )) {
+            return;
+        }
         let source = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let root = Arc::new(fs_safety::Root::open(source.path()).unwrap());
@@ -1296,6 +1310,12 @@ mod tests {
 
     #[test]
     fn native_discard_acquired_writer_change_reports_unknown_and_stops_remaining_paths() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::native_discard_acquired_writer_change_reports_unknown_and_stops_remaining_paths"
+        )) {
+            return;
+        }
         use std::os::unix::fs::FileExt;
 
         let source = tempfile::tempdir().unwrap();
