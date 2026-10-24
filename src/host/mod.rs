@@ -214,6 +214,20 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+/// Reserve and configure the serving socket before restore can take ownership
+/// of an original holder. The caller still holds HostLease and admission, and
+/// does not accept clients or publish readiness until restoration finishes.
+fn listener_before_restore(
+    paths: &RuntimePaths,
+    restore: impl FnOnce() -> Result<(), HostError>,
+) -> Result<UnixListener, HostError> {
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    restore()?;
+    Ok(listener)
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -263,28 +277,28 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
-    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
-    chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
-    let retained_runs = chat::retained_actor::retained_runs(&host);
-    // A committed acceptance is not proof of provider delivery. Until a
-    // restored actor supplies exact run evidence, never authorize a resend.
-    if let Ok(registry) = agent_execution::registry(&host) {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs_except(
-                crate::chat::now_ms().unwrap_or(0),
-                &retained_runs,
-            )
-            .map_err(io::Error::other)?;
-    }
+    let listener = listener_before_restore(&paths, || {
+        let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
+        state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+        chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
+        chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+        let retained_runs = chat::retained_actor::retained_runs(&host);
+        // A committed acceptance is not proof of provider delivery. Until a
+        // restored actor supplies exact run evidence, never authorize a resend.
+        if let Ok(registry) = agent_execution::registry(&host) {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupt_unproven_agent_runs_except(
+                    crate::chat::now_ms().unwrap_or(0),
+                    &retained_runs,
+                )
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    })?;
     let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     let tally_host = Arc::downgrade(&host);
