@@ -7539,6 +7539,8 @@ impl Cagents {
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
+        #[cfg(test)]
+        terminal_output_tests::record_owner_resolution();
         let state = self
             .card_state(card)
             .filter(|state| state.existence.is_open())?;
@@ -9109,8 +9111,10 @@ impl Cagents {
                 // the end replays the activity it once reported, which must
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    if ended_terminal(self.card_state(card)).is_none() {
-                        metadata_changed |= self.sidebar_state.card_activity(card) != activity;
+                    if ended_terminal(self.card_state(card)).is_none()
+                        && self.sidebar_state.card_activity(card) != activity
+                    {
+                        metadata_changed = true;
                         self.observe_agent_activity_for_card(card, activity);
                     }
                 }
@@ -9252,8 +9256,10 @@ impl Cagents {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
             });
-            metadata_changed |= self.sidebar_state.card_activity(card) != activity;
-            self.observe_agent_activity_for_card(card, activity);
+            if self.sidebar_state.card_activity(card) != activity {
+                metadata_changed = true;
+                self.observe_agent_activity_for_card(card, activity);
+            }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {

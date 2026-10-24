@@ -19,6 +19,7 @@ use std::{
 thread_local! {
     static PROJECTIONS: Cell<usize> = const { Cell::new(0) };
     static PROTECTIONS: Cell<usize> = const { Cell::new(0) };
+    static OWNER_RESOLUTIONS: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     PROJECTIONS.set(PROJECTIONS.get() + 1);
@@ -26,12 +27,16 @@ pub(super) fn record_projection() {
 pub(super) fn record_protection() {
     PROTECTIONS.set(PROTECTIONS.get() + 1);
 }
+pub(super) fn record_owner_resolution() {
+    OWNER_RESOLUTIONS.set(OWNER_RESOLUTIONS.get() + 1);
+}
 fn counts() -> (usize, usize) {
     (PROJECTIONS.get(), PROTECTIONS.get())
 }
 fn reset() {
     PROJECTIONS.set(0);
     PROTECTIONS.set(0);
+    OWNER_RESOLUTIONS.set(0);
 }
 
 struct Peer {
@@ -858,4 +863,155 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
             ChannelTitleSource::Provider
         );
     }
+}
+
+#[test]
+fn unchanged_agent_output_reuses_ownership_and_topology_rebinds_attention() {
+    use crate::{
+        agent::{Activity, ActivityState, Provider},
+        model::WorktreeId,
+        repository::RepositoryId,
+        sidebar::{SidebarProject, SidebarWorktree},
+    };
+    let (mut app, card, mut peer) = fixture();
+    let root = card_directory(app.card_state(card).unwrap())
+        .unwrap()
+        .to_path_buf();
+    let first = ProjectId::new();
+    let first_row = WorktreeId::new();
+    let second = ProjectId::new();
+    let second_row = WorktreeId::new();
+    let project = |id, row| {
+        SidebarProject::new(
+            id,
+            RepositoryId::new(),
+            "Agent output ownership".into(),
+            root.clone(),
+            vec![SidebarWorktree::new(
+                row,
+                root.clone(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            vec![],
+        )
+    };
+    app.sidebar_model.projects = vec![project(first, first_row)];
+    app.worktree_owners.remove(&card);
+    Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
+    app.known_worktree_roots.clear();
+    for index in 0..200 {
+        app.known_worktree_roots
+            .insert(PathBuf::from(format!("/agent-output-fixture/root-{index}")));
+    }
+    // Output from a background window remains unread; no focus or navigation
+    // action is needed to exercise its real sidebar ownership.
+    app.refresh_ui.focused = false;
+    let working = Activity {
+        provider: Provider::Claude,
+        state: ActivityState::Working,
+    };
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::AgentActivityChanged {
+            activity: Some(working),
+        }),
+    );
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, first_row),
+        Some(ActivityState::Working)
+    );
+    apply(&mut app, card, &mut peer, Some(WireTerminalEvent::Bell));
+    assert!(app.sidebar_state.has_agent_update(first, first_row));
+    let proof = peer.handle.proof();
+    let durable = Arc::clone(&app.durable);
+    reset();
+    for _ in 0..32 {
+        apply(&mut app, card, &mut peer, None);
+    }
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::AgentActivityChanged {
+            activity: Some(working),
+        }),
+    );
+    assert_eq!(OWNER_RESOLUTIONS.get(), 0);
+    assert_eq!(counts(), (0, 0));
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    assert_eq!(peer.handle.proof(), proof);
+    assert_eq!(app.sidebar_state.card_activity(card), Some(working));
+    assert!(app.sidebar_state.has_agent_update(first, first_row));
+
+    // OSC cwd is live metadata, not a new launch/filing authority. It still
+    // runs the structural tail without moving this unchanged activity.
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::WorkingDirectoryChanged {
+            path: root.join("shell-only-directory"),
+        }),
+    );
+    assert_eq!(counts(), (1, 1));
+    assert_eq!(OWNER_RESOLUTIONS.get(), 0);
+    assert_eq!(
+        app.sidebar_state.agent_activity(first, first_row),
+        Some(ActivityState::Working)
+    );
+    assert!(app.sidebar_state.has_agent_update(first, first_row));
+
+    // A real structural update rebinds both cached activity and unread
+    // attention even though no new activity event arrives from the terminal.
+    app.sidebar_model.projects = vec![project(second, second_row)];
+    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
+    assert!(!app.sidebar_state.has_agent_update(first, first_row));
+    assert_eq!(
+        app.sidebar_state.agent_activity(second, second_row),
+        Some(ActivityState::Working)
+    );
+    assert!(app.sidebar_state.has_agent_update(second, second_row));
+    reset();
+    apply(&mut app, card, &mut peer, None);
+    assert_eq!(OWNER_RESOLUTIONS.get(), 0);
+    assert_eq!(counts(), (0, 0));
+    assert!(app.sidebar_state.has_agent_update(second, second_row));
+
+    // Actual agent transitions must still use the current owner and publish
+    // their existing activity/unread semantics after the unchanged fast path.
+    for state in [
+        ActivityState::Waiting,
+        ActivityState::Working,
+        ActivityState::Idle,
+    ] {
+        reset();
+        apply(
+            &mut app,
+            card,
+            &mut peer,
+            Some(WireTerminalEvent::AgentActivityChanged {
+                activity: Some(Activity { state, ..working }),
+            }),
+        );
+        assert!(OWNER_RESOLUTIONS.get() > 0, "{state:?}");
+        assert_eq!(counts(), (1, 1), "{state:?}");
+        assert_eq!(
+            app.sidebar_state.agent_activity(second, second_row),
+            Some(state)
+        );
+        assert_eq!(peer.handle.proof(), proof);
+    }
+    assert!(matches!(
+        app.cards.get(&card),
+        Some(CardRuntime::Terminal(_))
+    ));
 }
