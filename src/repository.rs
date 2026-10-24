@@ -39,6 +39,8 @@ mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
 mod status_limit;
+#[cfg(test)]
+pub(crate) mod test_fixture;
 pub use pr_checkout::{
     ExistingPrCheckoutPlan, ExistingPrCheckoutRequest, PrCheckoutDisposition, PrCheckoutFailure,
     PrCheckoutFailureKind, PrCheckoutTracking, VerifiedPrCheckout,
