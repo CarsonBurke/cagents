@@ -32,6 +32,7 @@ pub(crate) mod daemon;
 pub(crate) mod daemon_health;
 #[cfg(feature = "ui")]
 pub mod design;
+pub(crate) mod descriptor_frame;
 pub mod device;
 pub mod device_service;
 pub mod diagnostics;
