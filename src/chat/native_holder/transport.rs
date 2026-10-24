@@ -1837,8 +1837,13 @@ mod tests {
             .allocator
             .boot_id = boot;
         source.launch.recipe.program = "./provider".into();
-        source.launch.recipe.arguments.clear();
         source.launch.recipe.working_directory = cwd.clone();
+        // The published source keeps its exact issued --remote ownership;
+        // only the executable ProcessSpec below is the local test fixture.
+        assert!(source.owns_codex_listener());
+        let mut stripped = source.clone();
+        stripped.launch.recipe.arguments.clear();
+        assert!(!stripped.owns_codex_listener());
         let spec = ProcessSpec {
             execution: None,
             messages: None,
@@ -1854,6 +1859,11 @@ mod tests {
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let proof = source.proof.clone().unwrap();
         let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        assert_eq!(
+            spawn(spec.clone(), stripped).err().as_deref(),
+            Some("Native holder has inconsistent ownership evidence"),
+            "a source without the issued listener must still fail before provider creation"
+        );
         let mut holder = spawn(spec, source.clone()).unwrap();
         let record = holder.identity.record.clone();
         let deadline = Instant::now() + TIMEOUT;
