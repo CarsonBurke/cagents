@@ -411,6 +411,11 @@ impl Cagents {
 
     pub(super) fn palette_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if let Some(field) = self.palette.recording {
+            // Recording is globally visible, but a real dialog owns its
+            // key before the recording or settings draft can change.
+            if self.modal_is_open() {
+                return None;
+            }
             if is_escape_press(event) {
                 self.palette.recording = None;
                 return Some(Task::none());
@@ -477,10 +482,9 @@ impl Cagents {
                         if !chords.contains(&chord) {
                             chords.push(chord);
                         }
-                        return Some(self.update(Message::SettingsDraftChanged {
-                            field,
-                            value: settings::format_chords(&chords),
-                        }));
+                        return Some(
+                            self.queue_setting_input(field, settings::format_chords(&chords)),
+                        );
                     }
                 }
             }
@@ -1493,7 +1497,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let initial = focus_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(initial.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
 
             let open = app.update_palette(Action::Open);
@@ -1503,7 +1507,7 @@ mod tests {
             assert!(
                 !while_open
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             assert!(
                 while_open
@@ -1515,7 +1519,7 @@ mod tests {
             assert!(!app.palette.is_open());
             let after = focus_fixture_step(&app, &mut tree, &renderer, dismiss, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
         }
     }
@@ -1546,7 +1550,7 @@ mod tests {
         assert!(!app.palette.is_open());
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -1572,7 +1576,7 @@ mod tests {
         ));
         let after = focus_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -1602,7 +1606,7 @@ mod tests {
             assert!(
                 !after
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
         }
     }

@@ -240,6 +240,14 @@ impl Cagents {
             Message::WorkUi(action) if !action.background() => {
                 return Some(Task::none());
             }
+            Message::AutomationUi(action) if !action.background() => {
+                return Some(Task::none());
+            }
+            Message::SelectSettingsCategory(_)
+            | Message::SettingsSearchChanged(_)
+            | Message::SettingsChanged { .. }
+            | Message::SettingsDraftChanged { .. }
+            | Message::ResetSettings => return Some(Task::none()),
             Message::RunCommand(command) => {
                 return Some(
                     self.channel_work_global_command(*command)
@@ -274,6 +282,7 @@ impl Cagents {
                     | SidebarAction::OpenAutomations
                     | SidebarAction::OpenWork
             ) | Message::FocusCard(_)
+                | Message::AccountUi(account_ui::Action::OpenPane)
         );
         if !navigation {
             return None;
@@ -507,7 +516,8 @@ impl Cagents {
                         SidebarAction::OpenSettings
                         | SidebarAction::OpenAutomations
                         | SidebarAction::OpenWork,
-                    ) => true,
+                    )
+                    | Message::AccountUi(account_ui::Action::OpenPane) => true,
                     _ => false,
                 };
             return if valid {
@@ -1437,6 +1447,17 @@ mod tests {
         use crate::work_ui::{Action as BoardAction, Watch};
         let mut renderer = super::super::tests::headless_renderer();
         let (mut app, home) = visible_workboard_fixture();
+        let mut tree = workboard_native(&app, &mut renderer);
+        let point = bounds(&tree, "List, newest first").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::WorkUi(BoardAction::Layout(
+                crate::work_ui::Layout::List
+            ))]
+        ));
+        let _ = tree.into_cache();
+        drop(app.update(messages.remove(0)));
         let queued = workboard_query_callback(&app, &mut renderer);
         drop(app.open_channel_work(home.channel));
         assert!(app.channel_work_is_main());
@@ -1551,6 +1572,666 @@ mod tests {
             bounds(&ui, "Open branch").x > before.x,
             "the same visible native Pin still moves the card to Stale"
         );
+    }
+
+    #[test]
+    fn main_work_rejects_hidden_automation_fields_and_save_but_preserves_completion_and_visible_save()
+     {
+        use crate::automation_ui::{Action as AutomationAction, Field};
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        drop(app.open_utility_card(CardKind::Automations));
+        app.automation_ui.set_choices(
+            vec![crate::automation_ui::TargetChoice {
+                label: "Fixture".into(),
+                target: crate::agent_execution::Target {
+                    repository: "/fixture".into(),
+                    directory: "/fixture".into(),
+                    placement: None,
+                },
+                defaults: Default::default(),
+            }],
+            vec![crate::automation_ui::AccountChoice {
+                label: "Synthetic Claude".into(),
+                provider: crate::agent::Provider::Claude,
+                id: crate::account::Account::system(crate::agent::Provider::Claude).id(),
+            }],
+            Default::default(),
+        );
+        app.automation_ui.update(AutomationAction::New);
+        app.automation_ui.update(AutomationAction::Field(
+            Field::Name,
+            "Fixture automation".into(),
+        ));
+        app.automation_ui
+            .update(AutomationAction::Field(Field::Timezone, "UTC".into()));
+        app.automation_ui.update(AutomationAction::Prompt(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                Arc::new("Synthetic fixture prompt; never dispatched".into()),
+            )),
+        ));
+        let queued_field = utility_input_callback(&app, &mut renderer, false, "Name", "z");
+        let mut tree = utility_native(&app, &mut renderer, false);
+        let point = bounds(&tree, "Save automation").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::AutomationUi(AutomationAction::Save)]
+        ));
+        let queued_save = messages.remove(0);
+        let before = native_field_value(&tree, "Name");
+        let _ = tree.into_cache();
+        drop(app.open_channel_work(home.channel));
+        let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+        assert!(
+            !native_labels(&tree)
+                .iter()
+                .any(|label| label == "Save automation")
+        );
+        let _ = tree.into_cache();
+        drop(app.update(queued_field));
+        drop(app.update(queued_save));
+        drop(app.update(Message::AutomationUi(AutomationAction::Tick)));
+        let tree = utility_native(&app, &mut renderer, false);
+        assert_eq!(native_field_value(&tree, "Name"), before);
+        let _ = tree.into_cache();
+        assert_eq!(
+            app.automation_ui.draft_close_blocker(),
+            Some(
+                "The automation has unsaved changes. Keep editing or discard the draft before closing the window."
+            )
+        );
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        let fresh_field = utility_input_callback(&app, &mut renderer, false, "Name", "z");
+        drop(app.update(fresh_field));
+        let mut tree = utility_native(&app, &mut renderer, false);
+        assert_ne!(native_field_value(&tree, "Name"), before);
+        let point = bounds(&tree, "Save automation").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::AutomationUi(AutomationAction::Save)]
+        ));
+        let _ = tree.into_cache();
+        // The accepted task is dropped: no daemon/provider request is polled.
+        drop(app.update(messages.remove(0)));
+        assert_eq!(
+            app.automation_ui.draft_close_blocker(),
+            Some("Wait for the automation save to finish before closing the window.")
+        );
+
+        // A request accepted while the pane was visible can finish hidden.
+        let (mut app, home) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        let Some(crate::automation_ui::Effect::Request { sequence, .. }) =
+            app.automation_ui.update(AutomationAction::Refresh)
+        else {
+            panic!("accepted fixture read")
+        };
+        drop(app.open_channel_work(home.channel));
+        drop(
+            app.update(Message::AutomationUi(AutomationAction::Received {
+                sequence,
+                result: Arc::new(Err("fixture automation read completed".into())),
+            })),
+        );
+        let tree = utility_native(&app, &mut renderer, false);
+        assert!(
+            native_labels(&tree)
+                .iter()
+                .any(|label| label == "fixture automation read completed")
+        );
+    }
+
+    #[test]
+    fn main_work_rejects_hidden_settings_fields_and_search_but_preserves_accepted_autosave() {
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = main_fixture();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Terminal)));
+        let first = utility_input_callback(&app, &mut renderer, true, "Font family", "x");
+        assert!(matches!(
+            &first,
+            Message::UtilityPaneUi(inner) if matches!(inner.as_ref(),
+                Message::SettingsDraftChanged { field: SettingsField::TerminalFontFamily, .. })
+        ));
+        drop(app.update(first));
+        let accepted = app.settings_draft.terminal_font_family.clone();
+        let (generation, _) = app.settings_pending[&SettingsField::TerminalFontFamily].clone();
+        let queued_field = utility_input_callback(&app, &mut renderer, true, "Font family", "z");
+        let queued_search =
+            utility_input_callback(&app, &mut renderer, true, "Search settings", "z");
+        assert!(matches!(&queued_search, Message::UtilityPaneUi(inner)
+            if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "z")));
+        drop(app.open_channel_work(home.channel));
+        let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+        assert!(
+            !native_labels(&tree)
+                .iter()
+                .any(|label| label == "Search settings")
+        );
+        let _ = tree.into_cache();
+        drop(app.update(queued_field));
+        drop(app.update(queued_search));
+        let tree = utility_native(&app, &mut renderer, true);
+        assert_eq!(native_field_value(&tree, "Font family"), accepted);
+        assert_eq!(native_field_value(&tree, "Search settings"), "");
+        let _ = tree.into_cache();
+        assert_eq!(
+            app.settings_pending[&SettingsField::TerminalFontFamily].0,
+            generation
+        );
+        assert!(app.settings_path.is_none());
+        // This debounce belongs to the earlier accepted visible field, not
+        // the refused hidden edit. Drop its save task without filesystem IO.
+        drop(app.update(Message::SettingsAutosave {
+            field: SettingsField::TerminalFontFamily,
+            generation,
+        }));
+        assert!(
+            !app.settings_pending
+                .contains_key(&SettingsField::TerminalFontFamily)
+        );
+        assert_eq!(app.settings.terminal_font_family, accepted);
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        let fresh = utility_input_callback(&app, &mut renderer, true, "Font family", "z");
+        drop(app.update(fresh));
+        assert_ne!(app.settings_draft.terminal_font_family, accepted);
+        let fresh = utility_input_callback(&app, &mut renderer, true, "Search settings", "z");
+        drop(app.update(fresh));
+        assert_eq!(app.settings_search, "z");
+    }
+
+    #[test]
+    fn main_work_keeps_global_shortcut_recording_but_real_dialog_owns_the_key() {
+        let (mut app, _) = main_fixture();
+        let field = SettingsField::ShortcutCommandPalette;
+        let mut renderer = super::super::tests::headless_renderer();
+        let before = app
+            .settings_draft
+            .keyboard_shortcuts
+            .command_palette
+            .clone();
+        drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
+        let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+        assert!(
+            native_labels(&tree)
+                .iter()
+                .any(|label| label == "Press a shortcut · Escape cancels")
+        );
+        let _ = tree.into_cache();
+        let mut event = match key(
+            keyboard::Key::Character("j".into()),
+            keyboard::key::Code::KeyJ,
+            None,
+        ) {
+            iced::Event::Keyboard(event) => event,
+            _ => unreachable!(),
+        };
+        if let keyboard::Event::KeyPressed { modifiers, .. } = &mut event {
+            *modifiers = keyboard::Modifiers::ALT;
+        }
+        drop(app.update(Message::KeyEvent {
+            event: event.clone(),
+            captured: false,
+        }));
+        assert!(!app.palette.is_open());
+        assert_ne!(
+            app.settings_draft.keyboard_shortcuts.command_palette,
+            before
+        );
+        assert!(
+            app.settings_draft
+                .keyboard_shortcuts
+                .command_palette
+                .contains("Alt+J")
+        );
+        assert!(app.settings_pending.contains_key(&field));
+
+        drop(app.update(Message::Palette(palette_ui::Action::Record(field))));
+        app.settings_reset_confirm = true;
+        assert!(app.modal_is_open());
+        assert!(app.dialog().is_some());
+        let before = app
+            .settings_draft
+            .keyboard_shortcuts
+            .command_palette
+            .clone();
+        let pending = app.settings_pending[&field].clone();
+        drop(app.update(Message::KeyEvent {
+            event,
+            captured: false,
+        }));
+        assert!(
+            app.palette.is_open(),
+            "the blocked key cannot consume the recording"
+        );
+        assert_eq!(
+            app.settings_draft.keyboard_shortcuts.command_palette,
+            before
+        );
+        assert_eq!(app.settings_pending[&field], pending);
+        drop(app.update(Message::CancelResetSettings));
+        assert!(!app.modal_is_open());
+    }
+
+    #[test]
+    fn visible_account_pop_out_leaves_work_only_after_the_dirty_draft_guard_accepts() {
+        let mut renderer = super::super::tests::headless_renderer();
+        for dirty in [false, true] {
+            let (mut app, _) = main_fixture();
+            if dirty {
+                dirty_native_form(&mut app, &mut renderer);
+            }
+            let id = app
+                .account_ui
+                .add_managed_fixture(crate::agent::Provider::Claude, 989);
+            drop(app.update(Message::AccountUi(account_ui::Action::Popover(Some(id)))));
+            let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+            let point =
+                workboard_popup_button(&mut tree, &renderer, "Open in the Accounts pane").center();
+            let mut messages = click(&mut tree, &mut renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::AccountUi(account_ui::Action::OpenPane)]
+            ));
+            let open = messages.remove(0);
+            let _ = tree.into_cache();
+            drop(app.update(open.clone()));
+            if dirty {
+                assert!(app.channel_work_is_main());
+                assert!(app.utility_card(&CardKind::Accounts).is_none());
+                let mut tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
+                let point = bounds(&tree, "Keep editing").center();
+                let mut messages = click(&mut tree, &mut renderer, point);
+                assert!(matches!(
+                    messages.as_slice(),
+                    [Message::ChannelWork(ui::Action::Keep(..))]
+                ));
+                let _ = tree.into_cache();
+                drop(app.update(messages.remove(0)));
+                assert!(app.channel_work_is_main());
+                assert!(app.utility_card(&CardKind::Accounts).is_none());
+                drop(app.update(open));
+                discard_native(&mut app, &mut renderer);
+            }
+            assert!(!app.channel_work_is_main());
+            let card = app
+                .utility_card(&CardKind::Accounts)
+                .expect("visible Accounts destination");
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Accounts)));
+        }
+    }
+
+    #[test]
+    fn main_work_rejects_real_account_pane_inline_callbacks_even_under_a_global_modal() {
+        use account_ui::Action as AccountAction;
+        let mut renderer = super::super::tests::headless_renderer();
+        for modal in [false, true] {
+            let (mut app, home) = main_fixture();
+            drop(app.update(Message::AccountUi(AccountAction::OpenPane)));
+            assert!(!app.channel_work_is_main());
+            let id = app
+                .account_ui
+                .add_managed_fixture(crate::agent::Provider::Claude, 992);
+            let mut tree = accounts_native(&app, &mut renderer);
+            let point = bounds(&tree, "Add account").center();
+            let mut messages = click(&mut tree, &mut renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(AccountAction::AddMenu(true)))
+            ));
+            let _ = tree.into_cache();
+            drop(app.update(messages.remove(0)));
+            let mut tree = accounts_native(&app, &mut renderer);
+            let point =
+                workboard_popup_button(&mut tree, &renderer, "Existing Claude home").center();
+            let mut messages = click(&mut tree, &mut renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(AccountAction::LinkStart(crate::agent::Provider::Claude)))
+            ));
+            let _ = tree.into_cache();
+            drop(app.update(messages.remove(0)));
+            let queued_input = account_pane_input_callback(&app, &mut renderer);
+            assert!(
+                matches!(&queued_input, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::AccountUi(AccountAction::LinkInput(value)) if value == "z"))
+            );
+            let mut tree = accounts_native(&app, &mut renderer);
+            let point = bounds(&tree, "Cancel").center();
+            let mut messages = click(&mut tree, &mut renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(AccountAction::LinkCancel))
+            ));
+            let queued_cancel = messages.remove(0);
+            let _ = tree.into_cache();
+            // Start a real adapter probe but never poll its returned task.
+            drop(app.update(Message::AccountUi(AccountAction::Refresh(id.clone()))));
+            let probe_owner = app.account_ui.probe_owner(&id).unwrap();
+            drop(app.open_channel_work(home.channel));
+            if modal {
+                drop(app.update(Message::DaemonHealth(
+                    crate::daemon_health::State::Unreachable {
+                        since: std::time::SystemTime::UNIX_EPOCH,
+                    },
+                )));
+                drop(app.update(Message::DaemonHealthUi(daemon_health_ui::Action::Open)));
+                assert!(app.modal_is_open());
+                assert!(app.dialog().is_some());
+            }
+            let before = (
+                app.workspace.focused(),
+                app.channel_work.view.owner(),
+                app.default_account(crate::agent::Provider::Claude).id(),
+            );
+            drop(app.update(queued_input));
+            drop(app.update(queued_cancel));
+            let tree = accounts_native(&app, &mut renderer);
+            assert_eq!(
+                native_field_value(&tree, "Absolute path to the provider home"),
+                ""
+            );
+            assert!(
+                native_labels(&tree)
+                    .iter()
+                    .any(|label| label == "Use an existing Claude home")
+            );
+            let _ = tree.into_cache();
+            assert_eq!(
+                (
+                    app.workspace.focused(),
+                    app.channel_work.view.owner(),
+                    app.default_account(crate::agent::Provider::Claude).id()
+                ),
+                before
+            );
+            // Accepted completion remains AccountUi, not pane-origin input.
+            drop(app.update(Message::AccountUi(AccountAction::Probed {
+                owner: probe_owner,
+                id: id.clone(),
+                outcome: crate::account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: crate::account::UsageSnapshot::state(
+                        crate::account::UsageStatus::Unavailable,
+                        "fixture completion",
+                        1_000,
+                    ),
+                },
+            })));
+            let snapshot = app.account_ui.snapshot_for_test(&id).unwrap();
+            assert_eq!(snapshot.observed_at, 1_000);
+            assert_eq!(snapshot.detail.as_deref(), Some("fixture completion"));
+            if modal {
+                drop(app.update(Message::DaemonHealthUi(daemon_health_ui::Action::Cancel)));
+                assert!(!app.modal_is_open());
+            }
+            let owner = app.channel_work.view.owner().unwrap();
+            drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+            assert!(!app.channel_work_is_main());
+            let fresh = account_pane_input_callback(&app, &mut renderer);
+            drop(app.update(fresh));
+            let mut tree = accounts_native(&app, &mut renderer);
+            assert_eq!(
+                native_field_value(&tree, "Absolute path to the provider home"),
+                "z"
+            );
+            let point = bounds(&tree, "Cancel").center();
+            let mut messages = click(&mut tree, &mut renderer, point);
+            assert!(matches!(
+                messages.as_slice(),
+                [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(AccountAction::LinkCancel))
+            ));
+            let _ = tree.into_cache();
+            drop(app.update(messages.remove(0)));
+            let tree = accounts_native(&app, &mut renderer);
+            assert!(
+                !native_labels(&tree)
+                    .iter()
+                    .any(|label| label == "Use an existing Claude home")
+            );
+        }
+    }
+
+    #[test]
+    fn main_work_rejects_real_settings_account_and_record_callbacks_but_visible_controls_survive() {
+        use account_ui::Action as AccountAction;
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = main_fixture();
+        let provider = crate::agent::Provider::Claude;
+        let id = app.account_ui.add_managed_fixture(provider, 993);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Accounts)));
+        let before = app.default_account(provider).id();
+        assert_ne!(before, id);
+        let queued_choice = settings_account_choice_callback(&app, &mut renderer, &id);
+        assert!(
+            matches!(&queued_choice, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::AccountUi(AccountAction::SetDefault(actual)) if *actual == id))
+        );
+        let mut tree = utility_native(&app, &mut renderer, true);
+        let point = bounds(&tree, "Open Accounts").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(AccountAction::OpenPane))
+        ));
+        let queued_open = messages.remove(0);
+        let _ = tree.into_cache();
+        drop(app.open_channel_work(home.channel));
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(queued_choice));
+        drop(app.update(queued_open));
+        assert_eq!(app.default_account(provider).id(), before);
+        assert!(app.channel_work_is_main());
+        assert_eq!(app.channel_work.view.owner(), Some(owner));
+        assert!(app.utility_card(&CardKind::Accounts).is_none());
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        let fresh = settings_account_choice_callback(&app, &mut renderer, &id);
+        drop(app.update(fresh));
+        // The standard App fixture has no account Store: this changes only
+        // its synthetic in-memory registry, never a real default/config file.
+        assert_eq!(app.default_account(provider).id(), id);
+
+        // The same pane root also owns shared global-message constructors.
+        // Record is a Palette action, not a Settings or Account action.
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
+        drop(app.update(Message::SettingsSearchChanged("Command palette".into())));
+        let mut tree = utility_native(&app, &mut renderer, true);
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(
+            matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
+            if matches!(inner.as_ref(), Message::Palette(palette_ui::Action::Record(SettingsField::ShortcutCommandPalette))))
+        );
+        let queued_record = messages.remove(0);
+        let _ = tree.into_cache();
+        drop(app.open_channel_work(home.channel));
+        drop(app.update(queued_record));
+        assert!(!app.palette.is_open());
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
+        let mut tree = utility_native(&app, &mut renderer, true);
+        let point = bounds(&tree, "Record shortcut for Command palette").center();
+        let mut messages = click(&mut tree, &mut renderer, point);
+        assert!(
+            matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
+            if matches!(inner.as_ref(), Message::Palette(palette_ui::Action::Record(SettingsField::ShortcutCommandPalette))))
+        );
+        let _ = tree.into_cache();
+        drop(app.update(messages.remove(0)));
+        assert!(app.palette.is_open());
+        drop(app.update(Message::Palette(palette_ui::Action::Close)));
+        let before = app.settings_search.clone();
+        drop(
+            app.update(Message::UtilityPaneUi(Box::new(Message::UtilityPaneUi(
+                Box::new(Message::SettingsSearchChanged(
+                    "nested envelope must not dispatch".into(),
+                )),
+            )))),
+        );
+        assert_eq!(app.settings_search, before);
+    }
+
+    fn accounts_native<'a>(app: &'a Cagents, renderer: &mut cosmic::Renderer) -> Native<'a> {
+        let mut tree = iced::runtime::UserInterface::build(
+            app.accounts_pane(),
+            iced::Size::new(1_400.0, 1_600.0),
+            Cache::new(),
+            renderer,
+        );
+        tree.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        tree
+    }
+
+    fn account_pane_input_callback(app: &Cagents, renderer: &mut cosmic::Renderer) -> Message {
+        let mut tree = accounts_native(app, renderer);
+        let point = bounds(&tree, "Absolute path to the provider home").center();
+        assert!(click(&mut tree, renderer, point).is_empty());
+        let mut messages = events(
+            &mut tree,
+            renderer,
+            &[key(
+                keyboard::Key::Character("z".into()),
+                keyboard::key::Code::KeyZ,
+                Some("z"),
+            )],
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::LinkInput(_)))
+        ));
+        messages.remove(0)
+    }
+
+    fn settings_account_choice_callback(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        id: &crate::account::AccountId,
+    ) -> Message {
+        let choices = app.default_account_choices();
+        let (_, choices) = choices
+            .iter()
+            .find(|(provider, _)| *provider == crate::agent::Provider::Claude)
+            .unwrap();
+        let index = choices.iter().position(|choice| choice.id == *id).unwrap() + 1;
+        let mut tree = utility_native(app, renderer, true);
+        let label = bounds(&tree, "Claude");
+        // The pinned COSMIC Dropdown exposes neither AX nor Operation bounds.
+        // Derive its adjacent native row from the actual heading and the
+        // shared field geometry, then require the exact real emitted callback.
+        let inset = (design::DENSE_ROW_HEIGHT - 18.0) / 2.0;
+        let row_height = 1.2 * design::TEXT_BODY + 2.0 * inset;
+        let top = label.y + label.height + space::XS;
+        let point = iced::Point::new(label.x + space::S, top + row_height / 2.0);
+        assert!(click(&mut tree, renderer, point).is_empty());
+        // Dropdown's overlay List has the same row height and a native
+        // container padding. Its index0 is Automatic; account indices follow.
+        let point = iced::Point::new(
+            point.x + space::S,
+            top + row_height + inset + (index as f32 + 0.5) * row_height,
+        );
+        let mut messages = click(&mut tree, renderer, point);
+        assert!(
+            matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(), Message::AccountUi(account_ui::Action::SetDefault(actual)) if actual == id))
+        );
+        messages.remove(0)
+    }
+
+    fn utility_native<'a>(
+        app: &'a Cagents,
+        renderer: &mut cosmic::Renderer,
+        settings: bool,
+    ) -> Native<'a> {
+        let content = if settings {
+            settings_ui::settings_pane(
+                app.settings_category,
+                &app.settings_draft,
+                &app.settings_search,
+                settings_ui::SettingsContext {
+                    feedback: app.settings_feedback.as_ref(),
+                    invalid: &app.settings_invalid,
+                    accounts: app.default_account_choices(),
+                    updates: app.update_summary(),
+                    testing_notification: app.notification_ui.testing,
+                },
+            )
+        } else {
+            app.automation_ui.view().map(Message::AutomationUi)
+        };
+        let mut tree = iced::runtime::UserInterface::build(
+            content,
+            iced::Size::new(1_400.0, 1_600.0),
+            Cache::new(),
+            renderer,
+        );
+        tree.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+        tree
+    }
+
+    fn native_field_value(tree: &Native<'_>, label: &str) -> String {
+        let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label) && node.node().value().is_some())
+            .unwrap_or_else(|| panic!("missing mounted native field {label}"))
+            .node()
+            .value()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn utility_input_callback(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        settings: bool,
+        label: &str,
+        value: &str,
+    ) -> Message {
+        let mut tree = utility_native(app, renderer, settings);
+        let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let b = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label) && node.node().value().is_some())
+            .unwrap_or_else(|| panic!("missing mounted native input {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        let point = iced::Point::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        assert!(click(&mut tree, renderer, point).is_empty());
+        let mut messages = events(
+            &mut tree,
+            renderer,
+            &[key(
+                keyboard::Key::Character(value.into()),
+                keyboard::key::Code::KeyZ,
+                Some(value),
+            )],
+            iced::mouse::Cursor::Unavailable,
+        );
+        assert_eq!(messages.len(), 1, "one actual field callback for {label}");
+        messages.remove(0)
     }
 
     fn workboard_snapshot(branch: &str) -> Arc<crate::work::Board> {

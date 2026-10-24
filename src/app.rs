@@ -4585,6 +4585,7 @@ pub enum Message {
     DaemonHealth(crate::daemon_health::State),
     DaemonHealthUi(daemon_health_ui::Action),
     AccountUi(account_ui::Action),
+    UtilityPaneUi(Box<Message>),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
@@ -14074,6 +14075,12 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Pane callbacks retain their rendering origin while queued. Unwrap
+        // once before all message-dependent policy and completion bookkeeping.
+        let (message, pane_origin) = match message {
+            Message::UtilityPaneUi(message) => (*message, true),
+            message => (message, false),
+        };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14086,6 +14093,9 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if pane_origin && self.channel_work_is_main() {
+            return Task::none();
+        }
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -17211,6 +17221,7 @@ impl Application for Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
+            Message::UtilityPaneUi(_) => Task::none(),
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),

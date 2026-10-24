@@ -4942,8 +4942,15 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self)
+        table::view(self).map(pane_message)
     }
+}
+
+/// Preserve every callback's pane origin, including responsive children and
+/// overlays. Shared global controls and accepted task completions are not
+/// wrapped: only these completed workspace pane views use this boundary.
+pub(super) fn pane_message(message: Message) -> Message {
+    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {

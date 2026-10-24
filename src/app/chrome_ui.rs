@@ -388,7 +388,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let before = rename_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(before.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
 
             let open = app.update_chrome(Action::Rename(card));
@@ -399,7 +399,7 @@ mod tests {
             assert!(
                 !during
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
             let close = match dismissal {
@@ -428,7 +428,7 @@ mod tests {
             );
             let after = rename_fixture_step(&app, &mut tree, &renderer, close, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
         }
     }
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(state.title_source, ChannelTitleSource::Manual);
         let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -498,7 +498,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
@@ -519,7 +519,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
