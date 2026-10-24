@@ -14591,7 +14591,7 @@ mod tests {
             assert!(detail.contains(expected), "{replacement}: {detail}");
             assert!(runtime.is_dirty() && runtime.blocks_navigation());
             assert!(
-                matches!(runtime.take_lsp_intents().as_slice(), [LspIntent::Open { text, version: open_version, .. }] if text == &edited && *open_version == version)
+                matches!(runtime.take_lsp_intents().as_slice(), [LspIntent::Open { text, version: open_version, .. }] if text == &LspChangeText::from(edited.as_str()) && *open_version == version)
             );
             drop(runtime.update(RepositoryAction::Undo { card }));
             assert_eq!(
