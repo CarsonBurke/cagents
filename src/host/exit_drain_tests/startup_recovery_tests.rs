@@ -86,11 +86,33 @@ fn origin_body(root: &Path, count: usize) {
     drop(handles);
 }
 
+fn assert_waitable_child_signal() {
+    // A handler could add an unrelated Host poll wake, and NOCLDWAIT would
+    // discard the status this fixture must actually reap. Observe, never reset.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) },
+        0
+    );
+    assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+    assert_eq!(action.sa_flags & libc::SA_NOCLDWAIT, 0);
+}
+
 fn foreign_originals(
     root: &Path,
     name: &str,
     count: usize,
 ) -> (Vec<Original>, Vec<(OriginalPin, OriginalPin)>) {
+    // This function runs only in the exact private_runtime self-child. Become
+    // the reaper of this fixture's orphaned holder before its separate origin
+    // exits; namespace init is not obligated to wait within our test deadline.
+    // This creates no child_reaper reservation or caller-local cleanup credit.
+    assert!(std::env::var_os(ROOT).is_some());
+    assert_waitable_child_signal();
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
     let stdout = root.join("origin.stdout");
     let stderr = root.join("origin.stderr");
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -130,6 +152,19 @@ fn foreign_originals(
     );
     assert!(out.contains(&format!("test {name} ... ok")));
     assert!(out.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    for original in &originals {
+        assert_eq!(
+            Process::read(original.owner.holder.pid).unwrap(),
+            original.owner.holder
+        );
+        let stat = fs::read_to_string(format!("/proc/{}/stat", original.owner.holder.pid)).unwrap();
+        let fields = stat.rsplit_once(')').unwrap().1.split_whitespace();
+        assert_eq!(
+            fields.skip(1).next().unwrap().parse::<u32>().unwrap(),
+            std::process::id(),
+            "the isolated fixture must own its orphaned holder's final wait"
+        );
+    }
     assert!(
         !child_reaper::has_outstanding_ownership(),
         "foreign original is not a caller-local reaper credit"
@@ -230,13 +265,36 @@ fn stale_close_is_refused(paths: &RuntimePaths, original: &Original) {
 }
 
 fn prove_foreign_reaped(pin: &mut OriginalPin) {
-    // The foreign holder is reparented when the origin fixture exits. Its
-    // actual exit can precede init's wait; retain the strict disappearance
-    // oracle while allowing that independently scheduled reap to complete.
-    wait_for(|| match Process::read(pin.process.pid) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-        Ok(current) => current != pin.process,
-        Err(error) => panic!("original reaping could not be observed: {error}"),
+    assert_waitable_child_signal();
+    // The original root is normally reaped by its holder. The holder becomes
+    // this isolated fixture's child when the foreign origin exits. Consume only
+    // that captured original's status, never an arbitrary child or reused PID.
+    wait_for(|| {
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pin.pidfd.as_raw_fd() as libc::id_t,
+                &mut status,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            let observed = unsafe { status.si_pid() };
+            assert!(observed == 0 || observed == pin.process.pid);
+        } else {
+            let error = io::Error::last_os_error();
+            assert!(
+                error.raw_os_error() == Some(libc::ECHILD)
+                    || error.kind() == io::ErrorKind::Interrupted,
+                "exact foreign original wait failed: {error}"
+            );
+        }
+        match Process::read(pin.process.pid) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Ok(current) => current != pin.process,
+            Err(error) => panic!("original reaping could not be observed: {error}"),
+        }
     });
     pin.prove_reaped();
 }

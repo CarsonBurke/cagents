@@ -681,9 +681,9 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
             .is_ok_and(|command| command.trim() == "sleep")
     };
 
-    // A genuinely fatal failure still retains the whole checkpoint for a
-    // rollback, and records nothing as unattached: a session the candidate
-    // could not start stands in for anything its predecessor might restore.
+    // A fatal failure after original adoption retains that exact ownership
+    // and the whole Restoring checkpoint for explicit recovery. It records
+    // nothing as unattached and never makes an automatic replay safe.
     let mut failing = checkpoint.clone();
     failing.terminals.push(relaunch(
         TerminalId::new(),
@@ -694,12 +694,45 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         },
     ));
     store().save(&failing).unwrap();
+    let mut expected_retained: serde_json::Value =
+        serde_json::from_slice(&fs::read(store().path).unwrap()).unwrap();
     let candidate = replace_daemon("candidate");
     let failure =
         restore_upgrade_from(&candidate, store(), &empty_proc, Some(&holders)).unwrap_err();
-    assert!(failure.starts_with("Upgrade restore failed"), "{failure}");
+    assert!(
+        failure.starts_with("Upgrade restore retained original ownership:"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("terminal dimensions or scrollback are outside supported bounds"),
+        "the invalid-dimensions negative must remain the failure: {failure}"
+    );
     let retained = store().load().unwrap().unwrap();
-    assert_eq!(retained.phase, Phase::Ready);
+    assert_eq!(retained.phase, Phase::Restoring);
+    expected_retained["phase"] = serde_json::to_value(Phase::Restoring).unwrap();
+    let actual_retained: serde_json::Value =
+        serde_json::from_slice(&fs::read(store().path).unwrap()).unwrap();
+    assert_eq!(
+        actual_retained, expected_retained,
+        "the entire checkpoint payload changes only to Restoring"
+    );
+    {
+        let state = candidate.lock().unwrap();
+        assert!(
+            state
+                .startup_recovery()
+                .is_some_and(|detail| detail == failure.as_str()),
+            "the failed candidate retains reachable recovery-only ownership"
+        );
+        assert_eq!(state.terminals.len(), terminals.len());
+        for &(terminal, pid) in &terminals {
+            let handle = &state.terminals[&terminal].handle;
+            let owner = handle.holder_identity().unwrap();
+            assert_eq!(owner.root.pid, pid, "the candidate owns the same original");
+            assert!(owner.root.is_current());
+            assert!(!handle.is_completed());
+        }
+    }
     assert_eq!(retained.chats.len(), 1);
     assert!(store().unattached().unwrap().is_empty());
     assert!(!store().unattached_path().exists());
