@@ -1861,7 +1861,7 @@ impl Worker {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: current_size.columns,
             rows: current_size.rows,
-            max_scrollback: config.max_scrollback,
+            max_scrollback: config.max_scrollback_bytes,
         })
         .map_err(|error| format!("create Ghostty terminal: {error}"))?;
         apply_theme(&mut terminal, config.theme)
@@ -4341,6 +4341,36 @@ mod tests {
         let local = published.prepare_search(None, 1);
         assert_eq!(published.searches.lock().unwrap().len(), 1);
         assert_eq!(local.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn default_scrollback_byte_budget_retains_over_ten_thousand_rows() {
+        let config = TerminalConfig::default();
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: config.columns,
+            rows: config.rows,
+            max_scrollback: config.max_scrollback_bytes,
+        })
+        .unwrap();
+        terminal.vt_write(&b"output\r\n".repeat(20_000));
+        assert!(terminal.scrollbar().unwrap().total > 10_000);
+    }
+
+    #[test]
+    fn scrollback_byte_budget_changes_retained_history() {
+        let retained = |budget| {
+            let mut terminal = Terminal::new(TerminalOptions {
+                cols: 80,
+                rows: 24,
+                max_scrollback: budget,
+            })
+            .unwrap();
+            terminal.vt_write(&b"output\r\n".repeat(20_000));
+            terminal.scrollbar().unwrap().total
+        };
+        let low = retained(2 * 1024 * 1024);
+        let high = retained(TerminalConfig::default().max_scrollback_bytes);
+        assert!(high > low * 2, "low={low}, high={high}");
     }
 
     #[test]
@@ -7073,7 +7103,7 @@ mod tests {
                 environment: BTreeMap::new(),
             },
             TerminalConfig {
-                max_scrollback: 4_000_000,
+                max_scrollback_bytes: 4_000_000,
                 ..TerminalConfig::default()
             },
         );
