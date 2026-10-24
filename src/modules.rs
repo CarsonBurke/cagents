@@ -30,6 +30,8 @@ pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
