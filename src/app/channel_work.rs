@@ -1524,6 +1524,71 @@ mod tests {
         }
 
         #[test]
+        fn repository_full_url_typing_preserves_every_native_character_and_exact_submit_target() {
+            const URL: &str = "https://github.com/NativeFixtureFork/cagents/pull/1568";
+            assert_eq!(URL.len(), 54);
+            let (mut app, home) = main_fixture();
+            app.window_width = 1280.0;
+            app.window_height = 900.0;
+            app.core.set_main_window_id(Some(window::Id::RESERVED));
+            let owner = app.channel_work.view.owner().unwrap();
+            assert!(matches!(
+                app.channel_work.view.update(ui::Action::Attach(owner)),
+                Some(Effect::Focus { .. })
+            ));
+            let mut renderer = super::super::super::tests::headless_renderer();
+            let mut frame = mount(&app, Cache::new(), &mut renderer);
+            let repository = input(&mut frame, &renderer, "-repo");
+            let point = probe(&mut frame, &renderer)
+                .0
+                .iter()
+                .find(|node| node.id.as_ref().is_some_and(|id| same(id, &repository)))
+                .unwrap()
+                .bounds
+                .center();
+            assert!(click(&mut frame, &mut renderer, point).is_empty());
+            let cache = frame.into_cache();
+            let mut form = None;
+            // Each actual widget callback goes through App::update and the
+            // full frame is rebuilt from Cache before typing the next byte.
+            // In particular /pull/1 must not replace the field before 568.
+            let cache = repository_characters(
+                &mut app,
+                cache,
+                &mut renderer,
+                &repository,
+                &mut form,
+                "",
+                URL,
+            );
+            let mut frame = mount(&app, cache, &mut renderer);
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            assert_eq!(repository_state(&frame), (URL.into(), 54, 54));
+            let (_, submit) = labelled(&mut frame, &renderer, "Track PR");
+            let messages = click(&mut frame, &mut renderer, submit.center());
+            let _ = frame.into_cache();
+            let expected = crate::channel_work::Target::PullRequest(
+                crate::github_identity::PullRequestKey::from_url(URL).unwrap(),
+            )
+            .canonicalized()
+            .unwrap();
+            assert!(
+                matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Submit { owner: actual, target, role: crate::channel_work::Role::Contribute, revision: 0 }))] if Some(*actual) == form && target == &expected),
+                "the complete typed fork/number must be the only Submit: {messages:?}"
+            );
+            assert_eq!(app.channel_work.view.home(), Some(home));
+            assert!(app.channel_work.view.pending_homes().next().is_none());
+            let cosmic::Action::App(message) = messages.into_iter().next().unwrap() else {
+                unreachable!()
+            };
+            drop(app.update(message));
+            assert_eq!(
+                app.channel_work.view.pending_homes().collect::<Vec<_>>(),
+                vec![home]
+            );
+        }
+
+        #[test]
         fn repository_native_focus_and_selection_survive_poll_loading_and_matching_reply() {
             const URL: &str = "https://github.com/NativeFixtureFork/cagents/pull/1568";
             const PREFIX: &str = "https://github.com/NativeFixtureFork/cagents/p";
@@ -1586,8 +1651,8 @@ mod tests {
             );
             assert_eq!(repository_state(&frame), (PREFIX.into(), 46, 46));
             let cache = frame.into_cache();
-            // /pull/ remains incomplete. Typing the first numeric PR digit
-            // enters the current URL-normalization path, a separate UX issue.
+            // Keep this poll diagnostic at the incomplete /pull/ boundary.
+            // The separate full-URL typing parent covers all numeric digits.
             let cache = repository_characters(
                 &mut app,
                 cache,
@@ -1668,7 +1733,7 @@ mod tests {
             drop(app.update(message));
             let mut frame = mount(&app, cache, &mut renderer);
             assert!(same(&active(&mut frame, &renderer), &repository));
-            assert_eq!(repository_state(&frame).0, "nativefixturefork/cagents");
+            assert_eq!(repository_state(&frame).0, URL);
             let (_, submit) = labelled(&mut frame, &renderer, "Track PR");
             let messages = click(&mut frame, &mut renderer, submit.center());
             let _ = frame.into_cache();
