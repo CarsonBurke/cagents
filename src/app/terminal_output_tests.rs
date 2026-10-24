@@ -1005,9 +1005,19 @@ fn unchanged_agent_output_reuses_ownership_and_topology_rebinds_attention() {
         assert!(OWNER_RESOLUTIONS.get() > 0, "{state:?}");
         assert_eq!(counts(), (1, 1), "{state:?}");
         assert_eq!(
-            app.sidebar_state.agent_activity(second, second_row),
-            Some(state)
+            app.sidebar_state.card_activity(card),
+            Some(Activity { state, ..working }),
+            "exact per-card activity survives every transition, including Idle"
         );
+        // Worktree attention aggregates Working/Waiting, not idle agents.
+        // Idle remains an exact per-card observation and does not read news.
+        assert_eq!(
+            app.sidebar_state.agent_activity(second, second_row),
+            matches!(state, ActivityState::Working | ActivityState::Waiting).then_some(state)
+        );
+        assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
+        assert!(!app.sidebar_state.has_agent_update(first, first_row));
+        assert!(app.sidebar_state.has_agent_update(second, second_row));
         assert_eq!(peer.handle.proof(), proof);
     }
     assert!(matches!(
