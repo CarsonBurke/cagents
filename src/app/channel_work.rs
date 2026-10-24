@@ -1612,16 +1612,28 @@ mod tests {
                 Arc::new("Synthetic fixture prompt; never dispatched".into()),
             )),
         ));
-        let queued_field = utility_input_callback(&app, &mut renderer, false, "Name", "z");
+        app.automation_ui.update(AutomationAction::Prompt(
+            iced::widget::text_editor::Action::SelectAll,
+        ));
+        let queued_field = utility_input_callbacks(&app, &mut renderer, false, "Name", "z");
         let mut tree = utility_native(&app, &mut renderer, false);
         let point = bounds(&tree, "Save automation").center();
-        let mut messages = click(&mut tree, &mut renderer, point);
-        assert!(matches!(
-            messages.as_slice(),
-            [Message::AutomationUi(AutomationAction::Save)]
-        ));
-        let queued_save = messages.remove(0);
+        let queued_save = click(&mut tree, &mut renderer, point);
+        assert!(
+            matches!(
+                queued_save.as_slice(),
+                [
+                    Message::AutomationUi(AutomationAction::Prompt(
+                        iced::widget::text_editor::Action::ClearSelection
+                    )),
+                    Message::AutomationUi(AutomationAction::Save),
+                ]
+            ),
+            "exact queued Save click callbacks: {queued_save:?}"
+        );
         let before = native_field_value(&tree, "Name");
+        let prompt_selection = automation_prompt_selection(&tree);
+        assert_ne!(prompt_selection.0, prompt_selection.1);
         let _ = tree.into_cache();
         drop(app.open_channel_work(home.channel));
         let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
@@ -1631,11 +1643,16 @@ mod tests {
                 .any(|label| label == "Save automation")
         );
         let _ = tree.into_cache();
-        drop(app.update(queued_field));
-        drop(app.update(queued_save));
+        for message in queued_field {
+            drop(app.update(message));
+        }
+        for message in queued_save {
+            drop(app.update(message));
+        }
         drop(app.update(Message::AutomationUi(AutomationAction::Tick)));
         let tree = utility_native(&app, &mut renderer, false);
         assert_eq!(native_field_value(&tree, "Name"), before);
+        assert_eq!(automation_prompt_selection(&tree), prompt_selection);
         let _ = tree.into_cache();
         assert_eq!(
             app.automation_ui.draft_close_blocker(),
@@ -1645,19 +1662,33 @@ mod tests {
         );
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
-        let fresh_field = utility_input_callback(&app, &mut renderer, false, "Name", "z");
-        drop(app.update(fresh_field));
+        let fresh_field = utility_input_callbacks(&app, &mut renderer, false, "Name", "z");
+        for message in fresh_field {
+            drop(app.update(message));
+        }
         let mut tree = utility_native(&app, &mut renderer, false);
         assert_ne!(native_field_value(&tree, "Name"), before);
+        let prompt_selection = automation_prompt_selection(&tree);
+        assert_eq!(prompt_selection.0, prompt_selection.1);
         let point = bounds(&tree, "Save automation").center();
-        let mut messages = click(&mut tree, &mut renderer, point);
-        assert!(matches!(
-            messages.as_slice(),
-            [Message::AutomationUi(AutomationAction::Save)]
-        ));
+        let messages = click(&mut tree, &mut renderer, point);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    Message::AutomationUi(AutomationAction::Prompt(
+                        iced::widget::text_editor::Action::ClearSelection
+                    )),
+                    Message::AutomationUi(AutomationAction::Save),
+                ]
+            ),
+            "exact visible Save click callbacks: {messages:?}"
+        );
         let _ = tree.into_cache();
-        // The accepted task is dropped: no daemon/provider request is polled.
-        drop(app.update(messages.remove(0)));
+        // Accepted tasks are dropped: no daemon/provider request is polled.
+        for message in messages {
+            drop(app.update(message));
+        }
         assert_eq!(
             app.automation_ui.draft_close_blocker(),
             Some("Wait for the automation save to finish before closing the window.")
@@ -1695,20 +1726,24 @@ mod tests {
         let (mut app, home) = main_fixture();
         drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
         drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Terminal)));
-        let first = utility_input_callback(&app, &mut renderer, true, "Font family", "x");
+        let first = utility_input_callbacks(&app, &mut renderer, true, "Font family", "x");
         assert!(matches!(
-            &first,
-            Message::UtilityPaneUi(inner) if matches!(inner.as_ref(),
+            first.as_slice(),
+            [Message::UtilityPaneUi(inner)] if matches!(inner.as_ref(),
                 Message::SettingsDraftChanged { field: SettingsField::TerminalFontFamily, .. })
         ));
-        drop(app.update(first));
+        for message in first {
+            drop(app.update(message));
+        }
         let accepted = app.settings_draft.terminal_font_family.clone();
         let (generation, _) = app.settings_pending[&SettingsField::TerminalFontFamily].clone();
-        let queued_field = utility_input_callback(&app, &mut renderer, true, "Font family", "z");
+        let queued_field = utility_input_callbacks(&app, &mut renderer, true, "Font family", "z");
         let queued_search =
-            utility_input_callback(&app, &mut renderer, true, "Search settings", "z");
-        assert!(matches!(&queued_search, Message::UtilityPaneUi(inner)
-            if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "z")));
+            utility_input_callbacks(&app, &mut renderer, true, "Search settings", "z");
+        assert!(
+            matches!(queued_search.as_slice(), [Message::UtilityPaneUi(inner)]
+            if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "z"))
+        );
         drop(app.open_channel_work(home.channel));
         let tree = native(&app, Cache::new(), &mut renderer, 1_400.0);
         assert!(
@@ -1717,8 +1752,12 @@ mod tests {
                 .any(|label| label == "Search settings")
         );
         let _ = tree.into_cache();
-        drop(app.update(queued_field));
-        drop(app.update(queued_search));
+        for message in queued_field {
+            drop(app.update(message));
+        }
+        for message in queued_search {
+            drop(app.update(message));
+        }
         let tree = utility_native(&app, &mut renderer, true);
         assert_eq!(native_field_value(&tree, "Font family"), accepted);
         assert_eq!(native_field_value(&tree, "Search settings"), "");
@@ -1741,11 +1780,15 @@ mod tests {
         assert_eq!(app.settings.terminal_font_family, accepted);
         let owner = app.channel_work.view.owner().unwrap();
         drop(app.update(Message::ChannelWork(ui::Action::Close(owner))));
-        let fresh = utility_input_callback(&app, &mut renderer, true, "Font family", "z");
-        drop(app.update(fresh));
+        let fresh = utility_input_callbacks(&app, &mut renderer, true, "Font family", "z");
+        for message in fresh {
+            drop(app.update(message));
+        }
         assert_ne!(app.settings_draft.terminal_font_family, accepted);
-        let fresh = utility_input_callback(&app, &mut renderer, true, "Search settings", "z");
-        drop(app.update(fresh));
+        let fresh = utility_input_callbacks(&app, &mut renderer, true, "Search settings", "z");
+        for message in fresh {
+            drop(app.update(message));
+        }
         assert_eq!(app.settings_search, "z");
     }
 
@@ -2233,14 +2276,36 @@ mod tests {
             .to_owned()
     }
 
-    fn utility_input_callback(
+    fn automation_prompt_selection(tree: &Native<'_>) -> (usize, usize) {
+        let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let selection = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some("Automation instructions"))
+            .expect("mounted instructions editor")
+            .node()
+            .text_selection()
+            .expect("instructions editor exposes its selection");
+        assert_eq!(
+            selection.anchor.node, selection.focus.node,
+            "single-line fixture prompt"
+        );
+        (
+            selection.anchor.character_index,
+            selection.focus.character_index,
+        )
+    }
+
+    fn utility_input_callbacks(
         app: &Cagents,
         renderer: &mut cosmic::Renderer,
         settings: bool,
         label: &str,
         value: &str,
-    ) -> Message {
+    ) -> Vec<Message> {
         let mut tree = utility_native(app, renderer, settings);
+        let expected_value = format!("{}{value}", native_field_value(&tree, label));
         let nodes = tree.a11y_nodes(iced::mouse::Cursor::Unavailable);
         let id = nodes
             .root()
@@ -2257,7 +2322,7 @@ mod tests {
             renderer,
             &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
         );
-        let mut messages = events(
+        let messages = events(
             &mut tree,
             renderer,
             &[key(
@@ -2267,12 +2332,33 @@ mod tests {
             )],
             iced::mouse::Cursor::Unavailable,
         );
-        assert_eq!(
-            messages.len(),
-            1,
-            "one actual field callback for {label}, typed {value:?}; all emitted messages: {messages:?}"
+        let expected = if settings {
+            match label {
+                "Font family" => matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
+                    if matches!(inner.as_ref(), Message::SettingsDraftChanged {
+                        field: SettingsField::TerminalFontFamily, value
+                    } if value == &expected_value)),
+                "Search settings" => matches!(messages.as_slice(), [Message::UtilityPaneUi(inner)]
+                    if matches!(inner.as_ref(), Message::SettingsSearchChanged(value)
+                        if value == &expected_value)),
+                _ => panic!("unsupported mounted Settings field {label}"),
+            }
+        } else {
+            assert_eq!(label, "Name");
+            // Focusing Name also unfocuses the instructions editor. Its next
+            // update publishes the pending ClearSelection; keep that callback.
+            matches!(messages.as_slice(), [
+                Message::AutomationUi(crate::automation_ui::Action::Field(
+                    crate::automation_ui::Field::Name, value)),
+                Message::AutomationUi(crate::automation_ui::Action::Prompt(
+                    iced::widget::text_editor::Action::ClearSelection)),
+            ] if value == &expected_value)
+        };
+        assert!(
+            expected,
+            "exact actual callbacks for {label}, typed {value:?}; all emitted messages: {messages:?}"
         );
-        messages.remove(0)
+        messages
     }
 
     fn workboard_snapshot(branch: &str) -> Arc<crate::work::Board> {
