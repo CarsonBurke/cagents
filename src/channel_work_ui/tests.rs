@@ -1603,7 +1603,9 @@ fn narrow_home_keeps_wrapped_channel_identity_outside_scroll_and_partial_page_cl
             actual.height - rendered.height,
         ];
         assert!(
-            differences.iter().all(|difference| difference.abs() <= 0.01),
+            differences
+                .iter()
+                .all(|difference| difference.abs() <= 0.01),
             "the named accessible control must match its painted and hit-tested bounds: {actual:?} vs {rendered:?}"
         );
     }
