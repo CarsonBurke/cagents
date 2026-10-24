@@ -2718,7 +2718,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         Message::ChannelWork(action) => !action.background(),
-        Message::OpenChannelWork(_) | Message::ChannelWorkEscape => true,
+        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2836,6 +2836,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 ..
             }
             | Message::ToggleContextInspector
+            | Message::OpenChannelWork(_)
+            | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
             | Message::Sidebar(
@@ -4586,6 +4588,7 @@ pub enum Message {
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
     OpenChannelWork(ChannelId),
+    ChannelWorkNavigation(channel_work::Navigation),
     ChannelWorkPoll,
     ChannelWorkEscape,
     AutomationApproval(automation_approval::Action),
@@ -11970,7 +11973,8 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+        !self.channel_work_is_main()
+            && (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
             && (self.context_inspector_open || self.context_inspector_transition.is_some())
     }
 
@@ -12075,6 +12079,12 @@ impl Cagents {
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
+        self.channel_work_is_main() || self.shell_inputs_blocked()
+    }
+
+    // Shell navigation remains usable over main Work without admitting input
+    // to the conversation panes it replaces.
+    fn shell_inputs_blocked(&self) -> bool {
         self.modal_is_open()
             || self.context_inspector_is_overlay()
             || self.chrome_ui.is_open()
@@ -12082,7 +12092,7 @@ impl Cagents {
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
-        !self.context_inspector_is_overlay()
+        !self.channel_work_is_main() && !self.context_inspector_is_overlay()
     }
 
     fn enter_context_overlay(&mut self) -> Task<Message> {
@@ -13978,6 +13988,9 @@ impl Application for Cagents {
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
+        }
+        if let Some(task) = self.intercept_channel_work_navigation(&message) {
+            return task;
         }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
@@ -16997,7 +17010,8 @@ impl Application for Cagents {
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
             Message::OpenChannelWork(channel) => self.open_channel_work(channel),
-            Message::ChannelWorkEscape => self.channel_work.view.escape().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
+            Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
+            Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
@@ -17926,7 +17940,20 @@ impl Application for Cagents {
             .flatten();
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
-        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+        let workspace: Element<'_, Message> = if self.channel_work_is_main() {
+            // Do not build terminal/chat/browser widgets under an invisible
+            // Conversations layer. Their runtimes remain hosted and hidden.
+            crate::ui_controls::responsive(move |size| {
+                crate::interaction::focused_escape(
+                    self.channel_work
+                        .view
+                        .view(size.width, size.height)
+                        .map(Message::ChannelWork),
+                    || Message::ChannelWorkEscape,
+                )
+            })
+            .into()
+        } else if self.workspace.cards().is_empty() {
             let directory = self
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());
@@ -20208,7 +20235,7 @@ mod tests {
     /// Shared rather than written per surface, because every surface that
     /// mounts ids from a list is exposed to the same invariant and a per-test
     /// copy of the walk would drift from the runtime it is modelling.
-    fn widget_id_counts(element: &mut Element<'_, Message>) -> HashMap<String, usize> {
+    pub(super) fn widget_id_counts(element: &mut Element<'_, Message>) -> HashMap<String, usize> {
         use cosmic::iced::advanced::widget::Tree;
         use iced_accessibility::id::Internal;
 

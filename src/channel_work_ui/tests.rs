@@ -771,7 +771,7 @@ fn narrow_render_separates_review_from_owned_work_and_exposes_real_controls() {
             .filter_map(|node| node.node().label())
             .collect::<Vec<_>>();
         assert!(labels.contains(&"Working on"));
-        assert!(labels.contains(&"Review and reference"));
+        assert!(labels.contains(&"Reviews and references"));
         assert!(
             labels.contains(&"On this page: 1 work relations · 1 review or reference relations")
         );
@@ -1162,4 +1162,629 @@ fn receipt_confirmation_settles_without_projection_and_never_rebinds_offscreen()
     assert!(state.pending.is_empty());
     assert_eq!(state.home(), Some(home(11)));
     assert!(state.view.as_ref().unwrap().notice.is_none());
+}
+
+fn labels(ui: &Ui<'_>) -> Vec<String> {
+    let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+    nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .filter_map(|node| node.node().label().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn channel_home_keeps_multiple_full_pr_keys_and_declared_roles_without_checkout_ownership() {
+    use crate::channel_work::{CheckoutContext, Freshness, Observation, PrState};
+    let home = home(10);
+    let mut contributed = entry(1, Role::Contribute);
+    let mut stewarded = entry(2, Role::Steward);
+    stewarded.target = Target::PullRequest(
+        PullRequestKey::new(
+            GitHubRepoKey::new("github.com", None, "fork", "other").unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
+    contributed.observation = Some(Observation {
+        generation: 1,
+        state: PrState::Open { draft: false },
+        freshness: Freshness::Stale,
+        title: Some("Fix parser".into()),
+        node_id: None,
+        head: None,
+        observed_at_ms: 1,
+    });
+    contributed.contexts.push(CheckoutContext {
+        id: Uuid::from_u128(990),
+        registry: home.registry,
+        repository: "/nonexistent/project".into(),
+        path: "/nonexistent/deleted-checkout".into(),
+        branch: Some("same-branch".into()),
+        head: Some("a".repeat(40)),
+        generation: 1,
+        dirty: true,
+    });
+    stewarded.contexts = contributed.contexts.clone();
+    let mut reviewed = entry(3, Role::Review);
+    let session = crate::model::TerminalId::from_uuid(Uuid::from_u128(999));
+    reviewed.claims.push(Claim {
+        source: Source::Session(crate::channel_work::Contributor {
+            session,
+            lineage: crate::agent_execution::Lineage(session),
+            agent: None,
+            run: None,
+        }),
+        role: Role::Contribute,
+        active: true,
+        confirmed_generation: 0,
+    });
+    let reference = entry(4, Role::Reference);
+    let mut ended = entry(5, Role::Contribute);
+    ended.user_ended = true;
+    let mut observed = entry(6, Role::Reference);
+    observed.claims.clear();
+    observed.ever_claimed = false;
+    let entries = vec![
+        contributed.clone(),
+        stewarded.clone(),
+        reviewed,
+        reference,
+        observed,
+        ended,
+    ];
+    for width in [300.0, 1000.0] {
+        let mut state = ready(home, entries.clone());
+        let read = state.open(home, "Parser delivery".into()).unwrap();
+        load(&mut state, read, snapshot(home, entries.clone(), 2));
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let ui = cached(&state, Cache::new(), &mut renderer, width, 3000.0);
+        let text = labels(&ui);
+        assert!(text.iter().any(|s| s == "Parser delivery"));
+        assert!(text.iter().any(|s| s == "Working on"));
+        assert!(text.iter().any(|s| s == "Reviews and references"));
+        assert!(
+            text.iter()
+                .any(|s| s == "On this page: 2 work relations · 2 review or reference relations")
+        );
+        assert!(
+            text.iter()
+                .any(|s| s == "Contributing · Last known: Open PR")
+        );
+        assert!(
+            text.iter()
+                .any(|s| s == "Stewarding · PR status not yet observed")
+        );
+        assert!(
+            text.iter()
+                .any(|s| s == "Review only · PR status not yet observed")
+        );
+        assert!(!text.iter().any(|s| s == "Confirm previous work"));
+        for item in [&contributed, &stewarded] {
+            let hit = bounds(&ui, &format!("Open {}", target_label(&item.target)));
+            assert!(hit.x >= 0.0 && hit.x + hit.width <= width + 0.01);
+        }
+        let _ = ui.into_cache();
+        for item in [&contributed, &stewarded] {
+            let mut ui = cached(&state, Cache::new(), &mut renderer, width, 3000.0);
+            let hit = bounds(&ui, &format!("Open {}", target_label(&item.target))).center();
+            let mut messages = click(&mut ui, &mut renderer, hit);
+            let _ = ui.into_cache();
+            let Effect::OpenPullRequest {
+                home: captured,
+                key,
+                url,
+            } = state.update(messages.remove(0)).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(captured, home);
+            assert_eq!(Target::PullRequest(key), item.target);
+            assert_eq!(Some(url), item.target.pull_request_url().unwrap());
+        }
+        let owner = state.owner().unwrap();
+        state.update(Action::Tab(owner, Bucket::NeedsConfirmation));
+        let ui = cached(&state, Cache::new(), &mut renderer, width, 1500.0);
+        assert!(
+            labels(&ui)
+                .iter()
+                .any(|s| s == &format!("Confirm role… for {}", target_label(&target(6))))
+        );
+        let _ = ui.into_cache();
+        state.update(Action::Tab(owner, Bucket::History));
+        let ui = cached(&state, Cache::new(), &mut renderer, width, 1500.0);
+        assert!(
+            labels(&ui)
+                .iter()
+                .any(|s| s == &format!("Open {}", target_label(&target(5))))
+        );
+        assert!(labels(&ui).iter().any(|s| s == "Parser delivery"));
+    }
+}
+
+#[test]
+fn reopened_pr_fresh_review_shows_previous_work_until_explicit_captured_role_confirmation() {
+    use crate::channel_work::{
+        Contributor, Freshness, HomeState, Observation, Origin, PollOutcome, PrState,
+        observe_entry, reduce_entry,
+    };
+    let home = home(10);
+    let header = HomeState {
+        home,
+        lifecycle: HomeLifecycle::Active,
+        revision: 1000,
+    };
+    let actor = |id| {
+        let session = crate::model::TerminalId::from_uuid(Uuid::from_u128(id));
+        Origin::Actor {
+            home,
+            actor: Contributor {
+                session,
+                lineage: crate::agent_execution::Lineage(session),
+                agent: None,
+                run: None,
+            },
+            contexts: Vec::new(),
+        }
+    };
+    let claim = |old: Option<&Entry>, role, actor: &Origin, id| {
+        reduce_entry(
+            &header,
+            old,
+            &Mutation {
+                home,
+                expected_revision: old.map_or(0, |e| e.revision),
+                operation: Uuid::from_u128(id),
+                change: Change::Claim {
+                    target: target(1),
+                    role,
+                },
+            },
+            actor,
+        )
+        .unwrap()
+        .entry
+    };
+    let observe = |old: &Entry, generation, state| {
+        observe_entry(
+            &header,
+            old,
+            generation,
+            PollOutcome::Success(Observation {
+                generation,
+                state,
+                freshness: Freshness::Current,
+                title: Some("Same PR".into()),
+                node_id: None,
+                head: None,
+                observed_at_ms: generation,
+            }),
+        )
+        .unwrap()
+        .entry
+    };
+    let original = claim(None, Role::Contribute, &actor(10), 100);
+    let reopened = observe(
+        &observe(&original, 1, PrState::Merged),
+        2,
+        PrState::Open { draft: false },
+    );
+    let review = claim(Some(&reopened), Role::Review, &actor(11), 101);
+    assert_eq!(review.bucket(), Bucket::Ongoing);
+    assert!(!review.is_ongoing_work());
+    let revision = review.revision;
+    let mut state = State::default();
+    let read = state.open(home, "Release discussion".into()).unwrap();
+    load(&mut state, read, snapshot(home, vec![review.clone()], 1000));
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let text = labels(&ui);
+    assert!(text.iter().any(|s| s == "Confirm previous work"));
+    assert!(
+        text.iter()
+            .any(|s| s == "Previously contributing · Open PR")
+    );
+    assert!(
+        text.iter()
+            .any(|s| s == "No contributed or stewarded work on this page.")
+    );
+    assert!(!text.iter().any(|s| s == "Reviews and references"));
+    assert!(!text.iter().any(|s| s == "Contributing · Open PR"));
+    let hit = bounds(
+        &ui,
+        &format!("Confirm work role… for {}", target_label(&target(1))),
+    )
+    .center();
+    let mut messages = click(&mut ui, &mut renderer, hit);
+    let _ = ui.into_cache();
+    assert!(matches!(
+        state.update(messages.remove(0)),
+        Some(Effect::Focus { .. })
+    ));
+    assert!(
+        state.pending.is_empty(),
+        "opening the form does not claim work"
+    );
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let hit = bounds(&ui, "Apply tracking").center();
+    let mut messages = click(&mut ui, &mut renderer, hit);
+    let _ = ui.into_cache();
+    let Effect::Mutate { ticket, mutation } = state.update(messages.remove(0)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(mutation.expected_revision, revision);
+    assert_eq!(mutation.home, home);
+    assert_eq!(
+        mutation.change,
+        Change::Claim {
+            target: target(1),
+            role: Role::Contribute
+        }
+    );
+    let confirmed = reduce_entry(&header, Some(&review), &mutation, &Origin::User)
+        .unwrap()
+        .entry;
+    assert!(confirmed.is_ongoing_work());
+    let mut reply = completed(&mutation, confirmed.revision, vec![confirmed]);
+    reply.snapshot.revision = 1001;
+    reply.receipt.sequence = 1001;
+    state.update(Action::Applied {
+        ticket,
+        result: Ok(reply),
+    });
+    let ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let text = labels(&ui);
+    assert!(!text.iter().any(|s| s == "Confirm previous work"));
+    assert!(text.iter().any(|s| s == "Contributing · Open PR"));
+}
+
+#[test]
+fn home_native_pr_hold_rejects_same_number_other_repository_and_keeps_current_target_on_metadata_refresh()
+ {
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1200.0);
+    let hit = bounds(&ui, &open_name(1)).center();
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            hit,
+            &[mouse::Event::ButtonPressed(mouse::Button::Left)]
+        )
+        .is_empty()
+    );
+    let cache = ui.into_cache();
+    let mut fork = entry(1, Role::Contribute);
+    fork.target = Target::PullRequest(
+        PullRequestKey::new(
+            GitHubRepoKey::new("github.com", None, "other", "repo").unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
+    refresh(&mut state, snapshot(home(10), vec![fork.clone()], 2));
+    let name = format!("Open {}", target_label(&fork.target));
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1200.0);
+    assert!(bounds(&ui, &name).contains(hit));
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            hit,
+            &[mouse::Event::ButtonReleased(mouse::Button::Left)]
+        )
+        .is_empty()
+    );
+    let mut messages = click(&mut ui, &mut renderer, hit);
+    let _ = ui.into_cache();
+    assert!(
+        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { key, .. }) if Target::PullRequest(key) == fork.target)
+    );
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1200.0);
+    let hit = bounds(&ui, &name).center();
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            hit,
+            &[mouse::Event::ButtonPressed(mouse::Button::Left)]
+        )
+        .is_empty()
+    );
+    let cache = ui.into_cache();
+    fork.revision = 2;
+    refresh(&mut state, snapshot(home(10), vec![fork.clone()], 3));
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1200.0);
+    assert!(bounds(&ui, &name).contains(hit));
+    let mut messages = events(
+        &mut ui,
+        &mut renderer,
+        hit,
+        &[mouse::Event::ButtonReleased(mouse::Button::Left)],
+    );
+    let _ = ui.into_cache();
+    assert_eq!(messages.len(), 1);
+    assert!(
+        matches!(state.update(messages.remove(0)), Some(Effect::OpenPullRequest { home: actual, key, .. }) if actual == home(10) && Target::PullRequest(key) == fork.target)
+    );
+}
+
+#[test]
+fn narrow_home_keeps_wrapped_channel_identity_outside_scroll_and_partial_page_claims_honest() {
+    let title =
+        "Parser delivery and follow-up across the core library and its downstream integrations";
+    let mut state = State::default();
+    let read = state.open(home(10), title.into()).unwrap();
+    let mut page = snapshot(
+        home(10),
+        vec![entry(1, Role::Review), entry(2, Role::Reference)],
+        2,
+    );
+    page.next_current = Some(20);
+    load(&mut state, read, page);
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 300.0, 600.0);
+    let title_bounds = bounds(&ui, title);
+    let refresh_bounds = bounds(&ui, "Refresh channel work");
+    let close_bounds = bounds(&ui, "Close channel work");
+    for b in [title_bounds, refresh_bounds, close_bounds] {
+        assert!(b.x >= 0.0 && b.x + b.width <= 300.01);
+        assert!(b.y >= 0.0 && b.y + b.height <= 600.01);
+    }
+    let text = labels(&ui);
+    assert!(
+        text.iter()
+            .any(|s| s == "No contributed or stewarded work on this page.")
+    );
+    assert!(!text.iter().any(|s| s == "No ongoing work is tracked here"));
+    assert!(text.iter().any(|s| s == "Reviews and references"));
+    assert!(text.iter().any(|s| s == "Next current page"));
+    let first_before = bounds(&ui, &open_name(1));
+    assert!(
+        events(
+            &mut ui,
+            &mut renderer,
+            iced::Point::new(150.0, 580.0),
+            &[mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -6.0 }
+            }]
+        )
+        .is_empty()
+    );
+    assert_eq!(bounds(&ui, title), title_bounds);
+    assert_eq!(bounds(&ui, "Refresh channel work"), refresh_bounds);
+    let first_after = bounds(&ui, &open_name(1));
+    assert!(
+        first_after.y < first_before.y,
+        "the real content scrolls independently of the channel header"
+    );
+}
+
+struct PasteClipboard(String);
+impl iced::advanced::Clipboard for PasteClipboard {
+    fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+        Some(self.0.clone())
+    }
+    fn write(&mut self, _: iced::advanced::clipboard::Kind, value: String) {
+        self.0 = value;
+    }
+}
+fn repository_paste(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer, value: &str) -> Vec<Action> {
+    let press = |name: &str, code| {
+        let key = iced::keyboard::Key::Character(name.into());
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: iced::keyboard::key::Physical::Code(code),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::COMMAND,
+            text: None,
+            repeat: false,
+        })
+    };
+    let mut messages = Vec::new();
+    let mut clipboard = PasteClipboard(value.into());
+    let _ = ui.update(
+        &[
+            press("a", iced::keyboard::key::Code::KeyA),
+            press("v", iced::keyboard::key::Code::KeyV),
+            iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                key: iced::keyboard::Key::Character("v".into()),
+                modified_key: iced::keyboard::Key::Character("v".into()),
+                physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyV),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::COMMAND,
+            }),
+        ],
+        mouse::Cursor::Unavailable,
+        renderer,
+        &mut clipboard,
+        &mut messages,
+    );
+    messages
+}
+
+#[test]
+fn repository_native_url_paste_fills_full_fork_port_and_u64_then_explicit_submit_keeps_role_and_cas()
+ {
+    let url = "https://Forge.Example:8443/Fork/Repository/pull/18446744073709551615/";
+    let expected = Target::PullRequest(
+        PullRequestKey::new(
+            GitHubRepoKey::new("forge.example", Some(8443), "fork", "repository").unwrap(),
+            u64::MAX,
+        )
+        .unwrap(),
+    );
+    let mut existing = entry(1, Role::Contribute);
+    existing.target = expected.clone();
+    existing.revision = 7;
+    let mut state = State::default();
+    let read = state.open(home(10), "Delivery".into()).unwrap();
+    load(&mut state, read, snapshot(home(10), vec![existing], 9));
+    state.update(Action::Attach(state.owner().unwrap()));
+    let owner = state.view.as_ref().unwrap().form.as_ref().unwrap().owner;
+    state.update(Action::Role(owner, 2));
+    state.update(Action::Field(owner, Field::Number, "17".into()));
+    state.update(Action::Field(owner, Field::Repository, "owner/repo".into()));
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    let old_submit_point = bounds(&ui, "Track PR").center();
+    let old_submit = click(&mut ui, &mut renderer, old_submit_point).remove(0);
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(form_input_id(owner, Field::Repository)),
+    );
+    let mut messages = repository_paste(&mut ui, &mut renderer, url);
+    let cache = ui.into_cache();
+    assert!(
+        matches!(messages.as_slice(), [Action::Field(actual, Field::Repository, value)] if *actual == owner && value == url)
+    );
+    assert!(state.update(messages.remove(0)).is_none());
+    assert!(
+        state.pending.is_empty(),
+        "paste does not submit or declare work"
+    );
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    assert_eq!(form.owner, owner);
+    assert_eq!(form.host, "forge.example:8443");
+    assert_eq!(form.repository, "fork/repository");
+    assert_eq!(form.number, u64::MAX.to_string());
+    assert_eq!(form.role, Role::Review);
+    assert_eq!(form.expected_revision, 0);
+    assert!(form.dirty());
+    assert_eq!(form.target().unwrap(), expected);
+    assert!(
+        state.update(old_submit).is_none(),
+        "the old target submit cannot apply the pasted identity"
+    );
+    assert!(state.pending.is_empty());
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1800.0);
+    let point = bounds(&ui, "Track PR").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let Effect::Mutate { mutation, .. } = state.update(messages.remove(0)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(mutation.home, home(10));
+    assert_eq!(mutation.expected_revision, 7);
+    assert_eq!(
+        mutation.change,
+        Change::Claim {
+            target: expected.clone(),
+            role: Role::Review
+        }
+    );
+    assert!(
+        state
+            .update(Action::Field(
+                owner,
+                Field::Repository,
+                "https://github.com/other/repo/pull/2".into()
+            ))
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .target()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(state.pending[0].mutation, mutation);
+}
+
+#[test]
+fn url_paste_invalid_inputs_do_not_partially_retarget_and_old_form_or_fixed_target_cannot_accept_it()
+ {
+    let url = "https://github.com/fork/repo/pull/88";
+    let mut state = ready(home(10), vec![entry(1, Role::Contribute)]);
+    let old = filled_form(&mut state);
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(form_input_id(old, Field::Repository)),
+    );
+    let old_paste = repository_paste(&mut ui, &mut renderer, url).remove(0);
+    let cache = ui.into_cache();
+    state.update(Action::Dismiss(old));
+    let owner = state.owner().unwrap();
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    state.update(Action::Discard(owner, confirmation));
+    let current = filled_form(&mut state);
+    state.update(Action::Field(
+        current,
+        Field::Host,
+        "current.example:9443".into(),
+    ));
+    state.update(Action::Field(current, Field::Number, "29".into()));
+    state.update(Action::Role(current, 1));
+    let mut ui = cached(&state, cache, &mut renderer, 800.0, 1800.0);
+    assert!(
+        repository_paste(&mut ui, &mut renderer, url).is_empty(),
+        "replacement draft does not inherit old native input focus"
+    );
+    let _ = ui.into_cache();
+    assert!(state.update(old_paste).is_none());
+    for invalid in [
+        "https://github.com/fork/repo/pull/",
+        "http://github.com/fork/repo/pull/88",
+        "https://example:secret@github.com/fork/repo/pull/88",
+        "https://github.com/fork/repo/pull/88?query",
+        "https://github.com/fork/repo/pull/88#fragment",
+        " https://github.com/fork/repo/pull/88 ",
+    ] {
+        let mut ui = cached(&state, Cache::new(), &mut renderer, 800.0, 1800.0);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(form_input_id(current, Field::Repository)),
+        );
+        let mut messages = repository_paste(&mut ui, &mut renderer, invalid);
+        let _ = ui.into_cache();
+        assert_eq!(messages.len(), 1);
+        assert!(state.update(messages.remove(0)).is_none());
+        let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+        assert_eq!(form.repository, invalid);
+        assert_eq!(form.host, "current.example:9443");
+        assert_eq!(form.number, "29");
+        assert_eq!(form.role, Role::Steward);
+        assert_eq!(form.owner, current);
+        assert!(form.target().is_err());
+        assert!(state.pending.is_empty());
+    }
+    state.update(Action::Dismiss(current));
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    state.update(Action::Discard(owner, confirmation));
+    let row = row(&state, 1);
+    state.update(Action::Correct(row.clone()));
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    let fixed_owner = form.owner;
+    assert_eq!(form.fixed, Some(target(1)));
+    state.update(Action::Field(fixed_owner, Field::Repository, url.into()));
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    assert_eq!(form.fixed, Some(target(1)));
+    assert_eq!(form.expected_revision, row.revision);
+    assert!(form.host.is_empty() && form.repository.is_empty() && form.number.is_empty());
+    assert!(state.pending.is_empty());
 }

@@ -264,7 +264,7 @@ impl Cagents {
                 Task::none()
             }
             Action::Open => {
-                if self.workspace_inputs_blocked() {
+                if self.shell_inputs_blocked() {
                     return Task::none();
                 }
                 self.chrome_ui.close();

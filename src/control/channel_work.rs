@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     channel_work::{Change, Home, Mutation, Page, Role, Snapshot, Target},
     channel_work_api::{Context, Failure, Request, Response},
-    github_identity::{GitHubRepoKey, PullRequestKey},
+    github_identity::PullRequestKey,
 };
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 use uuid::Uuid;
@@ -104,77 +104,13 @@ fn parse_role(value: &str) -> Result<Role, String> {
     }
 }
 
-// URL path decoding, without form-query rules (`+` remains a literal plus).
-fn path_segment(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if bytes[offset] == b'%' {
-            let pair = bytes
-                .get(offset + 1..offset + 3)
-                .ok_or("Invalid URL path escape")?;
-            let hex = |b: u8| match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                b'A'..=b'F' => Some(b - b'A' + 10),
-                _ => None,
-            };
-            decoded.push(
-                hex(pair[0])
-                    .zip(hex(pair[1]))
-                    .map(|(a, b)| a * 16 + b)
-                    .ok_or("Invalid URL path escape")?,
-            );
-            offset += 3;
-        } else {
-            decoded.push(bytes[offset]);
-            offset += 1;
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| "The repository URL is not UTF-8".into())
-}
+#[cfg(test)]
+use crate::github_identity::pull_request_path_segment as path_segment;
 
 fn parse_pull_request(value: &str) -> Result<Target, String> {
-    let url =
-        url::Url::parse(value).map_err(|_| "Expected an HTTPS pull request URL".to_owned())?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("Use an HTTPS PR URL without credentials, query, or fragment".into());
-    }
-    let mut segments = url
-        .path_segments()
-        .ok_or("Expected a pull request path")?
-        .collect::<Vec<_>>();
-    if segments.last() == Some(&"") {
-        segments.pop();
-    }
-    if segments.len() != 4 || segments[2] != "pull" {
-        return Err("Expected /OWNER/REPOSITORY/pull/NUMBER".into());
-    }
-    if !segments[3].bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Expected a positive decimal PR number".into());
-    }
-    let number = segments[3]
-        .parse::<u64>()
-        .map_err(|_| "Expected a positive PR number".to_owned())?;
-    let repository = GitHubRepoKey::new(
-        url.host_str().ok_or("The PR URL needs a host")?,
-        url.port(),
-        path_segment(segments[0])?,
-        path_segment(segments[1])?,
-    )
-    .map_err(|_| "The PR repository identity is invalid".to_owned())?;
-    Target::PullRequest(
-        PullRequestKey::new(repository, number)
-            .map_err(|_| "Expected a positive PR number".to_owned())?,
-    )
-    .canonicalized()
-    .map_err(|_| "The PR identity is invalid".into())
+    Target::PullRequest(PullRequestKey::from_url(value)?)
+        .canonicalized()
+        .map_err(|_| "The PR identity is invalid".into())
 }
 
 enum Prepared {

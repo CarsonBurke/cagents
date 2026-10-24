@@ -780,7 +780,21 @@ impl State {
                 }
                 match field {
                     Field::Host => form.host = value,
-                    Field::Repository => form.repository = value,
+                    Field::Repository => {
+                        if let Some(Target::PullRequest(key)) = (value.trim() == value
+                            && !value.chars().any(char::is_control))
+                        .then(|| PullRequestKey::from_url(&value).ok())
+                        .flatten()
+                        .and_then(|key| Target::PullRequest(key).canonicalized().ok())
+                        {
+                            form.host = key.repository.authority();
+                            form.repository =
+                                format!("{}/{}", key.repository.owner, key.repository.name);
+                            form.number = key.number.to_string();
+                        } else {
+                            form.repository = value;
+                        }
+                    }
                     Field::Number => form.number = value,
                 }
             }
@@ -954,10 +968,8 @@ impl State {
                 .on_press_maybe(view.loading.is_none().then_some(Action::Refresh(owner))),
         );
         let title = widget::column::with_children(vec![
-            design::heading("Channel work").into(),
-            design::caption(view.title.as_str())
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            design::caption("Channel work").into(),
+            design::title(view.title.as_str()).into(),
         ])
         .spacing(space::XXS);
         let header = widget::row::with_children(vec![
@@ -1137,27 +1149,65 @@ impl State {
                 .iter()
                 .filter(|entry| entry.is_ongoing_work())
                 .count();
+            let awaiting = entries
+                .iter()
+                .filter(|entry| ongoing_group(entry) == OngoingGroup::ConfirmPrevious)
+                .count();
+            let related = entries.len() - work - awaiting;
+            let summary = format!(
+                "On this page: {work} work relations · {related} review or reference relations"
+            );
             body.push(
-                design::caption(format!(
-                    "On this page: {work} work relations · {} review or reference relations",
-                    entries.len() - work
-                ))
+                design::caption(if awaiting == 0 {
+                    summary
+                } else {
+                    format!("{summary} · {awaiting} work declarations awaiting confirmation")
+                })
                 .into(),
             );
-            let visible = entries
-                .iter()
-                .filter(|entry| entry.is_ongoing_work())
-                .chain(entries.iter().filter(|entry| !entry.is_ongoing_work()))
-                .take(view.visible)
-                .copied()
-                .collect::<Vec<_>>();
-            for (is_work, heading) in [(true, "Working on"), (false, "Review and reference")] {
-                let selected: Vec<_> = visible
+            let visible = [
+                OngoingGroup::Working,
+                OngoingGroup::ConfirmPrevious,
+                OngoingGroup::Related,
+            ]
+            .into_iter()
+            .flat_map(|group| {
+                entries
                     .iter()
-                    .filter(|entry| entry.is_ongoing_work() == is_work)
-                    .collect();
-                if !selected.is_empty() {
+                    .filter(move |entry| ongoing_group(entry) == group)
+            })
+            .take(view.visible)
+            .copied()
+            .collect::<Vec<_>>();
+            for (group, heading, detail) in [
+                (
+                    OngoingGroup::Working,
+                    "Working on",
+                    "Contributing and stewarding are explicit work declarations in this channel.",
+                ),
+                (
+                    OngoingGroup::ConfirmPrevious,
+                    "Confirm previous work",
+                    "Confirm your role to continue work after the PR ended. A new review does not restart an earlier contribution.",
+                ),
+                (
+                    OngoingGroup::Related,
+                    "Reviews and references",
+                    "Related to this channel, without declaring implementation or responsibility for progressing the work.",
+                ),
+            ] {
+                let selected = visible
+                    .iter()
+                    .filter(|entry| ongoing_group(entry) == group)
+                    .collect::<Vec<_>>();
+                if !selected.is_empty() || (group == OngoingGroup::Working && !entries.is_empty()) {
                     body.push(design::heading(heading).into());
+                    body.push(design::caption(detail).into());
+                }
+                if group == OngoingGroup::Working && work == 0 && !entries.is_empty() {
+                    body.push(
+                        design::body("No contributed or stewarded work on this page.").into(),
+                    );
                 }
                 for entry in selected {
                     body.push(self.entry_view(view, entry, narrow));
@@ -1279,7 +1329,7 @@ impl State {
                 ("GitHub host", "github.com", form.host.as_str(), Field::Host),
                 (
                     "Repository",
-                    "owner/repository",
+                    "owner/repository or PR URL",
                     form.repository.as_str(),
                     Field::Repository,
                 ),
@@ -1376,14 +1426,24 @@ impl State {
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
         ];
-        let role_label = role.map_or(
-            if entry.bucket() == Bucket::History {
-                "Tracking ended"
-            } else {
-                "Not confirmed"
-            },
-            Role::label,
-        );
+        let role_label = if entry.bucket() == Bucket::Ongoing
+            && ongoing_group(entry) == OngoingGroup::ConfirmPrevious
+        {
+            match role {
+                Some(Role::Contribute) => "Previously contributing",
+                Some(Role::Steward) => "Previously stewarding",
+                _ => "Work intent needs confirmation",
+            }
+        } else {
+            role.map_or(
+                if entry.bucket() == Bucket::History {
+                    "Tracking ended"
+                } else {
+                    "Not confirmed"
+                },
+                Role::label,
+            )
+        };
         let status = entry_status(entry);
         rows.push(design::body(format!("{role_label} · {status}")).into());
         if entry.suppressed {
@@ -1419,6 +1479,9 @@ impl State {
         });
         if !terminal {
             let label = match entry.bucket() {
+                Bucket::Ongoing if ongoing_group(entry) == OngoingGroup::ConfirmPrevious => {
+                    "Confirm work role…"
+                }
                 Bucket::Ongoing => "Change role",
                 Bucket::NeedsConfirmation => "Confirm role…",
                 Bucket::History => "Resume…",
@@ -1543,6 +1606,25 @@ impl State {
     }
 }
 
+// Effective work roles without a fresh work claim are not review/reference.
+// A fresh review can keep the relation visible after another actor's old work ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OngoingGroup {
+    Working,
+    ConfirmPrevious,
+    Related,
+}
+
+fn ongoing_group(entry: &Entry) -> OngoingGroup {
+    if entry.is_ongoing_work() {
+        OngoingGroup::Working
+    } else if entry.role().is_some_and(Role::establishes_work_intent) {
+        OngoingGroup::ConfirmPrevious
+    } else {
+        OngoingGroup::Related
+    }
+}
+
 fn target_label(target: &Target) -> String {
     match target {
         Target::PullRequest(key) => format!(
@@ -1552,7 +1634,7 @@ fn target_label(target: &Target) -> String {
             key.number,
             key.repository.authority()
         ),
-        Target::Local(_) => "Local work · not published".into(),
+        Target::Local(id) => format!("Local work · {} · no PR linked", short_id(&id.to_string())),
     }
 }
 fn entry_status(entry: &Entry) -> String {
@@ -1617,7 +1699,7 @@ fn message<'a>(text: &'a str, warning: bool) -> Element<'a, Action> {
 fn mount<'a>(
     header: impl Into<Element<'a, Action>>,
     rows: Vec<Element<'a, Action>>,
-    height: f32,
+    _height: f32,
 ) -> Element<'a, Action> {
     widget::column::with_children(vec![
         widget::container(header)
@@ -1630,7 +1712,7 @@ fn mount<'a>(
                 .spacing(space::M)
                 .padding(space::M),
         )
-        .height(Length::Fixed((height - 80.0).max(80.0)))
+        .height(Length::Fill)
         .width(Length::Fill)
         .into(),
     ])
