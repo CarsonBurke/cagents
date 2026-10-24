@@ -44,6 +44,11 @@ use `cagents channel work end PR_URL`, saving that request too if recovery may
 be needed. This does not end other agents' participation. A user's explicit
 role correction remains authoritative.
 
+An internal worker may share its lead's session identity. In that case, report
+your subtask's relationship to the lead instead of replacing its channel role.
+A review subtask does not end the lead's ongoing contribution or stewardship.
+Do not invent another caller identity to distinguish internal tasks.
+
 The saved request path must be new and task-owned. If submission is uncertain,
 use the reported `channel work result` command with its original registry,
 channel, incarnation and operation. Missing receipt means unknown. Retry only

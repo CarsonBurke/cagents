@@ -228,6 +228,9 @@ impl Cagents {
             Message::Repository(action) if !repository_action_allowed_while_modal(action) => {
                 return Some(Task::none());
             }
+            Message::ChatUi(action) if !action.allowed_while_modal() => {
+                return Some(Task::none());
+            }
             Message::RunCommand(command) => {
                 return Some(
                     self.channel_work_global_command(*command)

@@ -1344,8 +1344,7 @@ impl State {
                         .on_input_maybe(
                             enabled.then_some(move |value| Action::Field(owner, kind, value)),
                         )
-                        .on_submit_maybe(enter.map(|action| move |_| action.clone()))
-                        .into(),
+                        .on_submit_maybe(enter.map(|action| move |_| action.clone())),
                 ));
             }
         }

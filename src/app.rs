@@ -101,7 +101,7 @@ use crate::{
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
+        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof, LaunchRecipe,
         ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
         TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
         WorkspaceState, WorktreeState,
