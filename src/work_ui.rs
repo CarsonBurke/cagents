@@ -360,6 +360,16 @@ impl State {
                 None
             }
             Action::Scope(scope) => {
+                if let Some(repository) = &scope
+                    && !self.board.as_ref().is_some_and(|board| {
+                        board
+                            .projects
+                            .iter()
+                            .any(|project| project.repository == *repository)
+                    })
+                {
+                    return None;
+                }
                 self.scope = scope;
                 self.scope_menu = false;
                 None
@@ -1793,6 +1803,166 @@ mod tests {
             scope_menu_text(&state).unwrap(),
             ["All projects", "0 cards"]
         );
+    }
+
+    #[test]
+    fn queued_project_picker_choice_cannot_restore_a_removed_scope() {
+        use iced::runtime::user_interface::Cache;
+
+        fn build<'a>(
+            state: &'a State,
+            cache: Cache,
+            renderer: &mut cosmic::Renderer,
+        ) -> iced::runtime::UserInterface<'a, Action, Theme, cosmic::Renderer> {
+            let mut ui = iced::runtime::UserInterface::build(
+                state.layout_view(1600.0),
+                iced::Size::new(1600.0, 900.0),
+                cache,
+                renderer,
+            );
+            draw_work_ui(&mut ui, renderer);
+            ui
+        }
+
+        fn choose(state: &mut State, renderer: &mut cosmic::Renderer, label: &str) -> Action {
+            let cache = if !state.scope_menu {
+                let mut ui = build(state, Cache::new(), renderer);
+                let point = first_open_bounds(&ui, "Choose project").center();
+                let actions = click_work(&mut ui, renderer, point);
+                let cache = ui.into_cache();
+                assert!(matches!(actions.as_slice(), [Action::ScopeMenu(true)]));
+                state.update(actions.into_iter().next().unwrap());
+                cache
+            } else {
+                Cache::new()
+            };
+            let mut ui = build(state, cache, renderer);
+            // The selected project's text also appears in the anchor. Only
+            // choose a real overlay row below it, never that same-label anchor.
+            #[derive(Default)]
+            struct Rows {
+                text: Vec<(String, iced::Rectangle)>,
+                buttons: Vec<iced::Rectangle>,
+            }
+            impl iced::advanced::widget::Operation for Rows {
+                fn traverse(
+                    &mut self,
+                    visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                    self.text.push((text.into(), bounds));
+                }
+                fn focusable(
+                    &mut self,
+                    _: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    _: &mut dyn iced::advanced::widget::operation::Focusable,
+                ) {
+                    self.buttons.push(bounds);
+                }
+            }
+            let anchor = first_open_bounds(&ui, "Choose project");
+            let mut rows = Rows::default();
+            ui.operate(renderer, &mut rows);
+            let bounds = rows
+                .buttons
+                .iter()
+                .filter(|bounds| {
+                    bounds.y >= anchor.y + anchor.height
+                        && rows.text.iter().any(|(text, text_bounds)| {
+                            text == label && bounds.contains(text_bounds.center())
+                        })
+                })
+                .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+                .copied()
+                .unwrap_or_else(|| panic!("missing actual scope row {label}"));
+            assert!(bounds.width > 0.0 && bounds.height > 0.0);
+            let point = bounds.center();
+            let actions = click_work(&mut ui, renderer, point);
+            assert!(
+                matches!(actions.as_slice(), [Action::Scope(_)]),
+                "{actions:?}"
+            );
+            actions.into_iter().next().unwrap()
+        }
+
+        for select_b in [false, true] {
+            let mut state = State::default();
+            let a = native_work_item("branch-a", "project-a");
+            let b = native_work_item("branch-b", "project-b");
+            let other_b = native_work_item("other-b", "project-b");
+            connected(
+                &mut state,
+                1,
+                board(vec![a.clone(), b.clone(), other_b.clone()]),
+            );
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let old_a = choose(&mut state, &mut renderer, "project-a");
+            assert!(matches!(&old_a, Action::Scope(Some(path)) if *path == a.project));
+            let current = choose(
+                &mut state,
+                &mut renderer,
+                if select_b {
+                    "project-b"
+                } else {
+                    "All projects"
+                },
+            );
+            state.update(current);
+            let scope = state.scope.clone();
+            assert_eq!(scope, select_b.then(|| b.project.clone()));
+            watched(&mut state, 2, board(vec![b.clone(), other_b]));
+
+            assert!(state.update(old_a).is_none());
+            assert_eq!(
+                state.scope, scope,
+                "late A must preserve the valid current scope"
+            );
+            assert!(!state.scope_menu);
+            assert_eq!(
+                state.visible().map(Item::label).collect::<Vec<_>>(),
+                ["branch-b", "other-b"]
+            );
+            // Inspect the rendered header/status/body, not just the scope field.
+            #[derive(Default)]
+            struct Text(Vec<String>);
+            impl iced::advanced::widget::Operation for Text {
+                fn traverse(
+                    &mut self,
+                    visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+                ) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                    self.0.push(text.into());
+                }
+            }
+            let mut ui = build(&state, Cache::new(), &mut renderer);
+            let mut text = Text::default();
+            ui.operate(&renderer, &mut text);
+            assert!(text.0.iter().any(|text| text
+                == if select_b {
+                    "project-b"
+                } else {
+                    "All projects"
+                }));
+            assert!(text.0.iter().any(|text| text == "2 cards"));
+            assert!(!text.0.iter().any(|text| text == "No cards match"));
+            assert!(first_open_bounds(&ui, "Open branch-b").width > 0.0);
+            drop(ui);
+
+            // Current project and All projects callbacks remain accepted.
+            let current_b = choose(&mut state, &mut renderer, "project-b");
+            state.update(current_b);
+            assert_eq!(state.scope, Some(b.project));
+            assert!(!state.scope_menu);
+            let all = choose(&mut state, &mut renderer, "All projects");
+            state.update(all);
+            assert!(state.scope.is_none());
+            assert!(!state.scope_menu);
+        }
     }
 
     #[test]
