@@ -1037,6 +1037,552 @@ mod tests {
     type Native<'a> = iced::runtime::UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
     type Cache = iced::runtime::user_interface::Cache;
 
+    // These tests intentionally include libcosmic's outer frame. The local
+    // Work form's direct-ID focus tests cannot detect a traversal boundary
+    // between that form and the window controls.
+    mod full_frame_focus {
+        use super::*;
+        use iced::advanced::widget::{Operation, operation};
+
+        type Frame<'a> = iced::runtime::UserInterface<
+            'a,
+            cosmic::Action<Message>,
+            cosmic::Theme,
+            cosmic::Renderer,
+        >;
+
+        #[derive(Debug)]
+        struct FocusNode {
+            id: Option<widget::Id>,
+            bounds: iced::Rectangle,
+            focused: bool,
+        }
+
+        #[derive(Default, Debug)]
+        struct Focus(Vec<FocusNode>);
+
+        impl Operation for Focus {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                self.0.push(FocusNode {
+                    id: id.cloned(),
+                    bounds,
+                    focused: state.is_focused(),
+                });
+            }
+        }
+
+        fn same(a: &widget::Id, b: &widget::Id) -> bool {
+            iced_accessibility::IdEq::eq(a, b)
+        }
+
+        fn mount<'a>(app: &'a Cagents, cache: Cache, renderer: &mut cosmic::Renderer) -> Frame<'a> {
+            let mut frame = iced::runtime::UserInterface::build(
+                cosmic::ApplicationExt::view_main(app),
+                iced::Size::new(1280.0, 900.0),
+                cache,
+                renderer,
+            );
+            draw(&mut frame, renderer);
+            frame
+        }
+
+        fn draw(frame: &mut Frame<'_>, renderer: &mut cosmic::Renderer) {
+            frame.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                iced::mouse::Cursor::Unavailable,
+            );
+        }
+
+        fn probe(frame: &mut Frame<'_>, renderer: &cosmic::Renderer) -> Focus {
+            let mut focus = Focus::default();
+            frame.operate(renderer, &mut focus);
+            let focused = focus.0.iter().filter(|node| node.focused).count();
+            assert!(
+                focused <= 1,
+                "full window has {focused} focused widgets: {focus:?}"
+            );
+            focus
+        }
+
+        fn active(frame: &mut Frame<'_>, renderer: &cosmic::Renderer) -> widget::Id {
+            let focus = probe(frame, renderer);
+            focus
+                .0
+                .iter()
+                .find(|node| node.focused)
+                .and_then(|node| node.id.clone())
+                .unwrap_or_else(|| panic!("no named native focus after traversal: {focus:?}"))
+        }
+
+        fn operate(
+            frame: &mut Frame<'_>,
+            renderer: &cosmic::Renderer,
+            mut operation: Box<dyn Operation>,
+        ) {
+            // focus_next/previous first count the whole tree, then chain the
+            // actual focus change. Applying only the first pass tests nothing.
+            for _ in 0..4 {
+                frame.operate(renderer, &mut operation);
+                match operation.finish() {
+                    operation::Outcome::Chain(next) => operation = next,
+                    operation::Outcome::None | operation::Outcome::Some(()) => return,
+                }
+            }
+            panic!("unexpected unbounded focus-operation chain");
+        }
+
+        fn apply_focus_task(
+            frame: &mut Frame<'_>,
+            renderer: &cosmic::Renderer,
+            task: Task<Message>,
+        ) {
+            let mut stream = iced::runtime::task::into_stream(task)
+                .expect("draft guard must issue its native focus operation");
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let mut operations = 0;
+            while let Some(action) = executor.block_on(stream.next()) {
+                match action {
+                    iced::runtime::Action::Widget(operation) => {
+                        operate(frame, renderer, operation);
+                        operations += 1;
+                    }
+                    _ => panic!("a local draft focus must not dispatch background work"),
+                }
+            }
+            assert!(operations > 0);
+            let _ = active(frame, renderer);
+        }
+
+        fn event(
+            frame: &mut Frame<'_>,
+            renderer: &mut cosmic::Renderer,
+            events: &[iced::Event],
+            cursor: iced::mouse::Cursor,
+        ) -> (Vec<cosmic::Action<Message>>, Vec<iced::event::Status>) {
+            let mut messages = Vec::new();
+            let (_, statuses) = frame.update(
+                events,
+                cursor,
+                renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            draw(frame, renderer);
+            (messages, statuses)
+        }
+
+        fn click(
+            frame: &mut Frame<'_>,
+            renderer: &mut cosmic::Renderer,
+            point: iced::Point,
+        ) -> Vec<cosmic::Action<Message>> {
+            event(
+                frame,
+                renderer,
+                &[
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: point }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ],
+                iced::mouse::Cursor::Available(point),
+            )
+            .0
+        }
+
+        fn tab(
+            frame: &mut Frame<'_>,
+            renderer: &mut cosmic::Renderer,
+            reverse: bool,
+        ) -> widget::Id {
+            let mut tab = key(
+                keyboard::Key::Named(keyboard::key::Named::Tab),
+                keyboard::key::Code::Tab,
+                None,
+            );
+            if let iced::Event::Keyboard(keyboard::Event::KeyPressed { modifiers, .. }) = &mut tab {
+                *modifiers = if reverse {
+                    keyboard::Modifiers::SHIFT
+                } else {
+                    keyboard::Modifiers::empty()
+                };
+            }
+            let (messages, statuses) =
+                event(frame, renderer, &[tab], iced::mouse::Cursor::Unavailable);
+            assert!(
+                messages.is_empty(),
+                "Tab unexpectedly emitted application actions: {messages:?}"
+            );
+            assert_eq!(
+                statuses,
+                [iced::event::Status::Ignored],
+                "captured Tab cannot reach COSMIC keyboard_nav"
+            );
+            // The actual keyboard_nav subscription emits precisely this
+            // standard operation for an ignored Tab/Shift-Tab. A headless UI
+            // does not run the platform event subscription itself.
+            operate(
+                frame,
+                renderer,
+                if reverse {
+                    Box::new(operation::focusable::focus_previous::<()>())
+                } else {
+                    Box::new(operation::focusable::focus_next::<()>())
+                },
+            );
+            active(frame, renderer)
+        }
+
+        fn seek(frame: &mut Frame<'_>, renderer: &mut cosmic::Renderer, target: &widget::Id) {
+            let total = probe(frame, renderer).0.len();
+            for _ in 0..=total {
+                if probe(frame, renderer)
+                    .0
+                    .iter()
+                    .any(|node| node.focused && node.id.as_ref().is_some_and(|id| same(id, target)))
+                {
+                    return;
+                }
+                tab(frame, renderer, false);
+            }
+            panic!(
+                "full-window traversal never reached {target:?}: {:?}",
+                probe(frame, renderer)
+            );
+        }
+
+        fn labelled(
+            frame: &mut Frame<'_>,
+            renderer: &cosmic::Renderer,
+            label: &str,
+        ) -> (widget::Id, iced::Rectangle) {
+            let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            let matches = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label)
+                })
+                .filter_map(|node| node.node().bounds())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "one actual full-frame AX control {label}: {matches:?}"
+            );
+            let b = matches[0];
+            let bounds = iced::Rectangle {
+                x: b.x0 as f32,
+                y: b.y0 as f32,
+                width: (b.x1 - b.x0) as f32,
+                height: (b.y1 - b.y0) as f32,
+            };
+            let focus = probe(frame, renderer);
+            let controls = focus
+                .0
+                .iter()
+                .filter(|node| node.bounds.contains(bounds.center()))
+                .filter_map(|node| node.id.as_ref().map(|id| (id, node.bounds)))
+                .collect::<Vec<_>>();
+            let (id, _) = controls
+                .iter()
+                .min_by(|a, b| (a.1.width * a.1.height).total_cmp(&(b.1.width * b.1.height)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "AX control {label} is absent from full-window focus traversal: {focus:?}"
+                    )
+                });
+            ((*id).clone(), bounds)
+        }
+
+        fn input(frame: &mut Frame<'_>, renderer: &cosmic::Renderer, suffix: &str) -> widget::Id {
+            let focus = probe(frame, renderer);
+            let ids = focus
+                .0
+                .iter()
+                .filter_map(|node| node.id.as_ref())
+                .filter(|id| {
+                    id.to_string().starts_with("channel-work-input-")
+                        && id.to_string().ends_with(suffix)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(ids.len(), 1, "one mounted Work input {suffix}: {focus:?}");
+            ids[0].clone()
+        }
+
+        fn fixture(renderer: &mut cosmic::Renderer) -> (Cagents, Home, ui::FormOwner, Cache) {
+            let (mut app, home) = main_fixture();
+            app.window_width = 1280.0;
+            app.window_height = 900.0;
+            assert!(
+                !app.core.window.show_headerbar,
+                "production uses the custom application header"
+            );
+            app.core.set_main_window_id(Some(window::Id::RESERVED));
+            assert!(
+                app.core.keyboard_nav(),
+                "ordinary window traversal is enabled by default"
+            );
+            let owner = app.channel_work.view.owner().unwrap();
+            let Some(Effect::Focus { id: host, .. }) =
+                app.channel_work.view.update(ui::Action::Attach(owner))
+            else {
+                panic!("attach must create the real form");
+            };
+            let mut frame = mount(&app, Cache::new(), renderer);
+            let focus = probe(&mut frame, renderer);
+            let point = focus
+                .0
+                .iter()
+                .find(|node| node.id.as_ref().is_some_and(|id| same(id, &host)))
+                .unwrap_or_else(|| panic!("full frame omitted the attached form: {focus:?}"))
+                .bounds
+                .center();
+            assert!(click(&mut frame, renderer, point).is_empty());
+            let (messages, _) = event(
+                &mut frame,
+                renderer,
+                &[key(
+                    keyboard::Key::Character("x".into()),
+                    keyboard::key::Code::KeyX,
+                    Some("x"),
+                )],
+                iced::mouse::Cursor::Unavailable,
+            );
+            let [
+                cosmic::Action::App(Message::ChannelWork(ui::Action::Field(
+                    form,
+                    ui::Field::Host,
+                    _,
+                ))),
+            ] = messages.as_slice()
+            else {
+                panic!("actual full-frame host callback: {messages:?}");
+            };
+            let form = *form;
+            let cache = frame.into_cache();
+            // Set a valid target using the owner captured by that native field,
+            // without dispatching a transport or directly focusing any role.
+            for action in [
+                ui::Action::Field(form, ui::Field::Host, "github.com".into()),
+                ui::Action::Field(form, ui::Field::Repository, "fixture/work".into()),
+                ui::Action::Field(form, ui::Field::Number, "17".into()),
+            ] {
+                assert!(app.channel_work.view.update(action).is_none());
+            }
+            (app, home, form, cache)
+        }
+
+        #[test]
+        fn full_window_tab_cycle_reaches_work_fields_roles_and_submit_after_cached_frames() {
+            for number_click in [false, true] {
+                let mut renderer = super::super::super::tests::headless_renderer();
+                let (mut app, home, form, cache) = fixture(&mut renderer);
+                let mut frame = mount(&app, cache, &mut renderer);
+                let host = input(&mut frame, &renderer, "-host");
+                let repo = input(&mut frame, &renderer, "-repo");
+                let number = input(&mut frame, &renderer, "-number");
+                let roles = ["Contributing", "Stewarding", "Review only", "Reference"]
+                    .map(|label| labelled(&mut frame, &renderer, label).0);
+                let submit = labelled(&mut frame, &renderer, "Track PR").0;
+                let focus = probe(&mut frame, &renderer);
+                assert!(
+                    focus.0.len() > 8,
+                    "count every global and form focusable, not only WindowClose: {focus:?}"
+                );
+                if number_click {
+                    let point = focus
+                        .0
+                        .iter()
+                        .find(|node| node.id.as_ref().is_some_and(|id| same(id, &number)))
+                        .unwrap()
+                        .bounds
+                        .center();
+                    assert!(click(&mut frame, &mut renderer, point).is_empty());
+                    assert!(
+                        same(&active(&mut frame, &renderer), &number),
+                        "real Number click must own native focus exclusively"
+                    );
+                    assert!(same(&tab(&mut frame, &mut renderer, false), &roles[0]));
+                } else {
+                    // Identify the actual window-close button by its own native
+                    // callback; never dispatch that close in this fixture.
+                    let close = focus
+                        .0
+                        .iter()
+                        .filter(|node| {
+                            node.bounds.y < design::HEADER_HEIGHT && node.bounds.width <= 48.0
+                        })
+                        .max_by(|a, b| a.bounds.x.total_cmp(&b.bounds.x))
+                        .expect("window chrome close control");
+                    let close_id = close.id.clone().unwrap();
+                    let close_messages = click(&mut frame, &mut renderer, close.bounds.center());
+                    assert!(
+                        matches!(
+                            close_messages.as_slice(),
+                            [cosmic::Action::App(Message::WindowCloseRequested(id))]
+                            if *id == window::Id::RESERVED
+                        ),
+                        "actual window-close callback: {close_messages:?}"
+                    );
+                    // Keep the actual post-click state: resetting all focus
+                    // here would conceal the suspected retained/dual-focus
+                    // failure before the next Tab could expose it.
+                    let _ = probe(&mut frame, &renderer);
+                    seek(&mut frame, &mut renderer, &close_id);
+                    seek(&mut frame, &mut renderer, &host);
+                    assert!(same(&tab(&mut frame, &mut renderer, false), &repo));
+                    assert!(same(&tab(&mut frame, &mut renderer, false), &number));
+                    assert!(same(&tab(&mut frame, &mut renderer, false), &roles[0]));
+                }
+                for role in &roles[1..] {
+                    assert!(same(&tab(&mut frame, &mut renderer, false), role));
+                }
+                assert!(same(&tab(&mut frame, &mut renderer, false), &submit));
+                for expected in roles.iter().rev().chain([&number, &repo, &host]) {
+                    assert!(same(&tab(&mut frame, &mut renderer, true), expected));
+                }
+                seek(&mut frame, &mut renderer, &roles[3]);
+                let cache = frame.into_cache();
+                // Neither an unchanged full frame nor a presentation-only
+                // rename may replace native focus with the chrome close button.
+                app.channel_work
+                    .view
+                    .set_title(home, "Renamed channel".into());
+                let mut frame = mount(&app, cache, &mut renderer);
+                assert!(same(&active(&mut frame, &renderer), &roles[3]));
+                let (messages, _) = event(
+                    &mut frame,
+                    &mut renderer,
+                    &[key(
+                        keyboard::Key::Named(keyboard::key::Named::Enter),
+                        keyboard::key::Code::Enter,
+                        None,
+                    )],
+                    iced::mouse::Cursor::Unavailable,
+                );
+                assert!(
+                    matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Role(actual, 3)))] if *actual == form),
+                    "Enter must activate the traversed Reference button: {messages:?}"
+                );
+                let cache = frame.into_cache();
+                let cosmic::Action::App(selected) = messages.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                drop(app.update(selected));
+                assert!(
+                    app.core.keyboard_nav(),
+                    "selecting a role must not disable global Tab"
+                );
+                let mut frame = mount(&app, cache, &mut renderer);
+                assert!(same(&active(&mut frame, &renderer), &roles[3]));
+                // The actual header navigation and dirty Keep dialog also
+                // rebuild the outer frame. Execute their normal widget tasks
+                // against that frame, not a local copy of the form.
+                let (_, conversations) =
+                    labelled(&mut frame, &renderer, "Conversations for channel Original");
+                let navigation = click(&mut frame, &mut renderer, conversations.center());
+                let [cosmic::Action::App(Message::ChannelWorkNavigation(destination))] =
+                    navigation.as_slice()
+                else {
+                    panic!("actual dirty navigation callback: {navigation:?}");
+                };
+                let destination = *destination;
+                let cache = frame.into_cache();
+                let focus_keep = app.update(Message::ChannelWorkNavigation(destination));
+                assert!(app.channel_work_is_main());
+                assert!(app.channel_work.view.has_confirmation());
+                assert_eq!(app.channel_work.view.home(), Some(home));
+                let mut frame = mount(&app, cache, &mut renderer);
+                apply_focus_task(&mut frame, &renderer, focus_keep);
+                let (keep_id, keep_bounds) = labelled(&mut frame, &renderer, "Keep editing");
+                assert!(same(&active(&mut frame, &renderer), &keep_id));
+                let kept = click(&mut frame, &mut renderer, keep_bounds.center());
+                let [
+                    cosmic::Action::App(Message::ChannelWork(ui::Action::Keep(view, confirmation))),
+                ] = kept.as_slice()
+                else {
+                    panic!("actual Keep callback: {kept:?}");
+                };
+                let (view, confirmation) = (*view, *confirmation);
+                let cache = frame.into_cache();
+                let focus_role =
+                    app.update(Message::ChannelWork(ui::Action::Keep(view, confirmation)));
+                assert!(app.channel_work_is_main());
+                assert!(!app.channel_work.view.has_confirmation());
+                assert_eq!(app.channel_work.view.home(), Some(home));
+                assert_eq!(app.durable.active_channel, Some(home.channel));
+                assert!(
+                    app.core.keyboard_nav(),
+                    "Keep must preserve global traversal admission"
+                );
+                let mut frame = mount(&app, cache, &mut renderer);
+                apply_focus_task(&mut frame, &renderer, focus_role);
+                assert!(same(&active(&mut frame, &renderer), &roles[3]));
+                let (_, submit_bounds) = labelled(&mut frame, &renderer, "Track PR");
+                assert!(
+                    iced::Rectangle::with_size(iced::Size::new(1280.0, 900.0))
+                        .contains(submit_bounds.center()),
+                    "actual native submit must be in the viewport: {submit_bounds:?}"
+                );
+                let submitted = click(&mut frame, &mut renderer, submit_bounds.center());
+                let _ = frame.into_cache();
+                let [
+                    cosmic::Action::App(Message::ChannelWork(ui::Action::Submit {
+                        owner,
+                        role: crate::channel_work::Role::Reference,
+                        target,
+                        revision: 0,
+                    })),
+                ] = submitted.as_slice()
+                else {
+                    panic!(
+                        "keyboard Reference must not steal the later pointer submit: {submitted:?}"
+                    );
+                };
+                assert_eq!(*owner, form);
+                assert_eq!(
+                    target,
+                    &crate::channel_work::Target::PullRequest(
+                        crate::github_identity::PullRequestKey::from_url(
+                            "https://github.com/fixture/work/pull/17"
+                        )
+                        .unwrap()
+                    )
+                );
+                let cosmic::Action::App(submit) = submitted.into_iter().next().unwrap() else {
+                    unreachable!()
+                };
+                // Dispatch the actual full-frame callback through App, then
+                // drop its unpolled transport task: no fixture RPC is run.
+                drop(app.update(submit));
+                assert_eq!(
+                    app.channel_work.view.pending_homes().collect::<Vec<_>>(),
+                    [home]
+                );
+            }
+        }
+    }
+
     fn main_fixture() -> (Cagents, Home) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let home = captured();
