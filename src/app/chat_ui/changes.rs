@@ -185,7 +185,6 @@ fn kind(kind: &chat::ChangeKind) -> &'static str {
     }
 }
 
-
 fn totals(additions: Option<u64>, deletions: Option<u64>) -> String {
     match (additions, deletions) {
         (Some(added), Some(deleted)) => format!("+{added} −{deleted}"),

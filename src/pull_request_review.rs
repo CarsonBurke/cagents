@@ -3104,6 +3104,51 @@ pub(crate) mod tests {
     use crate::github::{PullRequestFile, RemoteValue};
     use crate::repository::ValidatedRefName;
 
+    #[test]
+    fn summary_title_ellipsis_preserves_ordinary_word_wrap_geometry() {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::{
+            Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+            ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+        };
+
+        // Exercise the text engine reexported by the UI, so removing or
+        // bypassing the temporary dependency patch also fails an app test.
+        let mut db = fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+        );
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow.";
+        let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        let layout = |ellipsize| {
+            let mut lines = Vec::new();
+            shaped.layout_to_buffer(
+                &mut ShapeBuffer::default(),
+                18.0,
+                Some(110.0),
+                Wrap::WordOrGlyph,
+                ellipsize,
+                None,
+                &mut lines,
+                None,
+                Hinting::Disabled,
+            );
+            lines
+        };
+        let ordinary = layout(Ellipsize::None);
+        let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+            SUMMARY_TITLE_LINES,
+        )));
+        assert!(ordinary.len() > SUMMARY_TITLE_LINES);
+        assert_eq!(limited.len(), SUMMARY_TITLE_LINES);
+        let expected = &ordinary[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        let actual = &limited[SUMMARY_TITLE_LINES - 1].glyphs[0];
+        assert_eq!(actual.start, expected.start);
+        assert_eq!(actual.x, expected.x);
+        assert!(!text[actual.start..actual.end].starts_with(' '));
+    }
+
     fn path(value: &str) -> RepoPath {
         RepoPath::parse(value).unwrap()
     }
