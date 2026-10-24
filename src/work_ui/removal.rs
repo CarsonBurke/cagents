@@ -182,6 +182,19 @@ impl State {
         })
     }
 
+    /// A pane replacement retires queued user input from its unsubmitted
+    /// review. The accepted plan and choices remain available when reopened;
+    /// pending requests and in-flight read/completion custody keep their IDs.
+    pub(super) fn retire_review_input(&mut self) {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase == Phase::Review)
+        {
+            self.rotate();
+        }
+    }
+
     pub(super) fn subject(&self) -> Option<&RemovalSubject> {
         self.operation.as_ref().map(|operation| &operation.subject)
     }

@@ -314,8 +314,9 @@ impl State {
     pub fn reset(&mut self) {
         let scope = self.scope.take();
         let layout = self.layout;
-        // Closing a pane is not cancellation or proof that a destructive
-        // request failed. Keep its exact host, token, generation and receipt.
+        // Closing a pane retires unsubmitted review input, not an accepted
+        // request. Keep its exact host, token, receipt and in-flight generation.
+        self.removal.retire_review_input();
         let removal = std::mem::take(&mut self.removal);
         *self = Self {
             scope,
@@ -3351,6 +3352,43 @@ mod tests {
     }
 
     #[test]
+    fn a_planning_reply_survives_reset_with_its_original_request_generation() {
+        let mut state = State::default();
+        let original = removable("/work/original");
+        connected(&mut state, 1, board(vec![original.clone()]));
+        let subject = RemovalSubject::of(&original).unwrap();
+        let Some(Effect::Removal(RemovalEffect::Plan { generation, .. })) = state.update(
+            RemovalAction::Open {
+                generation: state.removal.generation(),
+                subject: subject.clone(),
+            }
+            .into(),
+        ) else {
+            panic!("initial inspection")
+        };
+        state.reset();
+        assert_eq!(state.removal.generation(), generation);
+        connected(&mut state, 1, board(vec![original]));
+        assert!(
+            state
+                .update(
+                    RemovalAction::Planned {
+                        generation,
+                        result: Ok(prepared_removal(&subject)),
+                    }
+                    .into()
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            state.update(RemovalAction::Confirm {
+                generation: state.removal.generation(),
+            }.into()),
+            Some(Effect::Removal(RemovalEffect::Remove { subject: removed, .. })) if removed == subject
+        ));
+    }
+
+    #[test]
     fn pending_and_uncertain_removal_survive_reset_and_completions_are_background() {
         let mut state = State::default();
         let original = removable("/work/original");
@@ -3398,6 +3436,9 @@ mod tests {
         };
         assert_eq!(inspected, subject);
         assert_eq!(backend, prepared_removal(&subject).backend);
+        state.reset();
+        assert_eq!(state.removal.generation(), generation);
+        assert_eq!(state.removal.subject(), Some(&subject));
         let completion: Action = RemovalAction::Planned {
             generation,
             result: Err("not reachable".into()),
@@ -3674,7 +3715,7 @@ mod tests {
                 "confirm must be fully visible: {bounds:?}, {viewport:?}"
             );
             let point = bounds.center();
-            let queued = click_work(&mut ui, &mut renderer, point);
+            let mut queued = click_work(&mut ui, &mut renderer, point);
             assert!(
                 matches!(queued.as_slice(), [Action::Removal(action)] if matches!(action.as_ref(), RemovalAction::Confirm { generation: g } if *g == generation)),
                 "{queued:?}"
@@ -3702,7 +3743,7 @@ mod tests {
             if let Some(choice) = choice {
                 assert!(state.update(choice).is_none());
                 assert_ne!(state.removal.generation(), generation);
-                assert!(state.update(queued.into_iter().next().unwrap()).is_none());
+                assert!(state.update(queued.remove(0)).is_none());
             }
             // A first Watch owns new Pin callbacks, but the accepted review
             // still owns its original inspection, host and receipt generation.
@@ -3712,7 +3753,13 @@ mod tests {
             connected(&mut state, 1, board(vec![original]));
             assert_eq!(state.removal.subject(), Some(&subject));
             let accepted_generation = state.removal.generation();
-            if !change_choice {
+            if change == "reset" {
+                assert_ne!(accepted_generation, generation);
+                assert!(
+                    state.update(queued.remove(0)).is_none(),
+                    "a real queued Confirm from the closed pane must not remove the identical reconnected subject"
+                );
+            } else if !change_choice {
                 assert_eq!(accepted_generation, generation);
             }
             let mut ui = full_removal_ui(&state, cache, &mut renderer);
