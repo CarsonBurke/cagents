@@ -1447,6 +1447,29 @@ impl ClientHandle {
         self.install_snapshot_for_test(snapshot);
     }
 
+    /// Observe disposal of this exact publication, independently of the UI's
+    /// presentation reclaimer. The signal follows destruction of its payload.
+    #[cfg(test)]
+    pub(crate) fn observe_snapshot_retirement_for_test(
+        &self,
+    ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
+        let (completed, observed) = std::sync::mpsc::channel();
+        let publication = self.inner.publication.current.load();
+        assert!(
+            publication.resident,
+            "observe a resident transcript publication"
+        );
+        assert!(
+            publication
+                .retirement_complete
+                .lock()
+                .unwrap()
+                .replace(completed)
+                .is_none()
+        );
+        observed
+    }
+
     /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
     pub fn preview(
         session: Session,

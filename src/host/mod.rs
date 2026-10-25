@@ -3,6 +3,7 @@ pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
+mod channel_work;
 mod chat;
 mod client;
 mod delivery;
