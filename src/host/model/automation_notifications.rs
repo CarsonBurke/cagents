@@ -211,9 +211,10 @@ pub(super) fn queue(
 }
 
 /// Read only a finite oldest-first page. Reading/enqueueing is not ACK. The
-/// transfer owner serializes page selection plus enqueue with slot writers,
-/// releases Registry/Host/control locks before waiting for any journal receipt,
-/// and acknowledges only the exact successful/durably-duplicate Entry.
+/// sole transfer owner permits one selected/in-flight snapshot. Independent
+/// model connections may supersede or suppress it before enqueue; it remains
+/// historical evidence, and its exact ACK cannot consume a replacement. Release
+/// Registry/Host/control guards before observing any journal receipt.
 pub(super) fn pending(db: &Connection, limit: usize) -> Result<Vec<Entry>, String> {
     if !(1..=PAGE_SIZE).contains(&limit) {
         return Err("Invalid automation attention page size".into());
@@ -269,8 +270,8 @@ pub(super) fn acknowledge(tx: &Transaction<'_>, committed: &[Entry]) -> Result<u
 
 /// Causal resolution, not delivery ACK. Suppress only this firing's older,
 /// still-pending precheck interruption after its exact recovered audit receipt.
-/// Already-enqueued/committed notifications cannot be retracted by this leaf;
-/// activation must show the historical cause and current authorized status.
+/// Already-selected/enqueued/committed snapshots cannot be retracted by this
+/// leaf; activation must show the historical cause and current authorized status.
 pub(super) fn suppress_precheck(
     tx: &Transaction<'_>,
     automation: Uuid,

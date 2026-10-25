@@ -110,9 +110,12 @@ impl Transfer {
             return Ok(RECEIPT_POLL);
         }
 
-        // Serialize read + enqueue with lifecycle writers. Notification enqueue
-        // takes only a bounded pending mutex; the journal broker releases that
-        // mutex before Registry/HostState access or disk I/O.
+        // This guard serializes only execution-connection users. A separate
+        // model connection can replace/suppress the selected entry before its
+        // enqueue; that immutable snapshot may still become historical notice.
+        // The sole transfer owner cannot enqueue a successor until this exact
+        // receipt settles, and its ACK cannot consume a replacement. Enqueue
+        // takes only a bounded mutex, released before journal I/O/host access.
         let registry = registry.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(entry) = registry
             .pending_automation_notifications(1)?
@@ -318,7 +321,9 @@ mod tests {
         let (directory, registry, automation, old) = fixture();
         let (mut transfer, sender) = waiting(old.clone());
         let newer = {
-            let mut registry = registry.lock().unwrap();
+            // Model edits use an independent SQLite connection, not this
+            // transfer owner's execution-registry mutex.
+            let mut registry = registry.lock().unwrap().execution_connection().unwrap();
             registry
                 .apply(&ModelEdit::ReopenProject {
                     repository: directory.path().to_owned(),
