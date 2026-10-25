@@ -1455,13 +1455,18 @@ impl ClientHandle {
     ) -> std::sync::mpsc::Receiver<std::thread::ThreadId> {
         let (completed, observed) = std::sync::mpsc::channel();
         let publication = self.inner.publication.current.load();
-        assert!(publication.resident, "observe a resident transcript publication");
-        assert!(publication
-            .retirement_complete
-            .lock()
-            .unwrap()
-            .replace(completed)
-            .is_none());
+        assert!(
+            publication.resident,
+            "observe a resident transcript publication"
+        );
+        assert!(
+            publication
+                .retirement_complete
+                .lock()
+                .unwrap()
+                .replace(completed)
+                .is_none()
+        );
         observed
     }
 
