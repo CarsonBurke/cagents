@@ -965,6 +965,7 @@ pub enum Action {
     /// through the daemon, or could not.
     OffstripClosed {
         card: CardId,
+        source: TerminalSession,
         result: Result<(), String>,
     },
     LoginVerified {
@@ -2795,16 +2796,27 @@ impl Cagents {
                     }
                 }
             }
-            Action::OffstripClosed { card, result } => match result {
-                // With its card gone, the sign-in counts as ended.
-                Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(format!(
-                        "The sign-in could not be stopped: {error}"
-                    )));
-                    Task::none()
+            Action::OffstripClosed {
+                card,
+                source,
+                result,
+            } => {
+                // The card may have been retried while this close was in flight.
+                // Neither its result nor its error belongs to the replacement.
+                if !offstrip_close_matches(self.card_state(card), &source) {
+                    return Task::none();
                 }
-            },
+                match result {
+                    // With its original card gone, the sign-in counts as ended.
+                    Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "The sign-in could not be stopped: {error}"
+                        )));
+                        Task::none()
+                    }
+                }
+            }
             Action::LoginVerified { key, outcome } => self.login_verified(key, outcome),
             Action::LoginSettled { key, result } => self.login_settled(key, result),
             Action::CancelLogin(key) => {
@@ -3857,19 +3869,24 @@ impl Cagents {
             }) => session
                 .continuity
                 .live_proof()
-                .map(|proof| (session.id, proof)),
+                .map(|proof| (session.clone(), proof)),
             _ => None,
         };
-        let Some((terminal, proof)) = hosted else {
+        let Some((source, proof)) = hosted else {
             // Ended already, or never taken on by the daemon: nothing runs.
             return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
         };
+        let terminal = source.id;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::AccountUi(Action::OffstripClosed { card, result })
+            Message::AccountUi(Action::OffstripClosed {
+                card,
+                source,
+                result,
+            })
         })
     }
 
@@ -5232,6 +5249,22 @@ fn ended_on_host(
         .collect())
 }
 
+// Match process identity, not the continuity variant: the original terminal
+// may legitimately exit before its close acknowledgement reaches this window.
+fn offstrip_close_matches(state: Option<&CardState>, source: &TerminalSession) -> bool {
+    let Some(proof) = source.continuity.live_proof() else {
+        return false;
+    };
+    matches!(state, Some(CardState { kind: CardKind::Terminal(current), existence, .. })
+        if existence.is_open()
+            && current.id == source.id
+            && current.launch == source.launch
+            && (current.continuity.live_proof().as_ref() == Some(&proof)
+                || matches!(current.continuity,
+                    TerminalContinuity::Exited { .. }
+                    | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })))
+}
+
 /// Closes the hosted `terminal` for good. A daemon that restored it under
 /// a session of its own is asked again with that session, so a close is
 /// only reported done once the terminal has ended or is gone.
@@ -6268,8 +6301,12 @@ mod app_tests {
             app.card_state(card)
                 .is_some_and(|state| state.existence.is_open())
         );
+        let CardKind::Terminal(source) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("the original sign-in terminal remains")
+        };
         let _ = app.update(Message::AccountUi(Action::OffstripClosed {
             card,
+            source: source.clone(),
             result: Err("unreachable".into()),
         }));
         assert!(
@@ -6278,6 +6315,7 @@ mod app_tests {
         );
         let _ = app.update(Message::AccountUi(Action::OffstripClosed {
             card,
+            source,
             result: Ok(()),
         }));
         assert!(
@@ -6286,6 +6324,247 @@ mod app_tests {
             "the settled sign-in's card was left open"
         );
         assert!(!app.durable.card_scopes.contains_key(&card));
+    }
+
+    // No terminal or close task is polled: these are accepted-message identity
+    // controls using the real navigation, exit reducer and public Retry path.
+    fn offstrip_close_fixture() -> (Cagents, CardId, TerminalSession) {
+        let mut app = app_in_repo();
+        let key = uuid::Uuid::from_u128(923);
+        let home = PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string());
+        let launch = login_launch(
+            &Account::managed(Provider::Claude, key, home.clone()),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .unwrap();
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|state| {
+                matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal)
+                    .then_some(state.id)
+            })
+            .unwrap();
+        let CardKind::Terminal(source) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("sign-in terminal")
+        };
+        source.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("original-host"),
+            boot_id: crate::model::BootId::new("original-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("original-incarnation"),
+        };
+        let source = source.clone();
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        drop(app.select_worktree("/elsewhere".into(), false));
+        assert!(!app.workspace.order().any(|id| id == card));
+        drop(app.close_offstrip_sign_in(card));
+        (app, card, source)
+    }
+
+    #[test]
+    fn an_old_offstrip_close_cannot_retire_or_report_against_a_retried_sign_in() {
+        let (mut app, card, source) = offstrip_close_fixture();
+        drop(app.select_worktree("/repo".into(), false));
+        assert!(app.workspace.order().any(|id| id == card));
+        app.retire_ended_terminal(card, 7, None, true);
+        assert!(matches!(&app.card_state(card).unwrap().kind,
+            CardKind::Terminal(current) if current.id == source.id
+                && matches!(current.continuity, TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })));
+        drop(app.update(Message::RetryCard(card)));
+        let CardKind::Terminal(replacement) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("Retry retains the terminal card")
+        };
+        assert_ne!(
+            replacement.id, source.id,
+            "actual Retry creates a new terminal identity"
+        );
+        assert_eq!(replacement.predecessor, Some(source.id));
+        assert_eq!(replacement.launch, source.launch);
+        replacement.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("replacement-host"),
+            boot_id: crate::model::BootId::new("original-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("original-incarnation"),
+        };
+        drop(app.select_worktree("/elsewhere".into(), false));
+        assert!(!app.workspace.order().any(|id| id == card));
+        let replacement = app.card_state(card).unwrap().clone();
+        let scopes = app.durable.card_scopes.clone();
+        let lifecycle = app
+            .lifecycle
+            .state(card)
+            .map(|(exposure, residency)| (*exposure, residency.clone()));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        app.status = Some(TransientNotice::warning("replacement is current"));
+        for result in [Ok(()), Err("old close failed".into())] {
+            let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                card,
+                source: source.clone(),
+                result,
+            }));
+            assert_eq!(
+                task.units(),
+                0,
+                "no retirement, login check or follow-up task"
+            );
+            drop(task);
+            assert_eq!(app.card_state(card), Some(&replacement));
+            assert_eq!(app.durable.card_scopes, scopes);
+            assert_eq!(
+                app.lifecycle
+                    .state(card)
+                    .map(|(exposure, residency)| (*exposure, residency.clone())),
+                lifecycle
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+            assert_eq!(app.account_ui.logins.len(), 1);
+            assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Waiting);
+            assert!(!app.account_ui.asking_host);
+            assert_eq!(
+                app.status.as_ref().unwrap().message,
+                "replacement is current"
+            );
+        }
+    }
+
+    #[test]
+    fn offstrip_close_requires_original_source_but_allows_its_legitimate_exit() {
+        for changed in ["proof", "launch", "kind", "closed"] {
+            let (mut app, card, source) = offstrip_close_fixture();
+            let state = app.card_state_mut(card).unwrap();
+            match changed {
+                "proof" => {
+                    let CardKind::Terminal(current) = &mut state.kind else {
+                        unreachable!()
+                    };
+                    current.continuity = TerminalContinuity::Live {
+                        host_session_id: crate::model::HostSessionId::new("different-host"),
+                        boot_id: crate::model::BootId::new("original-boot"),
+                        host_incarnation: crate::model::HostIncarnation::new(
+                            "original-incarnation",
+                        ),
+                    };
+                }
+                "launch" => {
+                    let CardKind::Terminal(current) = &mut state.kind else {
+                        unreachable!()
+                    };
+                    current.launch.arguments.push("changed-command".into());
+                }
+                "kind" => state.kind = CardKind::Settings,
+                "closed" => {
+                    state.existence = Existence::Closed {
+                        tombstone: crate::model::Tombstone {
+                            operation_id: None,
+                            closed_at_unix_ms: 1,
+                            reason: None,
+                        },
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let current = app.card_state(card).unwrap().clone();
+            app.status = Some(TransientNotice::warning("current state"));
+            for result in [Ok(()), Err("stale failure".into())] {
+                let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                    card,
+                    source: source.clone(),
+                    result,
+                }));
+                assert_eq!(task.units(), 0, "{changed}");
+                drop(task);
+                assert_eq!(app.card_state(card), Some(&current), "{changed}");
+                assert!(!app.account_ui.asking_host, "{changed}");
+                assert_eq!(
+                    app.status.as_ref().unwrap().message,
+                    "current state",
+                    "{changed}"
+                );
+            }
+        }
+        // A still-original failure remains actionable, without checking logins.
+        let (mut app, card, source) = offstrip_close_fixture();
+        let task = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            source,
+            result: Err("original unavailable".into()),
+        }));
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.account_ui.asking_host);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("original unavailable")
+        );
+        // An original close acknowledged after returning to its strip must
+        // retain the visible card; normal strip close still owns its surface.
+        let (mut app, card, source) = offstrip_close_fixture();
+        drop(app.select_worktree("/repo".into(), false));
+        assert!(app.workspace.order().any(|id| id == card));
+        let task = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            source,
+            result: Ok(()),
+        }));
+        drop(task);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.durable.card_scopes.contains_key(&card));
+        for ended in ["exited", "relaunch"] {
+            let (mut app, card, source) = offstrip_close_fixture();
+            let last_exit = crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 42,
+            };
+            let CardKind::Terminal(current) = &mut app.card_state_mut(card).unwrap().kind else {
+                unreachable!()
+            };
+            current.continuity = if ended == "exited" {
+                TerminalContinuity::Exited { last_exit }
+            } else {
+                TerminalContinuity::RelaunchAvailable {
+                    recipe: current.launch.clone(),
+                    last_exit: Some(last_exit),
+                }
+            };
+            assert_eq!(current.id, source.id);
+            assert_eq!(current.launch, source.launch);
+            let task = app.update(Message::AccountUi(Action::OffstripClosed {
+                card,
+                source,
+                result: Ok(()),
+            }));
+            drop(task);
+            assert!(
+                app.card_state(card)
+                    .is_none_or(|state| !state.existence.is_open()),
+                "{ended}"
+            );
+            assert!(!app.durable.card_scopes.contains_key(&card), "{ended}");
+            assert!(!app.cards.contains_key(&card), "{ended}");
+            assert_eq!(
+                app.account_ui.logins[0].phase,
+                LoginPhase::Verifying,
+                "original exit can settle sign-in"
+            );
+        }
     }
 
     #[test]
