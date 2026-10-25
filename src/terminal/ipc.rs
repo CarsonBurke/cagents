@@ -181,7 +181,6 @@ use crate::{
 /// cannot decode this unsolicited event, so all three executables must match.
 /// Version 116 combines channel-work requests/responses with recoverable input
 /// notices. Neither predecessor identifies this combined matched executable set.
-/// This private candidate slot is provisional pending shared ABI coordination.
 pub const PROTOCOL_VERSION: u16 = 116;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
