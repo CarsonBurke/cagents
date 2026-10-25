@@ -16,6 +16,8 @@ use crate::{
 
 pub type RemovalGeneration = Uuid;
 
+const MAX_UNRESOLVED: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendTarget {
     pub socket: PathBuf,
@@ -93,6 +95,20 @@ pub enum Action {
     Reinspect {
         generation: RemovalGeneration,
     },
+    KeepUnresolved {
+        generation: RemovalGeneration,
+        owner: Uuid,
+    },
+    ReturnUnresolved {
+        generation: RemovalGeneration,
+        owner: Uuid,
+        id: Uuid,
+    },
+    CloseUnresolved {
+        generation: RemovalGeneration,
+        owner: Uuid,
+        id: Uuid,
+    },
     Finished {
         generation: RemovalGeneration,
         result: RemovalOutcome,
@@ -113,7 +129,10 @@ impl Action {
             | Self::Confirm { generation }
             | Self::Dismiss { generation }
             | Self::Reinspect { generation }
-            | Self::Finished { generation, .. } => *generation,
+            | Self::Finished { generation, .. }
+            | Self::KeepUnresolved { generation, .. }
+            | Self::ReturnUnresolved { generation, .. }
+            | Self::CloseUnresolved { generation, .. } => *generation,
         }
     }
 }
@@ -143,7 +162,15 @@ enum Phase {
     Removed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+struct Submitted {
+    subject: RemovalSubject,
+    prepared: PreparedPlan,
+    request: Removal,
+    diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct Operation {
     subject: RemovalSubject,
     prepared: Option<PreparedPlan>,
@@ -155,12 +182,24 @@ struct Operation {
     recovering: bool,
     message: Option<String>,
     removed: Option<Removed>,
+    submitted: Option<Submitted>,
+}
+
+#[derive(Debug)]
+struct Unresolved {
+    id: Uuid,
+    operation: Operation,
 }
 
 #[derive(Debug)]
 pub(super) struct State {
     generation: RemovalGeneration,
     operation: Option<Operation>,
+    unresolved: Vec<Unresolved>,
+    viewing_unresolved: Option<Uuid>,
+    // Separate input ownership retires new retained-list callbacks on pane
+    // reset without invalidating outstanding original worker completions.
+    retained_owner: Uuid,
 }
 
 impl Default for State {
@@ -168,6 +207,9 @@ impl Default for State {
         Self {
             generation: Uuid::new_v4(),
             operation: None,
+            unresolved: Vec::new(),
+            viewing_unresolved: None,
+            retained_owner: Uuid::new_v4(),
         }
     }
 }
@@ -177,15 +219,26 @@ impl State {
         self.generation
     }
     pub(super) fn can_open(&self) -> bool {
-        !self.operation.as_ref().is_some_and(|operation| {
-            matches!(operation.phase, Phase::Pending | Phase::Uncertain) || operation.recovering
-        })
+        self.unresolved.len() < MAX_UNRESOLVED
+            && self.viewing_unresolved.is_none()
+            && !self.operation.as_ref().is_some_and(|operation| {
+                matches!(operation.phase, Phase::Pending | Phase::Uncertain) || operation.recovering
+            })
+    }
+
+    pub(super) fn can_open_subject(&self, subject: &RemovalSubject) -> bool {
+        self.can_open()
+            && !self.unresolved.iter().any(|saved| {
+                saved.operation.subject.card == subject.card
+                    || saved.operation.subject.path == subject.path
+            })
     }
 
     /// A pane replacement retires queued user input from its unsubmitted
     /// review. The accepted plan and choices remain available when reopened;
     /// pending requests and in-flight read/completion custody keep their IDs.
     pub(super) fn retire_review_input(&mut self) {
+        self.retained_owner = Uuid::new_v4();
         if self
             .operation
             .as_ref()
@@ -201,6 +254,7 @@ impl State {
 
     fn rotate(&mut self) {
         self.generation = Uuid::new_v4();
+        self.retained_owner = Uuid::new_v4();
     }
 
     /// `current` means the board still names this exact non-primary worktree,
@@ -209,12 +263,59 @@ impl State {
         if action.generation() != self.generation {
             return None;
         }
-        if let Action::Open { subject, .. } = action {
-            if !current
-                || self.operation.as_ref().is_some_and(|op| {
-                    matches!(op.phase, Phase::Pending | Phase::Uncertain) || op.recovering
-                })
+        match &action {
+            Action::KeepUnresolved { owner, .. }
+                if *owner == self.retained_owner
+                    && self.viewing_unresolved.is_none()
+                    && self.unresolved.len() < MAX_UNRESOLVED
+                    && self
+                        .operation
+                        .as_ref()
+                        .is_some_and(|op| op.phase == Phase::Uncertain) =>
             {
+                self.unresolved.push(Unresolved {
+                    id: Uuid::new_v4(),
+                    operation: self.operation.take().expect("checked terminal unknown"),
+                });
+                self.rotate();
+                return None;
+            }
+            Action::ReturnUnresolved { owner, id, .. }
+                if *owner == self.retained_owner && self.operation.is_none() =>
+            {
+                let saved = self.unresolved.iter().find(|saved| saved.id == *id)?;
+                let mut original = saved.operation.clone();
+                if let Some(submitted) = &original.submitted {
+                    original.subject = submitted.subject.clone();
+                    original.prepared = Some(submitted.prepared.clone());
+                    original.keep = Some(submitted.request.keep);
+                    original.delete_branch = submitted.request.delete_branch;
+                    original.message = submitted.diagnostic.clone();
+                }
+                original.phase = Phase::Uncertain;
+                original.recovering = false;
+                self.operation = Some(original);
+                self.viewing_unresolved = Some(*id);
+                self.rotate();
+                return None;
+            }
+            Action::CloseUnresolved { owner, id, .. }
+                if *owner == self.retained_owner
+                    && self.viewing_unresolved == Some(*id)
+                    && self
+                        .operation
+                        .as_ref()
+                        .is_some_and(|op| op.phase == Phase::Uncertain) =>
+            {
+                self.operation = None;
+                self.viewing_unresolved = None;
+                self.rotate();
+                return None;
+            }
+            _ => {}
+        }
+        if let Action::Open { subject, .. } = action {
+            if !current || !self.can_open_subject(&subject) {
                 return None;
             }
             self.rotate();
@@ -227,6 +328,7 @@ impl State {
                 recovering: false,
                 message: None,
                 removed: None,
+                submitted: None,
             });
             return Some(Effect::Plan {
                 generation: self.generation,
@@ -234,6 +336,7 @@ impl State {
                 backend: None,
             });
         }
+        let readonly = self.viewing_unresolved.is_some();
         let operation = self.operation.as_mut()?;
         match action {
             Action::Open { .. } => unreachable!(),
@@ -254,6 +357,14 @@ impl State {
                     Ok(prepared)
                 });
                 match result {
+                    Ok(prepared) if readonly => {
+                        // This is an observation, never a receipt for the old
+                        // mutation or fresh consent. The stored record is untouched.
+                        operation.prepared = Some(prepared);
+                        operation.phase = Phase::Uncertain;
+                        operation.recovering = false;
+                        operation.message = Some("Inspection completed. The original removal result remains unconfirmed.".into());
+                    }
                     Ok(prepared) => {
                         operation.keep = match prepared.plan.inspection.verdict {
                             Verdict::Unsaved { .. } => prepared
@@ -280,7 +391,9 @@ impl State {
                 }
                 self.rotate();
             }
-            Action::Keep { keep, .. } if operation.phase == Phase::Review && current => {
+            Action::Keep { keep, .. }
+                if !readonly && operation.phase == Phase::Review && current =>
+            {
                 if operation
                     .prepared
                     .as_ref()?
@@ -292,7 +405,9 @@ impl State {
                     self.rotate();
                 }
             }
-            Action::DeleteBranch { delete, .. } if operation.phase == Phase::Review && current => {
+            Action::DeleteBranch { delete, .. }
+                if !readonly && operation.phase == Phase::Review && current =>
+            {
                 let plan = &operation.prepared.as_ref()?.plan;
                 if !delete
                     || (plan.inspection.branch.is_some()
@@ -302,7 +417,7 @@ impl State {
                     self.rotate();
                 }
             }
-            Action::Confirm { .. } if operation.phase == Phase::Review && current => {
+            Action::Confirm { .. } if !readonly && operation.phase == Phase::Review && current => {
                 let prepared = operation.prepared.as_ref()?;
                 let keep = operation.keep?;
                 prepared.plan.permits(keep, operation.delete_branch).ok()?;
@@ -318,18 +433,25 @@ impl State {
                 if !operation.subject.path.is_absolute() {
                     return None;
                 }
+                let request = Removal {
+                    scope: Scope::Project(operation.subject.card.project.clone()),
+                    item,
+                    token,
+                    keep,
+                    delete_branch: operation.delete_branch,
+                };
+                operation.submitted = Some(Submitted {
+                    subject: operation.subject.clone(),
+                    prepared: prepared.clone(),
+                    request: request.clone(),
+                    diagnostic: None,
+                });
                 operation.phase = Phase::Pending;
                 return Some(Effect::Remove {
                     generation: self.generation,
                     subject: operation.subject.clone(),
                     backend: prepared.backend.clone(),
-                    request: Removal {
-                        scope: Scope::Project(operation.subject.card.project.clone()),
-                        item,
-                        token,
-                        keep,
-                        delete_branch: operation.delete_branch,
-                    },
+                    request,
                 });
             }
             Action::Finished { result, .. } if operation.phase == Phase::Pending => {
@@ -354,6 +476,11 @@ impl State {
                         operation.phase = Phase::Uncertain;
                         operation.message = Some(error);
                     }
+                }
+                if operation.phase == Phase::Uncertain
+                    && let Some(submitted) = &mut operation.submitted
+                {
+                    submitted.diagnostic = operation.message.clone();
                 }
                 self.rotate();
             }
@@ -381,7 +508,8 @@ impl State {
                 });
             }
             Action::Dismiss { .. }
-                if !matches!(operation.phase, Phase::Pending | Phase::Uncertain)
+                if !readonly
+                    && !matches!(operation.phase, Phase::Pending | Phase::Uncertain)
                     && !operation.recovering =>
             {
                 self.operation = None;
@@ -397,13 +525,93 @@ impl State {
         current: bool,
         pane: super::ActivationLifetime,
     ) -> Option<Element<'_, Action>> {
-        let operation = self.operation.as_ref()?;
+        if self.operation.is_none() && self.unresolved.is_empty() {
+            return None;
+        }
+        let generation = self.generation;
+        let owner = self.retained_owner;
+        let mut content = widget::column::with_capacity(4).spacing(space::XS);
+        if let Some(operation) = &self.operation {
+            content = content.push(self.operation_view(operation, current));
+        }
+        if !self.unresolved.is_empty() {
+            content = content.push(design::heading(format!(
+                "Unresolved removals · {} / {MAX_UNRESOLVED}",
+                self.unresolved.len()
+            )));
+            content = content.push(design::caption("Kept for the current application lifetime. Original results are still unconfirmed; no removal is resent. The same card or path stays protected."));
+            if self.unresolved.len() == MAX_UNRESOLVED {
+                content = content.push(design::body("All 16 unresolved slots are occupied. New removals are disabled; browsing and inspecting retained originals remain available. No records are discarded automatically."));
+            }
+            for saved in &self.unresolved {
+                let id = saved.id;
+                let row = widget::column::with_children(vec![
+                    design::body(bounded(&saved.operation.subject.label)).into(),
+                    design::caption(bounded(&crate::app::display_path(
+                        &saved.operation.subject.path,
+                    )))
+                    .into(),
+                    button::secondary("Review original")
+                        .on_press_maybe(self.operation.is_none().then_some(
+                            Action::ReturnUnresolved {
+                                generation,
+                                owner,
+                                id,
+                            },
+                        ))
+                        .into(),
+                ])
+                .spacing(space::XS);
+                content = content.push(crate::ui_controls::owned(
+                    (pane, generation, owner, id),
+                    row,
+                ));
+            }
+            if self.operation.is_some() {
+                content = content.push(design::caption(
+                    "Close this review before opening another retained original.",
+                ));
+            }
+        }
+        // Preserve the outer scroll state while retiring native input owners.
+        Some(
+            widget::container(
+                widget::scrollable(crate::ui_controls::owned(
+                    (
+                        pane,
+                        generation,
+                        self.operation.as_ref().map(|op| op.phase),
+                        current,
+                    ),
+                    content,
+                ))
+                .height(Length::Shrink),
+            )
+            .max_height(360.0)
+            .padding(space::M)
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
+    fn operation_view<'a>(
+        &'a self,
+        operation: &'a Operation,
+        current: bool,
+    ) -> Element<'a, Action> {
         let generation = self.generation;
         let mut content = widget::column::with_children(vec![
-            design::heading(format!("Remove worktree · {}", operation.subject.label)).into(),
-            design::caption(crate::app::display_path(&operation.subject.path)).into(),
+            design::heading(format!(
+                "Remove worktree · {}",
+                bounded(&operation.subject.label)
+            ))
+            .into(),
+            design::caption(bounded(&crate::app::display_path(&operation.subject.path))).into(),
         ])
         .spacing(space::XS);
+        if self.viewing_unresolved.is_some() {
+            content = content.push(design::body("Read-only original. Inspection cannot confirm or settle the original removal. Its full unresolved record remains kept for the current application lifetime."));
+        }
         if let Some(prepared) = &operation.prepared
             && operation.phase != Phase::Removed
         {
@@ -508,7 +716,7 @@ impl State {
             }
         }
         if let Some(message) = &operation.message {
-            content = content.push(design::body(message.as_str()));
+            content = content.push(design::body(bounded(message)));
         }
         content = match operation.phase {
             Phase::Planning if operation.recovering => content.push(design::body("Inspecting the original worktree… The previous removal result is still unconfirmed.")),
@@ -528,7 +736,27 @@ impl State {
             }
             Phase::Review | Phase::Refused => content,
         };
-        let mut actions = widget::row::with_capacity(2).spacing(space::S);
+        let mut actions = widget::column::with_capacity(3).spacing(space::S);
+        if operation.phase == Phase::Uncertain {
+            if let Some(id) = self.viewing_unresolved {
+                actions = actions.push(button::quiet("Back to unresolved removals").on_press(
+                    Action::CloseUnresolved {
+                        generation,
+                        owner: self.retained_owner,
+                        id,
+                    },
+                ));
+            } else {
+                actions = actions.push(
+                    button::secondary("Keep unresolved; review other work").on_press(
+                        Action::KeepUnresolved {
+                            generation,
+                            owner: self.retained_owner,
+                        },
+                    ),
+                );
+            }
+        }
         if matches!(
             operation.phase,
             Phase::Review | Phase::Refused | Phase::Uncertain
@@ -542,24 +770,7 @@ impl State {
                 .push(button::quiet("Close review").on_press(Action::Dismiss { generation }));
         }
         content = content.push(actions);
-        // Choices rotate the controller generation. Phase also changes on
-        // submission without rotating it, so the original completion still
-        // owns Pending. Pane replacement retires native input only. Watch
-        // UUIDs are excluded; current eligibility may
-        // retire controls without changing the controller or scroll position.
-        Some(
-            widget::container(
-                widget::scrollable(crate::ui_controls::owned(
-                    (pane, generation, operation.phase, current),
-                    content,
-                ))
-                .height(Length::Shrink),
-            )
-            .max_height(360.0)
-            .padding(space::M)
-            .width(Length::Fill)
-            .into(),
-        )
+        content.into()
     }
 }
 
@@ -677,6 +888,389 @@ mod tests {
                     true
                 )
                 .is_none()
+        );
+    }
+
+    fn distinct_subject(number: usize) -> RemovalSubject {
+        let mut value = subject(&format!("/work/{number}"));
+        value.card.key = ItemKey::Worktree(value.path.clone());
+        value.branch = Some(format!("branch-{number}"));
+        value.label = format!("work-{number}");
+        value
+    }
+
+    fn uncertain(state: &mut State, subject: RemovalSubject) -> (RemovalGeneration, Removal) {
+        review(state, subject, Verdict::Landed);
+        state.update(
+            Action::DeleteBranch {
+                generation: state.generation(),
+                delete: true,
+            },
+            true,
+        );
+        let generation = state.generation();
+        let Some(Effect::Remove { request, .. }) =
+            state.update(Action::Confirm { generation }, true)
+        else {
+            panic!("one accepted request")
+        };
+        state.update(
+            Action::Finished {
+                generation,
+                result: RemovalOutcome::Uncertain("EOF after submission".into()),
+            },
+            false,
+        );
+        (generation, request)
+    }
+
+    fn keep_unresolved(state: &mut State) -> Uuid {
+        assert!(
+            state
+                .update(
+                    Action::KeepUnresolved {
+                        generation: state.generation(),
+                        owner: state.retained_owner
+                    },
+                    false
+                )
+                .is_none()
+        );
+        assert!(state.operation.is_none());
+        state.unresolved.last().unwrap().id
+    }
+
+    fn return_unresolved(state: &mut State, id: Uuid) {
+        assert!(
+            state
+                .update(
+                    Action::ReturnUnresolved {
+                        generation: state.generation(),
+                        owner: state.retained_owner,
+                        id
+                    },
+                    false
+                )
+                .is_none()
+        );
+        assert_eq!(state.viewing_unresolved, Some(id));
+    }
+
+    #[test]
+    fn keeping_missing_unknown_preserves_submitted_consent_and_readonly_original_recovery() {
+        let mut state = State::default();
+        let mut original = distinct_subject(1);
+        original.label = "🦀".repeat(500);
+        let (submitted_generation, request) = uncertain(&mut state, original.clone());
+        let submitted = state
+            .operation
+            .as_ref()
+            .unwrap()
+            .submitted
+            .as_ref()
+            .unwrap()
+            .clone();
+        let Some(Effect::Plan {
+            generation,
+            backend: Some(backend),
+            subject,
+        }) = state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            false,
+        )
+        else {
+            panic!("exact original read")
+        };
+        assert_eq!(backend, submitted.prepared.backend);
+        assert_eq!(subject, original);
+        // Successful removal followed by a lost reply can leave no target for
+        // planning. Absence is an error, never proof of success or permission.
+        state.update(
+            Action::Planned {
+                generation,
+                result: Err("original worktree is no longer registered".into()),
+            },
+            false,
+        );
+        assert_eq!(state.operation.as_ref().unwrap().keep, None);
+        let id = keep_unresolved(&mut state);
+        let saved = &state.unresolved[0].operation;
+        let original_request = saved.submitted.as_ref().unwrap();
+        assert_eq!(original_request.request, request);
+        assert!(original_request.request.delete_branch);
+        assert_eq!(
+            original_request.prepared.plan.inspection.token.as_deref(),
+            Some("reviewed-token")
+        );
+        assert_eq!(
+            original_request.prepared.backend,
+            submitted.prepared.backend
+        );
+        assert_eq!(original_request.subject, original);
+        assert_eq!(
+            original_request.diagnostic.as_deref(),
+            Some("EOF after submission")
+        );
+        assert!(
+            saved
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("no longer registered")
+        );
+        assert_eq!(saved.phase, Phase::Uncertain);
+
+        let other = distinct_subject(2);
+        let pending_other = open(&mut state, other.clone());
+        state.update(
+            Action::Finished {
+                generation: submitted_generation,
+                result: RemovalOutcome::Uncertain("late A".into()),
+            },
+            true,
+        );
+        state.update(
+            Action::Planned {
+                generation,
+                result: Ok(prepared(&original, Verdict::Landed)),
+            },
+            true,
+        );
+        assert_eq!(state.subject(), Some(&other));
+        state.update(
+            Action::Planned {
+                generation: pending_other,
+                result: Ok(prepared(&other, Verdict::Landed)),
+            },
+            true,
+        );
+        assert!(
+            matches!(state.update(Action::Confirm { generation: state.generation() }, true), Some(Effect::Remove { subject, .. }) if subject == other)
+        );
+        assert_eq!(state.unresolved.len(), 1);
+        // Returning A cannot interrupt B's pending request.
+        let blocked_owner = state.retained_owner;
+        state.update(
+            Action::ReturnUnresolved {
+                generation: state.generation(),
+                owner: blocked_owner,
+                id,
+            },
+            false,
+        );
+        assert_eq!(state.subject(), Some(&other));
+        let pending = state.generation();
+        state.update(
+            Action::Finished {
+                generation: pending,
+                result: RemovalOutcome::Refused("before send".into()),
+            },
+            true,
+        );
+        state.update(
+            Action::Dismiss {
+                generation: state.generation(),
+            },
+            true,
+        );
+        return_unresolved(&mut state, id);
+        assert_eq!(state.operation.as_ref().unwrap().keep, Some(request.keep));
+        assert_eq!(
+            state.operation.as_ref().unwrap().delete_branch,
+            request.delete_branch
+        );
+
+        for replacement in [true, false] {
+            let Some(Effect::Plan {
+                generation,
+                backend: Some(backend),
+                subject,
+            }) = state.update(
+                Action::Reinspect {
+                    generation: state.generation(),
+                },
+                false,
+            )
+            else {
+                panic!("readonly original host")
+            };
+            assert_eq!(backend, submitted.prepared.backend);
+            assert_eq!(subject, original);
+            let mut observed = prepared(&original, Verdict::Landed);
+            observed.plan.inspection.token = Some("new-observation-token".into());
+            if replacement {
+                observed.backend.proof.host_incarnation = HostIncarnation::new("replacement");
+            }
+            state.update(
+                Action::Planned {
+                    generation,
+                    result: Ok(observed),
+                },
+                true,
+            );
+            assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Uncertain);
+            assert!(
+                state
+                    .update(
+                        Action::Confirm {
+                            generation: state.generation()
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                state.unresolved[0]
+                    .operation
+                    .submitted
+                    .as_ref()
+                    .unwrap()
+                    .request,
+                request
+            );
+        }
+        assert!(!outline(&state).iter().any(|text| text == "Remove worktree"));
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text == &format!("Remove worktree · {}", bounded(&original.label)))
+        );
+        assert!(
+            !outline(&state)
+                .iter()
+                .any(|text| text.contains(&original.label))
+        );
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text.contains("Read-only original"))
+        );
+        state.update(
+            Action::CloseUnresolved {
+                generation: state.generation(),
+                owner: state.retained_owner,
+                id,
+            },
+            false,
+        );
+        assert!(state.operation.is_none());
+        assert_eq!(state.unresolved.len(), 1);
+        assert!(!state.can_open_subject(&original));
+    }
+
+    #[test]
+    fn unresolved_capacity_fences_card_or_path_and_never_parks_inflight_work() {
+        let mut state = State::default();
+        let original = distinct_subject(0);
+        review(&mut state, original.clone(), Verdict::Landed);
+        let generation = state.generation();
+        state.update(Action::Confirm { generation }, true);
+        state.update(
+            Action::KeepUnresolved {
+                generation,
+                owner: state.retained_owner,
+            },
+            false,
+        );
+        assert!(state.unresolved.is_empty());
+        assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Pending);
+        state.update(
+            Action::Finished {
+                generation,
+                result: RemovalOutcome::Uncertain("lost".into()),
+            },
+            false,
+        );
+        let Some(Effect::Plan { generation, .. }) = state.update(
+            Action::Reinspect {
+                generation: state.generation(),
+            },
+            false,
+        ) else {
+            panic!("recovery")
+        };
+        state.update(
+            Action::KeepUnresolved {
+                generation,
+                owner: state.retained_owner,
+            },
+            false,
+        );
+        assert!(state.unresolved.is_empty());
+        assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Planning);
+        state.update(
+            Action::Planned {
+                generation,
+                result: Err("missing".into()),
+            },
+            false,
+        );
+        let first_id = keep_unresolved(&mut state);
+        let mut same_card = original.clone();
+        same_card.path = "/work/recreated-elsewhere".into();
+        same_card.branch = Some("renamed".into());
+        let mut same_path = distinct_subject(99);
+        same_path.path = original.path.clone();
+        same_path.card.project = "/different/root/.git".into();
+        for fenced in [same_card, same_path] {
+            assert!(!state.can_open_subject(&fenced));
+            assert!(
+                state
+                    .update(
+                        Action::Open {
+                            generation: state.generation(),
+                            subject: fenced
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            assert!(state.operation.is_none());
+        }
+        for number in 1..MAX_UNRESOLVED {
+            uncertain(&mut state, distinct_subject(number));
+            keep_unresolved(&mut state);
+        }
+        assert_eq!(state.unresolved.len(), MAX_UNRESOLVED);
+        assert_eq!(state.unresolved[0].id, first_id);
+        assert!(!state.can_open());
+        assert!(
+            state
+                .update(
+                    Action::Open {
+                        generation: state.generation(),
+                        subject: distinct_subject(100)
+                    },
+                    true
+                )
+                .is_none()
+        );
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text.contains("All 16 unresolved slots are occupied"))
+        );
+        return_unresolved(&mut state, first_id);
+        state.update(
+            Action::CloseUnresolved {
+                generation: state.generation(),
+                owner: state.retained_owner,
+                id: first_id,
+            },
+            false,
+        );
+        assert_eq!(state.unresolved.len(), MAX_UNRESOLVED);
+        assert_eq!(
+            state.unresolved[0]
+                .operation
+                .submitted
+                .as_ref()
+                .unwrap()
+                .diagnostic
+                .as_deref(),
+            Some("lost")
         );
     }
 

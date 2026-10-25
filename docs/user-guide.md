@@ -520,7 +520,19 @@ Use **Inspect again** and review the new plan when content changes. Closing the
 Work pane does not cancel a pending removal. If its result is not confirmed,
 inspect the original worktree and saved snapshots before any retry; the app
 does not automatically resend removal. A failed reinspection leaves the result
-unresolved. A saved snapshot's receipt shows its actual ref and a restore
+unresolved. **Keep unresolved; review other work** keeps the full original
+request and its uncertainty for the current application lifetime, so unrelated
+worktrees can still be reviewed. This is memory-only, not recovery across app
+restarts. The same original card or absolute path stays blocked, even if its
+branch, contents or host change. **Review original** returns to a read-only
+view: **Inspect again** uses the original host, and neither a missing path nor
+a successful inspection proves that removal succeeded or enables removal.
+**Back to unresolved removals** closes only that view. Up to 16 unresolved
+operations can be kept; at capacity new removals stop, while browsing and
+original inspection remain available. Records are never evicted or expired
+automatically, and removals are never resent automatically.
+
+A saved snapshot's receipt shows its actual ref and a restore
 command: use that ref in another worktree of the same project on the same
 device. If branch deletion fails, the worktree may already be removed; read the
 receipt before taking further action.

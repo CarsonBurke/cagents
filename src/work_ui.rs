@@ -333,7 +333,7 @@ impl State {
                     || activation.watch != self.pins.lifetime
                     || activation.generation != self.removal.generation()
                     || self.lost.is_some()
-                    || !self.removal.can_open()
+                    || !self.removal.can_open_subject(&activation.subject)
                     || !self
                         .item(&activation.subject.card)
                         .is_some_and(|item| activation.subject.matches(item))
@@ -1332,7 +1332,8 @@ impl State {
                     generation: self.removal.generation(),
                     subject,
                 };
-                let enabled = self.lost.is_none() && self.removal.can_open();
+                let enabled =
+                    self.lost.is_none() && self.removal.can_open_subject(&activation.subject);
                 items.push(crate::ui_controls::owned(
                     (activation.clone(), enabled),
                     popover_item(
@@ -3644,6 +3645,225 @@ mod tests {
         bounds.x -= translation.x;
         bounds.y -= translation.y;
         bounds
+    }
+
+    // Exercise the actual full Work tree/cache and its scroll translation,
+    // rather than manufacturing new retained-list callbacks.
+    fn unresolved_control_point(
+        ui: &mut iced::runtime::UserInterface<'_, Action, Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        label: &str,
+    ) -> iced::Point {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct Scroll(Option<(iced::Rectangle, iced::Vector)>);
+        impl Operation for Scroll {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if bounds.height <= 360.0 {
+                    self.0 = Some((bounds, translation));
+                }
+            }
+        }
+        let mut scroll = Scroll::default();
+        ui.operate(renderer, &mut scroll);
+        let (viewport, _) = scroll.0.expect("inline removal scrollable");
+        assert!(
+            retained_work_events(
+                ui,
+                renderer,
+                viewport.center(),
+                &[iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels {
+                        x: 0.0,
+                        y: -100_000.0
+                    },
+                }]
+            )
+            .is_empty()
+        );
+        let mut scroll = Scroll::default();
+        ui.operate(renderer, &mut scroll);
+        let (viewport, translation) = scroll.0.unwrap();
+        let bounds = projected_review_bounds(popup_button_bounds(ui, renderer, label), translation);
+        assert!(
+            viewport.contains(bounds.center()),
+            "{label} visible after ordinary scroll: {bounds:?} in {viewport:?}"
+        );
+        bounds.center()
+    }
+
+    #[test]
+    fn unresolved_native_keep_return_and_back_retire_reset_input_without_losing_original() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+        for width in [1600.0, 420.0] {
+            let original = removable("/work/original");
+            let mut other = removable("/work/other");
+            other.key = crate::work::ItemKey::Worktree("/work/other".into());
+            other.branch = Some("unrelated".into());
+            let mut state = State::default();
+            connected(&mut state, 1, board(vec![original.clone(), other.clone()]));
+            let subject = removal_review(&mut state, &original);
+            let generation = state.removal.generation();
+            assert!(matches!(
+                state.update(RemovalAction::Confirm { generation }.into()),
+                Some(Effect::Removal(RemovalEffect::Remove { .. }))
+            ));
+            state.update(
+                RemovalAction::Finished {
+                    generation,
+                    result: RemovalOutcome::Uncertain("EOF after original submission".into()),
+                }
+                .into(),
+            );
+            // A lost success reply can arrive after the board has already
+            // stopped listing the removed worktree. Keeping must work without
+            // treating that absence as a successful receipt.
+            watched(&mut state, 2, board(vec![other.clone()]));
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let mut cache = Cache::new();
+            let mut old_return = None;
+            for label in ["Keep unresolved; review other work", "Review original"] {
+                let mut ui = iced::runtime::UserInterface::build(
+                    state.layout_view(width),
+                    iced::Size::new(width, 1000.0),
+                    cache,
+                    &mut renderer,
+                );
+                draw_work_ui(&mut ui, &mut renderer);
+                let point = unresolved_control_point(&mut ui, &mut renderer, label);
+                let queued = click_work(&mut ui, &mut renderer, point);
+                assert!(
+                    matches!(queued.as_slice(), [Action::Removal(action)] if match (label, action.as_ref()) {
+                        ("Review original", RemovalAction::ReturnUnresolved { .. }) => true,
+                        ("Keep unresolved; review other work", RemovalAction::KeepUnresolved { .. }) => true,
+                        _ => false,
+                    }),
+                    "actual callback: {queued:?}"
+                );
+                assert!(
+                    retained_work_events(
+                        &mut ui,
+                        &mut renderer,
+                        point,
+                        &[Event::ButtonPressed(Button::Left)]
+                    )
+                    .is_empty()
+                );
+                cache = ui.into_cache();
+                state.reset();
+                connected(&mut state, 1, board(vec![other.clone()]));
+                for action in queued.clone() {
+                    assert!(state.update(action).is_none());
+                }
+                if label == "Review original" {
+                    assert!(
+                        state.removal.subject().is_none(),
+                        "old queued return retired by pane owner"
+                    );
+                    old_return = Some(queued[0].clone());
+                } else {
+                    assert_eq!(
+                        state.removal.subject(),
+                        Some(&subject),
+                        "old queued Keep cannot hide current unknown"
+                    );
+                }
+                let mut ui = iced::runtime::UserInterface::build(
+                    state.layout_view(width),
+                    iced::Size::new(width, 1000.0),
+                    cache,
+                    &mut renderer,
+                );
+                draw_work_ui(&mut ui, &mut renderer);
+                let new_point = unresolved_control_point(&mut ui, &mut renderer, label);
+                assert!(
+                    retained_work_events(
+                        &mut ui,
+                        &mut renderer,
+                        new_point,
+                        &[Event::ButtonReleased(Button::Left)]
+                    )
+                    .is_empty(),
+                    "old held input cannot borrow fresh callback"
+                );
+                let fresh = click_work(&mut ui, &mut renderer, new_point);
+                assert!(matches!(fresh.as_slice(), [Action::Removal(_)]));
+                cache = ui.into_cache();
+                for action in fresh {
+                    assert!(state.update(action).is_none());
+                }
+            }
+            assert_eq!(state.removal.subject(), Some(&subject));
+            let mut ui = iced::runtime::UserInterface::build(
+                state.layout_view(width),
+                iced::Size::new(width, 1000.0),
+                cache,
+                &mut renderer,
+            );
+            draw_work_ui(&mut ui, &mut renderer);
+            let point = unresolved_control_point(&mut ui, &mut renderer, "Inspect again");
+            let inspected = click_work(&mut ui, &mut renderer, point);
+            assert!(
+                matches!(inspected.as_slice(), [Action::Removal(action)] if matches!(action.as_ref(), RemovalAction::Reinspect { .. }))
+            );
+            cache = ui.into_cache();
+            let Some(Effect::Removal(RemovalEffect::Plan {
+                generation,
+                subject: inspected_subject,
+                backend: Some(backend),
+            })) = state.update(inspected.into_iter().next().unwrap())
+            else {
+                panic!("original-host readonly inspection")
+            };
+            assert_eq!(inspected_subject, subject);
+            assert_eq!(backend, prepared_removal(&subject).backend);
+            state.update(
+                RemovalAction::Planned {
+                    generation,
+                    result: Err("original worktree missing after unknown result".into()),
+                }
+                .into(),
+            );
+            let mut ui = iced::runtime::UserInterface::build(
+                state.layout_view(width),
+                iced::Size::new(width, 1000.0),
+                cache,
+                &mut renderer,
+            );
+            draw_work_ui(&mut ui, &mut renderer);
+            let point =
+                unresolved_control_point(&mut ui, &mut renderer, "Back to unresolved removals");
+            let back = click_work(&mut ui, &mut renderer, point);
+            assert!(
+                matches!(back.as_slice(), [Action::Removal(action)] if matches!(action.as_ref(), RemovalAction::CloseUnresolved { .. }))
+            );
+            drop(ui);
+            for action in back {
+                assert!(state.update(action).is_none());
+            }
+            assert!(state.removal.subject().is_none());
+            assert!(
+                !state.removal.can_open_subject(&subject),
+                "kept original stays fenced after Back/reset/read failure"
+            );
+            let other_subject = removal_review(&mut state, &other);
+            assert!(state.update(old_return.unwrap()).is_none());
+            assert_eq!(state.removal.subject(), Some(&other_subject));
+            assert!(
+                matches!(state.update(RemovalAction::Confirm { generation: state.removal.generation() }.into()), Some(Effect::Removal(RemovalEffect::Remove { subject, .. })) if subject == other_subject)
+            );
+        }
     }
 
     #[test]
