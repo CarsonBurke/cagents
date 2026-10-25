@@ -267,7 +267,7 @@ pub(crate) struct HostState {
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     #[cfg(test)]
-    test_fail_startup_commit: Option<TerminalId>,
+    pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
     test_checkpoint_failure_at: Option<(TerminalId, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
