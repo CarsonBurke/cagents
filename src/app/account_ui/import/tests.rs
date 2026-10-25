@@ -230,6 +230,29 @@ fn lost_reply_never_enables_prepare_resend_and_status_or_verify_keep_the_same_uu
 
 #[test]
 fn wrong_completion_sequence_plan_profile_home_or_registered_account_cannot_replace_the_original() {
+    // Discriminate the FIRST response, before a previous receipt can protect it.
+    for reserved_with_receipt in [false, true] {
+        let (mut first, request) = prepared();
+        let plan = first.plan.clone().unwrap();
+        let mut inconsistent = status(&plan, ImportStage::Published);
+        if reserved_with_receipt {
+            inconsistent.stage = ImportStage::Reserved;
+        } else {
+            inconsistent.receipt.as_mut().unwrap().size += 1;
+        }
+        finish(&mut first, &request, inconsistent);
+        assert!(
+            first.status.is_none(),
+            "inconsistent first publication metadata must not be adopted"
+        );
+        assert_eq!(first.plan.as_ref(), Some(&plan));
+        assert!(first.pending.is_none());
+        let owner = first.owner;
+        assert!(
+            act(&mut first, Action::Prepare(owner)).is_none(),
+            "a refused response never authorizes reseeding"
+        );
+    }
     let (mut state, request) = prepared();
     let plan = state.plan.clone().unwrap();
     let good = status(&plan, ImportStage::Published);
@@ -297,6 +320,52 @@ fn wrong_completion_sequence_plan_profile_home_or_registered_account_cannot_repl
 
 #[test]
 fn editing_invalidates_inspection_and_no_result_or_capacity_error_dispatches_another_stage() {
+    let mut absolute = State::default();
+    act(&mut absolute, Action::Open);
+    let owner = absolute.owner;
+    act(
+        &mut absolute,
+        Action::Path(owner, "/selected/auth.json".into()),
+    );
+    let inspected_request = act(&mut absolute, Action::Inspect(owner)).unwrap();
+    let mut foreign = observation();
+    foreign.path = "/different/auth.json".into();
+    act(
+        &mut absolute,
+        Action::Finished {
+            sequence: inspected_request.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Inspected(ImportInspection {
+                    destination: target().proof,
+                    observation: foreign,
+                }),
+            }),
+        },
+    );
+    assert!(absolute.inspection.is_none());
+    assert!(!absolute.can_prepare());
+    assert_eq!(absolute.path, "/selected/auth.json");
+    let inspected_request = act(&mut absolute, Action::Inspect(owner)).unwrap();
+    let mut exact = observation();
+    exact.path = "/selected/auth.json".into();
+    act(
+        &mut absolute,
+        Action::Finished {
+            sequence: inspected_request.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Inspected(ImportInspection {
+                    destination: target().proof,
+                    observation: exact,
+                }),
+            }),
+        },
+    );
+    assert!(
+        absolute.inspection.is_some(),
+        "the exact absolute selection remains supported"
+    );
     let mut state = inspected();
     let owner = state.owner;
     act(&mut state, Action::Path(owner, "/new/auth.json".into()));
@@ -473,6 +542,106 @@ fn accepted_completion_is_not_pane_input_and_dismissal_does_not_change_defaults_
     assert_eq!(app.account_ui.import.status.as_ref(), Some(&reply));
     assert_eq!(app.account_ui.registry, before);
     assert!(app.account_ui.import.pending.is_none());
+
+    // Make a reload observable without executing it or touching any Store.
+    // Only an accepted explicit Verify may create the existing reload task.
+    app.account_ui.store = Some(Store::at("/not-opened/import-ui-fixture/registry"));
+    let (mut known, prepare) = prepared();
+    let original = known.plan.clone().unwrap();
+    finish(
+        &mut known,
+        &prepare,
+        status(&original, ImportStage::Published),
+    );
+    let owner = known.owner;
+    let verify = act(&mut known, Action::Verify(owner)).unwrap();
+    finish(
+        &mut known,
+        &verify,
+        status(&original, ImportStage::Registered),
+    );
+    app.account_ui.import = known;
+    for list in [false, true] {
+        let request = act(
+            &mut app.account_ui.import,
+            if list {
+                Action::Load(owner)
+            } else {
+                Action::Status(owner)
+            },
+        )
+        .unwrap();
+        let current = status(&original, ImportStage::Registered);
+        let reply = if list {
+            ImportReply::Listed(vec![current])
+        } else {
+            ImportReply::Status(current)
+        };
+        let task = app.update_account_import(Action::Finished {
+            sequence: request.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply,
+            }),
+        });
+        assert_eq!(
+            task.units(),
+            0,
+            "metadata completion must not reload/probe an old registered account"
+        );
+        drop(task);
+    }
+    let request = act(&mut app.account_ui.import, Action::Verify(owner)).unwrap();
+    let task = app.update_account_import(Action::Finished {
+        sequence: request.sequence + 1,
+        result: Ok(Response {
+            target: target(),
+            reply: ImportReply::Status(status(&original, ImportStage::Registered)),
+        }),
+    });
+    assert_eq!(
+        task.units(),
+        0,
+        "wrong sequence cannot create registry work"
+    );
+    drop(task);
+    assert!(app.account_ui.import.pending.is_some());
+    let mut inconsistent = status(&original, ImportStage::Registered);
+    inconsistent.receipt.as_mut().unwrap().size += 1;
+    let task = app.update_account_import(Action::Finished {
+        sequence: request.sequence,
+        result: Ok(Response {
+            target: target(),
+            reply: ImportReply::Status(inconsistent),
+        }),
+    });
+    assert_eq!(
+        task.units(),
+        0,
+        "refused Verify metadata cannot create a reload"
+    );
+    drop(task);
+    let request = act(&mut app.account_ui.import, Action::Verify(owner)).unwrap();
+    let completion = Action::Finished {
+        sequence: request.sequence,
+        result: Ok(Response {
+            target: target(),
+            reply: ImportReply::Status(status(&original, ImportStage::Registered)),
+        }),
+    };
+    let task = app.update_account_import(completion.clone());
+    assert!(
+        task.units() > 0,
+        "matching explicit Verify keeps its registration reload"
+    );
+    drop(task); // Never poll the filesystem/provider future in this test.
+    let task = app.update_account_import(completion);
+    assert_eq!(
+        task.units(),
+        0,
+        "duplicate completion must not reload an old registration"
+    );
+    drop(task);
 }
 
 #[test]
@@ -662,6 +831,35 @@ fn retained_list_resumes_an_original_plan_after_restart_and_verify_uses_the_fres
 
 #[test]
 fn retained_discovery_is_bounded_and_cannot_drop_or_replace_an_unacknowledged_local_operation() {
+    for reserved_with_receipt in [false, true] {
+        let (source, _) = prepared();
+        let plan = source.plan.unwrap();
+        let mut inconsistent = status(&plan, ImportStage::Published);
+        if reserved_with_receipt {
+            inconsistent.stage = ImportStage::Reserved;
+        } else {
+            inconsistent.receipt.as_mut().unwrap().size += 1;
+        }
+        let mut fresh = State::default();
+        act(&mut fresh, Action::Open);
+        let owner = fresh.owner;
+        let request = act(&mut fresh, Action::Load(owner)).unwrap();
+        act(
+            &mut fresh,
+            Action::Finished {
+                sequence: request.sequence,
+                result: Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Listed(vec![inconsistent]),
+                }),
+            },
+        );
+        assert!(
+            fresh.retained.is_empty() && fresh.plan.is_none(),
+            "first discovery must refuse inconsistent original publication metadata"
+        );
+        assert_eq!(fresh.discovery, 0);
+    }
     let (mut state, prepare) = prepared();
     let plan = state.plan.clone().unwrap();
     let owner = state.owner;

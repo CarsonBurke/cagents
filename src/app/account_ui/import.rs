@@ -207,13 +207,15 @@ impl State {
             && crate::account::import::expected_email_is_valid(self.email.trim())
             && self.inspection.is_some()
     }
-    fn accept(&mut self, sequence: u64, result: Result<Response, Failure>) {
+    // Only an explicit, validated Verify completion may request a registry
+    // reload. Metadata Status/List and stale replies never schedule probing.
+    fn accept(&mut self, sequence: u64, result: Result<Response, Failure>) -> bool {
         let Some(request) = self
             .pending
             .as_ref()
             .filter(|request| request.sequence == sequence)
         else {
-            return;
+            return false;
         };
         let kind = request.kind.clone();
         let profile = request.profile.clone();
@@ -235,9 +237,11 @@ impl State {
                         None
                     };
                 }
-                (RequestKind::Inspect(_), ImportReply::Inspected(inspection))
+                (RequestKind::Inspect(path), ImportReply::Inspected(inspection))
                     if inspection.destination == response.target.proof
-                        && inspection.observation.validate().is_ok() =>
+                        && inspection.observation.validate().is_ok()
+                        && (!path.is_absolute()
+                            || inspection.observation.path() == path.as_path()) =>
                 {
                     self.inspection = Some((response.target, inspection));
                     self.problem = None;
@@ -248,9 +252,12 @@ impl State {
                     | RequestKind::Verify(plan),
                     ImportReply::Status(status),
                 ) if valid_status(&status, plan, &response.target.proof, self.status.as_ref()) => {
+                    let reload =
+                        matches!(kind, RequestKind::Verify(_)) && status.registered.is_some();
                     self.local_uncertain = status.uncertain;
                     self.status = Some(status);
                     self.problem = None;
+                    return reload;
                 }
                 _ => self.problem = Some(Failure::Invalid.description()),
             },
@@ -267,6 +274,7 @@ impl State {
             }
             Err(failure) => self.problem = Some(failure.description()),
         }
+        false
     }
     fn update(&mut self, action: Action, profile: Profile) -> Option<Request> {
         if let Action::Finished { sequence, result } = action {
@@ -443,9 +451,12 @@ fn valid_status(
     let id: AccountId = format!("codex/{}", plan.operation).parse().unwrap();
     status.plan == *plan && status.observed_destination == *proof
         && status.plan.validate().is_ok()
-        && status.receipt.as_ref().is_none_or(|receipt| receipt.operation() == plan.operation && receipt.validate().is_ok())
+        && status.receipt.as_ref().is_none_or(|receipt| receipt.operation() == plan.operation && receipt.validate().is_ok() && receipt.size() == plan.observation.size())
         && previous.and_then(|old| old.receipt.as_ref()).is_none_or(|old| status.receipt.as_ref() == Some(old))
-        && (status.stage == ImportStage::Reserved || status.receipt.is_some())
+        && match status.stage {
+            ImportStage::Reserved => status.receipt.is_none(),
+            _ => status.receipt.is_some(),
+        }
         && status.registered.as_ref().is_none_or(|account| status.stage == ImportStage::Registered && account == &id)
         && status.coding_profile.as_ref().is_none_or(|report| {
             status.registered.as_ref() == Some(&report.account) && report.host == *proof
@@ -518,6 +529,13 @@ fn message(action: Action) -> Message {
 }
 impl Cagents {
     pub(super) fn update_account_import(&mut self, action: Action) -> Task<Message> {
+        if let Action::Finished { sequence, result } = action {
+            return if self.account_ui.import.accept(sequence, result) {
+                self.reload_registry()
+            } else {
+                Task::none()
+            };
+        }
         if let Action::Check(owner) = action {
             let state = &self.account_ui.import;
             if state.visible
@@ -535,7 +553,6 @@ impl Cagents {
             self.account_ui.check.close();
             self.account_ui.table.close_popups();
         }
-        let completed = matches!(action, Action::Finished { .. });
         let request = self.account_ui.import.update(action, Profile::current());
         if let Some(request) = request {
             let sequence = request.sequence;
@@ -548,16 +565,6 @@ impl Cagents {
                 },
                 |action| cosmic::Action::App(message(action)),
             );
-        }
-        if completed
-            && self
-                .account_ui
-                .import
-                .status
-                .as_ref()
-                .is_some_and(|status| status.registered.is_some())
-        {
-            return self.reload_registry();
         }
         Task::none()
     }

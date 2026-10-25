@@ -126,11 +126,70 @@ pub struct CopyConsent {
 }
 
 /// No implicit System configuration or network permission is inherited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodingProfile {
     Unconfigured,
     WorkspaceWrite { network_access: bool },
+}
+
+// Human-readable plans keep their existing tagged JSON/TOML schema. Postcard
+// cannot deserialize an internal tag's self-describing visitor; its matched
+// protocol uses an ordinary external enum with an explicit variant order.
+mod coding_profile_serde {
+    use super::CodingProfile;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum Human {
+        Unconfigured {},
+        WorkspaceWrite { network_access: bool },
+    }
+    #[derive(Serialize, Deserialize)]
+    enum Binary {
+        Unconfigured,
+        WorkspaceWrite { network_access: bool },
+    }
+    impl Serialize for CodingProfile {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if serializer.is_human_readable() {
+                match *self {
+                    Self::Unconfigured => Human::Unconfigured {},
+                    Self::WorkspaceWrite { network_access } => {
+                        Human::WorkspaceWrite { network_access }
+                    }
+                }
+                .serialize(serializer)
+            } else {
+                match *self {
+                    Self::Unconfigured => Binary::Unconfigured,
+                    Self::WorkspaceWrite { network_access } => {
+                        Binary::WorkspaceWrite { network_access }
+                    }
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+    impl<'de> Deserialize<'de> for CodingProfile {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            if deserializer.is_human_readable() {
+                Ok(match Human::deserialize(deserializer)? {
+                    Human::Unconfigured {} => Self::Unconfigured,
+                    Human::WorkspaceWrite { network_access } => {
+                        Self::WorkspaceWrite { network_access }
+                    }
+                })
+            } else {
+                Ok(match Binary::deserialize(deserializer)? {
+                    Binary::Unconfigured => Self::Unconfigured,
+                    Binary::WorkspaceWrite { network_access } => {
+                        Self::WorkspaceWrite { network_access }
+                    }
+                })
+            }
+        }
+    }
 }
 
 /// Immutable original intent. The operation is also the destination managed key.
@@ -315,6 +374,7 @@ mod tests {
             uncertain: false,
             publication: ImportPublication::Missing,
             registered: None,
+            coding_profile: None,
         };
         assert_eq!(status.plan, original);
         assert_ne!(status.observed_destination, status.plan.destination);
@@ -352,3 +412,6 @@ mod tests {
         assert!(serde_json::from_value::<ImportPlan>(changed).is_err());
     }
 }
+
+#[cfg(test)]
+mod wire_tests;
