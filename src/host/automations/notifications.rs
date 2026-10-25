@@ -145,7 +145,8 @@ mod tests {
             Automation, Definition, DirectoryIdentity, Occurrence, Schedule, SchedulePattern,
             SessionMode,
         },
-        workspace_model::{ModelEdit, ProjectKind},
+        model::ProjectKind,
+        workspace_model::ModelEdit,
     };
 
     // Uses the actual composed Registry migration and project-close hook. No
