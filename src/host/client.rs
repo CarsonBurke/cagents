@@ -88,7 +88,7 @@ impl Drop for Registration {
     }
 }
 
-/// Keep an actual terminal Close's result queueable until its handler has
+/// Keep an actual terminal or native chat Close's result queueable until its handler has
 /// removed custody and serve_with has enqueued the correlated reply. This is
 /// not a remote ACK: existing close_after_drain settles the actual writer.
 struct CheckedCloseReply {
@@ -288,6 +288,8 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
             ClientRequest::CloseTerminalChecked { .. }
                 | ClientRequest::ReleaseCompletedTerminal { .. }
                 | ClientRequest::ShutdownTerminal { .. }
+                | ClientRequest::ChatClose { .. }
+                | ClientRequest::ChatCloseRetained { .. }
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -2624,17 +2626,266 @@ mod tests {
         let name = thread::current().name().unwrap().to_owned();
         let cases = match std::env::var(CASE) {
             Ok(case) => vec![case],
-            Err(_) => ["checked", "release", "shutdown"]
+            Err(_) => ["checked", "release", "shutdown", "chat"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
         };
+        fn chat_close_case() {
+            use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+            struct Quiet;
+            impl Adapter for Quiet {
+                fn initialize(&mut self) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+                fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+                fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                    Ok(Step::default())
+                }
+            }
+            thread_local! {
+                static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            fn close_then_pause(
+                host: &SharedHost,
+                client: ClientId,
+                request: ClientRequest,
+            ) -> Result<RequestOutcome, ProtocolError> {
+                let closing = matches!(&request, ClientRequest::ChatClose { .. });
+                if matches!(&request, ClientRequest::ChatCloseRetained { .. }) {
+                    assert!(
+                        host.lock().unwrap().ordinary_exit_cleanup_blocked(),
+                        "retained Close must own reply custody even on refusal"
+                    );
+                }
+                let result = process_request(host, client, request);
+                if closing {
+                    assert!(result.is_ok(), "real native chat close failed: {result:?}");
+                    assert!(host.lock().unwrap().chats.is_empty());
+                    PAUSE.with(|pause| {
+                        let (closed, resume) = pause.borrow_mut().take().unwrap();
+                        closed.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                }
+                result
+            }
+            fn send(
+                stream: &mut UnixStream,
+                proof: &HostSessionProof,
+                id: u64,
+                request: ClientRequest,
+            ) {
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: id,
+                            proof: Some(proof.clone()),
+                            request,
+                        },
+                    )
+                    .unwrap();
+            }
+            fn reply(stream: &mut UnixStream, id: u64) -> ServerMessage {
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                loop {
+                    let envelope = codec
+                        .read::<ServerEnvelope>(stream)
+                        .unwrap()
+                        .expect("native close reply lost before delivery drained");
+                    if envelope.request_id == Some(id) {
+                        return envelope.message;
+                    }
+                }
+            }
+            let (proof, host) = panic_test_host("chat-reply-custody");
+            let directory = tempfile::Builder::new().prefix("cq-").tempdir().unwrap();
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            // The adapter is in-process; its harmless JSON-lines transport
+            // is a real local cat, never an installed model/provider.
+            recipe.program = "/bin/cat".into();
+            recipe.arguments.clear();
+            let spec = ProcessSpec::from(&recipe);
+            let mut initial = Step::default();
+            let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+            let actor = crate::chat::runtime::Handle::start(
+                spec,
+                Box::new(Quiet),
+                initial,
+                store,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            assert!(!actor.is_completed());
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof.clone()),
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Omp,
+                    recipe,
+                    session_id: None,
+                },
+            };
+            {
+                let mut state = host.lock().unwrap();
+                state.install_model(
+                    super::super::model::Registry::at(&directory.path().join("model.sqlite3"))
+                        .unwrap(),
+                );
+                state.chats.insert(
+                    source.id,
+                    super::super::chat::Record {
+                        execution_instance: uuid::Uuid::new_v4(),
+                        console_recipe: None,
+                        paired_terminal: None,
+                        session: source.clone(),
+                        handle: actor.clone(),
+                        source_process: None,
+                        subscribers: std::collections::BTreeMap::from([(1, false)]),
+                        observations: Default::default(),
+                        completion_observed: false,
+                        returning_terminal: false,
+                    },
+                );
+            }
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (closed_tx, closed_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let serving_host = Arc::clone(&host);
+            let serving = thread::spawn(move || {
+                PAUSE.with(|pause| *pause.borrow_mut() = Some((closed_tx, resume_rx)));
+                serve_with(server_stream, 1, serving_host, close_then_pause);
+            });
+            send(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                reply(&mut stream, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            // This actor has no detached authenticated holder. Real retained
+            // cleanup must refuse it; its error reply must release the guard.
+            // Successful retained-native teardown is not claimed here.
+            send(
+                &mut stream,
+                &proof,
+                2,
+                ClientRequest::ChatCloseRetained {
+                    session: source.clone(),
+                },
+            );
+            assert!(matches!(reply(&mut stream, 2), ServerMessage::Error(error)
+                if error.code == ProtocolErrorCode::TerminalUnavailable && error.retryable));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "refused retained close leaked reply custody"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!actor.is_completed());
+            assert!(
+                host.lock().unwrap().chats[&source.id]
+                    .handle
+                    .same_attachment(&actor)
+            );
+            assert!(host.lock().unwrap().chat_spawning.is_empty());
+            assert!(host.lock().unwrap().native_closing.is_empty());
+            send(
+                &mut stream,
+                &proof,
+                3,
+                ClientRequest::ChatClose { chat_id: source.id },
+            );
+            closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(actor.is_completed());
+            assert!(host.lock().unwrap().chats.is_empty());
+            let drain = super::super::begin_ordinary_exit(&host).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !drain.try_seal_absence() {
+                assert!(
+                    Instant::now() < deadline,
+                    "chat child custody did not settle"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut cleanup_error = None;
+            assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            assert!(!super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "native chat reply guard did not release"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            assert!(cleanup_error.is_none());
+            let deliveries = {
+                let mut state = host.lock().unwrap();
+                assert!(drain.try_seal_absence());
+                assert!(!state.ordinary_exit_cleanup_blocked());
+                let deliveries = state.close_ordinary_exit_registration();
+                assert_eq!(
+                    state.begin_checked_close_reply(99).unwrap_err().code,
+                    ProtocolErrorCode::TerminalUnavailable
+                );
+                deliveries
+            };
+            super::super::close_shutdown_deliveries(&host, &deliveries);
+            assert!(matches!(reply(&mut stream, 3), ServerMessage::Response {
+                response: ServerResponse::ChatClosed { chat_id, .. }
+            } if chat_id == source.id));
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+                assert_eq!(envelope.request_id, None);
+                assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+            }
+            serving.join().unwrap();
+            assert!(host.lock().unwrap().clients.is_empty());
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        }
         for case in cases {
             let Some(_root) =
                 super::super::exit_drain_tests::private_runtime_case(&name, Some(&case))
             else {
                 continue;
             };
+            if case == "chat" {
+                chat_close_case();
+                continue;
+            }
             thread_local! {
                 static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
                     const { std::cell::RefCell::new(None) };
