@@ -716,6 +716,28 @@ impl Holder {
     pub(super) fn prove_cleanup(&mut self) {
         self.cleanup_proved = true;
     }
+
+    /// Only a checked close of the exact original family authorizes discarding
+    /// an unconfirmed startup replay. It supersedes provisional adoption; an
+    /// ordinary Drop, failed inspection or timeout never calls this method.
+    pub(super) fn prove_startup_cleanup(&mut self) {
+        self.cleanup_proved = true;
+        self.adoption_pending = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_after_actual_commit_for_test(&mut self) -> Result<(), String> {
+        self.commit_adoption()?; // real original holder acknowledged and cleared replay
+        // Inject the caller's uncertain outcome at precisely that irreversible
+        // boundary, retaining the conservative phase of a lost acknowledgement.
+        self.adoption_pending = true;
+        Err("injected local failure AFTER actual holder commit acknowledgement".into())
+    }
+
+    #[cfg(test)]
+    pub(super) fn startup_cleanup_state_for_test(&self) -> (bool, bool) {
+        (self.adoption_pending, self.cleanup_proved)
+    }
     pub(super) fn registered(&self) -> bool {
         self.registered
     }
