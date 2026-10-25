@@ -2166,6 +2166,7 @@ impl Cagents {
         };
         let now = now_ms();
         self.account_ui.now_ms = now;
+        let cli_not_absent = self.account_ui.installed.get(&provider) != Some(&false);
         let Some(state) = self.account_ui.account_mut(&id) else {
             return Task::none();
         };
@@ -2185,10 +2186,12 @@ impl Cagents {
             }
         }
         if observed {
-            // A conversation reporting figures is running on a signed-in
-            // account whose CLI is installed.
-            state.present = true;
-            state.failure = None;
+            // A running CLI can still report after discovery found its
+            // executable absent. Keep those figures without undoing discovery.
+            if cli_not_absent {
+                state.present = true;
+                state.failure = None;
+            }
             state.schedule.login_settled();
         }
         if login_changed {
@@ -3016,12 +3019,7 @@ impl Cagents {
             .expect("owner checked")
             .account
             .provider;
-        if self.account_ui.installed.get(&provider) == Some(&false)
-            && self.account_ui.account(&id).is_some_and(|state| {
-                state.failure.as_deref()
-                    == Some(format!("{} is not installed", probe::cli_name(provider)).as_str())
-            })
-        {
+        if self.account_ui.installed.get(&provider) == Some(&false) {
             // Discovery completed after this probe prepared its executable.
             // Keep the last history and explicit absence instead of reviving it.
             if let Some(state) = self.account_ui.account_mut(&id) {
@@ -8894,6 +8892,129 @@ mod app_tests {
             state.owner, owner,
             "CLI detection does not replace account ownership"
         );
+    }
+
+    #[test]
+    fn live_usage_during_cli_absence_keeps_discovery_authority_and_rejects_late_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.cache = Some(Cache::at(directory.path()));
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 910);
+        let recipe = recipe_on(&app, &id);
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let registry = app.account_ui.registry.clone();
+        let now = now_ms();
+        {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.snapshot = Some(UsageSnapshot::state(
+                UsageStatus::Ok,
+                "previous usage",
+                now - 1,
+            ));
+            state.schedule.start(Trigger::Focus, now);
+            state.schedule.await_login(now);
+        }
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, false)]));
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.43), now)]);
+        let state = app.account_ui.account(&id).unwrap();
+        let live = state.snapshot.clone().unwrap();
+        assert_eq!(live.source, UsageSource::Live);
+        assert_eq!(live.observed_at, now);
+        assert!((live.windows[0].used - 0.43).abs() < 1e-6);
+        assert!(
+            !state.present,
+            "the still-running actor does not rediscover a CLI"
+        );
+        assert_eq!(
+            state.failure.as_deref(),
+            Some("Claude Code is not installed")
+        );
+        assert!(
+            !state.schedule.awaiting_login(now),
+            "live figures still settle login watching"
+        );
+        assert!(app.account_ui.live_unsaved.contains(&id));
+        assert!(app.account_ui.saving_live);
+        assert_eq!(state.account, account);
+        assert_eq!(app.account_ui.registry, registry);
+
+        // Rejection depends on discovery, not mutable user-facing diagnostics.
+        app.account_ui.account_mut(&id).unwrap().failure = Some("another diagnostic".into());
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                identity: Some(Identity::default()),
+                catalog: None,
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "late old executable", now + 1),
+            },
+        }));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.present);
+        assert_eq!(state.snapshot.as_ref(), Some(&live));
+        assert_eq!(state.failure.as_deref(), Some("another diagnostic"));
+        assert!(state.identity.is_none());
+        assert!(!state.schedule.in_flight(now));
+        assert_eq!(state.owner, owner);
+        assert!(app.probe_account(&id, Trigger::Manual, now).is_none());
+
+        // Fresh discovery can restore presence, but never admits another owner.
+        let _ = app.locate_accounts();
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Claude, true)]));
+        assert!(app.account_ui.account(&id).unwrap().present);
+        let fresh = UsageSnapshot::state(UsageStatus::Ok, "fresh executable", now + 2);
+        let answer = |owner| {
+            Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: fresh.clone(),
+                },
+            })
+        };
+        let _ = app.update(answer(owner + 1));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&live)
+        );
+        let _ = app.update(answer(owner));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert_eq!(state.snapshot.as_ref(), Some(&fresh));
+        assert_eq!(state.owner, owner);
+        assert_eq!(state.account, account);
+        assert_eq!(app.account_ui.registry, registry);
+
+        // Unknown or positive installation retains the established live-report behavior.
+        for installed in [None, Some(true)] {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 911);
+            let recipe = recipe_on(&app, &id);
+            app.account_ui.installed.remove(&Provider::Claude);
+            if let Some(installed) = installed {
+                app.account_ui.installed.insert(Provider::Claude, installed);
+            }
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = false;
+            state.failure = Some("previous failure".into());
+            state.snapshot = Some(UsageSnapshot::state(
+                UsageStatus::Ok,
+                "previous usage",
+                now - 1,
+            ));
+            let _ =
+                app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.5), now)]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.present);
+            assert!(state.failure.is_none());
+            assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
+        }
     }
 
     #[test]
