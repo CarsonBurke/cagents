@@ -27433,10 +27433,18 @@ mod tests {
                 let proof = chat_runtime(&app, card).handle().unwrap().proof().unwrap();
                 let cli = TerminalSession {
                     id: TerminalId::new(),
-                    launch: LaunchRecipe::shell(FIXTURE_DIRECTORY),
-                    host_session_id: proof.host_session_id.clone(),
-                    boot_id: proof.boot_id.clone(),
-                    host_incarnation: proof.host_incarnation.clone(),
+                    launch: LaunchRecipe::shell(FIXTURE_DIRECTORY.into())
+                        .expect("the returned terminal fixture has a usable shell"),
+                    continuity: TerminalContinuity::Live {
+                        host_session_id: proof.host_session_id,
+                        boot_id: proof.boot_id,
+                        host_incarnation: proof.host_incarnation,
+                    },
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    transcript_path: None,
+                    resume_hint: None,
                 };
                 drop(app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(cli)))));
                 assert!(matches!(

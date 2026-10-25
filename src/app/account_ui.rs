@@ -266,6 +266,10 @@ impl State {
         self.accounts.iter().find(|account| &account.id == id)
     }
 
+    pub(super) fn account_label(&self, id: &AccountId) -> Option<String> {
+        self.account(id).map(|account| self.display_name(account))
+    }
+
     fn account_mut(&mut self, id: &AccountId) -> Option<&mut AccountState> {
         self.accounts.iter_mut().find(|account| &account.id == id)
     }
