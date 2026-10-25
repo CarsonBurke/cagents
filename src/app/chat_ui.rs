@@ -26527,6 +26527,7 @@ mod tests {
         show_chat_snapshot_for_test(&mut app, card, first);
         let runtime = app.chat_runtime_mut(target).unwrap();
         let handle = runtime.handle().unwrap().clone();
+        let client_retired = handle.observe_snapshot_retirement_for_test();
         runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
         runtime.selected_subagent = Some("child".into());
         let plain: Arc<str> = Arc::from("Rendered selected child words\n".repeat(4096));
@@ -26563,6 +26564,11 @@ mod tests {
         assert!(!runtime.cache.is_empty());
         runtime.set_visible(false).unwrap();
         preparation::retirement_barrier();
+        // Client publications retire on a separate worker. Waiting for UI
+        // presentation disposal alone does not establish body reclamation.
+        client_retired
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the hidden client's exact publication must retire");
         assert!(runtime.cache.is_empty());
         assert!(runtime.selection_document.borrow().is_none());
         assert!(
