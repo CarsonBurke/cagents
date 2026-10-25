@@ -17,7 +17,7 @@ use cosmic::{
     iced::{Alignment, Length, widget::text_editor},
     widget,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 const PAGE: usize = 50;
@@ -151,19 +151,31 @@ pub enum Effect {
 /// then replaces its history with the newest page.
 #[derive(Clone, Copy)]
 enum Pending {
-    List { append: bool },
+    List {
+        append: bool,
+    },
     Show,
     Reload,
     Save,
     Mutate,
-    History { append: bool },
-    Lifecycle { id: Uuid, append: bool },
+    History {
+        append: bool,
+    },
+    Lifecycle {
+        id: Uuid,
+        append: bool,
+    },
     RefreshList,
     RefreshLoadedList(LoadedListRefresh),
     RefreshAutomation,
-    RefreshHistory,
+    RefreshHistory {
+        scope: Option<Uuid>,
+    },
     RefreshRun,
-    HistoryRun { index: usize },
+    RefreshOlderHistory {
+        refresh: HistoryRefresh,
+        before: Option<HistoryKey>,
+    },
     Run,
     OpenRun,
 }
@@ -175,9 +187,9 @@ impl Pending {
             Self::RefreshList
                 | Self::RefreshLoadedList(_)
                 | Self::RefreshAutomation
-                | Self::RefreshHistory
+                | Self::RefreshHistory { .. }
                 | Self::RefreshRun
-                | Self::HistoryRun { .. }
+                | Self::RefreshOlderHistory { .. }
         )
     }
 }
@@ -188,6 +200,44 @@ impl Pending {
 struct LoadedListRefresh {
     after: Option<Uuid>,
     through: Uuid,
+}
+
+type HistoryKey = (u64, Uuid);
+
+/// A finite read through the reader's loaded history, not a server snapshot.
+/// Both endpoints are actual firing keys; neither is a manual paging cursor.
+#[derive(Clone, Copy)]
+struct HistoryRefresh {
+    scope: Option<Uuid>,
+    before: HistoryKey,
+    through: HistoryKey,
+}
+
+fn history_key(firing: &Firing) -> HistoryKey {
+    (firing.created_ms, firing.id)
+}
+
+fn history_cursor(key: HistoryKey) -> HistoryCursor {
+    HistoryCursor {
+        created_ms: key.0,
+        id: key.1,
+    }
+}
+
+/// History's public cursor is a structured exclusive key, not a capability.
+/// Canonical UUID text order equals its unsigned 128-bit order. Derive the
+/// tight inclusive bound for a real loaded candidate, skipping unrequested
+/// newer history. None is the unbounded upper end for the maximal SQL key.
+fn including_history_key(key: HistoryKey) -> Result<Option<HistoryKey>, &'static str> {
+    i64::try_from(key.0)
+        .map_err(|_| "The loaded run history timestamp is outside the supported range")?;
+    Ok(if let Some(id) = key.1.as_u128().checked_add(1) {
+        Some((key.0, Uuid::from_u128(id)))
+    } else if key.0 < i64::MAX as u64 {
+        Some((key.0 + 1, Uuid::nil()))
+    } else {
+        None
+    })
 }
 
 struct Confirmation {
@@ -678,6 +728,7 @@ pub struct State {
     history_status: HistoryStatus,
     history_next: Option<HistoryCursor>,
     history_newer: bool,
+    history_refresh: Option<HistoryRefresh>,
     all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
@@ -773,6 +824,9 @@ impl State {
     }
     fn request(&mut self, pending: Pending, request: Request) -> Option<Effect> {
         self.sequence = self.sequence.wrapping_add(1);
+        if !pending.background_read() {
+            self.history_refresh = None;
+        }
         self.pending = Some((self.sequence, pending));
         self.error = None;
         if matches!(pending, Pending::History { .. }) {
@@ -854,16 +908,165 @@ impl State {
         });
     }
 
-    fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
-        let index = (from..self.history.len()).find(|&index| {
-            self.history[index].state.is_active() || self.history[index].release_pending
-        })?;
+    fn merge_history_rows(&mut self, rows: Vec<Firing>) {
+        // Build once per bounded page, rather than re-finding every loaded
+        // row for every full RunDetail response. No insertion or reordering.
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        let newest = self.history.iter().map(history_key).max();
+        for firing in rows {
+            if let Some(&index) = indices.get(&firing.id) {
+                self.history[index] = firing;
+            } else if newest.is_some_and(|newest| history_key(&firing) > newest) {
+                self.history_newer = true;
+            }
+        }
+    }
+
+    fn refresh_older_history(&mut self, newest: Option<HistoryKey>, more: bool) -> Option<Effect> {
+        let scope = self.selected.as_ref().map(|automation| automation.id);
+        if (!self.all_history && scope.is_none()) || !more {
+            self.history_refresh = None;
+            return None;
+        }
+        let Some(newest) = newest else {
+            self.history_refresh = None;
+            return None;
+        };
+        let through = self.history.iter().map(history_key).min()?;
+        let mut refresh = self
+            .history_refresh
+            .filter(|refresh| refresh.scope == scope)
+            .unwrap_or(HistoryRefresh {
+                scope,
+                before: newest,
+                through,
+            });
+        // Compaction can extend the newest page past our old resume point.
+        // Never reread the page whose metadata just arrived.
+        refresh.before = refresh.before.min(newest);
+        let next = self
+            .history
+            .iter()
+            .filter(|firing| firing.state.is_active() || firing.release_pending)
+            .map(history_key)
+            .filter(|key| *key < refresh.before && *key >= refresh.through)
+            .max();
+        let Some(next) = next else {
+            self.history_refresh = None;
+            return None;
+        };
+        let before = match including_history_key(next) {
+            Ok(before) => before,
+            Err(error) => {
+                self.history_status = HistoryStatus::Failed(error.into());
+                self.error = Some(error.into());
+                return None;
+            }
+        };
+        // Only one older page is issued per Tick. If it fails or foreground
+        // input supersedes it, resume below this actual loaded candidate on a
+        // later Tick. It stays visible/unconfirmed and is revisited on wrap;
+        // a persistently failing first row cannot starve every later row.
+        self.history_refresh = (next > refresh.through).then_some(HistoryRefresh {
+            before: next,
+            ..refresh
+        });
         self.request(
-            Pending::HistoryRun { index },
-            Request::ShowFiring {
-                id: self.history[index].id,
+            Pending::RefreshOlderHistory { refresh, before },
+            Request::History {
+                id: scope,
+                before: before.map(history_cursor),
+                limit: PAGE,
             },
         )
+    }
+
+    fn valid_history_page(
+        &self,
+        scope: Option<Uuid>,
+        before: Option<HistoryKey>,
+        page: &crate::automations::HistoryPage,
+    ) -> bool {
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        page.firings.len() <= PAGE
+            && page.firings.iter().all(|firing| {
+                firing.created_ms <= i64::MAX as u64
+                    && before.is_none_or(|before| history_key(firing) < before)
+                    && scope.is_none_or(|id| firing.automation == id)
+                    && seen.insert(firing.id)
+                    && indices.get(&firing.id).is_none_or(|&index| {
+                        let previous = &self.history[index];
+                        previous.automation == firing.automation
+                            && previous.created_ms == firing.created_ms
+                    })
+            })
+            && page
+                .firings
+                .windows(2)
+                .all(|pair| history_key(&pair[0]) > history_key(&pair[1]))
+            && page.next.as_ref().is_none_or(|cursor| {
+                page.firings.len() == PAGE
+                    && page
+                        .firings
+                        .last()
+                        .is_some_and(|firing| history_key(firing) == (cursor.created_ms, cursor.id))
+            })
+    }
+
+    fn accept_older_history(
+        &mut self,
+        refresh: HistoryRefresh,
+        before: Option<HistoryKey>,
+        page: crate::automations::HistoryPage,
+    ) {
+        let current_scope = self.selected.as_ref().map(|automation| automation.id);
+        if current_scope != refresh.scope || (!self.all_history && current_scope.is_none()) {
+            return;
+        }
+        let valid = self.valid_history_page(refresh.scope, before, &page);
+        if !valid {
+            let error = "The older run history reply was inconsistent".to_owned();
+            self.history_status = HistoryStatus::Failed(error.clone());
+            self.error = Some(error);
+            return;
+        }
+        self.history_status = HistoryStatus::Loaded;
+        // A valid response replaces the failure fallback with its actual
+        // strict cursor. Empty/exhausted/past-horizon responses end this pass;
+        // absent loaded rows never become terminal or disappear.
+        self.history_refresh = page
+            .next
+            .as_ref()
+            .filter(|cursor| (cursor.created_ms, cursor.id) > refresh.through)
+            .map(|cursor| HistoryRefresh {
+                before: (cursor.created_ms, cursor.id),
+                ..refresh
+            });
+        for firing in &page.firings {
+            self.refresh_last_outcome(firing, false);
+        }
+        let indices: HashMap<_, _> = self
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, firing)| (firing.id, index))
+            .collect();
+        for firing in page.firings {
+            if let Some(&index) = indices.get(&firing.id) {
+                self.history[index] = firing;
+            }
+        }
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
@@ -914,6 +1117,35 @@ impl State {
             self.pending = None;
             let result =
                 std::sync::Arc::try_unwrap(result).unwrap_or_else(|result| (*result).clone());
+            if let Pending::RefreshHistory { scope } = pending {
+                let current_scope = self.selected.as_ref().map(|automation| automation.id);
+                if scope != current_scope || (scope.is_none() && !self.all_history) {
+                    return None;
+                }
+                match &result {
+                    Ok(Response::History(page)) if self.valid_history_page(scope, None, page) => {}
+                    Err(_) => {}
+                    _ => {
+                        let error = "The newest run history reply was inconsistent".to_owned();
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                        self.error = Some(error);
+                        return None;
+                    }
+                }
+            }
+            if let Pending::RefreshOlderHistory { refresh, before } = pending {
+                match result {
+                    Ok(Response::History(page)) => self.accept_older_history(refresh, before, page),
+                    result => {
+                        let error = result.err().unwrap_or_else(|| {
+                            "The older run history reply was inconsistent".into()
+                        });
+                        self.history_status = HistoryStatus::Failed(error.clone());
+                        self.error = Some(error);
+                    }
+                }
+                return None;
+            }
             if let Pending::RefreshLoadedList(refresh) = pending {
                 match result {
                     Ok(Response::Listed(rows)) => self.refresh_loaded_list(refresh, rows),
@@ -929,7 +1161,10 @@ impl State {
             }
             match result {
                 Err(error) => {
-                    if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
+                    if matches!(
+                        pending,
+                        Pending::History { .. } | Pending::RefreshHistory { .. }
+                    ) {
                         self.history_status = HistoryStatus::Failed(error.clone());
                     }
                     if matches!(
@@ -1002,7 +1237,7 @@ impl State {
                         {
                             Pending::History { append: false }
                         } else {
-                            Pending::RefreshHistory
+                            Pending::RefreshHistory { scope: Some(id) }
                         },
                         Request::History {
                             id: Some(id),
@@ -1017,35 +1252,20 @@ impl State {
                         self.refresh_last_outcome(firing, newest_page);
                     }
                     self.history_status = HistoryStatus::Loaded;
-                    if matches!(pending, Pending::RefreshHistory) {
+                    if matches!(pending, Pending::RefreshHistory { .. }) {
                         // Keep the reader's paginated snapshot stable. Automatically
                         // inserting every new run would grow the mounted list forever
                         // and create gaps between its newest and older pages.
+                        let newest = page.firings.iter().map(history_key).min();
+                        let more = page.next.is_some();
                         if self.history.is_empty() {
                             self.history = page.firings;
                             self.history_next = page.next;
                             self.history_newer = false;
                         } else {
-                            let newest = self
-                                .history
-                                .iter()
-                                .map(|firing| (firing.created_ms, firing.id))
-                                .max();
-                            for firing in page.firings {
-                                if let Some(current) = self
-                                    .history
-                                    .iter_mut()
-                                    .find(|current| current.id == firing.id)
-                                {
-                                    *current = firing;
-                                } else if newest
-                                    .is_some_and(|latest| (firing.created_ms, firing.id) > latest)
-                                {
-                                    self.history_newer = true;
-                                }
-                            }
+                            self.merge_history_rows(page.firings);
                         }
-                        return self.refresh_history_runs(0);
+                        return self.refresh_older_history(newest, more);
                     }
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
@@ -1096,16 +1316,6 @@ impl State {
                 }
                 Ok(Response::Detail(detail)) => {
                     self.refresh_last_outcome(&detail.firing, false);
-                    if let Pending::HistoryRun { index } = pending {
-                        if let Some(firing) = self
-                            .history
-                            .iter_mut()
-                            .find(|firing| firing.id == detail.firing.id)
-                        {
-                            *firing = detail.firing;
-                        }
-                        return self.refresh_history_runs(index + 1);
-                    }
                     if matches!(pending, Pending::OpenRun) {
                         self.run = Some(detail.clone());
                         return Some(Effect::OpenRun(detail));
@@ -1198,7 +1408,7 @@ impl State {
             }
             if self.all_history {
                 return self.request(
-                    Pending::RefreshHistory,
+                    Pending::RefreshHistory { scope: None },
                     Request::History {
                         id: None,
                         before: None,
@@ -2828,7 +3038,9 @@ fn progress_label(pending: Pending) -> &'static str {
         // ever be shown.
         Pending::RefreshList | Pending::RefreshLoadedList(_) => "Refreshing automations…",
         Pending::RefreshAutomation => "Refreshing automation…",
-        Pending::RefreshHistory | Pending::HistoryRun { .. } => "Refreshing run history…",
+        Pending::RefreshHistory { .. } | Pending::RefreshOlderHistory { .. } => {
+            "Refreshing run history…"
+        }
         Pending::RefreshRun => "Refreshing run…",
     }
 }
@@ -3351,6 +3563,12 @@ mod tests {
         assert_eq!(state.rows[0].last_state, Some(FiringState::Succeeded));
     }
 
+    fn history_page(firings: Vec<Firing>, more: bool) -> crate::automations::HistoryPage {
+        let next = more
+            .then(|| history_cursor(history_key(firings.last().expect("nonempty cursor page"))));
+        crate::automations::HistoryPage { firings, next }
+    }
+
     #[test]
     fn newer_runs_update_last_outcome_without_replacing_paginated_history() {
         use crate::automations::{FiringState, HistoryPage};
@@ -3360,10 +3578,11 @@ mod tests {
         let mut newer = history_firing(100, FiringState::Running);
         newer.automation = selected.id;
         let mut state = State {
+            all_history: true,
             rows: vec![selected.summary(Some(loaded.state))],
             history: vec![loaded.clone()],
             history_status: HistoryStatus::Loaded,
-            pending: Some((1, Pending::RefreshHistory)),
+            pending: Some((1, Pending::RefreshHistory { scope: None })),
             ..Default::default()
         };
         state.update(Action::Received {
@@ -3377,14 +3596,12 @@ mod tests {
         assert!(state.history_newer);
         assert_eq!(state.rows[0].last_state, Some(FiringState::Running));
         newer.state = FiringState::Failed;
-        state.pending = Some((2, Pending::HistoryRun { index: 0 }));
+        state.pending = Some((2, Pending::RefreshHistory { scope: None }));
         state.update(Action::Received {
             sequence: 2,
-            result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                definition: selected.definition,
-                firing: newer,
-                agent: None,
-                run: None,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![newer],
+                next: None,
             }))),
         });
         assert_eq!(state.rows[0].last_state, Some(FiringState::Failed));
@@ -3972,7 +4189,7 @@ mod tests {
             result: std::sync::Arc::new(Ok(Response::Automation(owner))),
         });
         assert!(
-            matches!(state.pending, Some((_, Pending::RefreshHistory))),
+            matches!(state.pending, Some((_, Pending::RefreshHistory { .. }))),
             "the poll refreshes the loaded page in the background"
         );
         assert_eq!(state.history.len(), 1, "the loaded page stays on screen");
@@ -4389,9 +4606,10 @@ mod tests {
 
     #[test]
     fn user_navigation_supersedes_background_history_without_accepting_its_late_reply() {
-        use crate::automations::{FiringState, HistoryPage};
+        use crate::automations::FiringState;
         let selected = automation();
-        let old_run = history_firing(100, FiringState::Running);
+        let mut old_run = history_firing(100, FiringState::Running);
+        old_run.automation = selected.id;
         let mut state = State {
             selected: Some(selected.clone()),
             history: vec![old_run.clone()],
@@ -4420,14 +4638,19 @@ mod tests {
             HistoryStatus::Loaded,
             "cached history remains usable while polling"
         );
+        let fresh = (151..201)
+            .rev()
+            .map(|created| {
+                let mut firing = history_firing(created, FiringState::Running);
+                firing.automation = old_run.automation;
+                firing
+            })
+            .collect();
         let Some(Effect::Request {
             sequence: detail, ..
         }) = state.update(Action::Received {
             sequence: history,
-            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                firings: vec![old_run.clone()],
-                next: None,
-            }))),
+            result: std::sync::Arc::new(Ok(Response::History(history_page(fresh, true)))),
         })
         else {
             panic!("active row poll");
@@ -4450,12 +4673,10 @@ mod tests {
             state
                 .update(Action::Received {
                     sequence: detail,
-                    result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                        definition: automation().definition,
-                        firing: old_run,
-                        agent: None,
-                        run: None
-                    })))
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        vec![old_run],
+                        false
+                    ))))
                 })
                 .is_none()
         );
@@ -4483,7 +4704,7 @@ mod tests {
 
     #[test]
     fn background_history_refresh_preserves_older_pages_and_updates_active_rows() {
-        use crate::automations::{FiringState, HistoryPage};
+        use crate::automations::FiringState;
         for terminal_pending in [false, true] {
             let newest = history_firing(100, FiringState::Running);
             let mut older = history_firing(
@@ -4511,16 +4732,20 @@ mod tests {
             };
             let mut completed = newest.clone();
             completed.state = FiringState::Succeeded;
+            let mut newest_page = vec![completed];
+            newest_page
+                .extend((1..PAGE).map(|i| history_firing(100 - i as u64, FiringState::Succeeded)));
+            let expected_before =
+                history_cursor(including_history_key(history_key(&older)).unwrap().unwrap());
             let Some(Effect::Request { sequence, request }) = state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
-                    firings: vec![completed],
-                    next: None,
-                }))),
+                result: std::sync::Arc::new(Ok(Response::History(history_page(newest_page, true)))),
             }) else {
                 panic!("active older firing poll expected");
             };
-            assert!(matches!(request, Request::ShowFiring { id } if id == older.id));
+            assert!(
+                matches!(request, Request::History { id: None, before: Some(before), limit: PAGE } if before == expected_before)
+            );
             assert_eq!(state.history.len(), 2);
             assert_eq!(state.history_next, Some(cursor));
             let mut completed = older;
@@ -4532,12 +4757,10 @@ mod tests {
             completed.release_pending = false;
             state.update(Action::Received {
                 sequence,
-                result: std::sync::Arc::new(Ok(Response::Detail(RunDetail {
-                    definition: automation().definition,
-                    firing: completed,
-                    agent: None,
-                    run: None,
-                }))),
+                result: std::sync::Arc::new(Ok(Response::History(history_page(
+                    vec![completed],
+                    false,
+                )))),
             });
             assert_eq!(state.history[0].state, FiringState::Succeeded);
             assert_eq!(
@@ -4583,6 +4806,7 @@ mod tests {
                 panic!("history poll expected");
             };
             let firings = (0..PAGE)
+                .rev()
                 .map(|i| history_firing((1000 + poll * PAGE + i) as u64, FiringState::Succeeded))
                 .collect();
             state.update(Action::Received {
@@ -5924,6 +6148,506 @@ mod tests {
         assert!(state.loaded_list_refresh.is_none());
         assert!(!state.list_changed);
         assert!(state.selected.is_none() && state.draft.is_none() && state.history.is_empty());
+    }
+
+    fn budget_history_rows(count: usize) -> Vec<Firing> {
+        (1..=count)
+            .rev()
+            .map(|i| {
+                let mut firing = history_firing(i as u64, crate::automations::FiringState::Running);
+                firing.id = Uuid::from_u128(i as u128);
+                firing.automation = Uuid::from_u128(10_000 + i as u128);
+                firing
+            })
+            .collect()
+    }
+
+    fn load_budget_history(state: &mut State, backend: &[Firing], pages: usize) {
+        for page in 0..pages {
+            let Some(Effect::Request {
+                sequence,
+                request:
+                    Request::History {
+                        id: None,
+                        before,
+                        limit: PAGE,
+                    },
+            }) = state.update(if page == 0 {
+                Action::AllHistory
+            } else {
+                Action::MoreHistory
+            })
+            else {
+                panic!("ordinary manual history page")
+            };
+            assert_eq!(
+                before,
+                (page > 0).then(|| history_cursor(history_key(&backend[page * PAGE - 1])))
+            );
+            let end = (page + 1) * PAGE;
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(Response::History(history_page(
+                            backend[page * PAGE..end].to_vec(),
+                            end < backend.len()
+                        ))))
+                    })
+                    .is_none()
+            );
+        }
+    }
+
+    fn budget_poll(state: &mut State, backend: &[Firing]) -> Option<(u64, HistoryCursor)> {
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::History {
+                    id: None,
+                    before: None,
+                    limit: PAGE,
+                },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("one newest metadata page per Tick")
+        };
+        match state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                backend[..backend.len().min(PAGE)].to_vec(),
+                backend.len() > PAGE,
+            )))),
+        }) {
+            Some(Effect::Request {
+                sequence,
+                request:
+                    Request::History {
+                        id: None,
+                        before: Some(before),
+                        limit: PAGE,
+                    },
+            }) => Some((sequence, before)),
+            None => None,
+            _ => panic!("never fan out full RunDetail reads"),
+        }
+    }
+
+    fn receive_budget_page(
+        state: &mut State,
+        sequence: u64,
+        before: &HistoryCursor,
+        backend: &[Firing],
+    ) {
+        let older = backend
+            .iter()
+            .filter(|firing| history_key(firing) < (before.created_ms, before.id))
+            .collect::<Vec<_>>();
+        let page = older
+            .iter()
+            .take(PAGE)
+            .map(|firing| (**firing).clone())
+            .collect();
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        page,
+                        older.len() > PAGE
+                    ))))
+                })
+                .is_none(),
+            "no immediate third read or detail chain"
+        );
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn history_poll_batches_loaded_metadata_once_and_fairly_reaches_older_release() {
+        use crate::automations::FiringState;
+        let mut backend = budget_history_rows(PAGE * 4);
+        backend[PAGE * 3 - 1].state = FiringState::Failed;
+        backend[PAGE * 3 - 1].release_pending = true;
+        let mut state = State::default();
+        load_budget_history(&mut state, &backend, 3);
+        let ids = state
+            .history
+            .iter()
+            .map(|firing| firing.id)
+            .collect::<Vec<_>>();
+        let manual = state.history_next.clone();
+        backend[PAGE * 3 - 1].release_pending = false;
+        for tick in 0..4 {
+            let (sequence, before) = budget_poll(&mut state, &backend).expect("one older batch");
+            let expected = if tick % 2 == 0 { PAGE } else { PAGE * 2 };
+            assert_eq!(
+                before,
+                history_cursor(
+                    including_history_key(history_key(&backend[expected]))
+                        .unwrap()
+                        .unwrap()
+                )
+            );
+            assert!(
+                backend[..PAGE]
+                    .iter()
+                    .all(|fresh| history_key(fresh) >= (before.created_ms, before.id)),
+                "fresh newest rows are not requested twice"
+            );
+            receive_budget_page(&mut state, sequence, &before, &backend);
+            assert_eq!(
+                state
+                    .history
+                    .iter()
+                    .map(|firing| firing.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(state.history_next, manual);
+            assert!(!state.history_newer);
+            assert!(state.run.is_none() && state.selected.is_none() && state.draft.is_none());
+            if tick >= 1 {
+                assert_eq!(state.history[PAGE * 3 - 1].state, FiringState::Failed);
+                assert!(
+                    !state.history[PAGE * 3 - 1].release_pending,
+                    "tail cleanup metadata refreshed without full details"
+                );
+            }
+        }
+        assert_eq!(
+            including_history_key((7, Uuid::from_u128(u128::MAX))).unwrap(),
+            Some((8, Uuid::nil()))
+        );
+        assert_eq!(
+            including_history_key((i64::MAX as u64, Uuid::from_u128(u128::MAX))).unwrap(),
+            None
+        );
+        assert!(including_history_key((u64::MAX, Uuid::nil())).is_err());
+        assert!(including_history_key((u64::MAX, Uuid::from_u128(u128::MAX))).is_err());
+    }
+
+    #[test]
+    fn history_batch_cursor_survives_new_arrivals_compaction_errors_and_foreground_supersession() {
+        use crate::automations::{FiringState, HistoryPage};
+        let original = budget_history_rows(PAGE * 4);
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        let ids = state
+            .history
+            .iter()
+            .map(|firing| firing.id)
+            .collect::<Vec<_>>();
+        let manual = state.history_next.clone();
+        let mut burst = (0..PAGE)
+            .map(|i| {
+                let mut firing = history_firing(1_000_000 - i as u64, FiringState::Running);
+                firing.id = Uuid::from_u128(1_000_000 - i as u128);
+                firing
+            })
+            .collect::<Vec<_>>();
+        burst.extend(original.clone());
+        let (sequence, before) = budget_poll(&mut state, &burst).unwrap();
+        assert_eq!(
+            before,
+            history_cursor(
+                including_history_key(history_key(&original[0]))
+                    .unwrap()
+                    .unwrap()
+            ),
+            "skip the entire unrequested million-key gap in one bounded query"
+        );
+        receive_budget_page(&mut state, sequence, &before, &burst);
+        assert_eq!(state.history_next, manual);
+        // Start the independent compaction/new-arrival pass from the same
+        // ordinarily loaded snapshot.
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        // New rows lie before a finite scan; a deleted loaded row must not
+        // become terminal or be dropped merely because no page returns it.
+        let missing = original[PAGE + 5].id;
+        for tick in 0..5 {
+            let mut backend = budget_history_rows(PAGE * (6 + tick));
+            backend.retain(|firing| firing.id != missing);
+            for firing in &mut backend {
+                if ids.contains(&firing.id) {
+                    firing.state = FiringState::Succeeded;
+                }
+            }
+            if let Some((sequence, before)) = budget_poll(&mut state, &backend) {
+                receive_budget_page(&mut state, sequence, &before, &backend);
+            }
+            assert_eq!(
+                state
+                    .history
+                    .iter()
+                    .map(|firing| firing.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(state.history_next, manual);
+        }
+        assert!(state.history_newer);
+        assert_eq!(
+            state.history.last().unwrap().state,
+            FiringState::Succeeded,
+            "new arrivals cannot restart a finite old range forever"
+        );
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .find(|firing| firing.id == missing)
+                .unwrap()
+                .state,
+            FiringState::Running
+        );
+
+        // A failed first batch advances only past an actually issued loaded
+        // candidate. Later rows get a turn before the failed row is retried.
+        let mut state = State::default();
+        load_budget_history(&mut state, &original, 3);
+        let (sequence, first) = budget_poll(&mut state, &original).unwrap();
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("bounded page failure".into())),
+        });
+        assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+        let (sequence, second) = budget_poll(&mut state, &original).unwrap();
+        assert!((second.created_ms, second.id) < (first.created_ms, first.id));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("another bounded page failure".into())),
+        });
+        let (sequence, third) = budget_poll(&mut state, &original).unwrap();
+        assert!((third.created_ms, third.id) < (second.created_ms, second.id));
+        let mut completed = original.clone();
+        for firing in &mut completed {
+            firing.state = FiringState::Succeeded;
+        }
+        receive_budget_page(&mut state, sequence, &third, &completed);
+        assert_eq!(
+            state.history[PAGE].state,
+            FiringState::Running,
+            "failed candidate is not falsely settled"
+        );
+        assert_eq!(state.history[PAGE + 1].state, FiringState::Running);
+        assert_eq!(state.history[PAGE + 2].state, FiringState::Succeeded);
+        for _ in 0..3 {
+            if let Some((sequence, before)) = budget_poll(&mut state, &completed) {
+                receive_budget_page(&mut state, sequence, &before, &completed);
+            }
+        }
+        assert_eq!(
+            state.history[PAGE].state,
+            FiringState::Succeeded,
+            "wrap revisits the original failed candidate"
+        );
+
+        for next in [
+            Action::Search("new filter".into()),
+            Action::New,
+            Action::Select(original[0].automation),
+            Action::Refresh,
+        ] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let (sequence, before) = budget_poll(&mut state, &original).unwrap();
+            state.update(next);
+            let pending = state.pending.map(|(sequence, _)| sequence);
+            let snapshot = state.history.clone();
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(history_page(
+                    original[PAGE..PAGE * 2].to_vec(),
+                    true,
+                )))),
+            });
+            assert_eq!(
+                state.history, snapshot,
+                "late valid page cannot cross foreground context"
+            );
+            assert_eq!(state.pending.map(|(sequence, _)| sequence), pending);
+            assert!(before.created_ms > original.last().unwrap().created_ms);
+        }
+
+        for bad in ["foreign", "order", "cursor", "duplicate", "detail"] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let snapshot = state.history.clone();
+            let outcomes = state.last_firings.clone();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!("newest poll")
+            };
+            let mut page = history_page(original[..PAGE].to_vec(), true);
+            match bad {
+                "foreign" => page.firings[0].automation = Uuid::new_v4(),
+                "order" => page.firings.swap(0, 1),
+                "duplicate" => page.firings[1] = page.firings[0].clone(),
+                "cursor" => page.next = Some(history_cursor(history_key(&original[0]))),
+                _ => {}
+            }
+            let response = if bad == "detail" {
+                Response::Detail(RunDetail {
+                    definition: automation().definition,
+                    firing: original[0].clone(),
+                    agent: None,
+                    run: None,
+                })
+            } else {
+                Response::History(page)
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(response))
+                    })
+                    .is_none()
+            );
+            assert_eq!(
+                state.history, snapshot,
+                "newest malformed page cannot enter known rows: {bad}"
+            );
+            assert_eq!(
+                state.last_firings, outcomes,
+                "no outcome mutation before validation"
+            );
+            assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+            assert!(state.run.is_none() && state.history_refresh.is_none());
+        }
+
+        let owner = automation();
+        let mut scoped = original.clone();
+        for firing in &mut scoped {
+            firing.automation = owner.id;
+        }
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Select(owner.id)) else {
+            panic!("select exact owner")
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+        }) else {
+            panic!("initial scoped history")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                scoped[..PAGE].to_vec(),
+                true,
+            )))),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::MoreHistory) else {
+            panic!("older scoped page")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                scoped[PAGE..PAGE * 2].to_vec(),
+                true,
+            )))),
+        });
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("selected definition still uses its existing Show read")
+        };
+        assert_eq!(id, owner.id);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        }) else {
+            panic!("scoped newest read")
+        };
+        let snapshot = state.history.clone();
+        let mut foreign = history_firing(999, FiringState::Succeeded);
+        foreign.automation = Uuid::new_v4();
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(
+                        vec![foreign],
+                        false
+                    ))))
+                })
+                .is_none()
+        );
+        assert_eq!(
+            state.history, snapshot,
+            "unseen foreign firing cannot change a selected scope"
+        );
+        assert!(matches!(state.history_status, HistoryStatus::Failed(_)));
+
+        // Typed pending rejects full-detail and malformed page shapes before
+        // any update, while an empty valid response keeps absent rows intact.
+        for bad in [
+            "foreign",
+            "order",
+            "cursor",
+            "oversized",
+            "identity",
+            "duplicate",
+            "detail",
+            "empty",
+        ] {
+            let mut state = State::default();
+            load_budget_history(&mut state, &original, 3);
+            let (sequence, _) = budget_poll(&mut state, &original).unwrap();
+            let snapshot = state.history.clone();
+            let mut page = history_page(original[PAGE..PAGE * 2].to_vec(), true);
+            match bad {
+                "foreign" => page.firings[0].automation = Uuid::new_v4(),
+                "order" => page.firings.swap(0, 1),
+                "duplicate" => page.firings[1] = page.firings[0].clone(),
+                "cursor" => page.next = Some(history_cursor(history_key(&original[0]))),
+                "oversized" => page = history_page(original[PAGE..PAGE * 2 + 1].to_vec(), false),
+                "identity" => page.firings[0].created_ms -= 1,
+                "empty" => {
+                    page = HistoryPage {
+                        firings: vec![],
+                        next: None,
+                    }
+                }
+                _ => {}
+            }
+            let response = if bad == "detail" {
+                Response::Detail(RunDetail {
+                    definition: automation().definition,
+                    firing: original[PAGE].clone(),
+                    agent: None,
+                    run: None,
+                })
+            } else {
+                Response::History(page)
+            };
+            assert!(
+                state
+                    .update(Action::Received {
+                        sequence,
+                        result: std::sync::Arc::new(Ok(response))
+                    })
+                    .is_none()
+            );
+            assert_eq!(
+                state.history, snapshot,
+                "atomic rejection/absence preserves loaded rows: {bad}"
+            );
+            assert_eq!(state.history_next, manual);
+            assert!(state.run.is_none());
+            if bad == "empty" {
+                assert!(state.history_refresh.is_none());
+            } else {
+                assert!(
+                    matches!(state.history_status, HistoryStatus::Failed(_)),
+                    "{bad}"
+                );
+            }
+        }
     }
 
     #[test]
