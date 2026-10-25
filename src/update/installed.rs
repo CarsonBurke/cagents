@@ -132,6 +132,8 @@ pub(super) fn perform(
         }
         Ok(())
     })?;
+    let mut startup_attempted = false;
+    let mut startup_owned = false;
     let result = (|| {
         let current = observe(
             confirmed
@@ -163,25 +165,36 @@ pub(super) fn perform(
             root.join("bin")
                 .join(crate::companion::Product::Cli.file_name()),
         );
-        command.args(["--json", "daemon", "start"]);
+        command
+            .args(["--json", "daemon", "start"])
+            .stderr(Stdio::null());
         guard.inherit_for_install(&mut command)?;
-        let started = bounded_command(
-            &mut command,
-            "installed daemon startup",
-            SMALL_ASSET_LIMIT,
-            Duration::from_secs(30),
-            &cancellation,
-        );
-        if let Err(error) = started {
-            if !staged.daemon_running(&cancellation).unwrap_or(false) {
-                return Err(error);
-            }
+        let timeout = crate::install_guard::daemon_start_timeout()?;
+        startup_attempted = true;
+        let started = crate::install_guard::wait_daemon_start(&mut command, timeout);
+        startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
+        // A post-spawn failure is never converted to success by readiness.
+        // Its exact original command has settled, but its result remains error.
+        started.map_err(|failure| failure.error)?;
+        if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
+            != Some(root.join("bin/cagentsd"))
+        {
+            return Err(invalid(
+                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
+            ));
         }
         Ok(())
     })();
-    // Only the confirmed installation may be relaunched. If another installer
-    // moved current during failure recovery, retain the old matched executable.
-    let reopen = if result.is_ok() {
+    // Before startup, retain the previous matched executable on failure. Once
+    // the successor owns the runtime or an actual startup command was spawned,
+    // reopen that candidate's recovery UI instead of an incompatible old UI.
+    let successor_owns_runtime = startup_attempted
+        && !startup_owned
+        && result.is_err()
+        && crate::daemon::running_executable()
+            .map_err(|error| invalid(error.to_string()))?
+            .is_some_and(|executable| executable == root.join("bin/cagentsd"));
+    let reopen = if result.is_ok() || successor_owns_runtime || startup_owned {
         root.to_owned()
     } else {
         installation
