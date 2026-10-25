@@ -31,7 +31,7 @@ fn caller(resolved: &TrustedResolvedOrigin) -> Option<Caller> {
         (Origin::Actor { actor, .. }, Some(proof)) => Some(Caller {
             session: actor.session,
             card: proof.card,
-            view_revision: proof.view_revision,
+            placement_epoch: proof.placement_epoch,
             run: actor.run,
         }),
         _ => None,

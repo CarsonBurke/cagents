@@ -44,7 +44,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -305,6 +305,7 @@ impl Registry {
                     statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
                         .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
                 };
+                views::retire_project_placements(&transaction, repository)?;
                 for channel in channels {
                     channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
                 }
@@ -407,11 +408,13 @@ impl Registry {
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
                 if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
+                    views::retire_channel_placements(&transaction, home.channel)?;
                     channel_work::deleted_in(&transaction, home.channel)?;
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
+                views::retire_channel_placements(&transaction, *id)?;
                 channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
@@ -623,6 +626,10 @@ fn migrate_through(
     if version < 17 && target >= 17 {
         channel_work::migrate(tx)?;
         schema::migration_checkpoint(17)?;
+    }
+    if version < 18 && target >= 18 {
+        channel_work::placement::migrate(tx)?;
+        schema::migration_checkpoint(18)?;
     }
     Ok(())
 }
@@ -1073,7 +1080,9 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_operations;
+                "DROP TABLE channel_work_placement_epochs;
+                 DROP TABLE channel_work_placement_clock;
+                 DROP TABLE channel_work_operations;
                  DROP TABLE channel_work_entries;
                  DROP TABLE channel_work_homes;
                  DROP TABLE automation_lifecycle;

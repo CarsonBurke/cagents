@@ -507,6 +507,7 @@ fn native_origin(registry: &mut Registry, home: Home) -> TrustedResolvedOrigin {
             source,
             card,
             view_revision,
+            placement_epoch: placement::token(&registry.db, card).unwrap(),
         }),
     }
 }
@@ -1665,4 +1666,201 @@ fn metadata_only_home_read_preserves_retained_receipt_scope_without_decoding_pro
         wrong.channel = ChannelId::new();
         assert!(registry.read_channel_work_home(&wrong).is_err());
     }
+}
+
+#[test]
+fn presentation_and_unrelated_pane_edits_preserve_captured_actor_placement() {
+    use crate::workspace_model::views::{Change as ViewChange, Scope};
+    let (mut registry, _directory, home) = fixture();
+    let origin = native_origin(&mut registry, home);
+    let proof = origin.proof.as_ref().unwrap();
+    let scope = Scope::Channel(home.channel);
+    let original = views::read(&registry.db, &scope).unwrap();
+    let before = original
+        .panes
+        .iter()
+        .find(|pane| pane.id == proof.card)
+        .unwrap()
+        .clone();
+    let mut renamed = before.clone();
+    renamed.title = "A new presentation title".into();
+    renamed.user_title = Some("A user title".into());
+    renamed.width_fraction = 0.75;
+    registry
+        .apply(&ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: original.revision,
+            operation: Uuid::new_v4(),
+            change: ViewChange::Update {
+                before,
+                pane: renamed.clone(),
+            },
+        })
+        .unwrap();
+    let mut unrelated = renamed;
+    unrelated.id = CardId::new();
+    unrelated.kind = CardKind::Browser(crate::model::BrowserSession {
+        id: crate::model::BrowserId::new(),
+        current_url: "https://example.test/unrelated".parse().unwrap(),
+        history: Vec::new(),
+        history_index: 0,
+        scroll_x: 0.0,
+        scroll_y: 0.0,
+        fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+    });
+    registry
+        .apply(&ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: registry.view_revision(&scope).unwrap(),
+            operation: Uuid::new_v4(),
+            change: ViewChange::Insert {
+                pane: unrelated,
+                before: None,
+            },
+        })
+        .unwrap();
+    registry
+        .apply(&ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: registry.view_revision(&scope).unwrap(),
+            operation: Uuid::new_v4(),
+            change: ViewChange::Move {
+                id: proof.card,
+                before: None,
+            },
+        })
+        .unwrap();
+    let current = registry
+        .resolve_channel_work_source(&proof.authority, &proof.source)
+        .unwrap();
+    assert_eq!(current.origin, origin.origin);
+    assert!(registry.view_revision(&scope).unwrap() > proof.view_revision);
+    assert_eq!(
+        current.proof.as_ref().unwrap().placement_epoch,
+        proof.placement_epoch
+    );
+    let request = claim(home, 31, 0);
+    let reply = registry.apply_channel_work(&origin, &request).unwrap();
+    assert!(reply.receipt.changed);
+    assert_eq!(reply.receipt.operation, request.operation);
+}
+
+#[test]
+fn independent_wal_transfer_round_trip_does_not_revive_a_captured_actor_placement() {
+    use crate::workspace_model::views::{Change as ViewChange, Scope};
+    let (mut registry, _directory, home) = fixture();
+    let origin = native_origin(&mut registry, home);
+    let proof = origin.proof.as_ref().unwrap();
+    let repository = registry
+        .model()
+        .unwrap()
+        .channel(home.channel)
+        .unwrap()
+        .repository
+        .clone();
+    let destination = ChannelId::new();
+    registry
+        .apply(&ModelEdit::CreateChannel {
+            id: destination,
+            repository,
+            title: "Temporary destination".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+    let mut writer = registry.execution_connection().unwrap();
+    for (from, to) in [(home.channel, destination), (destination, home.channel)] {
+        let scope = Scope::Channel(from);
+        writer
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: writer.view_revision(&scope).unwrap(),
+                scope,
+                operation: Uuid::new_v4(),
+                change: ViewChange::Transfer {
+                    id: proof.card,
+                    destination: Scope::Channel(to),
+                    before: None,
+                },
+            })
+            .unwrap();
+    }
+    let current = registry
+        .resolve_channel_work_source(&proof.authority, &proof.source)
+        .unwrap();
+    assert_eq!(
+        current.origin, origin.origin,
+        "Home/session/run are equal after the round trip"
+    );
+    assert_eq!(current.proof.as_ref().unwrap().card, proof.card);
+    assert_ne!(
+        current.proof.as_ref().unwrap().placement_epoch,
+        proof.placement_epoch
+    );
+    let before = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    let request = claim(home, 32, 0);
+    assert!(matches!(
+        registry.apply_channel_work(&origin, &request),
+        Err(ApplyError::Refused(_))
+    ));
+    assert_eq!(snapshot(&registry, &home), before);
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    assert!(
+        registry
+            .channel_work_receipt(&user(), &home, request.operation)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        registry.apply_channel_work(&current, &request).is_ok(),
+        "a fresh explicit context still works"
+    );
+}
+
+#[test]
+fn source_proof_replacement_and_restore_cannot_revive_old_actor_placement() {
+    use crate::workspace_model::views::{Change as ViewChange, Scope};
+    let (mut registry, _directory, home) = fixture();
+    let origin = native_origin(&mut registry, home);
+    let proof = origin.proof.as_ref().unwrap();
+    let scope = Scope::Channel(home.channel);
+    let original = views::read(&registry.db, &scope)
+        .unwrap()
+        .panes
+        .into_iter()
+        .find(|pane| pane.id == proof.card)
+        .unwrap();
+    let mut replaced = original.clone();
+    let CardKind::Chat(session) = &mut replaced.kind else {
+        panic!("native chat fixture")
+    };
+    session.proof.as_mut().unwrap().host_incarnation =
+        crate::model::HostIncarnation::new("replacement-incarnation");
+    for (before, pane) in [(original.clone(), replaced.clone()), (replaced, original)] {
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                operation: Uuid::new_v4(),
+                change: ViewChange::Update { before, pane },
+            })
+            .unwrap();
+    }
+    let current = registry
+        .resolve_channel_work_source(&proof.authority, &proof.source)
+        .unwrap();
+    assert_eq!(current.origin, origin.origin);
+    assert_ne!(
+        current.proof.as_ref().unwrap().placement_epoch,
+        proof.placement_epoch
+    );
+    let before = snapshot(&registry, &home);
+    let sequence = registry.model().unwrap().sequence;
+    let request = claim(home, 33, 0);
+    assert!(matches!(
+        registry.apply_channel_work(&origin, &request),
+        Err(ApplyError::Refused(_))
+    ));
+    assert_eq!(snapshot(&registry, &home), before);
+    assert_eq!(registry.model().unwrap().sequence, sequence);
+    assert!(registry.apply_channel_work(&current, &request).is_ok());
 }

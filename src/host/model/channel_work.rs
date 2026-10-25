@@ -10,13 +10,19 @@ use crate::channel_work::{
 use crate::model::{CardId, CardKind};
 use rusqlite::{Transaction, TransactionBehavior};
 
+pub(super) mod placement;
+
 /// Constructed only by the strictly authenticated host service. Neither the
 /// capability nor this proof is serializable or retained in the work ledger.
 pub(crate) struct SourceProof {
     pub(crate) authority: Authority,
     pub(crate) source: HostedSession,
     pub(crate) card: CardId,
+    #[cfg(test)]
     pub(crate) view_revision: u64,
+    // Durable causal identity of this pane's placement/source. Presentation
+    // changes still advance the canonical view revision without replacing it.
+    pub(crate) placement_epoch: u64,
 }
 
 pub(crate) struct TrustedResolvedOrigin {
@@ -431,7 +437,7 @@ fn resolve_in(
     {
         return Err("The actor no longer has one exact canonical channel pane".into());
     }
-    let (scope, view_revision, card, _) = matches.remove(0);
+    let (scope, _view_revision, card, _) = matches.remove(0);
     let crate::workspace_model::views::Scope::Channel(channel) = scope else {
         return Err("The actor is not displayed in a channel".into());
     };
@@ -448,6 +454,7 @@ fn resolve_in(
         creation_ordinal,
     };
     require_current_home(db, &home)?;
+    let placement_epoch = placement::token(db, card)?;
     let run = if let Some(agent) = &agent {
         let raw: Option<String> = db
             .query_row(
@@ -479,7 +486,9 @@ fn resolve_in(
             authority: authority.clone(),
             source: source.clone(),
             card,
-            view_revision,
+            #[cfg(test)]
+            view_revision: _view_revision,
+            placement_epoch,
         }),
     })
 }
@@ -512,7 +521,7 @@ fn require_origin(
                 || current_home != home
                 || current.origin.source() != resolved.origin.source()
                 || current_proof.card != proof.card
-                || current_proof.view_revision != proof.view_revision
+                || current_proof.placement_epoch != proof.placement_epoch
             {
                 return Err("The actor's captured channel context changed".into());
             }

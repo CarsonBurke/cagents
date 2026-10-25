@@ -255,6 +255,8 @@ where
             }
             if context.caller.as_ref().is_some_and(|c| {
                 c.session.as_uuid().is_nil()
+                    || c.placement_epoch == 0
+                    || c.placement_epoch > i64::MAX as u64
                     || c.card.as_uuid().is_nil()
                     || c.run.is_some_and(|id| id.as_uuid().is_nil())
             }) {
@@ -522,6 +524,8 @@ fn validate_saved(request: &Request) -> Result<(), AppError> {
     }
     if caller.as_ref().is_some_and(|c| {
         c.session.as_uuid().is_nil()
+            || c.placement_epoch == 0
+            || c.placement_epoch > i64::MAX as u64
             || c.card.as_uuid().is_nil()
             || c.run.is_some_and(|id| id.as_uuid().is_nil())
     }) {
@@ -569,6 +573,18 @@ fn load_request(path: &Path) -> Result<Request, AppError> {
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("The saved request is not valid request JSON"))?;
+    if value
+        .get("Mutate")
+        .and_then(|request| request.get("caller"))
+        .and_then(Value::as_object)
+        .is_some_and(|caller| {
+            caller.contains_key("view_revision") && !caller.contains_key("placement_epoch")
+        })
+    {
+        return Err(invalid(
+            "This saved actor request uses an older placement format. Its file has been kept unchanged; inspect the original operation with channel work result before creating new intent",
+        ));
+    }
     let request: Request = serde_json::from_slice(&bytes)
         .map_err(|_| invalid("The saved request has an unsupported shape"))?;
     if serde_json::to_value(&request).map_err(invalid)? != value {
@@ -607,7 +623,7 @@ mod tests {
             caller: Some(Caller {
                 session: TerminalId::from_uuid(Uuid::from_u128(4)),
                 card: crate::model::CardId::from_uuid(Uuid::from_u128(5)),
-                view_revision: 6,
+                placement_epoch: 6,
                 run: None,
             }),
         }
@@ -1042,6 +1058,79 @@ mod tests {
             });
             assert!(result.is_err(), "page contract case {invalid}");
         }
+    }
+
+    #[test]
+    fn legacy_actor_placement_requests_are_kept_and_refused_before_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-actor.json");
+        let mut value = serde_json::to_value(request()).unwrap();
+        let caller = value["Mutate"]["caller"].as_object_mut().unwrap();
+        let old_revision = caller.remove("placement_epoch").unwrap();
+        caller.insert("view_revision".into(), old_revision);
+        let original_bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &original_bytes).unwrap();
+        let error = match Prepared::new(WorkCommand::Apply {
+            request: path.clone(),
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("an old actor request must never be reinterpreted"),
+        };
+        assert!(format!("{error:?}").contains("older placement format"));
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        let fresh = request();
+        let fresh_path = directory.path().join("current-actor.json");
+        save_request(&fresh_path, &fresh).unwrap();
+        assert_eq!(load_request(&fresh_path).unwrap(), fresh);
+        for epoch in [0, i64::MAX as u64 + 1] {
+            let mut malformed = request();
+            let Request::Mutate {
+                caller: Some(caller),
+                ..
+            } = &mut malformed
+            else {
+                panic!()
+            };
+            caller.placement_epoch = epoch;
+            assert!(validate_saved(&malformed).is_err());
+            let mut calls = 0;
+            let mut fresh_context = context_value();
+            fresh_context.caller.as_mut().unwrap().placement_epoch = epoch;
+            assert!(
+                run(
+                    Prepared::Change {
+                        channel: None,
+                        change: Change::Claim {
+                            target: parse_pull_request("https://github.com/a/b/pull/1").unwrap(),
+                            role: Role::Review
+                        },
+                        save: None,
+                    },
+                    &mut |request| {
+                        calls += 1;
+                        assert!(matches!(request, Request::Context { .. }));
+                        Ok(Response::Context(fresh_context.clone()))
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(
+                calls, 1,
+                "invalid Context epochs must not reach target lookup or mutation"
+            );
+        }
+        let mut user_request = request();
+        let Request::Mutate { caller, .. } = &mut user_request else {
+            panic!()
+        };
+        *caller = None;
+        let user_path = directory.path().join("user.json");
+        save_request(&user_path, &user_request).unwrap();
+        assert_eq!(
+            load_request(&user_path).unwrap(),
+            user_request,
+            "explicit User requests have no actor stamp to migrate"
+        );
     }
 
     #[test]

@@ -16,7 +16,9 @@ use crate::{
 pub struct Caller {
     pub session: TerminalId,
     pub card: CardId,
-    pub view_revision: u64,
+    /// Durable causal revision of this exact pane's placement and source.
+    /// Presentation and unrelated pane edits cannot change this epoch.
+    pub placement_epoch: u64,
     pub run: Option<RunId>,
 }
 
