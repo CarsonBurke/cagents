@@ -159,6 +159,7 @@ enum Pending {
     History { append: bool },
     Lifecycle { id: Uuid, append: bool },
     RefreshList,
+    RefreshLoadedList(LoadedListRefresh),
     RefreshAutomation,
     RefreshHistory,
     RefreshRun,
@@ -172,12 +173,21 @@ impl Pending {
         matches!(
             self,
             Self::RefreshList
+                | Self::RefreshLoadedList(_)
                 | Self::RefreshAutomation
                 | Self::RefreshHistory
                 | Self::RefreshRun
                 | Self::HistoryRun { .. }
         )
     }
+}
+
+/// One bounded read through the UUID range the reader explicitly loaded.
+/// This is a cursor, not a snapshot or a promise about refresh latency.
+#[derive(Clone, Copy)]
+struct LoadedListRefresh {
+    after: Option<Uuid>,
+    through: Uuid,
 }
 
 struct Confirmation {
@@ -655,6 +665,8 @@ pub struct State {
     last_firings: BTreeMap<Uuid, (u64, Uuid)>,
     more: bool,
     after: Option<Uuid>,
+    loaded_list_refresh: Option<LoadedListRefresh>,
+    list_changed: bool,
     search: String,
     selected: Option<Automation>,
     draft: Option<Draft>,
@@ -783,6 +795,65 @@ impl State {
         }
     }
 
+    fn refresh_loaded_list(&mut self, refresh: LoadedListRefresh, rows: Vec<Summary>) {
+        // Validate the whole page before changing any row or advancing a
+        // cursor. Canonical UUID order is the daemon's immutable List order.
+        if rows.len() > PAGE
+            || rows
+                .first()
+                .is_some_and(|row| refresh.after.is_some_and(|after| row.id <= after))
+            || rows.windows(2).any(|pair| pair[0].id >= pair[1].id)
+        {
+            self.list_status =
+                ListStatus::Failed("The automation list reply was inconsistent".into());
+            self.error = Some("The automation list reply was inconsistent".into());
+            return;
+        }
+        let last = rows.last().map(|row| row.id);
+        let complete = rows.len() < PAGE || last.is_some_and(|last| last >= refresh.through);
+        let covered = if complete {
+            refresh.through
+        } else {
+            last.expect("a full page has a final UUID")
+        };
+        // Foreground Save/More can leave a non-prefix display order. Keep its
+        // slots: only the response is ordered, not necessarily our loaded Vec.
+        // Missing or new IDs request Refresh, never automatic removal/growth.
+        let covered_count = self
+            .rows
+            .iter()
+            .filter(|row| refresh.after.is_none_or(|after| row.id > after) && row.id <= covered)
+            .count();
+        let mut matched = 0;
+        for row in rows {
+            if row.id > refresh.through {
+                // A returned addition beyond the old tail still needs a
+                // refresh cue once the manual list was exhausted. Otherwise
+                // this can simply be an already-unloaded page.
+                self.list_changed |= !self.more;
+                continue;
+            }
+            if let Some(current) = self.rows.iter_mut().find(|loaded| loaded.id == row.id) {
+                self.last_firings.remove(&row.id);
+                *current = row;
+                matched += 1;
+            } else {
+                // A Show reply may have added a known non-prefix row. When
+                // more pages remain, unknown IDs beyond the manual cursor
+                // need not be new; they are not a membership census.
+                self.list_changed |= !self.more || self.after.is_some_and(|after| row.id <= after);
+            }
+        }
+        if matched != covered_count {
+            self.list_changed = true;
+        }
+        self.list_status = ListStatus::Loaded;
+        self.loaded_list_refresh = (!complete).then_some(LoadedListRefresh {
+            after: last,
+            through: refresh.through,
+        });
+    }
+
     fn refresh_history_runs(&mut self, from: usize) -> Option<Effect> {
         let index = (from..self.history.len()).find(|&index| {
             self.history[index].state.is_active() || self.history[index].release_pending
@@ -843,6 +914,19 @@ impl State {
             self.pending = None;
             let result =
                 std::sync::Arc::try_unwrap(result).unwrap_or_else(|result| (*result).clone());
+            if let Pending::RefreshLoadedList(refresh) = pending {
+                match result {
+                    Ok(Response::Listed(rows)) => self.refresh_loaded_list(refresh, rows),
+                    result => {
+                        let error = result
+                            .err()
+                            .unwrap_or_else(|| "The automation list reply was inconsistent".into());
+                        self.list_status = ListStatus::Failed(error.clone());
+                        self.error = Some(error);
+                    }
+                }
+                return None;
+            }
             match result {
                 Err(error) => {
                     if matches!(pending, Pending::History { .. } | Pending::RefreshHistory) {
@@ -862,7 +946,9 @@ impl State {
                     self.after = rows.last().map(|row| row.id);
                     if !matches!(pending, Pending::List { append: true }) {
                         self.rows.clear();
+                        self.list_changed = false;
                     }
+                    self.loaded_list_refresh = None;
                     for row in rows {
                         // The list is authoritative but does not carry the latest
                         // firing identity. Retire our earlier detail-read fence.
@@ -1120,7 +1206,17 @@ impl State {
                     },
                 );
             }
-            return None;
+            let refresh = self.loaded_list_refresh.unwrap_or(LoadedListRefresh {
+                after: None,
+                through: self.rows.iter().map(|row| row.id).max()?,
+            });
+            return self.request(
+                Pending::RefreshLoadedList(refresh),
+                Request::List {
+                    after: refresh.after,
+                    limit: PAGE,
+                },
+            );
         }
         if let Action::Confirm(generation) = action {
             let Some(confirmation) = self.confirmation.take() else {
@@ -1701,6 +1797,8 @@ impl State {
             "Refresh run"
         } else if self.all_history {
             "Refresh run history"
+        } else if self.list_changed {
+            "Automation list changed; refresh to show additions or removals"
         } else {
             "Refresh automations"
         });
@@ -1718,7 +1816,10 @@ impl State {
         ))
         .id(refresh_id())
         .name(label)
-        .class(crate::ui_controls::control_style(false, None))
+        .class(crate::ui_controls::control_style(
+            self.list_changed && self.run.is_none() && !self.all_history,
+            None,
+        ))
         .width(crate::design::PRIMARY_CONTROL_SIZE)
         .height(crate::design::PRIMARY_CONTROL_SIZE)
         .padding(0)
@@ -1834,7 +1935,7 @@ impl State {
                             .selected
                             .as_ref()
                             .is_some_and(|selected| selected.id == row.id);
-                        listing.push(
+                        let mut row_content = widget::column::with_children(vec![
                             widget::button::custom(
                                 widget::column::with_children(vec![
                                     crate::design::heading(&row.name).into(),
@@ -1863,10 +1964,13 @@ impl State {
                             .width(Length::Fill)
                             .on_press_maybe((!busy).then_some(Action::Select(row.id)))
                             .into(),
-                        );
+                        ])
+                        .spacing(space::XS)
+                        .width(Length::Fill);
                         if let Some(blocked) = &row.blocked {
-                            listing.push(crate::design::caption(blocked).into());
+                            row_content = row_content.push(crate::design::caption(blocked));
                         }
+                        listing.push(crate::ui_controls::owned(row.id, row_content));
                     }
                     if listing.is_empty() && !self.rows.is_empty() {
                         listing.push(
@@ -2691,7 +2795,7 @@ fn progress_label(pending: Pending) -> &'static str {
         Pending::OpenRun => "Opening agent…",
         // Background reads draw no progress, but name themselves should one
         // ever be shown.
-        Pending::RefreshList => "Refreshing automations…",
+        Pending::RefreshList | Pending::RefreshLoadedList(_) => "Refreshing automations…",
         Pending::RefreshAutomation => "Refreshing automation…",
         Pending::RefreshHistory | Pending::HistoryRun { .. } => "Refreshing run history…",
         Pending::RefreshRun => "Refreshing run…",
@@ -5138,6 +5242,657 @@ mod tests {
             }))),
         });
         assert!(state.lifecycle.is_none());
+    }
+    fn list_refresh_rows(count: usize) -> Vec<Summary> {
+        (1..=count)
+            .map(|index| {
+                let mut value = automation();
+                value.id = Uuid::from_u128(index as u128 * 2);
+                value.definition.name = format!("Job {index:04}");
+                value.enabled = true;
+                value.summary(Some(crate::automations::FiringState::Running))
+            })
+            .collect()
+    }
+
+    fn receive_list(state: &mut State, sequence: u64, rows: Vec<Summary>) {
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Listed(rows))),
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn loaded_automation_pages_refresh_outcomes_without_moving_native_search_or_pagination() {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Rectangle, Size, keyboard, mouse};
+        type Ui<'a> = UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer>;
+        fn frame<'a>(state: &'a State, cache: Cache, renderer: &mut cosmic::Renderer) -> Ui<'a> {
+            let mut ui =
+                UserInterface::build(state.view(), Size::new(900.0, 700.0), cache, renderer);
+            ui.draw(
+                renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            ui
+        }
+        fn bounds(ui: &Ui<'_>, name: &str) -> Rectangle {
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let rect = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(name))
+                .unwrap_or_else(|| panic!("mounted {name}"))
+                .node()
+                .bounds()
+                .unwrap();
+            Rectangle::new(
+                Point::new(rect.x0 as f32, rect.y0 as f32),
+                Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+            )
+        }
+        #[derive(Default)]
+        struct Search(Option<widget::Id>);
+        impl Operation for Search {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text_input(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                _: &mut dyn operation::TextInput,
+            ) {
+                assert!(self.0.is_none(), "one mounted list search");
+                self.0 = id.cloned();
+            }
+        }
+
+        let rows = list_refresh_rows(PAGE + 1);
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        state.update(Action::Search("Job 0001".into()));
+        // Filtering leaves the real More control in this viewport, without
+        // faking an offscreen click or changing the loaded-row budget.
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let point = bounds(&ui, "Load more automations").center();
+        assert!(Rectangle::with_size(Size::new(900.0, 700.0)).contains(point));
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::More]),
+            "{messages:?}"
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, request }) = state.update(messages.remove(0)) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        receive_list(&mut state, sequence, vec![rows[PAGE].clone()]);
+        let manual_after = state.after;
+        assert!(!state.more);
+        let mut ui = frame(&state, cache, &mut renderer);
+        let refresh_bounds = bounds(&ui, "Refresh automations");
+        let search_bounds = bounds(&ui, "Filter automations");
+        let mut search = Search::default();
+        ui.operate(&renderer, &mut search);
+        let search_id = search.0.unwrap();
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(search_id.clone()),
+        );
+        ui.operate(
+            &renderer,
+            &mut operation::text_input::select_all::<()>(search_id),
+        );
+        let cache = ui.into_cache();
+
+        let old_firing = Uuid::from_u128(9000);
+        state.last_firings.insert(rows[0].id, (1, old_firing));
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("a loaded second page must not stop status refresh");
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: None,
+                limit: PAGE
+            }
+        );
+        let mut first = rows[..PAGE].to_vec();
+        first[0].enabled = false;
+        first[0].blocked = Some("Fixture cleanup needs inspection".into());
+        first[0].last_state = Some(crate::automations::FiringState::Failed);
+        receive_list(&mut state, sequence, first.clone());
+        assert!(!state.rows[0].enabled);
+        assert_eq!(
+            state.rows[0].last_state,
+            Some(crate::automations::FiringState::Failed)
+        );
+        assert!(!state.last_firings.contains_key(&rows[0].id));
+        let mut old_detail = history_firing(1, crate::automations::FiringState::Running);
+        old_detail.id = old_firing;
+        old_detail.automation = rows[0].id;
+        state.refresh_last_outcome(&old_detail, false);
+        assert_eq!(
+            state.rows[0].last_state,
+            Some(crate::automations::FiringState::Failed)
+        );
+        let outline = Outline::of(&state, 900.0, 700.0);
+        outline.text("Last: Failed");
+        outline.text("Fixture cleanup needs inspection");
+        let ui = frame(&state, cache, &mut renderer);
+        assert_eq!(bounds(&ui, "Filter automations"), search_bounds);
+        let cache = ui.into_cache();
+
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        let mut last = rows[PAGE].clone();
+        last.last_state = Some(crate::automations::FiringState::Succeeded);
+        // A genuinely observed new tail row requests Refresh but cannot
+        // extend this pass or grow the reader's loaded snapshot.
+        let beyond = list_refresh_rows(PAGE + 2).pop().unwrap();
+        receive_list(&mut state, sequence, vec![last, beyond]);
+        assert!(state.loaded_list_refresh.is_none());
+        assert_eq!(
+            state.rows[PAGE].last_state,
+            Some(crate::automations::FiringState::Succeeded)
+        );
+        assert!(state.list_changed);
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: None,
+                limit: PAGE
+            },
+            "completed passes wrap"
+        );
+        let mut unknown = first[1].clone();
+        unknown.id = Uuid::from_u128(3);
+        first[1] = unknown;
+        receive_list(&mut state, sequence, first);
+        assert_eq!(state.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        assert_eq!(state.after, manual_after);
+        assert!(!state.more);
+        assert!(state.selected.is_none() && state.draft.is_none() && state.run.is_none());
+        let mut ui = frame(&state, cache, &mut renderer);
+        assert_eq!(
+            bounds(
+                &ui,
+                "Automation list changed; refresh to show additions or removals"
+            ),
+            refresh_bounds
+        );
+        assert_eq!(bounds(&ui, "Filter automations"), search_bounds);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("z".into()),
+                modified_key: keyboard::Key::Character("z".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyZ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some("z".into()),
+                repeat: false,
+            })],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Search(value)] if value == "z"),
+            "search focus and selection survived every cached reply: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        state.update(messages.remove(0));
+        state.update(Action::Search("Job 0051".into()));
+        Outline::of(&state, 900.0, 700.0).text("Last: Succeeded");
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        assert!(!state.list_changed);
+        assert_eq!(state.rows, rows[..PAGE]);
+        assert_eq!(state.after, Some(rows[PAGE - 1].id));
+        assert!(state.more);
+
+        // Adding an earlier row's warning must not move a later button's
+        // native focused state to its neighbour in the retained widget tree.
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+        state.update(Action::Search("Job 000".into()));
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let third = bounds(&ui, "Select automation Job 0003");
+        assert!(Rectangle::with_size(Size::new(900.0, 700.0)).contains(third.center()));
+        struct ButtonAt {
+            bounds: Rectangle,
+            id: Option<widget::Id>,
+        }
+        impl Operation for ButtonAt {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if bounds == self.bounds {
+                    assert!(self.id.is_none(), "one native row target");
+                    self.id = id.cloned();
+                }
+            }
+        }
+        let mut target = ButtonAt {
+            bounds: third,
+            id: None,
+        };
+        ui.operate(&renderer, &mut target);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(target.id.expect("actual third row button")),
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        let mut changed = rows[..PAGE].to_vec();
+        changed[0].blocked = Some("Earlier row now needs inspection".into());
+        receive_list(&mut state, sequence, changed);
+        let mut ui = frame(&state, cache, &mut renderer);
+        assert!(bounds(&ui, "Select automation Job 0003").y > third.y);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Select(id)] if *id == rows[2].id),
+            "the original third row retains focus through an earlier warning: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        assert!(
+            matches!(state.update(messages.remove(0)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == rows[2].id)
+        );
+
+        // A rename may remove an earlier row from an unchanged search. The
+        // held native press must not transfer to another UUID in its slot.
+        let mut state = State::default();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+        state.update(Action::Search("Job 000".into()));
+        let mut ui = frame(&state, Cache::new(), &mut renderer);
+        let point = bounds(&ui, "Select automation Job 0003").center();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "a held row press has not selected yet: {messages:?}"
+        );
+        let cache = ui.into_cache();
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!()
+        };
+        let mut changed = rows[..PAGE].to_vec();
+        changed[0].name = "Renamed outside current search".into();
+        receive_list(&mut state, sequence, changed);
+        let mut ui = frame(&state, cache, &mut renderer);
+        let replacement = bounds(&ui, "Select automation Job 0004").center();
+        assert_eq!(
+            replacement, point,
+            "the old held slot now belongs to another UUID"
+        );
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: replacement,
+                }),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(replacement),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            messages.is_empty(),
+            "a filtered replacement cannot inherit the old row press: {messages:?}"
+        );
+        let point = bounds(&ui, "Select automation Job 0003").center();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Action::Select(id)] if *id == rows[2].id),
+            "a fresh press still selects the actual current UUID: {messages:?}"
+        );
+        let _ = ui.into_cache();
+        assert!(
+            matches!(state.update(messages.remove(0)), Some(Effect::Request { request: Request::Show { id }, .. }) if id == rows[2].id)
+        );
+    }
+
+    #[test]
+    fn paginated_list_refresh_rejects_bad_pages_and_yields_to_foreground_intent() {
+        use crate::automations::HistoryPage;
+
+        fn loaded() -> (State, Vec<Summary>) {
+            let rows = list_refresh_rows(PAGE * 2);
+            let mut state = State::default();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Refresh) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::More) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[PAGE..].to_vec());
+            (state, rows)
+        }
+        for bad in [
+            "duplicate",
+            "reversed",
+            "oversized",
+            "before",
+            "wrong response",
+            "error",
+        ] {
+            let (mut state, rows) = loaded();
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+            let cursor = state
+                .loaded_list_refresh
+                .map(|value| (value.after, value.through));
+            let manual = (state.after, state.more);
+            let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            let mut changed = rows[PAGE].clone();
+            changed.enabled = false;
+            let result = match bad {
+                "duplicate" => Ok(Response::Listed(vec![changed.clone(), changed])),
+                "reversed" => Ok(Response::Listed(vec![rows[PAGE + 1].clone(), changed])),
+                "oversized" => Ok(Response::Listed(
+                    list_refresh_rows(PAGE * 2 + 1)[PAGE..].to_vec(),
+                )),
+                "before" => Ok(Response::Listed(vec![rows[0].clone()])),
+                "wrong response" => Ok(Response::Automation(automation())),
+                _ => Err("Fixture list read failed".into()),
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(result),
+            });
+            assert_eq!(
+                state.rows, rows,
+                "{bad} may not partly update a valid prefix"
+            );
+            assert_eq!((state.after, state.more), manual);
+            assert_eq!(
+                state
+                    .loaded_list_refresh
+                    .map(|value| (value.after, value.through)),
+                cursor
+            );
+            assert!(!state.list_changed);
+            assert!(state.selected.is_none() && state.history.is_empty());
+            assert!(matches!(state.list_status, ListStatus::Failed(_)));
+            assert!(
+                matches!(state.update(Action::Tick), Some(Effect::Request { request: Request::List { after: Some(after), limit: PAGE }, .. }) if after == rows[PAGE-1].id)
+            );
+        }
+        for intent in ["search", "more", "refresh", "new", "select"] {
+            let (mut state, rows) = loaded();
+            let manual = (state.after, state.more);
+            let Some(Effect::Request { sequence: old, .. }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            let action = match intent {
+                "search" => Action::Search("Job 0099".into()),
+                "more" => Action::More,
+                "refresh" => Action::Refresh,
+                "new" => Action::New,
+                _ => Action::Select(rows[0].id),
+            };
+            let effect = state.update(action);
+            let accepted = state.pending.map(|(sequence, _)| sequence);
+            let mut stale = rows[..PAGE].to_vec();
+            stale[0].enabled = false;
+            receive_list(&mut state, old, stale);
+            assert_eq!(state.rows, rows, "{intent} retires the old read");
+            assert_eq!((state.after, state.more), manual);
+            assert_eq!(state.pending.map(|(sequence, _)| sequence), accepted);
+            assert!(!state.list_changed);
+            match intent {
+                "search" => {
+                    assert_eq!(state.search, "Job 0099");
+                    assert!(state.pending.is_none());
+                }
+                "new" => assert!(state.draft.is_some()),
+                "more" => assert!(
+                    matches!(effect, Some(Effect::Request { request: Request::List { after: Some(after), .. }, .. }) if after == rows.last().unwrap().id)
+                ),
+                "refresh" => assert!(matches!(
+                    effect,
+                    Some(Effect::Request {
+                        request: Request::List { after: None, .. },
+                        ..
+                    })
+                )),
+                _ => {
+                    let Some(Effect::Request {
+                        sequence,
+                        request: Request::Show { id },
+                    }) = effect
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(id, rows[0].id);
+                    let mut selected = automation();
+                    selected.id = id;
+                    assert!(
+                        matches!(state.update(Action::Received { sequence, result: std::sync::Arc::new(Ok(Response::Automation(selected))) }), Some(Effect::Request { request: Request::History { id: Some(actual), .. }, .. }) if actual == id)
+                    );
+                    assert_eq!(state.selected.as_ref().unwrap().id, id);
+                }
+            }
+        }
+
+        // Save can insert a row outside the foreground UUID prefix. A failed
+        // Browse retains it; More appends its real next page after that row.
+        // Refresh must use UUID membership, without sorting the reader's slots.
+        let (mut state, mut saved) = editing(None, None);
+        state.update(Action::CancelEdit);
+        let rows = list_refresh_rows(PAGE * 3);
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!()
+        };
+        receive_list(&mut state, sequence, rows[..PAGE].to_vec());
+        state.update(Action::New);
+        state.update(Action::Provider(1));
+        state.update(Action::Field(Field::Name, "Saved outlier".into()));
+        state.update(Action::Field(Field::Timezone, "UTC".into()));
+        state.update(Action::Prompt(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Create { definition },
+        }) = state.update(Action::Save)
+        else {
+            panic!("the ordinary new draft issues Create: {:?}", state.error);
+        };
+        saved.id = Uuid::from_u128(1000);
+        saved.definition = definition;
+        let Some(Effect::Request {
+            sequence: history,
+            request: Request::History { id: Some(id), .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(saved.clone()))),
+        })
+        else {
+            panic!()
+        };
+        assert_eq!(id, saved.id);
+        state.update(Action::Received {
+            sequence: history,
+            result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                firings: vec![],
+                next: None,
+            }))),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!()
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("Fixture transient list failure".into())),
+        });
+        assert!(state.selected.is_none());
+        let Some(Effect::Request { sequence, request }) = state.update(Action::More) else {
+            panic!()
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows[PAGE - 1].id),
+                limit: PAGE
+            }
+        );
+        receive_list(&mut state, sequence, rows[PAGE..PAGE * 2].to_vec());
+        assert_eq!(state.rows[PAGE].id, saved.id);
+        assert!(
+            state.rows[PAGE].id > state.rows[PAGE + 1].id,
+            "ordinary More leaves a non-sorted display snapshot"
+        );
+        let ids = state.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let manual = (state.after, state.more);
+        for page in 0..3 {
+            let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+                panic!()
+            };
+            assert_eq!(
+                request,
+                Request::List {
+                    after: (page > 0).then(|| rows[page * PAGE - 1].id),
+                    limit: PAGE
+                }
+            );
+            receive_list(
+                &mut state,
+                sequence,
+                rows[page * PAGE..(page + 1) * PAGE].to_vec(),
+            );
+            assert!(
+                !state.list_changed,
+                "unloaded rows beyond the manual cursor are not claimed new"
+            );
+        }
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("the saved maximum UUID remains in this finite pass")
+        };
+        assert_eq!(
+            request,
+            Request::List {
+                after: Some(rows.last().unwrap().id),
+                limit: PAGE
+            }
+        );
+        let mut outlier = saved.summary(Some(crate::automations::FiringState::Failed));
+        outlier.enabled = false;
+        receive_list(&mut state, sequence, vec![outlier.clone()]);
+        assert_eq!(state.rows[PAGE], outlier);
+        assert_eq!(state.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        assert_eq!((state.after, state.more), manual);
+        assert!(state.loaded_list_refresh.is_none());
+        assert!(!state.list_changed);
+        assert!(state.selected.is_none() && state.draft.is_none() && state.history.is_empty());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
