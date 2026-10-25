@@ -56,6 +56,7 @@ pub enum WorkCommand {
         /// Relationship: contribute, steward, review, or reference.
         #[arg(value_parser = parse_role)]
         role: Role,
+        /// Channel UUID; omit to use your authenticated session's channel.
         #[arg(long)]
         channel: Option<ChannelId>,
         /// Save the exact safe request before sending it. The path must not exist.
