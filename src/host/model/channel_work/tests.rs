@@ -1965,76 +1965,78 @@ fn reopening_current_registry_repairs_batched_missing_homes_without_reviving_his
 
 #[test]
 fn failed_reopen_repair_rolls_back_prior_valid_candidates() {
-    let (mut registry, directory, home) = fixture();
-    registry
-        .db
-        .execute("DELETE FROM channel_work_homes", [])
-        .unwrap();
-    let malformed = ChannelId::new();
-    let repository = registry
-        .model()
-        .unwrap()
-        .channel(home.channel)
-        .unwrap()
-        .repository
-        .clone();
-    registry
-        .apply(&ModelEdit::CreateChannel {
-            id: malformed,
-            repository,
-            title: "Malformed later candidate".into(),
-            title_source: Default::default(),
-        })
-        .unwrap();
-    registry
-        .db
-        .execute(
-            "DELETE FROM channel_work_homes WHERE channel=?1",
-            [malformed.to_string()],
-        )
-        .unwrap();
-    // Lexically after every normalized UUID: the valid candidate is repaired
-    // first inside the admission transaction, then this damaged row refuses.
-    registry
-        .db
-        .execute(
-            "UPDATE channels SET id='zz-invalid-channel' WHERE id=?1",
-            [malformed.to_string()],
-        )
-        .unwrap();
-    let before: (String, i64, i64) = registry
-        .db
-        .query_row(
-            "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    let error = Registry::at(&directory.path().join("model.sqlite3"))
-        .err()
-        .expect("damaged canonical identity must refuse reopen");
-    assert!(error.contains("unreadable"), "{error}");
-    let count: u64 = registry
-        .db
-        .query_row("SELECT count(*) FROM channel_work_homes", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 0, "the earlier valid repair must roll back too");
-    let after: (String, i64, i64) = registry
-        .db
-        .query_row(
-            "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(after, before);
-    let version: u32 = registry
-        .db
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, super::super::SCHEMA_VERSION);
+    for malformed_id in ["", "zz-invalid-channel"] {
+        let (mut registry, directory, home) = fixture();
+        registry
+            .db
+            .execute("DELETE FROM channel_work_homes", [])
+            .unwrap();
+        let malformed = ChannelId::new();
+        let repository = registry
+            .model()
+            .unwrap()
+            .channel(home.channel)
+            .unwrap()
+            .repository
+            .clone();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: malformed,
+                repository,
+                title: "Malformed later candidate".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "DELETE FROM channel_work_homes WHERE channel=?1",
+                [malformed.to_string()],
+            )
+            .unwrap();
+        // Empty IDs must be inspected in the first batch. The other case sorts
+        // after normalized UUIDs and proves rollback of an earlier valid repair.
+        registry
+            .db
+            .execute(
+                "UPDATE channels SET id=?2 WHERE id=?1",
+                params![malformed.to_string(), malformed_id],
+            )
+            .unwrap();
+        let before: (String, i64, i64) = registry
+            .db
+            .query_row(
+                "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let error = Registry::at(&directory.path().join("model.sqlite3"))
+            .err()
+            .expect("damaged canonical identity must refuse reopen");
+        assert!(error.contains("unreadable"), "{error}");
+        let count: u64 = registry
+            .db
+            .query_row("SELECT count(*) FROM channel_work_homes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "the earlier valid repair must roll back too");
+        let after: (String, i64, i64) = registry
+            .db
+            .query_row(
+                "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let version: u32 = registry
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::super::SCHEMA_VERSION);
+    }
 }
 
 #[test]

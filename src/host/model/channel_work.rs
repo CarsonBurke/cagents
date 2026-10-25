@@ -117,14 +117,17 @@ pub(super) fn repair_missing_homes_in(tx: &Transaction<'_>) -> Result<(), String
     let mut checked_ledger = false;
     loop {
         let candidates = {
+            // Include malformed empty TEXT identities in the first batch;
+            // later batches remain strict indexed keyset ranges.
+            let comparison = if after.is_empty() { ">=" } else { ">" };
             let mut query = tx
-                .prepare(
+                .prepare(&format!(
                     "SELECT c.id,c.ordinal FROM channels c
-                 WHERE c.id>?1 AND NOT EXISTS(
+                 WHERE c.id{comparison}?1 AND NOT EXISTS(
                      SELECT 1 FROM channel_work_homes h
                      WHERE h.channel=c.id AND h.incarnation=c.ordinal)
-                 ORDER BY c.id LIMIT ?2",
-                )
+                 ORDER BY c.id LIMIT ?2"
+                ))
                 .map_err(|error| error.to_string())?;
             query
                 .query_map(params![after, BATCH], |row| {
