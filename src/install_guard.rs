@@ -647,6 +647,16 @@ pub(crate) fn wait_daemon_start(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<(), DaemonStartError> {
+    wait_daemon_start_with_progress(command, timeout, || Ok(()))
+}
+
+/// Reports once when the startup budget is crossed with the original child
+/// still running. Reporting failure cannot unwind child or caller-fence custody.
+pub(crate) fn wait_daemon_start_with_progress(
+    command: &mut Command,
+    timeout: Duration,
+    waiting: impl FnOnce() -> io::Result<()>,
+) -> Result<(), DaemonStartError> {
     let deadline = Instant::now() + timeout;
     let mut child = command
         .stdin(Stdio::null())
@@ -664,7 +674,7 @@ pub(crate) fn wait_daemon_start(
         )
     };
     loop {
-        let error = match child.try_wait() {
+        let (error, overdue) = match child.try_wait() {
             Ok(Some(status)) => {
                 return if Instant::now() >= deadline {
                     Err(DaemonStartError {
@@ -684,13 +694,36 @@ pub(crate) fn wait_daemon_start(
                 thread::sleep(Duration::from_millis(25));
                 continue;
             }
-            Ok(None) => budget_error(),
-            Err(error) => error,
+            Ok(None) => (budget_error(), true),
+            Err(error) => (error, false),
         };
         tracing::warn!(
             pid = child.id(),
             "Daemon startup result was not confirmed within its budget; retaining the original wait owner"
         );
+        // A failed diagnostic (including an unwinding reporter) must not drop
+        // the original child or return through the caller's held fences.
+        let progress_result = if overdue {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                waiting().map_err(|failure| failure.to_string())
+            }))
+        } else {
+            // A failed try_wait is unconfirmed ownership, not evidence that
+            // this allowance elapsed. Preserve its original error and wait.
+            Ok(Ok(()))
+        };
+        let progress_failure = match &progress_result {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure.clone()),
+            Err(_) => Some("the startup progress reporter panicked".to_owned()),
+        };
+        let error = match progress_failure {
+            Some(failure) => io::Error::new(
+                error.kind(),
+                format!("{error}; Could not record the waiting status: {failure}"),
+            ),
+            None => error,
+        };
         // Neither a timeout nor an unconfirmed wait permits dropping the
         // original Child. Retry actual wait errors without fabricating success.
         loop {
@@ -701,6 +734,12 @@ pub(crate) fn wait_daemon_start(
                         success = status.success(),
                         "Original daemon startup command was naturally waited"
                     );
+                    if let Err(payload) = progress_result {
+                        // An arbitrary panic payload may itself panic on Drop.
+                        // The short-lived coordinator must still return through
+                        // its candidate-recovery routing after the exact reap.
+                        std::mem::forget(payload);
+                    }
                     return Err(DaemonStartError {
                         error,
                         spawned: true,
