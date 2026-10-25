@@ -127,6 +127,14 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
         let mut operations = 0;
         let mut reads = 0;
         for operation in ["spawn", "write", "close", "pin", "unpin", "plan", "remove"] {
+            // --no-start first checks socket liveness with one bare connection.
+            // Require its clean EOF, then keep the actual framed session strict.
+            let mut probe = accept(&listener);
+            assert!(
+                read_frame::<ClientEnvelope>(&mut probe).unwrap().is_none(),
+                "the liveness probe unexpectedly sent a request"
+            );
+            drop(probe);
             let mut stream = accept(&listener);
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert_eq!(connect.version, PROTOCOL_VERSION);
