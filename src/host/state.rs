@@ -4171,6 +4171,12 @@ fn start_terminal_view_owned_reserved(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
+    // Adoption already inspected this holder's issued source. Keep that exact
+    // receipt alias in the independently installed owner, including when the
+    // startup commit fails; the relaunch projection has no ownership proof.
+    let install_session = previous
+        .as_ref()
+        .map_or_else(|| session.clone(), |previous| previous.source.clone());
     let holder_recovery = {
         let mut state = shared
             .lock()
@@ -4338,7 +4344,6 @@ fn start_terminal_view_owned_reserved(
     };
     let wake_redraw = Arc::clone(&redraw);
     let adopting = config.adoption.is_some();
-    let install_session = session.clone();
     let install_options = options.clone();
     let install_environment = retained_environment.clone();
     let install_execution = execution_recipe.clone();

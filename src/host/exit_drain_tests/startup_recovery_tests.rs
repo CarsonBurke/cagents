@@ -609,12 +609,29 @@ fn completed_failed_startup_metadata_waits_for_exact_host_close_before_retiremen
         .unwrap()
         .retire_terminal(original.session.id)
         .unwrap();
+    let current_proof = host.lock().unwrap().proof().clone();
+    let (authenticated, _) = crate::terminal::inspect_holder(
+        &crate::terminal::holder::socket(&holders, original.session.id),
+        &original.owner,
+        &current_proof,
+    )
+    .unwrap();
     host.lock().unwrap().test_fail_startup_commit = Some(original.session.id);
     let failure = state::restore_orphaned_holders(&host).unwrap_err();
     assert!(failure.contains("original ownership"));
     let retained = same_original(&host, original);
     assert!(retained.startup_unresolved());
     assert!(host.lock().unwrap().startup_blocks_shutdown());
+    let retained_source = host.lock().unwrap().terminals[&original.session.id]
+        .session
+        .clone();
+    assert_eq!(retained_source.id, authenticated.source.id);
+    assert_eq!(retained_source.launch, authenticated.source.launch);
+    assert_eq!(
+        retained_source.continuity.live_proof(),
+        authenticated.source.continuity.live_proof()
+    );
+    assert!(retained_source.continuity.live_proof().is_some());
 
     // Exercise the real physical-worker/Host-metadata boundary: this existing
     // exact-owner API closes the failed-startup worker, while its independently
@@ -628,6 +645,39 @@ fn completed_failed_startup_metadata_waits_for_exact_host_close_before_retiremen
     wait_for(|| retained.is_completed());
     prove_foreign_reaped(&mut pins[0].0);
     prove_foreign_reaped(&mut pins[0].1);
+    // The real receipt admits only the captured issued source. A descriptor
+    // without proof or with a different proof cannot authorize its retirement.
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(
+            &retained_source,
+            &original.owner,
+            &current_proof,
+        )
+        .unwrap()
+    );
+    let mut proofless = retained_source.clone();
+    proofless.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: proofless.launch.clone(),
+        last_exit: None,
+    };
+    assert!(
+        crate::terminal::holder::cleanup::confirmed(&proofless, &original.owner, &current_proof,)
+            .is_err()
+    );
+    let mut wrong_source = retained_source.clone();
+    wrong_source.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: "unissued-startup-source".into(),
+        boot_id: current_proof.boot_id.clone(),
+        host_incarnation: current_proof.host_incarnation.clone(),
+    };
+    assert!(
+        !crate::terminal::holder::cleanup::confirmed(
+            &wrong_source,
+            &original.owner,
+            &current_proof,
+        )
+        .unwrap()
+    );
     let registry = {
         let mut state = host.lock().unwrap();
         assert!(!state.recovery_owns_work());
