@@ -27521,24 +27521,67 @@ mod tests {
     #[test]
     fn cached_continuation_press_cannot_move_to_a_replacement_account_choice() {
         use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::advanced::widget::Operation;
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-        use cosmic::iced::{Event, Point, Size, mouse};
+        use cosmic::iced::{Event, Rectangle, Size, mouse};
+        #[derive(Default)]
+        struct Controls {
+            warning: Option<Rectangle>,
+            action: Option<Rectangle>,
+        }
+        impl Operation for Controls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(
+                &mut self,
+                _: Option<&cosmic::iced::advanced::widget::Id>,
+                bounds: Rectangle,
+                text: &str,
+            ) {
+                if text.starts_with("Start a new conversation on ") {
+                    assert!(text.contains("history and provider cache will not carry over"));
+                    self.warning = Some(bounds);
+                } else if text == "Continue as new conversation" {
+                    self.action = Some(bounds);
+                }
+            }
+        }
         fn frame(
             runtime: &Runtime,
             cache: &mut Cache,
             renderer: &mut cosmic::Renderer,
+            held_cursor: &mut Option<iced::Point>,
             event: mouse::Event,
         ) -> Vec<Message> {
             let mut ui = UserInterface::build(
                 runtime.account_switch_controls(false).unwrap(),
-                Size::new(800.0, 100.0),
+                Size::new(280.0, 400.0),
                 std::mem::replace(cache, Cache::new()),
                 renderer,
+            );
+            let mut controls = Controls::default();
+            ui.operate(renderer, &mut controls);
+            let warning = controls.warning.expect("the rendered warning is visible");
+            let button = controls
+                .action
+                .expect("the rendered continuation action is visible");
+            assert!(warning.width <= 280.0 && button.width <= 280.0);
+            assert!(warning.y + warning.height <= button.y);
+            assert!(button.x >= 0.0 && button.x + button.width <= 280.0);
+            assert!(button.y + button.height <= 400.0);
+            if matches!(event, mouse::Event::ButtonPressed(mouse::Button::Left)) {
+                *held_cursor = Some(button.center());
+            }
+            let cursor = held_cursor.expect("a real preceding button press owns the cursor");
+            assert!(
+                button.contains(cursor),
+                "the old press still lands inside the new action"
             );
             let mut messages = Vec::new();
             ui.update(
                 &[Event::Mouse(event)],
-                mouse::Cursor::Available(Point::new(20.0, 20.0)),
+                mouse::Cursor::Available(cursor),
                 renderer,
                 &mut clipboard::Null,
                 &mut messages,
@@ -27552,25 +27595,40 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let mut cache = Cache::new();
+        let mut held_cursor = None;
         let mut renderer = crate::app::tests::headless_renderer();
         drop(app.choose_chat_account(target, first));
         account_switch_reply(&mut app, card, chat::Recovery::AccountSwitchUnavailable);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .account_switch_fallback
+            .as_mut()
+            .unwrap()
+            .1 = "LongUnbrokenSyntheticAccountName".repeat(12);
         assert!(
             frame(
                 chat_runtime(&app, card),
                 &mut cache,
                 &mut renderer,
+                &mut held_cursor,
                 mouse::Event::ButtonPressed(mouse::Button::Left)
             )
             .is_empty()
         );
         drop(app.choose_chat_account(target, second.clone()));
         account_switch_reply(&mut app, card, chat::Recovery::AccountSwitchUnavailable);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .account_switch_fallback
+            .as_mut()
+            .unwrap()
+            .1 = "LongUnbrokenSyntheticAccountName".repeat(12);
         assert!(
             frame(
                 chat_runtime(&app, card),
                 &mut cache,
                 &mut renderer,
+                &mut held_cursor,
                 mouse::Event::ButtonReleased(mouse::Button::Left)
             )
             .is_empty()
@@ -27581,6 +27639,7 @@ mod tests {
                 chat_runtime(&app, card),
                 &mut cache,
                 &mut renderer,
+                &mut held_cursor,
                 mouse::Event::ButtonPressed(mouse::Button::Left)
             )
             .is_empty()
@@ -27589,6 +27648,7 @@ mod tests {
             chat_runtime(&app, card),
             &mut cache,
             &mut renderer,
+            &mut held_cursor,
             mouse::Event::ButtonReleased(mouse::Button::Left),
         );
         assert!(

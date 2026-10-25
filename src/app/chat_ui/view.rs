@@ -3245,14 +3245,23 @@ impl Runtime {
                     "continue",
                     true,
                 ),
-                crate::ui_controls::button::secondary(format!(
-                    "Continue on {name} as a new conversation (history not transferred)"
-                ))
-                .on_press(action(Action::ContinueOnAccount(
-                    target,
-                    id.clone(),
-                    self.account_switch_choice,
-                ))),
+                widget::column::with_children(vec![
+                    design::caption(format!(
+                        "Start a new conversation on {name}. Conversation history and provider cache will not carry over."
+                    ))
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+                    crate::ui_controls::button::secondary("Continue as new conversation")
+                        .on_press(action(Action::ContinueOnAccount(
+                            target,
+                            id.clone(),
+                            self.account_switch_choice,
+                        )))
+                        .into(),
+                ])
+                .width(Length::Fill)
+                .spacing(space::XS),
             ))
         } else {
             None
