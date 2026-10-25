@@ -3,7 +3,10 @@
 //! This owner never waits for a receipt under Registry, HostState or control
 //! guards. Dropping it loses only a volatile waiter: the exact durable outbox
 //! entry remains eligible for replay after restart.
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     host::{
@@ -33,6 +36,7 @@ struct Pending {
 #[derive(Default)]
 pub(super) struct Transfer {
     pending: Option<Pending>,
+    retry_at: Option<Instant>,
 }
 
 impl Transfer {
@@ -43,6 +47,37 @@ impl Transfer {
     /// The caller treats failure as notification-only retry, allowing normal
     /// scheduler cleanup and deadlines to continue independently.
     pub(super) fn advance(
+        &mut self,
+        registry: &SharedRegistry,
+        notifications: &Handle,
+        event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
+    ) -> Result<Duration, String> {
+        self.advance_at(Instant::now(), registry, notifications, event)
+    }
+
+    fn advance_at(
+        &mut self,
+        now: Instant,
+        registry: &SharedRegistry,
+        notifications: &Handle,
+        event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
+    ) -> Result<Duration, String> {
+        if let Some(retry_at) = self.retry_at {
+            if now < retry_at {
+                return Ok(retry_at.duration_since(now));
+            }
+            self.retry_at = None;
+        }
+        let result = self.advance_ready(registry, notifications, event);
+        if result.is_err() {
+            // A running precheck can tick every250ms even when notification
+            // delivery requested5s. Persist backoff independently of tick's min.
+            self.retry_at = now.checked_add(RETRY);
+        }
+        result
+    }
+
+    fn advance_ready(
         &mut self,
         registry: &SharedRegistry,
         notifications: &Handle,
@@ -186,6 +221,7 @@ mod tests {
                     entry,
                     receipt: Receipt::Waiting(receiver),
                 }),
+                retry_at: None,
             },
             sender,
         )
@@ -353,6 +389,48 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("stopping"));
         assert!(transfer.pending.is_none());
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(1)
+                .unwrap(),
+            vec![entry]
+        );
+    }
+
+    #[test]
+    fn fast_precheck_ticks_cannot_bypass_notification_failure_backoff() {
+        let (_directory, registry, _automation, entry) = fixture();
+        let (notifications, _) = Handle::inert_for_test();
+        let mut transfer = Transfer::default();
+        let now = Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let failed = |_: &Registry, _: &Entry| {
+            calls.set(calls.get() + 1);
+            Err("synthetic notification construction failure".into())
+        };
+        assert!(
+            transfer
+                .advance_at(now, &registry, &notifications, failed)
+                .is_err()
+        );
+        for tick in 1..20 {
+            let elapsed = Duration::from_millis(tick * 250);
+            assert_eq!(
+                transfer
+                    .advance_at(now + elapsed, &registry, &notifications, failed)
+                    .unwrap(),
+                RETRY - elapsed
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(
+            transfer
+                .advance_at(now + RETRY, &registry, &notifications, failed)
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
         assert_eq!(
             registry
                 .lock()
