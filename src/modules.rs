@@ -24,6 +24,10 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+pub mod channel_work;
+pub mod channel_work_api;
+#[cfg(feature = "ui")]
+pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;
@@ -130,6 +134,8 @@ pub mod transcript_location;
 pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui_controls;
+#[cfg(feature = "ui")]
+pub mod ui_memory;
 pub mod update;
 pub mod upgrade;
 pub mod work;
