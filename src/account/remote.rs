@@ -197,7 +197,7 @@ fn execute_at(
                 })
             })?;
             let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, program) {
+            let recipe = match login_recipe_with_path(&account, program, search.as_deref()) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     return Err(format!(
@@ -375,9 +375,23 @@ fn execute_at(
 }
 
 #[cfg(feature = "host")]
+#[cfg(test)]
 fn login_recipe(
     account: &super::Account,
     program: std::path::PathBuf,
+) -> Result<crate::model::LaunchRecipe, String> {
+    login_recipe_with_path(
+        account,
+        program,
+        super::probe::current_search_path().as_deref(),
+    )
+}
+
+#[cfg(feature = "host")]
+fn login_recipe_with_path(
+    account: &super::Account,
+    program: std::path::PathBuf,
+    search_path: Option<&std::ffi::OsStr>,
 ) -> Result<crate::model::LaunchRecipe, String> {
     let mut environment = std::collections::BTreeMap::new();
     if let (Some(variable), Some(home)) = (
@@ -386,7 +400,7 @@ fn login_recipe(
     ) {
         environment.insert(variable.into(), home.display().to_string());
     }
-    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.to_str()) {
+    if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
     Ok(crate::model::LaunchRecipe {
@@ -582,5 +596,29 @@ mod tests {
             std::fs::read(linked.join("history")).unwrap(),
             b"keep linked history"
         );
+    }
+
+    #[test]
+    fn a_prepared_remote_login_uses_its_selected_path_snapshot() {
+        let selected = std::ffi::OsString::from("/old/node/bin:/old/cli/bin");
+        let recipe = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            Some(&selected),
+        )
+        .unwrap();
+        assert_eq!(recipe.program, "/old/cli/bin/codex");
+        assert_eq!(
+            recipe.environment.get("PATH").map(String::as_str),
+            selected.to_str()
+        );
+        assert_eq!(recipe.arguments, ["login", "--device-auth"]);
+        let no_path = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            None,
+        )
+        .unwrap();
+        assert!(!no_path.environment.contains_key("PATH"));
     }
 }
