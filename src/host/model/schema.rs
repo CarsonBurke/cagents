@@ -722,6 +722,11 @@ mod tests {
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
             (18, "DROP TABLE channel_work_placement_epochs;"),
+            (18, "DROP TABLE channel_work_placement_clock;"),
+            (
+                18,
+                "ALTER TABLE channel_work_placement_clock RENAME COLUMN last_epoch TO changed_epoch;",
+            ),
             (
                 18,
                 "ALTER TABLE channel_work_placement_epochs RENAME COLUMN epoch TO changed_epoch;",
@@ -1069,7 +1074,9 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
+        for step in [
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);

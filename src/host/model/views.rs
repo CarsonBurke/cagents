@@ -497,6 +497,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
             // Migration is additive, including old independent windows. Closed
@@ -567,7 +568,9 @@ pub(super) fn apply(
                             .revision
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
-                        write(transaction, &target)?;
+                        // Publish only after the source relinquishes its
+                        // active placement, inside this same transaction.
+                        deferred_target = Some(target);
                         transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
@@ -672,6 +675,9 @@ pub(super) fn apply(
             .checked_add(1)
             .ok_or("view revision exhausted")?;
         write(transaction, &view)?;
+    }
+    if let Some(target) = deferred_target {
+        write(transaction, &target)?;
     }
     Ok(changed || !existed)
 }
@@ -2165,6 +2171,25 @@ mod tests {
     #[test]
     fn terminal_retention_projection_tracks_view_changes_and_rolls_back_with_them() {
         use std::collections::BTreeSet;
+        fn placement_storage(registry: &Registry) -> (Vec<(String, i64)>, Vec<(i64, i64)>) {
+            let active = registry
+                .db
+                .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let clock = registry
+                .db
+                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            (active, clock)
+        }
         let (mut registry, directory, a, b) = setup();
         let original = live_source_pane();
         let terminal_id = |pane: &Pane| {
@@ -2198,6 +2223,7 @@ mod tests {
             },
         );
         let before = registry.model().unwrap();
+        let placement_before = placement_storage(&registry);
         registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention BEFORE UPDATE ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention projection failure'); END;").unwrap();
         assert!(
             registry
@@ -2206,6 +2232,11 @@ mod tests {
                 .contains("retention projection failure")
         );
         assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(
+            placement_storage(&registry),
+            placement_before,
+            "rejected pin publication must also roll back active epochs and the allocator"
+        );
         assert_eq!(
             registry.pinned_terminals(&candidates).unwrap(),
             BTreeSet::from([old])
@@ -2304,7 +2335,38 @@ mod tests {
                 before: None,
             },
         );
+        let before_transfer = registry.model().unwrap();
+        let placement_before_transfer = placement_storage(&registry);
+        registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention_transfer BEFORE INSERT ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention transfer failure'); END;").unwrap();
+        assert!(
+            registry
+                .apply(&transfer)
+                .unwrap_err()
+                .contains("retention transfer failure")
+        );
+        assert_eq!(registry.model().unwrap(), before_transfer);
+        assert_eq!(
+            placement_storage(&registry),
+            placement_before_transfer,
+            "source-first Transfer and its failed target pins must roll back together"
+        );
+        assert_eq!(
+            registry.pinned_terminals(&candidates).unwrap(),
+            BTreeSet::from([new])
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_retention_transfer;")
+            .unwrap();
         registry.apply(&transfer).unwrap();
+        let placement_after_transfer = placement_storage(&registry);
+        let next = placement_before_transfer.1[0].1 + 1;
+        assert_eq!(placement_after_transfer.1, vec![(1, next)]);
+        assert_eq!(
+            placement_after_transfer.0,
+            vec![(replacement.id.to_string(), next)],
+            "Transfer must leave one fresh active mapping, not a source tombstone"
+        );
         assert!(
             read(&registry.db, &Scope::Channel(a))
                 .unwrap()

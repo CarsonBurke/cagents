@@ -406,6 +406,14 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert_eq!(placement_before, vec![(pane.id.to_string(), 1)]);
+            let clock_before: Vec<(i64, i64)> = before
+                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(clock_before, vec![(1, 1)]);
             drop(before);
             let registry = Registry::at(&path).unwrap();
             assert_eq!(
@@ -425,7 +433,19 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 placement_after, placement_before,
-                "retention migration must preserve published placement epochs"
+                "retention migration must preserve published active placement epochs"
+            );
+            let clock_after: Vec<(i64, i64)> = registry
+                .db
+                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                clock_after, clock_before,
+                "retention migration must preserve the published global allocator"
             );
             assert_eq!(registry.model().unwrap().identity.to_string(), identity);
             let saved: String = registry

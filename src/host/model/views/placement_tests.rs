@@ -6,6 +6,26 @@ mod placement_hooks {
         channel_work::placement::token(&registry.db, id).unwrap()
     }
 
+    fn placement_storage(registry: &Registry) -> (Vec<(String, i64)>, Vec<(i64, i64)>) {
+        let active = registry
+            .db
+            .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let clock = registry
+            .db
+            .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (active, clock)
+    }
+
     #[test]
     fn canonical_edits_preserve_presentation_tokens_but_retire_transfer_and_reinsert_aba() {
         let (mut registry, _directory, a, b) = setup();
@@ -83,11 +103,10 @@ mod placement_hooks {
 
         let remove = edit(&mut registry, a, Change::Remove { id: original.id });
         registry.apply(&remove).unwrap();
-        let removed = token(&registry, original.id);
-        assert_ne!(removed, returned);
+        assert!(channel_work::placement::token(&registry.db, original.id).is_err());
         assert!(owner(&registry.db, original.id).unwrap().is_none());
-        // This fresh target has no retired marker for this ID. Its retained epoch
-        // still prevents a reinserted exact descriptor from reviving a token.
+        // No retired map row remains. The durable allocator still gives this
+        // exact reinserted descriptor a fresh stamp in a new target.
         registry
             .apply(&ModelEdit::SeedView {
                 scope: Scope::Worktree {
@@ -98,7 +117,7 @@ mod placement_hooks {
                 closed: vec![],
             })
             .unwrap();
-        assert_ne!(token(&registry, original.id), removed);
+        assert!(token(&registry, original.id) > returned);
         assert_ne!(token(&registry, original.id), first);
     }
 
@@ -173,7 +192,7 @@ mod placement_hooks {
     }
 
     #[test]
-    fn channel_and_project_cascades_retire_actor_and_worktree_epochs_without_deleting_tombstones() {
+    fn channel_and_project_cascades_remove_active_epochs_and_preserve_the_allocator() {
         let (mut registry, _directory, a, b) = setup();
         let channel_actor = live_source_pane();
         let other_actor = live_source_pane();
@@ -196,23 +215,166 @@ mod placement_hooks {
         let worktree_before = token(&registry, worktree_actor.id);
         registry.apply(&ModelEdit::DeleteChannel { id: a }).unwrap();
         assert!(owner(&registry.db, channel_actor.id).unwrap().is_none());
-        assert_ne!(token(&registry, channel_actor.id), channel_before);
+        assert!(channel_work::placement::token(&registry.db, channel_actor.id).is_err());
         assert_eq!(token(&registry, other_actor.id), other_before);
         assert_eq!(token(&registry, worktree_actor.id), worktree_before);
-        let channel_tombstone = token(&registry, channel_actor.id);
+        assert!(channel_before > 0);
         registry
             .apply(&ModelEdit::CloseProject {
                 repository: "/repo".into(),
             })
             .unwrap();
         assert!(all(&registry.db).unwrap().is_empty());
-        assert_eq!(token(&registry, channel_actor.id), channel_tombstone);
-        assert_ne!(token(&registry, other_actor.id), other_before);
-        assert_ne!(token(&registry, worktree_actor.id), worktree_before);
+
         for id in [channel_actor.id, other_actor.id, worktree_actor.id] {
             assert!(owner(&registry.db, id).unwrap().is_none());
-            assert!(channel_work::placement::token(&registry.db, id).is_ok());
+            assert!(channel_work::placement::token(&registry.db, id).is_err());
         }
+        let (active, clock) = placement_storage(&registry);
+        assert!(active.is_empty());
+        assert_eq!(clock.len(), 1);
+        assert_eq!(clock[0].0, 1);
+        assert!(clock[0].1 >= other_before.max(worktree_before) as i64);
+    }
+
+    #[test]
+    fn publication_failures_roll_back_transfer_agent_index_ledger_and_allocator() {
+        use crate::agent_execution::{Destination, Origin, Spec, Submit, Surface, Target};
+        let (mut registry, _directory, a, b) = setup();
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: Some("Fixture worker".into()),
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Codex,
+                        account: None,
+                        target: Target {
+                            repository: "/repo".into(),
+                            directory: "/repo".into(),
+                            placement: Some(Scope::Channel(a)),
+                        },
+                        surface: Surface::Terminal,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Fixture only; never dispatched".into(),
+                    idempotency_key: "placement-transfer-rollback".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let mut original = live_source_pane();
+        original.id = CardId::from_uuid(accepted.agent.id.as_uuid());
+        let CardKind::Terminal(session) = &original.kind else {
+            panic!()
+        };
+        registry
+            .bind_agent(
+                accepted.agent.id,
+                None,
+                HostedSession::Terminal(session.clone()),
+            )
+            .unwrap();
+        seed(&mut registry, a, vec![original.clone()]);
+        seed(&mut registry, b, vec![]);
+        let source = Scope::Channel(a);
+        let target = Scope::Channel(b);
+        let source_before = read(&registry.db, &source).unwrap();
+        let target_before = read(&registry.db, &target).unwrap();
+        let model_before = registry.model().unwrap();
+        let agent_before = registry.agent(accepted.agent.id).unwrap();
+        let storage_before = placement_storage(&registry);
+        let captured = token(&registry, original.id);
+        let transfer = edit(
+            &mut registry,
+            a,
+            Change::Transfer {
+                id: original.id,
+                destination: target.clone(),
+                before: None,
+            },
+        );
+        let ModelEdit::ChangeView { operation, .. } = &transfer else {
+            panic!()
+        };
+        assert!(!operation_seen(&registry.db, *operation).unwrap());
+        // TEMP keeps the published main schema unchanged. Both failures occur
+        // after agent/index/ledger work. The target's distinct error also proves
+        // the real source view was empty before its prepared target was written.
+        for fail_source in [true, false] {
+            let (scope, expected, failure) = if fail_source {
+                (
+                    &source,
+                    "fixture source publication failure",
+                    "SELECT RAISE(ABORT,'fixture source publication failure');".to_owned(),
+                )
+            } else {
+                (&target, "fixture target publication failure", format!(
+                    "SELECT CASE WHEN EXISTS(SELECT 1 FROM main.shared_views WHERE scope='{}' AND json_array_length(panes)>0)
+                     THEN RAISE(ABORT,'fixture target preceded source')
+                     ELSE RAISE(ABORT,'fixture target publication failure') END;", key(&source).unwrap()))
+            };
+            registry
+                .db
+                .execute_batch(&format!(
+                "CREATE TEMP TRIGGER reject_fixture_publication BEFORE INSERT ON main.shared_views
+                 WHEN NEW.scope='{}' BEGIN {failure} END;", key(scope).unwrap(),
+            ))
+                .unwrap();
+            assert!(registry.apply(&transfer).unwrap_err().contains(expected));
+            assert_eq!(read(&registry.db, &source).unwrap(), source_before);
+            assert_eq!(read(&registry.db, &target).unwrap(), target_before);
+            assert_eq!(registry.model().unwrap(), model_before);
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent_before);
+            assert_eq!(
+                owner(&registry.db, original.id).unwrap(),
+                Some(source.clone())
+            );
+            assert_eq!(placement_storage(&registry), storage_before);
+            assert_eq!(token(&registry, original.id), captured);
+            assert!(!operation_seen(&registry.db, *operation).unwrap());
+            registry
+                .db
+                .execute_batch("DROP TRIGGER temp.reject_fixture_publication;")
+                .unwrap();
+        }
+        registry.apply(&transfer).unwrap();
+        assert!(operation_seen(&registry.db, *operation).unwrap());
+        assert!(read(&registry.db, &source).unwrap().panes.is_empty());
+        assert_eq!(
+            read(&registry.db, &target).unwrap().panes,
+            [original.clone()]
+        );
+        assert_eq!(
+            owner(&registry.db, original.id).unwrap(),
+            Some(target.clone())
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, target);
+        let moved = token(&registry, original.id);
+        assert!(moved > captured);
+        let back = edit(
+            &mut registry,
+            b,
+            Change::Transfer {
+                id: original.id,
+                destination: source.clone(),
+                before: None,
+            },
+        );
+        registry.apply(&back).unwrap();
+        assert_eq!(
+            read(&registry.db, &source).unwrap().panes,
+            [original.clone()]
+        );
+        assert_eq!(
+            owner(&registry.db, original.id).unwrap(),
+            Some(source.clone())
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, source);
+        assert!(token(&registry, original.id) > moved);
+        assert_ne!(token(&registry, original.id), captured);
     }
 
     #[test]
