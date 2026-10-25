@@ -1,6 +1,8 @@
 //! Daemon-owned automation coordination. Process execution and clock planning
 //! stay outside HostState and SQLite transactions.
 
+mod notification_event;
+mod notifications;
 pub(super) mod precheck;
 pub(super) use crate::automations::schedule;
 pub(super) mod service;
