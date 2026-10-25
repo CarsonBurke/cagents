@@ -177,7 +177,12 @@ use crate::{
 /// executables must be replaced together; JSON omission alone is compatible.
 /// Version 110 bounds channel-work projections with independent current/history
 /// cursors and adds exact-target and metadata-only home reads for safe recovery.
-pub const PROTOCOL_VERSION: u16 = 110;
+/// Version 115 appends an explicit recoverable input notice. Older clients
+/// cannot decode this unsolicited event, so all three executables must match.
+/// Version 116 combines channel-work requests/responses with recoverable input
+/// notices. Neither predecessor identifies this combined matched executable set.
+/// This private candidate slot is provisional pending shared ABI coordination.
+pub const PROTOCOL_VERSION: u16 = 116;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -1554,6 +1559,10 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    InputNotice {
+        operation: String,
+        message: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
@@ -1591,6 +1600,10 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 Self::AgentActivityChanged { activity }
             }
             TerminalEvent::Bell => Self::Bell,
+            TerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: operation.to_owned(),
+                message,
+            },
             TerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1600,7 +1613,11 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 signal,
                 intentional,
             },
-            TerminalEvent::Error { operation, message } => Self::Error {
+            // InputRejected is client-local. If serialized by a future caller,
+            // preserve the conservative existing wire Error semantics; a bare
+            // wire event must never issue trusted nonfatal admission evidence.
+            TerminalEvent::Error { operation, message }
+            | TerminalEvent::InputRejected { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
             },
@@ -1647,6 +1664,19 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 Self::AgentActivityChanged(activity)
             }
             WireTerminalEvent::Bell => Self::Bell,
+            WireTerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: match operation.as_str() {
+                    "cancel terminal input" => "cancel terminal input",
+                    "write terminal input" => "write terminal input",
+                    "write encoded key" => "write encoded key",
+                    "write terminal paste" => "write terminal paste",
+                    "write encoded mouse event" => "write encoded mouse event",
+                    "write terminal response" => "write terminal response",
+                    "interrupt terminal" => "interrupt terminal",
+                    _ => "terminal input",
+                },
+                message,
+            },
             WireTerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -2096,6 +2126,37 @@ mod tests {
             );
         }
         assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn recoverable_input_notice_does_not_reclassify_error_or_admission_evidence() {
+        let message = "Previously delivered input was preserved; unsent input was canceled.";
+        let notice = TerminalEvent::InputNotice {
+            operation: "cancel terminal input",
+            message: message.into(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &WireTerminalEvent::from(notice.clone())).unwrap();
+        let received = read_frame::<WireTerminalEvent>(&mut Cursor::new(bytes))
+            .unwrap()
+            .unwrap();
+        assert_eq!(TerminalEvent::from(received), notice);
+
+        // An old or genuine failure with identical text is still a failure.
+        // Only the explicit event variant carries recoverable semantics.
+        let error = TerminalEvent::from(WireTerminalEvent::Error {
+            operation: "cancel terminal input".into(),
+            message: message.into(),
+        });
+        assert!(matches!(error, TerminalEvent::Error { .. }));
+        assert!(matches!(
+            WireTerminalEvent::from(TerminalEvent::InputRejected {
+                operation: "write terminal input",
+                message: "local correlated refusal".into(),
+            }),
+            WireTerminalEvent::Error { .. }
+        ));
+        assert!(PROTOCOL_VERSION > 105);
     }
 
     #[test]
