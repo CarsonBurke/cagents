@@ -70,6 +70,13 @@ pub enum Action {
     Status(u64),
     Verify(u64),
     Check(u64),
+    Load(u64),
+    Resume {
+        owner: u64,
+        discovery: u64,
+        operation: Uuid,
+    },
+    New(u64),
     Finished {
         sequence: u64,
         result: Result<Response, Failure>,
@@ -90,7 +97,10 @@ impl Action {
             | Self::Prepare(n)
             | Self::Status(n)
             | Self::Verify(n)
-            | Self::Check(n) => Some(*n),
+            | Self::Check(n)
+            | Self::Load(n)
+            | Self::New(n) => Some(*n),
+            Self::Resume { owner, .. } => Some(*owner),
         }
     }
     pub(super) fn blocked_while_modal(&self) -> bool {
@@ -104,6 +114,7 @@ pub struct Response {
 }
 #[derive(Debug, Clone)]
 enum RequestKind {
+    List,
     Inspect(PathBuf),
     Prepare(ImportPlan, Target),
     Status(ImportPlan),
@@ -130,6 +141,9 @@ pub(super) struct State {
     inspection: Option<(Target, ImportInspection)>,
     plan: Option<ImportPlan>,
     status: Option<ImportStatus>,
+    retained: Vec<ImportStatus>,
+    discovery: u64,
+    local_uncertain: bool,
     pending: Option<Request>,
     problem: Option<&'static str>,
 }
@@ -142,6 +156,31 @@ impl State {
     }
     fn editable(&self) -> bool {
         self.plan.is_none() && self.pending.is_none()
+    }
+    fn can_new(&self) -> bool {
+        self.pending.is_none()
+            && !self.local_uncertain
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.stage == ImportStage::Registered && !status.uncertain)
+    }
+    fn can_resume(&self, status: &ImportStatus) -> bool {
+        self.pending.is_none()
+            && (self.plan.is_none()
+                || self.can_new()
+                || self.plan.as_ref().is_some_and(|plan| {
+                    plan == &status.plan
+                        && self
+                            .status
+                            .as_ref()
+                            .and_then(|old| old.receipt.as_ref())
+                            .is_none_or(|old| status.receipt.as_ref() == Some(old))
+                }))
+    }
+    fn rotate_owner(&mut self) {
+        self.next = self.next.saturating_add(1);
+        self.owner = self.next;
     }
     fn registered_account(&self, accounts: &super::State) -> Option<AccountId> {
         let status = self.status.as_ref()?;
@@ -181,6 +220,21 @@ impl State {
         self.pending = None;
         match result {
             Ok(response) if response.target.profile == profile => match (&kind, response.reply) {
+                (RequestKind::List, ImportReply::Listed(statuses))
+                    if valid_list(&statuses, &response.target.proof) =>
+                {
+                    self.retained = statuses;
+                    self.discovery = sequence;
+                    self.problem = if self.plan.as_ref().is_some_and(|plan| {
+                        !self.retained.iter().any(|status| &status.plan == plan)
+                    }) {
+                        Some(
+                            "The list did not confirm your local operation. Preserve its UUID and use Status; do not prepare it again.",
+                        )
+                    } else {
+                        None
+                    };
+                }
                 (RequestKind::Inspect(_), ImportReply::Inspected(inspection))
                     if inspection.destination == response.target.proof
                         && inspection.observation.validate().is_ok() =>
@@ -194,12 +248,18 @@ impl State {
                     | RequestKind::Verify(plan),
                     ImportReply::Status(status),
                 ) if valid_status(&status, plan, &response.target.proof, self.status.as_ref()) => {
+                    self.local_uncertain = status.uncertain;
                     self.status = Some(status);
                     self.problem = None;
                 }
                 _ => self.problem = Some(Failure::Invalid.description()),
             },
             Ok(_) => self.problem = Some(Failure::Changed.description()),
+            Err(Failure::Unavailable) if matches!(kind, RequestKind::List) => {
+                self.problem = Some(
+                    "Retained imports could not be loaded. Existing local operation custody is unchanged.",
+                );
+            }
             Err(Failure::Unavailable) if self.plan.is_none() => {
                 self.problem = Some(
                     "Inspection did not return a result. Inspect again explicitly; no import was prepared.",
@@ -214,8 +274,7 @@ impl State {
             return None;
         }
         if matches!(action, Action::Open) {
-            self.next = self.next.saturating_add(1);
-            self.owner = self.next;
+            self.rotate_owner();
             self.visible = true;
             self.profile.get_or_insert(profile);
             return None;
@@ -232,6 +291,59 @@ impl State {
             return None;
         }
         if self.pending.is_some() {
+            return None;
+        }
+        if matches!(action, Action::New(_)) {
+            if self.can_new() {
+                self.path.clear();
+                self.email.clear();
+                self.copy = false;
+                self.session = false;
+                self.write = false;
+                self.network = false;
+                self.inspection = None;
+                self.plan = None;
+                self.status = None;
+                self.problem = None;
+                self.local_uncertain = false;
+                self.rotate_owner();
+            }
+            return None;
+        }
+        if let Action::Resume {
+            discovery,
+            operation,
+            ..
+        } = action
+        {
+            if discovery == self.discovery
+                && let Some(status) = self
+                    .retained
+                    .iter()
+                    .find(|status| status.plan.operation == operation)
+                    .cloned()
+                && self.can_resume(&status)
+            {
+                self.path = status
+                    .plan
+                    .observation
+                    .path()
+                    .to_string_lossy()
+                    .into_owned();
+                self.email = status.plan.expected_email.clone();
+                self.copy = status.plan.consent.staged_file_only;
+                self.session = status.plan.consent.source_session_limit_acknowledged;
+                (self.write, self.network) = match status.plan.profile {
+                    CodingProfile::Unconfigured => (false, false),
+                    CodingProfile::WorkspaceWrite { network_access } => (true, network_access),
+                };
+                self.inspection = None;
+                self.plan = Some(status.plan.clone());
+                self.local_uncertain = status.uncertain;
+                self.status = Some(status);
+                self.problem = None;
+                self.rotate_owner();
+            }
             return None;
         }
         if self.editable() {
@@ -255,6 +367,7 @@ impl State {
             }
         }
         let kind = match action {
+            Action::Load(_) => RequestKind::List,
             Action::Inspect(_)
                 if self.editable()
                     && !self.path.trim().is_empty()
@@ -289,6 +402,7 @@ impl State {
                 let kind = RequestKind::Prepare(plan.clone(), target.clone());
                 // Retain before dispatch, even if the reply is lost or Close is next.
                 self.plan = Some(plan);
+                self.local_uncertain = true;
                 kind
             }
             Action::Status(_) if self.plan.is_some() => {
@@ -304,6 +418,7 @@ impl State {
                             && status.publication == ImportPublication::Present)
                     }) =>
             {
+                self.local_uncertain = true;
                 RequestKind::Verify(self.plan.clone().unwrap())
             }
             _ => return None,
@@ -332,7 +447,6 @@ fn valid_status(
         && previous.and_then(|old| old.receipt.as_ref()).is_none_or(|old| status.receipt.as_ref() == Some(old))
         && (status.stage == ImportStage::Reserved || status.receipt.is_some())
         && status.registered.as_ref().is_none_or(|account| status.stage == ImportStage::Registered && account == &id)
-        && (status.stage != ImportStage::Registered || status.registered.as_ref() == Some(&id))
         && status.coding_profile.as_ref().is_none_or(|report| {
             status.registered.as_ref() == Some(&report.account) && report.host == *proof
                 && status.receipt.as_ref().is_some_and(|receipt| {
@@ -340,8 +454,18 @@ fn valid_status(
                 }) && matches!(plan.profile, CodingProfile::WorkspaceWrite { network_access } if network_access == report.network_access)
         })
 }
+fn valid_list(statuses: &[ImportStatus], proof: &HostSessionProof) -> bool {
+    let mut operations = std::collections::HashSet::new();
+    statuses.len() <= 16
+        && statuses.iter().all(|status| {
+            operations.insert(status.plan.operation)
+                && status.plan.validate().is_ok()
+                && valid_status(status, &status.plan, proof, None)
+        })
+}
 fn wire_operation(request: &Request, proof: &HostSessionProof) -> Result<ImportOperation, Failure> {
     Ok(match &request.kind {
+        RequestKind::List => ImportOperation::List,
         RequestKind::Inspect(path) => ImportOperation::Inspect { path: path.clone() },
         RequestKind::Prepare(plan, target) => {
             if *proof != target.proof
@@ -542,6 +666,21 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
         .spacing(space::S)
         .into(),
     );
+    fields.push(
+        crate::ui_controls::button::secondary("Load retained imports")
+            .on_press_maybe(
+                state
+                    .pending
+                    .is_none()
+                    .then_some(message(Action::Load(owner))),
+            )
+            .into(),
+    );
+    fields.push(
+        crate::ui_controls::button::secondary("New import")
+            .on_press_maybe(state.can_new().then_some(message(Action::New(owner))))
+            .into(),
+    );
     let mut results: Vec<Element<'_, Message>> = vec![];
     if state.pending.is_some() {
         results.push(design::caption("Request in progress. Close only dismisses this form; it does not cancel an accepted import.").wrapping(iced::widget::text::Wrapping::Word).into());
@@ -568,6 +707,9 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
                     "Private home prepared; inspect publication before proceeding"
                 }
                 ImportStage::Published => "Cache published; identity not registered",
+                ImportStage::Registered if status.registered.is_none() => {
+                    "Historical registration; the current account is unavailable"
+                }
                 ImportStage::Registered => "Account registered; execution access not verified",
             })
             .into(),
@@ -612,6 +754,53 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
         }
     } else if state.inspection.is_some() {
         results.push(design::caption("File metadata inspected. Prepare copies it once; Verify identity is a separate provider request.").wrapping(iced::widget::text::Wrapping::Word).into());
+    }
+    if state.discovery != 0 && state.retained.is_empty() {
+        results.push(design::caption("No retained records were returned. Any unconfirmed local operation remains preserved.").wrapping(iced::widget::text::Wrapping::Word).into());
+    }
+    if !state.retained.is_empty() {
+        results.push(design::heading("Retained imports").into());
+        results.push(design::caption("All retained records count toward the 16-operation limit, including completed imports. Loading and resuming do not copy a file or contact the provider.").wrapping(iced::widget::text::Wrapping::Word).into());
+        for retained in &state.retained {
+            let operation = retained.plan.operation;
+            let stage = match retained.stage {
+                ImportStage::Reserved => "Intent retained",
+                ImportStage::Prepared => "Prepared",
+                ImportStage::Published => "Published",
+                ImportStage::Registered => "Historical registration",
+            };
+            let row =
+                widget::column::with_children(vec![
+                    design::body(format!(
+                        "{} · {stage}{}",
+                        retained.plan.expected_email,
+                        if retained.uncertain {
+                            " · acknowledgement uncertain"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+                    design::caption(operation.to_string())
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                    crate::ui_controls::button::secondary("Resume import")
+                        .on_press_maybe(state.can_resume(retained).then_some(message(
+                            Action::Resume {
+                                owner,
+                                discovery: state.discovery,
+                                operation,
+                            },
+                        )))
+                        .into(),
+                ])
+                .spacing(space::XS);
+            results.push(crate::ui_controls::owned(
+                (owner, state.discovery, operation),
+                row,
+            ));
+        }
     }
     Some(
         crate::ui_controls::owned(

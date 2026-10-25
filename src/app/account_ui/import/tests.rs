@@ -553,3 +553,282 @@ fn held_prepare_press_cannot_migrate_to_a_reopened_import_form() {
     }
     assert!(app.account_ui.import.plan.is_some());
 }
+
+#[test]
+fn retained_list_resumes_an_original_plan_after_restart_and_verify_uses_the_fresh_proof() {
+    let (original, _) = prepared();
+    let plan = original.plan.clone().unwrap();
+    let mut retained = status(&plan, ImportStage::Published);
+    retained.observed_destination = proof("restarted-daemon");
+    let mut response_target = target();
+    response_target.proof = retained.observed_destination.clone();
+    let mut state = State::default();
+    assert!(act(&mut state, Action::Open).is_none());
+    assert!(
+        state.pending.is_none(),
+        "Open never contacts a provider or automatically resumes a mutation"
+    );
+    let owner = state.owner;
+    let load = act(&mut state, Action::Load(owner)).unwrap();
+    assert_eq!(
+        wire_operation(&load, &proof("restarted-daemon")).unwrap(),
+        ImportOperation::List
+    );
+    assert!(
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: load.sequence,
+                result: Ok(Response {
+                    target: response_target.clone(),
+                    reply: ImportReply::Listed(vec![retained.clone()])
+                })
+            }
+        )
+        .is_none()
+    );
+    assert!(
+        state.plan.is_none() && state.pending.is_none(),
+        "discovery does not choose or dispatch an operation"
+    );
+    let discovery = state.discovery;
+    assert!(
+        act(
+            &mut state,
+            Action::Resume {
+                owner,
+                discovery: discovery + 1,
+                operation: plan.operation
+            }
+        )
+        .is_none()
+    );
+    assert!(state.plan.is_none());
+    let mut mounted = context_inspector_test_app(false);
+    mounted.account_ui.import = state;
+    let callbacks = click(view(&mounted).unwrap(), "Resume import");
+    assert!(
+        matches!(callbacks.as_slice(), [Message::AccountUi(super::super::Action::Import(Action::Resume {owner: actual_owner, discovery: actual_discovery, operation}))] if *actual_owner == owner && *actual_discovery == discovery && *operation == plan.operation)
+    );
+    for callback in callbacks {
+        let Message::AccountUi(super::super::Action::Import(action)) = callback else {
+            panic!("unexpected callback")
+        };
+        assert!(act(&mut mounted.account_ui.import, action).is_none());
+    }
+    let mut state = std::mem::take(&mut mounted.account_ui.import);
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    assert_eq!(state.status.as_ref(), Some(&retained));
+    assert!(state.pending.is_none());
+    let resumed_owner = state.owner;
+    assert_ne!(owner, resumed_owner);
+    assert!(
+        act(&mut state, Action::Prepare(resumed_owner)).is_none(),
+        "restored plans cannot seed another cache"
+    );
+    assert!(
+        act(&mut state, Action::Verify(owner)).is_none(),
+        "old rendered callbacks cannot verify a resumed form"
+    );
+    let verify = act(&mut state, Action::Verify(resumed_owner)).unwrap();
+    assert_eq!(
+        wire_operation(&verify, &proof("next-fresh-connection")).unwrap(),
+        ImportOperation::Verify {
+            operation: plan.operation,
+            destination: proof("next-fresh-connection")
+        }
+    );
+    assert_eq!(state.plan.as_ref().unwrap().destination, proof("initial"));
+    // A legitimate historical Registered record may outlive its account row.
+    let mut historical = status(&plan, ImportStage::Registered);
+    historical.registered = None;
+    historical.observed_destination = response_target.proof.clone();
+    let mut app = context_inspector_test_app(false);
+    assert!(valid_status(
+        &historical,
+        &plan,
+        &response_target.proof,
+        None
+    ));
+    app.account_ui.import.plan = Some(plan);
+    app.account_ui.import.status = Some(historical);
+    assert!(
+        app.account_ui
+            .import
+            .registered_account(&app.account_ui)
+            .is_none()
+    );
+}
+
+#[test]
+fn retained_discovery_is_bounded_and_cannot_drop_or_replace_an_unacknowledged_local_operation() {
+    let (mut state, prepare) = prepared();
+    let plan = state.plan.clone().unwrap();
+    let owner = state.owner;
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: prepare.sequence,
+            result: Err(Failure::Unavailable),
+        },
+    );
+    let load = act(&mut state, Action::Load(owner)).unwrap();
+    assert!(
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: load.sequence,
+                result: Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Listed(vec![])
+                })
+            }
+        )
+        .is_none()
+    );
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    assert!(state.local_uncertain && state.status.is_none());
+    assert!(
+        state
+            .problem
+            .unwrap()
+            .contains("did not confirm your local operation")
+    );
+    let mut other = status(&plan, ImportStage::Published);
+    other.plan.operation = Uuid::from_u128(701);
+    other.receipt.as_mut().unwrap().operation = other.plan.operation;
+    let load = act(&mut state, Action::Load(owner)).unwrap();
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: load.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Listed(vec![other.clone()]),
+            }),
+        },
+    );
+    let discovery = state.discovery;
+    assert!(
+        act(
+            &mut state,
+            Action::Resume {
+                owner,
+                discovery,
+                operation: other.plan.operation
+            }
+        )
+        .is_none()
+    );
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    assert!(act(&mut state, Action::New(owner)).is_none());
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    assert!(!state.can_new());
+    let retained = state.retained.clone();
+    for listed in [
+        vec![other.clone(), other.clone()],
+        (1..=17)
+            .map(|n| {
+                let mut row = other.clone();
+                row.plan.operation = Uuid::from_u128(800 + n);
+                row.receipt.as_mut().unwrap().operation = row.plan.operation;
+                row
+            })
+            .collect(),
+    ] {
+        let load = act(&mut state, Action::Load(owner)).unwrap();
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: load.sequence,
+                result: Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Listed(listed),
+                }),
+            },
+        );
+        assert_eq!(
+            state.retained, retained,
+            "ambiguous or oversized discovery must preserve the previous list"
+        );
+        assert_eq!(state.plan.as_ref(), Some(&plan));
+    }
+    let read = act(&mut state, Action::Status(owner)).unwrap();
+    assert_eq!(
+        wire_operation(&read, &proof("fresh")).unwrap(),
+        ImportOperation::Status {
+            operation: plan.operation
+        }
+    );
+}
+
+#[test]
+fn new_import_requires_acknowledged_registration_and_retires_the_old_form_owner() {
+    let (mut state, prepare) = prepared();
+    let plan = state.plan.clone().unwrap();
+    let owner = state.owner;
+    assert!(act(&mut state, Action::New(owner)).is_none());
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: prepare.sequence,
+            result: Err(Failure::Unavailable),
+        },
+    );
+    assert!(act(&mut state, Action::New(owner)).is_none());
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    let request = act(&mut state, Action::Status(owner)).unwrap();
+    let mut uncertain = status(&plan, ImportStage::Registered);
+    uncertain.uncertain = true;
+    finish(&mut state, &request, uncertain);
+    assert!(!state.can_new());
+    assert!(act(&mut state, Action::New(owner)).is_none());
+    assert_eq!(state.plan.as_ref(), Some(&plan));
+    let request = act(&mut state, Action::Status(owner)).unwrap();
+    let historical = status(&plan, ImportStage::Registered);
+    finish(&mut state, &request, historical.clone());
+    assert!(state.can_new());
+    // The durable original remains available in discovery, without deletion,
+    // expiration or pretending that completion frees one of the 16 slots.
+    state.retained = vec![historical.clone()];
+    let mut mounted = context_inspector_test_app(false);
+    mounted.account_ui.import = state;
+    let callbacks = click(view(&mounted).unwrap(), "New import");
+    assert!(
+        matches!(callbacks.as_slice(), [Message::AccountUi(super::super::Action::Import(Action::New(actual)))] if *actual == owner)
+    );
+    for callback in callbacks {
+        let Message::AccountUi(super::super::Action::Import(action)) = callback else {
+            panic!("unexpected callback")
+        };
+        assert!(act(&mut mounted.account_ui.import, action).is_none());
+    }
+    let mut state = std::mem::take(&mut mounted.account_ui.import);
+    assert!(state.plan.is_none() && state.status.is_none() && state.pending.is_none());
+    assert!(
+        state.path.is_empty()
+            && state.email.is_empty()
+            && !state.copy
+            && !state.session
+            && !state.network
+            && !state.write
+    );
+    assert_ne!(state.owner, owner);
+    assert_eq!(state.retained, vec![historical]);
+    assert!(
+        act(
+            &mut state,
+            Action::Path(owner, "/old-callback/auth.json".into())
+        )
+        .is_none()
+    );
+    assert!(state.path.is_empty());
+    let current = state.owner;
+    assert!(act(&mut state, Action::Path(current, "/new/auth.json".into())).is_none());
+    assert_eq!(state.path, "/new/auth.json");
+    assert!(
+        state.plan.is_none(),
+        "New and editing do not mint an operation UUID"
+    );
+}
