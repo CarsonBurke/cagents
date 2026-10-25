@@ -88,6 +88,16 @@ fn diagnostic_key(text: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
 }
 
+// Shared by the actual bounded preview widget and its transcript catalog.
+// The incident key already includes scope/cause; raw diagnostics never enter
+// this identity or the collapsed selection catalog.
+pub(super) fn diagnostic_preview_identity(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    ("failure-diagnostic-preview", key).hash(&mut hash);
+    hash.finish()
+}
+
 impl State {
     fn metadata(
         provider: Provider,
@@ -776,11 +786,16 @@ impl Runtime {
             if let Some((preview, omitted)) = self.failure_preview(&incident.key) {
                 rows.push(
                     widget::container(
-                        widget::scrollable(selectable_prose::plain(
-                            preview.to_owned(),
-                            design::TEXT_CAPTION,
+                        widget::scrollable(selectable_prose::logical_text(
+                            vec![iced::widget::text::Span::new(preview.to_owned())].into(),
+                            design::TEXT_CAPTION.into(),
                             iced::Font::MONOSPACE,
                             target,
+                            None,
+                            selectable_prose::Logical {
+                                identity: diagnostic_preview_identity(&incident.key),
+                                start: 0,
+                            },
                         ))
                         .direction(iced::widget::scrollable::Direction::Vertical(
                             design::scrollbar(),

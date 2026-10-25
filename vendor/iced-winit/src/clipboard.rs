@@ -184,6 +184,29 @@ impl Clipboard {
 
     /// Reads the current content of the [`Clipboard`] as text.
     pub fn read(&self, kind: Kind) -> Option<String> {
+        #[cfg(all(
+            feature = "x11",
+            unix,
+            not(any(
+                target_family = "wasm",
+                target_os = "redox",
+                target_os = "android",
+                target_vendor = "apple"
+            ))
+        ))]
+        if let State::Connected {
+            x11_reader: Some(reader),
+            ..
+        } = &self.state
+        {
+            return match reader.read_text(kind) {
+                Ok(text) => text,
+                Err(error) => {
+                    log::warn!("Could not read X11 clipboard text: {error}");
+                    None
+                }
+            };
+        }
         match &self.state {
             State::Connected { clipboard, .. } => match kind {
                 Kind::Standard => clipboard.read().ok(),
@@ -402,15 +425,7 @@ impl Clipboard {
 
 impl crate::core::Clipboard for Clipboard {
     fn read(&self, kind: Kind) -> Option<String> {
-        match (&self.state, kind) {
-            (State::Connected { clipboard, .. }, Kind::Standard) => {
-                clipboard.read().ok()
-            }
-            (State::Connected { clipboard, .. }, Kind::Primary) => {
-                clipboard.read_primary().and_then(|res| res.ok())
-            }
-            (State::Unavailable, _) => None,
-        }
+        Clipboard::read(self, kind)
     }
 
     fn write(&mut self, kind: Kind, contents: String) {

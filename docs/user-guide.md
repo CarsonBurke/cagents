@@ -408,6 +408,43 @@ a proven **NotCreated** outcome permits a fresh attempt; **OutcomeUnknown**
 requires manual inspection. The Git ownership lock is held through the durable
 Created commit, and a failure to release it is reported rather than hidden.
 
+## Channel work
+
+Open a channel and choose **Work** beside **Conversations** to see the PRs
+tracked in that channel. Return to **Conversations** to use its terminals and
+chats. Changing this view keeps those sessions running.
+
+Use **Track PR…** to enter the forge host, repository and PR number, or type or
+paste a full PR URL into **Repository**. The URL stays editable while the host
+and number update. Editing the host or number switches to separate identity
+fields. Review the identity and choose the channel's role before submitting:
+
+| Role | Meaning |
+| --- | --- |
+| **Contributing** | Declared implementation work |
+| **Stewarding** | Responsibility for progressing the work |
+| **Review only** | Reviewing without claiming implementation |
+| **Reference** | Related context without claiming ownership |
+
+**Working on** groups contributions and stewardship. **Reviews and references**
+keeps related PRs separate. A channel can track several PRs, including PRs in
+different repositories or forks. Checking out a branch does not declare a
+contribution, and switching branches or removing a checkout does not move the
+channel's tracked work.
+
+PR observations show when they were last read. **Refresh** checks tracked PRs;
+an unavailable forge preserves the previous observation. Closed, merged and
+ended work remains in **History**. Confirm a fresh work role before an earlier
+contribution to a reopened PR counts as ongoing work again. A new review alone
+does not restart that contribution. Page counts describe only the loaded
+pages; use the current-page and history controls to browse further.
+
+**Change role** corrects a relation, and **End tracking** moves it to history.
+Leaving an edited tracking form offers **Keep editing** or **Discard draft**.
+Submitted changes continue independently of the view. If a result is
+unconfirmed, use **Check result** or **Retry original change**; retry preserves
+the original target, role and operation.
+
 ## Work board
 
 The Work board answers "what was I working on?" across every open project. The

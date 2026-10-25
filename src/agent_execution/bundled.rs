@@ -18,7 +18,11 @@ const LEGACY_NAME: &str = "cagents-agents";
 /// unedited, so it is upgraded in place; anything else is user content and is
 /// never replaced. Append only: when `SKILL.md` changes, a test fails until its
 /// new hash is appended, which keeps every earlier revision upgradable.
-const BUNDLED: &[&str] = &["246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4"];
+const BUNDLED: &[&str] = &[
+    "246f4a5f0a2d614ccf3ff204a967bcacf99cac23d257ceed87a2d994802b12a4",
+    "91ef5d665ff6c64fef61cb960a70b6432f3e5aeec91de41ea20b5fc9f81add53",
+    "da0498ddc44bae2ae3ea33e0dc7f8965c4289cb555accfce353461c3f221b75a",
+];
 
 /// Recognized copies of the retired cagents-agents skill, used only for cleanup.
 const LEGACY_BUNDLED: &[&str] = &[
