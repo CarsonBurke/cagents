@@ -695,7 +695,8 @@ fn row<'a>(
             UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
         )
     });
-    let stale = snapshot.is_some_and(|snapshot| is_stale(snapshot, now));
+    let stale =
+        account.failure.is_some() || snapshot.is_some_and(|snapshot| is_stale(snapshot, now));
     let cells = layout
         .columns
         .iter()
@@ -748,19 +749,44 @@ fn row<'a>(
             (column.width(layout.usage), cell)
         })
         .collect::<Vec<_>>();
-    if layout.stacked {
-        return stacked_row(
+    let content = if layout.stacked {
+        stacked_row(
             account_cell(app, account, project),
             layout.columns.iter().copied().zip(cells).collect(),
             actions(app, account, now, project),
+        )
+    } else {
+        line(
+            account_cell(app, account, project),
+            cells,
+            actions(app, account, now, project),
+            ROW_HEIGHT,
+        )
+    };
+    // Keep the account and its controls in the same child slot when a
+    // background check fails. The explanation can wrap below the fixed-height
+    // row, including when the Status column has been dropped for space.
+    let mut lines = vec![content];
+    if let Some(reason) = failure_caption(account) {
+        lines.push(
+            widget::container(
+                design::caption(reason)
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: space::M,
+                bottom: space::M,
+                left: space::M,
+            })
+            .width(Length::Fill)
+            .into(),
         );
     }
-    line(
-        account_cell(app, account, project),
-        cells,
-        actions(app, account, now, project),
-        ROW_HEIGHT,
-    )
+    widget::column::with_children(lines)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A row for a card too narrow for columns: the account and its actions,
@@ -952,12 +978,11 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
 
 /// How an account stands, in a word and a tone.
 fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::Color) {
+    if account.failure.is_some() {
+        return ("Check failed", design::warning_color);
+    }
     let Some(snapshot) = &account.snapshot else {
-        return if account.failure.is_some() {
-            ("Unavailable", design::muted_color)
-        } else {
-            ("Checking", design::muted_color)
-        };
+        return ("Checking", design::muted_color);
     };
     match snapshot.status {
         UsageStatus::Ok => ("Available", design::success_color),
@@ -966,6 +991,42 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
         UsageStatus::NeedsLogin => ("Signed out", design::warning_color),
         UsageStatus::Unavailable => ("Unavailable", design::muted_color),
     }
+}
+
+/// A failed read does not invalidate the last figures, but they no longer
+/// describe the outcome of the most recent check.
+fn failure_caption(account: &AccountState) -> Option<String> {
+    let failure = account.failure.as_ref()?;
+    // Remote transport diagnostics can be longer than the probe's own fixed
+    // summaries. Bound the always-visible text without copying the full
+    // diagnostic; the existing tooltip still carries it in full.
+    let mut chars = failure.chars();
+    let mut detail: String = chars
+        .by_ref()
+        .take(240)
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    if chars.next().is_some() {
+        detail.push('…');
+    } else {
+        detail.truncate(detail.trim_end().len());
+    }
+    if !matches!(detail.chars().last(), Some('.' | '!' | '?' | '…')) {
+        detail.push('.');
+    }
+    let figures = if account.snapshot.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.status,
+            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+        )
+    }) {
+        " Showing last known usage."
+    } else {
+        ""
+    };
+    Some(format!(
+        "Last check failed: {detail}{figures} Refresh to try again."
+    ))
 }
 
 fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
@@ -1400,5 +1461,211 @@ mod tests {
         table.escape();
         assert_eq!(table.rename, None);
         assert!(!table.has_popup());
+    }
+
+    #[test]
+    fn a_failed_check_keeps_usage_and_explains_it_in_wide_and_narrow_rows() {
+        use iced::advanced::{
+            Layout as WidgetLayout, layout,
+            widget::{Operation, Tree},
+        };
+
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let measure = |app: &Cagents, id: &AccountId, width: f32| {
+            let mut element = row(
+                app,
+                app.account_ui.account(id).unwrap(),
+                &layout(width),
+                None,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let available = width.min(MAX_WIDTH) - 2.0 * GUTTER;
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(available, 900.0)),
+            );
+            let mut texts = Texts::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                WidgetLayout::new(&node),
+                &renderer,
+                &mut texts,
+            );
+            (texts.0, node.size(), node.children()[0].bounds())
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 1167);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", app.account_ui.now_ms);
+        snapshot.detail = None;
+        snapshot.windows = vec![UsageWindow {
+            key: "session".into(),
+            kind: account::WindowKind::Session,
+            label: "Session".into(),
+            used: 0.4,
+            resets_at: None,
+            span_secs: None,
+            binding: false,
+        }];
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        // Exercise accepted probe completions; no returned background Task is polled.
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: snapshot.clone(),
+            },
+        }));
+        let widths = [1_400.0, 1_100.0, 520.0, 360.0];
+        let healthy = widths.map(|width| measure(&app, &id, width));
+        assert!(healthy[0].0.iter().any(|(text, _)| text == "Available"));
+        assert!(healthy.iter().all(|(texts, _, _)| {
+            texts.iter().any(|(text, _)| text == "60% left")
+                && !texts
+                    .iter()
+                    .any(|(text, _)| text.starts_with("Last check failed:"))
+        }));
+        let failure = "Codex did not answer within 30 seconds";
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Failed(failure.into()),
+        }));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&snapshot)
+        );
+        let caption = "Last check failed: Codex did not answer within 30 seconds. Showing last known usage. Refresh to try again.";
+        let mut wide_caption_height = None;
+        for (index, width) in widths.into_iter().enumerate() {
+            let (texts, size, controls) = measure(&app, &id, width);
+            assert_eq!(
+                controls, healthy[index].2,
+                "existing controls stay in child zero"
+            );
+            assert!(texts.iter().any(|(text, _)| text == "60% left"));
+            assert!(!texts.iter().any(|(text, _)| text == "Available"));
+            assert_eq!(
+                texts.iter().any(|(text, _)| text == "Check failed"),
+                layout(width).columns.contains(&Column::Status),
+            );
+            let matches = texts
+                .iter()
+                .filter(|(text, _)| text == caption)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "reason must be rendered, not tooltip-only: {width}"
+            );
+            let bounds = matches[0].1;
+            assert!(bounds.width.is_finite() && bounds.height.is_finite());
+            assert!(bounds.width > 0.0 && bounds.height > 0.0);
+            assert!(bounds.y >= controls.y + controls.height);
+            assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= size.width + 0.1);
+            assert!(bounds.y + bounds.height <= size.height + 0.1);
+            assert!(size.height > healthy[index].1.height);
+            if index == 0 {
+                wide_caption_height = Some(bounds.height);
+            }
+            if width == 360.0 {
+                assert!(
+                    bounds.height > wide_caption_height.unwrap(),
+                    "narrow reason wraps"
+                );
+                assert!(!layout(width).columns.contains(&Column::Status));
+            }
+        }
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                identity: None,
+                catalog: None,
+                snapshot: snapshot.clone(),
+            },
+        }));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&snapshot)
+        );
+        for (index, width) in widths.into_iter().enumerate() {
+            let (texts, size, controls) = measure(&app, &id, width);
+            assert_eq!((size, controls), (healthy[index].1, healthy[index].2));
+            assert!(texts.iter().any(|(text, _)| text == "60% left"));
+            assert!(
+                !texts
+                    .iter()
+                    .any(|(text, _)| text.starts_with("Last check failed:"))
+            );
+            assert!(!texts.iter().any(|(text, _)| text == "Check failed"));
+            if layout(width).columns.contains(&Column::Status) {
+                assert!(texts.iter().any(|(text, _)| text == "Available"));
+            }
+        }
+        // Long transport diagnostics cannot turn the visible row into an
+        // unbounded body. Unicode stays intact and guidance is outside the cap.
+        let long_failure = "界🙂é ".repeat(4_000);
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Failed(long_failure.clone()),
+        }));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.failure.as_ref(), Some(&long_failure));
+        assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+        // status_badge's existing tooltip still formats this whole state.failure.
+        let expected = format!(
+            "Last check failed: {}… Showing last known usage. Refresh to try again.",
+            "界🙂é ".repeat(60),
+        );
+        let (texts, size, controls) = measure(&app, &id, 360.0);
+        let captions = texts
+            .iter()
+            .filter(|(text, _)| text.starts_with("Last check failed:"))
+            .collect::<Vec<_>>();
+        assert_eq!(captions.len(), 1);
+        assert_eq!(captions[0].0, expected);
+        assert!(captions[0].0.chars().count() < 340);
+        assert!(captions[0].1.height.is_finite() && captions[0].1.height > 0.0);
+        assert!(captions[0].1.x + captions[0].1.width <= size.width + 0.1);
+        assert!(captions[0].1.y + captions[0].1.height <= size.height + 0.1);
+        assert_eq!(controls, healthy[3].2);
+        // Existing sentence punctuation is not duplicated by the caption.
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome: Outcome::Failed("Codex could not read usage just now.".into()),
+        }));
+        let (texts, _, _) = measure(&app, &id, 520.0);
+        assert!(texts.iter().any(|(text, _)| text ==
+            "Last check failed: Codex could not read usage just now. Showing last known usage. Refresh to try again."));
+        // A first failed check explains the failure without claiming cached figures.
+        let unchecked = app.account_ui.add_managed_fixture(Provider::Codex, 1168);
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            owner: app.account_ui.account(&unchecked).unwrap().owner,
+            id: unchecked.clone(),
+            outcome: Outcome::Failed(failure.into()),
+        }));
+        let (texts, _, _) = measure(&app, &unchecked, 360.0);
+        assert!(texts.iter().any(|(text, _)| text
+            == "Last check failed: Codex did not answer within 30 seconds. Refresh to try again."));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _)| text.contains("last known usage"))
+        );
     }
 }
