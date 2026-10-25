@@ -522,6 +522,26 @@ impl Cagents {
     }
 
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
+        self.apply_workspace_model_update_effect(update).0
+    }
+
+    /// Only stale complete snapshots skip projection. Even an equal model can
+    /// restore optimistic local state after refusal (for example channel titles).
+    /// Newer metadata edges may still lack an older snapshot's full inventory.
+    pub(super) fn apply_workspace_model_update_effect(
+        &mut self,
+        update: ModelUpdate,
+    ) -> (Task<Message>, bool) {
+        if let ModelUpdate::Read(model) = &update
+            && model.identity == self.workspace_model.identity
+            && model.sequence < self.shared_views.snapshot_sequence
+        {
+            return (Task::none(), false);
+        }
+        (self.apply_workspace_model_update_inner(update), true)
+    }
+
+    fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
