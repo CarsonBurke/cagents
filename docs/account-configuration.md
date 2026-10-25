@@ -301,3 +301,59 @@ is forgotten without deleting its files. The CLI sends only the account ID,
 never a local home path, and requires `--yes` before contacting the daemon.
 If the response is uncertain, inspect the account list before retrying; removal
 does not retry automatically.
+
+## Importing a staged ChatGPT cache
+
+In **Accounts → Add account → Import staged ChatGPT cache**, choose one staged
+`auth.json` on the selected device. Enter the expected ChatGPT email and confirm
+both the file copy and the session-sharing limitation. **Inspect file** checks
+its format and private-file properties. **Prepare import** creates a separate
+managed home and copies only that file; it does not register a login or start a
+coding task. Existing homes, identities, defaults and configuration are preserved.
+
+**Verify identity** asks the official Codex client in that original destination
+home to report its ChatGPT identity. A wrong, missing, API-key or duplicate
+identity does not select another account. The pending import is retained for
+inspection. Successful registration can then create an absent, independent
+workspace-write configuration if you explicitly requested it; network access
+requires its own choice. Existing configuration is never overwritten.
+Registration and configuration creation do not prove coding access: use
+**Check coding access** with the intended workspace and explicit write/GitHub
+checks before relying on a worker. This flow does not dispatch or resume tasks.
+
+Closing the form preserves an outstanding operation. After restarting the app,
+use **Load retained imports** and resume its original operation. **Status** reads
+metadata; **Verify identity** is always explicit and uses the current daemon
+connection while preserving the original account key, email and intent. An
+uncertain result does not trigger another copy, a new operation or an automatic
+retry. Completed operations remain retained; this initial journal holds at most
+16 total operations, including completed imports. Completing an import does not
+free a slot, and this flow provides no journal-deletion operation.
+
+The CLI uses the same selected-device service from the user's own terminal:
+
+```sh
+cagents --device workstation account import inspect '~/staged/auth.json'
+cagents --device workstation account import prepare --request-file ./import-plan.json
+cagents --device workstation account import list
+cagents --device workstation account import status ORIGINAL-UUID
+cagents --device workstation account import verify ORIGINAL-UUID
+```
+
+Inspection returns a metadata-only plan preview. To prepare, supply its complete
+observation and destination proof, an original nonnil operation UUID, expected
+email, explicit copy acknowledgements, and chosen profile in a private JSON file.
+The request file must contain metadata, never credentials. Preserve the operation
+UUID if a response is lost. Status and List never advance an import or verify
+execution access. Hosted agents cannot import credentials or change their own
+permissions through these commands.
+
+This is a destination import for an already staged **managed ChatGPT file
+cache**. It does not export another device's login, copy a whole account home,
+read browser cookies or perform browser authorization. Codex documents copying a
+file cache as a headless setup option; it also warns that managed refresh tokens
+must be used on one machine or one serialized stream. Concurrent copies can
+invalidate each other's refresh state. Use the provider's supported transfer and
+consent path, protect the staged file, and never replace the client's refreshed
+cache with an older seed. See the official [authentication guide](https://learn.chatgpt.com/docs/auth)
+and [managed authentication guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth).
