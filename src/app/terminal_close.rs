@@ -338,6 +338,11 @@ impl Cagents {
     /// Moves focus off a card whose removal the workspace has reserved, then
     /// commits that removal.
     pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
+        if !self.workspace_surfaces_visible() {
+            // The accepted close still commits, but its hidden pane cannot
+            // take native focus from Work or the contextual inspector.
+            return cosmic::task::message(Message::CommitClose(handoff.unmounting));
+        }
         workspace_widget::focus_handoff_then(
             handoff,
             widget::Id::new(TOOLBAR_FOCUS_ID),
@@ -459,7 +464,8 @@ impl Cagents {
             }
             _ => Task::none(),
         };
-        let focus = if !replacing
+        let focus = if self.workspace_surfaces_visible()
+            && !replacing
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {

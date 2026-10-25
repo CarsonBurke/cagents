@@ -8757,9 +8757,7 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if !self.context_inspector_overlay_active
-            && let Some(card) = self.workspace.take_widget_focus_request()
-        {
+        if surfaces_visible && let Some(card) = self.workspace.take_widget_focus_request() {
             tasks.push(
                 iced::widget::operation::focus(self.card_keyboard_focus(card))
                     .map(cosmic::Action::App),

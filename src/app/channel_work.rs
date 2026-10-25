@@ -1548,6 +1548,221 @@ mod tests {
             }
         }
 
+        fn closing_fixture(
+            renderer: &mut cosmic::Renderer,
+        ) -> (Cagents, Home, ui::FormOwner, Cache, CardId, CardId) {
+            use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+            let (mut app, home, form, cache) = fixture(renderer);
+            let (other, closing, survivor) = two_channels(&mut app, home);
+            app.workspace_model
+                .channels
+                .retain(|channel| channel.id != other);
+            app.workspace_model
+                .views
+                .retain(|view| view.scope != Scope::Channel(other));
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.retain(|channel| channel.id != other);
+            durable.channels[0].cards.push(survivor);
+            for card in &mut durable.cards {
+                card.width_fraction = 0.5;
+                card.residency = Residency::Hot;
+            }
+            app.workspace_model.views[0].panes = durable
+                .cards
+                .iter()
+                .map(|card| crate::workspace_model::views::Pane::from_card(card, None).unwrap())
+                .collect();
+            app.workspace = Cagents::rebuild_workspace(&WorkspaceState {
+                cards: durable.cards.clone(),
+                focused: Some(closing),
+                ..WorkspaceState::default()
+            });
+            let _ = app.workspace.resize_viewport(1000.0);
+            assert_eq!(app.workspace.take_widget_focus_request(), Some(closing));
+            // A real native frame is mounted, but no terminal or provider is
+            // started. The accepted close's immutable receipt is supplied below.
+            for card in [closing, survivor] {
+                app.cards
+                    .insert(card, CardRuntime::Failed("Fixture terminal".into()));
+            }
+            let CardKind::Terminal(session) = &mut app.card_state_mut(closing).unwrap().kind else {
+                panic!("closing fixture is a terminal");
+            };
+            session.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new("late-close"),
+                boot_id: BootId::new("late-close-boot"),
+                host_incarnation: HostIncarnation::new("late-close-incarnation"),
+            };
+            (app, home, form, cache, closing, survivor)
+        }
+
+        fn local_close_effects(
+            frame: &mut Frame<'_>,
+            renderer: &cosmic::Renderer,
+            task: Task<Message>,
+        ) -> Vec<Message> {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let mut messages = Vec::new();
+            while let Some(action) = executor.block_on(stream.next()) {
+                match action {
+                    iced::runtime::Action::Widget(operation) => operate(frame, renderer, operation),
+                    iced::runtime::Action::Output(cosmic::Action::App(message)) => {
+                        messages.push(message)
+                    }
+                    action => panic!("unexpected nonlocal close effect: {action:?}"),
+                }
+            }
+            messages
+        }
+
+        #[test]
+        fn late_checked_close_preserves_work_native_selection_and_visible_close_still_hands_off() {
+            let mut renderer = super::super::super::tests::headless_renderer();
+            for work in [true, false] {
+                let (mut app, home, form, cache, closing, survivor) =
+                    closing_fixture(&mut renderer);
+                app.channel_work.main = false;
+                // Start the actual asynchronous close reducer, but do not poll
+                // its RPC task. Navigation is permitted while this is pending.
+                drop(app.begin_card_close(closing));
+                assert!(app.terminal_close_pending(closing));
+                assert!(!app.modal_is_open());
+                let intent = app.terminal_close.as_ref().unwrap().clone();
+                app.channel_work.main = work;
+                let mut frame = mount(&app, cache, &mut renderer);
+                let repository = if work {
+                    let id = input(&mut frame, &renderer, "-repo");
+                    seek(&mut frame, &mut renderer, &id);
+                    let (messages, _) = event(
+                        &mut frame,
+                        &mut renderer,
+                        &[command_key("a", keyboard::key::Code::KeyA)],
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    assert!(messages.is_empty(), "native selection: {messages:?}");
+                    assert_eq!(repository_state(&frame), ("fixture/work".into(), 0, 12));
+                    Some(id)
+                } else {
+                    let id = app.card_keyboard_focus(closing);
+                    operate(
+                        &mut frame,
+                        &renderer,
+                        Box::new(operation::focusable::focus::<()>(id.clone())),
+                    );
+                    assert!(same(&active(&mut frame, &renderer), &id));
+                    None
+                };
+                let cache = frame.into_cache();
+                let accepted = app.terminal_close_finished(
+                    closing,
+                    intent.terminal,
+                    intent.proof,
+                    intent.generation,
+                    terminal_close::CloseOutcome::Closed,
+                );
+                assert!(app.terminal_close.is_none());
+                assert!(app.closed_terminal_cards.contains(&closing));
+                let mut frame = mount(&app, cache, &mut renderer);
+                let messages = local_close_effects(&mut frame, &renderer, accepted);
+                assert!(
+                    matches!(messages.as_slice(), [Message::CommitClose(card)] if *card == closing),
+                    "accepted close must still request its exact commit: {messages:?}"
+                );
+                let expected = repository
+                    .clone()
+                    .unwrap_or_else(|| app.card_keyboard_focus(survivor));
+                assert!(same(&active(&mut frame, &renderer), &expected));
+                let cache = frame.into_cache();
+                // This is CommitClose's actual reducer after the checked-close
+                // receipt admitted the same original. No transport is polled.
+                let committed = app.commit_card_removal(closing, None).unwrap();
+                assert!(!app.card_state(closing).unwrap().existence.is_open());
+                assert!(!app.cards.contains_key(&closing));
+                assert_eq!(app.workspace.focused(), Some(survivor));
+                let mut frame = mount(&app, cache, &mut renderer);
+                let messages = local_close_effects(&mut frame, &renderer, committed);
+                assert!(
+                    messages.is_empty(),
+                    "unexpected commit callback: {messages:?}"
+                );
+                assert!(same(&active(&mut frame, &renderer), &expected));
+                if work {
+                    assert_eq!(app.channel_work.view.home(), Some(home));
+                    assert_eq!(repository_state(&frame), ("fixture/work".into(), 0, 12));
+                    let (messages, _) = event(
+                        &mut frame,
+                        &mut renderer,
+                        &[key(
+                            keyboard::Key::Character("z".into()),
+                            keyboard::key::Code::KeyZ,
+                            Some("z"),
+                        )],
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    assert!(
+                        matches!(messages.as_slice(), [cosmic::Action::App(Message::ChannelWork(ui::Action::Field(owner, ui::Field::Repository, value)))] if *owner == form && value == "z"),
+                        "ordinary typing must replace the retained selection: {messages:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn hidden_work_preserves_queued_pane_focus_until_a_visible_conversations_frame() {
+            let mut renderer = super::super::super::tests::headless_renderer();
+            let (mut app, home, _, cache, _, survivor) = closing_fixture(&mut renderer);
+            let mut frame = mount(&app, cache, &mut renderer);
+            let repository = input(&mut frame, &renderer, "-repo");
+            seek(&mut frame, &mut renderer, &repository);
+            let (messages, _) = event(
+                &mut frame,
+                &mut renderer,
+                &[command_key("a", keyboard::key::Code::KeyA)],
+                iced::mouse::Cursor::Unavailable,
+            );
+            assert!(messages.is_empty(), "native selection: {messages:?}");
+            let selection = repository_state(&frame);
+            assert_eq!(selection, ("fixture/work".into(), 0, 12));
+            let cache = frame.into_cache();
+            let update = app.workspace.focus(survivor).unwrap();
+            let hidden = app.apply_viewport(update, false, true);
+            let mut frame = mount(&app, cache, &mut renderer);
+            let messages = local_close_effects(&mut frame, &renderer, hidden);
+            assert!(
+                messages.is_empty(),
+                "unexpected viewport callback: {messages:?}"
+            );
+            assert!(same(&active(&mut frame, &renderer), &repository));
+            assert_eq!(repository_state(&frame), selection);
+            let cache = frame.into_cache();
+            assert_eq!(app.channel_work.view.home(), Some(home));
+            // Isolate delivery of the original queued focus: expose the
+            // Conversations frame without issuing a new focus request.
+            app.channel_work.main = false;
+            let visible =
+                app.apply_viewport(crate::workspace::ViewportUpdate::unchanged(), false, true);
+            let mut frame = mount(&app, cache, &mut renderer);
+            let messages = local_close_effects(&mut frame, &renderer, visible);
+            assert!(
+                messages.is_empty(),
+                "unexpected visible callback: {messages:?}"
+            );
+            assert!(same(
+                &active(&mut frame, &renderer),
+                &app.card_keyboard_focus(survivor)
+            ));
+            assert!(
+                app.workspace.take_widget_focus_request().is_none(),
+                "visible frame consumes the retained request once"
+            );
+        }
+
         #[test]
         fn open_form_polling_keeps_native_fields_and_roles_stationary_with_header_progress() {
             fn sized<'a>(
