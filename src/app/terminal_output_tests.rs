@@ -1382,3 +1382,149 @@ fn late_input_notice_cannot_replace_a_fatal_or_completed_original() {
         }));
     }
 }
+
+#[test]
+fn local_relaunch_retires_old_unread_without_acknowledging_it_or_same_session_reattach() {
+    use crate::agent::{Activity, ActivityState, Provider};
+
+    for ended in [false, true] {
+        let (mut app, card, mut peer) = fixture();
+        app.refresh_ui.focused = false;
+        let CardKind::Terminal(original) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("terminal fixture");
+        };
+        // A separate card's unread attribution must survive the relaunch.
+        let mut other = app.card_state(card).unwrap().clone();
+        other.id = CardId::new();
+        let unrelated = other.id;
+        if let CardKind::Terminal(session) = &mut other.kind {
+            session.id = TerminalId::new();
+        }
+        Arc::make_mut(&mut app.durable).cards.push(other);
+        app.sidebar_state.observe_card_update(unrelated);
+        let notice = uuid::Uuid::new_v4();
+        let journal = |id, source| crate::notifications::Snapshot {
+            diagnostic: None,
+            notices: vec![crate::notifications::Notice {
+                id,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    content: None,
+                    target: crate::notifications::Target::Session(source),
+                    source_session: Some(source),
+                    provider: Some(Provider::Claude),
+                    directory: Some(original.launch.working_directory.clone()),
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "local-relaunch-unread".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+            }],
+        };
+        let old_journal = journal(notice, original.id);
+        drop(app.update_notifications(notification_ui::Action::Snapshot(old_journal.clone())));
+        let waiting = Activity {
+            provider: Provider::Claude,
+            state: ActivityState::Waiting,
+        };
+        apply(
+            &mut app,
+            card,
+            &mut peer,
+            Some(WireTerminalEvent::AgentActivityChanged {
+                activity: Some(waiting),
+            }),
+        );
+        assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+        assert!(app.sidebar_state.has_card_update(card));
+        if ended {
+            // Use the real framed event and normal App reducer, rather than
+            // fabricating an ended descriptor around a still-running actor.
+            apply(
+                &mut app,
+                card,
+                &mut peer,
+                Some(WireTerminalEvent::Completed {
+                    exit_code: 0,
+                    signal: None,
+                    intentional: false,
+                }),
+            );
+            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert_eq!(app.sidebar_state.card_activity(card), None);
+            assert!(app.sidebar_state.has_card_update(card));
+        }
+        let focused = app.workspace.focused();
+        let durable_focused = app.durable.focused;
+        // Dropping the returned task exercises the actual accepted relaunch
+        // transition without executing any daemon/provider startup future.
+        drop(app.update(Message::RetryCard(card)));
+        let CardKind::Terminal(current) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("retry keeps the terminal pane");
+        };
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(matches!(
+            app.card_state(card).unwrap().residency,
+            Residency::Hydrating { .. }
+        ));
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.durable.focused, durable_focused);
+        assert_eq!(current.launch, original.launch);
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+        if !ended {
+            assert_eq!(current.id, original.id, "same original actor reattachment");
+            assert_eq!(app.sidebar_state.card_activity(card), Some(waiting));
+            assert!(app.sidebar_state.has_card_update(card));
+            continue;
+        }
+        assert_ne!(current.id, original.id);
+        assert_eq!(current.predecessor, Some(original.id));
+        assert_eq!(app.sidebar_state.card_activity(card), None);
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "old unread belongs to the old actor"
+        );
+        drop(app.update(Message::TerminalStarted {
+            card,
+            terminal: original.id,
+            result: Err("late predecessor attachment".into()),
+        }));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(matches!(&app.card_state(card).unwrap().kind,
+            CardKind::Terminal(session) if session.id == current.id));
+        drop(app.update_notifications(notification_ui::Action::Snapshot(old_journal)));
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "late old journal cannot rebind"
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        let fresh = uuid::Uuid::new_v4();
+        drop(
+            app.update_notifications(notification_ui::Action::Snapshot(journal(
+                fresh, current.id,
+            ))),
+        );
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "new actor's unread remains usable"
+        );
+        drop(app.update(Message::TerminalStarted {
+            card,
+            terminal: current.id,
+            result: Err("current relaunch unavailable".into()),
+        }));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "failure is not reading fresh news"
+        );
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        assert!(!app.notification_ui.acknowledged_for_test(fresh));
+        assert_eq!(app.workspace.focused(), focused);
+    }
+}

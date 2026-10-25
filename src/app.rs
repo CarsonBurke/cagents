@@ -8366,6 +8366,9 @@ impl Cagents {
         }
         self.status = None;
         if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // A fresh actor must not inherit its predecessor's sidebar news.
+            // Retiring that attribution does not acknowledge the old journal.
+            self.sidebar_state.forget_card_attention(card);
             // The ended identity's final-screen outcome is spent.
             self.retained_outputs.remove(expected_terminal_id);
         }
