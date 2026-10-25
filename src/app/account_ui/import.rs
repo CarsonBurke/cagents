@@ -143,6 +143,8 @@ pub(super) struct State {
     status: Option<ImportStatus>,
     retained: Vec<ImportStatus>,
     discovery: u64,
+    // Unanswered/unacknowledged local dispatch, distinct from the journal's
+    // historical uncertainty bit which survives a terminal registration ACK.
     local_uncertain: bool,
     pending: Option<Request>,
     problem: Option<&'static str>,
@@ -163,7 +165,7 @@ impl State {
             && self
                 .status
                 .as_ref()
-                .is_some_and(|status| status.stage == ImportStage::Registered && !status.uncertain)
+                .is_some_and(|status| status.stage == ImportStage::Registered)
     }
     fn can_resume(&self, status: &ImportStatus) -> bool {
         self.pending.is_none()
@@ -254,7 +256,10 @@ impl State {
                 ) if valid_status(&status, plan, &response.target.proof, self.status.as_ref()) => {
                     let reload =
                         matches!(kind, RequestKind::Verify(_)) && status.registered.is_some();
-                    self.local_uncertain = status.uncertain;
+                    // A validated terminal ACK resolves local dispatch custody;
+                    // the retained journal still records any earlier uncertainty.
+                    self.local_uncertain =
+                        status.uncertain && status.stage != ImportStage::Registered;
                     self.status = Some(status);
                     self.problem = None;
                     return reload;
@@ -347,7 +352,9 @@ impl State {
                 };
                 self.inspection = None;
                 self.plan = Some(status.plan.clone());
-                self.local_uncertain = status.uncertain;
+                // Discovery can be older than an unanswered local dispatch.
+                // Resuming its cached record must not acknowledge that request.
+                self.local_uncertain |= status.uncertain && status.stage != ImportStage::Registered;
                 self.status = Some(status);
                 self.problem = None;
                 self.rotate_owner();
@@ -722,7 +729,16 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
             .into(),
         );
         if status.uncertain {
-            results.push(design::caption("An earlier acknowledgement was uncertain. Keep this operation; never reseed the cache or generate another key to retry.").wrapping(iced::widget::text::Wrapping::Word).into());
+            let text = if status.stage == ImportStage::Registered {
+                "Registration was acknowledged. The retained record still notes an earlier uncertain acknowledgement. New import starts a separate operation; it never retries this cache."
+            } else {
+                "An earlier acknowledgement was uncertain. Keep this operation; never reseed the cache or generate another key to retry."
+            };
+            results.push(
+                design::caption(text)
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+            );
         }
         results.push(
             design::caption(match status.publication {

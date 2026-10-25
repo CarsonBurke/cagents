@@ -976,17 +976,64 @@ fn new_import_requires_acknowledged_registration_and_retires_the_old_form_owner(
     );
     assert!(act(&mut state, Action::New(owner)).is_none());
     assert_eq!(state.plan.as_ref(), Some(&plan));
+    // Match the HOST journal's real trajectory: uncertainty remains true
+    // through Prepared/Published and the later acknowledged Registered stage.
+    // Journal::mark_registered never clears that historical audit evidence.
+    for stage in [ImportStage::Prepared, ImportStage::Published] {
+        let request = act(&mut state, Action::Status(owner)).unwrap();
+        let mut uncertain = status(&plan, stage);
+        uncertain.uncertain = true;
+        finish(&mut state, &request, uncertain);
+        assert!(!state.can_new());
+        assert!(act(&mut state, Action::New(owner)).is_none());
+        assert_eq!(state.plan.as_ref(), Some(&plan));
+    }
+    let verify = act(&mut state, Action::Verify(owner)).unwrap();
+    assert!(
+        !state.can_new(),
+        "an outstanding Verify is not a terminal ACK"
+    );
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: verify.sequence,
+            result: Err(Failure::Unavailable),
+        },
+    );
+    assert!(!state.can_new(), "a lost Verify reply keeps local custody");
     let request = act(&mut state, Action::Status(owner)).unwrap();
-    let mut uncertain = status(&plan, ImportStage::Registered);
-    uncertain.uncertain = true;
-    finish(&mut state, &request, uncertain);
-    assert!(!state.can_new());
-    assert!(act(&mut state, Action::New(owner)).is_none());
-    assert_eq!(state.plan.as_ref(), Some(&plan));
+    let mut historical = status(&plan, ImportStage::Registered);
+    historical.uncertain = true;
+    let mut wrong_receipt = historical.clone();
+    wrong_receipt.receipt.as_mut().unwrap().file.inode += 1;
+    finish(&mut state, &request, wrong_receipt);
+    assert!(
+        !state.can_new(),
+        "a different receipt cannot resolve the original"
+    );
+    assert!(state.local_uncertain);
     let request = act(&mut state, Action::Status(owner)).unwrap();
-    let historical = status(&plan, ImportStage::Registered);
+    act(
+        &mut state,
+        Action::Finished {
+            sequence: request.sequence + 1,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Status(historical.clone()),
+            }),
+        },
+    );
+    assert!(
+        state.pending.is_some() && !state.can_new(),
+        "a stale ACK cannot release the current request"
+    );
     finish(&mut state, &request, historical.clone());
     assert!(state.can_new());
+    assert!(!state.local_uncertain);
+    assert!(
+        state.status.as_ref().unwrap().uncertain,
+        "historical audit evidence is not erased"
+    );
     // The durable original remains available in discovery, without deletion,
     // expiration or pretending that completion frees one of the 16 slots.
     state.retained = vec![historical.clone()];
@@ -1029,4 +1076,189 @@ fn new_import_requires_acknowledged_registration_and_retires_the_old_form_owner(
         state.plan.is_none(),
         "New and editing do not mint an operation UUID"
     );
+}
+
+#[test]
+fn restored_registered_audit_uncertainty_allows_a_separate_import_without_account_readiness() {
+    for current_account in [false, true] {
+        let original = inspected().inspection.unwrap().1;
+        let plan = ImportPlan {
+            operation: Uuid::from_u128(991),
+            destination: original.destination,
+            observation: original.observation,
+            expected_email: "fixture@example.test".into(),
+            consent: CopyConsent {
+                staged_file_only: true,
+                source_session_limit_acknowledged: true,
+            },
+            profile: CodingProfile::Unconfigured,
+        };
+        let mut historical = status(&plan, ImportStage::Registered);
+        historical.uncertain = true;
+        if !current_account {
+            historical.registered = None;
+        }
+        let mut state = State::default();
+        act(&mut state, Action::Open);
+        let initial_owner = state.owner;
+        let load = act(&mut state, Action::Load(initial_owner)).unwrap();
+        assert!(
+            !state.accept(
+                load.sequence,
+                Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Listed(vec![historical.clone()]),
+                })
+            ),
+            "List is metadata-only and never schedules registry/provider work"
+        );
+        assert!(state.plan.is_none());
+        let owner = state.owner;
+        let discovery = state.discovery;
+        assert!(
+            act(
+                &mut state,
+                Action::Resume {
+                    owner,
+                    discovery,
+                    operation: plan.operation,
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(state.plan.as_ref(), Some(&plan));
+        assert_eq!(state.status.as_ref(), Some(&historical));
+        assert!(state.can_new());
+        assert!(!state.local_uncertain);
+        assert!(state.status.as_ref().unwrap().uncertain);
+        let resumed_owner = state.owner;
+        assert_ne!(resumed_owner, owner);
+
+        // An older acknowledged status must not mask a NEW unanswered Verify.
+        let verify = act(&mut state, Action::Verify(resumed_owner)).unwrap();
+        assert!(state.local_uncertain && !state.can_new());
+        act(
+            &mut state,
+            Action::Finished {
+                sequence: verify.sequence,
+                result: Err(Failure::Unavailable),
+            },
+        );
+        assert_eq!(state.status.as_ref(), Some(&historical));
+        assert!(state.local_uncertain && !state.can_new());
+        let mut other = historical.clone();
+        other.plan.operation = Uuid::from_u128(992);
+        other.receipt.as_mut().unwrap().operation = other.plan.operation;
+        if current_account {
+            other.registered = Some(format!("codex/{}", other.plan.operation).parse().unwrap());
+        }
+        let listed = vec![historical.clone(), other.clone()];
+        let load = act(&mut state, Action::Load(resumed_owner)).unwrap();
+        assert!(!state.accept(
+            load.sequence,
+            Ok(Response {
+                target: target(),
+                reply: ImportReply::Listed(listed.clone()),
+            })
+        ));
+        assert!(
+            state.local_uncertain && !state.can_new(),
+            "List does not resolve the original unanswered request"
+        );
+        let discovery = state.discovery;
+        assert!(
+            act(
+                &mut state,
+                Action::Resume {
+                    owner: resumed_owner,
+                    discovery,
+                    operation: other.plan.operation,
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            state.plan.as_ref(),
+            Some(&plan),
+            "cannot leave unresolved local custody for another record"
+        );
+        assert!(
+            act(
+                &mut state,
+                Action::Resume {
+                    owner: resumed_owner,
+                    discovery,
+                    operation: plan.operation,
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            state.local_uncertain && !state.can_new(),
+            "even resuming the same cached Registered record cannot acknowledge a newer lost Verify"
+        );
+        let after_cached_resume = state.owner;
+        assert_ne!(after_cached_resume, resumed_owner);
+        let read = act(&mut state, Action::Status(after_cached_resume)).unwrap();
+        assert!(
+            !state.accept(
+                read.sequence,
+                Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Status(historical.clone()),
+                })
+            ),
+            "terminal metadata acknowledgement creates no registry/provider task"
+        );
+        assert!(state.can_new());
+        assert!(!state.local_uncertain && state.status.as_ref().unwrap().uncertain);
+        assert!(
+            act(
+                &mut state,
+                Action::Resume {
+                    owner: after_cached_resume,
+                    discovery,
+                    operation: other.plan.operation,
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(state.plan.as_ref(), Some(&other.plan));
+        assert!(state.can_new());
+        let current_owner = state.owner;
+        assert_ne!(current_owner, resumed_owner);
+        assert!(act(&mut state, Action::New(resumed_owner)).is_none());
+        assert_eq!(
+            state.plan.as_ref(),
+            Some(&other.plan),
+            "old form callback stays retired"
+        );
+        let mut app = context_inspector_test_app(false);
+        let registry = app.account_ui.registry.clone();
+        app.account_ui.import = state;
+        assert!(
+            app.account_ui
+                .import
+                .registered_account(&app.account_ui)
+                .is_none(),
+            "journal metadata does not create/select an account or authorize Check"
+        );
+        let check = app.update_account_import(Action::Check(current_owner));
+        assert_eq!(check.units(), 0);
+        drop(check);
+        assert_eq!(app.account_ui.registry, registry);
+        let callbacks = click(view(&app).unwrap(), "New import");
+        assert!(
+            matches!(callbacks.as_slice(), [Message::AccountUi(super::super::Action::Import(Action::New(actual)))] if *actual == current_owner)
+        );
+        for callback in callbacks {
+            let Message::AccountUi(super::super::Action::Import(action)) = callback else {
+                panic!("only import action")
+            };
+            assert!(act(&mut app.account_ui.import, action).is_none());
+        }
+        assert!(app.account_ui.import.plan.is_none() && app.account_ui.import.pending.is_none());
+        assert_eq!(app.account_ui.import.retained, listed);
+        assert_eq!(app.account_ui.registry, registry);
+    }
 }
