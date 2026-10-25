@@ -968,7 +968,7 @@ mod tests {
             CREATE TABLE workspace_view_edits(operation TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT;
             PRAGMA user_version=7;").unwrap();
         db.execute(
-            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"kept\"]')",
+            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"00000000-0000-4000-8000-000000000071\"]')",
             [channel.to_string()],
         )
         .unwrap();
@@ -1002,7 +1002,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(view, (9, "[]".into(), "[\"kept\"]".into()));
+        assert_eq!(
+            view,
+            (
+                9,
+                "[]".into(),
+                "[\"00000000-0000-4000-8000-000000000071\"]".into()
+            )
+        );
         for (table, column, value) in [
             ("shared_view_panes", "id", "pane"),
             ("shared_view_edits", "operation", "edit"),
