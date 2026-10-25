@@ -16,10 +16,9 @@ use crate::{
 pub struct Caller {
     pub session: TerminalId,
     pub card: CardId,
-    /// Historical field name: a tagged, durable pane-placement revision.
-    /// Presentation and unrelated pane edits cannot change this stamp. The
-    /// high bit separates it from all saved whole-view SQLite revisions.
-    pub view_revision: u64,
+    /// Durable causal revision of this exact pane's placement and source.
+    /// Presentation and unrelated pane edits cannot change this epoch.
+    pub placement_epoch: u64,
     pub run: Option<RunId>,
 }
 
