@@ -22,7 +22,7 @@ pub(super) fn enter() -> bool {
     }
 
     let root = tempfile::Builder::new()
-        .prefix("user-fixture-")
+        .prefix("u")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()
         .unwrap();
@@ -57,7 +57,7 @@ pub(super) fn enter() -> bool {
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_CACHE_HOME", root.path().join("cache"))
-        .env("TMPDIR", root.path().join("tmp"))
+        .env("TMPDIR", root.path())
         .env("PATH", "/usr/bin:/bin")
         .current_dir(root.path())
         .stdin(Stdio::null())
