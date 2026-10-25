@@ -106,6 +106,82 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Repair metadata omitted by older implicit agent-channel writers, only after
+/// published-layout admission and inside its existing Immediate transaction.
+/// Canonical channels determine exact identity/incarnation; no actor, PR, work
+/// claim or filesystem observation is inferred. Existing homes always win,
+/// including archived/deleted current pairs and every historical incarnation.
+pub(super) fn repair_missing_homes_in(tx: &Transaction<'_>) -> Result<(), String> {
+    const BATCH: usize = 32;
+    let mut after = String::new();
+    let mut checked_ledger = false;
+    loop {
+        let candidates = {
+            let mut query = tx
+                .prepare(
+                    "SELECT c.id,c.ordinal FROM channels c
+                 WHERE c.id>?1 AND NOT EXISTS(
+                     SELECT 1 FROM channel_work_homes h
+                     WHERE h.channel=c.id AND h.incarnation=c.ordinal)
+                 ORDER BY c.id LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            query
+                .query_map(params![after, BATCH], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+        };
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        // Operations are indexed by operation, not by home. Inspect orphan
+        // ledger rows once, only when a repair is needed, rather than scanning
+        // that table again for every candidate. Immediate ownership keeps this
+        // result stable for all subsequent batches.
+        if !checked_ledger {
+            let orphaned: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                     SELECT 1 FROM channel_work_entries e
+                     JOIN channels c ON c.id=e.channel AND c.ordinal=e.incarnation
+                     WHERE NOT EXISTS(SELECT 1 FROM channel_work_homes h
+                         WHERE h.channel=c.id AND h.incarnation=c.ordinal))
+                 OR EXISTS(
+                     SELECT 1 FROM channel_work_operations o
+                     JOIN channels c ON c.id=o.channel AND c.ordinal=o.incarnation
+                     WHERE NOT EXISTS(SELECT 1 FROM channel_work_homes h
+                         WHERE h.channel=c.id AND h.incarnation=c.ordinal))",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if orphaned {
+                return Err("A missing channel work home has orphaned ledger records".into());
+            }
+            checked_ledger = true;
+        }
+        let registry = registry_identity(tx)?;
+        for (id, ordinal) in candidates {
+            let channel = parse_channel_id(&id)?;
+            if channel.to_string() != id {
+                return Err("The canonical channel identity is not normalized".into());
+            }
+            let home = Home {
+                registry,
+                channel,
+                creation_ordinal: u32::try_from(ordinal)
+                    .map_err(|_| "The canonical channel incarnation is invalid")?,
+            };
+            home.validate().map_err(|error| error.to_string())?;
+            created_in(tx, channel)?;
+            after = id;
+        }
+    }
+}
+
 fn registry_identity(db: &Connection) -> Result<Uuid, String> {
     let identity: String = db
         .query_row("SELECT identity FROM metadata WHERE key=0", [], |row| {
