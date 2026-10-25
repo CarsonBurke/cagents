@@ -88,6 +88,7 @@ fn prepare_file(path: &Path) -> Result<(), String> {
 }
 
 fn open_existing(path: &Path) -> Result<Connection, String> {
+    reject_unjournaled_layout(path)?;
     // A read transaction pins rollback-journal inspection until writer
     // admission. A hot journal must fail here, before a RW connection can
     // recover it. WAL writers may still advance; the writer reread detects it.
@@ -178,6 +179,51 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
         release.commit().map_err(|e| e.to_string())?;
     }
     Ok(db)
+}
+
+fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
+    // Even a read-only WAL connection can create empty journal sidecars before
+    // rejecting an unsupported layout. When no journal exists, inspect only
+    // for an early refusal without creating one. Presence includes dangling
+    // symlinks; an uncertain namespace never qualifies for this shortcut.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        match std::fs::symlink_metadata(std::path::PathBuf::from(sidecar)) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // This is deliberately NOT admission: immutable disables locking and may
+    // see stale/inconsistent data if a writer starts after the absence checks.
+    // That can cause a harmless refusal, never authorization. Every successful
+    // path still takes the normal pinned reader and authoritative writer above.
+    // Use the default SQLite VFS so closing this connection still respects the
+    // other connections' same-process POSIX lock ownership.
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let mut uri = url::Url::from_file_path(absolute)
+        .map_err(|_| "workspace registry path cannot be represented as a file URL")?;
+    uri.query_pairs_mut()
+        .append_pair("mode", "ro")
+        .append_pair("immutable", "1");
+    let db = Connection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    let inspected = inspect(&db)?;
+    if inspected.version >= 12 {
+        require_open_layout(&db, inspected.version)?;
+    }
+    drop(db);
+    checkpoint("prechecked")?;
+    Ok(())
 }
 
 fn inspect(db: &Connection) -> Result<Inspection, String> {
@@ -1332,6 +1378,110 @@ mod tests {
         assert!(Registry::at(&path).err().unwrap().contains("newer"));
         assert_eq!(bytes(&path), original);
         assert_eq!(bytes(&wal(&path)), original_wal);
+    }
+
+    #[test]
+    fn unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename() {
+        use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
+        for future in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // URI metacharacters and a non-UTF8 byte are literal filename data.
+            let path = dir.path().join(std::ffi::OsString::from_vec(
+                b"refusal ?#%\xff.sqlite3".to_vec(),
+            ));
+            drop(Registry::at(&path).unwrap());
+            let db = Connection::open(&path).unwrap();
+            if future {
+                db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                    .unwrap();
+            } else {
+                db.execute_batch("CREATE TABLE unknown_refusal(value TEXT) STRICT;")
+                    .unwrap();
+            }
+            // A normal last SQLite close checkpoints and removes the sidecars,
+            // leaving the persistent WAL-mode header in the original database.
+            drop(db);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let original = bytes(&path);
+            let metadata = std::fs::metadata(&path).unwrap();
+            let sidecars = ["-wal", "-shm", "-journal"].map(|suffix| {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                std::path::PathBuf::from(name)
+            });
+            assert_eq!(&original[18..20], &[2, 2], "actual WAL-mode header");
+            assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
+            let error = Registry::at(&path).err().expect("must refuse");
+            assert!(
+                if future {
+                    error.contains("newer")
+                } else {
+                    error.contains("layout does not match published schema")
+                },
+                "{error}"
+            );
+            assert_eq!(bytes(&path), original);
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!((after.dev(), after.ino()), (metadata.dev(), metadata.ino()));
+            assert_eq!(after.permissions().mode() & 0o777, 0o640);
+            assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
+        }
+    }
+
+    #[test]
+    fn immutable_precheck_cannot_admit_a_later_writer_or_new_wal() {
+        let _clear = Clear;
+        for future in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prechecked.sqlite3");
+            drop(Registry::at(&path).unwrap());
+            // Prepare a current WAL database without sidecars, just as after
+            // an external writer's ordinary last close.
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            drop(db);
+            assert!(!wal(&path).exists());
+            let saved = Rc::new(std::cell::RefCell::new(None));
+            let observed = Rc::clone(&saved);
+            let target = path.clone();
+            hook(move |stage| {
+                if stage == "prechecked" {
+                    let writer = connect(&target, false)?;
+                    if future {
+                        writer
+                            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                            .map_err(|error| error.to_string())?;
+                    } else {
+                        writer
+                            .execute_batch("CREATE TABLE concurrent_unknown(value TEXT) STRICT;")
+                            .map_err(|error| error.to_string())?;
+                    }
+                    drop(writer);
+                    *observed.borrow_mut() = Some((bytes(&target), bytes(&wal(&target))));
+                }
+                Ok(())
+            });
+            let error = Registry::at(&path)
+                .err()
+                .expect("immutable precheck must never authorize a later writer");
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+            assert!(
+                if future {
+                    error.contains("newer")
+                } else {
+                    error.contains("layout does not match published schema")
+                },
+                "{error}"
+            );
+            let (original, original_wal) = saved.borrow_mut().take().unwrap();
+            assert!(!original_wal.is_empty(), "actual newly created WAL");
+            assert_eq!(bytes(&path), original);
+            assert_eq!(bytes(&wal(&path)), original_wal);
+        }
     }
 
     #[test]
