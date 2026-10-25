@@ -950,9 +950,10 @@ impl Store {
         Ok((key, home))
     }
 
-    /// Forget and park under the same lifecycle lock as spawning. A failed
-    /// deletion cannot make an unregistered home launchable again; the sweep
-    /// finishes parked trees later. Linked aliases still protect their home.
+    // Legacy destructive fixture support only. Product lifecycle operations
+    // require daemon admission and preserve managed/abandoned home files.
+    // Registry absence or an old parked name grants no deletion authority.
+    #[cfg(test)]
     pub fn remove_home(
         &self,
         homes: &Homes,

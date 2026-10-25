@@ -1032,12 +1032,12 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
         0 => iced::widget::Space::new().into(),
         count => design::caption(if linked {
             format!(
-                "{count} open {} on this home and will keep running.",
-                if count == 1 { "card runs" } else { "cards run" }
+                "{count} open {} this home. The daemon refuses to forget it while a hosted process uses it.",
+                if count == 1 { "card uses" } else { "cards use" }
             )
         } else {
             format!(
-                "{count} open {} this account. Running processes are not stopped, but may lose access after sign-out.",
+                "{count} open {} this account. Its processes, login and files are kept; managed account removal is unavailable.",
                 if count == 1 { "card uses" } else { "cards use" },
             )
         })
@@ -1056,14 +1056,16 @@ fn menu<'a>(
     let id = &account.id;
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
         widget::column::with_children(vec![
-            design::body(format!("Remove {}?", state.display_name(account))).into(),
+            design::body(if account.account.is_linked() {
+                format!("Forget {}?", state.display_name(account))
+            } else {
+                "Managed account removal is unavailable".into()
+            })
+            .into(),
             design::caption(if account.account.is_linked() {
                 "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
             } else {
-                format!(
-                    "{} signs this account out and cagents deletes its files. Resuming saved conversations will require choosing another account that can access them.",
-                    probe::cli_name(account.account.provider)
-                )
+                "This build keeps this account registered, with its login, conversations and files unchanged. It cannot safely delete a managed account.".to_owned()
             })
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
@@ -1073,8 +1075,12 @@ fn menu<'a>(
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press(action(Action::RemoveCancel))
                     .into(),
-                crate::ui_controls::button::destructive("Remove")
-                    .on_press(action(Action::RemoveConfirm(id.clone())))
+                crate::ui_controls::button::destructive(if account.account.is_linked() {
+                    "Forget home"
+                } else {
+                    "Removal unavailable"
+                })
+                    .on_press_maybe(account.account.is_linked().then(|| action(Action::RemoveConfirm(id.clone()))))
                     .into(),
             ])
             .spacing(space::S)
@@ -1181,14 +1187,15 @@ fn menu<'a>(
             items.push(
                 crate::ui_controls::popover_item(
                     Icon::Minus,
-                    "Remove",
+                    if account.account.is_linked() { "Forget home" } else { "Removal unavailable" },
                     if account.account.is_linked() {
                         "Forget this home without changing its files"
                     } else {
-                        "Sign out and delete this account's files"
+                        "Managed account removal is unavailable; its login, conversations and files are kept"
                     },
                     action(Action::Remove(id.clone())),
                 )
+                .on_press_maybe(account.account.is_linked().then(|| action(Action::Remove(id.clone()))))
                 .into(),
             );
         }
@@ -1400,5 +1407,108 @@ mod tests {
         table.escape();
         assert_eq!(table.rename, None);
         assert!(!table.has_popup());
+    }
+
+    #[test]
+    fn removal_menus_keep_managed_files_and_only_allow_linked_forget() {
+        use iced::advanced::{clipboard, widget::Operation};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Rectangle, Size, mouse};
+
+        #[derive(Default)]
+        struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.into(), bounds));
+            }
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 1087);
+        let directory = tempfile::tempdir().unwrap();
+        let linked_home = directory.path().join("linked");
+        std::fs::create_dir(&linked_home).unwrap();
+        let linked_key = uuid::Uuid::new_v4();
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .link(
+                Provider::Codex,
+                linked_key,
+                linked_home.clone(),
+                None,
+                app.account_ui.homes.as_ref(),
+                1,
+            )
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        let linked = Account::linked(Provider::Codex, linked_key, linked_home).id();
+        let mut renderer = crate::app::tests::headless_renderer();
+        for width in [700.0, 320.0] {
+            for (id, enabled) in [(managed.clone(), false), (linked.clone(), true)] {
+                app.account_ui.table.confirm_remove = Some(id.clone());
+                app.account_ui.table.confirm_in_use = 1;
+                let account = app.account_ui.account(&id).unwrap();
+                let element = menu(&app, account, None);
+                let mut ui = UserInterface::build(
+                    element,
+                    Size::new(width, 600.0),
+                    Cache::new(),
+                    &mut renderer,
+                );
+                let mut texts = Texts::default();
+                ui.operate(&renderer, &mut texts);
+                let button = if enabled {
+                    "Forget home"
+                } else {
+                    "Removal unavailable"
+                };
+                assert!(!texts.0.iter().any(|(text, _)| text.contains("Resuming saved conversations will require")));
+                let caption = if enabled {
+                    "This only removes the home from cagents. Its login, sessions and files stay where they are."
+                } else {
+                    "This build keeps this account registered, with its login, conversations and files unchanged. It cannot safely delete a managed account."
+                };
+                let bounds = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == caption)
+                    .expect("visible truthful caption")
+                    .1;
+                assert!(bounds.width > 0.0 && bounds.height > 0.0 && bounds.height.is_finite());
+                assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.1);
+                assert!(bounds.y + bounds.height < 600.0);
+                let target = texts
+                    .0
+                    .iter()
+                    .find(|(text, _)| text == button)
+                    .expect("button label")
+                    .1;
+                let point = Point::new(target.center_x(), target.center_y());
+                let mut messages = Vec::new();
+                let _ = ui.update(
+                    &[
+                        Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    ],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                if enabled {
+                    assert!(
+                        matches!(messages.as_slice(), [Message::AccountUi(Action::RemoveConfirm(received))] if *received == id)
+                    );
+                } else {
+                    assert!(
+                        messages.is_empty(),
+                        "managed removal has no native callback"
+                    );
+                }
+            }
+        }
     }
 }
