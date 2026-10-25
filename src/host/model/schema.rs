@@ -227,6 +227,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static SIXTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -235,6 +236,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         16 => &SIXTEEN,
         17 => &SEVENTEEN,
         18 => &EIGHTEEN,
+        19 => &NINETEEN,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -721,6 +723,15 @@ mod tests {
             (17, "DROP TABLE channel_work_homes;"),
             (18, "DROP TABLE channel_work_placement_epochs;"),
             (18, "DROP TABLE channel_work_placement_clock;"),
+            (19, "DROP TABLE automation_notifications;"),
+            (
+                19,
+                "ALTER TABLE automation_notifications RENAME COLUMN sequence TO changed_sequence;",
+            ),
+            (
+                19,
+                "ALTER TABLE automation_notifications ADD COLUMN unknown_payload TEXT;",
+            ),
             (
                 18,
                 "ALTER TABLE channel_work_placement_clock RENAME COLUMN last_epoch TO changed_epoch;",
@@ -865,6 +876,157 @@ mod tests {
             drop(registry);
             assert_eq!(Registry::at(&path).unwrap().model().unwrap(), model);
         }
+    }
+
+    #[test]
+    fn published_eighteen_adds_only_empty_attention_outbox_and_preserves_audit() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, LifecycleCause, Schedule, SchedulePattern,
+                SessionMode,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention18.sqlite3");
+        let (identity, channel) = legacy(&path, 18);
+        let mut db = Connection::open(&path).unwrap();
+        // Use the published predecessor's transaction writers. No outbox DDL,
+        // schema-admission bypass or live scheduler/provider is needed.
+        let tx = db.transaction().unwrap();
+        let automation = super::super::automations::create_automation_in(
+            &tx,
+            Definition {
+                name: "Preserved private name".into(),
+                prompt: "Preserved private prompt".into(),
+                agent: Spec {
+                    provider: Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: "/kept".into(),
+                        directory: "/kept".into(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                },
+                schedule: Schedule {
+                    pattern: SchedulePattern::Daily { hour: 9, minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Reuse,
+                precheck: None,
+            },
+            100,
+            DirectoryIdentity {
+                device: 1,
+                inode: 1,
+            },
+            None,
+        )
+        .unwrap();
+        // A historical actionable cause is retained audit, not fresh attention.
+        super::super::automation_audit::record(
+            &tx,
+            &automation,
+            LifecycleCause::ProjectClosed,
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let old_layout = inspect(&db).unwrap().objects;
+        let audit_rows = |db: &Connection| {
+            db.prepare("SELECT sequence,automation,repository,record FROM automation_lifecycle ORDER BY sequence")
+                .unwrap()
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let historical = audit_rows(&db);
+        assert_eq!(historical.len(), 2);
+        assert!(
+            !old_layout
+                .iter()
+                .any(|object| object.1 == "automation_notifications")
+        );
+        drop(db);
+        for _ in 0..2 {
+            let registry = Registry::at(&path).unwrap();
+            require_current(&registry.db).unwrap();
+            assert_eq!(inspect(&registry.db).unwrap().version, 19);
+            let mut inventory = inspect(&registry.db).unwrap().objects;
+            let outbox = inventory
+                .iter()
+                .position(|object| object.1 == "automation_notifications")
+                .unwrap();
+            assert_eq!(
+                inventory.remove(outbox),
+                (
+                    "table".into(),
+                    "automation_notifications".into(),
+                    "automation_notifications".into(),
+                    tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
+                )
+            );
+            assert_eq!(inventory, old_layout, "only the outbox table may be added");
+            assert!(
+                registry
+                    .pending_automation_notifications(100)
+                    .unwrap()
+                    .is_empty(),
+                "migration must not backfill even an actionable historical audit cause"
+            );
+            assert_eq!(audit_rows(&registry.db), historical);
+            assert_eq!(registry.automation(automation.id).unwrap(), automation);
+            let model = registry.model().unwrap();
+            assert_eq!(model.identity.to_string(), identity);
+            assert_eq!(model.sequence, 7);
+            assert_eq!(model.projects[0].ordinal, 4);
+            assert_eq!(model.channels[0].id, channel);
+            assert_eq!(model.channels[0].ordinal, 5);
+        }
+    }
+
+    #[test]
+    fn failed_eighteen_to_nineteen_rolls_back_outbox_and_published_header() {
+        let _clear = Clear;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention18-rollback.sqlite3");
+        let (identity, channel) = legacy(&path, 18);
+        let before = bytes(&path);
+        let old_layout = inspect(&Connection::open(&path).unwrap()).unwrap();
+        FAIL_STEP.with(|step| step.set(Some(19)));
+        let error = Registry::at(&path).err().expect("injected step19 failure");
+        FAIL_STEP.with(|step| step.set(None));
+        assert!(error.contains("failure at 19"), "{error}");
+        assert_eq!(bytes(&path), before);
+        assert!(!wal(&path).exists());
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(inspect(&db).unwrap(), old_layout);
+        assert_eq!(old_layout.version, 18);
+        assert!(
+            !old_layout
+                .objects
+                .iter()
+                .any(|object| object.1 == "automation_notifications")
+        );
+        drop(db);
+        let registry = Registry::at(&path).unwrap();
+        require_current(&registry.db).unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(model.identity.to_string(), identity);
+        assert_eq!(model.sequence, 7);
+        assert_eq!(model.channels[0].id, channel);
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1079,7 +1241,9 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
+        for step in [
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
