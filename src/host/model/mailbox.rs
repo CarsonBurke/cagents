@@ -665,7 +665,12 @@ mod tests {
             .unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
         let tx = registry
             .db
@@ -896,7 +901,12 @@ mod tests {
         registry.post_message(&last).unwrap();
         registry
             .db
-            .execute_batch("DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;")
+            .execute_batch(
+                "DROP TABLE channel_work_operations;
+                DROP TABLE channel_work_entries;
+                DROP TABLE channel_work_homes;
+                DROP TABLE mailbox_attention_heads; PRAGMA user_version=11;",
+            )
             .unwrap();
         let tx = registry
             .db
