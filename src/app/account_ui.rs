@@ -5072,21 +5072,28 @@ impl Cagents {
                     .into(),
             );
         }
-        let mut items: Vec<Element<'a, Message>> = vec![
+        let mut identity: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::provider_icon(account.account.provider))
                 .size(design::ROW_ICON_SIZE)
                 .into(),
             widget::column::with_children(title)
-                .width(Length::Shrink)
+                .width(Length::Fill)
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            items.push(crate::ui_controls::badge(
+            identity.push(crate::ui_controls::badge(
                 plan,
                 design::Tone::Themed(design::accent_color),
             ));
         }
-        items.push(iced::widget::Space::new().width(Length::Fill).into());
+        // Reserve the trailing actions before measuring any identity metadata.
+        let mut items: Vec<Element<'a, Message>> = vec![
+            widget::row::with_children(identity)
+                .width(Length::Fill)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        ];
         if account.present || account.snapshot.is_some() {
             items.push(refresh_control(account, now).into());
         }
@@ -5099,6 +5106,7 @@ impl Cagents {
             );
         }
         widget::row::with_children(items)
+            .width(Length::Fill)
             .spacing(space::S)
             .align_y(Alignment::Center)
             .into()
@@ -5106,8 +5114,15 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self)
+        table::view(self).map(pane_message)
     }
+}
+
+/// Preserve every callback's pane origin, including responsive children and
+/// overlays. Shared global controls and accepted task completions are not
+/// wrapped: only these completed workspace pane views use this boundary.
+pub(super) fn pane_message(message: Message) -> Message {
+    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {
@@ -5365,6 +5380,16 @@ impl State {
             state.present = true;
         }
         id
+    }
+
+    /// Changes only the synthetic in-memory registry; never writes a Store.
+    pub(super) fn set_fixture_label(&mut self, id: &AccountId, label: Option<&str>) {
+        let account = self
+            .account(id)
+            .expect("registered fixture account")
+            .account
+            .clone();
+        self.registry.set_label(&account, label.map(str::to_owned));
     }
 
     pub(super) fn snapshot_for_test(&self, id: &AccountId) -> Option<&UsageSnapshot> {
@@ -8378,6 +8403,101 @@ mod app_tests {
             "a read under way is not started again"
         );
     }
+    #[test]
+    fn account_popover_header_reserves_actions_before_long_plan_metadata() {
+        use iced::advanced::{clipboard, mouse};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        let mut renderer = crate::app::tests::headless_renderer();
+        for plan in ["pro".to_owned(), "unrecognized_provider_plan_".repeat(64)] {
+            let mut app = context_inspector_test_app(false);
+            app.window_height = 600.0;
+            let shown = app.account_ui.add_managed_fixture(Provider::Claude, 9913);
+            let mut usage = UsageSnapshot::state(UsageStatus::Ok, "fixture", NOW);
+            usage.plan = Some(plan.clone());
+            app.account_ui.account_mut(&shown).unwrap().snapshot = Some(usage);
+            let account = app.account_ui.account(&shown).unwrap();
+            let content = app.account_popover_body(
+                Provider::Claude,
+                vec![app.account_details(account, NOW, Placement::Popover)],
+            );
+            let mut ui = UserInterface::build(
+                content,
+                iced::Size::new(320.0, 600.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let tree = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let control = |label: &str| {
+                let found = tree
+                    .root()
+                    .iter()
+                    .chain(tree.children())
+                    .filter(|node| node.node().label() == Some(label))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "one actual {label} control for plan {plan:?}"
+                );
+                let bounds = found[0].node().bounds().expect("control geometry");
+                iced::Rectangle {
+                    x: bounds.x0 as f32,
+                    y: bounds.y0 as f32,
+                    width: (bounds.x1 - bounds.x0) as f32,
+                    height: (bounds.y1 - bounds.y0) as f32,
+                }
+            };
+            let refresh = control("Check now");
+            let popout = control("Open in the Accounts pane");
+            for bounds in [refresh, popout] {
+                assert!(
+                    bounds.x.is_finite() && bounds.y.is_finite(),
+                    "finite target: {bounds:?}"
+                );
+                assert_eq!(
+                    bounds.width,
+                    design::COMPACT_CONTROL_SIZE,
+                    "full target for {plan:?}"
+                );
+                assert_eq!(bounds.height, design::COMPACT_CONTROL_SIZE);
+                assert!(
+                    bounds.x >= 0.0
+                        && bounds.x + bounds.width <= 320.0
+                        && bounds.y >= 0.0
+                        && bounds.y + bounds.height <= 600.0,
+                    "target stays inside actual320px popup: {bounds:?}"
+                );
+            }
+            assert!(
+                refresh.x + refresh.width <= popout.x,
+                "separate targets: {refresh:?} {popout:?}"
+            );
+            let point = popout.center();
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(
+                matches!(messages.as_slice(), [Message::AccountUi(Action::OpenPane)]),
+                "actual long-plan popout callbacks: {messages:?}"
+            );
+        }
+    }
+
     #[test]
     fn account_popover_scroll_reaches_last_account_inside_short_window() {
         use iced::advanced::{

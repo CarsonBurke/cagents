@@ -497,6 +497,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
             // Migration is additive, including old independent windows. Closed
@@ -567,7 +568,9 @@ pub(super) fn apply(
                             .revision
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
-                        write(transaction, &target)?;
+                        // Publish only after the source relinquishes its
+                        // active placement, inside this same transaction.
+                        deferred_target = Some(target);
                         transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
@@ -673,6 +676,9 @@ pub(super) fn apply(
             .ok_or("view revision exhausted")?;
         write(transaction, &view)?;
     }
+    if let Some(target) = deferred_target {
+        write(transaction, &target)?;
+    }
     Ok(changed || !existed)
 }
 
@@ -755,6 +761,7 @@ pub(super) fn adopt_authenticated_agent_pane(
         return Ok(false);
     };
     let mut view = read(db, &scope)?;
+    let before = view.clone();
     if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
         return Ok(false);
     }
@@ -808,6 +815,7 @@ pub(super) fn adopt_authenticated_agent_pane(
         .revision
         .checked_add(1)
         .ok_or("view revision exhausted")?;
+    channel_work::placement::observe_view_transition(db, &before, &view)?;
     // Holder continuity does not start a new channel naming choice, including
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
@@ -823,7 +831,48 @@ pub(super) fn adopt_authenticated_agent_pane(
     Ok(true)
 }
 
+/// Record removal before foreign-key cascades erase canonical membership.
+/// Like normal view writes, this must participate in the deleting transaction.
+pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
+    retire_scope_placements(db, &Scope::Channel(channel))
+}
+
+pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
+    if db.is_autocommit() {
+        return Err("Placement removal requires the canonical view transaction".into());
+    }
+    let repository = repository_key(repository)?;
+    let scopes = {
+        let mut statement = db
+            .prepare(
+                "SELECT s.scope FROM shared_view_scopes s
+             LEFT JOIN channels c ON c.id=s.channel
+             WHERE s.repository=?1 OR c.repository=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([repository], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
+    };
+    for raw in scopes {
+        let scope = parse_scope(&raw)?;
+        retire_scope_placements(db, &scope)?;
+    }
+    Ok(())
+}
+
+fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
+    let before = read(db, scope)?;
+    let mut after = before.clone();
+    after.panes.clear();
+    channel_work::placement::observe_view_transition(db, &before, &after)
+}
+
 fn write(db: &Connection, view: &View) -> Result<(), String> {
+    let before = read(db, &view.scope)?;
+    channel_work::placement::observe_view_transition(db, &before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
             view.panes.iter().find_map(|pane| match &pane.kind {
@@ -836,7 +885,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
                 _ => None,
             })
         };
-        if primary(&read(db, &view.scope)?) != primary(view) {
+        if primary(&before) != primary(view) {
             // A new primary conversation starts a new automatic naming choice.
             // Manual/legacy names describe the channel and survive all moves.
             db.execute(
@@ -2106,4 +2155,6 @@ mod tests {
             assert_eq!(replay.agent.placement, Scope::Channel(a));
         }
     }
+
+    include!("views/placement_tests.rs");
 }
