@@ -1151,6 +1151,15 @@ impl State {
             if !self.can_open_run() {
                 return None;
             }
+            if self
+                .run
+                .as_ref()
+                .and_then(|detail| detail.run.as_ref())
+                .map(|current| current.id)
+                != Some(run)
+            {
+                self.notice = None;
+            }
             // Notification activation can race a restored card's initial list
             // read. Supersede reads using the request sequence; never discard
             // a user's draft, consent, or an in-flight mutation.
@@ -1250,6 +1259,9 @@ impl State {
         self.confirmation = None;
         match action {
             Action::Browse => {
+                if self.selected.is_some() || self.run.is_some() || self.all_history {
+                    self.notice = None;
+                }
                 self.run = None;
                 self.selected = None;
                 self.lifecycle = None;
@@ -1300,6 +1312,12 @@ impl State {
                 self.run = None;
             }
             Action::Select(id) => {
+                if self.selected.as_ref().map(|automation| automation.id) != Some(id)
+                    || self.run.is_some()
+                    || self.all_history
+                {
+                    self.notice = None;
+                }
                 self.draft = None;
                 self.all_history = false;
                 self.selected = None;
@@ -1533,6 +1551,9 @@ impl State {
             }
             Action::History | Action::MoreHistory | Action::AllHistory => {
                 if matches!(action, Action::AllHistory) {
+                    if !self.all_history || self.selected.is_some() || self.run.is_some() {
+                        self.notice = None;
+                    }
                     self.all_history = true;
                     self.history.clear();
                     self.history_newer = false;
@@ -1558,8 +1579,18 @@ impl State {
                     );
                 }
             }
-            Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
-            Action::CloseRun => self.run = None,
+            Action::Run(id) => {
+                if self.run.as_ref().map(|detail| detail.firing.id) != Some(id) {
+                    self.notice = None;
+                }
+                return self.request(Pending::Run, Request::ShowFiring { id });
+            }
+            Action::CloseRun => {
+                if self.run.is_some() {
+                    self.notice = None;
+                }
+                self.run = None;
+            }
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(
@@ -5893,6 +5924,294 @@ mod tests {
         assert!(state.loaded_list_refresh.is_none());
         assert!(!state.list_changed);
         assert!(state.selected.is_none() && state.draft.is_none() && state.history.is_empty());
+    }
+
+    #[test]
+    fn completed_run_notice_stays_with_its_automation_and_not_a_new_selection() {
+        use crate::automations::{FiringState, HistoryPage, Trigger};
+
+        fn receive_automation(state: &mut State, sequence: u64, value: Automation) {
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id, .. },
+            }) = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Automation(value.clone()))),
+            })
+            else {
+                panic!("the selected definition reads its history")
+            };
+            assert_eq!(id, Some(value.id));
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::History(HistoryPage {
+                    firings: Vec::new(),
+                    next: None,
+                }))),
+            });
+        }
+        let a = automation();
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.definition.name = "Unrequested automation B".into();
+        let mut state = State {
+            rows: vec![a.summary(None), b.summary(None)],
+            selected: Some(a.clone()),
+            ..Default::default()
+        };
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { id, request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("explicit run A")
+        };
+        assert_eq!(id, a.id);
+        let mut firing = history_firing(100, FiringState::Accepted);
+        firing.automation = a.id;
+        firing.trigger = Trigger::Manual { request };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Firing(firing))),
+        });
+        let message = "Run requested: Queued";
+        assert_eq!(state.notice.as_deref(), Some(message));
+        Outline::of(&state, 900.0, 700.0).text(message);
+
+        // Ordinary reads of A preserve its own confirmation, including an
+        // explicit same-subject selection and a list-based Refresh.
+        for action in [Action::Tick, Action::Select(a.id)] {
+            let Some(Effect::Request {
+                sequence,
+                request: Request::Show { id },
+            }) = state.update(action)
+            else {
+                panic!("same A read")
+            };
+            assert_eq!(id, a.id);
+            receive_automation(&mut state, sequence, a.clone());
+            assert_eq!(state.notice.as_deref(), Some(message));
+        }
+        let Some(Effect::Request {
+            sequence,
+            request: Request::List { .. },
+        }) = state.update(Action::Refresh)
+        else {
+            panic!("explicit Refresh")
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![
+                a.summary(None),
+                b.summary(None),
+            ]))),
+        })
+        else {
+            panic!("Refresh reloads A")
+        };
+        assert_eq!(id, a.id);
+        receive_automation(&mut state, sequence, a.clone());
+        assert_eq!(state.notice.as_deref(), Some(message));
+
+        // Refused navigation cannot consume the prior confirmation or an
+        // accepted/uncertain request's original UUID.
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("second explicit run A")
+        };
+        assert!(state.update(Action::Select(b.id)).is_none());
+        assert_eq!(state.selected.as_ref().unwrap().id, a.id);
+        assert_eq!(state.notice.as_deref(), Some(message));
+        assert_eq!(
+            state.manual_requests.get(&a.id),
+            Some(&(a.execution_revision, request))
+        );
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("Unobserved fixture reply".into())),
+        });
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Select(b.id))
+        else {
+            panic!("accepted selection B")
+        };
+        assert_eq!(id, b.id);
+        receive_automation(&mut state, sequence, b.clone());
+        assert_eq!(state.selected.as_ref().unwrap().id, b.id);
+        assert!(state.notice.is_none());
+        assert_eq!(
+            state.manual_requests.get(&a.id),
+            Some(&(a.execution_revision, request))
+        );
+        for width in [900.0, 360.0] {
+            assert!(
+                !Outline::of(&state, width, 700.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == message)
+            );
+        }
+
+        // A removal already returned to the list has no selected subject to
+        // leave: refreshing that list should retain its useful confirmation.
+        state.update(Action::Remove);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Remove { id, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("explicit remove B")
+        };
+        assert_eq!(id, b.id);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Removed)),
+        });
+        let removed = state.notice.clone();
+        assert!(state.selected.is_none());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
+            panic!("already-list Browse")
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Listed(vec![a.summary(None)]))),
+        });
+        assert_eq!(state.notice, removed);
+    }
+
+    #[test]
+    fn cancellation_notice_retires_only_when_accepted_navigation_leaves_its_run() {
+        fn detail(owner: &Automation) -> RunDetail {
+            let mut value = run_of(owner);
+            let run = crate::model::RunId::new();
+            value.firing.state = crate::automations::FiringState::Running;
+            value.firing.run = Some(run);
+            value.run = Some(crate::agent_execution::Run {
+                id: run,
+                agent: crate::model::AgentId::new(),
+                state: crate::agent_execution::State::Running,
+                revision: 1,
+                accepted_ms: 100,
+                started_ms: Some(100),
+                finished_ms: None,
+                provider_key: None,
+                result: Default::default(),
+            });
+            value
+        }
+        fn canceled(owner: &Automation, firing: &RunDetail) -> State {
+            let mut state = State {
+                selected: Some(owner.clone()),
+                ..Default::default()
+            };
+            let Some(Effect::Request {
+                sequence,
+                request: Request::ShowFiring { id },
+            }) = state.update(Action::Run(firing.firing.id))
+            else {
+                panic!("open actual firing")
+            };
+            assert_eq!(id, firing.firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(firing.clone()))),
+            });
+            let Some(Effect::Request {
+                sequence,
+                request:
+                    Request::Cancel {
+                        id,
+                        firing: requested,
+                    },
+            }) = state.update(Action::CancelRun)
+            else {
+                panic!("explicit cancel")
+            };
+            assert_eq!((id, requested), (owner.id, firing.firing.id));
+            assert!(
+                state
+                    .update(Action::InspectRun(crate::model::RunId::new()))
+                    .is_none()
+            );
+            assert_eq!(state.run.as_ref().unwrap().firing.id, firing.firing.id);
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::CancellationRequested)),
+            });
+            state
+        }
+        let owner = automation();
+        let first = detail(&owner);
+        let other = detail(&owner);
+        let message = "Cancellation requested. Refresh the run for its confirmed outcome.";
+        let mut state = canceled(&owner, &first);
+        assert_eq!(state.notice.as_deref(), Some(message));
+        Outline::of(&state, 900.0, 700.0).text(message);
+        // Same firing read through normal tick, Refresh, row selection and
+        // notification activation is not a new subject or completion.
+        for action in [
+            Action::Tick,
+            Action::Refresh,
+            Action::Run(first.firing.id),
+            Action::InspectRun(first.run.as_ref().unwrap().id),
+        ] {
+            let Some(Effect::Request { sequence, .. }) = state.update(action) else {
+                panic!("read the same run")
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(first.clone()))),
+            });
+            assert_eq!(state.notice.as_deref(), Some(message));
+            assert_eq!(
+                state.run.as_ref().unwrap().firing.state,
+                crate::automations::FiringState::Running
+            );
+        }
+        for action in [
+            Action::Run(other.firing.id),
+            Action::InspectRun(other.run.as_ref().unwrap().id),
+        ] {
+            let mut state = canceled(&owner, &first);
+            let Some(Effect::Request { sequence, request }) = state.update(action) else {
+                panic!("accepted other run read")
+            };
+            assert!(
+                matches!(request, Request::ShowFiring { id } if id == other.firing.id)
+                    || matches!(request, Request::ShowRun { run } if run == other.run.as_ref().unwrap().id)
+            );
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(other.clone()))),
+            });
+            assert_eq!(state.run.as_ref().unwrap().firing.id, other.firing.id);
+            assert!(state.notice.is_none());
+            assert!(
+                !Outline::of(&state, 360.0, 700.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == message)
+            );
+        }
+        for action in [Action::CloseRun, Action::Browse, Action::AllHistory] {
+            let mut state = canceled(&owner, &first);
+            state.update(action);
+            assert!(state.run.is_none());
+            assert!(state.notice.is_none());
+        }
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
