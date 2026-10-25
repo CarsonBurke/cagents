@@ -20,6 +20,7 @@ use thiserror::Error;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
+mod channel_work;
 mod channels;
 mod chat;
 pub use chat::ChatCommand;
@@ -388,6 +389,11 @@ pub enum ProjectCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ChannelCommand {
+    /// Inspect and declare the work this channel is progressing.
+    Work {
+        #[command(subcommand)]
+        command: channel_work::WorkCommand,
+    },
     /// Move a live pane, hosted session or agent into another channel.
     Move {
         /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
@@ -1531,6 +1537,21 @@ impl ControlClient {
         self.request_strict(request)
     }
 
+    pub(crate) fn channel_work(
+        &mut self,
+        authority: Authority,
+        request: crate::channel_work_api::Request,
+        timeout: Duration,
+    ) -> Result<crate::channel_work_api::Response, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChannelWork { authority, request },
+            Instant::now() + timeout,
+        )? {
+            ServerResponse::ChannelWork(response) => Ok(response),
+            response => Err(unexpected_response("channel_work", &response)),
+        }
+    }
+
     fn request_strict(&mut self, request: ClientRequest) -> Result<ServerResponse, ControlError> {
         self.request(request, None)
     }
@@ -1973,6 +1994,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
+        ServerResponse::ChannelWork(_) => "channel_work",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -3625,6 +3647,10 @@ fn project_line(project: &ModelProject) -> String {
 /// point of the shared model is that a channel exists whether or not a window
 /// is running to show it.
 fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
+    let command = match command {
+        ChannelCommand::Work { command } => return channel_work::execute(command),
+        command => command,
+    };
     // Reject invalid filesystem paths before starting a daemon. The shared
     // registry then takes precedence over fresh Git discovery for open folders.
     let selected = match &command {
@@ -3678,6 +3704,9 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
+            Self::Work { .. } => {
+                unreachable!("channel work is dispatched before legacy channel resolution")
+            }
             Self::Move { target, to } => ResolvedChannel::Move { target, to },
             Self::Spawn { repository, title } => {
                 let location = resolve_project_location(repository, model)?;
