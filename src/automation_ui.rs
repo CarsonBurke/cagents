@@ -6080,7 +6080,9 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Ok(Response::Removed)),
         });
-        let removed = state.notice.clone();
+        let removed = "Automation removed. Past runs remain in history.";
+        assert_eq!(state.notice.as_deref(), Some(removed));
+        Outline::of(&state, 900.0, 700.0).text(removed);
         assert!(state.selected.is_none());
         let Some(Effect::Request { sequence, .. }) = state.update(Action::Browse) else {
             panic!("already-list Browse")
@@ -6089,7 +6091,8 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Ok(Response::Listed(vec![a.summary(None)]))),
         });
-        assert_eq!(state.notice, removed);
+        assert_eq!(state.notice.as_deref(), Some(removed));
+        Outline::of(&state, 900.0, 700.0).text(removed);
     }
 
     #[test]
