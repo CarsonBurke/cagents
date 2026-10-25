@@ -99,6 +99,12 @@ pub enum Request {
         mutation: Mutation,
         caller: Option<Caller>,
     },
+    /// A native actor may inspect only its actual retained launch directory.
+    /// It supplies no directory name or physical identity on the wire.
+    PrepareOwnLocal {
+        home: Home,
+        caller: Option<Caller>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +183,10 @@ mod tests {
                 Request::PrepareLocal {
                     home: selected.home,
                     directory: selected.context.path.clone(),
+                    caller: None,
+                },
+                Request::PrepareOwnLocal {
+                    home: selected.home,
                     caller: None,
                 },
                 Request::ApplySelection {

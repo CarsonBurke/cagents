@@ -144,7 +144,7 @@ pub struct Contributor {
 }
 
 impl Contributor {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.session.as_uuid().is_nil()
             || self.lineage.0.as_uuid().is_nil()
             || self.agent.is_some_and(|id| id.as_uuid().is_nil())

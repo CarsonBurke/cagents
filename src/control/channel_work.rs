@@ -49,10 +49,22 @@ pub enum WorkCommand {
         #[arg(long)]
         save_request: Option<PathBuf>,
     },
-    /// Track an explicitly selected worktree, after daemon-side physical validation.
+    /// Track a user-selected worktree, after daemon-side physical validation (interactive user only).
     TrackLocal {
         /// Absolute checkout directory on the selected device.
         directory: PathBuf,
+        /// Relationship: contribute, steward, review, or reference.
+        #[arg(value_parser = parse_role)]
+        role: Role,
+        /// Channel UUID; omit to use your authenticated session's channel.
+        #[arg(long)]
+        channel: Option<ChannelId>,
+        /// Save the exact safe request before sending it. The path must not exist.
+        #[arg(long)]
+        save_request: Option<PathBuf>,
+    },
+    /// Track this authenticated native session's original launch checkout, without choosing a directory.
+    TrackOwnLocal {
         /// Relationship: contribute, steward, review, or reference.
         #[arg(value_parser = parse_role)]
         role: Role,
@@ -155,6 +167,11 @@ fn parse_pull_request(value: &str) -> Result<Target, String> {
         .map_err(|_| "The PR identity is invalid".into())
 }
 
+enum LocalSource {
+    Directory(PathBuf),
+    OwnLaunch,
+}
+
 enum Prepared {
     Context(Option<ChannelId>),
     Show(Option<ChannelId>, Page),
@@ -165,7 +182,7 @@ enum Prepared {
     },
     Local {
         channel: Option<ChannelId>,
-        directory: PathBuf,
+        source: LocalSource,
         role: Role,
         save: Option<PathBuf>,
     },
@@ -209,11 +226,21 @@ impl Prepared {
                 }
                 Self::Local {
                     channel,
-                    directory,
+                    source: LocalSource::Directory(directory),
                     role,
                     save: save_request,
                 }
             }
+            WorkCommand::TrackOwnLocal {
+                role,
+                channel,
+                save_request,
+            } => Self::Local {
+                channel,
+                source: LocalSource::OwnLaunch,
+                role,
+                save: save_request,
+            },
             WorkCommand::Track {
                 url,
                 role,
@@ -439,18 +466,30 @@ where
         }
         Prepared::Local {
             channel,
-            directory,
+            source,
             role,
             save,
         } => {
             let context = context(channel, send)?;
-            let selected = match send(Request::PrepareLocal {
-                home: context.home,
-                directory,
-                caller: context.caller.clone(),
-            })
-            .map_err(protocol_error)?
-            {
+            let preparation = match source {
+                LocalSource::Directory(directory) => Request::PrepareLocal {
+                    home: context.home,
+                    directory,
+                    caller: context.caller.clone(),
+                },
+                LocalSource::OwnLaunch => {
+                    if context.caller.is_none() {
+                        return Err(invalid(
+                            "Own-checkout tracking requires an authenticated native session; an interactive user can use track-local DIRECTORY ROLE",
+                        ));
+                    }
+                    Request::PrepareOwnLocal {
+                        home: context.home,
+                        caller: context.caller.clone(),
+                    }
+                }
+            };
+            let selected = match send(preparation).map_err(protocol_error)? {
                 Response::Selected(selected) if selected.home == context.home => {
                     selected.validate().map_err(|_| contract())?;
                     selected
@@ -1358,7 +1397,7 @@ mod tests {
         .unwrap();
         let Prepared::Local {
             channel,
-            directory,
+            source: LocalSource::Directory(directory),
             role,
             save,
         } = Prepared::new(command.command).unwrap()
@@ -1409,7 +1448,7 @@ mod tests {
         let output = run(
             Prepared::Local {
                 channel: Some(home().channel),
-                directory: "/outside/worktree".into(),
+                source: LocalSource::Directory("/outside/worktree".into()),
                 role: Role::Review,
                 save: Some(path.clone()),
             },
@@ -1512,7 +1551,7 @@ mod tests {
             let result = run(
                 Prepared::Local {
                     channel: Some(home().channel),
-                    directory: "/outside/worktree".into(),
+                    source: LocalSource::Directory("/outside/worktree".into()),
                     role: Role::Contribute,
                     save: None,
                 },
@@ -1737,6 +1776,180 @@ mod tests {
                     assert_eq!(sent.len(), 2);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn own_local_grammar_requires_a_role_and_never_accepts_a_directory() {
+        for args in [
+            vec!["work", "track-own-local"],
+            vec!["work", "track-own-local", "unknown"],
+            vec!["work", "track-own-local", "review", "/outside/worktree"],
+            vec!["work", "track-own-local", "/outside/worktree", "review"],
+        ] {
+            assert!(Grammar::try_parse_from(args).is_err());
+        }
+        for (value, expected) in [
+            ("contribute", Role::Contribute),
+            ("steward", Role::Steward),
+            ("review", Role::Review),
+            ("reference", Role::Reference),
+        ] {
+            let channel = home().channel.to_string();
+            let command = Grammar::try_parse_from([
+                "work",
+                "track-own-local",
+                value,
+                "--channel",
+                &channel,
+                "--save-request",
+                "/safe/own-request.json",
+            ])
+            .unwrap();
+            let Prepared::Local {
+                channel,
+                source: LocalSource::OwnLaunch,
+                role,
+                save,
+            } = Prepared::new(command.command).unwrap()
+            else {
+                panic!("own launch preparation")
+            };
+            assert_eq!(channel, Some(home().channel));
+            assert_eq!(role, expected);
+            assert_eq!(save, Some(PathBuf::from("/safe/own-request.json")));
+        }
+    }
+
+    #[test]
+    fn own_local_captures_native_caller_and_exact_selection_before_saved_lost_request_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("own-selection.json");
+        let selected = local_selection();
+        let mut sent = Vec::new();
+        let output = run(
+            Prepared::Local {
+                channel: Some(home().channel), source: LocalSource::OwnLaunch,
+                role: Role::Steward, save: Some(path.clone()),
+            },
+            &mut |request| {
+                sent.push(request.clone());
+                Ok(match request {
+                    Request::Context { channel } => {
+                        assert_eq!(channel, Some(home().channel));
+                        Response::Context(context_value())
+                    }
+                    Request::PrepareOwnLocal { home: requested, caller } => {
+                        assert_eq!(requested, home());
+                        assert_eq!(caller, context_value().caller);
+                        Response::Selected(selected.clone())
+                    }
+                    Request::ApplySelection { selection, mutation, caller } => {
+                        assert_eq!(selection, selected.selection);
+                        assert_eq!(mutation.home, home());
+                        assert_eq!(mutation.expected_revision, selected.expected_revision);
+                        assert_eq!(mutation.change, Change::Claim {
+                            target: Target::Local(selected.context.id), role: Role::Steward,
+                        });
+                        assert!(!mutation.operation.is_nil());
+                        assert_eq!(caller, context_value().caller);
+                        assert_eq!(load_request(&path).unwrap(), *sent.last().unwrap());
+                        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                        return Err(ControlError::ConnectionClosed);
+                    }
+                    _ => panic!("own launch cannot choose a directory, scan pages or fall back to User mutation"),
+                })
+            },
+        ).unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(output.data["outcome"], "pending");
+        let saved = load_request(&path).unwrap();
+        assert_eq!(saved, sent[2]);
+        assert_eq!(
+            output.data["request"],
+            serde_json::to_value(&saved).unwrap()
+        );
+        let mut retried = Vec::new();
+        let output = run(Prepared::Apply(saved.clone()), &mut |request| {
+            retried.push(request);
+            Err(ControlError::ConnectionClosed)
+        })
+        .unwrap();
+        assert_eq!(
+            retried,
+            [saved.clone()],
+            "exact retry cannot recapture source, issue another selection or replace its operation"
+        );
+        assert_eq!(output.data["outcome"], "pending");
+        assert_eq!(
+            output.data["request"],
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[test]
+    fn own_local_requires_native_context_and_valid_selected_reply_without_fallback() {
+        for case in 0..13 {
+            let mut sent = Vec::new();
+            let result = run(
+                Prepared::Local {
+                    channel: Some(home().channel),
+                    source: LocalSource::OwnLaunch,
+                    role: Role::Review,
+                    save: None,
+                },
+                &mut |request| {
+                    sent.push(request.clone());
+                    Ok(match request {
+                        Request::Context { .. } => {
+                            let mut context = context_value();
+                            if case == 0 {
+                                context.caller = None;
+                            }
+                            if case == 1 {
+                                context.caller.as_mut().unwrap().card =
+                                    crate::model::CardId::from_uuid(Uuid::nil());
+                            }
+                            Response::Context(context)
+                        }
+                        Request::PrepareOwnLocal {
+                            home: requested,
+                            caller,
+                        } => {
+                            assert_eq!(requested, home());
+                            assert_eq!(caller, context_value().caller);
+                            let mut selected = local_selection();
+                            match case {
+                                2 => selected.home.registry = Uuid::from_u128(99),
+                                3 => {
+                                    selected.home.channel =
+                                        ChannelId::from_uuid(Uuid::from_u128(99))
+                                }
+                                4 => selected.home.creation_ordinal += 1,
+                                5 => selected.context.registry = Uuid::from_u128(99),
+                                6 => selected.selection = Uuid::nil(),
+                                7 => selected.context.generation = 0,
+                                8 => selected.context.path = "relative".into(),
+                                9 => {
+                                    return Ok(Response::Failed(Failure::Refused(
+                                        "Native launch handle unavailable".into(),
+                                    )));
+                                }
+                                10 => return Err(ControlError::ConnectionClosed),
+                                11 => return Ok(Response::Failed(Failure::Uncertain)),
+                                12 => return Ok(Response::Receipt(None)),
+                                _ => unreachable!(),
+                            }
+                            Response::Selected(selected)
+                        }
+                        _ => panic!(
+                            "case {case}: refusal cannot prepare a User directory or dispatch any mutation"
+                        ),
+                    })
+                },
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(sent.len(), if case < 2 { 1 } else { 2 }, "case {case}");
         }
     }
 }

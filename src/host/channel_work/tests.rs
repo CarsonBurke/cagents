@@ -114,6 +114,7 @@ fn public_handler_refuses_unknown_authority_instead_of_falling_back_to_user_and_
             directory: "/must-not-be-opened".into(),
             caller: None,
         },
+        Request::PrepareOwnLocal { home, caller: None },
         Request::ApplySelection {
             selection: uuid::Uuid::new_v4(),
             mutation: Mutation {

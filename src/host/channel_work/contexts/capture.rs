@@ -87,6 +87,7 @@ struct NamedPin {
     original: PathBuf,
     canonical: PathBuf,
     identity: DirectoryIdentity,
+    original_descriptor: Option<Arc<File>>,
 }
 impl NamedPin {
     fn open(path: &Path) -> Result<Self, String> {
@@ -105,7 +106,57 @@ impl NamedPin {
             original: path.into(),
             canonical,
             identity,
+            original_descriptor: None,
         };
+        pin.check()?;
+        Ok(pin)
+    }
+    fn from_launch(
+        expected: &crate::agent_execution::DirectoryIdentity,
+        original: Arc<File>,
+    ) -> Result<Self, String> {
+        let metadata = original.metadata().map_err(|_| UNAVAILABLE)?;
+        if !metadata.is_dir()
+            || crate::agent_execution::DirectoryIdentity::from_metadata(&metadata) != *expected
+        {
+            return Err("The original launch directory identity does not match".into());
+        }
+        // Inspect only this live owned descriptor; never repair its flags or
+        // accept an unsupported descriptor as equivalent runtime evidence.
+        // SAFETY: F_GETFD only reads flags of the live Arc-owned File.
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+            return Err("The original launch directory is not close-on-exec".into());
+        }
+        // The kernel link supplies a CURRENT display name only. The root is
+        // duplicated from the actual supplied descriptor, never opened from it.
+        let current = fs::read_link(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            original.as_raw_fd()
+        ))
+        .map_err(|_| UNAVAILABLE)?;
+        if !current.is_absolute()
+            || current.as_os_str().as_encoded_bytes().len()
+                > crate::channel_work::MAX_CONTEXT_PATH_BYTES
+        {
+            return Err(UNAVAILABLE.into());
+        }
+        let root =
+            Root::from_retained_directory(&original, current.clone()).map_err(|_| UNAVAILABLE)?;
+        let identity = DirectoryIdentity::of(&metadata);
+        if DirectoryIdentity::of(&root.metadata().map_err(|_| UNAVAILABLE)?) != identity {
+            return Err(CHANGED.into());
+        }
+        let pin = Self {
+            root,
+            original: current.clone(),
+            canonical: current,
+            identity,
+            original_descriptor: Some(original),
+        };
+        // Reopening the observed name is only a comparison against the held
+        // object. Deleted, renamed-again or replaced names cannot supply a pin.
         pin.check()?;
         Ok(pin)
     }
@@ -120,6 +171,11 @@ impl NamedPin {
         }
         if DirectoryIdentity::of(&self.root.metadata().map_err(|_| CHANGED)?) != self.identity {
             return Err(CHANGED.into());
+        }
+        if let Some(original) = &self.original_descriptor {
+            if DirectoryIdentity::of(&original.metadata().map_err(|_| CHANGED)?) != self.identity {
+                return Err(CHANGED.into());
+            }
         }
         Ok(())
     }
@@ -256,6 +312,29 @@ impl CapturedCheckout {
         not_cancelled(cancel)?;
         let project = NamedPin::open(repository)?;
         let tree = NamedPin::open(selected_worktree)?;
+        Self::capture_pinned(project, tree, cancel)
+    }
+
+    /// Physical evidence from the exact live runtime handle. The service must
+    /// separately authenticate its source, Home and selection before using it.
+    /// Initially only an original launch AT a worktree root is supported.
+    pub(crate) fn capture_actor(
+        repository: &Path,
+        expected: &crate::agent_execution::DirectoryIdentity,
+        original: Arc<File>,
+        cancel: &CancellationToken,
+    ) -> Result<Self, String> {
+        not_cancelled(cancel)?;
+        let tree = NamedPin::from_launch(expected, original)?;
+        let project = NamedPin::open(repository)?;
+        Self::capture_pinned(project, tree, cancel)
+    }
+
+    fn capture_pinned(
+        project: NamedPin,
+        tree: NamedPin,
+        cancel: &CancellationToken,
+    ) -> Result<Self, String> {
         let marker =
             fs_safety::metadata_beneath(&tree.root, Path::new(".git")).map_err(|_| UNAVAILABLE)?;
         let locator = if marker.is_file() {
@@ -299,7 +378,7 @@ impl CapturedCheckout {
             None
         };
         // A directory inside a worktree or a configured alternate worktree is
-        // not the explicit root selected by the user. Do not make it one by
+        // not a supported selected root. Do not make it one by
         // supplying --work-tree to the later pinned metadata commands.
         let discovered = service()
             .discover(&tree.root.process_path(), cancel)
@@ -359,6 +438,13 @@ impl CapturedCheckout {
     }
     pub(crate) fn identity(&self) -> CheckoutIdentity {
         self.identity.clone()
+    }
+    /// Identity of the retained tree object, not a new lookup of its name.
+    pub(crate) fn directory_identity(&self) -> crate::agent_execution::DirectoryIdentity {
+        crate::agent_execution::DirectoryIdentity {
+            device: self.tree.identity.device,
+            inode: self.tree.identity.inode,
+        }
     }
     pub(crate) fn observed_at(&self) -> Instant {
         self.observed_at

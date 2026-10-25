@@ -57,6 +57,52 @@ fn user() -> Owner {
     Owner {
         source: Source::User,
         caller: None,
+        native: None,
+    }
+}
+
+fn native_session(terminal: TerminalId) -> HostedSession {
+    HostedSession::Chat(crate::chat::Session {
+        id: terminal,
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: crate::model::LaunchRecipe {
+                program: "fixture-not-executed".into(),
+                arguments: vec![],
+                working_directory: "/fixture".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        },
+        proof: Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("selection-native"),
+            boot_id: crate::model::BootId::new("selection-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("selection-incarnation"),
+        }),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    })
+}
+
+fn native_owner() -> Owner {
+    let native = native_session(TerminalId::new());
+    let terminal = native.id();
+    Owner {
+        source: Source::Session(crate::channel_work::Contributor {
+            session: terminal,
+            lineage: Lineage(terminal),
+            agent: None,
+            run: None,
+        }),
+        caller: Some(Caller {
+            session: terminal,
+            card: CardId::new(),
+            placement_epoch: 1,
+            run: None,
+        }),
+        native: Some(native),
     }
 }
 
@@ -121,6 +167,7 @@ fn selection_nonce_needs_original_host_home_and_authenticated_source_comparisons
             placement_epoch: 1,
             run: None,
         }),
+        native: Some(native_session(terminal)),
     };
     assert!(
         selections
@@ -142,6 +189,94 @@ fn selection_nonce_needs_original_host_home_and_authenticated_source_comparisons
     assert!(
         selections
             .lookup(home, &user(), candidate.selection, now)
+            .is_err()
+    );
+}
+
+#[test]
+fn native_selection_keeps_original_process_proof_without_binding_mutable_thread_metadata() {
+    if crate::repository::isolated_git_test(concat!(
+        module_path!(),
+        "::native_selection_keeps_original_process_proof_without_binding_mutable_thread_metadata"
+    )) {
+        return;
+    }
+    let (directory, home) = fixture();
+    let native = native_owner();
+    native.validate().unwrap();
+    let mut selections = Selections::default();
+    let selected = selections
+        .issue(
+            home,
+            native.clone(),
+            capture(directory.path()),
+            Instant::now(),
+        )
+        .unwrap();
+    let mut metadata_update = native.clone();
+    let Some(HostedSession::Chat(chat)) = &mut metadata_update.native else {
+        panic!()
+    };
+    chat.launch.session_id = Some("updated-thread-label".into());
+    assert!(
+        selections
+            .lookup(home, &metadata_update, selected.selection, Instant::now())
+            .is_ok()
+    );
+    let mut replacement = native.clone();
+    let Some(HostedSession::Chat(chat)) = &mut replacement.native else {
+        panic!()
+    };
+    chat.proof.as_mut().unwrap().host_incarnation =
+        crate::model::HostIncarnation::new("replacement-incarnation");
+    replacement.validate().unwrap();
+    assert!(
+        selections
+            .lookup(home, &replacement, selected.selection, Instant::now())
+            .is_err()
+    );
+    selections.consume(home, &replacement, selected.selection);
+    assert!(
+        selections
+            .lookup(home, &native, selected.selection, Instant::now())
+            .is_ok()
+    );
+    // A causal placement stamp, not an incidental view revision, owns this
+    // selection. A transferred-and-returned pane cannot revive the old ticket.
+    for epoch in [2, 0, i64::MAX as u64 + 1] {
+        let mut changed = native.clone();
+        changed.caller.as_mut().unwrap().placement_epoch = epoch;
+        assert_eq!(changed.validate().is_ok(), epoch == 2);
+        assert!(
+            selections
+                .lookup(home, &changed, selected.selection, Instant::now())
+                .is_err()
+        );
+        selections.consume(home, &changed, selected.selection);
+        assert!(
+            selections
+                .lookup(home, &native, selected.selection, Instant::now())
+                .is_ok(),
+            "another placement cannot consume the original selection"
+        );
+    }
+    let mut unsupported = native.clone();
+    unsupported.native = None;
+    assert!(unsupported.validate().is_err());
+    assert!(
+        selections
+            .lookup(home, &unsupported, selected.selection, Instant::now())
+            .is_err()
+    );
+    let mut unproved = native.clone();
+    let Some(HostedSession::Chat(chat)) = &mut unproved.native else {
+        panic!()
+    };
+    chat.proof = None;
+    assert!(unproved.validate().is_err());
+    assert!(
+        selections
+            .lookup(home, &unproved, selected.selection, Instant::now())
             .is_err()
     );
 }

@@ -440,8 +440,8 @@ filesystem writes, associate a PR or run a task. **Working-tree changes not
 inspected** means unknown, not clean.
 
 An inspection expires after five minutes. Before a new submission, use
-**Inspect again** if it expires or the checkout changes. This selection flow
-currently supports the interactive User only; provider sessions and issued
+**Inspect again** if it expires or the checkout changes. Directory selection
+supports the interactive User only; provider sessions and issued
 Child callers cannot select arbitrary checkouts. Keep the original caller
 identity rather than attempting to change its authority.
 
@@ -457,6 +457,20 @@ sending; its file must not already exist. Once a Local identity is listed in
 that channel, `track local:UUID ROLE`, `end local:UUID` and `dismiss local:UUID`
 under `cagents channel work` accept that known identity with `--channel`.
 An arbitrary UUID cannot create a new Local relation.
+
+An authenticated native session can instead declare work in its own original
+launch checkout, without supplying a directory:
+
+```sh
+cagents channel work track-own-local contribute --save-request /private/new-own-local-request.json
+```
+
+This uses the session's actual channel, live process and retained launch
+checkout. Changing the shell's current directory does not select another
+checkout. The original launch must be at a checkout root; unsupported or closed
+holders are refused. This remains a session declaration, with its original
+session/run provenance, rather than an interactive User decision. Exact saved
+request and uncertain-result recovery use the same commands below.
 
 PR observations show when they were last read. **Refresh** checks tracked PRs;
 an unavailable forge preserves the previous observation. Closed, merged and

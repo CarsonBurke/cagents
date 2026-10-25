@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    agent_execution::HostedSession,
     channel_work::{Change, CheckoutContext, Home, Mutation, Source, Target},
     channel_work_api::Caller,
 };
@@ -24,22 +25,40 @@ const SELECTION_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// Comparison data constructed after the service authenticates its caller.
 /// This type cannot be deserialized from a request.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(super) struct Owner {
     pub(super) source: Source,
     pub(super) caller: Option<Caller>,
+    pub(super) native: Option<HostedSession>,
+}
+
+impl PartialEq for Owner {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.caller == other.caller
+            && match (&self.native, &other.native) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.same_process(b),
+                _ => false,
+            }
+    }
 }
 
 impl Owner {
     fn validate(&self) -> Result<(), String> {
-        match (&self.source, &self.caller) {
-            (Source::User, None) => Ok(()),
-            (Source::Session(source), Some(caller))
+        match (&self.source, &self.caller, &self.native) {
+            (Source::User, None, None) => Ok(()),
+            (Source::Session(source), Some(caller), Some(native))
                 if source.session == caller.session
+                    && source.validate().is_ok()
+                    && native.id() == source.session
+                    && native.has_complete_proof()
                     && source.run == caller.run
                     && !source.session.as_uuid().is_nil()
                     && !source.lineage.0.as_uuid().is_nil()
-                    && !caller.card.as_uuid().is_nil() =>
+                    && !caller.card.as_uuid().is_nil()
+                    && caller.placement_epoch > 0
+                    && caller.placement_epoch <= i64::MAX as u64 =>
             {
                 Ok(())
             }

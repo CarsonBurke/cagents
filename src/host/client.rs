@@ -676,6 +676,10 @@ pub(super) fn process_request(
                     drop(_shared);
                     super::channel_work::prepare_local(host, &authority, home, directory, caller)
                 }
+                crate::channel_work_api::Request::PrepareOwnLocal { home, caller } => {
+                    drop(_shared);
+                    super::channel_work::prepare_own_local(host, &authority, home, caller)
+                }
                 crate::channel_work_api::Request::ApplySelection {
                     selection,
                     mutation,

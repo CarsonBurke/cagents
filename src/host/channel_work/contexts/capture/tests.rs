@@ -378,3 +378,162 @@ fn configured_clean_and_process_helpers_are_never_invoked_and_dirty_is_unknown()
         );
     }
 }
+
+fn held_launch(path: &Path) -> (crate::agent_execution::DirectoryIdentity, Arc<File>) {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+        .unwrap();
+    let identity =
+        crate::agent_execution::DirectoryIdentity::from_metadata(&file.metadata().unwrap());
+    (identity, Arc::new(file))
+}
+
+#[test]
+fn actor_capture_uses_original_held_checkout_after_move_and_name_replacement() {
+    if crate::repository::isolated_git_test(concat!(
+        module_path!(),
+        "::actor_capture_uses_original_held_checkout_after_move_and_name_replacement"
+    )) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = project(directory.path(), "project");
+    let original = directory.path().join("outside");
+    linked(&root, &original);
+    let (expected, pin) = held_launch(&original);
+    let moved = directory.path().join("moved");
+    git(
+        &root,
+        &[
+            "worktree",
+            "move",
+            original.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir(&original).unwrap();
+    fs::write(original.join("replacement"), "leave untouched\n").unwrap();
+    let captured =
+        CapturedCheckout::capture_actor(&root, &expected, Arc::clone(&pin), &token()).unwrap();
+    assert_eq!(captured.directory_identity(), expected);
+    assert_eq!(captured.facts().path, moved);
+    assert_eq!(captured.facts().branch.as_deref(), Some("linked"));
+    assert_eq!(captured.facts().dirty, None);
+    assert_eq!(
+        captured.identity().worktree,
+        DirectoryIdentity::of(&pin.metadata().unwrap())
+    );
+    assert!(Arc::ptr_eq(
+        captured.tree.original_descriptor.as_ref().unwrap(),
+        &pin
+    ));
+    let user = CapturedCheckout::capture_user(&root, &moved, &token()).unwrap();
+    assert_eq!(user.directory_identity(), expected);
+    assert_eq!(captured.identity(), user.identity());
+    assert_eq!(captured.revalidate(&token()).unwrap(), user.facts());
+    assert_eq!(
+        fs::read(original.join("replacement")).unwrap(),
+        b"leave untouched\n"
+    );
+    // A later unregistered move invalidates the captured display/metadata
+    // bindings. It never causes a new lookup of the old launch recipe path.
+    let moved_again = directory.path().join("moved-again");
+    fs::rename(&moved, &moved_again).unwrap();
+    assert!(captured.revalidate(&token()).is_err());
+    assert!(
+        CapturedCheckout::capture_actor(&root, &expected, Arc::clone(&pin), &token()).is_err(),
+        "a stale worktree backlink is not silently repaired"
+    );
+    assert_eq!(
+        DirectoryIdentity::of(&pin.metadata().unwrap()),
+        captured.identity().worktree
+    );
+    assert_eq!(
+        fs::read(original.join("replacement")).unwrap(),
+        b"leave untouched\n"
+    );
+}
+
+#[test]
+fn actor_capture_preserves_traverse_only_launch_pin_and_unknown_dirty() {
+    use std::os::unix::fs::PermissionsExt;
+    if crate::repository::isolated_git_test(concat!(
+        module_path!(),
+        "::actor_capture_preserves_traverse_only_launch_pin_and_unknown_dirty"
+    )) {
+        return;
+    }
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = project(directory.path(), "project");
+    let _restore = Restore(root.clone());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o111)).unwrap();
+    let (expected, pin) = held_launch(&root);
+    let captured =
+        CapturedCheckout::capture_actor(&root, &expected, Arc::clone(&pin), &token()).unwrap();
+    let original_flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
+    let captured_flags = unsafe { libc::fcntl(captured.tree.root.descriptor(), libc::F_GETFL) };
+    assert!(original_flags >= 0 && original_flags & libc::O_PATH != 0);
+    assert!(captured_flags >= 0 && captured_flags & libc::O_PATH != 0);
+    assert_eq!(captured.facts().branch.as_deref(), Some("main"));
+    assert!(captured.facts().head.is_some());
+    assert_eq!(captured.revalidate(&token()).unwrap().dirty, None);
+    let cancelled = token();
+    cancelled.cancel();
+    assert!(CapturedCheckout::capture_actor(&root, &expected, pin, &cancelled).is_err());
+}
+
+#[test]
+fn actor_capture_refuses_wrong_identity_non_directory_subdir_foreign_and_stale_home() {
+    if crate::repository::isolated_git_test(concat!(
+        module_path!(),
+        "::actor_capture_refuses_wrong_identity_non_directory_subdir_foreign_and_stale_home"
+    )) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = project(directory.path(), "project");
+    let (expected, pin) = held_launch(&root);
+    let wrong = crate::agent_execution::DirectoryIdentity {
+        device: expected.device,
+        inode: expected.inode.wrapping_add(1),
+    };
+    assert!(CapturedCheckout::capture_actor(&root, &wrong, Arc::clone(&pin), &token()).is_err());
+    let regular_path = directory.path().join("regular");
+    fs::write(&regular_path, "not a directory").unwrap();
+    let regular = Arc::new(File::open(&regular_path).unwrap());
+    let regular_identity =
+        crate::agent_execution::DirectoryIdentity::from_metadata(&regular.metadata().unwrap());
+    assert!(CapturedCheckout::capture_actor(&root, &regular_identity, regular, &token()).is_err());
+    let subdir = root.join("nested");
+    fs::create_dir(&subdir).unwrap();
+    let (subdir_identity, subdir_pin) = held_launch(&subdir);
+    assert!(
+        CapturedCheckout::capture_actor(&root, &subdir_identity, Arc::clone(&subdir_pin), &token())
+            .is_err(),
+        "subdirectory original launches are explicitly unsupported in this slice"
+    );
+    fs::remove_dir(&subdir).unwrap();
+    assert!(
+        CapturedCheckout::capture_actor(&root, &subdir_identity, subdir_pin, &token()).is_err()
+    );
+    let foreign = project(directory.path(), "foreign");
+    let (foreign_identity, foreign_pin) = held_launch(&foreign);
+    assert!(
+        CapturedCheckout::capture_actor(&root, &foreign_identity, foreign_pin, &token()).is_err()
+    );
+    // The actual launch object survives, but a stale Home repository name
+    // cannot be rebound implicitly through that object's new display path.
+    fs::rename(&root, directory.path().join("project-moved")).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("replacement"), "preserve\n").unwrap();
+    assert!(CapturedCheckout::capture_actor(&root, &expected, pin, &token()).is_err());
+    assert_eq!(fs::read(root.join("replacement")).unwrap(), b"preserve\n");
+}

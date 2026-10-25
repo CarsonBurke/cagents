@@ -119,6 +119,51 @@ fn malformed_wire_paths_are_refused_without_opening_a_checkout_or_changing_work(
 }
 
 #[test]
+fn own_launch_inspection_refuses_user_and_unknown_authority_without_creating_native_identity() {
+    let (host, _directory, home) = fixture();
+    let registry = agent_execution::registry(&host).unwrap();
+    let before = registry.lock().unwrap().model().unwrap();
+    for (authority, captured) in [
+        (Authority::default(), None),
+        (Authority::session(Uuid::new_v4().to_string()), None),
+        (
+            Authority::default(),
+            Some(Caller {
+                session: crate::model::TerminalId::new(),
+                card: crate::model::CardId::new(),
+                placement_epoch: 1,
+                run: None,
+            }),
+        ),
+    ] {
+        assert!(matches!(
+            wire(
+                &host,
+                authority,
+                Request::PrepareOwnLocal {
+                    home,
+                    caller: captured
+                }
+            ),
+            Response::Failed(Failure::Refused(_))
+        ));
+    }
+    let projection = registry
+        .lock()
+        .unwrap()
+        .read_channel_work(&home, Page::default())
+        .unwrap();
+    assert!(projection.entries.is_empty() && projection.history.is_empty());
+    assert_eq!(registry.lock().unwrap().model().unwrap(), before);
+    let state = host.lock().unwrap();
+    let credits: Vec<_> = (0..4)
+        .map(|_| state.channel_work_selections.inspect().unwrap())
+        .collect();
+    assert!(state.channel_work_selections.inspect().is_err());
+    drop(credits);
+}
+
+#[test]
 fn actual_user_selection_claims_and_consumed_ticket_replays_only_original_operation() {
     if crate::repository::isolated_git_test(concat!(
         module_path!(),

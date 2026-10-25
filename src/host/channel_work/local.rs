@@ -2,7 +2,7 @@
 //! pathname, current working directory or guessed UUID into native authority.
 use super::{RefreshBudget, announce, caller, contexts, resolve};
 use crate::{
-    agent_execution::Authority,
+    agent_execution::{Authority, DirectoryIdentity, HostedSession},
     channel_work::{Change, Home, HomeLifecycle, Mutation, Origin, Target},
     channel_work_api::{Caller, Failure, LocalSelection, Response},
     host::{
@@ -11,7 +11,7 @@ use crate::{
         state::SharedHost,
     },
 };
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{fs::File, path::PathBuf, sync::Arc, time::Instant};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -21,6 +21,7 @@ fn owner(resolved: &TrustedResolvedOrigin) -> contexts::Owner {
     contexts::Owner {
         source: resolved.origin.source(),
         caller: caller(resolved),
+        native: resolved.proof.as_ref().map(|proof| proof.source.clone()),
     }
 }
 
@@ -39,10 +40,135 @@ fn require_user(resolved: &TrustedResolvedOrigin) -> Result<(), String> {
     if matches!(&resolved.origin, Origin::User) && resolved.proof.is_none() {
         Ok(())
     } else {
-        // An authenticated native source is never converted to the interactive
-        // user. Its original launch pin requires the runtime owner's supported
-        // handle API, which is deliberately not inferred from its recipe path.
-        Err("Local selection needs the native session's original launch directory; this holder is not supported yet".into())
+        Err(
+            "A native session must inspect its own original launch directory; use track-own-local"
+                .into(),
+        )
+    }
+}
+
+fn require_actor(resolved: &TrustedResolvedOrigin, home: Home) -> Result<(), String> {
+    match (&resolved.origin, &resolved.proof) {
+        (
+            Origin::Actor {
+                home: actual,
+                actor,
+                ..
+            },
+            Some(proof),
+        ) if *actual == home
+            && proof.source.id() == actor.session
+            && proof.source.has_complete_proof() =>
+        {
+            Ok(())
+        }
+        _ => Err("Own-launch selection needs a live native session in its captured channel".into()),
+    }
+}
+
+fn require_selected_source(resolved: &TrustedResolvedOrigin, home: Home) -> Result<(), String> {
+    match &resolved.origin {
+        Origin::User => require_user(resolved),
+        Origin::Actor { .. } => require_actor(resolved, home),
+        Origin::SelectedUser { .. } => Err("The original selection source is unavailable".into()),
+    }
+}
+
+enum LaunchHandle {
+    Chat(crate::chat::runtime::Handle),
+    Terminal(crate::terminal::TerminalHandle),
+}
+
+fn original_directory(
+    host: &SharedHost,
+    resolved: &TrustedResolvedOrigin,
+) -> Result<(DirectoryIdentity, Arc<File>), String> {
+    let source = &resolved
+        .proof
+        .as_ref()
+        .ok_or("The original native source is unavailable")?
+        .source;
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        match source {
+            HostedSession::Chat(session) => LaunchHandle::Chat(
+                state
+                    .chats
+                    .get(&session.id)
+                    .filter(|record| {
+                        !record.handle.is_completed()
+                            && source.same_process(&HostedSession::Chat(record.session.clone()))
+                    })
+                    .map(|record| record.handle.clone())
+                    .ok_or("The exact native provider is no longer live")?,
+            ),
+            HostedSession::Terminal(session) => LaunchHandle::Terminal(
+                state
+                    .terminals
+                    .get(&session.id)
+                    .filter(|record| {
+                        !record.handle.is_completed()
+                            && source.same_process(&HostedSession::Terminal(record.session.clone()))
+                    })
+                    .map(|record| record.handle.clone())
+                    .ok_or("The exact native terminal is no longer live")?,
+            ),
+        }
+    };
+    // A retained provider may perform a bounded holder request. Do not retain
+    // the host or control gate across that request, or reopen its recipe path.
+    match handle {
+        LaunchHandle::Chat(handle) => handle.pinned_launch_directory(),
+        LaunchHandle::Terminal(handle) => handle.pinned_launch_directory(),
+    }
+}
+
+fn verify_launch(
+    host: &SharedHost,
+    resolved: &TrustedResolvedOrigin,
+    home: Home,
+    pin: &contexts::capture::CapturedCheckout,
+) -> Result<(), String> {
+    if matches!(&resolved.origin, Origin::Actor { .. }) {
+        require_actor(resolved, home)?;
+        let (identity, file) = original_directory(host, resolved)?;
+        if identity != pin.directory_identity()
+            || DirectoryIdentity::from_metadata(
+                &file
+                    .metadata()
+                    .map_err(|_| "The original launch directory could not be checked")?,
+            ) != identity
+        {
+            return Err("The native session's original launch directory changed".into());
+        }
+    }
+    Ok(())
+}
+
+enum SelectionScope {
+    Directory(PathBuf),
+    OwnLaunch,
+}
+
+impl SelectionScope {
+    fn require(&self, resolved: &TrustedResolvedOrigin, home: Home) -> Result<(), String> {
+        match self {
+            Self::Directory(directory) => {
+                require_user(resolved)?;
+                if !directory.is_absolute()
+                    || directory.as_os_str().as_encoded_bytes().len()
+                        > crate::channel_work::MAX_CONTEXT_PATH_BYTES
+                    || directory.as_os_str().as_encoded_bytes().contains(&0)
+                    || directory
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return Err("Choose an absolute checkout path without parent traversal, within the supported path length".into());
+                }
+                Ok(())
+            }
+            Self::OwnLaunch => require_actor(resolved, home),
+        }
     }
 }
 
@@ -53,22 +179,35 @@ pub(super) fn prepare(
     directory: PathBuf,
     captured: Option<Caller>,
 ) -> Response {
+    prepare_inner(
+        host,
+        authority,
+        home,
+        SelectionScope::Directory(directory),
+        captured,
+    )
+}
+
+pub(super) fn prepare_own(
+    host: &SharedHost,
+    authority: &Authority,
+    home: Home,
+    captured: Option<Caller>,
+) -> Response {
+    prepare_inner(host, authority, home, SelectionScope::OwnLaunch, captured)
+}
+
+fn prepare_inner(
+    host: &SharedHost,
+    authority: &Authority,
+    home: Home,
+    scope: SelectionScope,
+    captured: Option<Caller>,
+) -> Response {
     let result = (|| -> Result<LocalSelection, String> {
         let initial = resolve(host, authority)?;
         captured_matches(&initial, &captured)?;
-        require_user(&initial)?;
-        // Validate the wire path before opening anything or starting a reader.
-        // A selected path is an explicit observation, never ambient cwd.
-        if !directory.is_absolute()
-            || directory.as_os_str().as_encoded_bytes().len()
-                > crate::channel_work::MAX_CONTEXT_PATH_BYTES
-            || directory.as_os_str().as_encoded_bytes().contains(&0)
-            || directory
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            return Err("Choose an absolute checkout path without parent traversal, within the supported path length".into());
-        }
+        scope.require(&initial, home)?;
         let expected_owner = owner(&initial);
         let registry = agent_execution::registry(host)?;
         let repository = registry
@@ -82,11 +221,33 @@ pub(super) fn prepare(
             .inspect()?;
         let budget = RefreshBudget::start()?;
         // All Git/FS work runs without host, registry or control-gate locks.
-        let pin = Arc::new(contexts::capture::CapturedCheckout::capture_user(
-            &repository,
-            &directory,
-            &budget.cancellation,
-        )?);
+        let pin = Arc::new(match &scope {
+            SelectionScope::Directory(directory) => {
+                contexts::capture::CapturedCheckout::capture_user(
+                    &repository,
+                    directory,
+                    &budget.cancellation,
+                )?
+            }
+            SelectionScope::OwnLaunch => {
+                let (identity, original) = original_directory(host, &initial)?;
+                contexts::capture::CapturedCheckout::capture_actor(
+                    &repository,
+                    &identity,
+                    original,
+                    &budget.cancellation,
+                )?
+            }
+        });
+        if matches!(&scope, SelectionScope::OwnLaunch) {
+            let inspected = resolve(host, authority)?;
+            captured_matches(&inspected, &captured)?;
+            scope.require(&inspected, home)?;
+            if owner(&inspected) != expected_owner {
+                return Err("The native source changed during inspection".into());
+            }
+            verify_launch(host, &inspected, home, &pin)?;
+        }
         let gate = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -96,7 +257,7 @@ pub(super) fn prepare(
         super::super::client::ensure_control_open(host).map_err(|error| error.message)?;
         let current = resolve(host, authority)?;
         captured_matches(&current, &captured)?;
-        require_user(&current)?;
+        scope.require(&current, home)?;
         if owner(&current) != expected_owner
             || registry
                 .lock()
@@ -188,7 +349,7 @@ pub(super) fn apply(
                 return Ok(reply);
             }
             reconcile = true;
-            require_user(&current)?;
+            require_selected_source(&current, mutation.home)?;
             owner(&current)
         };
         let attempt = host
@@ -207,6 +368,13 @@ pub(super) fn apply(
                 contexts::BeginError::InFlight => ApplyError::CommitUncertain,
             })?;
         let prepared = &attempt.prepared;
+        let before_read = resolve(host, authority)?;
+        captured_matches(&before_read, &captured)?;
+        require_selected_source(&before_read, mutation.home)?;
+        if owner(&before_read) != expected_owner {
+            return Err("The selected caller changed before checkout inspection".into());
+        }
+        verify_launch(host, &before_read, mutation.home, &prepared.pin)?;
         let budget = RefreshBudget::start()?;
         let _inspection = host
             .lock()
@@ -217,11 +385,18 @@ pub(super) fn apply(
         // read verifies physical/branch binding; it must not silently replace
         // selected provenance with newer dirty or commit-head observations.
         let _observed = prepared.pin.revalidate(&budget.cancellation)?;
+        let inspected = resolve(host, authority)?;
+        captured_matches(&inspected, &captured)?;
+        require_selected_source(&inspected, mutation.home)?;
+        if owner(&inspected) != expected_owner {
+            return Err("The selected caller changed during checkout inspection".into());
+        }
+        verify_launch(host, &inspected, mutation.home, &prepared.pin)?;
         let _admission = gate.read().unwrap_or_else(|p| p.into_inner());
         super::super::client::ensure_control_open(host).map_err(|error| error.message)?;
         let mut current = resolve(host, authority)?;
         captured_matches(&current, &captured)?;
-        require_user(&current)?;
+        require_selected_source(&current, mutation.home)?;
         if owner(&current) != expected_owner {
             return Err("The selected caller changed; inspect the checkout again".into());
         }
@@ -238,9 +413,19 @@ pub(super) fn apply(
                 &attempt,
                 Instant::now(),
             )?;
-        current.origin = Origin::SelectedUser {
-            home: mutation.home,
-            contexts: vec![prepared.context.clone()],
+        current.origin = match current.origin {
+            Origin::User => Origin::SelectedUser {
+                home: mutation.home,
+                contexts: vec![prepared.context.clone()],
+            },
+            Origin::Actor { home, actor, .. } => Origin::Actor {
+                home,
+                actor,
+                contexts: vec![prepared.context.clone()],
+            },
+            Origin::SelectedUser { .. } => {
+                return Err("The original selection source is unavailable".into());
+            }
         };
         let registry = agent_execution::registry(host)?;
         let reply = registry

@@ -149,7 +149,9 @@ fn process_inner(
             }
         }
         Request::Refresh { .. } => Err("Use the targeted forge refresh path".into()),
-        Request::PrepareLocal { .. } | Request::ApplySelection { .. } => {
+        Request::PrepareLocal { .. }
+        | Request::PrepareOwnLocal { .. }
+        | Request::ApplySelection { .. } => {
             Err("Use the scoped local checkout selection path".into())
         }
     }
@@ -163,6 +165,15 @@ pub(super) fn prepare_local(
     captured: Option<Caller>,
 ) -> Response {
     local::prepare(host, authority, home, directory, captured)
+}
+
+pub(super) fn prepare_own_local(
+    host: &SharedHost,
+    authority: &Authority,
+    home: Home,
+    captured: Option<Caller>,
+) -> Response {
+    local::prepare_own(host, authority, home, captured)
 }
 
 pub(super) fn apply_selection(
