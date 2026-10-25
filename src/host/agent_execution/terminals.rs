@@ -86,6 +86,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::SendTestNotification
         | R::ChatStart { .. }
         | R::ChatRecoverAccount { .. }
+        | R::ChatAccountSwitchGeneration { .. }
         | R::ChatAttach { .. }
         | R::ChatDetach { .. }
         | R::ChatCommand { .. }
@@ -260,4 +261,35 @@ fn denied(message: impl Into<String>) -> ProtocolError {
 
 fn internal(message: String) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, message, false)
+}
+
+#[cfg(test)]
+mod account_switch_access_tests {
+    use super::*;
+    #[test]
+    fn readiness_query_stays_user_only_like_account_mutation() {
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("fixture".into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "not-executed".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        assert!(matches!(
+            access(&ClientRequest::ChatAccountSwitchGeneration { source }),
+            Access::Refused
+        ));
+        assert!(matches!(access(&ClientRequest::List), Access::Open));
+    }
 }

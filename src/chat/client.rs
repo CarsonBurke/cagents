@@ -35,6 +35,10 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         message: error.message,
         recovery: match error.code {
             ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
+            ipc::ProtocolErrorCode::AccountSwitchBusy => super::Recovery::AccountSwitchBusy,
+            ipc::ProtocolErrorCode::AccountSwitchUnavailable => {
+                super::Recovery::AccountSwitchUnavailable
+            }
             ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
             _ => super::Recovery::Retry,
         },
@@ -888,8 +892,13 @@ impl ActivityObservation {
         if generation < self.generation {
             return false;
         }
+        let newer = generation > self.generation;
         self.generation = generation;
-        if self.state == state {
+        // A newer idle/disconnected edge can release one queued account choice
+        // even when its activity label did not change. Coalesce pending wakes.
+        if self.state == state
+            && !(newer && matches!(state, ActivityState::Idle | ActivityState::Unknown))
+        {
             return false;
         }
         self.state = state;
@@ -1644,7 +1653,7 @@ impl ClientHandle {
             None,
             false,
             None,
-            Some((source, None)),
+            Some((source, None, false)),
             None,
             wake,
         )
@@ -1668,7 +1677,34 @@ impl ClientHandle {
             None,
             false,
             None,
-            Some((source, Some(generation))),
+            Some((source, Some(generation), false)),
+            None,
+            wake,
+        )
+    }
+
+    /// Switch the user's exact account choice. Only a typed pre-effect Busy
+    /// response authorizes waiting and a later new attempt. An uncertain reply
+    /// must never be automatically replayed.
+    pub fn switch_account_explicit(
+        source: Session,
+        replacement: Session,
+        generation: Option<u64>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !super::is_account_recovery(&source, &replacement) {
+            return Err("Account switch changed the saved conversation".into());
+        }
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::connect_on(
+            stream,
+            replacement,
+            Intent::Start,
+            None,
+            false,
+            None,
+            Some((source, generation, true)),
             None,
             wake,
         )
@@ -1701,7 +1737,7 @@ impl ClientHandle {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         selection: Option<String>,
-        account_recovery: Option<(Session, Option<u64>)>,
+        account_recovery: Option<(Session, Option<u64>, bool)>,
         upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
@@ -1788,13 +1824,14 @@ impl ClientHandle {
             }
             upgrade_recovery = Some((session, expected.clone()));
             ClientRequest::ChatAttach { session: expected }
-        } else if let Some((source, idle_generation)) = account_recovery {
+        } else if let Some((source, idle_generation, explicit)) = account_recovery {
             let execution_environment = native_environment(&session, true);
             ClientRequest::ChatRecoverAccount {
                 source,
                 replacement: session,
                 idle_generation,
                 execution_environment,
+                explicit,
             }
         } else if let Some(token) = selection {
             if intent != Intent::Start || terminate_source {
@@ -2276,6 +2313,31 @@ impl ClientHandle {
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.publication.current.load().snapshot.clone()
     }
+    /// Scheduling hint only: borrowing publication metadata never hydrates a
+    /// hidden transcript, and never authorizes a close or a mutation.
+    pub(crate) fn account_switch_readiness_observation(&self) -> Option<u64> {
+        let publication = self.inner.publication.current.load();
+        let state = &publication.snapshot;
+        let generation = state.generation;
+        let idle = (state.ready || state.exited)
+            && !state.busy
+            && !state.waiting
+            && state.requests.is_empty()
+            && state.queued_messages.is_empty();
+        let activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if activity.generation > generation && activity.state == ActivityState::Unknown {
+            return Some(activity.generation);
+        }
+        if activity.generation >= generation && activity.state != ActivityState::Unknown {
+            return (activity.state == ActivityState::Idle).then_some(activity.generation);
+        }
+        idle.then_some(generation)
+    }
+
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
         let state = self.inner.publication.current.load();
         (state.snapshot.clone(), state.clock)
@@ -2796,6 +2858,207 @@ mod tests {
     }
 
     #[test]
+    fn explicit_account_admission_requires_exact_framed_proof_and_correlation() {
+        const CHILD: &str = "CAGENTS_TEST_ACCOUNT_SWITCH_FRAMING";
+        if std::env::var_os(CHILD).is_none() {
+            use std::io::Read;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let private = tempfile::Builder::new()
+                .prefix("account-wire-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let stdout = private.path().join("stdout");
+            let stderr = private.path().join("stderr");
+            let output = |path: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .unwrap()
+            };
+            let name = thread::current().name().unwrap().to_owned();
+            // Fake peer only: start a fresh User-by-construction child with no
+            // ambient provider configuration or operational capability copied.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env(CHILD, "1")
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", private.path())
+                .env("TMPDIR", private.path())
+                .env("XDG_CONFIG_HOME", private.path())
+                .env("XDG_DATA_HOME", private.path())
+                .env("XDG_RUNTIME_DIR", private.path())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(output(&stdout))
+                .stderr(output(&stderr))
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline
+                    || [&stdout, &stderr]
+                        .iter()
+                        .any(|path| std::fs::metadata(path).unwrap().len() > 1024 * 1024)
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated fake account peer exceeded its finite fixture bound");
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let read = |path: &std::path::Path| {
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .unwrap()
+                    .take(1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                assert!(bytes.len() <= 1024 * 1024);
+                String::from_utf8(bytes).unwrap()
+            };
+            let stdout = read(&stdout);
+            let stderr = read(&stderr);
+            assert!(
+                status.success(),
+                "fake account peer child: {status}\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {name} ... ok"))
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"))
+            );
+            return;
+        }
+        for case in [
+            "busy",
+            "unavailable",
+            "wrong-request",
+            "wrong-proof",
+            "wrong-version",
+        ] {
+            let proof = host_proof("account-switch-framing");
+            let mut source = omp_card(
+                Some("12345678-1234-4234-8234-123456789abc"),
+                Some(proof.clone()),
+            );
+            source.launch.provider = crate::agent::Provider::Claude;
+            source
+                .launch
+                .recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), "/fixture/original".into());
+            let mut replacement = source.clone();
+            replacement.id = TerminalId::new();
+            replacement.proof = None;
+            replacement
+                .launch
+                .recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), "/fixture/alternate".into());
+            assert!(super::super::is_account_recovery(&source, &replacement));
+            let expected_source = source.clone();
+            let expected_replacement = replacement.clone();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let hello: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert_eq!(hello.version, PROTOCOL_VERSION);
+                assert_eq!(hello.request_id, 1);
+                assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+                codec
+                    .write(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(1),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                let asked: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert_eq!(asked.version, PROTOCOL_VERSION);
+                assert_eq!(asked.proof, Some(proof.clone()));
+                assert!(matches!(asked.request, ClientRequest::ChatRecoverAccount {
+                    source, replacement, idle_generation: Some(41), explicit: true, ..
+                } if source == expected_source && replacement == expected_replacement));
+                let code = if case == "unavailable" {
+                    ipc::ProtocolErrorCode::AccountSwitchUnavailable
+                } else {
+                    ipc::ProtocolErrorCode::AccountSwitchBusy
+                };
+                codec
+                    .write(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: if case == "wrong-version" {
+                                PROTOCOL_VERSION - 1
+                            } else {
+                                PROTOCOL_VERSION
+                            },
+                            request_id: Some(asked.request_id + u64::from(case == "wrong-request")),
+                            proof: if case == "wrong-proof" {
+                                host_proof("foreign")
+                            } else {
+                                proof
+                            },
+                            message: ServerMessage::Error(ipc::ProtocolError::new(
+                                code,
+                                "Actor retained; no replay",
+                                true,
+                            )),
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    codec.read::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                    "a refusal or uncertain response must not resend the mutation"
+                );
+            });
+            let failure = ClientHandle::connect_on(
+                stream,
+                replacement,
+                Intent::Start,
+                None,
+                false,
+                None,
+                Some((source, Some(41), true)),
+                None,
+                |_| {},
+            )
+            .err()
+            .expect("fake peer refuses admission");
+            server.join().unwrap();
+            assert_eq!(
+                failure.recovery,
+                match case {
+                    "busy" => super::super::Recovery::AccountSwitchBusy,
+                    "unavailable" => super::super::Recovery::AccountSwitchUnavailable,
+                    _ => super::super::Recovery::Retry,
+                },
+                "only the exact correlated current-proof error is a typed pre-effect refusal: {case}"
+            );
+        }
+    }
+
+    #[test]
     fn admission_capacity_is_typed_and_keeps_daemon_detail() {
         for (code, recovery) in [
             (
@@ -2805,6 +3068,14 @@ mod tests {
             (
                 ipc::ProtocolErrorCode::AccountRemoved,
                 super::super::Recovery::Account,
+            ),
+            (
+                ipc::ProtocolErrorCode::AccountSwitchBusy,
+                super::super::Recovery::AccountSwitchBusy,
+            ),
+            (
+                ipc::ProtocolErrorCode::AccountSwitchUnavailable,
+                super::super::Recovery::AccountSwitchUnavailable,
             ),
             (
                 ipc::ProtocolErrorCode::TerminalUnavailable,
@@ -3361,7 +3632,11 @@ mod tests {
         assert!(activity.observe(6, ActivityState::Waiting));
         assert!(!activity.observe(7, ActivityState::Idle));
         assert_eq!(activity.take(), ActivityState::Idle);
+        // A newer settled-control idle edge wakes a queued account choice.
+        assert!(activity.observe(8, ActivityState::Idle));
         assert!(!activity.observe(8, ActivityState::Idle));
+        assert!(!activity.observe(7, ActivityState::Idle));
+        assert_eq!(activity.take(), ActivityState::Idle);
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
     }

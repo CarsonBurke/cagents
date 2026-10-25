@@ -321,6 +321,10 @@ pub enum Recovery {
     /// The recorded managed home was removed; choose another account of this
     /// provider before attempting the exact conversation again.
     Account,
+    /// The exact actor refused the handoff before effects; wait for a newer idle observation.
+    AccountSwitchBusy,
+    /// This actor cannot prove an exact handoff; its original conversation is retained.
+    AccountSwitchUnavailable,
     /// Running the same start again is a real next step, because what refused
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
@@ -613,6 +617,10 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        // Automatic routing is account-selection metadata, not a provider option.
+        recipe
+            .environment
+            .remove(crate::account::routing::AUTOMATIC_MARKER);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));

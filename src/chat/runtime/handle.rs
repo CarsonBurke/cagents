@@ -371,6 +371,54 @@ impl Handle {
             }
         }
     }
+    /// Remote owners need their own exact account-switch contract. Unsupported
+    /// retained transports stay alive and are refused before any close or copy.
+    pub(crate) fn supports_account_switch(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.supports_account_switch(),
+            Owner::Remote(_) => false,
+        }
+    }
+    pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
+        match &self.0 {
+            Owner::Local(local) => local.account_switch_generation(),
+            Owner::Remote(_) => {
+                Err("This retained actor cannot prove an exact account handoff".into())
+            }
+        }
+    }
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<super::AccountSwitchOptions>, String> {
+        match &self.0 {
+            Owner::Local(local) => local.close_for_account_switch(generation),
+            Owner::Remote(_) => {
+                Err("This retained actor cannot prove an exact account handoff".into())
+            }
+        }
+    }
+    pub(crate) fn restore_account_options(
+        &self,
+        options: &super::AccountSwitchOptions,
+        deadline: std::time::Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.restore_account_options(options, deadline, cancelled),
+            Owner::Remote(_) => {
+                Err("This retained actor cannot confirm account handoff controls".into())
+            }
+        }
+    }
+    pub(crate) fn account_switch_notice(&self) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.account_switch_notice(),
+            Owner::Remote(_) => {
+                Err("This retained actor cannot publish an account handoff notice".into())
+            }
+        }
+    }
     pub(crate) fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_if_idle_for_resume(generation),

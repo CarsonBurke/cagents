@@ -1650,6 +1650,9 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn account_switch_ready(&self) -> bool {
+        self.pending.is_empty()
+    }
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;

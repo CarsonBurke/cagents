@@ -2927,6 +2927,9 @@ impl Runtime {
             );
         }
         if !self.closed_elsewhere {
+            if let Some(control) = self.account_switch_controls(transitioning) {
+                status.push(control);
+            }
             status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
         }
         // Keep budget and cost together when the footer wraps.
@@ -3200,6 +3203,71 @@ impl Runtime {
         )
     }
 
+    pub(super) fn account_switch_controls(
+        &self,
+        transitioning: bool,
+    ) -> Option<Element<'_, Message>> {
+        let target = self.target;
+        if let Some((id, name)) = &self.pending_account_switch {
+            Some(crate::ui_controls::owned(
+                (
+                    target,
+                    id.clone(),
+                    self.account_switch_choice,
+                    "waiting",
+                    !transitioning,
+                ),
+                widget::row::with_children(vec![
+                    design::caption(if transitioning {
+                        format!("Switching to {name}…")
+                    } else {
+                        format!("Switches to {name} when the current work is idle")
+                    })
+                    .into(),
+                    crate::ui_controls::button::quiet("Cancel switch")
+                        .on_press_maybe((!transitioning).then_some(action(
+                            Action::CancelAccountSwitch(
+                                target,
+                                id.clone(),
+                                self.account_switch_choice,
+                            ),
+                        )))
+                        .into(),
+                ])
+                .spacing(space::S),
+            ))
+        } else if !transitioning && let Some((id, name)) = &self.account_switch_fallback {
+            Some(crate::ui_controls::owned(
+                (
+                    target,
+                    id.clone(),
+                    self.account_switch_choice,
+                    "continue",
+                    true,
+                ),
+                widget::column::with_children(vec![
+                    design::caption(format!(
+                        "Start a new conversation on {name}. Conversation history and provider cache will not carry over."
+                    ))
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+                    crate::ui_controls::button::secondary("Continue as new conversation")
+                        .on_press(action(Action::ContinueOnAccount(
+                            target,
+                            id.clone(),
+                            self.account_switch_choice,
+                        )))
+                        .into(),
+                ])
+                .width(Length::Fill)
+                .spacing(space::XS),
+            ))
+        } else {
+            None
+        }
+    }
+
     fn composer_actions(&self, available: bool) -> Element<'_, Message> {
         let target = self.target;
         let snapshot = &self.snapshot;
@@ -3466,8 +3534,8 @@ impl Runtime {
         controls
     }
 
-    /// A draft can explicitly pin its account. Started conversations display
-    /// their current account; automatic routing may hand off between turns.
+    /// Drafts and started conversations can explicitly choose an account.
+    /// The actor proves whether a started conversation may hand off.
     fn account_picker<'a>(
         &'a self,
         accounts: ChatAccounts,
@@ -3482,9 +3550,8 @@ impl Runtime {
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
         let icon = Icon::Avatar.handle();
-        if transitioning || !self.choosing() {
-            // Manual choices are made before the first message. Automatic
-            // routing can hand off later at a safe idle boundary.
+        if transitioning || self.attachment_chooser_pending.is_some() || self.pastes_pending > 0 {
+            // A transition or an open attachment chooser owns this control.
             return crate::interaction::tooltip(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
@@ -3505,7 +3572,7 @@ impl Runtime {
                     {
                         "Automatic can switch to another signed-in account between turns when needed."
                     } else {
-                        "This account is pinned. Start a new conversation to use another account."
+                        "This account is pinned. Choose another account to switch explicitly."
                     }
                 ),
             );

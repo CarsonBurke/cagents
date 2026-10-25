@@ -49,7 +49,36 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
+/// Current, actor-confirmed controls, separate from the immutable issued recipe.
+/// Codex can stage model/effort for the next prompt without persisting them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountSwitchOptions {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub permission_mode: Option<String>,
+    pub fast_mode: Option<bool>,
+    pub permissions: Option<super::PermissionSettings>,
+}
+impl AccountSwitchOptions {
+    fn capture(state: &Snapshot) -> Self {
+        Self {
+            model: state.selected_model.clone(),
+            reasoning: state.reasoning.clone(),
+            permission_mode: state.permission_mode.clone(),
+            fast_mode: state.fast_mode.as_ref().map(super::FastMode::enabled),
+            permissions: state.permissions.clone(),
+        }
+    }
+}
+
 enum ActorCommand {
+    AccountNotice(String),
+    AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
+    CloseForAccountSwitch {
+        generation: u64,
+        admitted: crossbeam_channel::Sender<Option<AccountSwitchOptions>>,
+        retain_receipt: Option<Arc<AtomicBool>>,
+    },
     RetainedProvider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -504,6 +533,7 @@ impl LocalHandle {
                     login_recovery: None,
                     dirty: false,
                     activity: ActivityState::Idle,
+                    account_switch_ready: false,
                     ready: false,
                     prompt_available: false,
                     attention: TurnAttention::default(),
@@ -695,6 +725,9 @@ impl LocalHandle {
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| "Provider launch-directory owner did not respond".to_owned())?
     }
+    pub(super) fn supports_account_switch(&self) -> bool {
+        !self.0.history_only
+    }
     pub(super) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
         self.0
             .provider_process
@@ -843,6 +876,135 @@ impl LocalHandle {
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+    }
+
+    pub(crate) fn account_switch_notice(&self) -> Result<(), String> {
+        self.ownership_command(ActorCommand::AccountNotice(
+            "Account switched. This is the same saved conversation; provider caches may be rebuilt.".into(),
+        ))
+    }
+
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<AccountSwitchOptions>, String> {
+        let retain_receipt = matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        )
+        .then(|| self.0.retain_cleanup_receipt.clone());
+        let (admitted, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CloseForAccountSwitch {
+            generation,
+            admitted,
+            retain_receipt,
+        })?;
+        let admitted = response.try_recv().map_err(|error| {
+            format!("Account-switch close admission was not acknowledged: {error}")
+        })?;
+        if admitted.is_some() {
+            self.close_for_resume()?;
+        }
+        Ok(admitted)
+    }
+
+    /// Restore controls only after exact-thread confirmation. No prompt is issued,
+    /// and the successor's published launch recipe remains the original contract.
+    pub(crate) fn restore_account_options(
+        &self,
+        options: &AccountSwitchOptions,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut model_sent = false;
+        let mut permission_sent = false;
+        let mut fast_sent = false;
+        let mut permissions_requested = false;
+        loop {
+            if cancelled() || self.is_completed() {
+                return Err("The account switch stopped before the current conversation options were confirmed".into());
+            }
+            if let Some(failure) = self.failure() {
+                return Err(failure);
+            }
+            // Current controls are bounded resident metadata. Restoring them
+            // never pages a transcript or makes a hidden body resident.
+            let (ready, current, model_known) = {
+                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.ready,
+                    AccountSwitchOptions::capture(&state),
+                    state
+                        .models
+                        .iter()
+                        .any(|model| Some(&model.id) == options.model.as_ref()),
+                )
+            };
+            if ready {
+                let model_matches = options.model.is_none()
+                    || (current.model == options.model && current.reasoning == options.reasoning);
+                let permission_matches = options.permission_mode.is_none()
+                    || current.permission_mode == options.permission_mode;
+                let fast_matches =
+                    options.fast_mode.is_none() || current.fast_mode == options.fast_mode;
+                // Account-owned inherited rules are never rewritten as session
+                // rules. If known permissions differ, refuse the seamless handoff
+                // rather than silently losing a restriction or granting access.
+                let permissions_match =
+                    options.permissions.is_none() || current.permissions == options.permissions;
+                if model_matches && permission_matches && fast_matches && permissions_match {
+                    return Ok(());
+                }
+                if options.fast_mode == Some(false) && current.fast_mode == Some(true) {
+                    // A successor may restart with the issued recipe's fast tier.
+                    // Disable it and await confirmation before a non-fast model
+                    // can be selected. Enabling follows model restoration below.
+                    if !fast_sent {
+                        self.command(Command::SetFastMode { enabled: false })?;
+                        fast_sent = true;
+                    }
+                } else if !model_matches && !model_sent && model_known {
+                    self.command(Command::SetModel {
+                        model: options.model.clone().expect("a differing known model"),
+                        reasoning: options.reasoning.clone(),
+                    })?;
+                    model_sent = true;
+                } else if model_matches && !permission_matches && !permission_sent {
+                    self.command(Command::SetPermissionMode {
+                        mode: options
+                            .permission_mode
+                            .clone()
+                            .expect("a differing known permission mode"),
+                    })?;
+                    permission_sent = true;
+                } else if model_matches && permission_matches && !fast_matches && !fast_sent {
+                    self.command(Command::SetFastMode {
+                        enabled: options.fast_mode.expect("a differing known fast mode"),
+                    })?;
+                    fast_sent = true;
+                } else if model_matches
+                    && permission_matches
+                    && !permissions_match
+                    && !permissions_requested
+                {
+                    self.command(Command::RefreshPermissions)?;
+                    permissions_requested = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("The alternate account could not confirm the current model, reasoning, permissions and speed settings; continue separately with an explicit choice".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// An actor-ordered metadata barrier; never hydrates transcript history.
+    pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::AccountSwitchGeneration(reply))?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Account-switch readiness was not acknowledged: {error}"))
     }
 
     fn claim_idle_close(&self, generation: u64) -> Result<bool, String> {
@@ -1896,6 +2058,7 @@ struct Actor {
     login_recovery: Option<String>,
     dirty: bool,
     activity: ActivityState,
+    account_switch_ready: bool,
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     prompt_available: bool,
@@ -2424,6 +2587,58 @@ impl Actor {
                     }
                     (None, Command::Interrupt)
                 }
+                ActorCommand::CloseForAccountSwitch {
+                    generation,
+                    admitted,
+                    retain_receipt,
+                } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let idle = state.generation == generation
+                        && self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty();
+                    if idle {
+                        // Publish retention before teardown, but never alter
+                        // the healthy source on a pre-effect Busy refusal.
+                        if let Some(retain_receipt) = retain_receipt {
+                            retain_receipt.store(true, Ordering::Release);
+                        }
+                        self.stop.store(true, Ordering::Release);
+                    }
+                    let options = idle.then(|| AccountSwitchOptions::capture(&state));
+                    let _ = admitted.send(options);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                ActorCommand::AccountSwitchGeneration(readiness) => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let generation = (self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty())
+                    .then_some(state.generation);
+                    drop(state);
+                    let _ = readiness.send(generation);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                ActorCommand::AccountNotice(text) => {
+                    let result = self.step(Step {
+                        events: vec![Event::Item(Item {
+                            started_at: super::now_ms(),
+                            id: format!("cagents-account-switch-{}", uuid::Uuid::new_v4()),
+                            role: super::Role::System,
+                            content: ItemContent::Text {
+                                text,
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                            at: super::now_ms(),
+                        })],
+                        ..Step::default()
+                    });
+                    let _ = reply.send(result);
+                    continue;
+                }
                 ActorCommand::CloseIfIdle { generation, closed } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     // A stale generation must never hide new requests, child
@@ -2934,6 +3149,15 @@ impl Actor {
         }
         let activity = state.activity();
         let generation = state.generation;
+        // A settled provider-control reply may leave the activity label idle.
+        // Emit one metadata edge so a hidden queued choice can query the actor
+        // again. This is a scheduling hint, not the close admission barrier.
+        let account_ready = activity == ActivityState::Idle
+            && state.ready
+            && state.queued_messages.is_empty()
+            && self.adapter.account_switch_ready();
+        let account_became_ready = account_ready && !self.account_switch_ready;
+        self.account_switch_ready = account_ready;
         let waiting_fingerprint = if activity == ActivityState::Waiting {
             state.waiting_fingerprint()
         } else {
@@ -2962,7 +3186,7 @@ impl Actor {
                 kind: crate::notifications::Kind::Waiting,
             });
         }
-        if activity_changed {
+        if activity_changed || account_became_ready {
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
@@ -4932,6 +5156,144 @@ mod tests {
     use super::super::Role;
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn account_handoff_fences_real_control_reply_and_preserves_current_options() {
+        struct Controls {
+            pending: bool,
+        }
+        impl Adapter for Controls {
+            fn account_switch_ready(&self) -> bool {
+                !self.pending
+            }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::Models {
+                            models: Vec::new(),
+                            selected: Some("original-model".into()),
+                            reasoning: Some("low".into()),
+                        },
+                    ],
+                    ..Step::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let Command::SetModel { model, reasoning } = command else {
+                    return Err("Only the fixture's actual model control is accepted".into());
+                };
+                self.pending = true;
+                Ok(Step {
+                    writes: vec![json!({"model": model, "reasoning": reasoning})],
+                    ..Step::default()
+                })
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                self.pending = false;
+                Ok(Step {
+                    events: vec![Event::Models {
+                        models: Vec::new(),
+                        selected: Some(frame["model"].as_str().unwrap().into()),
+                        reasoning: Some(frame["reasoning"].as_str().unwrap().into()),
+                    }],
+                    ..Step::default()
+                })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let entered = directory.path().join("received-control");
+        let release = directory.path().join("release-control");
+        let script = r#"import json, pathlib, sys, time
+entered, release = map(pathlib.Path, sys.argv[1:])
+for line in sys.stdin:
+    frame = json.loads(line)
+    entered.write_text('control received')
+    deadline = time.monotonic() + 10
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('fixture control release deadline')
+        time.sleep(.005)
+    print(json.dumps(frame), flush=True)
+"#;
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/python3".into(),
+            arguments: vec![
+                "-c".into(),
+                script.into(),
+                entered.to_str().unwrap().into(),
+                release.to_str().unwrap().into(),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Controls { pending: false });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, updates) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            send.send(update).unwrap();
+        })
+        .unwrap();
+        let original = handle
+            .provider_process()
+            .expect("the real original child is pinned");
+        let generation = handle.account_switch_generation().unwrap().unwrap();
+        let (_, pinned) = handle.pinned_launch_directory().unwrap();
+        let identity =
+            crate::agent_execution::DirectoryIdentity::from_metadata(&pinned.metadata().unwrap());
+        assert_eq!(
+            identity,
+            crate::agent_execution::DirectoryIdentity::from_metadata(
+                &std::fs::metadata(directory.path()).unwrap()
+            )
+        );
+        updates.try_iter().for_each(drop);
+        handle
+            .command(Command::SetModel {
+                model: "chosen-model".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "real provider must receive the control"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.account_switch_generation().unwrap(), None);
+        assert_eq!(handle.close_for_account_switch(generation).unwrap(), None);
+        assert!(!handle.is_completed());
+        assert!(original.is_current());
+        assert!(!handle.0.retain_cleanup_receipt.load(Ordering::Acquire));
+        std::fs::write(&release, b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let current = loop {
+            if let Some(current) = handle.account_switch_generation().unwrap() {
+                break current;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(current > generation);
+        assert!(updates.try_iter().any(|update| matches!(update, Update::Activity { state: ActivityState::Idle, generation } if generation == current)), "settled control must wake a hidden queued choice without changing its idle label");
+        assert_eq!(handle.close_for_account_switch(generation).unwrap(), None);
+        assert!(original.is_current());
+        let options = handle.close_for_account_switch(current).unwrap().unwrap();
+        assert_eq!(options.model.as_deref(), Some("chosen-model"));
+        assert_eq!(options.reasoning.as_deref(), Some("high"));
+        assert!(handle.is_completed());
+        assert!(
+            !original.is_current(),
+            "the same original process must be retired"
+        );
+    }
 
     #[test]
     fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
