@@ -6006,13 +6006,13 @@ impl RepositoryRuntime {
                     // A location requested for the rejected disk read must not
                     // move the retained buffer's original caret or selection.
                     self.pending_editor_navigation = None;
-                    self.pending_editor_focus = None;
+                    // The accepted read can finish while another surface or
+                    // dialog owns the keyboard. Let the shell restore focus
+                    // only when this editor is mounted and owns input again.
+                    self.pending_editor_focus = Some(identity.clone());
                     self.pending_fragment = None;
                     self.push_lsp_open(&identity.worktree);
-                    return Task::batch([
-                        self.restore_visible_scroll(),
-                        self.focus_editor(identity.card),
-                    ]);
+                    return self.restore_visible_scroll();
                 }
                 let restored_focus = self
                     .restores_editor_navigation(&identity)
@@ -14601,6 +14601,148 @@ mod tests {
             drop(runtime.update(RepositoryAction::Redo { card }));
             assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
         }
+    }
+
+    #[test]
+    fn rejected_reload_preserves_foreground_focus_until_the_editor_is_visible() {
+        use cosmic::iced::advanced::widget::operation;
+        use cosmic::iced::futures::StreamExt;
+
+        struct FocusProbe(widget::Id, bool);
+        impl Operation for FocusProbe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.0) {
+                    self.1 = state.is_focused();
+                }
+            }
+        }
+
+        fn apply_widgets<Message: 'static>(
+            task: Task<Message>,
+            element: &mut Element<'_, ()>,
+            tree: &mut Tree,
+            node: &layout::Node,
+            renderer: &cosmic::Renderer,
+        ) {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        let iced::runtime::Action::Widget(mut operation) = action else {
+                            panic!("restoring local scroll/focus must not dispatch other work");
+                        };
+                        loop {
+                            element.as_widget_mut().operate(
+                                tree,
+                                Layout::new(node),
+                                renderer,
+                                operation.as_mut(),
+                            );
+                            match operation.finish() {
+                                operation::Outcome::Chain(next) => operation = next,
+                                operation::Outcome::None | operation::Outcome::Some(()) => break,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let card = CardId::new();
+        let (directory, mut runtime, _) = reload_read_fixture(card);
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let edited = runtime.editor_text().unwrap();
+        let cursor = runtime.cursor_position();
+        std::fs::remove_file(directory.path().join("notes.txt")).unwrap();
+        drop(runtime.update(RepositoryAction::Reload { card }));
+        let identity = runtime.current_identity(card, "notes.txt".into());
+        let result = crate::editor::read_file_at(
+            &identity.worktree,
+            &identity.path,
+            crate::editor::PdfTone::Original,
+            runtime.original_editor_root.clone(),
+        );
+        assert!(result.is_err());
+
+        // The editor is not mounted while a Work form or dialog owns input.
+        // Apply the real accepted-read task to that foreground native widget:
+        // focusing an absent editor would unfocus this field too.
+        let renderer = headless_renderer();
+        let foreground = widget::Id::unique();
+        let mut element: Element<'_, ()> = iced::widget::text_input("PR URL", "unsent value")
+            .id(foreground.clone())
+            .on_input(|_| ())
+            .into();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(480.0, 120.0)),
+        );
+        apply_widgets(
+            iced::widget::operation::focus::<()>(foreground.clone()),
+            &mut element,
+            &mut tree,
+            &node,
+            &renderer,
+        );
+        let mut before = FocusProbe(foreground.clone(), false);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+        assert!(before.1, "the foreground field must actually own native focus");
+
+        let completion = runtime.update(RepositoryAction::FileLoadedAt { identity, result });
+        apply_widgets(completion, &mut element, &mut tree, &node, &renderer);
+        let mut after = FocusProbe(foreground, false);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut after);
+        assert!(after.1, "a hidden failed Reload must preserve foreground focus");
+        assert_eq!(runtime.editor_text().as_deref(), Some(edited.as_str()));
+        assert_eq!(runtime.cursor_position(), cursor);
+
+        // The shell can deliver the retained request once this editor really
+        // owns input again; it is not consumed by the hidden completion task.
+        let target = runtime.take_restored_editor_focus(card).unwrap();
+        assert!(runtime.take_restored_editor_focus(card).is_none());
+        let mut editor: Element<'_, ()> = editor_surface(card, &runtime).map(|_| ());
+        let mut editor_tree = Tree::new(editor.as_widget());
+        let editor_node = editor.as_widget_mut().layout(
+            &mut editor_tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(480.0, 240.0)),
+        );
+        apply_widgets(
+            iced::widget::operation::focus::<()>(target.clone()),
+            &mut editor,
+            &mut editor_tree,
+            &editor_node,
+            &renderer,
+        );
+        let mut visible = FocusProbe(target, false);
+        editor.as_widget_mut().operate(
+            &mut editor_tree,
+            Layout::new(&editor_node),
+            &renderer,
+            &mut visible,
+        );
+        assert!(visible.1, "the visible editor must still accept its focus handoff");
     }
 
     #[test]

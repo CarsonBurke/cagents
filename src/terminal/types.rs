@@ -81,6 +81,18 @@ pub enum TerminalEvent {
         operation: &'static str,
         message: String,
     },
+    /// A locally correlated daemon admission refusal; the command had no
+    /// effects and this attachment remains live. Never inferred from wire text.
+    InputRejected {
+        operation: &'static str,
+        message: String,
+    },
+    /// A recoverable condition reported by the input owner. Earlier input may
+    /// already have effects; this neither promises rejection nor requests replay.
+    InputNotice {
+        operation: &'static str,
+        message: String,
+    },
     AgentActivityChanged(Option<crate::agent::Activity>),
     /// The PTY has drained and the final grid is published. Unlike `Exited`,
     /// this confirms that descendants no longer own the terminal.
@@ -212,6 +224,14 @@ pub enum TerminalStartError {
     Worker(String),
     #[error("terminal worker exited before startup completed")]
     WorkerExited,
+    /// The original worker and already-read output remain owned. This is not
+    /// a successful startup, and callers must retain the handle for recovery.
+    #[cfg(feature = "host")]
+    #[error("terminal startup retained original custody: {message}")]
+    CustodyRetained {
+        handle: super::TerminalHandle,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
