@@ -773,6 +773,7 @@ mod tests {
             "false20",
             "private_retention19",
             "damaged_saved19",
+            "downgraded20",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("refused.sqlite3");
@@ -788,11 +789,19 @@ mod tests {
                 tx.commit().unwrap();
             } else {
                 outbox19(&path, &pane);
+                if damage == "downgraded20" {
+                    // Start from an actually migrated current store, then
+                    // relabel only its header. Extra known objects are not an
+                    // authentic outbox19 layout and must not be reopened.
+                    drop(Registry::at(&path).unwrap());
+                }
                 let db = Connection::open(&path).unwrap();
                 db.execute_batch(if damage == "unknown19" {
                     "CREATE TABLE unknown_outbox_payload(value TEXT) STRICT;"
                 } else if damage == "damaged_saved19" {
                     "UPDATE shared_views SET panes='not-json';"
+                } else if damage == "downgraded20" {
+                    "PRAGMA user_version=19;"
                 } else {
                     "PRAGMA user_version=20;"
                 })
