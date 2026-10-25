@@ -111,10 +111,10 @@ fn migration_backfills_all_current_panes_and_keeps_tokens_after_reopen() {
     write(&db, &b);
     backfill(&mut db);
     let tokens = [card(1), card(2), card(3)].map(|id| token(&db, id).unwrap());
-    assert!(tokens.iter().all(|value| *value > i64::MAX as u64));
     assert!(
-        !tokens.contains(&a.revision),
-        "old saved whole-view tokens are disjoint"
+        tokens
+            .iter()
+            .all(|value| (1..=i64::MAX as u64).contains(value))
     );
     assert!(token(&db, card(99)).is_err());
     assert_eq!(
@@ -364,6 +364,7 @@ fn missing_malformed_and_exhausted_epochs_refuse_without_partial_publication() {
     .unwrap();
     let first = token(&db, card(1)).unwrap();
     let last = token(&db, card(2)).unwrap();
+    assert_eq!(last, i64::MAX as u64);
     let mut changed = replace_source(&original);
     changed.panes[1].pending_terminal_start = true;
     {

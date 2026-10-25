@@ -14,10 +14,6 @@ pub(in crate::host::model) const TABLE_SQL: &str = "CREATE TABLE channel_work_pl
     epoch INTEGER NOT NULL CHECK(epoch > 0)
 ) STRICT;";
 
-// Old view revisions are nonnegative SQLite INTEGERs. The disjoint high bit
-// prevents an old, unversioned saved Caller from accidentally matching an epoch.
-const TOKEN_TAG: u64 = 1 << 63;
-
 /// Called only by the owning published-schema migration, within its transaction.
 /// Existing canonical panes receive a generation immediately, never on demand
 /// while resolving a caller. A bad/ambiguous backfill rolls back with the DDL.
@@ -154,11 +150,11 @@ pub(in crate::host::model) fn observe_view_transition(
     Ok(())
 }
 
-/// An opaque public comparison token. A removed pane's retained token alone
+/// A positive durable placement epoch. A removed pane's retained value alone
 /// grants nothing: resolution must still prove its unique current placement.
 pub(in crate::host::model) fn token(db: &Connection, card: CardId) -> Result<u64, String> {
     let value = epoch(db, card)?.ok_or("The canonical pane has no placement epoch")?;
-    Ok(TOKEN_TAG | value as u64)
+    Ok(value as u64)
 }
 
 #[cfg(test)]
