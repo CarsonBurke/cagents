@@ -497,6 +497,7 @@ pub(super) fn apply(
     register(transaction, scope)?;
     let mut view = read(transaction, scope)?;
     let mut changed = false;
+    let mut deferred_target = None;
     match edit {
         ModelEdit::SeedView { panes, closed, .. } => {
             // Migration is additive, including old independent windows. Closed
@@ -567,7 +568,9 @@ pub(super) fn apply(
                             .revision
                             .checked_add(1)
                             .ok_or("view revision exhausted")?;
-                        write(transaction, &target)?;
+                        // Publish only after the source relinquishes its
+                        // active placement, inside this same transaction.
+                        deferred_target = Some(target);
                         transfer_agent(transaction, &pane, destination, &repository)?;
                         transaction
                             .execute(
@@ -672,6 +675,9 @@ pub(super) fn apply(
             .checked_add(1)
             .ok_or("view revision exhausted")?;
         write(transaction, &view)?;
+    }
+    if let Some(target) = deferred_target {
+        write(transaction, &target)?;
     }
     Ok(changed || !existed)
 }
