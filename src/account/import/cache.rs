@@ -406,6 +406,14 @@ pub(crate) fn publication_state(
     root: &Root,
     receipt: &PublicationReceipt,
 ) -> Result<PublicationState, Error> {
+    publication_state_with(root, receipt, || {})
+}
+
+fn publication_state_with(
+    root: &Root,
+    receipt: &PublicationReceipt,
+    after_open: impl FnOnce(),
+) -> Result<PublicationState, Error> {
     let directory = root.metadata().map_err(|_| Error::InspectFailed)?;
     if receipt.validate().is_err() {
         return Err(Error::InspectFailed);
@@ -416,21 +424,52 @@ pub(crate) fn publication_state(
     {
         return Ok(PublicationState::Different);
     }
+    if named_home(root, receipt)?.is_none() {
+        return Ok(PublicationState::Different);
+    }
     let file = match fs_safety::open_beneath(root, Path::new(AUTH_FILE)) {
         Ok(file) => file,
         Err(error) if error.is_not_found() => return Ok(PublicationState::Missing),
         Err(_) => return Ok(PublicationState::Different),
     };
+    after_open();
     let metadata = file.metadata().map_err(|_| Error::InspectFailed)?;
+    // Held original descriptors alone do not prove what auth.json now names.
+    let Some(named_home) = named_home(root, receipt)? else {
+        return Ok(PublicationState::Different);
+    };
+    let named = match fs_safety::open_beneath(&named_home, Path::new(AUTH_FILE)) {
+        Ok(named) => named.metadata().map_err(|_| Error::InspectFailed)?,
+        Err(_) => return Ok(PublicationState::Different),
+    };
     Ok(
         if private_regular(&metadata)
             && metadata.mode() & 0o7777 == 0o600
             && identity(&metadata) == receipt.file
             && metadata.len() == receipt.size
+            && private_regular(&named)
+            && named.mode() & 0o7777 == 0o600
+            && identity(&named) == receipt.file
+            && named.len() == receipt.size
         {
             PublicationState::Present
         } else {
             PublicationState::Different
+        },
+    )
+}
+
+fn named_home(root: &Root, receipt: &PublicationReceipt) -> Result<Option<Root>, Error> {
+    let named = match absolute_directory(root.path()) {
+        Ok(home) => home,
+        Err(_) => return Ok(None),
+    };
+    let metadata = named.metadata().map_err(|_| Error::InspectFailed)?;
+    Ok(
+        if identity(&metadata) == receipt.home && require_private_directory(&metadata).is_ok() {
+            Some(named)
+        } else {
+            None
         },
     )
 }

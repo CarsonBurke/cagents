@@ -303,6 +303,32 @@ fn publication_result_loss_retains_exact_original_inode_and_never_reseeds() {
         b"refreshed-or-foreign-cache"
     );
     assert_eq!(fs::read(root.path().join("original")).unwrap(), payload());
+    for replace in [false, true] {
+        let prepared = prepare_new(
+            &directory.path().join(if replace {
+                "rename-replace"
+            } else {
+                "rename-away"
+            }),
+            take_snapshot(&source),
+        );
+        let root = prepared.root.try_clone().unwrap();
+        let receipt = publish(prepared).unwrap();
+        assert_eq!(
+            publication_state_with(&root, &receipt, || {
+                fs::rename(root.path().join(AUTH_FILE), root.path().join("retained")).unwrap();
+                if replace {
+                    private_write(&root.path().join(AUTH_FILE), &payload());
+                }
+            })
+            .unwrap(),
+            PublicationState::Different
+        );
+        assert_eq!(fs::read(root.path().join("retained")).unwrap(), payload());
+        if replace {
+            assert_eq!(fs::read(root.path().join(AUTH_FILE)).unwrap(), payload());
+        }
+    }
 }
 
 #[test]
@@ -311,10 +337,16 @@ fn new_home_provenance_and_current_physical_directory_are_required() {
     let source = staged(&directory.path().join("source"));
     let prepared = prepare_new(&directory.path().join("homes"), take_snapshot(&source));
     let home = prepared.home.clone();
+    let root = prepared.root.try_clone().unwrap();
+    let receipt = prepared.receipt();
     let retained = home.with_extension("retained");
     fs::rename(&home, &retained).unwrap();
     fs::create_dir(&home).unwrap();
     fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        publication_state(&root, &receipt).unwrap(),
+        PublicationState::Different
+    );
     assert_eq!(
         publish(prepared).unwrap_err(),
         PublishFailure::NotPublished(Error::UnsafeDestination)
