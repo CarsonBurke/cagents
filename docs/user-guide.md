@@ -753,10 +753,24 @@ confirms that conversation. A failed or mismatched resume keeps the original
 saved descriptor. This cannot recover conversation files deleted with the old
 home if the provider cannot access them from the selected account.
 
-Account loading also removes unregistered managed homes older than 24 hours.
-Pending sign-ins, registered accounts, homes referenced by linked accounts, and
-arbitrary external directories are preserved. Missing, unreadable, or newer
-account registries prevent this orphan cleanup.
+A native chat's account picker also works after its first message, including
+when its current account is pinned. Choosing a different account asks the
+original actor for a safe exact handoff. Only a confirmed refusal before any
+effects queues the choice until idle; **Cancel switch** cancels that waiting
+choice, not work already handed off. A connection error stops the wait and does
+not automatically retry or resend a message. Choosing the current account leaves
+its existing launch unchanged.
+
+If exact handoff is unavailable, **Continue on … as a new conversation** opens an
+independent, editable draft beside the original. It includes a bounded recent
+text excerpt and the unsent request and attachments; provider cache/history is
+not transferred. The original conversation and draft remain available, and the
+new draft is never sent automatically. Review it before sending.
+
+Account loading performs read-only discovery; it does not delete provider homes.
+Unregistered or unproved homes, pending sign-ins, and linked or external directories
+are preserved. A missing, unreadable, or newer registry never authorizes cleanup
+during loading.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
