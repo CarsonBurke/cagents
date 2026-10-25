@@ -1757,6 +1757,7 @@ mod tests {
                 &active(&mut frame, &renderer),
                 &app.card_keyboard_focus(survivor)
             ));
+            drop(frame);
             assert!(
                 app.workspace.take_widget_focus_request().is_none(),
                 "visible frame consumes the retained request once"
