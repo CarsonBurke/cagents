@@ -298,6 +298,9 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
+            // Requires canonical work and pane evidence; an optimistic client
+            // cannot infer whether retirement was accepted.
+            ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -382,6 +385,12 @@ pub enum ModelEdit {
         expected_revision: u64,
         title: String,
         source: crate::model::ChannelTitleSource,
+    },
+    /// Daemon-only invalidation after a committed channel-work transaction.
+    ChannelWorkChanged { home: crate::channel_work::Home },
+    RetireEmptyChannel {
+        home: crate::channel_work::Home,
+        expected_view_revision: u64,
     },
 }
 
@@ -468,7 +477,9 @@ impl ModelEdit {
             | Self::SuggestChannelTitle { .. }
             | Self::SuggestConversationTitle { .. }
             | Self::DeleteChannel { .. }
-            | Self::AgentsChanged) => edit,
+            | Self::AgentsChanged
+            | Self::ChannelWorkChanged { .. }
+            | Self::RetireEmptyChannel { .. }) => edit,
         })
     }
 }
@@ -545,6 +556,32 @@ mod tests {
         let bytes = postcard::to_allocvec(&edit).unwrap();
         assert_eq!(bytes[0], 12);
         assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+    }
+
+    #[test]
+    fn channel_work_edits_preserve_captured_home_and_retirement_revision() {
+        let home = crate::channel_work::Home {
+            registry: Uuid::new_v4(),
+            channel: ChannelId::new(),
+            creation_ordinal: 73,
+        };
+        for (edit, tag) in [
+            (ModelEdit::ChannelWorkChanged { home }, 13),
+            (
+                ModelEdit::RetireEmptyChannel {
+                    home,
+                    expected_view_revision: u64::MAX,
+                },
+                14,
+            ),
+        ] {
+            let canonical = edit.clone().canonicalized().unwrap();
+            assert_eq!(canonical, edit);
+            assert_eq!(canonical.clone().canonicalized().unwrap(), edit);
+            let bytes = postcard::to_allocvec(&canonical).unwrap();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+        }
     }
 
     #[test]

@@ -1651,8 +1651,32 @@ impl<E: ProcessExecutor> GitHubService<E> {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, None)
+    }
+
+    /// A targeted read can use a smaller process budget without changing the
+    /// defaults of unrelated GitHub operations. Cancellation also bounds its
+    /// wait for the shared process permit.
+    pub fn view_with_timeout(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<PullRequest, GitHubError> {
+        self.view_with_budget(key, cancellation, Some(timeout))
+    }
+
+    fn view_with_budget(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<PullRequest, GitHubError> {
         key.validate()?;
-        let command = self.view_command(key);
+        let mut command = self.view_command(key);
+        if let Some(timeout) = timeout {
+            command = command.timeout(timeout);
+        }
         let output = self.run_checked(&command, &key.repository, cancellation)?;
         let pull_request =
             attach_process(parse_pull_request(&output.stdout, &key.repository), &output)?;
@@ -2894,8 +2918,8 @@ pub fn pull_request_number(
         .ok_or_else(|| GitHubValidationError::InvalidPullRequestUrl(url.to_string()))?
         .collect();
     if segments.len() != 4
-        || segments[0] != repository.owner
-        || segments[1] != repository.name
+        || !segments[0].eq_ignore_ascii_case(&repository.owner)
+        || !segments[1].eq_ignore_ascii_case(&repository.name)
         || segments[2] != "pull"
     {
         return Err(GitHubValidationError::InvalidPullRequestUrl(
@@ -3325,7 +3349,12 @@ mod tests {
             ]
         );
         assert!(!cheap.last().unwrap().contains("statusCheckRollup"));
-        assert!(arguments(true).last().unwrap().contains("statusCheckRollup"));
+        assert!(
+            arguments(true)
+                .last()
+                .unwrap()
+                .contains("statusCheckRollup")
+        );
     }
 
     #[test]
@@ -4492,3 +4521,6 @@ mod tests {
         assert!(argument_strings(&commands[0]).contains(&"path=src/lib.rs".to_owned()));
     }
 }
+
+#[cfg(test)]
+mod channel_work_tests;

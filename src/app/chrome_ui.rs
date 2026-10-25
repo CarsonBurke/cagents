@@ -388,7 +388,7 @@ mod tests {
                 .map(cosmic::Action::App);
             let before = rename_fixture_step(&app, &mut tree, &renderer, focus, true);
             assert!(before.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
 
             let open = app.update_chrome(Action::Rename(card));
@@ -399,7 +399,7 @@ mod tests {
             assert!(
                 !during
                     .iter()
-                    .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                    .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
             );
             let _ = app.update_chrome(Action::RenameChanged(" New name ".into()));
             let close = match dismissal {
@@ -428,7 +428,7 @@ mod tests {
             );
             let after = rename_fixture_step(&app, &mut tree, &renderer, close, true);
             assert!(after.iter().any(|message| matches!(
-                message, Message::SettingsSearchChanged(value) if value == "x"
+                message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
             )));
         }
     }
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(state.title_source, ChannelTitleSource::Manual);
         let after = rename_fixture_step(&app, &mut tree, &renderer, submit, true);
         assert!(after.iter().any(|message| matches!(
-            message, Message::SettingsSearchChanged(value) if value == "x"
+            message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(value) if value == "x")
         )));
     }
 
@@ -498,7 +498,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
@@ -519,7 +519,7 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|message| matches!(message, Message::SettingsSearchChanged(_)))
+                .any(|message| matches!(message, Message::UtilityPaneUi(inner) if matches!(inner.as_ref(), Message::SettingsSearchChanged(_))))
         );
     }
 
@@ -2460,49 +2460,130 @@ impl Cagents {
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let (_, tab_width) = self.tab_strip_geometry();
-        let tabs = self
-            .workspace
-            .order()
-            .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-            .chain(std::iter::once(self.new_tab_control()))
-            .collect();
-        let generation = self.workspace_view_generation;
-        let tabs = crate::tab_strip::reorderable(
-            widget::Id::new("workspace.tabs"),
-            tabs,
-            design::PRIMARY_CONTROL_SIZE,
-            design::HEADER_HEIGHT,
-            Some(Box::new(|viewport| {
-                Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
-            })),
-            crate::tab_strip::Reordering {
-                order: self.workspace.order().collect(),
-                tab_width,
-                enabled: !self.workspace_inputs_blocked(),
-                select: Box::new(Message::FocusCard),
-                dropped: Box::new(move |card, before| Message::Viewport {
-                    generation,
-                    event: WorkspaceViewportEvent::Reordered { card, before },
-                }),
-            },
-        );
-        let actions = widget::row::with_children(self.workflow_header())
+        let header = if self.channel_work_is_main() {
+            let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
+            self.native_header(
+                iced::widget::Space::new().into(),
+                Some(actions.into()),
+                true,
+            )
+        } else {
+            let (_, tab_width) = self.tab_strip_geometry();
+            let tabs = self
+                .workspace
+                .order()
+                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
+                .chain(std::iter::once(self.new_tab_control()))
+                .collect();
+            let generation = self.workspace_view_generation;
+            let tabs = crate::tab_strip::reorderable(
+                widget::Id::new("workspace.tabs"),
+                tabs,
+                design::PRIMARY_CONTROL_SIZE,
+                design::HEADER_HEIGHT,
+                Some(Box::new(|viewport| {
+                    Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
+                })),
+                crate::tab_strip::Reordering {
+                    order: self.workspace.order().collect(),
+                    tab_width,
+                    enabled: !self.workspace_inputs_blocked(),
+                    select: Box::new(Message::FocusCard),
+                    dropped: Box::new(move |card, before| Message::Viewport {
+                        generation,
+                        event: WorkspaceViewportEvent::Reordered { card, before },
+                    }),
+                },
+            );
+            let actions = widget::row::with_children(self.workflow_header())
+                .spacing(space::XXS)
+                .align_y(Alignment::Center);
+            self.native_header(
+                tabs.into(),
+                Some(actions.into()),
+                !self.context_inspector_open,
+            )
+        };
+        let mut rows = vec![header];
+        if let Some(channel) = self.channel_home_bar() {
+            rows.push(channel);
+        }
+        rows.push(crate::design::horizontal_rule().into());
+        rows.push(content);
+        widget::column::with_children(rows)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
+        let (home, title) = self.channel_home()?;
+        let generation = self.channel_home_generation();
+        let workspace = self.workspace_view_generation;
+        let work = self.channel_work_is_main();
+        let compact = self.window_width < 800.0;
+        let mut navigation = Vec::new();
+        for (label, surface, selected) in [
+            ("Conversations", channel_work::Surface::Conversations, !work),
+            ("Work", channel_work::Surface::Work, work),
+        ] {
+            let action = Message::ChannelWorkNavigation(channel_work::Navigation {
+                home,
+                generation,
+                workspace,
+                surface,
+            });
+            navigation.push(crate::ui_controls::owned(
+                (home, generation, workspace, surface),
+                crate::ui_controls::view_tab(
+                    crate::ui_controls::ViewTab {
+                        label: label.into(),
+                        description: format!("{label} for channel {title}").into(),
+                        count: None,
+                        selected,
+                        id: None,
+                        on_press: (!self.modal_is_open()).then_some(action),
+                    },
+                    compact,
+                    None,
+                ),
+            ));
+        }
+        let navigation = widget::row::with_children(navigation)
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let header = self.native_header(
-            tabs.into(),
-            Some(actions.into()),
-            !self.context_inspector_open,
-        );
-        widget::column::with_children(vec![
-            header,
-            crate::design::horizontal_rule().into(),
-            content,
+        let identity = widget::column::with_children(vec![
+            design::caption("CHANNEL").into(),
+            design::heading(if title.is_empty() {
+                "Untitled channel".to_owned()
+            } else {
+                title
+            })
+            .width(Length::Fill)
+            .into(),
         ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .spacing(space::XXS)
+        .width(Length::Fill);
+        let content: Element<'_, Message> = if work {
+            // Work's fixed leaf header already displays the captured channel
+            // title. Do not repeat it or narrow it beside the navigation.
+            navigation.into()
+        } else if compact {
+            widget::column::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::XS)
+                .into()
+        } else {
+            widget::row::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        Some(
+            widget::container(content)
+                .padding([space::XS, space::S])
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
@@ -2510,7 +2591,11 @@ impl Cagents {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
-        let total = self.workspace.cards().len();
+        let total = if self.channel_work_is_main() {
+            0
+        } else {
+            self.workspace.cards().len()
+        };
         if should_show_card_navigator(total) {
             let current = self
                 .workspace
@@ -2591,7 +2676,8 @@ impl Cagents {
             )
             .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
+                (!panel_owns_shared_controls && !self.channel_work_is_main())
+                    .then(|| self.sidebar_toggle()),
             )
             .into(),
         ]
@@ -2963,6 +3049,32 @@ impl Cagents {
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
+        if !self.channel_work_is_main() && self.channel_work.view.is_open() {
+            let end = widget::row::with_children(vec![
+                widget::row::with_children(self.notice_control()).into(),
+                widget::row::with_children(self.update_control()).into(),
+            ])
+            .spacing(space::XXS)
+            .align_y(Alignment::Center)
+            .into();
+            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            return widget::column::with_children(vec![
+                heading,
+                crate::interaction::focused_escape(
+                    self.channel_work
+                        .view
+                        .view(
+                            width,
+                            (self.window_height - design::HEADER_CONTENT_HEIGHT).max(0.0),
+                        )
+                        .map(Message::ChannelWork),
+                    || Message::ChannelWorkEscape,
+                ),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
         let indicators = self.context_rail_indicators();
         let tabs = widget::row::with_children(
             ContextTab::ALL
@@ -3039,6 +3151,20 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let tabs = widget::row::with_children(vec![
+            tabs.into(),
+            crate::ui_controls::button::secondary("Channel work")
+                .name("Open current channel work")
+                .on_press_maybe(
+                    self.durable
+                        .active_channel
+                        .filter(|_| !self.modal_is_open())
+                        .map(Message::OpenChannelWork),
+                )
+                .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::XS);
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)
