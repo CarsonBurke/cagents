@@ -1174,6 +1174,15 @@ mod tests {
                     }
                 })
                 .unwrap();
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                if manual {
+                    "User chosen"
+                } else {
+                    "Provider chosen"
+                },
+                "establish the naming source before replacing the primary thread"
+            );
             let mut successor = original.clone();
             let CardKind::Chat(chat) = &mut successor.kind else {
                 unreachable!()
