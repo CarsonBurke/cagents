@@ -487,6 +487,116 @@ impl Reservation {
         Ok(reservation)
     }
 
+    /// Reserve only the explicitly planned destination. Import never reserves
+    /// or seeds System and never turns an existing directory into fresh-home
+    /// creation authority. A later explicit Verify reserves the original home.
+    pub(super) fn for_import(
+        host: &SharedHost,
+        key: uuid::Uuid,
+        fresh: bool,
+    ) -> Result<Self, ProtocolError> {
+        let store = Store::installation().ok_or_else(|| refusal("Account registry unavailable"))?;
+        let homes = crate::account::home::Homes::installation()
+            .ok_or_else(|| refusal("Account homes unavailable"))?;
+        Self::for_import_at(host, key, fresh, store, &homes)
+    }
+
+    fn for_import_at(
+        host: &SharedHost,
+        key: uuid::Uuid,
+        fresh: bool,
+        store: Store,
+        homes: &crate::account::home::Homes,
+    ) -> Result<Self, ProtocolError> {
+        if key.is_nil() {
+            return Err(refusal("The import operation must be nonnil"));
+        }
+        let account = Account::managed(
+            crate::agent::Provider::Codex,
+            key,
+            homes.path(crate::agent::Provider::Codex, key),
+        );
+        let mut reservation = Self::install_with_store(host, &[account], store, Some(homes))?;
+        let current = reservation.current().map_err(refusal)?;
+        let destination = current
+            .homes
+            .first()
+            .ok_or_else(|| refusal("Import home unavailable"))?;
+        if fresh {
+            if destination.pin.is_some() {
+                return Err(refusal(
+                    "The planned import home already exists; it was retained",
+                ));
+            }
+            reservation.create = Some((crate::agent::Provider::Codex, key));
+        } else if destination.pin.is_none() {
+            return Err(refusal("The original import home is unavailable"));
+        }
+        Ok(reservation)
+    }
+
+    /// Called within the import's existing Store/lifecycle lease. The initializer
+    /// receives the actual new-directory receipt before any credential link or
+    /// registry publication. None explicitly prevents all System seed/link work.
+    pub(crate) fn create_import_home(
+        &self,
+        homes: &crate::account::home::Homes,
+        initialized: impl FnOnce(&crate::account::home::NewHomeCreationReceipt) -> std::io::Result<()>,
+    ) -> std::io::Result<(uuid::Uuid, PathBuf)> {
+        self.create_home_initialized(
+            homes,
+            crate::agent::Provider::Codex,
+            None,
+            crate::account::home::CodexConfig::Shared,
+            initialized,
+        )
+    }
+
+    /// Physical-only validation under an already-held Store lease. This never
+    /// reenters the registry flock and grants no import ownership on its own.
+    pub(crate) fn verify_import_scope(&self, operation: uuid::Uuid) -> Result<(), String> {
+        let current = self.current()?;
+        if operation.is_nil()
+            || self.accounts.len() != 1
+            || current.homes.len() != 1
+            || self.accounts[0].provider != crate::agent::Provider::Codex
+            || self.accounts[0].registry_key() != Some(operation)
+        {
+            return Err("The import reservation no longer matches its destination".into());
+        }
+        current.homes[0].verify()
+    }
+
+    /// Registry preimages change after our own pending publication. Verify only
+    /// original installed physical custody here; the import Store helper must
+    /// independently recheck the exact import-owned pending record and intent.
+    pub(crate) fn verify_import_home(
+        &self,
+        key: uuid::Uuid,
+        expected: crate::account::import::PhysicalIdentity,
+    ) -> Result<(), String> {
+        self.verify_import_scope(key)?;
+        let current = self.current()?;
+        let home = &current.homes[0];
+        home.verify()?;
+        let pin = home
+            .pin
+            .as_ref()
+            .ok_or("The original import directory is unavailable")?;
+        let metadata = pin
+            .metadata()
+            .map_err(|_| "The original import directory is unavailable")?;
+        if metadata.dev() != expected.device()
+            || metadata.ino() != expected.inode()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() == 0
+        {
+            return Err("The original import directory changed".into());
+        }
+        Ok(())
+    }
+
     fn current(&self) -> Result<Arc<Reserved>, String> {
         self.map
             .lock()
@@ -1083,6 +1193,85 @@ pub(crate) mod tests {
         host.lock().unwrap().register_client(1);
         host
     }
+    #[test]
+    fn import_reserves_only_a_fresh_destination_and_retains_existing_home() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let key = uuid::Uuid::new_v4();
+        let target = homes.path(Provider::Codex, key);
+        let reservation =
+            Reservation::for_import_at(&host, key, true, store.clone(), &homes).unwrap();
+        assert_eq!(reservation.accounts.len(), 1);
+        assert!(!reservation.accounts[0].is_system());
+        assert!(ensure_paths(&host, [target.clone()]).is_err());
+        let mut actual = None;
+        let created = reservation
+            .create_import_home(&homes, |receipt| {
+                assert_eq!(receipt.key(), key);
+                assert!(std::fs::read_dir(receipt.home())?.next().is_none());
+                let metadata = receipt.directory().metadata()?;
+                actual = Some(crate::account::import::PhysicalIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(created, (key, target.clone()));
+        assert!(
+            std::fs::read_dir(&target).unwrap().next().is_none(),
+            "no System links, configuration or instructions may be seeded"
+        );
+        reservation
+            .verify_import_home(key, actual.unwrap())
+            .unwrap();
+        drop(reservation);
+        std::fs::write(target.join("retain-fixture"), b"untouched").unwrap();
+        assert!(Reservation::for_import_at(&host, key, true, store.clone(), &homes).is_err());
+        assert_eq!(
+            std::fs::read(target.join("retain-fixture")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            store.load().unwrap().pending().is_empty(),
+            "reservation alone never publishes a pending registration"
+        );
+    }
+
+    #[test]
+    fn import_verification_pins_the_original_home_and_does_not_recreate_it() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let host = host();
+        let key = uuid::Uuid::new_v4();
+        assert!(Reservation::for_import_at(&host, key, false, store.clone(), &homes).is_err());
+        let target = homes.path(Provider::Codex, key);
+        assert!(!target.exists());
+        let fresh = Reservation::for_import_at(&host, key, true, store.clone(), &homes).unwrap();
+        fresh.create_import_home(&homes, |_| Ok(())).unwrap();
+        drop(fresh);
+        let verifier = Reservation::for_import_at(&host, key, false, store, &homes).unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        let expected = crate::account::import::PhysicalIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        verifier.verify_import_home(key, expected).unwrap();
+        let moved = root.path().join("moved");
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(verifier.verify_import_home(key, expected).is_err());
+        assert!(
+            ensure_paths(&host, [moved.clone()]).is_err(),
+            "original physical custody survives a lexical replacement"
+        );
+        drop(verifier);
+        assert!(moved.exists());
+    }
+
     #[test]
     fn original_inode_and_physical_ancestry_block_aliases_after_rename() {
         let root = tempfile::tempdir().unwrap();
