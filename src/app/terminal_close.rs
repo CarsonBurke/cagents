@@ -143,7 +143,7 @@ impl Cagents {
         }
         // Read before anything persists the scope, which prunes the closed
         // card from its channel's membership.
-        let emptied = self.channels_emptied_by(&[card]);
+        let emptied = self.close_emptied_channels(&[card]);
         self.retire_lsp_card(card);
         self.sidebar_state.forget_card_attention(card);
         self.cards.remove(&card);
@@ -158,12 +158,8 @@ impl Cagents {
                 },
             };
         }
-        let emptied = emptied
-            .into_iter()
-            .filter(|&channel| !self.channel_has_open_card(channel))
-            .collect();
         self.persist();
-        Task::batch([self.delete_channels(emptied), self.sync_chrome()])
+        Task::batch([emptied, self.sync_chrome()])
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
@@ -342,6 +338,11 @@ impl Cagents {
     /// Moves focus off a card whose removal the workspace has reserved, then
     /// commits that removal.
     pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
+        if !self.workspace_surfaces_visible() {
+            // The accepted close still commits, but its hidden pane cannot
+            // take native focus from Work or the contextual inspector.
+            return cosmic::task::message(Message::CommitClose(handoff.unmounting));
+        }
         workspace_widget::focus_handoff_then(
             handoff,
             widget::Id::new(TOOLBAR_FOCUS_ID),
@@ -385,7 +386,11 @@ impl Cagents {
         };
         // Read before anything persists the scope, which prunes the
         // closed card from its channel's membership.
-        let emptied = self.channels_emptied_by(&[id]);
+        let emptied = if replacing {
+            Task::none()
+        } else {
+            self.close_emptied_channels(&[id])
+        };
         if let Some(card) = closed_descriptor {
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
@@ -452,12 +457,6 @@ impl Cagents {
         let replacement = replacement
             .map(|(launch, slot, succession)| self.open_chat_replacement(launch, slot, succession))
             .unwrap_or_else(Task::none);
-        // The replacement joins the chat's channel, which is then not
-        // empty after all.
-        let emptied = emptied
-            .into_iter()
-            .filter(|&channel| !self.channel_has_open_card(channel))
-            .collect();
         let reopen = match utility {
             Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
                 self.reopen_utility = None;
@@ -465,7 +464,8 @@ impl Cagents {
             }
             _ => Task::none(),
         };
-        let focus = if !replacing
+        let focus = if self.workspace_surfaces_visible()
+            && !replacing
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
@@ -480,15 +480,8 @@ impl Cagents {
             Task::none()
         };
         Some(
-            Task::batch([
-                closed,
-                replacement,
-                settings,
-                self.delete_channels(emptied),
-                reopen,
-                focus,
-            ])
-            .chain(self.next_queued_card_close()),
+            Task::batch([closed, replacement, settings, emptied, reopen, focus])
+                .chain(self.next_queued_card_close()),
         )
     }
 
@@ -768,6 +761,113 @@ fn close_focus(index: usize) -> Task<Message> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    fn channel_close_fixture() -> (Cagents, CardId, crate::channel_work::Home) {
+        use crate::workspace_model::{
+            ModelChannel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let home = crate::channel_work::Home {
+            registry: uuid::Uuid::new_v4(),
+            channel: crate::model::ChannelId::new(),
+            creation_ordinal: 4,
+        };
+        let project = ProjectId::new();
+        app.active_workspace = Some("/tmp".into());
+        app.workspace_model.identity = home.registry;
+        app.workspace_model.channels.push(ModelChannel {
+            id: home.channel,
+            repository: "/tmp".into(),
+            title: "Retained Home".into(),
+            title_source: Default::default(),
+            ordinal: home.creation_ordinal,
+        });
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(home.channel),
+            revision: 7,
+            panes: vec![Pane::from_card(app.card_state(card).unwrap(), None).unwrap()],
+            retired: vec![],
+        });
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(home.channel);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: home.channel,
+            project_id: project,
+            title: "Retained Home".into(),
+            title_source: Default::default(),
+            ordinal: home.creation_ordinal,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        (app, card, home)
+    }
+
+    fn assert_deferred_home_close(
+        app: &mut Cagents,
+        card: CardId,
+        home: crate::channel_work::Home,
+    ) {
+        use crate::workspace_model::ModelEdit;
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == home.channel)
+        );
+        assert!(
+            !app.channel_ui.is_deleting(home.channel),
+            "closing a pane is not explicit Home deletion"
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == home.channel)
+                .unwrap()
+                .cards
+                .is_empty(),
+            "persist prunes closed membership after the original Home was captured"
+        );
+        assert!(app.channel_work.retire_candidates.contains(&home));
+        let (send, received) = async_channel::unbounded();
+        app.workspace_model_tx = send;
+        app.retire_settled_empty_channels();
+        assert!(
+            received.try_recv().is_err(),
+            "the old occupied canonical view is insufficient"
+        );
+        app.workspace_model.views[0].panes.clear();
+        app.workspace_model.views[0].revision = 8;
+        app.retire_settled_empty_channels();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            ModelEdit::RetireEmptyChannel {
+                home,
+                expected_view_revision: 8,
+            }
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn final_pane_commit_defers_home_retirement_to_canonical_work_and_view_proof() {
+        let (mut app, card, home) = channel_close_fixture();
+        app.workspace.request_close(card).unwrap();
+        drop(app.commit_card_removal(card, None).unwrap());
+        assert_deferred_home_close(&mut app, card, home);
+    }
+
+    #[test]
+    fn final_offstrip_pane_close_defers_home_retirement_to_canonical_work_and_view_proof() {
+        let (mut app, card, home) = channel_close_fixture();
+        app.workspace = Cagents::rebuild_workspace(&WorkspaceState::default());
+        drop(app.retire_offstrip_card(card));
+        assert_deferred_home_close(&mut app, card, home);
+    }
 
     #[test]
     fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {
