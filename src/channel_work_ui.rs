@@ -5,6 +5,7 @@ use crate::{
         Bucket, Change, Entry, Freshness, Home, HomeLifecycle, Mutation, Page, PrState, Receipt,
         Reply, Role, Snapshot, Source, Target,
     },
+    channel_work_api::LocalSelection,
     design::{self, space},
     github_identity::{GitHubRepoKey, PullRequestKey},
     ui_controls::{self, Icon, ViewTab, button, field},
@@ -14,6 +15,7 @@ use cosmic::{
     iced::{Alignment, Length},
     widget,
 };
+use std::path::PathBuf;
 use uuid::Uuid;
 
 const PAGE_SIZE: u16 = 50;
@@ -94,6 +96,25 @@ pub enum Action {
     Latest(ViewOwner),
     More(ViewOwner),
     Attach(ViewOwner),
+    AttachLocal(ViewOwner),
+    LocalPath(FormOwner, String),
+    InspectLocal {
+        owner: FormOwner,
+        path_generation: Uuid,
+        directory: String,
+        role: Role,
+    },
+    PreparedLocal {
+        ticket: Ticket,
+        result: Result<LocalSelection, Failure>,
+    },
+    SubmitLocal {
+        owner: FormOwner,
+        selection: Uuid,
+        target: Uuid,
+        role: Role,
+        revision: u64,
+    },
     Field(FormOwner, Field, String),
     Role(FormOwner, usize),
     Submit {
@@ -130,7 +151,10 @@ impl Action {
     pub fn background(&self) -> bool {
         matches!(
             self,
-            Self::Loaded { .. } | Self::Applied { .. } | Self::LookedUp { .. }
+            Self::Loaded { .. }
+                | Self::Applied { .. }
+                | Self::LookedUp { .. }
+                | Self::PreparedLocal { .. }
         )
     }
 }
@@ -146,9 +170,15 @@ pub enum Effect {
         home: Home,
         page: Page,
     },
+    PrepareLocal {
+        ticket: Ticket,
+        home: Home,
+        directory: PathBuf,
+    },
     Mutate {
         ticket: Ticket,
         mutation: Mutation,
+        selection: Option<Uuid>,
     },
     Lookup {
         ticket: Ticket,
@@ -170,6 +200,28 @@ pub enum Effect {
 }
 
 #[derive(Debug)]
+struct Inspection {
+    ticket: Ticket,
+    path_generation: Uuid,
+}
+#[derive(Debug)]
+struct LocalDraft {
+    directory: String,
+    path_generation: Uuid,
+    inspecting: Option<Inspection>,
+    selected: Option<LocalSelection>,
+    error: Option<String>,
+}
+impl LocalDraft {
+    fn directory(&self) -> Option<PathBuf> {
+        (self.directory.trim() == self.directory
+            && !self.directory.contains('\0')
+            && self.directory.len() <= 4096
+            && std::path::Path::new(&self.directory).is_absolute())
+        .then(|| PathBuf::from(&self.directory))
+    }
+}
+#[derive(Debug)]
 struct Form {
     owner: FormOwner,
     fixed: Option<Target>,
@@ -179,9 +231,13 @@ struct Form {
     number: String,
     role: Role,
     initial_role: Role,
+    local: Option<LocalDraft>,
 }
 impl Form {
     fn dirty(&self) -> bool {
+        if let Some(local) = &self.local {
+            return !local.directory.is_empty() || self.role != self.initial_role;
+        }
         self.role != self.initial_role
             || (self.fixed.is_none()
                 && (self.host != "github.com"
@@ -214,6 +270,13 @@ impl Form {
     }
 
     fn target(&self) -> Result<Target, &'static str> {
+        if let Some(local) = &self.local {
+            return local
+                .selected
+                .as_ref()
+                .map(|selected| Target::Local(selected.context.id))
+                .ok_or("Inspect a checkout before tracking local work.");
+        }
         if let Some(target) = &self.fixed {
             return Ok(target.clone());
         }
@@ -304,6 +367,7 @@ enum Delivery {
 #[derive(Debug)]
 struct Pending {
     mutation: Mutation,
+    selection: Option<Uuid>,
     ticket: Ticket,
     lookup: Option<Ticket>,
     delivery: Delivery,
@@ -317,6 +381,9 @@ struct Pending {
 pub struct State {
     view: Option<View>,
     pending: Vec<Pending>,
+    // One actual client inspection survives view/form dismissal. A stale reply
+    // releases only its own slot and cannot populate another draft.
+    local_inspection: Option<Ticket>,
 }
 
 impl State {
@@ -497,6 +564,15 @@ impl State {
         })
     }
     fn begin(&mut self, owner: ViewOwner, revision: u64, change: Change) -> Option<Effect> {
+        self.begin_selected(owner, revision, change, None)
+    }
+    fn begin_selected(
+        &mut self,
+        owner: ViewOwner,
+        revision: u64,
+        change: Change,
+        selection: Option<Uuid>,
+    ) -> Option<Effect> {
         if !self.writable(owner) {
             return None;
         }
@@ -511,6 +587,7 @@ impl State {
         let ticket = Ticket::new(owner.home);
         self.pending.push(Pending {
             mutation: mutation.clone(),
+            selection,
             ticket,
             lookup: None,
             delivery: Delivery::Sending,
@@ -520,7 +597,11 @@ impl State {
             view.error = None;
             view.notice = None;
         }
-        Some(Effect::Mutate { ticket, mutation })
+        Some(Effect::Mutate {
+            ticket,
+            mutation,
+            selection,
+        })
     }
     fn adopt(&mut self, snapshot: Snapshot) {
         if let Some(view) = &mut self.view {
@@ -591,6 +672,14 @@ impl State {
                     .filter(|view| view.owner.home == pending.mutation.home)
                 {
                     view.error = Some(format!("Tracking was not changed: {reason}"));
+                    if pending.selection.is_some()
+                        && let Some(local) = view.form.as_mut().and_then(|form| form.local.as_mut())
+                    {
+                        local.selected = None;
+                        local.error = Some(
+                            "Inspect the checkout again before submitting a new change.".into(),
+                        );
+                    }
                 }
             }
             _ => {
@@ -601,6 +690,12 @@ impl State {
         }
     }
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if let Action::PreparedLocal { ticket, .. } = &action {
+            if self.local_inspection != Some(*ticket) {
+                return None;
+            }
+            self.local_inspection = None;
+        }
         if self.has_confirmation()
             && !action.background()
             && !matches!(&action, Action::Keep(..) | Action::Discard(..))
@@ -786,6 +881,167 @@ impl State {
                 let view = self.view.as_mut()?;
                 view.visible = view.visible.saturating_add(VISIBLE_ROWS);
             }
+            Action::AttachLocal(owner) if self.writable(owner) => {
+                if let Some(form) = self.view.as_ref()?.form.as_ref() {
+                    return Some(Effect::Focus {
+                        owner,
+                        id: if form.local.is_some() {
+                            local_path_id(form.owner)
+                        } else {
+                            role_id(form.owner, form.role)
+                        },
+                    });
+                }
+                let form_owner = FormOwner {
+                    view: owner,
+                    draft: Uuid::new_v4(),
+                };
+                self.view.as_mut()?.notice = None;
+                self.view.as_mut()?.error = None;
+                self.view.as_mut()?.form = Some(Form {
+                    owner: form_owner,
+                    fixed: None,
+                    expected_revision: 0,
+                    host: String::new(),
+                    repository: String::new(),
+                    number: String::new(),
+                    role: Role::Contribute,
+                    initial_role: Role::Contribute,
+                    local: Some(LocalDraft {
+                        directory: String::new(),
+                        path_generation: Uuid::new_v4(),
+                        inspecting: None,
+                        selected: None,
+                        error: None,
+                    }),
+                });
+                return Some(Effect::Focus {
+                    owner,
+                    id: local_path_id(form_owner),
+                });
+            }
+            Action::LocalPath(owner, value) if self.writable(owner.view) => {
+                let form = self.view.as_mut()?.form.as_mut()?;
+                if form.owner != owner || value.len() > 4096 || value.contains('\0') {
+                    return None;
+                }
+                let local = form.local.as_mut()?;
+                if local.directory != value {
+                    local.directory = value;
+                    local.path_generation = Uuid::new_v4();
+                    local.selected = None;
+                    local.error = None;
+                    // Keep a finite in-flight inspection owned until its reply;
+                    // its old generation can no longer populate this path.
+                }
+            }
+            Action::InspectLocal {
+                owner,
+                path_generation,
+                directory,
+                role,
+            } if self.writable(owner.view) => {
+                if self.local_inspection.is_some() {
+                    return None;
+                }
+                let form = self.view.as_mut()?.form.as_mut()?;
+                if form.owner != owner || form.role != role {
+                    return None;
+                }
+                let local = form.local.as_mut()?;
+                if local.path_generation != path_generation
+                    || local.directory != directory
+                    || local.inspecting.is_some()
+                {
+                    return None;
+                }
+                let directory = local.directory()?;
+                let ticket = Ticket::new(owner.view.home);
+                self.local_inspection = Some(ticket);
+                local.inspecting = Some(Inspection {
+                    ticket,
+                    path_generation,
+                });
+                local.selected = None;
+                local.error = None;
+                return Some(Effect::PrepareLocal {
+                    ticket,
+                    home: owner.view.home,
+                    directory,
+                });
+            }
+            Action::PreparedLocal { ticket, result } => {
+                let view = self.view.as_mut()?;
+                if view.owner.home != ticket.home {
+                    return None;
+                }
+                let form = view.form.as_mut()?;
+                let local = form.local.as_mut()?;
+                if local.inspecting.as_ref()?.ticket != ticket {
+                    return None;
+                }
+                let inspection = local.inspecting.take()?;
+                if local.path_generation != inspection.path_generation {
+                    return None;
+                }
+                match result {
+                    Ok(selected)
+                        if selected.home == view.owner.home && selected.validate().is_ok() =>
+                    {
+                        local.selected = Some(selected);
+                        local.error = None;
+                    }
+                    Ok(_) => {
+                        local.error = Some(
+                            "The selected checkout did not match this channel. Inspect it again."
+                                .into(),
+                        )
+                    }
+                    Err(Failure::Refused(reason)) => {
+                        local.error = Some(format!("Checkout inspection was refused: {reason}"))
+                    }
+                    Err(Failure::Unavailable) => {
+                        local.error = Some(
+                            "The checkout could not be inspected. No tracking change was sent."
+                                .into(),
+                        )
+                    }
+                }
+            }
+            Action::SubmitLocal {
+                owner,
+                selection,
+                target,
+                role,
+                revision,
+            } if self.writable(owner.view) => {
+                let form = self.view.as_ref()?.form.as_ref()?;
+                if form.owner != owner || form.role != role {
+                    return None;
+                }
+                let local = form.local.as_ref()?;
+                let selected = local.selected.as_ref()?;
+                if local.inspecting.is_some()
+                    || selected.selection != selection
+                    || selected.context.id != target
+                    || selected.home != owner.view.home
+                    || selected.expected_revision != revision
+                    || selected.validate().is_err()
+                {
+                    return None;
+                }
+                // Exact selected-target point CAS comes from the daemon, even
+                // when that target is absent from these bounded display pages.
+                return self.begin_selected(
+                    owner.view,
+                    revision,
+                    Change::Claim {
+                        target: Target::Local(target),
+                        role,
+                    },
+                    Some(selection),
+                );
+            }
             Action::Attach(owner) if self.writable(owner) => {
                 if let Some(form) = self.view.as_ref()?.form.as_ref() {
                     return Some(Effect::Focus {
@@ -807,6 +1063,7 @@ impl State {
                     number: String::new(),
                     role: Role::Contribute,
                     initial_role: Role::Contribute,
+                    local: None,
                 });
                 return Some(Effect::Focus {
                     owner,
@@ -815,7 +1072,11 @@ impl State {
             }
             Action::Field(owner, field, value) if self.writable(owner.view) => {
                 let form = self.view.as_mut()?.form.as_mut()?;
-                if form.owner != owner || form.fixed.is_some() || value.len() > 1024 {
+                if form.owner != owner
+                    || form.local.is_some()
+                    || form.fixed.is_some()
+                    || value.len() > 1024
+                {
                     return None;
                 }
                 match field {
@@ -858,6 +1119,7 @@ impl State {
             } if self.writable(owner.view) => {
                 let form = self.view.as_ref()?.form.as_ref()?;
                 if form.owner != owner
+                    || form.local.is_some()
                     || form.target().ok().as_ref() != Some(&target)
                     || form.role != role
                 {
@@ -905,6 +1167,7 @@ impl State {
                     number: String::new(),
                     role,
                     initial_role: role,
+                    local: None,
                 });
                 return Some(Effect::Focus {
                     owner: owner.view,
@@ -980,6 +1243,7 @@ impl State {
                 return Some(Effect::Mutate {
                     ticket,
                     mutation: pending.mutation.clone(),
+                    selection: pending.selection,
                 });
             }
             _ => {}
@@ -1032,7 +1296,7 @@ impl State {
         let mut body: Vec<Element<'_, Action>> = Vec::new();
         if let Some(confirmation) = &view.confirmation {
             status.push(panel(vec![design::heading("Discard this tracking draft?").into(),
-                design::body("The unsaved PR identity or role will be lost. Submitted changes are tracked separately and will not be cancelled.").into(),
+                design::body("The unsaved target or role will be lost. Submitted changes are tracked separately and will not be cancelled.").into(),
                 flow(vec![
                     ui_controls::owned((owner, confirmation.id, "keep"), button::primary("Keep editing").id(confirmation_id(confirmation.id)).on_press(Action::Keep(owner, confirmation.id))),
                     ui_controls::owned((owner, confirmation.id, "discard"), button::destructive("Discard draft").on_press(Action::Discard(owner, confirmation.id))),
@@ -1151,7 +1415,9 @@ impl State {
         body.push(ui_controls::owned((owner, "tabs"), navigation));
         body.push(flow(vec![design::caption("Counts describe the loaded pages, not all channel work. Tracked roles describe intent; PR state and checkout observations remain separate.").width(Length::Fill).into(),
             ui_controls::owned((owner, "attach", self.writable(owner)), button::secondary("Track PR…").icon(Icon::PullRequest).id(attach_id(owner))
-                .on_press_maybe(self.writable(owner).then_some(Action::Attach(owner))))], narrow));
+                .on_press_maybe(self.writable(owner).then_some(Action::Attach(owner)))),
+            ui_controls::owned((owner, "attach-local", self.writable(owner)), button::quiet("Track local work…")
+                .on_press_maybe(self.writable(owner).then_some(Action::AttachLocal(owner))))], narrow));
         if let Some(form) = &view.form {
             body.push(self.form_view(view, form, narrow));
         }
@@ -1340,6 +1606,9 @@ impl State {
         form: &'a Form,
         narrow: bool,
     ) -> Element<'a, Action> {
+        if let Some(local) = &form.local {
+            return self.local_form_view(view, form, local, narrow);
+        }
         let enabled = self.writable(view.owner);
         let owner = form.owner;
         let target = form.target();
@@ -1487,6 +1756,182 @@ impl State {
             (owner, "cancel", self.pending_for(view.owner.home).is_none()),
             button::quiet("Cancel").on_press_maybe(
                 (self.pending_for(view.owner.home).is_none()).then_some(Action::Dismiss(owner)),
+            ),
+        ));
+        rows.push(flow(controls, narrow));
+        panel(rows)
+    }
+
+    fn local_form_view<'a>(
+        &'a self,
+        view: &'a View,
+        form: &'a Form,
+        local: &'a LocalDraft,
+        narrow: bool,
+    ) -> Element<'a, Action> {
+        let owner = form.owner;
+        let enabled = self.writable(view.owner);
+        let inspect = Action::InspectLocal {
+            owner,
+            path_generation: local.path_generation,
+            directory: local.directory.clone(),
+            role: form.role,
+        };
+        let can_inspect = enabled
+            && self.local_inspection.is_none()
+            && local.inspecting.is_none()
+            && local.directory().is_some();
+        let mut rows: Vec<Element<'a, Action>> = vec![
+            design::heading("Track local work").into(),
+            design::body("Choose a checkout explicitly. Branch and filesystem observations do not establish contribution or a pull request association.").into(),
+            design::caption("Checkout directory on this device").into(),
+            ui_controls::owned((owner, "local-path"), field::text("/absolute/path/to/checkout", &local.directory)
+                .id(local_path_id(owner))
+                .on_input_maybe(enabled.then_some(move |value| Action::LocalPath(owner, value)))
+                .on_submit_maybe(can_inspect.then_some({let action = inspect.clone(); move |_| action.clone()})).into()),
+            design::caption("Your role").into(),
+        ];
+        rows.push(if enabled {
+            let mut choices = ROLE_VALUES.iter().enumerate().map(|(index, role)| {
+                let selected = *role == form.role;
+                let action = Action::Role(owner, index);
+                ui_controls::owned(
+                    (owner, *role),
+                    crate::interaction::focused_key(
+                        widget::button::custom(design::body(ROLES[index]))
+                            .name(ROLES[index])
+                            .description(format!(
+                                "{}{}",
+                                if selected {
+                                    "Selected role. "
+                                } else {
+                                    "Select role. "
+                                },
+                                role.description()
+                            ))
+                            .id(role_id(owner, *role))
+                            .selected(selected)
+                            .class(ui_controls::control_style(selected, None))
+                            .padding([space::XS, space::S])
+                            .width(Length::Fill)
+                            .on_press(action.clone()),
+                        // Handle Enter before Button sets a lingering native press.
+                        move |event| {
+                            matches!(
+                                event,
+                                cosmic::iced::keyboard::Event::KeyPressed {
+                                    key: cosmic::iced::keyboard::Key::Named(
+                                        cosmic::iced::keyboard::key::Named::Enter
+                                    ),
+                                    ..
+                                }
+                            )
+                            .then(|| action.clone())
+                        },
+                    ),
+                )
+            });
+            if narrow {
+                widget::column::with_children((0..2).map(|_| {
+                    widget::row::with_children(choices.by_ref().take(2).collect::<Vec<_>>())
+                        .spacing(space::S)
+                        .into()
+                }))
+                .spacing(space::S)
+                .into()
+            } else {
+                widget::row::with_children(choices.collect::<Vec<_>>())
+                    .spacing(space::S)
+                    .into()
+            }
+        } else {
+            design::body(form.role.label()).into()
+        });
+        rows.push(design::caption(form.role.description()).into());
+        if let Some(error) = &local.error {
+            rows.push(message(error, true));
+        }
+        if !local.directory.is_empty() && local.directory().is_none() {
+            rows.push(message(
+                "Enter an absolute checkout directory without leading or trailing spaces.",
+                true,
+            ));
+        }
+        if self.local_inspection.is_some() && local.inspecting.is_none() {
+            rows.push(design::caption("An earlier checkout inspection is finishing. Inspect this path explicitly when it settles.").into());
+        }
+        if local.inspecting.is_some() {
+            rows.push(
+                design::caption("Inspecting checkout… No tracking change has been sent.").into(),
+            );
+        }
+        if let Some(selected) = &local.selected {
+            rows.push(design::heading("Selected checkout").into());
+            for text in [
+                format!("Checkout: {}", selected.context.path.display()),
+                format!("Repository: {}", selected.context.repository.display()),
+                format!(
+                    "Branch: {}",
+                    selected
+                        .context
+                        .branch
+                        .as_deref()
+                        .unwrap_or("Detached or unavailable")
+                ),
+                format!(
+                    "HEAD: {}",
+                    selected.context.head.as_deref().unwrap_or("Unavailable")
+                ),
+                match selected.context.dirty {
+                    Some(true) => "Uncommitted changes were observed.".into(),
+                    Some(false) => "No uncommitted changes were observed.".into(),
+                    None => "Working-tree changes not inspected.".into(),
+                },
+            ] {
+                rows.push(design::body(text).width(Length::Fill).into());
+            }
+            rows.push(design::caption("This inspection is observational. Tracking declares your chosen role; it does not verify execution or create a pull request.").into());
+        }
+        let mut controls = vec![ui_controls::owned(
+            (owner, local.path_generation, form.role, can_inspect),
+            button::secondary(if local.selected.is_some() {
+                "Inspect again"
+            } else {
+                "Inspect checkout"
+            })
+            .on_press_maybe(can_inspect.then_some(inspect)),
+        )];
+        if let Some(selected) = &local.selected {
+            controls.push(ui_controls::owned(
+                (
+                    owner,
+                    selected.selection,
+                    selected.context.id,
+                    form.role,
+                    selected.expected_revision,
+                    enabled,
+                ),
+                button::primary("Track local work")
+                    .name("Track selected local checkout")
+                    .on_press_maybe(enabled.then_some(Action::SubmitLocal {
+                        owner,
+                        selection: selected.selection,
+                        target: selected.context.id,
+                        role: form.role,
+                        revision: selected.expected_revision,
+                    })),
+            ));
+        }
+        controls.push(ui_controls::owned(
+            (
+                owner,
+                "cancel-local",
+                self.pending_for(view.owner.home).is_none(),
+            ),
+            button::quiet("Cancel").on_press_maybe(
+                self.pending_for(view.owner.home)
+                    .is_none()
+                    .then_some(Action::Dismiss(owner)),
             ),
         ));
         rows.push(flow(controls, narrow));
@@ -1669,7 +2114,7 @@ impl State {
             }
             if !entry.contexts.is_empty() {
                 rows.push(design::body("Observed checkouts").into());
-                rows.push(design::caption("Location and dirty state describe a checkout; they do not identify who changed its files.").into());
+                rows.push(design::caption("Checkout metadata describes an observed location; it does not identify who changed its files.").into());
                 for context in entry
                     .contexts
                     .iter()
@@ -1680,10 +2125,10 @@ impl State {
                             "{} · {}{}",
                             context.branch.as_deref().unwrap_or("Detached checkout"),
                             context.path.display(),
-                            if context.dirty {
-                                " · local changes observed"
-                            } else {
-                                ""
+                            match context.dirty {
+                                Some(true) => " · local changes observed",
+                                Some(false) => " · no local changes observed",
+                                None => " · changes not inspected",
                             }
                         ))
                         .into(),
@@ -1848,4 +2293,8 @@ fn form_input_id(owner: FormOwner, field: Field) -> widget::Id {
 
 fn confirmation_id(id: Uuid) -> widget::Id {
     widget::Id::new(format!("channel-work-keep-{id}"))
+}
+
+fn local_path_id(owner: FormOwner) -> widget::Id {
+    widget::Id::new(format!("channel-work-local-path-{}", owner.draft))
 }

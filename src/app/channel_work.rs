@@ -589,6 +589,7 @@ impl Cagents {
         let home = match &effect {
             Effect::Read { home, .. }
             | Effect::Refresh { home, .. }
+            | Effect::PrepareLocal { home, .. }
             | Effect::Lookup { home, .. }
             | Effect::OpenPullRequest { home, .. }
             | Effect::Close { home } => *home,
@@ -671,12 +672,43 @@ impl Cagents {
                     }
                 })
             }
-            Effect::Mutate { ticket, mutation } => request(
+            Effect::PrepareLocal {
+                ticket,
+                home,
+                directory,
+            } => request(
                 route,
                 home,
-                api::Request::Mutate {
-                    mutation,
+                api::Request::PrepareLocal {
+                    home,
+                    directory,
                     caller: None,
+                },
+                move |result| ui::Action::PreparedLocal {
+                    ticket,
+                    result: result.and_then(|response| match response {
+                        api::Response::Selected(selected) => Ok(selected),
+                        _ => Err(Failure::Unavailable),
+                    }),
+                },
+            ),
+            Effect::Mutate {
+                ticket,
+                mutation,
+                selection,
+            } => request(
+                route,
+                home,
+                match selection {
+                    Some(selection) => api::Request::ApplySelection {
+                        selection,
+                        mutation,
+                        caller: None,
+                    },
+                    None => api::Request::Mutate {
+                        mutation,
+                        caller: None,
+                    },
                 },
                 move |result| ui::Action::Applied {
                     ticket,

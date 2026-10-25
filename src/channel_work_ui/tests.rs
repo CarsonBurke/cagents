@@ -328,7 +328,9 @@ fn completed(mutation: &Mutation, revision: u64, entries: Vec<Entry>) -> Reply {
 }
 fn begin_end(state: &mut State, number: u64) -> (Ticket, Mutation) {
     match state.update(Action::End(row(state, number))).unwrap() {
-        Effect::Mutate { ticket, mutation } => (ticket, mutation),
+        Effect::Mutate {
+            ticket, mutation, ..
+        } => (ticket, mutation),
         _ => panic!("expected mutation"),
     }
 }
@@ -383,6 +385,7 @@ fn close_unknown_lookup_missing_and_retry_retain_original_mutation_and_home() {
     let Effect::Mutate {
         ticket: retry,
         mutation,
+        ..
     } = state.update(Action::Retry(owner, operation)).unwrap()
     else {
         panic!()
@@ -1204,7 +1207,7 @@ fn channel_home_keeps_multiple_full_pr_keys_and_declared_roles_without_checkout_
         branch: Some("same-branch".into()),
         head: Some("a".repeat(40)),
         generation: 1,
-        dirty: true,
+        dirty: Some(true),
     });
     stewarded.contexts = contributed.contexts.clone();
     let mut reviewed = entry(3, Role::Review);
@@ -1410,7 +1413,10 @@ fn reopened_pr_fresh_review_shows_previous_work_until_explicit_captured_role_con
     let hit = bounds(&ui, "Apply tracking").center();
     let mut messages = click(&mut ui, &mut renderer, hit);
     let _ = ui.into_cache();
-    let Effect::Mutate { ticket, mutation } = state.update(messages.remove(0)).unwrap() else {
+    let Effect::Mutate {
+        ticket, mutation, ..
+    } = state.update(messages.remove(0)).unwrap()
+    else {
         panic!()
     };
     assert_eq!(mutation.expected_revision, revision);
@@ -2224,5 +2230,830 @@ fn incomplete_url_edit_disables_submit_and_refuses_a_previously_captured_complet
         .unwrap();
     assert!(
         matches!(messages.as_slice(), [Action::Submit { owner: actual, target, role: Role::Contribute, revision: 0 }] if *actual == owner && target == &expected)
+    );
+}
+
+fn local_draft(state: &mut State, directory: &str) -> FormOwner {
+    state.update(Action::AttachLocal(state.owner().unwrap()));
+    let owner = state.view.as_ref().unwrap().form.as_ref().unwrap().owner;
+    state.update(Action::LocalPath(owner, directory.into()));
+    owner
+}
+fn inspect_local(state: &mut State) -> Ticket {
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    let local = form.local.as_ref().unwrap();
+    let action = Action::InspectLocal {
+        owner: form.owner,
+        path_generation: local.path_generation,
+        directory: local.directory.clone(),
+        role: form.role,
+    };
+    let Effect::PrepareLocal {
+        ticket,
+        home: original,
+        directory,
+    } = state.update(action).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(Some(original), state.home());
+    assert_eq!(directory, PathBuf::from("/repo/local"));
+    ticket
+}
+fn selected(home: Home, revision: u64) -> LocalSelection {
+    LocalSelection {
+        selection: Uuid::new_v4(),
+        home,
+        expected_revision: revision,
+        context: crate::channel_work::CheckoutContext {
+            id: Uuid::from_u128(800),
+            registry: home.registry,
+            repository: "/repo".into(),
+            path: "/repo/local".into(),
+            branch: Some("topic".into()),
+            head: Some("a".repeat(40)),
+            generation: 1,
+            dirty: Some(true),
+        },
+    }
+}
+fn local_submit(state: &State) -> Action {
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    let selection = form.local.as_ref().unwrap().selected.as_ref().unwrap();
+    Action::SubmitLocal {
+        owner: form.owner,
+        selection: selection.selection,
+        target: selection.context.id,
+        role: form.role,
+        revision: selection.expected_revision,
+    }
+}
+
+#[test]
+fn local_native_input_inspects_before_explicit_tracking_and_uses_selected_point_cas() {
+    let mut state = ready(home(10), vec![]);
+    let owner = local_draft(&mut state, "");
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 500.0, 1600.0);
+    ui.operate(
+        &renderer,
+        &mut operation::focusable::focus::<()>(local_path_id(owner)),
+    );
+    let key = iced::keyboard::Key::Character("/".into());
+    let input = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Slash),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::default(),
+        text: Some("/repo/local".into()),
+        repeat: false,
+    });
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[input],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut iced::advanced::clipboard::Null,
+        &mut messages,
+    );
+    let cache = ui.into_cache();
+    assert!(
+        matches!(messages.as_slice(), [Action::LocalPath(actual, value)] if *actual == owner && value == "/repo/local")
+    );
+    state.update(messages.remove(0));
+    let mut ui = cached(&state, cache, &mut renderer, 500.0, 1600.0);
+    let point = bounds(&ui, "Inspect checkout").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let Effect::PrepareLocal {
+        ticket,
+        home: original,
+        directory,
+    } = state.update(messages.remove(0)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(original, home(10));
+    assert_eq!(directory, PathBuf::from("/repo/local"));
+    assert!(state.pending.is_empty(), "inspection sends no mutation");
+    let selection = selected(home(10), 7);
+    assert!(selection.validate().is_ok());
+    state.update(Action::PreparedLocal {
+        ticket,
+        result: Ok(selection.clone()),
+    });
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 500.0, 1800.0);
+    let point = bounds(&ui, "Track selected local checkout").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let Effect::Mutate {
+        mutation,
+        selection: actual,
+        ..
+    } = state.update(messages.remove(0)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(actual, Some(selection.selection));
+    assert_eq!(
+        mutation.expected_revision, 7,
+        "an empty display page must not replace exact point CAS with zero"
+    );
+    assert_eq!(
+        mutation.change,
+        Change::Claim {
+            target: Target::Local(selection.context.id),
+            role: Role::Contribute
+        }
+    );
+}
+
+#[test]
+fn local_cached_track_press_is_owned_by_selection_role_and_draft_not_poll_metadata() {
+    for scenario in 0..4 {
+        let mut state = ready(home(10), vec![]);
+        let owner = local_draft(&mut state, "/repo/local");
+        let ticket = inspect_local(&mut state);
+        let original = selected(home(10), 7);
+        state.update(Action::PreparedLocal {
+            ticket,
+            result: Ok(original.clone()),
+        });
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached(&state, Cache::new(), &mut renderer, 1200.0, 1800.0);
+        let point = bounds(&ui, "Track selected local checkout").center();
+        let old_action = click(&mut ui, &mut renderer, point).remove(0);
+        assert!(
+            events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[mouse::Event::ButtonPressed(mouse::Button::Left)]
+            )
+            .is_empty()
+        );
+        let cache = ui.into_cache();
+        match scenario {
+            0 => {
+                let ticket = inspect_local(&mut state);
+                state.update(Action::PreparedLocal {
+                    ticket,
+                    result: Ok(selected(home(10), 7)),
+                });
+            }
+            1 => {
+                state.update(Action::Role(owner, 2));
+            }
+            2 => {
+                state.update(Action::Dismiss(owner));
+                let view = state.owner().unwrap();
+                let confirmation = state
+                    .view
+                    .as_ref()
+                    .unwrap()
+                    .confirmation
+                    .as_ref()
+                    .unwrap()
+                    .id;
+                state.update(Action::Discard(view, confirmation));
+                local_draft(&mut state, "/repo/local");
+                let ticket = inspect_local(&mut state);
+                state.update(Action::PreparedLocal {
+                    ticket,
+                    result: Ok(selected(home(10), 7)),
+                });
+            }
+            _ => {
+                refresh(&mut state, snapshot(home(10), Vec::new(), 50));
+            }
+        }
+        if scenario < 3 {
+            assert!(
+                state.update(old_action).is_none(),
+                "queued stale selected action must not mutate"
+            );
+        }
+        let mut ui = cached(&state, cache, &mut renderer, 1200.0, 1800.0);
+        let current = bounds(&ui, "Track selected local checkout");
+        assert!(
+            current.contains(point),
+            "replacement must occupy the held hit area"
+        );
+        let released = events(
+            &mut ui,
+            &mut renderer,
+            point,
+            &[mouse::Event::ButtonReleased(mouse::Button::Left)],
+        );
+        if scenario < 3 {
+            assert!(
+                released.is_empty(),
+                "old held Track must not become a different selected operation"
+            );
+        } else {
+            assert!(
+                matches!(released.as_slice(), [Action::SubmitLocal { selection, revision: 7, .. }] if *selection == original.selection),
+                "unrelated polling preserves valid held intent"
+            );
+        }
+        let mut fresh = click(&mut ui, &mut renderer, current.center());
+        let _ = ui.into_cache();
+        let Effect::Mutate {
+            selection: actual,
+            mutation,
+            ..
+        } = state.update(fresh.remove(0)).unwrap()
+        else {
+            panic!()
+        };
+        let expected = state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .selected
+            .as_ref()
+            .unwrap();
+        assert_eq!(actual, Some(expected.selection));
+        assert_eq!(mutation.expected_revision, 7);
+        assert_eq!(
+            mutation.change,
+            Change::Claim {
+                target: Target::Local(expected.context.id),
+                role: if scenario == 1 {
+                    Role::Review
+                } else {
+                    Role::Contribute
+                }
+            }
+        );
+    }
+}
+
+#[test]
+fn local_inspection_replies_require_current_home_draft_path_generation_and_ticket() {
+    let mut state = ready(home(10), vec![]);
+    let owner = local_draft(&mut state, "/repo/local");
+    let ticket = inspect_local(&mut state);
+    state.update(Action::LocalPath(owner, "/repo/other".into()));
+    state.update(Action::LocalPath(owner, "/repo/local".into()));
+    state.update(Action::PreparedLocal {
+        ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    let local = state
+        .view
+        .as_ref()
+        .unwrap()
+        .form
+        .as_ref()
+        .unwrap()
+        .local
+        .as_ref()
+        .unwrap();
+    assert!(
+        local.selected.is_none() && local.inspecting.is_none(),
+        "A→B→A must retire old inspection, without wedging new Inspect"
+    );
+    for invalid in 0..4 {
+        let ticket = inspect_local(&mut state);
+        let mut selection = selected(home(10), 0);
+        match invalid {
+            0 => selection.home = home(11),
+            1 => selection.context.registry = Uuid::new_v4(),
+            2 => selection.context.id = Uuid::nil(),
+            _ => selection.selection = Uuid::nil(),
+        }
+        state.update(Action::PreparedLocal {
+            ticket,
+            result: Ok(selection),
+        });
+        assert!(
+            state
+                .view
+                .as_ref()
+                .unwrap()
+                .form
+                .as_ref()
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .selected
+                .is_none()
+        );
+    }
+    let old_ticket = inspect_local(&mut state);
+    state.update(Action::Dismiss(owner));
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    state.update(Action::Discard(state.owner().unwrap(), confirmation));
+    let current_owner = local_draft(&mut state, "/repo/local");
+    assert_ne!(owner, current_owner);
+    assert!(
+        state
+            .update(Action::InspectLocal {
+                owner: current_owner,
+                path_generation: state
+                    .view
+                    .as_ref()
+                    .unwrap()
+                    .form
+                    .as_ref()
+                    .unwrap()
+                    .local
+                    .as_ref()
+                    .unwrap()
+                    .path_generation,
+                directory: "/repo/local".into(),
+                role: Role::Contribute,
+            })
+            .is_none(),
+        "dismissal cannot create another outstanding client read"
+    );
+    state.update(Action::PreparedLocal {
+        ticket: old_ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    let current_ticket = inspect_local(&mut state);
+    state.update(Action::PreparedLocal {
+        ticket: old_ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .inspecting
+            .as_ref()
+            .unwrap()
+            .ticket,
+        current_ticket
+    );
+    state.update(Action::PreparedLocal {
+        ticket: current_ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    assert!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .selected
+            .is_some(),
+        "current draft response is the positive control"
+    );
+    let mut wrong = local_submit(&state);
+    if let Action::SubmitLocal { revision, .. } = &mut wrong {
+        *revision = 1;
+    }
+    assert!(
+        state.update(wrong).is_none(),
+        "loaded-page or fabricated revision must not replace selected point CAS"
+    );
+    let mut wrong = local_submit(&state);
+    if let Action::SubmitLocal { target, .. } = &mut wrong {
+        *target = Uuid::new_v4();
+    }
+    assert!(
+        state.update(wrong).is_none(),
+        "selected identity cannot retarget to another arbitrary local UUID"
+    );
+    let ticket = inspect_local(&mut state);
+    state.update(Action::Close(state.owner().unwrap()));
+    let confirmation = state
+        .view
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .as_ref()
+        .unwrap()
+        .id;
+    state.update(Action::Discard(state.owner().unwrap(), confirmation));
+    let read = state.open(home(11), "Other".into()).unwrap();
+    load(&mut state, read, snapshot(home(11), Vec::new(), 1));
+    local_draft(&mut state, "/repo/local");
+    state.update(Action::PreparedLocal {
+        ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    assert_eq!(state.home(), Some(home(11)));
+    assert!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .selected
+            .is_none()
+    );
+    assert!(state.pending.is_empty());
+}
+
+#[test]
+fn selected_local_unknown_retry_keeps_original_selection_and_receipt_settles_without_projection() {
+    let mut state = ready(home(10), Vec::new());
+    let owner = local_draft(&mut state, "/repo/local");
+    let inspection = inspect_local(&mut state);
+    let original = selected(home(10), 7);
+    state.update(Action::PreparedLocal {
+        ticket: inspection,
+        result: Ok(original.clone()),
+    });
+    let Effect::Mutate {
+        ticket,
+        mutation,
+        selection,
+    } = state.update(local_submit(&state)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(selection, Some(original.selection));
+    state.update(Action::Applied {
+        ticket,
+        result: Err(Failure::Unavailable),
+    });
+    state.update(Action::LocalPath(owner, "/repo/other".into()));
+    state.escape();
+    let read = state.open(home(11), "Other".into()).unwrap();
+    load(&mut state, read, snapshot(home(11), Vec::new(), 1));
+    assert_eq!(
+        state.pending_for(home(10)).unwrap().selection,
+        Some(original.selection)
+    );
+    let read = state.open(home(10), "Original".into()).unwrap();
+    load(&mut state, read, snapshot(home(10), Vec::new(), 8));
+    let owner = state.owner().unwrap();
+    let Effect::Mutate {
+        ticket,
+        mutation: retried,
+        selection,
+    } = state
+        .update(Action::Retry(owner, mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(selection, Some(original.selection));
+    assert_eq!(
+        retried, mutation,
+        "retry must remain ApplySelection of exact original intent"
+    );
+    state.update(Action::Applied {
+        ticket,
+        result: Err(Failure::Refused("Selection expired".into())),
+    });
+    assert_eq!(
+        state.pending_for(home(10)).unwrap().delivery,
+        Delivery::Unknown
+    );
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    state.update(Action::LookedUp {
+        ticket,
+        operation,
+        result: Ok(None),
+    });
+    assert!(state.pending_for(home(10)).is_some());
+    let Effect::Lookup {
+        ticket, operation, ..
+    } = state
+        .update(Action::Check(owner, mutation.operation))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let effect = state
+        .update(Action::LookedUp {
+            ticket,
+            operation,
+            result: Ok(Some(completed(&mutation, 8, Vec::new()).receipt)),
+        })
+        .unwrap();
+    assert!(state.pending.is_empty());
+    let Effect::Read { ticket, .. } = effect else {
+        panic!()
+    };
+    state.update(Action::Loaded {
+        ticket,
+        result: Err(Failure::Unavailable),
+    });
+    assert!(state.pending.is_empty());
+    assert_eq!(state.home(), Some(home(10)));
+}
+
+#[test]
+fn local_draft_keep_discard_retains_path_and_defers_exact_destination() {
+    let mut state = ready(home(10), Vec::new());
+    let owner = local_draft(&mut state, "/repo/local");
+    let ticket = inspect_local(&mut state);
+    state.open(home(11), "Destination".into());
+    let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 400.0, 1600.0);
+    let point = bounds(&ui, "Keep editing").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    state.update(messages.remove(0));
+    assert_eq!(
+        state.view.as_ref().unwrap().form.as_ref().unwrap().owner,
+        owner
+    );
+    assert_eq!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .directory,
+        "/repo/local"
+    );
+    state.open(home(11), "Destination".into());
+    let mut ui = cached(&state, Cache::new(), &mut renderer, 400.0, 1600.0);
+    let point = bounds(&ui, "Discard draft").center();
+    let mut messages = click(&mut ui, &mut renderer, point);
+    let _ = ui.into_cache();
+    let Effect::Read {
+        home: opened,
+        ticket: read,
+        ..
+    } = state.update(messages.remove(0)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(opened, home(11));
+    state.update(Action::PreparedLocal {
+        ticket,
+        result: Ok(selected(home(10), 0)),
+    });
+    state.update(Action::Loaded {
+        ticket: read,
+        result: Ok(snapshot(home(11), Vec::new(), 1)),
+    });
+    assert_eq!(state.home(), Some(home(11)));
+    assert!(state.view.as_ref().unwrap().form.is_none());
+}
+
+#[test]
+fn correcting_and_ending_a_known_local_row_remain_plain_registered_intent() {
+    let mut local = entry(1, Role::Contribute);
+    local.target = Target::Local(Uuid::from_u128(800));
+    local.revision = 3;
+    let mut state = ready(home(10), vec![]);
+    refresh(&mut state, snapshot(home(10), vec![local], 3));
+    let view = state.view.as_ref().unwrap();
+    let current_entry = &view.snapshot.as_ref().unwrap().entries[0];
+    let row = RowOwner {
+        view: view.owner,
+        id: current_entry.id,
+        target: current_entry.target.clone(),
+        revision: current_entry.revision,
+        bucket: current_entry.bucket(),
+    };
+    state.update(Action::Correct(row.clone()));
+    let form = state.view.as_ref().unwrap().form.as_ref().unwrap();
+    assert!(form.local.is_none());
+    let action = Action::Submit {
+        owner: form.owner,
+        target: row.target.clone(),
+        role: Role::Contribute,
+        revision: 3,
+    };
+    assert!(
+        matches!(state.update(action), Some(Effect::Mutate { selection: None, mutation, .. }) if mutation.expected_revision == 3)
+    );
+    // A separate state proves End does not need a new arbitrary local selection.
+    let mut state = ready(home(10), vec![]);
+    let mut local = entry(1, Role::Contribute);
+    local.target = row.target.clone();
+    local.revision = 3;
+    refresh(&mut state, snapshot(home(10), vec![local], 3));
+    let mut current = row;
+    current.view = state.owner().unwrap();
+    assert!(
+        matches!(state.update(Action::End(current)), Some(Effect::Mutate { selection: None, mutation, .. }) if mutation.change == Change::End { target: Target::Local(Uuid::from_u128(800)) })
+    );
+}
+
+#[test]
+fn checkout_change_observations_distinguish_unknown_without_blocking_explicit_local_intent() {
+    for (dirty, preview, context_suffix) in [
+        (
+            Some(true),
+            "Uncommitted changes were observed.",
+            " · local changes observed",
+        ),
+        (
+            Some(false),
+            "No uncommitted changes were observed.",
+            " · no local changes observed",
+        ),
+        (
+            None,
+            "Working-tree changes not inspected.",
+            " · changes not inspected",
+        ),
+    ] {
+        let mut state = ready(home(10), vec![]);
+        local_draft(&mut state, "/repo/local");
+        let ticket = inspect_local(&mut state);
+        let mut selection = selected(home(10), 7);
+        selection.context.dirty = dirty;
+        assert!(selection.validate().is_ok());
+        state.update(Action::PreparedLocal {
+            ticket,
+            result: Ok(selection.clone()),
+        });
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cached(&state, Cache::new(), &mut renderer, 500.0, 2000.0);
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let labels = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&preview));
+        if dirty.is_none() {
+            assert!(!labels.contains(&"No uncommitted changes were observed."));
+            assert!(!labels.contains(&"Uncommitted changes were observed."));
+        }
+        let point = bounds(&ui, "Track selected local checkout").center();
+        let mut messages = click(&mut ui, &mut renderer, point);
+        let _ = ui.into_cache();
+        assert!(matches!(state.update(messages.remove(0)),
+            Some(Effect::Mutate { selection: Some(actual), mutation, .. })
+            if actual == selection.selection && mutation.expected_revision == 7
+                && mutation.change == Change::Claim { target: Target::Local(selection.context.id), role: Role::Contribute }
+        ));
+
+        let mut local = entry(1, Role::Contribute);
+        local.target = Target::Local(selection.context.id);
+        local.contexts = vec![selection.context.clone()];
+        let mut state = ready(home(10), vec![local.clone()]);
+        let owner = RowOwner {
+            view: state.owner().unwrap(),
+            id: local.id,
+            target: local.target.clone(),
+            revision: local.revision,
+            bucket: local.bucket(),
+        };
+        state.update(Action::Details(owner, true));
+        let ui = cached(&state, Cache::new(), &mut renderer, 500.0, 2000.0);
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let labels = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label())
+            .collect::<Vec<_>>();
+        let expected = format!("topic · /repo/local{context_suffix}");
+        assert!(labels.contains(&expected.as_str()));
+        if dirty.is_none() {
+            assert!(
+                !labels
+                    .iter()
+                    .any(|label| label.contains("no local changes observed"))
+            );
+        }
+    }
+}
+
+#[test]
+fn local_client_inspection_slot_survives_dismissal_home_changes_and_duplicate_replies() {
+    let mut state = ready(home(10), Vec::new());
+    local_draft(&mut state, "/repo/local");
+    let first = inspect_local(&mut state);
+    for n in 11..43 {
+        let owner = state.owner().unwrap();
+        state.update(Action::Close(owner));
+        let confirmation = state
+            .view
+            .as_ref()
+            .unwrap()
+            .confirmation
+            .as_ref()
+            .unwrap()
+            .id;
+        state.update(Action::Discard(owner, confirmation));
+        let read = state.open(home(n), "Other channel".into()).unwrap();
+        load(&mut state, read, snapshot(home(n), Vec::new(), 1));
+        let owner = local_draft(&mut state, "/repo/local");
+        let path_generation = state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .path_generation;
+        assert!(
+            state
+                .update(Action::InspectLocal {
+                    owner,
+                    path_generation,
+                    directory: "/repo/local".into(),
+                    role: Role::Contribute,
+                })
+                .is_none()
+        );
+        assert_eq!(state.local_inspection, Some(first));
+        assert!(state.pending.is_empty());
+    }
+    assert!(
+        state
+            .update(Action::PreparedLocal {
+                ticket: first,
+                result: Ok(selected(home(10), 0)),
+            })
+            .is_none()
+    );
+    assert!(state.local_inspection.is_none());
+    assert!(
+        state
+            .view
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .selected
+            .is_none()
+    );
+    let current = inspect_local(&mut state);
+    assert!(
+        state
+            .update(Action::PreparedLocal {
+                ticket: first,
+                result: Err(Failure::Unavailable),
+            })
+            .is_none()
+    );
+    assert_eq!(
+        state.local_inspection,
+        Some(current),
+        "old duplicate cannot release successor"
+    );
+    assert!(
+        state
+            .update(Action::PreparedLocal {
+                ticket: current,
+                result: Err(Failure::Unavailable),
+            })
+            .is_none(),
+        "failure does not automatically start another client read"
+    );
+    assert!(state.local_inspection.is_none());
+    assert!(state.pending.is_empty(), "inspections never submit a claim");
+    let explicit = inspect_local(&mut state);
+    assert_ne!(
+        explicit, current,
+        "only another explicit inspection starts after failure"
     );
 }
