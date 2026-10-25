@@ -440,4 +440,58 @@ mod tests {
             vec![entry]
         );
     }
+
+    #[test]
+    fn a_confirmed_journal_commit_survives_a_failed_sqlite_ack() {
+        let (directory, registry, _automation, entry) = fixture();
+        let (mut transfer, sender) = waiting(entry.clone());
+        let (notifications, _) = Handle::inert_for_test();
+        let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
+        // Contend with the real ACK transaction using a second connection. No
+        // extra table/trigger or alteration of the published schema is needed.
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        sender.send(Ok(())).unwrap();
+        let now = Instant::now();
+        assert!(
+            transfer
+                .advance_at(now, &registry, &notifications, no_enqueue)
+                .is_err()
+        );
+        assert!(matches!(
+            transfer.pending.as_ref().unwrap().receipt,
+            Receipt::Committed
+        ));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(1)
+                .unwrap(),
+            vec![entry]
+        );
+        assert_eq!(
+            transfer
+                .advance_at(
+                    now + Duration::from_secs(1),
+                    &registry,
+                    &notifications,
+                    no_enqueue
+                )
+                .unwrap(),
+            RETRY - Duration::from_secs(1)
+        );
+        transfer
+            .advance_at(now + RETRY, &registry, &notifications, no_enqueue)
+            .unwrap();
+        assert!(transfer.pending.is_none());
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .pending_automation_notifications(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
