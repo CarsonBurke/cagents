@@ -102,17 +102,22 @@ fn original_directory(
                     .map(|record| record.handle.clone())
                     .ok_or("The exact native provider is no longer live")?,
             ),
-            HostedSession::Terminal(session) => LaunchHandle::Terminal(
-                state
-                    .terminals
-                    .get(&session.id)
-                    .filter(|record| {
-                        !record.handle.is_completed()
-                            && source.same_process(&HostedSession::Terminal(record.session.clone()))
-                    })
-                    .map(|record| record.handle.clone())
-                    .ok_or("The exact native terminal is no longer live")?,
-            ),
+            HostedSession::Terminal(session) => {
+                // Stored terminal recipes need not carry their current live
+                // continuity. Compare the issued source with the daemon's
+                // authenticated live projection, as ordinary caller admission does.
+                let current = state.native_terminal_projection(session.id)?;
+                if !source.same_process(&HostedSession::Terminal(current)) {
+                    return Err("The exact native terminal is no longer live".into());
+                }
+                LaunchHandle::Terminal(
+                    state
+                        .terminals
+                        .get(&session.id)
+                        .map(|record| record.handle.clone())
+                        .ok_or("The exact native terminal is no longer live")?,
+                )
+            }
         }
     };
     // A retained provider may perform a bounded holder request. Do not retain
