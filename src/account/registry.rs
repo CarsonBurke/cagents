@@ -1911,3 +1911,787 @@ mod tests {
         assert!(Store::at(directory.path()).load().is_err());
     }
 }
+
+#[cfg(feature = "host")]
+pub(crate) use coding_config_init::CodingConfigRefusal;
+
+/// Only the selected daemon initializes an account file. UI/CLI callers use
+/// typed lifecycle RPCs; no shared reservation trait or lease is exported.
+#[cfg(feature = "host")]
+mod coding_config_init {
+    use super::*;
+    use crate::{
+        account::{
+            coding_config::{self, aliases},
+            readiness::PhysicalIdentity,
+        },
+        fs_safety::{self, Root},
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_HOMES: usize = 128;
+    const MAX_OBSERVATIONS: usize = 256;
+    const MAX_HOME_COMPONENTS: usize = 128;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CodingConfigRefusal {
+        RegistryUnavailable,
+        RegistryBusy,
+        RegistryNewer,
+        InvalidAccount,
+        ContextChanged,
+        SharedHome,
+        SharedConfig,
+        CensusUnavailable,
+        CensusLimit,
+    }
+    type Refusal = CodingConfigRefusal;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Stamp {
+        device: u64,
+        inode: u64,
+        uid: u32,
+        mode: u32,
+    }
+    impl Stamp {
+        fn directory(root: &Root) -> Result<Self, Refusal> {
+            let metadata = root.metadata().map_err(|_| Refusal::CensusUnavailable)?;
+            Self::metadata(&metadata)
+        }
+        fn metadata(metadata: &fs::Metadata) -> Result<Self, Refusal> {
+            if !metadata.is_dir() || metadata.nlink() == 0 {
+                return Err(Refusal::CensusUnavailable);
+            }
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                uid: metadata.uid(),
+                mode: metadata.mode(),
+            })
+        }
+        fn is_selected(&self, selected: PhysicalIdentity) -> bool {
+            (self.device, self.inode) == (selected.device, selected.inode)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HomeKey {
+        operand: PathBuf,
+        stamp: Stamp,
+        /// Empty for an existing home; otherwise the first proved-absent
+        /// component and remaining suffix under the retained nearest parent.
+        missing: PathBuf,
+    }
+    struct HomeObservation {
+        key: HomeKey,
+        root: Root,
+        anchor: PathBuf,
+    }
+    impl HomeObservation {
+        fn capture(path: PathBuf) -> Result<Self, Refusal> {
+            use std::path::Component;
+            if !path.is_absolute()
+                || path.as_os_str().as_bytes().len() > 16 * 1024
+                || path.components().count() > MAX_HOME_COMPONENTS
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return Err(Refusal::CensusUnavailable);
+            }
+            let mut ancestor = path.as_path();
+            let mut missing = Vec::new();
+            loop {
+                match ancestor.canonicalize() {
+                    Ok(canonical) => {
+                        let root =
+                            Root::open(&canonical).map_err(|_| Refusal::CensusUnavailable)?;
+                        let stamp = Stamp::directory(&root)?;
+                        let named =
+                            fs::metadata(ancestor).map_err(|_| Refusal::CensusUnavailable)?;
+                        if Stamp::metadata(&named)? != stamp {
+                            return Err(Refusal::ContextChanged);
+                        }
+                        let suffix: PathBuf = missing.into_iter().rev().collect();
+                        if let Some(first) = suffix.components().next() {
+                            // canonicalize(NotFound) alone is insufficient:
+                            // an existing dangling symlink is not absence.
+                            match fs_safety::metadata_beneath(&root, Path::new(first.as_os_str())) {
+                                Err(error) if error.is_not_found() => {}
+                                _ => return Err(Refusal::CensusUnavailable),
+                            }
+                        }
+                        return Ok(Self {
+                            key: HomeKey {
+                                operand: path.clone(),
+                                stamp,
+                                missing: suffix,
+                            },
+                            root,
+                            anchor: ancestor.to_path_buf(),
+                        });
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                        missing.push(
+                            ancestor
+                                .file_name()
+                                .ok_or(Refusal::CensusUnavailable)?
+                                .to_owned(),
+                        );
+                        ancestor = ancestor.parent().ok_or(Refusal::CensusUnavailable)?;
+                    }
+                    Err(_) => return Err(Refusal::CensusUnavailable),
+                }
+            }
+        }
+        fn revalidate(&self) -> bool {
+            if Stamp::directory(&self.root).ok().as_ref() != Some(&self.key.stamp)
+                || fs::metadata(&self.anchor)
+                    .ok()
+                    .and_then(|metadata| Stamp::metadata(&metadata).ok())
+                    .as_ref()
+                    != Some(&self.key.stamp)
+            {
+                return false;
+            }
+            self.key.missing.components().next().is_none_or(|first| {
+                matches!(fs_safety::metadata_beneath(&self.root, Path::new(first.as_os_str())), Err(error) if error.is_not_found())
+            })
+        }
+    }
+
+    struct Census {
+        homes: Vec<HomeObservation>,
+        witnesses: Vec<aliases::Witness>,
+        observations: usize,
+    }
+    impl Census {
+        fn revalidate(&self) -> bool {
+            self.homes.iter().all(HomeObservation::revalidate)
+                && self.witnesses.iter().all(aliases::Witness::revalidate)
+        }
+        fn same_homes(&self, fresh: &Self) -> bool {
+            self.homes
+                .iter()
+                .map(|home| &home.key)
+                .eq(fresh.homes.iter().map(|home| &home.key))
+        }
+    }
+
+    fn census(
+        registry: &Registry,
+        homes: &Homes,
+        selected: &AccountId,
+        root: &Root,
+        expected: PhysicalIdentity,
+        system: &[Account],
+        observation_budget: usize,
+    ) -> Result<Census, Refusal> {
+        if registry
+            .registered()
+            .len()
+            .checked_add(registry.pending().len())
+            .and_then(|count| count.checked_add(system.len()))
+            .is_none_or(|count| count > MAX_HOMES)
+        {
+            return Err(Refusal::CensusLimit);
+        }
+        let mut accounts: Vec<_> = registry
+            .registered()
+            .iter()
+            .map(|row| {
+                row.linked_home.as_ref().map_or_else(
+                    || Account::managed(row.provider, row.key, homes.path(row.provider, row.key)),
+                    |path| Account::linked(row.provider, row.key, path.clone()),
+                )
+            })
+            .collect();
+        accounts.extend(
+            registry.pending().iter().map(|row| {
+                Account::managed(row.provider, row.key, homes.path(row.provider, row.key))
+            }),
+        );
+        accounts.extend_from_slice(system);
+        let mut result = Census {
+            homes: Vec::new(),
+            witnesses: Vec::new(),
+            observations: 0,
+        };
+        for account in accounts {
+            if account.id() == *selected {
+                continue;
+            }
+            let path = account.resolved_home().ok_or(Refusal::CensusUnavailable)?;
+            let home = HomeObservation::capture(path)?;
+            if home.key.missing.as_os_str().is_empty() {
+                if home.key.stamp.is_selected(expected) {
+                    return Err(Refusal::SharedHome);
+                }
+                if account.provider == Provider::Codex {
+                    let observed = aliases::observe(&home.root, root);
+                    match observed.verdict {
+                        aliases::Verdict::Reference => return Err(Refusal::SharedConfig),
+                        aliases::Verdict::Unknown => return Err(Refusal::CensusUnavailable),
+                        aliases::Verdict::Independent => {}
+                    }
+                    let witness = observed.witness.ok_or(Refusal::CensusUnavailable)?;
+                    result.observations = result
+                        .observations
+                        .checked_add(witness.observation_count())
+                        .ok_or(Refusal::CensusLimit)?;
+                    if result.observations > observation_budget {
+                        return Err(Refusal::CensusLimit);
+                    }
+                    result.witnesses.push(witness);
+                }
+            }
+            result.homes.push(home);
+        }
+        if !result.revalidate() {
+            return Err(Refusal::ContextChanged);
+        }
+        Ok(result)
+    }
+
+    impl Store {
+        /// Publish only the selected fixed config, under one private registry
+        /// lease and the caller's existing account lifecycle reservation.
+        /// An earlier inspection is context, not permission: selection, home
+        /// identity and every relevant config target are checked afresh here.
+        /// No account/default/revision mutation or provider invocation occurs.
+        pub(crate) fn try_initialize_codex_config_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            id: &AccountId,
+            expected: PhysicalIdentity,
+            network_access: bool,
+        ) -> Result<coding_config::Outcome, CodingConfigRefusal> {
+            self.initialize_codex_config_with_system(
+                reservation,
+                homes,
+                id,
+                expected,
+                network_access,
+                &Account::system_accounts(),
+                |_| {},
+            )
+        }
+
+        fn initialize_codex_config_with_system(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            id: &AccountId,
+            expected: PhysicalIdentity,
+            network_access: bool,
+            system: &[Account],
+            mut before_validation: impl FnMut(bool),
+        ) -> Result<coding_config::Outcome, Refusal> {
+            // The exact existing private lock serializes every cooperating
+            // registry writer. No Registry mutation, save or revision occurs.
+            let _lease = self.try_lock().map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Refusal::RegistryBusy
+                } else {
+                    Refusal::RegistryUnavailable
+                }
+            })?;
+            let latest = read(&self.path()).map_err(|_| Refusal::RegistryUnavailable)?;
+            if latest.is_newer() {
+                return Err(Refusal::RegistryNewer);
+            }
+            let key = latest
+                .registered()
+                .iter()
+                .find(|row| {
+                    let account = row.linked_home.as_ref().map_or_else(
+                        || {
+                            Account::managed(
+                                row.provider,
+                                row.key,
+                                homes.path(row.provider, row.key),
+                            )
+                        },
+                        |path| Account::linked(row.provider, row.key, path.clone()),
+                    );
+                    account.id() == *id
+                })
+                .ok_or(Refusal::InvalidAccount)?;
+            if key.provider != Provider::Codex
+                || latest.is_archived(key.key)
+                || latest.pending().iter().any(|row| row.key == key.key)
+                // Deserialization accepts duplicate rows. A second home with
+                // this UUID must not disappear through the census's selected
+                // account exclusion, even if its provider differs.
+                || latest.registered().iter().filter(|row| row.key == key.key).count() != 1
+            {
+                return Err(Refusal::InvalidAccount);
+            }
+            let root = reservation
+                .coding_config_root(&latest, id, expected)
+                .map_err(|_| Refusal::ContextChanged)?;
+            let baseline = census(
+                &latest,
+                homes,
+                id,
+                &root,
+                expected,
+                system,
+                MAX_OBSERVATIONS,
+            )?;
+            let prepared = match coding_config::prepare(&root, network_access) {
+                Ok(prepared) => prepared,
+                Err(reason) => return Ok(coding_config::Outcome::NotCreated(reason)),
+            };
+            let mut post = false;
+            let mut refused = None;
+            let outcome = prepared.publish(|| {
+                before_validation(post);
+                post = true;
+                let validation = (|| {
+                    reservation
+                        .coding_config_root(&latest, id, expected)
+                        .map_err(|_| Refusal::ContextChanged)?;
+                    if !baseline.revalidate() {
+                        return Err(Refusal::ContextChanged);
+                    }
+                    // The earlier witnesses stay live during this pass. Bound
+                    // both sets together rather than allowing each a full
+                    // independent descriptor budget. The leaf walk also has
+                    // its own fixed bound for its in-progress observation.
+                    let fresh = census(
+                        &latest,
+                        homes,
+                        id,
+                        &root,
+                        expected,
+                        system,
+                        MAX_OBSERVATIONS - baseline.observations,
+                    )?;
+                    if !baseline.same_homes(&fresh) || !baseline.revalidate() || !fresh.revalidate()
+                    {
+                        return Err(Refusal::ContextChanged);
+                    }
+                    Ok(())
+                })();
+                if let Err(reason) = validation {
+                    refused = Some(reason);
+                    false
+                } else {
+                    true
+                }
+            });
+            if matches!(
+                outcome,
+                coding_config::Outcome::NotCreated(coding_config::Refusal::ContextChanged)
+            ) {
+                return Err(refused.unwrap_or(Refusal::ContextChanged));
+            }
+            Ok(outcome)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{account::AccountHome, host::AccountReservation};
+        use std::os::unix::fs::symlink;
+
+        struct Fixture {
+            directory: tempfile::TempDir,
+            store: Store,
+            homes: Homes,
+            host: crate::host::TestSharedHost,
+            account: Account,
+            expected: PhysicalIdentity,
+            system: Vec<Account>,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let selected = directory.path().join("selected");
+                fs::create_dir(&selected).unwrap();
+                let account = Account::linked(Provider::Codex, Uuid::new_v4(), selected.clone());
+                let metadata = fs::metadata(&selected).unwrap();
+                let store = Store::at(directory.path().join("registry"));
+                let homes = Homes::at(directory.path().join("managed"));
+                store
+                    .update(|registry| {
+                        registry.accounts.push(registered(&account));
+                        registry.set_default(&account);
+                        registry.set_project_default(Path::new("/fixture-project"), &account);
+                    })
+                    .unwrap();
+                let system = [Provider::Codex, Provider::Claude]
+                    .into_iter()
+                    .map(|provider| {
+                        let path = directory
+                            .path()
+                            .join(format!("system-{}", provider.executable()));
+                        fs::create_dir(&path).unwrap();
+                        Account {
+                            provider,
+                            home: AccountHome::SystemAt { path },
+                        }
+                    })
+                    .collect();
+                Self {
+                    directory,
+                    store,
+                    homes,
+                    host: AccountReservation::test_host(),
+                    account,
+                    expected: PhysicalIdentity {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                    system,
+                }
+            }
+            fn path(&self) -> PathBuf {
+                self.account.resolved_home().unwrap().join("config.toml")
+            }
+            fn reserve(&self) -> AccountReservation {
+                AccountReservation::test_install(
+                    &self.host,
+                    std::slice::from_ref(&self.account),
+                    self.store.clone(),
+                    &self.homes,
+                )
+                .unwrap()
+            }
+            fn other(&self, name: &str) -> Account {
+                let path = self.directory.path().join(name);
+                fs::create_dir(&path).unwrap();
+                let account = Account::linked(Provider::Codex, Uuid::new_v4(), path);
+                self.store
+                    .update(|registry| registry.accounts.push(registered(&account)))
+                    .unwrap();
+                account
+            }
+            fn initialize(
+                &self,
+                reservation: &AccountReservation,
+                hook: impl FnMut(bool),
+            ) -> Result<coding_config::Outcome, Refusal> {
+                self.store.initialize_codex_config_with_system(
+                    reservation,
+                    &self.homes,
+                    &self.account.id(),
+                    self.expected,
+                    false,
+                    &self.system,
+                    hook,
+                )
+            }
+        }
+        fn registered(account: &Account) -> Registered {
+            Registered {
+                provider: account.provider,
+                key: account.registry_key().unwrap(),
+                linked_home: account.resolved_home(),
+                label: Some("fixture".into()),
+                email: Some("fixture@example.test".into()),
+                organization: None,
+                added_at: 1,
+            }
+        }
+
+        #[test]
+        fn publication_holds_the_real_store_lease_and_preserves_registry_defaults_and_revision() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let before = fs::read(fixture.store.path()).unwrap();
+            let saved = fixture.store.load().unwrap();
+            let mut passes = 0;
+            let outcome = fixture.initialize(&reservation, |_| {
+                passes += 1;
+                assert!(matches!(fixture.store.try_lock(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+            }).unwrap();
+            assert_eq!(outcome, coding_config::Outcome::Created);
+            assert_eq!(passes, 2);
+            assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            assert_eq!(fixture.store.load().unwrap(), saved);
+            assert_eq!(fixture.store.load().unwrap().revision(), saved.revision());
+            let profile: toml::Value =
+                toml::from_str(&fs::read_to_string(fixture.path()).unwrap()).unwrap();
+            assert_eq!(
+                profile["sandbox_workspace_write"]["network_access"].as_bool(),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn reverse_config_links_from_registered_archived_system_and_pending_homes_refuse() {
+            for variant in [
+                "absolute",
+                "relative",
+                "parent-alias",
+                "chain",
+                "archived",
+                "system",
+                "pending",
+            ] {
+                let mut fixture = Fixture::new();
+                let selected = fixture.account.resolved_home().unwrap();
+                let other = if variant == "system" {
+                    fixture.system[0].clone()
+                } else if variant == "pending" {
+                    let key = Uuid::new_v4();
+                    let path = fixture.homes.path(Provider::Codex, key);
+                    fs::create_dir_all(&path).unwrap();
+                    fixture
+                        .store
+                        .update(|registry| registry.begin(Provider::Codex, key, 1))
+                        .unwrap();
+                    Account::managed(Provider::Codex, key, path)
+                } else {
+                    fixture.other("other")
+                };
+                if variant == "archived" {
+                    fixture
+                        .store
+                        .update(|registry| registry.archived.push(other.registry_key().unwrap()))
+                        .unwrap();
+                }
+                let parent = other.resolved_home().unwrap();
+                let target = match variant {
+                    "relative" => PathBuf::from("../selected/config.toml"),
+                    "parent-alias" => {
+                        let alias = fixture.directory.path().join("selected-alias");
+                        symlink(&selected, &alias).unwrap();
+                        alias.join("config.toml")
+                    }
+                    "chain" => {
+                        symlink(fixture.path(), parent.join("next-link")).unwrap();
+                        PathBuf::from("next-link")
+                    }
+                    _ => fixture.path(),
+                };
+                let config = parent.join("config.toml");
+                symlink(&target, &config).unwrap();
+                let inode = fs::symlink_metadata(&config).unwrap().ino();
+                let before = fs::read(fixture.store.path()).unwrap();
+                let reservation = fixture.reserve();
+                assert_eq!(
+                    fixture.initialize(&reservation, |_| {}),
+                    Err(Refusal::SharedConfig),
+                    "{variant}"
+                );
+                assert!(!fixture.path().exists());
+                assert_eq!(fs::read_link(&config).unwrap(), target);
+                assert_eq!(fs::symlink_metadata(&config).unwrap().ino(), inode);
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn a_physically_distinct_dangling_config_and_absent_home_remain_untouched() {
+            let mut fixture = Fixture::new();
+            let other = fixture.other("other").resolved_home().unwrap();
+            let target = PathBuf::from("independent.toml");
+            symlink(&target, other.join("config.toml")).unwrap();
+            let inode = fs::symlink_metadata(other.join("config.toml"))
+                .unwrap()
+                .ino();
+            fixture.system[1].home = AccountHome::SystemAt {
+                path: fixture.directory.path().join("absent-system-home"),
+            };
+            let reservation = fixture.reserve();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}).unwrap(),
+                coding_config::Outcome::Created
+            );
+            assert_eq!(fs::read_link(other.join("config.toml")).unwrap(), target);
+            assert_eq!(
+                fs::symlink_metadata(other.join("config.toml"))
+                    .unwrap()
+                    .ino(),
+                inode
+            );
+        }
+
+        #[test]
+        fn a_home_alias_introduced_after_reservation_is_caught_by_the_latest_census() {
+            let fixture = Fixture::new();
+            let other = fixture.other("other").resolved_home().unwrap();
+            let reservation = fixture.reserve();
+            fs::rename(&other, fixture.directory.path().join("old-other")).unwrap();
+            symlink(fixture.account.resolved_home().unwrap(), &other).unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::SharedHome)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn a_new_registered_reverse_alias_after_reservation_is_not_hidden_by_selected_validation() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let other = fixture.other("new-other").resolved_home().unwrap();
+            symlink(fixture.path(), other.join("config.toml")).unwrap();
+            let latest = fixture.store.load().unwrap();
+            assert!(reservation.verify_registry(&latest).is_ok());
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::SharedConfig)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn accepted_duplicate_uuid_rows_refuse_without_rewriting_or_touching_either_config() {
+            for provider in [Provider::Codex, Provider::Claude] {
+                let fixture = Fixture::new();
+                let reservation = fixture.reserve();
+                let other = fixture.directory.path().join("duplicate-home");
+                fs::create_dir(&other).unwrap();
+                let config = other.join("config.toml");
+                symlink(fixture.path(), &config).unwrap();
+                let link_before = fs::symlink_metadata(&config).unwrap();
+                let original = fixture.store.load().unwrap();
+                let mut duplicate = original.clone();
+                let mut row = duplicate.accounts[0].clone();
+                row.provider = provider;
+                row.linked_home = Some(other);
+                duplicate.accounts.push(row);
+
+                // Exercise the actual accepted on-disk preimage rather than
+                // relying on a normal writer to construct malformed metadata.
+                let bytes = toml::to_string_pretty(&duplicate).unwrap().into_bytes();
+                fs::write(fixture.store.path(), &bytes).unwrap();
+                let accepted = fixture.store.load().unwrap();
+                assert_eq!(accepted, duplicate);
+                assert_eq!(accepted.defaults, original.defaults);
+                assert_eq!(accepted.project_defaults, original.project_defaults);
+                assert_eq!(accepted.revision(), original.revision());
+                // Selected-only validation sees the first row unchanged;
+                // the new lease-time uniqueness guard must close this gap.
+                assert!(reservation.verify_registry(&accepted).is_ok());
+                assert_eq!(
+                    fixture.initialize(&reservation, |_| panic!("publication must not start")),
+                    Err(Refusal::InvalidAccount)
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+                assert_eq!(fixture.store.load().unwrap(), accepted);
+                assert!(matches!(
+                    fs::symlink_metadata(fixture.path()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                ));
+                let link_after = fs::symlink_metadata(&config).unwrap();
+                assert_eq!(
+                    (link_after.dev(), link_after.ino()),
+                    (link_before.dev(), link_before.ino())
+                );
+                assert_eq!(fs::read_link(&config).unwrap(), fixture.path());
+            }
+        }
+
+        #[test]
+        fn an_observed_target_changed_before_or_after_link_is_refused_or_uncertain() {
+            for after_link in [false, true] {
+                let fixture = Fixture::new();
+                let other = fixture.other("other").resolved_home().unwrap();
+                let config = other.join("config.toml");
+                symlink("independent.toml", &config).unwrap();
+                let reservation = fixture.reserve();
+                let before = fs::read(fixture.store.path()).unwrap();
+                let result = fixture.initialize(&reservation, |post| {
+                    if post == after_link {
+                        fs::remove_file(&config).unwrap();
+                        symlink(fixture.path(), &config).unwrap();
+                    }
+                });
+                if after_link {
+                    assert_eq!(
+                        result,
+                        Ok(coding_config::Outcome::CreationUncertain(
+                            coding_config::Uncertainty::ContextChanged
+                        ))
+                    );
+                    assert!(fixture.path().is_file());
+                } else {
+                    assert_eq!(result, Err(Refusal::ContextChanged));
+                    assert!(!fixture.path().exists());
+                }
+                assert_eq!(fs::read_link(config).unwrap(), fixture.path());
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn stale_home_identity_busy_registry_and_occupied_configuration_never_publish() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let lease = fixture.store.try_lock().unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::RegistryBusy)
+            );
+            drop(lease);
+            let wrong = PhysicalIdentity {
+                inode: fixture.expected.inode.wrapping_add(1),
+                ..fixture.expected
+            };
+            assert_eq!(
+                fixture.store.initialize_codex_config_with_system(
+                    &reservation,
+                    &fixture.homes,
+                    &fixture.account.id(),
+                    wrong,
+                    true,
+                    &fixture.system,
+                    |_| {}
+                ),
+                Err(Refusal::ContextChanged)
+            );
+            assert!(!fixture.path().exists());
+            fs::write(fixture.path(), b"existing user configuration").unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Ok(coding_config::Outcome::NotCreated(
+                    coding_config::Refusal::ExistingConfiguration
+                ))
+            );
+            assert_eq!(
+                fs::read(fixture.path()).unwrap(),
+                b"existing user configuration"
+            );
+        }
+
+        #[test]
+        fn alias_walks_have_an_aggregate_budget_without_publishing_a_partial_result() {
+            let fixture = Fixture::new();
+            for index in 0..100 {
+                fixture.other(&format!("other-{index}"));
+            }
+            let reservation = fixture.reserve();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::CensusLimit)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn fresh_census_shares_the_budget_with_the_still_retained_baseline() {
+            let fixture = Fixture::new();
+            for index in 0..55 {
+                fixture.other(&format!("other-{index}"));
+            }
+            let reservation = fixture.reserve();
+            let mut validations = 0;
+            assert_eq!(
+                fixture.initialize(&reservation, |_| validations += 1),
+                Err(Refusal::CensusLimit)
+            );
+            // Staging was reached, so the baseline alone fit. The first
+            // pre-publication pass must still account for its retained roots.
+            assert_eq!(validations, 1);
+            assert!(!fixture.path().exists());
+        }
+    }
+}

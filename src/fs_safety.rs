@@ -76,9 +76,9 @@ struct OpenHow {
 
 /// A directory a path may be resolved beneath.
 ///
-/// The descriptor is `O_PATH`, which needs no read permission on the directory
-/// and cannot be used for anything but further fd-relative resolution — the
-/// least authority that still lets this module work.
+/// `Root::open` uses `O_PATH`, which needs no read permission on the directory
+/// and cannot be used for anything but further fd-relative resolution. The
+/// HOST may also retain a directory handle issued by its lifecycle reservation.
 #[derive(Debug)]
 pub struct Root {
     directory: OwnedFd,
@@ -86,6 +86,28 @@ pub struct Root {
 }
 
 impl Root {
+    /// Retains an already issued directory handle without reopening its name.
+    ///
+    /// The HOST caller must obtain this handle from its original lifecycle
+    /// reservation and verify that reservation before effects. This constructor
+    /// grants no authority from `path`; it is retained only for diagnostics.
+    #[cfg(feature = "host")]
+    pub(crate) fn from_retained_directory(directory: File, path: PathBuf) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.nlink() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the retained handle is not a live directory",
+            ));
+        }
+        Ok(Self {
+            directory: directory.into(),
+            path,
+        })
+    }
+
     /// Opens `root` itself without following a final symlink.
     ///
     /// # Errors
@@ -1464,6 +1486,44 @@ fn fill_random(buffer: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn issued_directory_constructor_keeps_the_original_inode_after_path_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let original = fixture.path().join("original");
+        let moved = fixture.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("marker"), b"issued directory").unwrap();
+        let issued = File::open(&original).unwrap();
+        let before = issued.metadata().unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("marker"), b"replacement").unwrap();
+
+        let retained = Root::from_retained_directory(issued, original.clone()).unwrap();
+        let actual = retained.metadata().unwrap();
+        assert_eq!((actual.dev(), actual.ino()), (before.dev(), before.ino()));
+        assert_ne!(actual.ino(), std::fs::metadata(&original).unwrap().ino());
+        let mut contents = Vec::new();
+        open_beneath(&retained, Path::new("marker"))
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"issued directory");
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn issued_directory_constructor_refuses_a_regular_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("not-a-directory");
+        std::fs::write(&path, b"unchanged").unwrap();
+        assert!(Root::from_retained_directory(File::open(&path).unwrap(), path.clone()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"unchanged");
+    }
 
     use std::{
         fs,

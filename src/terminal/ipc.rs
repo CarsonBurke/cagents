@@ -175,17 +175,24 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
+/// Version 106 adds selected-account capability check request/report frames.
+/// A matched set refuses an older daemon instead of inventing readiness.
+/// Version 107 appends selected-user fixed configuration inspection/creation.
+/// Metadata observations grant neither mutation nor execution authority.
 /// Version 110 bounds channel-work projections with independent current/history
 /// cursors and adds exact-target and metadata-only home reads for safe recovery.
 /// Version 115 appends an explicit recoverable input notice. Older clients
 /// cannot decode this unsolicited event, so all three executables must match.
 /// Version 116 combines channel-work requests/responses with recoverable input
 /// notices. Neither predecessor identifies this combined matched executable set.
+/// Version 117 adds selected-account capability checks to the combined runtime.
+/// Version 118 adds selected-account coding-default inspection and creation.
 /// Version 119 replaces a channel-work caller's incidental whole-view revision
-/// with an explicit durable placement_epoch. Matched executables are required;
-/// old saved actor requests are refused without rebasing their captured intent.
-/// Known private account experiments use 117 and 118 and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 119;
+/// with an explicit durable placement_epoch. Old saved actor requests are refused
+/// without rebasing their captured intent.
+/// Version 120 combines those contracts with staged selected-account import.
+/// All three executables must match; private 117/118 and Core 119 are incompatible.
+pub const PROTOCOL_VERSION: u16 = 120;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
