@@ -27382,6 +27382,16 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let source = chat_runtime(&app, card).session.clone();
+        assert_eq!(
+            source
+                .launch
+                .recipe
+                .environment
+                .get(account::routing::AUTOMATIC_MARKER)
+                .map(String::as_str),
+            Some("1"),
+            "this control must cover an automatically selected started actor"
+        );
         let current = app
             .chat_account(source.launch.provider, &source.launch.recipe)
             .unwrap();
