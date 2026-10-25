@@ -377,8 +377,39 @@ fn context(id: u128, branch: &str, registry: Uuid) -> CheckoutContext {
         branch: Some(branch.into()),
         head: Some("a".repeat(40)),
         generation: 1,
-        dirty: true,
+        dirty: Some(true),
     }
+}
+
+#[test]
+fn checkout_changes_unknown_is_distinct_and_old_json_boolean_observations_remain_readable() {
+    let mut selected = context(800, "main", header().home.registry);
+    for observed in [true, false] {
+        let mut legacy = serde_json::to_value(&selected).unwrap();
+        legacy["dirty"] = serde_json::Value::Bool(observed);
+        let decoded: CheckoutContext = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.dirty, Some(observed));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        decoded.validate().unwrap();
+    }
+    selected.dirty = None;
+    selected.validate().unwrap();
+    let json = serde_json::to_value(&selected).unwrap();
+    assert!(json["dirty"].is_null());
+    assert_eq!(
+        serde_json::from_value::<CheckoutContext>(json).unwrap(),
+        selected
+    );
+    let encoded = postcard::to_stdvec(&selected).unwrap();
+    assert_eq!(encoded.len(), encoded_size(&selected).unwrap());
+    assert_eq!(
+        postcard::from_bytes::<CheckoutContext>(&encoded).unwrap(),
+        selected
+    );
+    let mut known_clean = selected.clone();
+    known_clean.dirty = Some(false);
+    assert_ne!(selected, known_clean);
+    assert_ne!(encoded, postcard::to_stdvec(&known_clean).unwrap());
 }
 
 #[test]
@@ -478,7 +509,7 @@ fn local_unpublished_work_is_independent_of_terminal_pr_and_never_a_forge_guess(
         observe(&candidate, 3, PrState::Open { draft: false }).bucket(),
         Bucket::NeedsConfirmation
     );
-    assert!(candidate.contexts[0].dirty);
+    assert_eq!(candidate.contexts[0].dirty, Some(true));
     assert_eq!(
         candidate.role(),
         None,
@@ -566,7 +597,7 @@ fn observational_context_changes_preserve_original_provenance_on_exact_replay() 
     if let Origin::Actor { contexts, .. } = &mut source {
         contexts[0].generation += 1;
         contexts[0].head = Some("b".repeat(40));
-        contexts[0].dirty = false;
+        contexts[0].dirty = Some(false);
     }
     let reply = replay_response(&stored, &request, &source, snapshot(entry, 10)).unwrap();
     assert_eq!(reply.receipt, stored.receipt);
@@ -891,7 +922,7 @@ fn maximum_entry(number: u64) -> Entry {
             branch: Some("b".repeat(1024)),
             head: Some("f".repeat(64)),
             generation: u64::MAX,
-            dirty: true,
+            dirty: Some(true),
         })
         .collect();
     entry.observation = Some(Observation {
@@ -1036,5 +1067,214 @@ fn independent_page_cursors_and_point_target_echo_cannot_hide_invalid_scope() {
         snapshot.validate(),
         Err(Error::InvalidSnapshot),
         "empty bucket cannot advertise a continuation"
+    );
+}
+
+#[test]
+fn selected_user_context_creates_local_and_pr_intent_with_manual_override_and_end() {
+    let captured = context(97000, "unpublished", home().registry);
+    let selected = Origin::SelectedUser {
+        home: home(),
+        contexts: vec![captured.clone()],
+    };
+    assert_eq!(selected.source(), Source::User);
+    let local = claim(
+        None,
+        Target::Local(captured.id),
+        Role::Contribute,
+        &selected,
+        97001,
+    );
+    assert_eq!(local.contexts, [captured.clone()]);
+    assert_eq!(local.claims[0].source, Source::User);
+    assert!(local.is_ongoing_work());
+    let shared = claim(
+        Some(&local),
+        local.target.clone(),
+        Role::Steward,
+        &actor(10),
+        97002,
+    );
+    let end = mutation(
+        Some(&shared),
+        Change::End {
+            target: shared.target.clone(),
+        },
+        97003,
+    );
+    let ended = reduce_entry(&header(), Some(&shared), &end, &selected)
+        .unwrap()
+        .entry;
+    assert!(ended.user_ended && ended.claims.iter().all(|claim| !claim.active));
+    assert_eq!(ended.bucket(), Bucket::History);
+    assert_eq!(ended.contexts, [captured.clone()]);
+
+    let original_pr = claim(None, pr(1), Role::Contribute, &actor(10), 97004);
+    let reviewed = claim(Some(&original_pr), pr(1), Role::Review, &selected, 97005);
+    assert_eq!(reviewed.contexts, [captured]);
+    assert_eq!(reviewed.target, original_pr.target);
+    assert_eq!(reviewed.role(), Some(Role::Review));
+    assert!(
+        !reviewed.is_ongoing_work(),
+        "manual review must not inherit another actor's contribution"
+    );
+    assert_eq!(
+        reviewed.claims.iter().filter(|claim| claim.active).count(),
+        2
+    );
+}
+
+#[test]
+fn selected_user_context_refuses_foreign_home_raw_ids_and_ambiguous_provenance() {
+    let captured = context(98000, "local", home().registry);
+    let request = mutation(
+        None,
+        Change::Claim {
+            target: Target::Local(captured.id),
+            role: Role::Contribute,
+        },
+        98001,
+    );
+    assert_eq!(
+        reduce_entry(&header(), None, &request, &Origin::User),
+        Err(Error::InvalidTarget)
+    );
+    for case in 0..9 {
+        let mut selected_home = home();
+        let mut contexts = vec![captured.clone()];
+        let expected = match case {
+            0 => {
+                selected_home.registry = uuid(99);
+                Error::WrongHome
+            }
+            1 => {
+                selected_home.channel = ChannelId::from_uuid(uuid(99));
+                Error::WrongHome
+            }
+            2 => {
+                selected_home.creation_ordinal += 1;
+                Error::WrongHome
+            }
+            3 => {
+                contexts[0].registry = uuid(99);
+                Error::WrongHome
+            }
+            4 => {
+                contexts.push(captured.clone());
+                Error::InvalidMetadata
+            }
+            5 => {
+                contexts = (0..=MAX_CONTEXTS)
+                    .map(|index| context(99000 + index as u128, "local", home().registry))
+                    .collect();
+                Error::Capacity
+            }
+            6 => {
+                contexts[0].path = "relative".into();
+                Error::InvalidMetadata
+            }
+            7 => {
+                contexts.clear();
+                Error::InvalidTarget
+            }
+            8 => {
+                contexts[0].id = uuid(99);
+                Error::InvalidTarget
+            }
+            _ => unreachable!(),
+        };
+        let selected = Origin::SelectedUser {
+            home: selected_home,
+            contexts,
+        };
+        let original = selected.clone();
+        assert_eq!(
+            reduce_entry(&header(), None, &request, &selected),
+            Err(expected),
+            "case {case}"
+        );
+        assert_eq!(
+            selected, original,
+            "refusal does not modify captured provenance"
+        );
+    }
+}
+
+#[test]
+fn selected_user_replay_keeps_original_provenance_after_context_refresh_end_and_selection_expiry() {
+    let captured = context(100000, "unpublished", home().registry);
+    let mut selected = Origin::SelectedUser {
+        home: home(),
+        contexts: vec![captured.clone()],
+    };
+    let request = mutation(
+        None,
+        Change::Claim {
+            target: Target::Local(captured.id),
+            role: Role::Contribute,
+        },
+        100001,
+    );
+    let original = reduce_entry(&header(), None, &request, &selected)
+        .unwrap()
+        .entry;
+    let receipt = Receipt {
+        operation: request.operation,
+        home: home(),
+        revision: original.revision,
+        sequence: 7,
+        changed: true,
+    };
+    let stored = StoredOperation::capture(&request, &selected, receipt.clone()).unwrap();
+    assert_eq!(stored.source, Source::User);
+    if let Origin::SelectedUser { contexts, .. } = &mut selected {
+        contexts[0].generation += 1;
+        contexts[0].head = Some("b".repeat(40));
+        contexts[0].dirty = Some(false);
+    }
+    let refreshed = claim(
+        Some(&original),
+        original.target.clone(),
+        Role::Contribute,
+        &selected,
+        100002,
+    );
+    assert_eq!(refreshed.target, original.target);
+    assert_eq!(refreshed.contexts[0].generation, 2);
+    assert_ne!(refreshed.contexts, stored.contexts);
+    let end = mutation(
+        Some(&refreshed),
+        Change::End {
+            target: refreshed.target.clone(),
+        },
+        100003,
+    );
+    let ended = reduce_entry(&header(), Some(&refreshed), &end, &Origin::User)
+        .unwrap()
+        .entry;
+    let current = snapshot(ended.clone(), 20);
+    for origin in [&selected, &Origin::User] {
+        let replay = replay_response(&stored, &request, origin, current.clone()).unwrap();
+        assert_eq!(replay.receipt, receipt);
+        assert_eq!(replay.snapshot.history, [ended.clone()]);
+        assert!(
+            replay.snapshot.entries.is_empty(),
+            "replay cannot resume later-ended work"
+        );
+    }
+    assert_eq!(stored.contexts, [captured]);
+    assert_eq!(
+        reduce_entry(&header(), None, &request, &Origin::User),
+        Err(Error::InvalidTarget),
+        "expired selection never authorizes a new Local claim"
+    );
+    let mut different_request = request.clone();
+    different_request.change = Change::Claim {
+        target: original.target,
+        role: Role::Steward,
+    };
+    assert_eq!(
+        replay_response(&stored, &different_request, &Origin::User, current),
+        Err(Error::OperationConflict)
     );
 }

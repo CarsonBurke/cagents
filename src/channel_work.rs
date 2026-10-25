@@ -178,6 +178,12 @@ impl Source {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Origin {
     User,
+    /// Explicit user intent enriched only by a daemon-validated selection.
+    /// The contexts are observations, never a client-supplied capability.
+    SelectedUser {
+        home: Home,
+        contexts: Vec<CheckoutContext>,
+    },
     Actor {
         home: Home,
         actor: Contributor,
@@ -188,24 +194,24 @@ pub(crate) enum Origin {
 impl Origin {
     pub(crate) fn source(&self) -> Source {
         match self {
-            Self::User => Source::User,
+            Self::User | Self::SelectedUser { .. } => Source::User,
             Self::Actor { actor, .. } => Source::Session(actor.clone()),
         }
     }
 
-    fn contexts(&self, home: Home) -> Result<Vec<CheckoutContext>, Error> {
-        let Self::Actor {
-            home: actual,
-            actor,
-            contexts,
-        } = self
-        else {
-            return Ok(Vec::new());
+    pub(crate) fn contexts(&self, home: Home) -> Result<Vec<CheckoutContext>, Error> {
+        let (actual, contexts) = match self {
+            Self::User => return Ok(Vec::new()),
+            Self::SelectedUser { home, contexts } | Self::Actor { home, contexts, .. } => {
+                (home, contexts)
+            }
         };
         if *actual != home {
             return Err(Error::WrongHome);
         }
-        actor.validate()?;
+        if let Self::Actor { actor, .. } = self {
+            actor.validate()?;
+        }
         if contexts.len() > MAX_CONTEXTS {
             return Err(Error::Capacity);
         }
@@ -233,7 +239,9 @@ pub struct CheckoutContext {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub generation: u64,
-    pub dirty: bool,
+    /// None means working-tree changes were not inspected. Disabling Git
+    /// conversions must never be reported as a clean checkout.
+    pub dirty: Option<bool>,
 }
 
 impl CheckoutContext {
