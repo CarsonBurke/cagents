@@ -245,7 +245,7 @@ mod placement_hooks {
             .submit_agent(
                 &Origin::User,
                 &Submit {
-                    name: Some("Fixture worker".into()),
+                    name: Some("fixture-worker".into()),
                     destination: Destination::New(Spec {
                         provider: crate::agent::Provider::Codex,
                         account: None,
