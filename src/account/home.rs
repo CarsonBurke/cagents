@@ -4,8 +4,8 @@
 //! it, `<data dir>/accounts/<provider>/<key>`, through the CLI's own variable
 //! (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The CLI owns everything inside: its
 //! login, its history, its caches. cagents creates the directory, links the
-//! reader's own instructions and extensions into it, and deletes it when the
-//! account is removed - and never opens a file the CLI wrote there.
+//! reader's own instructions and extensions into it, and preserves it when
+//! a pending sign-in is abandoned. Managed account deletion is unsupported.
 //!
 //! # What a managed home shares with the system home
 //!
@@ -36,19 +36,11 @@
 //!
 //! # Removal
 //!
-//! The current host admission foundation retains managed files until the
-//! complete ownership/deletion permit is composed. Existing local UI cleanup
-//! APIs below are outside this daemon admission cut; discovery grants no new
-//! cleanup authority.
-//!
-//! A home is removed by renaming it aside within its provider directory and
-//! then deleting the renamed tree. Nothing is followed on the way:
-//! the path is rebuilt from the account's key rather than taken from
-//! anywhere, every component of it is checked not to be a link, the directory
-//! must be a real one owned by this user, and the standard library's
-//! `remove_dir_all` unlinks symbolic links inside the tree rather than
-//! descending into them - so the shared entries above are unlinked, not
-//! emptied.
+//! Product lifecycle operations retain managed homes and old parked removal
+//! evidence. Discovery and registry absence never grant cleanup authority.
+//! Linked homes are only forgotten through the daemon's scoped admission;
+//! their files remain untouched. The legacy rename/delete helpers below are
+//! compiled only for historical destructive fixtures, not production paths.
 
 use std::{
     fs, io,
@@ -64,9 +56,9 @@ use crate::agent::Provider;
 mod creation;
 pub(crate) use creation::NewHomeCreationReceipt;
 
-/// Where a removal parks a home while it is deleted, so a removal that is
-/// interrupted leaves a name nothing else uses, and the next start finishes
-/// it.
+// Legacy destructive fixtures only. Product discovery preserves old parked
+// homes; their names grant no authority to finish a deletion.
+#[cfg(test)]
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -234,8 +226,9 @@ impl Homes {
         Ok((key, path))
     }
 
-    /// Deletes the home of account `key`. A home that is already gone is not
-    /// an error: removing an account twice leaves it just as removed.
+    // Legacy destructive fixture support. Product callers must use scoped
+    // daemon lifecycle operations, which retain managed and pending homes.
+    #[cfg(test)]
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
             remove_parked(&parked)?;
@@ -243,8 +236,7 @@ impl Homes {
         Ok(())
     }
 
-    /// Rename under the lifecycle/registry locks; delete the parked tree only
-    /// after releasing them, since provider caches can be large.
+    #[cfg(test)]
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
@@ -303,13 +295,9 @@ impl Homes {
         Ok(())
     }
 
-    /// Finishes removals an earlier run was interrupted in.
-    ///
-    /// Nothing else here is ever deleted on its own: a home the registry
-    /// does not name may belong to a registry this run cannot read - a newer
-    /// cagents, a reset configuration directory - and holds a login and its
-    /// history. Sign-ins that never finished are the registry's pending
-    /// entries, which the accounts view verifies before removing anything.
+    // Legacy destructive fixture support only. Never sweep parked evidence
+    // from discovery, sign-in cleanup, or any product lifecycle request.
+    #[cfg(test)]
     pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -449,6 +437,7 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
 
 /// Deletes a home that has been renamed aside, after checking it is still a
 /// real directory of this user's.
+#[cfg(test)]
 fn remove_parked(parked: &Path) -> io::Result<()> {
     crate::secure_file::reject_symlink_components(parked)?;
     crate::secure_file::validate_owned_directory(parked)?;

@@ -777,6 +777,7 @@ async fn run_json(command: Command) -> Result<Value, String> {
 /// not an error: the home is going regardless, and only the CLI knows where
 /// else its login lived. Only a managed account is ever signed out here; the
 /// system account's login is the reader's own.
+#[cfg(test)]
 pub async fn logout(account: Account) -> Result<(), String> {
     if account.is_system() {
         return Err("The system account is not signed out by cagents".into());
