@@ -88,7 +88,7 @@ impl Drop for Registration {
     }
 }
 
-/// Keep an actual checked Close's result queueable until its handler has
+/// Keep an actual terminal Close's result queueable until its handler has
 /// removed custody and serve_with has enqueued the correlated reply. This is
 /// not a remote ACK: existing close_after_drain settles the actual writer.
 struct CheckedCloseReply {
@@ -283,7 +283,12 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
-        let _close_reply = if matches!(&request, ClientRequest::CloseTerminalChecked { .. }) {
+        let _close_reply = if matches!(
+            &request,
+            ClientRequest::CloseTerminalChecked { .. }
+                | ClientRequest::ReleaseCompletedTerminal { .. }
+                | ClientRequest::ShutdownTerminal { .. }
+        ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
                 Err(error) => {
@@ -2608,6 +2613,285 @@ mod tests {
             super::super::state::HostState::new(proof.clone()),
         ));
         (proof, host)
+    }
+
+    /// Hold the real close handler before serve_with can enqueue its response.
+    /// Main retains the record: physical absence still cannot seal this gap.
+    #[test]
+    fn destructive_terminal_replies_drain_before_ordinary_exit_seals_delivery() {
+        use std::sync::mpsc;
+        const CASE: &str = "CAGENTS_EXIT_DRAIN_TEST_CASE";
+        let name = thread::current().name().unwrap().to_owned();
+        let cases = match std::env::var(CASE) {
+            Ok(case) => vec![case],
+            Err(_) => ["checked", "release", "shutdown"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        for case in cases {
+            let Some(_root) =
+                super::super::exit_drain_tests::private_runtime_case(&name, Some(&case))
+            else {
+                continue;
+            };
+            thread_local! {
+                static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                    const { std::cell::RefCell::new(None) };
+            }
+            fn retire_then_pause(
+                host: &SharedHost,
+                client: ClientId,
+                request: ClientRequest,
+            ) -> Result<RequestOutcome, ProtocolError> {
+                let closing = matches!(
+                    &request,
+                    ClientRequest::CloseTerminalChecked { .. }
+                        | ClientRequest::ReleaseCompletedTerminal { .. }
+                        | ClientRequest::ShutdownTerminal { .. }
+                );
+                let result = process_request(host, client, request);
+                if closing {
+                    assert!(
+                        result.is_ok(),
+                        "real terminal retirement failed: {result:?}"
+                    );
+                    let state = host.lock().unwrap();
+                    assert_eq!(state.terminals.len(), 1);
+                    assert!(
+                        state
+                            .terminals
+                            .values()
+                            .next()
+                            .unwrap()
+                            .handle
+                            .is_completed()
+                    );
+                    drop(state);
+                    PAUSE.with(|pause| {
+                        let (retired, resume) = pause.borrow_mut().take().unwrap();
+                        retired.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    });
+                }
+                result
+            }
+            fn send(
+                stream: &mut UnixStream,
+                proof: &HostSessionProof,
+                request_id: u64,
+                request: ClientRequest,
+            ) {
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                    .write(
+                        stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request,
+                        },
+                    )
+                    .unwrap();
+            }
+            fn reply(stream: &mut UnixStream, request_id: u64) -> ServerMessage {
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                loop {
+                    let envelope = codec
+                        .read::<ServerEnvelope>(stream)
+                        .unwrap()
+                        .expect("correlated reply was lost before delivery drained");
+                    if envelope.request_id == Some(request_id) {
+                        return envelope.message;
+                    }
+                }
+            }
+
+            let (_, host) = panic_test_host(&case);
+            let directory = tempfile::Builder::new().prefix("qr-").tempdir().unwrap();
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            recipe.program = if case == "release" {
+                "/bin/true"
+            } else {
+                "/bin/cat"
+            }
+            .into();
+            recipe.arguments.clear();
+            let mut session = crate::model::TerminalSession {
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+            };
+            let terminal =
+                crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                    .unwrap();
+            if case == "release" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !terminal.is_completed() {
+                    assert!(Instant::now() < deadline, "real PTY did not complete");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                terminal.shutdown().unwrap();
+            } else {
+                assert!(
+                    !terminal.is_completed(),
+                    "explicit close must close a live ordinary PTY"
+                );
+            }
+            {
+                let mut state = host.lock().unwrap();
+                state.register_client(1);
+                state.reserve_spawn(session.id).unwrap();
+                state
+                    .finish_spawn(1, session.clone(), terminal.clone(), false)
+                    .unwrap();
+            }
+            let proof = current_proof(&host);
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (retired_tx, retired_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let serving_host = Arc::clone(&host);
+            let serving = thread::spawn(move || {
+                PAUSE.with(|pause| *pause.borrow_mut() = Some((retired_tx, resume_rx)));
+                serve_with(server_stream, 1, serving_host, retire_then_pause);
+            });
+            send(
+                &mut stream,
+                &proof,
+                1,
+                ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                reply(&mut stream, 1),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                }
+            ));
+            let id = session.id;
+            let request = match case.as_str() {
+                "checked" => ClientRequest::CloseTerminalChecked {
+                    terminal_id: id,
+                    allow_active: true,
+                },
+                "release" => {
+                    session.continuity = crate::model::TerminalContinuity::Exited {
+                        last_exit: crate::model::TerminalExit {
+                            code: Some(0),
+                            signal: None,
+                            occurred_at_unix_ms: 1,
+                        },
+                    };
+                    ClientRequest::ReleaseCompletedTerminal {
+                        session,
+                        allow_active: false,
+                    }
+                }
+                "shutdown" => ClientRequest::ShutdownTerminal { terminal_id: id },
+                _ => panic!("unknown destructive request fixture"),
+            };
+            send(&mut stream, &proof, 2, request);
+            retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                host.lock().unwrap().terminals[&id]
+                    .handle
+                    .same_worker(&terminal)
+            );
+            let drain = super::super::begin_ordinary_exit(&host).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !drain.try_seal_absence() {
+                assert!(
+                    Instant::now() < deadline,
+                    "original child custody did not settle"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let mut cleanup_error = None;
+            assert!(!super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            assert!(cleanup_error.is_none());
+            // Actual original-child absence is already sealed: only the
+            // outstanding correlated reply can block final Host registration.
+            assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "correlated reply guard did not release"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(super::super::finish_shutdown_owners(
+                &host,
+                &mut cleanup_error,
+                false
+            ));
+            assert!(cleanup_error.is_none());
+            // Main retains the original record through real ordinary cleanup;
+            // neither record count nor an extant Handle prevents the seal.
+            assert_eq!(host.lock().unwrap().terminals.len(), 1);
+            assert!(
+                host.lock().unwrap().terminals[&id]
+                    .handle
+                    .same_worker(&terminal)
+            );
+            let deliveries = {
+                let mut state = host.lock().unwrap();
+                assert!(drain.try_seal_absence());
+                assert!(!state.ordinary_exit_cleanup_blocked());
+                let deliveries = state.close_ordinary_exit_registration();
+                assert_eq!(
+                    state.begin_checked_close_reply(99).unwrap_err().code,
+                    ProtocolErrorCode::TerminalUnavailable,
+                );
+                deliveries
+            };
+            // Close the real writer BEFORE reading the queued success: the
+            // frame must survive close_after_drain, not merely a live socket.
+            super::super::close_shutdown_deliveries(&host, &deliveries);
+            let response = reply(&mut stream, 2);
+            if case == "shutdown" {
+                assert!(matches!(
+                    response,
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted
+                    }
+                ));
+            } else {
+                assert!(matches!(response, ServerMessage::Response {
+                    response: ServerResponse::TerminalCloseChecked {
+                        terminal_id,
+                        outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                    }
+                } if terminal_id == id));
+            }
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+                assert_eq!(envelope.request_id, None);
+                assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+            }
+            serving.join().unwrap();
+            assert!(host.lock().unwrap().clients.is_empty());
+            assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        }
     }
 
     /// The host mutex panics when its holder locks it again, on the promise
