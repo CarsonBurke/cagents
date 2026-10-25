@@ -505,16 +505,21 @@ impl Cagents {
         }
     }
 
-    /// Closes every channel that `retired` has just left without an open card.
-    ///
-    /// A channel is its conversations; once the last one is closed there is
-    /// nothing to come back to, and an empty channel left in the sidebar is
-    /// one more row the user has to delete by hand. Only channels one of
-    /// these cards belonged to are considered: a channel that has just been
-    /// created is empty too, and is waiting for its first card.
+    /// Defer automatic retirement until the canonical view publication settles.
+    /// A work-bearing channel survives its final conversation, across windows.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
-        self.delete_channels(emptied)
+        let captured = emptied.into_iter().filter_map(|id| {
+            let channel = self.workspace_model.channel(id)?;
+            let home = crate::channel_work::Home {
+                registry: self.workspace_model.identity,
+                channel: id,
+                creation_ordinal: channel.ordinal,
+            };
+            home.validate().ok().map(|_| home)
+        });
+        self.channel_work.retire_candidates.extend(captured);
+        Task::none()
     }
 
     /// The channels `retired` would leave without an open card.
