@@ -590,6 +590,15 @@ impl LocalHandle {
                     } else {
                         format!("{error}\nProvider stderr (last 16 KiB): {stderr}")
                     };
+                    let message = actor
+                        .native_holder
+                        .as_mut()
+                        .and_then(|holder| holder.exit_diagnostic().ok())
+                        .and_then(|diagnostic| diagnostic.failure_summary())
+                        .map_or_else(
+                            || message.clone(),
+                            |diagnostic| format!("{message}\n{diagnostic}"),
+                        );
                     actor.apply(Event::Error {
                         message,
                         fatal: true,
