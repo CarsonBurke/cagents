@@ -7434,6 +7434,12 @@ impl Cagents {
         if unchanged {
             return None;
         }
+        if self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current.id != session.id),
+        ) {
+            // An accepted identity replacement retires attribution, not journal news.
+            self.sidebar_state.forget_card_attention(card);
+        }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
