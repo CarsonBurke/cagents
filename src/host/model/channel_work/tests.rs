@@ -1864,3 +1864,222 @@ fn source_proof_replacement_and_restore_cannot_revive_old_actor_placement() {
     assert_eq!(registry.model().unwrap().sequence, sequence);
     assert!(registry.apply_channel_work(&current, &request).is_ok());
 }
+
+#[test]
+fn reopening_current_registry_repairs_batched_missing_homes_without_reviving_history() {
+    let (mut registry, directory, archived) = fixture();
+    let request = claim(archived, 1, 0);
+    let original = registry.apply_channel_work(&user(), &request).unwrap();
+    let tx = registry
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(archived_in(&tx, &archived).unwrap());
+    tx.commit().unwrap();
+    let archived_before = snapshot(&registry, &archived);
+    let repository = registry
+        .model()
+        .unwrap()
+        .channel(archived.channel)
+        .unwrap()
+        .repository
+        .clone();
+    let mut missing = Vec::new();
+    for index in 0..70 {
+        let id = ChannelId::new();
+        let applied = registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: repository.clone(),
+                title: format!("Retained channel {index}"),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        missing.push(Home {
+            registry: applied.model.identity,
+            channel: id,
+            creation_ordinal: applied.model.channel(id).unwrap().ordinal,
+        });
+        // Reproduce the old implicit writer's omission, before any work or
+        // operation has ever belonged to this exact canonical channel.
+        registry
+            .db
+            .execute(
+                "DELETE FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                params![id.to_string(), missing.last().unwrap().creation_ordinal],
+            )
+            .unwrap();
+    }
+    let before = registry.model().unwrap();
+    let path = directory.path().join("model.sqlite3");
+    drop(registry);
+    for _ in 0..2 {
+        let mut registry = Registry::at(&path).unwrap();
+        assert_eq!(
+            registry.model().unwrap(),
+            before,
+            "repair changes no model identity, sequence, canonical channel, view or agent"
+        );
+        assert_eq!(snapshot(&registry, &archived), archived_before);
+        assert_eq!(
+            registry
+                .channel_work_receipt(&user(), &archived, request.operation)
+                .unwrap(),
+            Some(original.receipt.clone())
+        );
+        for home in &missing {
+            let actual = snapshot(&registry, home);
+            assert_eq!(actual.lifecycle, HomeLifecycle::Active);
+            assert_eq!(actual.revision, 0);
+            assert!(actual.entries.is_empty() && actual.history.is_empty());
+            let title: String = registry
+                .db
+                .query_row(
+                    "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                    params![home.channel.to_string(), home.creation_ordinal],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(title, before.channel(home.channel).unwrap().title);
+        }
+        let unknown = Home {
+            channel: ChannelId::new(),
+            ..archived
+        };
+        assert!(registry.read_channel_work_home(&unknown).is_err());
+        let count: u64 = registry
+            .db
+            .query_row("SELECT count(*) FROM channel_work_homes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 71);
+        assert!(
+            registry
+                .apply_channel_work(&user(), &claim(archived, 2, 0))
+                .is_err(),
+            "reopening cannot revive an archived claim owner"
+        );
+    }
+}
+
+#[test]
+fn failed_reopen_repair_rolls_back_prior_valid_candidates() {
+    for malformed_id in ["", "zz-invalid-channel"] {
+        let (mut registry, directory, home) = fixture();
+        registry
+            .db
+            .execute("DELETE FROM channel_work_homes", [])
+            .unwrap();
+        let malformed = ChannelId::new();
+        let repository = registry
+            .model()
+            .unwrap()
+            .channel(home.channel)
+            .unwrap()
+            .repository
+            .clone();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: malformed,
+                repository,
+                title: "Malformed later candidate".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "DELETE FROM channel_work_homes WHERE channel=?1",
+                [malformed.to_string()],
+            )
+            .unwrap();
+        // Empty IDs must be inspected in the first batch. The other case sorts
+        // after normalized UUIDs and proves rollback of an earlier valid repair.
+        registry
+            .db
+            .execute(
+                "UPDATE channels SET id=?2 WHERE id=?1",
+                params![malformed.to_string(), malformed_id],
+            )
+            .unwrap();
+        let before: (String, i64, i64) = registry
+            .db
+            .query_row(
+                "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let error = Registry::at(&directory.path().join("model.sqlite3"))
+            .err()
+            .expect("damaged canonical identity must refuse reopen");
+        assert!(error.contains("unreadable"), "{error}");
+        let count: u64 = registry
+            .db
+            .query_row("SELECT count(*) FROM channel_work_homes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "the earlier valid repair must roll back too");
+        let after: (String, i64, i64) = registry
+            .db
+            .query_row(
+                "SELECT identity,sequence,next_channel_ordinal FROM metadata WHERE key=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let version: u32 = registry
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, super::super::SCHEMA_VERSION);
+    }
+}
+
+#[test]
+fn missing_home_repair_refuses_orphaned_entries_and_operation_receipts() {
+    for keep_operations in [false, true] {
+        let (mut registry, directory, home) = fixture();
+        registry
+            .apply_channel_work(&user(), &claim(home, 1, 0))
+            .unwrap();
+        // A corrupted external store may contain orphaned data. Defer FK
+        // checking only inside this rollback-only negative fixture; production
+        // admission still enables and verifies normal foreign-key enforcement.
+        let tx = registry
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.pragma_update(None, "defer_foreign_keys", true).unwrap();
+        tx.execute(
+            "DELETE FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+            params![home.channel.to_string(), home.creation_ordinal],
+        )
+        .unwrap();
+        tx.execute(
+            if keep_operations {
+                "DELETE FROM channel_work_entries"
+            } else {
+                "DELETE FROM channel_work_operations"
+            },
+            [],
+        )
+        .unwrap();
+        let error = repair_missing_homes_in(&tx).unwrap_err();
+        assert!(error.contains("orphaned ledger"), "{error}");
+        let count: u64 = tx
+            .query_row("SELECT count(*) FROM channel_work_homes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        tx.rollback().unwrap();
+        assert!(
+            Registry::at(&directory.path().join("model.sqlite3")).is_ok(),
+            "the rollback preserves the original admitted registry"
+        );
+    }
+}

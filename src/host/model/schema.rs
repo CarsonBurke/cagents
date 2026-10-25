@@ -139,6 +139,7 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     checkpoint("admitted")?;
     super::migrate_through(&tx, inspected.version, SCHEMA_VERSION)?;
     require_layout(&tx)?;
+    super::channel_work::repair_missing_homes_in(&tx)?;
     // Also forces the rollback-mode EXCLUSIVE write before commit for an
     // already-current store. No future writer can enter the conversion gap.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
