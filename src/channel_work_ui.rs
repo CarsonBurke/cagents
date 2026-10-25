@@ -1788,7 +1788,7 @@ impl State {
             ui_controls::owned((owner, "local-path"), field::text("/absolute/path/to/checkout", &local.directory)
                 .id(local_path_id(owner))
                 .on_input_maybe(enabled.then_some(move |value| Action::LocalPath(owner, value)))
-                .on_submit_maybe(can_inspect.then_some({let action = inspect.clone(); move |_| action.clone()})).into()),
+                .on_submit_maybe(can_inspect.then_some({let action = inspect.clone(); move |_| action.clone()}))),
             design::caption("Your role").into(),
         ];
         rows.push(if enabled {
