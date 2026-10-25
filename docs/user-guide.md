@@ -767,10 +767,10 @@ text excerpt and the unsent request and attachments; provider cache/history is
 not transferred. The original conversation and draft remain available, and the
 new draft is never sent automatically. Review it before sending.
 
-Account loading also removes unregistered managed homes older than 24 hours.
-Pending sign-ins, registered accounts, homes referenced by linked accounts, and
-arbitrary external directories are preserved. Missing, unreadable, or newer
-account registries prevent this orphan cleanup.
+Account loading performs read-only discovery; it does not delete provider homes.
+Unregistered or unproved homes, pending sign-ins, and linked or external directories
+are preserved. A missing, unreadable, or newer registry never authorizes cleanup
+during loading.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
