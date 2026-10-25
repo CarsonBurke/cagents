@@ -300,7 +300,9 @@ pub(super) fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             .into(),
         );
     }
-    if let Some(form) = check::view(app) {
+    if let Some(form) = import::view(app) {
+        sections.push(form);
+    } else if let Some(form) = check::view(app) {
         sections.push(form);
     } else if let Some((provider, path)) = &state.table.link {
         sections.push(link_form(state, *provider, path));
@@ -391,7 +393,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     let description = widget::column::with_children(vec![
         design::heading("Accounts").into(),
         design::caption(
-            "Usage limits as each provider's own CLI reports them. Every login stays with its CLI; cagents never reads credentials.",
+            "Usage limits as each provider's own CLI reports them. Import only a staged cache you explicitly choose; credentials are never displayed.",
         )
         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
         .into(),
@@ -481,6 +483,12 @@ pub(super) fn add_menu(state: &State, browser_busy: bool) -> Element<'_, Message
             )
             .on_press_maybe((!state.table.linking).then_some(action(Action::LinkStart(Provider::Codex))))
             .into(),
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                "Import staged ChatGPT cache",
+                "Copy one selected auth.json file into a new isolated home",
+                action(Action::Import(import::Action::Open)),
+            ).into(),
             design::horizontal_rule(),
             crate::ui_controls::field::checkbox(state.table.own_codex_config)
                 .label("Keep a separate Codex configuration")

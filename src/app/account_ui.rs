@@ -48,6 +48,7 @@ use crate::account::{
 use crate::agent::Provider;
 
 mod check;
+mod import;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
@@ -117,6 +118,7 @@ pub(super) struct State {
     next_host_check: Millis,
     table: table::Table,
     check: check::State,
+    import: import::State,
     /// Accounts being signed out and deleted.
     removing: BTreeSet<AccountId>,
     /// Accounts whose home was found signed in to another login than the
@@ -252,6 +254,7 @@ impl State {
             next_host_check: 0,
             table: table::Table::default(),
             check: check::State::default(),
+            import: import::State::default(),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
             login_changes_reported: BTreeMap::new(),
@@ -862,6 +865,7 @@ pub struct Restored {
 #[derive(Debug, Clone)]
 pub enum Action {
     Check(check::Action),
+    Import(import::Action),
     RemoteHomeReady(Provider, Result<crate::account::remote::Created, String>),
     RemoteLoaded(Result<crate::device_service::AccountSnapshot, String>),
     RemoteLogin(AccountId, u64, Result<LaunchRecipe, String>),
@@ -989,6 +993,9 @@ impl Action {
     /// Whether this is the reader acting on the account surfaces, which a
     /// dialog in front of them must stop. Closing a popup never is.
     pub(super) fn blocked_while_modal(&self) -> bool {
+        if let Self::Import(action) = self {
+            return action.blocked_while_modal();
+        }
         if let Self::Check(action) = self {
             return action.blocked_while_modal();
         }
@@ -1887,6 +1894,7 @@ impl Cagents {
         if self.account_ui.popover.is_none()
             && !self.account_ui.table.has_popup()
             && !self.account_ui.check.is_open()
+            && !self.account_ui.import.is_open()
         {
             return None;
         }
@@ -1899,6 +1907,8 @@ impl Cagents {
             if self.account_ui.popover.take().is_none() {
                 if self.account_ui.table.menu.is_some() || self.account_ui.table.add_menu {
                     self.account_ui.table.escape();
+                } else if self.account_ui.import.is_open() {
+                    self.account_ui.import.close();
                 } else if self.account_ui.check.is_open() {
                     self.account_ui.check.close();
                     if self.account_ui.table.link.is_some() {
@@ -2215,7 +2225,13 @@ impl Cagents {
 
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Check(action) => self.update_account_check(action),
+            Action::Import(action) => self.update_account_import(action),
+            Action::Check(action) => {
+                if matches!(action, check::Action::Open(_)) {
+                    self.account_ui.import.close();
+                }
+                self.update_account_check(action)
+            }
             Action::RemoteHomeReady(provider, result) => match result {
                 Ok(created) => {
                     let task = self.begin_account_login(
@@ -2556,6 +2572,7 @@ impl Cagents {
                 // Switching inline editors hides the check, not its bounded
                 // request. Resume an existing draft instead of losing its path.
                 self.account_ui.check.close();
+                self.account_ui.import.close();
                 if self
                     .account_ui
                     .table
@@ -3333,6 +3350,11 @@ impl Cagents {
         let now = now_ms();
         let pending: Vec<registry::Pending> = self.account_ui.registry.pending().to_vec();
         for pending in pending {
+            // An imported cache has no sign-in terminal to recover. Its original
+            // intent and expected identity belong to explicit Import verification.
+            if pending.is_import() {
+                continue;
+            }
             if self
                 .account_ui
                 .logins
@@ -7849,6 +7871,63 @@ mod app_tests {
                 .entries
                 .iter()
                 .any(|entry| entry.notice.message.contains("check again"))
+        );
+    }
+
+    #[test]
+    fn imported_pending_homes_never_enter_automatic_sign_in_recovery() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let now = now_ms();
+        let imported = uuid::Uuid::from_u128(731);
+        let sign_in = uuid::Uuid::from_u128(732);
+        let mut registry = app.account_ui.registry.clone();
+        registry.begin(
+            Provider::Codex,
+            imported,
+            now.saturating_sub(2 * RECOVER_AFTER),
+        );
+        registry.begin(
+            Provider::Codex,
+            sign_in,
+            now.saturating_sub(2 * RECOVER_AFTER),
+        );
+        let mut encoded = serde_json::to_value(registry).unwrap();
+        let rows = encoded["pending"].as_array_mut().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|row| row["key"] == imported.to_string())
+            .unwrap();
+        row["origin"] = serde_json::json!({"kind":"cache_import","operation":imported});
+        let registry: Registry = serde_json::from_value(encoded).unwrap();
+        assert!(
+            registry
+                .pending()
+                .iter()
+                .any(|row| row.key == imported && row.is_import())
+        );
+        app.account_ui.set_registry(registry.clone());
+        app.recover_logins();
+        let keys: Vec<_> = app
+            .account_ui
+            .logins
+            .iter()
+            .map(|login| login.key)
+            .collect();
+        assert_eq!(
+            keys,
+            [sign_in],
+            "ordinary expired sign-ins still recover; imports need explicit Verify"
+        );
+        assert_eq!(
+            app.account_ui.registry, registry,
+            "recovery must preserve the original import row and metadata"
+        );
+        app.recover_logins();
+        assert_eq!(
+            app.account_ui.logins.len(),
+            1,
+            "no duplicate ordinary recovery or imported login may be enqueued"
         );
     }
 
