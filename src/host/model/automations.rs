@@ -2982,6 +2982,20 @@ mod tests {
             channel.title_source,
             crate::model::ChannelTitleSource::Manual
         );
+        let home = crate::channel_work::Home {
+            registry: model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        };
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: channel.repository.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            crate::channel_work::HomeLifecycle::Deleted
+        );
     }
 
     #[test]

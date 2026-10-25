@@ -2825,6 +2825,13 @@ mod tests {
             registry.read_channel_work_home(&home).unwrap().lifecycle,
             HomeLifecycle::Deleted
         );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.read_channel_work_home(&home).unwrap().lifecycle,
+            HomeLifecycle::Deleted,
+            "reopening must retain the deleted incarnation without recreating its channel"
+        );
         let retained: (String, String) = registry.db.query_row(
             "SELECT repository,title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
             params![home.channel.to_string(), home.creation_ordinal],
