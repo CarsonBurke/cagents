@@ -1368,8 +1368,9 @@ impl Cagents {
         Adoption::Opening(task)
     }
 
-    /// A failed passive read may retry on a later model observation. Never
-    /// reschedule from the failure itself, or a damaged checkout would spin.
+    /// A failed or retired passive read may retry on a later model observation.
+    /// Never reschedule here, or a damaged checkout would spin and a closed
+    /// project would reopen before its authoritative close was reversed.
     pub(super) fn finish_workspace_model_load(
         &mut self,
         project: ProjectId,
@@ -3609,6 +3610,124 @@ mod tests {
         assert!(app.workspace_model_loads.is_empty());
         assert!(app.durable.cards.is_empty());
         assert_eq!(app.active_workspace, None);
+    }
+
+    #[test]
+    fn a_closed_shared_project_releases_its_pending_load_until_an_explicit_reopen() {
+        let checkout = git_checkout().expect("the close/reopen fixture requires Git");
+        let repository = canonical_repository(&checkout.path().join(".git")).unwrap();
+        let removed_channel = ChannelId::new();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let publishes = intercept_publishes(&mut app);
+        app.workspace_model = WorkspaceModel {
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "shared checkout".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            }],
+            ..registry(vec![shared(
+                removed_channel,
+                &repository,
+                "closed channel",
+                1,
+            )])
+        };
+        // The real Git read has completed, but its window callback is still
+        // queued when the authoritative close arrives on the other stream.
+        let Message::RepositoryLoaded {
+            project_id,
+            generation,
+            result: Ok(loaded),
+            ..
+        } = first_message(app.reconcile_workspace_model()).unwrap()
+        else {
+            panic!("the real healthy checkout must produce a successful read");
+        };
+        let old_loaded = loaded.clone();
+        let cancellation = app.repository_pr_cancellations[&project_id].clone();
+        app.refresh_ui.mark_stale(project_id);
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence,
+            edit: ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+        }));
+        assert!(app.project_ui.closed.contains(&repository));
+        assert!(app.workspace_model.project(&repository).is_none());
+        assert!(app.workspace_model.channels.is_empty());
+        assert!(app.workspace_model_loads.contains_key(&project_id));
+        let discarded = app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation,
+            result: Ok(loaded),
+        });
+        assert!(first_message(discarded).is_none());
+        assert!(app.project_ui.closed.contains(&repository));
+        assert!(!app.workspace_model_opens.contains(&repository));
+        assert!(!app.workspace_model_loads.contains_key(&project_id));
+        assert!(!app.repository_generations.contains_key(&project_id));
+        assert!(!app.github_availability.contains_key(&project_id));
+        assert!(!app.repository_pr_cancellations.contains_key(&project_id));
+        assert!(!app.refresh_ui.projects.contains_key(&project_id));
+        assert!(!app.refresh_ui.is_stale(project_id));
+        assert!(cancellation.is_cancelled());
+        assert!(app.sidebar_model.projects.is_empty());
+        assert!(first_message(app.reconcile_workspace_model()).is_none());
+        assert!(
+            app.workspace_model_loads.is_empty(),
+            "closed intent admits no retry"
+        );
+
+        let retry = app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: sequence + 1,
+            edit: ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "shared checkout".into(),
+                kind: ProjectKind::Git,
+            },
+        });
+        assert!(!app.project_ui.closed.contains(&repository));
+        let (&current, (_, current_generation)) = app.workspace_model_loads.iter().next().unwrap();
+        let current_generation = *current_generation;
+        assert_ne!(current, project_id);
+        assert!(current_generation > generation);
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation,
+            result: Ok(old_loaded),
+        }));
+        assert_eq!(
+            app.workspace_model_loads[&current],
+            (repository.clone(), current_generation)
+        );
+        assert!(app.sidebar_model.projects.is_empty());
+        let current_loaded = first_message(retry).unwrap();
+        assert!(matches!(&current_loaded, Message::RepositoryLoaded {
+            project_id, generation, result: Ok(_), ..
+        } if *project_id == current && *generation == current_generation));
+        drop(app.update(current_loaded));
+        assert_eq!(app.sidebar_model.projects.len(), 1);
+        assert_eq!(app.project_for_repository(&repository), Some(current));
+        assert!(app.workspace_model_loads.is_empty());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .all(|entry| entry.id != removed_channel)
+        );
+        assert!(app.workspace_model.channels.is_empty());
+        assert!(
+            !drain(&publishes)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+        );
+        assert!(app.durable.cards.is_empty());
+        assert_eq!(app.active_workspace, None);
+        assert_eq!(app.workspace.focused(), None);
     }
 
     /// A channel another window created arrives as a scope, not as a

@@ -14455,9 +14455,6 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
-                if result.is_ok() {
-                    self.finish_workspace_model_load(project_id, generation, false);
-                }
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -14469,6 +14466,7 @@ impl Application for Cagents {
                 match result {
                     Ok(loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
+                            self.finish_workspace_model_load(project_id, generation, true);
                             self.repository_generations.remove(&project_id);
                             return Task::none();
                         }
@@ -14602,6 +14600,7 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
+                            self.finish_workspace_model_load(project_id, generation, false);
                             return task;
                         }
                         if let Some(session) = &self.session {
@@ -14778,6 +14777,7 @@ impl Application for Cagents {
                         // Every window shares which projects exist, and a
                         // channel the shared model named in this repository
                         // could not be adopted until the project existed here.
+                        self.finish_workspace_model_load(project_id, generation, false);
                         self.publish_project_opened(project_id);
                         task = Task::batch([
                             task,
