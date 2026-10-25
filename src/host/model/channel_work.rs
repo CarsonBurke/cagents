@@ -324,7 +324,10 @@ pub(super) fn created_in(tx: &Transaction<'_>, channel: ChannelId) -> Result<(),
 
 /// Root invokes this after canonical manual/inferred title edits in the same
 /// model transaction. An old incarnation's historical title never changes.
-pub(super) fn renamed_in(tx: &Transaction<'_>, channel: ChannelId) -> Result<(), String> {
+pub(super) fn renamed_in(tx: &Connection, channel: ChannelId) -> Result<(), String> {
+    if tx.is_autocommit() {
+        return Err("Channel work titles require the canonical writer transaction".into());
+    }
     tx.execute(
         "UPDATE channel_work_homes SET title=(SELECT title FROM channels WHERE id=?1)
          WHERE channel=?1 AND incarnation=(SELECT ordinal FROM channels WHERE id=?1)",
