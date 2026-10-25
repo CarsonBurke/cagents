@@ -364,6 +364,12 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     let host = Arc::new(state::HostLock::new(HostState::new(proof(
         "after-listener",
     ))));
+    // Production opens the durable execution registry before recovering an
+    // original holder; a bare HostState deliberately has no such connection.
+    host.lock()
+        .unwrap()
+        .install_model(model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    assert!(host.lock().unwrap().execution_registry.is_some());
     host.lock().unwrap().enable_holder_recovery();
     // Inject a real bind failure after acquiring the actual lease. This socket
     // is only this fixture's blocker; it never accepts or serves a client.
