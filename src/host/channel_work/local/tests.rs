@@ -377,3 +377,282 @@ fn replaced_checkout_and_foreign_or_forged_selection_leave_canonical_work_untouc
             .is_none()
     );
 }
+
+#[test]
+fn live_terminal_own_launch_selection_keeps_actor_origin_and_exact_replay_after_stale_caller() {
+    if crate::repository::isolated_git_test(concat!(
+        module_path!(),
+        "::live_terminal_own_launch_selection_keeps_actor_origin_and_exact_replay_after_stale_caller"
+    )) {
+        return;
+    }
+    use crate::{
+        agent_execution::HostedSession,
+        model::{CardId, CardKind, ChannelId, LaunchRecipe, TerminalId},
+        terminal_ipc::{TerminalCloseResult, TerminalDescriptor, TerminalSpawnOptions},
+        workspace_model::{ModelEdit, views},
+    };
+
+    let (host, directory, home) = fixture();
+    let repository = project(&host, home);
+    let checkout = repository.canonicalize().unwrap();
+    let id = TerminalId::new();
+    let session = TerminalDescriptor::relaunchable(
+        id,
+        LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: repository.clone(),
+            environment: [
+                (
+                    "HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "CODEX_HOME".into(),
+                    directory
+                        .path()
+                        .join("codex")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory
+                        .path()
+                        .join("claude")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]
+            .into(),
+            unset_environment: Default::default(),
+        },
+        None,
+    )
+    .session;
+    let (descriptor, handle) = crate::host::state::spawn_terminal_view_owned(
+        &host,
+        1,
+        session,
+        TerminalSpawnOptions::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    // Keep the exact published worker owned through every assertion, including
+    // panic. Only a confirmed ordinary close may retire that same worker.
+    struct CloseOriginal {
+        host: SharedHost,
+        id: TerminalId,
+        handle: crate::terminal::TerminalHandle,
+    }
+    impl Drop for CloseOriginal {
+        fn drop(&mut self) {
+            if self.handle.close_checked(true) == TerminalCloseResult::Closed {
+                let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
+                if state
+                    .terminals
+                    .get(&self.id)
+                    .is_some_and(|record| record.handle.same_worker(&self.handle))
+                {
+                    state.retire_terminal(self.id);
+                }
+            }
+        }
+    }
+    let cleanup = CloseOriginal {
+        host: host.clone(),
+        id,
+        handle: handle.clone(),
+    };
+    assert!(!handle.is_completed());
+    let source = HostedSession::Terminal(descriptor.session.clone());
+    assert!(source.has_complete_proof());
+    assert!(
+        host.lock().unwrap().terminals[&id]
+            .session
+            .continuity
+            .live_proof()
+            .is_none(),
+        "the ordinary stored recipe is not the returned live descriptor"
+    );
+    let registry = agent_execution::registry(&host).unwrap();
+    let authority = registry
+        .lock()
+        .unwrap()
+        .retained_agent_authority(id)
+        .unwrap();
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .agent_authority_source(&authority)
+            .unwrap(),
+        Some(source)
+    );
+    let scope = views::Scope::Channel(home.channel);
+    let card = CardId::new();
+    let pane = views::Pane {
+        id: card,
+        title: "Original native terminal".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: CardKind::Terminal(descriptor.session.clone()),
+        scope: None,
+    };
+    registry
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    let Response::Context(original) =
+        wire(&host, authority.clone(), Request::Context { channel: None })
+    else {
+        panic!("the live issued actor must resolve its canonical channel")
+    };
+    assert_eq!(original.home, home);
+    let old_caller = original.caller.expect("canonical native placement");
+    assert_eq!((old_caller.session, old_caller.card), (id, card));
+
+    // A real canonical transfer round trip preserves the process and card but
+    // retires its original placement epoch. Do not fabricate a replacement
+    // authority, Host proof or launch-directory descriptor for this refusal.
+    let other = ChannelId::new();
+    registry
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::CreateChannel {
+            id: other,
+            repository,
+            title: "Other channel".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+    let other_scope = views::Scope::Channel(other);
+    for (from, destination) in [
+        (scope.clone(), other_scope.clone()),
+        (other_scope, scope.clone()),
+    ] {
+        let mut registry = registry.lock().unwrap();
+        let revision = registry
+            .model()
+            .unwrap()
+            .views
+            .iter()
+            .find(|view| view.scope == from)
+            .unwrap()
+            .revision;
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: from,
+                expected_revision: revision,
+                operation: Uuid::new_v4(),
+                change: views::Change::Transfer {
+                    id: card,
+                    destination,
+                    before: None,
+                },
+            })
+            .unwrap();
+    }
+    let before = registry.lock().unwrap().model().unwrap();
+    assert!(matches!(
+        wire(
+            &host,
+            authority.clone(),
+            Request::PrepareOwnLocal {
+                home,
+                caller: Some(old_caller.clone()),
+            },
+        ),
+        Response::Failed(Failure::Refused(_))
+    ));
+    assert_eq!(registry.lock().unwrap().model().unwrap(), before);
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .read_channel_work(&home, Page::default())
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let Response::Context(current) =
+        wire(&host, authority.clone(), Request::Context { channel: None })
+    else {
+        panic!("the same live actor must resolve the new canonical placement")
+    };
+    assert_eq!(current.home, home);
+    let captured = current.caller.expect("fresh canonical native placement");
+    assert_eq!((captured.session, captured.card), (id, card));
+    assert!(captured.placement_epoch > old_caller.placement_epoch);
+    let Response::Selected(selected) = wire(
+        &host,
+        authority.clone(),
+        Request::PrepareOwnLocal {
+            home,
+            caller: Some(captured.clone()),
+        },
+    ) else {
+        panic!("inspect the live terminal's actual retained launch checkout")
+    };
+    selected.validate().unwrap();
+    assert_eq!(selected.home, home);
+    assert_eq!(selected.context.repository, checkout);
+    assert_eq!(selected.context.path, checkout);
+    assert_eq!(selected.context.dirty, None);
+    let mutation = claim(&selected);
+    let request = Request::ApplySelection {
+        selection: selected.selection,
+        mutation: mutation.clone(),
+        caller: Some(captured),
+    };
+    let Response::Applied(applied) = wire(&host, authority.clone(), request.clone()) else {
+        panic!("commit the original actor's inspected local declaration")
+    };
+    assert_eq!(applied.receipt.operation, mutation.operation);
+    assert!(applied.receipt.changed);
+    assert_eq!(applied.snapshot.entries.len(), 1);
+    assert_eq!(applied.snapshot.entries[0].contexts, [selected.context]);
+    let crate::channel_work::Source::Session(contributor) =
+        &applied.snapshot.entries[0].claims[0].source
+    else {
+        panic!("native intent must retain Actor provenance, never User")
+    };
+    assert_eq!(contributor.session, id);
+    assert_eq!(contributor.lineage, crate::agent_execution::Lineage(id));
+    assert_eq!((contributor.agent, contributor.run), (None, None));
+    let canonical = registry
+        .lock()
+        .unwrap()
+        .read_channel_work(&home, Page::default())
+        .unwrap();
+    assert_eq!(canonical, applied.snapshot);
+    let model = registry.lock().unwrap().model().unwrap();
+    let Response::Applied(replay) = wire(&host, authority.clone(), request) else {
+        panic!("the consumed selection must reconcile only its original operation")
+    };
+    assert_eq!(replay.receipt, applied.receipt);
+    assert_eq!(replay.snapshot, canonical);
+    assert_eq!(registry.lock().unwrap().model().unwrap(), model);
+    assert_eq!(
+        wire(
+            &host,
+            authority,
+            Request::Receipt {
+                home,
+                operation: mutation.operation,
+            },
+        ),
+        Response::Receipt(Some(applied.receipt))
+    );
+    assert_eq!(handle.close_checked(true), TerminalCloseResult::Closed);
+    drop(cleanup);
+    assert!(!host.lock().unwrap().terminals.contains_key(&id));
+}
