@@ -226,7 +226,7 @@ mod tests {
     }
 
     /// Construct published18 using the real17 then placement18 migrations.
-    /// Populate the saved17 view BEFORE placement backfill; never downgrade19.
+    /// Populate the saved17 view BEFORE placement backfill; never downgrade a newer store.
     fn published18(path: &Path, pane: &Pane) -> (String, String) {
         let mut db = Connection::open(path).unwrap();
         let tx = db.transaction().unwrap();
@@ -421,7 +421,7 @@ mod tests {
                     .db
                     .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                19
+                20
             );
             let placement_after: Vec<(String, i64)> = registry
                 .db
@@ -562,6 +562,258 @@ mod tests {
                 )
                 .unwrap(),
                 0
+            );
+        }
+    }
+
+    /// Build the actual outbox19 predecessor, never a downgraded retention store.
+    fn outbox19(path: &Path, pane: &Pane) -> (String, String) {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, LifecycleCause, Schedule, SchedulePattern,
+                SessionMode,
+            },
+        };
+        let (identity, scope) = published18(path, pane);
+        let mut db = Connection::open(path).unwrap();
+        let tx = db.transaction().unwrap();
+        super::super::migrate_through(&tx, 18, 19).unwrap();
+        let automation = super::super::automations::create_automation_in(
+            &tx,
+            Definition {
+                name: "Retained private name".into(),
+                prompt: "Retained private prompt".into(),
+                agent: Spec {
+                    provider: Provider::Codex,
+                    account: None,
+                    target: Target {
+                        repository: "/saved".into(),
+                        directory: "/saved".into(),
+                        placement: None,
+                    },
+                    surface: Surface::Chat,
+                    model: None,
+                    permission_mode: None,
+                    reasoning_effort: None,
+                },
+                schedule: Schedule {
+                    pattern: SchedulePattern::Daily { hour: 9, minute: 0 },
+                    timezone: "UTC".into(),
+                },
+                session_mode: SessionMode::Reuse,
+                precheck: None,
+            },
+            100,
+            DirectoryIdentity {
+                device: 1,
+                inode: 1,
+            },
+            None,
+        )
+        .unwrap();
+        super::super::automation_audit::record(
+            &tx,
+            &automation,
+            LifecycleCause::ProjectClosed,
+            None,
+        )
+        .unwrap();
+        super::super::automation_notifications::queue(
+            &tx,
+            &automation,
+            LifecycleCause::ProjectClosed,
+            None,
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO shared_view_edits(operation,scope) VALUES(?1,?2)",
+            params![uuid::Uuid::new_v4().to_string(), scope],
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 19).unwrap();
+        tx.commit().unwrap();
+        (identity, scope)
+    }
+
+    fn table_rows(
+        db: &Connection,
+    ) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        let names = db
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        names
+            .into_iter()
+            .map(|name| {
+                let mut statement = db
+                    .prepare(&format!(
+                        "SELECT * FROM \"{}\" ORDER BY rowid",
+                        name.replace('"', "\"\"")
+                    ))
+                    .unwrap();
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                (name, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn authentic_outbox19_migrates_to_retention20_without_changing_receipts_or_placement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outbox19.sqlite3");
+        let pane = terminal_pane();
+        let (identity, scope) = outbox19(&path, &pane);
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            19
+        );
+        let before = table_rows(&db);
+        assert!(!before.contains_key("terminal_retention_pins"));
+        assert!(!before.contains_key("shared_terminal_retention_pins"));
+        assert_eq!(before["automation_notifications"].len(), 1);
+        assert_eq!(before["automation_lifecycle"].len(), 2);
+        assert_eq!(before["shared_view_edits"].len(), 1);
+        assert_eq!(before["channel_work_placement_epochs"].len(), 1);
+        assert_eq!(before["channel_work_placement_clock"].len(), 1);
+        let attention = super::super::automation_notifications::pending(&db, 100).unwrap();
+        assert_eq!(attention.len(), 1);
+        drop(db);
+        for _ in 0..2 {
+            let registry = Registry::at(&path).unwrap();
+            assert_eq!(
+                registry
+                    .db
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                20
+            );
+            let mut after = table_rows(&registry.db);
+            assert!(after.remove("terminal_retention_pins").unwrap().is_empty());
+            assert_eq!(
+                after.remove("shared_terminal_retention_pins").unwrap(),
+                vec![vec![
+                    rusqlite::types::Value::Text(pane.id.to_string()),
+                    rusqlite::types::Value::Text(terminal(&pane).to_string())
+                ]]
+            );
+            assert_eq!(
+                after, before,
+                "every original table value, including audit/outbox/view receipts and placement allocator, must remain exact"
+            );
+            assert_eq!(
+                registry.pending_automation_notifications(100).unwrap(),
+                attention
+            );
+            assert_eq!(registry.model().unwrap().identity.to_string(), identity);
+            assert_eq!(
+                registry
+                    .db
+                    .query_row(
+                        "SELECT scope FROM shared_view_panes WHERE id=?1",
+                        [pane.id.to_string()],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                scope
+            );
+            assert!(
+                registry
+                    .pinned_terminals(&BTreeSet::from([terminal(&pane)]))
+                    .unwrap()
+                    .contains(&terminal(&pane))
+            );
+        }
+        // The exact pending journal receipt still acknowledges after migration;
+        // terminal membership is independent of this destructive outbox ACK.
+        let mut registry = Registry::at(&path).unwrap();
+        assert!(
+            registry
+                .acknowledge_automation_notification(&attention[0])
+                .unwrap()
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .pinned_terminals(&BTreeSet::from([terminal(&pane)]))
+                .unwrap()
+                .contains(&terminal(&pane))
+        );
+        assert!(
+            !registry
+                .acknowledge_automation_notification(&attention[0])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn outbox19_unknown_layout_and_retention_version_aliases_refuse_without_writes() {
+        for damage in [
+            "unknown19",
+            "false20",
+            "private_retention19",
+            "damaged_saved19",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("refused.sqlite3");
+            let pane = terminal_pane();
+            if damage == "private_retention19" {
+                published18(&path, &pane);
+                let mut db = Connection::open(&path).unwrap();
+                let tx = db.transaction().unwrap();
+                // Reproduce the old PRIVATE conflicting19 allocation only as
+                // a negative preimage. It is not the authentic predecessor.
+                super::migrate(&tx).unwrap();
+                tx.pragma_update(None, "user_version", 19).unwrap();
+                tx.commit().unwrap();
+            } else {
+                outbox19(&path, &pane);
+                let db = Connection::open(&path).unwrap();
+                db.execute_batch(if damage == "unknown19" {
+                    "CREATE TABLE unknown_outbox_payload(value TEXT) STRICT;"
+                } else if damage == "damaged_saved19" {
+                    "UPDATE shared_views SET panes='not-json';"
+                } else {
+                    "PRAGMA user_version=20;"
+                })
+                .unwrap();
+            }
+            let original = files(&path);
+            let error = Registry::at(&path)
+                .err()
+                .expect("an unknown or mislabeled layout must refuse");
+            assert!(
+                if damage == "damaged_saved19" {
+                    error.contains("Cannot recover saved terminal retention")
+                } else {
+                    error.contains("layout does not match published schema")
+                },
+                "{damage}: {error}"
+            );
+            assert_eq!(
+                files(&path),
+                original,
+                "{damage} may not publish migration or change journal bytes"
             );
         }
     }

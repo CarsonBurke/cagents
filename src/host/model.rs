@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod automation_audit;
+pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
 pub(super) mod channel_work;
@@ -45,7 +46,7 @@ mod terminal_owners;
 mod terminal_retention;
 mod views;
 
-const SCHEMA_VERSION: u32 = 19;
+const SCHEMA_VERSION: u32 = 20;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -633,8 +634,12 @@ fn migrate_through(
         schema::migration_checkpoint(18)?;
     }
     if version < 19 && target >= 19 {
-        terminal_retention::migrate(tx)?;
+        automation_notifications::migrate(tx)?;
         schema::migration_checkpoint(19)?;
+    }
+    if version < 20 && target >= 20 {
+        terminal_retention::migrate(tx)?;
+        schema::migration_checkpoint(20)?;
     }
     Ok(())
 }
@@ -1085,7 +1090,10 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE channel_work_placement_epochs;
+                "DROP TABLE shared_terminal_retention_pins;
+                 DROP TABLE terminal_retention_pins;
+                 DROP TABLE automation_notifications;
+                 DROP TABLE channel_work_placement_epochs;
                  DROP TABLE channel_work_placement_clock;
                  DROP TABLE channel_work_operations;
                  DROP TABLE channel_work_entries;
