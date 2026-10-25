@@ -185,7 +185,11 @@ use crate::{
 /// with an explicit durable placement_epoch. Matched executables are required;
 /// old saved actor requests are refused without rebasing their captured intent.
 /// Known private account experiments use 117 and 118 and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 119;
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
+pub const PROTOCOL_VERSION: u16 = 122;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
