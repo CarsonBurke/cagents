@@ -1697,16 +1697,24 @@ fn presentation_and_unrelated_pane_edits_preserve_captured_actor_placement() {
             },
         })
         .unwrap();
-    let mut utility = renamed;
-    utility.id = CardId::new();
-    utility.kind = CardKind::Settings;
+    let mut unrelated = renamed;
+    unrelated.id = CardId::new();
+    unrelated.kind = CardKind::Browser(crate::model::BrowserSession {
+        id: crate::model::BrowserId::new(),
+        current_url: "https://example.test/unrelated".parse().unwrap(),
+        history: Vec::new(),
+        history_index: 0,
+        scroll_x: 0.0,
+        scroll_y: 0.0,
+        fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+    });
     registry
         .apply(&ModelEdit::ChangeView {
             scope: scope.clone(),
             expected_revision: registry.view_revision(&scope).unwrap(),
             operation: Uuid::new_v4(),
             change: ViewChange::Insert {
-                pane: utility,
+                pane: unrelated,
                 before: None,
             },
         })

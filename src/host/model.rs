@@ -305,6 +305,7 @@ impl Registry {
                     statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
                         .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
                 };
+                views::retire_project_placements(&transaction, repository)?;
                 for channel in channels {
                     channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
                 }
@@ -407,11 +408,13 @@ impl Registry {
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
                 if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
+                    views::retire_channel_placements(&transaction, home.channel)?;
                     channel_work::deleted_in(&transaction, home.channel)?;
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
+                views::retire_channel_placements(&transaction, *id)?;
                 channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
