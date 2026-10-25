@@ -785,10 +785,27 @@ mod tests {
             focused_notice_ids(&snapshot, Some(&current.target), None, true, false),
             vec![current_notice.id]
         );
-        let update = Update::Activated(current.target.clone());
+        // GUI Update is not a wire type. Exercise the actual unsolicited
+        // activation carrier shared by the matched CLI, daemon and UI.
+        let activation = crate::terminal_ipc::ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: None,
+            proof: crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("automation-codec-fixture"),
+                boot_id: crate::model::BootId::new("automation-codec-fixture"),
+                host_incarnation: crate::model::HostIncarnation::new("automation-codec-fixture"),
+            },
+            message: crate::terminal_ipc::ServerMessage::NotificationActivated {
+                target: current.target.clone(),
+            },
+        };
+        assert!(activation.proof.is_complete());
         assert_eq!(
-            postcard::from_bytes::<Update>(&postcard::to_stdvec(&update).unwrap()).unwrap(),
-            update
+            postcard::from_bytes::<crate::terminal_ipc::ServerEnvelope>(
+                &postcard::to_stdvec(&activation).unwrap()
+            )
+            .unwrap(),
+            activation
         );
         assert_eq!(
             postcard::from_bytes::<Snapshot>(&postcard::to_stdvec(&snapshot).unwrap()).unwrap(),
