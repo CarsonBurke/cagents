@@ -1755,6 +1755,7 @@ mod tests {
             .agent_clients
             .insert(1, crate::agent_execution::Lineage(TerminalId::new()));
         for operation in [
+            ImportOperation::List,
             ImportOperation::Inspect {
                 path: "/must-not-be-read".into(),
             },

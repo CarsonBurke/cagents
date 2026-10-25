@@ -549,11 +549,28 @@ fn requested_profile(host: &SharedHost, mut status: ImportStatus) -> ImportStatu
     status
 }
 
+fn list_at(
+    host: &SharedHost,
+    installation: &Installation,
+) -> Result<Vec<ImportStatus>, ProtocolError> {
+    let records = installation.journal.load().map_err(|_| {
+        refused("The retained import journal is unavailable; no stage was repeated")
+    })?;
+    records
+        .into_iter()
+        .map(|record| status_at(host, installation, record.plan().operation, false))
+        .collect()
+}
+
 pub(super) fn execute(
     host: &SharedHost,
     operation: ImportOperation,
 ) -> Result<ImportReply, ProtocolError> {
     match operation {
+        ImportOperation::List => Ok(ImportReply::Listed(list_at(
+            host,
+            &Installation::selected(false)?,
+        )?)),
         ImportOperation::Inspect { path } => {
             let observation = cache::inspect(&staged_path(path)?).map_err(|_| {
                 refused("The selected staged cache is unsafe, unsupported or unavailable")

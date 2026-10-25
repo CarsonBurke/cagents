@@ -181,6 +181,8 @@ impl ImportPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ImportOperation {
+    /// Read all bounded retained import metadata, without advancing any stage.
+    List,
     Inspect {
         path: PathBuf,
     },
@@ -241,6 +243,7 @@ pub struct ImportStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ImportReply {
+    Listed(Vec<ImportStatus>),
     Inspected(ImportInspection),
     Status(ImportStatus),
 }

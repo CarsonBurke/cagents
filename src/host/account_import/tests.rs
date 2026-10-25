@@ -168,6 +168,7 @@ fn wrong_destination_and_existing_home_fail_before_new_intent_or_cache_publicati
 fn metadata_status_creates_no_storage_and_does_not_promote_an_unprepared_intent() {
     let (_root, host, installation, plan) = fixture();
     assert!(status_at(&host, &installation, plan.operation, false).is_err());
+    assert!(list_at(&host, &installation).unwrap().is_empty());
     let config = _root.path().join("config");
     assert_eq!(
         fs::read_dir(&config).unwrap().count(),
@@ -180,6 +181,10 @@ fn metadata_status_creates_no_storage_and_does_not_promote_an_unprepared_intent(
         .map(|entry| entry.unwrap().file_name())
         .collect();
     let status = status_at(&host, &installation, plan.operation, false).unwrap();
+    let retained = list_at(&host, &installation).unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].plan, plan);
+    assert_eq!(retained[0], status);
     assert_eq!(status.stage, ImportStage::Reserved);
     assert_eq!(status.publication, ImportPublication::Unknown);
     assert!(
