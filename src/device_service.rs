@@ -85,6 +85,8 @@ pub enum Operation {
     AccountCodingConfigInspect(crate::account::coding_config::InspectRequest),
     /// Explicit creation of one absent fixed config; never an execution permit.
     AccountCodingConfigCreate(crate::account::coding_config::CreateRequest),
+    /// Selected staged-file import; metadata only, admitted exclusively as User.
+    AccountImport(crate::account::import::ImportOperation),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -141,6 +143,7 @@ pub enum Reply {
     AccountCheck(Box<crate::account::readiness::CheckReport>),
     AccountCodingConfigInspect(Box<crate::account::coding_config::Observation>),
     AccountCodingConfigCreate(Box<crate::account::coding_config::CreateReport>),
+    AccountImport(Box<crate::account::import::ImportReply>),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -200,6 +203,9 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     match operation {
         Operation::AccountCheck(_) => {
             Err("Account checks require the selected daemon's scoped admission".into())
+        }
+        Operation::AccountImport(_) => {
+            Err("Account import requires the selected daemon's user admission".into())
         }
         Operation::AccountCodingConfigInspect(_) | Operation::AccountCodingConfigCreate(_) => {
             Err("Account configuration requires the selected daemon's user admission".into())

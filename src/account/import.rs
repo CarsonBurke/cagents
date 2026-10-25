@@ -234,6 +234,8 @@ pub struct ImportStatus {
     pub uncertain: bool,
     pub publication: ImportPublication,
     pub registered: Option<super::AccountId>,
+    /// Acknowledgement from this explicit Verify only; None does not mean absent.
+    pub coding_profile: Option<super::coding_config::CreateReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

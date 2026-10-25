@@ -29,6 +29,22 @@ pub enum Operation {
 }
 
 #[cfg(feature = "host")]
+fn require_sign_in_origin(
+    registry: &super::registry::Registry,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> Result<(), String> {
+    if registry
+        .pending()
+        .iter()
+        .any(|pending| pending.key == key && pending.provider == provider && pending.is_import())
+    {
+        return Err("This pending account belongs to an import; use its original import status and explicit verification".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host")]
 pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Account>, String> {
     use super::{Account, home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
@@ -38,6 +54,7 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
         .map_err(|error| error.to_string())?;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
+            require_sign_in_origin(&registry, *provider, *key)?;
             let pending = registry
                 .pending()
                 .iter()
@@ -242,6 +259,7 @@ fn execute_at(
         }
         Operation::Register { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
+            require_sign_in_origin(&registry, provider, key)?;
             // A transport interruption can lose a successful reply. Retrying
             // the same pending key must not delete or replace that login.
             if registry.find(key).is_some_and(|registered| {
@@ -335,6 +353,7 @@ fn execute_at(
         }
         Operation::Abandon { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
+            require_sign_in_origin(&registry, provider, key)?;
             if !registry
                 .pending()
                 .iter()
@@ -420,6 +439,63 @@ mod tests {
         agent::Provider,
     };
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn import_pending_refuses_generic_registration_and_abandon_before_any_provider_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let (key, home) = store
+            .create_pending(&homes, Provider::Codex, 1, || {
+                homes.create(Provider::Codex, None)
+            })
+            .unwrap();
+        store
+            .update(|registry| {
+                let mut encoded = serde_json::to_value(&*registry).unwrap();
+                let row = encoded["pending"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|row| row["key"] == key.to_string())
+                    .unwrap();
+                row["origin"] = serde_json::json!({"kind":"cache_import","operation":key});
+                *registry = serde_json::from_value(encoded).unwrap();
+            })
+            .unwrap();
+        std::fs::write(home.join("retain-import-fixture"), b"retained").unwrap();
+        let host = crate::host::AccountReservation::test_host();
+        let reservation = crate::host::AccountReservation::test_install(
+            &host,
+            &[Account::managed(Provider::Codex, key, home.clone())],
+            store.clone(),
+            &homes,
+        )
+        .unwrap();
+        let before = store.load().unwrap();
+        for operation in [
+            Operation::Register {
+                provider: Provider::Codex,
+                key,
+            },
+            Operation::Abandon {
+                provider: Provider::Codex,
+                key,
+            },
+        ] {
+            let error =
+                execute_at(operation, &reservation, homes.clone(), store.clone()).unwrap_err();
+            assert_eq!(
+                error,
+                "This pending account belongs to an import; use its original import status and explicit verification"
+            );
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(
+                std::fs::read(home.join("retain-import-fixture")).unwrap(),
+                b"retained"
+            );
+        }
+    }
 
     #[test]
     fn host_lifecycle_never_deletes_managed_or_linked_files_without_a_permit() {

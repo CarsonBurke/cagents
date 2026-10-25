@@ -2276,6 +2276,15 @@ where
         return ExitCode::FAILURE;
     }
 
+    // Staged import is an explicit user action. Refuse hosted authority before
+    // selecting a device, recovering a staged owner, or preparing SSH transport.
+    if let TopCommand::Account { command } = &cli.command
+        && let Err(error) = accounts::preflight(command)
+    {
+        emit_error(cli.json, &error);
+        return ExitCode::FAILURE;
+    }
+
     // Physical-device image receipts are user-managed local files. Refuse
     // hosted/remote authority before device preparation, staged-owner routing,
     // daemon recovery, or even opening the image store.

@@ -501,7 +501,7 @@ impl Reservation {
         Self::for_import_at(host, key, fresh, store, &homes)
     }
 
-    fn for_import_at(
+    pub(super) fn for_import_at(
         host: &SharedHost,
         key: uuid::Uuid,
         fresh: bool,

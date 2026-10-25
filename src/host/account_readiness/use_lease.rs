@@ -86,6 +86,9 @@ pub(in crate::host) struct Scope {
     home: Directory,
     workspace: Directory,
     retained: Mutex<Retained>,
+    // Import verification also retains its account reservation and probe lock.
+    // The scoped map keeps these alive until original child cleanup is known.
+    _guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 #[derive(Default)]
 struct Retained {
@@ -103,10 +106,31 @@ impl Scope {
         workspace: &Path,
         workspace_pin: &File,
     ) -> Result<Arc<Self>, String> {
+        Self::capture_inner(home, home_pin, workspace, workspace_pin, None)
+    }
+
+    pub(in crate::host) fn capture_guarded(
+        home: &Path,
+        home_pin: &File,
+        workspace: &Path,
+        workspace_pin: &File,
+        guard: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Arc<Self>, String> {
+        Self::capture_inner(home, home_pin, workspace, workspace_pin, Some(guard))
+    }
+
+    fn capture_inner(
+        home: &Path,
+        home_pin: &File,
+        workspace: &Path,
+        workspace_pin: &File,
+        guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
             home: Directory::capture(home, home_pin)?,
             workspace: Directory::capture(workspace, workspace_pin)?,
             retained: Mutex::new(Retained::default()),
+            _guard: guard,
         }))
     }
 }
@@ -551,6 +575,57 @@ mod tests {
         assert!(ensure_outside(&map, &workspace).is_ok());
         let _next = Lease::enroll(&map, scope).unwrap();
         assert!(ensure_outside(&map, &workspace).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn imported_probe_guard_survives_cancellation_until_original_child_is_reaped() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let guard = Arc::new(());
+        let observed = Arc::downgrade(&guard);
+        let scope =
+            Scope::capture_guarded(&home, &pin(&home), &home, &pin(&home), guard.clone()).unwrap();
+        let map = Leases::default();
+        let lease = Lease::enroll(&map, scope).unwrap();
+        drop(guard);
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        // As in the existing finite original-child fixture, stdin EOF is the
+        // sole completion path; no discovered PID or external process is used.
+        lease.retain_unconfirmed(child, true);
+        drop(lease);
+        cleanup_retained(&map);
+        assert!(
+            observed.upgrade().is_some(),
+            "probe serialization and reservation must outlive their cancelled waiter"
+        );
+        assert_eq!(active_count(&map), 1);
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                cleanup_retained(&map);
+                if active_count(&map) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the original child must be reaped after its finite EOF");
+        assert!(
+            observed.upgrade().is_none(),
+            "confirmed retirement releases the owned guard"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

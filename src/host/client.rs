@@ -517,6 +517,24 @@ pub(super) fn process_request(
     ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
     if let ClientRequest::DeviceOperation {
+        operation: crate::device_service::Operation::AccountImport(import),
+    } = &request
+    {
+        {
+            let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+            ensure_control_open(host)?;
+            super::agent_execution::terminals::admit(host, client_id, &request)?;
+        }
+        let reply = super::account_import::execute(host, import.clone())?;
+        return Ok((
+            ServerResponse::DeviceOperation {
+                reply: crate::device_service::Reply::AccountImport(Box::new(reply)),
+            },
+            Vec::new(),
+            false,
+        ));
+    }
+    if let ClientRequest::DeviceOperation {
         operation:
             operation @ (crate::device_service::Operation::AccountCodingConfigInspect(_)
             | crate::device_service::Operation::AccountCodingConfigCreate(_)),
@@ -1720,6 +1738,54 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn staged_import_requires_user_before_file_reads_and_preserves_shutdown_admission() {
+        use crate::{account::import::ImportOperation, device_service::Operation};
+        let (proof, host) = panic_test_host("import-admission");
+        let mut plan: crate::account::import::ImportPlan = serde_json::from_value(serde_json::json!({
+            "operation":"00000000-0000-4000-8000-000000000121",
+            "destination":proof,
+            "observation":{"path":"/must-not-be-read","parent":{"device":1,"inode":2},"file":{"device":1,"inode":3},"size":4,"mtime_seconds":0,"mtime_nanoseconds":0,"ctime_seconds":0,"ctime_nanoseconds":0},
+            "expected_email":"fixture@example.test", "consent":{"staged_file_only":true,"source_session_limit_acknowledged":true},"profile":{"kind":"unconfigured"}
+        })).unwrap();
+        plan.expected_email.clear(); // Would be refused by the handler, after User admission.
+        host.lock()
+            .unwrap()
+            .agent_clients
+            .insert(1, crate::agent_execution::Lineage(TerminalId::new()));
+        for operation in [
+            ImportOperation::Inspect {
+                path: "/must-not-be-read".into(),
+            },
+            ImportOperation::Prepare { plan },
+            ImportOperation::Status {
+                operation: uuid::Uuid::nil(),
+            },
+            ImportOperation::Verify {
+                operation: uuid::Uuid::nil(),
+                destination: proof.clone(),
+            },
+        ] {
+            let request = ClientRequest::DeviceOperation {
+                operation: Operation::AccountImport(operation),
+            };
+            assert_eq!(
+                process_request(&host, 1, request.clone()).unwrap_err().code,
+                ProtocolErrorCode::PermissionDenied
+            );
+        }
+        host.lock().unwrap().request_shutdown();
+        let request = ClientRequest::DeviceOperation {
+            operation: Operation::AccountImport(ImportOperation::Inspect {
+                path: "/must-not-be-read".into(),
+            }),
+        };
+        assert_eq!(
+            process_request(&host, 1, request).unwrap_err().code,
+            ProtocolErrorCode::TerminalUnavailable
+        );
+    }
 
     #[test]
     fn coding_config_operations_require_user_admission_before_request_or_filesystem_work() {

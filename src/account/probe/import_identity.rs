@@ -17,6 +17,7 @@ pub(crate) enum Error {
     ProbeUnavailable,
     ProbeBusy,
     ProviderMissing,
+    ProviderExecutableChanged,
     ProviderStartFailed,
     ProviderTimeout,
     ProviderProtocol,
@@ -30,6 +31,17 @@ fn physical(path: &Path) -> Option<PhysicalIdentity> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
+}
+
+fn executable_stamp(path: &Path) -> Option<(u64, u64, u64, i64, i64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    metadata.is_file().then_some((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    ))
 }
 
 fn expected_identity(result: &Value, email: &str) -> Result<Identity, Error> {
@@ -84,6 +96,7 @@ pub(crate) async fn verify(
     let search = current_search_path();
     let program = find_executable(Provider::Codex.executable(), search.as_deref())
         .ok_or(Error::ProviderMissing)?;
+    let executable = executable_stamp(&program).ok_or(Error::ProviderMissing)?;
     let mut process = command(&account, &program);
     process.arg("app-server").current_dir(&home);
     let mut session = tokio::time::timeout(TIMEOUT, Session::spawn_owned(process, owner))
@@ -99,6 +112,9 @@ pub(crate) async fn verify(
     let cleaned = session.close().await;
     if !cleaned {
         return Err(Error::CleanupUnconfirmed);
+    }
+    if executable_stamp(&program) != Some(executable) {
+        return Err(Error::ProviderExecutableChanged);
     }
     if original.canonicalize().ok().as_ref() != Some(&home)
         || physical(&home) != Some(expected_home)
