@@ -4,6 +4,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::os::unix::ffi::OsStrExt;
 
+#[cfg(test)]
+thread_local! {
+    static PLAIN_FINGERPRINT_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum RecoveryContent {
     Conversation(crate::agent::Provider, uuid::Uuid),
@@ -35,6 +40,8 @@ impl RecoveryContent {
             environment,
             unset_environment,
         } = &session.launch;
+        #[cfg(test)]
+        PLAIN_FINGERPRINT_EVALUATIONS.with(|count| count.set(count.get() + 1));
         let mut digest = Sha256::new();
         fn field(digest: &mut Sha256, bytes: &[u8]) {
             digest.update((bytes.len() as u64).to_le_bytes());
@@ -70,6 +77,11 @@ pub(crate) struct ClosedTerminalClaim {
 }
 
 impl ClosedTerminalClaim {
+    #[cfg(test)]
+    pub(crate) fn plain_fingerprint_evaluations_for_test() -> usize {
+        PLAIN_FINGERPRINT_EVALUATIONS.with(std::cell::Cell::get)
+    }
+
     pub(crate) fn of(session: &TerminalSession) -> Self {
         Self {
             id: session.id,

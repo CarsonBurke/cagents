@@ -70,6 +70,18 @@ fn observe_inventory(
 /// hosting that process, and a later observation of it must not reopen the card
 /// the user shut.
 fn saved_terminal_claims_host(saved: &TerminalSession, hosted: &TerminalSession) -> bool {
+    if saved.id == hosted.id {
+        return true;
+    }
+    let proof = saved.continuity.live_proof();
+    if proof.is_none()
+        || proof == hosted.continuity.live_proof()
+        || hosted.recovery_origin != Some(saved.recovery_origin.unwrap_or(saved.id))
+    {
+        return false;
+    }
+    // Only a real recovery candidate needs the full launch fingerprint.
+    // Ordinary inventory matching must not hash every saved recipe per row.
     crate::persistence::ClosedTerminalClaim::of(saved).claims(hosted)
 }
 
@@ -531,6 +543,86 @@ mod tests {
             })
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn inventory_claim_prefilter_hashes_only_real_recovery_candidates() {
+        use crate::persistence::ClosedTerminalClaim;
+
+        let mut saved = hosted("/repo");
+        saved.launch.arguments = vec!["-c".into(), "plain terminal payload".repeat(4096)];
+        saved
+            .launch
+            .environment
+            .insert("FIXTURE".into(), "private fixture value".repeat(4096));
+        let mut exact = saved.clone();
+        exact.launch.arguments[1].push_str("different metadata");
+        let mut unrelated = saved.clone();
+        unrelated.id = TerminalId::new();
+        let mut recovery = unrelated.clone();
+        recovery.recovery_origin = Some(saved.id);
+        recovery.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("replacement"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("replacement"),
+        };
+        let mut same_host_recovery = recovery.clone();
+        same_host_recovery.continuity = saved.continuity.clone();
+        let mut wrong_root = recovery.clone();
+        wrong_root.recovery_origin = Some(TerminalId::new());
+        let mut unissued = saved.clone();
+        unissued.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let before = ClosedTerminalClaim::plain_fingerprint_evaluations_for_test();
+        for _ in 0..32 {
+            assert!(saved_terminal_claims_host(&saved, &exact));
+            assert!(!saved_terminal_claims_host(&saved, &unrelated));
+            assert!(!saved_terminal_claims_host(&saved, &same_host_recovery));
+            assert!(!saved_terminal_claims_host(&saved, &wrong_root));
+            assert!(!saved_terminal_claims_host(&unissued, &recovery));
+        }
+        assert_eq!(
+            ClosedTerminalClaim::plain_fingerprint_evaluations_for_test(),
+            before,
+            "ordinary identity/proof/root checks must not fingerprint launch bytes"
+        );
+
+        assert!(saved_terminal_claims_host(&saved, &recovery));
+        assert_eq!(
+            ClosedTerminalClaim::plain_fingerprint_evaluations_for_test() - before,
+            2,
+            "a genuine recovery compares both original launch fingerprints"
+        );
+        for field in ["argument", "environment", "unset"] {
+            let mut changed = recovery.clone();
+            match field {
+                "argument" => changed.launch.arguments[1].push('!'),
+                "environment" => {
+                    changed
+                        .launch
+                        .environment
+                        .get_mut("FIXTURE")
+                        .unwrap()
+                        .push('!');
+                }
+                "unset" => {
+                    changed.launch.unset_environment.insert("PROFILE".into());
+                }
+                _ => unreachable!(),
+            }
+            let before = ClosedTerminalClaim::plain_fingerprint_evaluations_for_test();
+            assert!(!saved_terminal_claims_host(&saved, &changed));
+            assert_eq!(
+                ClosedTerminalClaim::plain_fingerprint_evaluations_for_test() - before,
+                2,
+                "matching recovery lineage still checks exact {field} bytes"
+            );
+        }
     }
 
     #[test]
