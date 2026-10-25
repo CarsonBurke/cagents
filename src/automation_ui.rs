@@ -703,8 +703,15 @@ impl Section {
     }
 }
 
+struct LifecycleNotice {
+    id: Uuid,
+    sequence: u64,
+    event: Option<crate::automations::LifecycleEvent>,
+}
+
 #[derive(Default)]
 pub struct State {
+    lifecycle_notice: Option<LifecycleNotice>,
     manual_requests: std::collections::BTreeMap<Uuid, (u64, Uuid)>,
     sequence: u64,
     pending: Option<(u64, Pending)>,
@@ -812,6 +819,67 @@ impl State {
                 Some((_, Pending::Save | Pending::Mutate | Pending::OpenRun))
             )
     }
+    /// Notification reads may supersede background polling, never a draft,
+    /// confirmation or foreground request owned by the user.
+    pub fn can_open_lifecycle(&self) -> bool {
+        self.can_open_run()
+            && self
+                .pending
+                .is_none_or(|(_, pending)| pending.background_read())
+    }
+
+    /// Adopt only the exact authorized historical receipt. No definition or
+    /// latest-row fallback is needed, including for a removed automation.
+    pub fn show_lifecycle_receipt(
+        &mut self,
+        id: Uuid,
+        sequence: u64,
+        result: Result<crate::automations::LifecyclePage, ()>,
+    ) -> bool {
+        if !self.can_open_lifecycle() || id.is_nil() || sequence == 0 || sequence > i64::MAX as u64
+        {
+            return false;
+        }
+        let event = result.ok().and_then(|mut page| {
+            if page.events.len() != 1 || page.next.is_some_and(|next| next != sequence) {
+                return None;
+            }
+            let event = page.events.pop()?;
+            (event.automation == id
+                && event.sequence == sequence
+                && event.actor == crate::automations::LifecycleActor::System
+                && matches!(
+                    event.cause,
+                    crate::automations::LifecycleCause::ProjectClosed
+                        | crate::automations::LifecycleCause::ProjectUnavailable
+                        | crate::automations::LifecycleCause::StartPaused
+                        | crate::automations::LifecycleCause::PrecheckInterrupted
+                        | crate::automations::LifecycleCause::PrecheckPaused
+                )
+                && !event.enabled
+                && event.revision > 0
+                && event.revision <= i64::MAX as u64
+                && event.occurred_ms <= i64::MAX as u64
+                && !event.firing.is_some_and(|id| id.is_nil()))
+            .then_some(event)
+        });
+        self.sequence = self.sequence.wrapping_add(1);
+        self.pending = None;
+        self.history_refresh = None;
+        self.selected = None;
+        self.run = None;
+        self.lifecycle = None;
+        self.all_history = false;
+        self.error = None;
+        self.notice = None;
+        self.lifecycle_notice = Some(LifecycleNotice {
+            id,
+            sequence,
+            event,
+        });
+        true
+    }
+
     pub fn set_choices(
         &mut self,
         targets: Vec<TargetChoice>,
@@ -1070,6 +1138,15 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if self.lifecycle_notice.is_some() {
+            // This surface is historical only. Retained callbacks from the
+            // previous editor cannot mutate or open a different run behind it.
+            if !matches!(action, Action::Browse | Action::InspectRun(_)) {
+                return None;
+            }
+            self.lifecycle_notice = None;
+        }
+
         if self.discard_draft.is_some() && !action.background() && !action.answers_draft_dialog() {
             return None;
         }
@@ -2069,6 +2146,38 @@ impl State {
     }
 
     fn view_layout(&self, size: cosmic::iced::Size) -> Element<'_, Action> {
+        if let Some(receipt) = &self.lifecycle_notice {
+            let mut content = widget::column::with_children(vec![
+                button("Back to automations", Action::Browse, true),
+                crate::design::title("Automation lifecycle receipt").into(),
+                crate::design::body(format!(
+                    "Automation {} · Receipt {}",
+                    receipt.id, receipt.sequence
+                ))
+                .into(),
+            ])
+            .spacing(space::M)
+            .width(Length::Fill);
+            if let Some(event) = &receipt.event {
+                content = content
+                    .push(crate::design::heading(event.cause.label()))
+                    .push(crate::design::body(format!("{} · {} · Revision {}",
+                        timestamp(event.occurred_ms), event.actor.label(), event.revision)))
+                    .push(crate::design::body("This records a past system event. It does not describe the automation's current status."));
+            } else {
+                content = content
+                    .push(crate::design::heading("This exact receipt is unavailable"))
+                    .push(crate::design::body("It may have expired from retained history or no longer be available on this backend. The original notice remains in Attention."));
+            }
+            return widget::scrollable(content.padding(space::L))
+                .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                    crate::design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
         let width = size.width;
         let busy = self
             .pending
@@ -6939,6 +7048,177 @@ mod tests {
             assert!(state.run.is_none());
             assert!(state.notice.is_none());
         }
+    }
+    fn notice_page(id: Uuid, sequence: u64) -> crate::automations::LifecyclePage {
+        crate::automations::LifecyclePage {
+            events: vec![crate::automations::LifecycleEvent {
+                automation: id,
+                sequence,
+                revision: 4,
+                occurred_ms: 600,
+                cause: crate::automations::LifecycleCause::PrecheckInterrupted,
+                actor: crate::automations::LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn exact_no_run_receipt_is_read_only_even_without_a_current_definition_and_at_narrow_width() {
+        let id = Uuid::new_v4();
+        let mut state = State::default();
+        state.pending = Some((7, Pending::RefreshList));
+        assert!(state.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(
+            state
+                .lifecycle_notice
+                .as_ref()
+                .unwrap()
+                .event
+                .as_ref()
+                .unwrap()
+                .sequence,
+            42
+        );
+        assert!(state.selected.is_none() && state.run.is_none() && state.rows.is_empty());
+        for action in [
+            Action::Tick,
+            Action::Refresh,
+            Action::Enable,
+            Action::RunNow,
+            Action::Remove,
+            Action::OpenSession,
+            Action::Run(Uuid::new_v4()),
+            Action::New,
+        ] {
+            assert!(state.update(action).is_none());
+        }
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence: 7,
+                    result: std::sync::Arc::new(Ok(Response::Listed(vec![
+                        automation().summary(None)
+                    ])))
+                })
+                .is_none()
+        );
+        assert!(state.rows.is_empty() && state.manual_requests.is_empty());
+        for width in [280.0, 900.0] {
+            let outline = Outline::of(&state, width, 600.0);
+            assert!(
+                outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == "Precheck interrupted")
+            );
+            assert!(
+                outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text.contains("past system event"))
+            );
+            assert!(
+                !outline
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text.contains("Run now")
+                        || text == "Enable"
+                        || text.contains("Inspect run"))
+            );
+            assert!(outline.field.is_none());
+        }
+        assert!(matches!(
+            state.update(Action::Browse),
+            Some(Effect::Request {
+                request: Request::List { after: None, .. },
+                ..
+            })
+        ));
+        assert!(state.lifecycle_notice.is_none());
+    }
+
+    #[test]
+    fn expired_foreign_or_malformed_lifecycle_reply_never_substitutes_a_latest_row() {
+        let id = Uuid::new_v4();
+        let mut wrong_actor = notice_page(id, 42);
+        wrong_actor.events[0].actor = crate::automations::LifecycleActor::UserManagement;
+        let mut wrong_cause = notice_page(id, 42);
+        wrong_cause.events[0].cause = crate::automations::LifecycleCause::Enabled;
+        let mut long = notice_page(id, 42);
+        long.events.push(long.events[0].clone());
+        let mut cursor = notice_page(id, 42);
+        cursor.next = Some(41);
+        let mut invalid = notice_page(id, 42);
+        invalid.events[0].revision = 0;
+        for reply in [
+            Err(()),
+            Ok(crate::automations::LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: true,
+            }),
+            Ok(notice_page(Uuid::new_v4(), 42)),
+            Ok(notice_page(id, 43)),
+            Ok(wrong_actor),
+            Ok(wrong_cause),
+            Ok(long),
+            Ok(cursor),
+            Ok(invalid),
+        ] {
+            let mut state = State {
+                selected: Some(automation()),
+                ..Default::default()
+            };
+            assert!(state.show_lifecycle_receipt(id, 42, reply));
+            let selected = state.lifecycle_notice.as_ref().unwrap();
+            assert_eq!((selected.id, selected.sequence), (id, 42));
+            assert!(selected.event.is_none());
+            assert!(state.selected.is_none() && state.run.is_none());
+            assert!(
+                Outline::of(&state, 280.0, 600.0)
+                    .texts
+                    .iter()
+                    .any(|(text, _)| text == "This exact receipt is unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_activation_preserves_edits_consent_and_foreground_request_ownership() {
+        let id = Uuid::new_v4();
+        let owner = automation();
+        let mut draft = State {
+            selected: Some(owner.clone()),
+            ..Default::default()
+        };
+        draft.update(Action::Edit);
+        draft.update(Action::Field(Field::Name, "Keep this draft".into()));
+        assert!(!draft.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(draft.draft.as_ref().unwrap().name, "Keep this draft");
+        assert!(draft.lifecycle_notice.is_none());
+        let mut selecting = State::default();
+        let Some(Effect::Request { sequence, .. }) = selecting.update(Action::Select(owner.id))
+        else {
+            panic!("foreground selection")
+        };
+        assert!(!selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert_eq!(selecting.pending.unwrap().0, sequence);
+        selecting.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner))),
+        });
+        assert!(selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        // Existing AgentRun navigation still leaves the historical-only panel.
+        let run = crate::model::RunId::new();
+        assert!(
+            matches!(selecting.update(Action::InspectRun(run)),Some(Effect::Request{request:Request::ShowRun{run:actual},..}) if actual==run)
+        );
+        assert!(selecting.lifecycle_notice.is_none());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {

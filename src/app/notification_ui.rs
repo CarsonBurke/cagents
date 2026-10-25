@@ -14,6 +14,11 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    HostBound(HostSessionProof),
+    LifecycleResolved {
+        generation: u64,
+        result: Result<crate::automations::LifecyclePage, ()>,
+    },
     SessionActivationExpired {
         session: TerminalId,
         generation: u64,
@@ -27,6 +32,66 @@ pub enum Action {
     Test,
     Tested(Result<TestOutcome, String>),
     Failed(String),
+}
+
+#[derive(Clone)]
+struct LifecycleActivation {
+    id: uuid::Uuid,
+    sequence: u64,
+    generation: u64,
+    registry: uuid::Uuid,
+    host: HostSessionProof,
+    backend: Option<(String, String, String)>,
+    workspace: Weak<WorkspaceState>,
+}
+
+fn lifecycle_backend() -> Option<(String, String, String)> {
+    crate::device::selected().map(|device| {
+        (
+            device.name.clone(),
+            device.host.clone(),
+            device.executable.clone(),
+        )
+    })
+}
+
+fn read_lifecycle(
+    activation: &LifecycleActivation,
+) -> Result<crate::automations::LifecyclePage, ()> {
+    if lifecycle_backend() != activation.backend {
+        return Err(());
+    }
+    let mut client = connect().map_err(|_| ())?;
+    if client.proof() != &activation.host {
+        return Err(());
+    }
+    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+        return Err(());
+    }
+    // At SQLite's maximum sequence there cannot be a later receipt. The
+    // receiver still requires exact equality; it never substitutes the latest.
+    let before = activation
+        .sequence
+        .checked_add(1)
+        .filter(|value| *value <= i64::MAX as u64);
+    let page = match client
+        .automation(
+            crate::agent_execution::Authority::default(),
+            crate::automations::Request::Audit {
+                id: activation.id,
+                before,
+                limit: 1,
+            },
+        )
+        .map_err(|_| ())?
+    {
+        crate::automations::Response::Audit(page) => page,
+        _ => return Err(()),
+    };
+    if client.read_workspace_model().map_err(|_| ())?.identity != activation.registry {
+        return Err(());
+    }
+    Ok(page)
 }
 
 struct ManagedActivation {
@@ -69,6 +134,8 @@ pub(super) struct State {
     acknowledged: BTreeSet<uuid::Uuid>,
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
+    lifecycle_activation: Option<LifecycleActivation>,
+    host: Option<HostSessionProof>,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
     activation_generation: u64,
@@ -94,6 +161,8 @@ impl Default for State {
             visible_acknowledged: false,
             acknowledged: BTreeSet::new(),
             testing: false,
+            lifecycle_activation: None,
+            host: None,
             inbox_activation: None,
             session_activation: None,
             activation_generation: 0,
@@ -215,6 +284,9 @@ fn observe(
     presence: &Mutex<Presence>,
 ) -> Result<(), String> {
     let mut client = connect()?;
+    sender
+        .send_blocking(Action::HostBound(client.proof().clone()))
+        .map_err(|error| error.to_string())?;
     let presence = presence.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let snapshot = client
         .watch_notifications(presence)
@@ -476,18 +548,112 @@ impl Cagents {
         self.sync_notification_presence();
     }
 
+    fn can_open_lifecycle_notice(&self) -> bool {
+        !self.workspace_inputs_blocked()
+            && !self.focused_repository_is_saving()
+            && self.exit.is_none()
+            && self.workspace.pending_close().is_none()
+            && !self.update_prepared
+            && self.automation_ui.can_open_lifecycle()
+    }
+
     pub(super) fn update_notifications(&mut self, action: Action) -> Task<Message> {
         if matches!(&action, Action::Activated(target) if !matches!(target, Target::SessionInbox(_)))
         {
             self.notification_ui.inbox_activation = None;
         }
         if matches!(&action, Action::Activated(_)) {
+            self.notification_ui.lifecycle_activation = None;
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
             self.notification_ui.activation_generation =
                 self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
+            Action::HostBound(proof) => {
+                if self.notification_ui.host.as_ref() != Some(&proof) {
+                    self.notification_ui.lifecycle_activation = None;
+                }
+                self.notification_ui.host = Some(proof);
+                Task::none()
+            }
+            Action::Activated(Target::Automation { id, sequence }) => {
+                if !self.can_open_lifecycle_notice() {
+                    self.status = Some(TransientNotice::warning(
+                        "Return to the workspace and finish any open edit or request, then open this lifecycle notice again.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let Some(host) = self
+                    .notification_ui
+                    .host
+                    .clone()
+                    .filter(|proof| proof.is_complete())
+                else {
+                    self.status = Some(TransientNotice::warning(
+                        "The notification backend is not connected. The original notice remains in Attention.",
+                    ));
+                    return self.activate_main_window(None);
+                };
+                if id.is_nil()
+                    || sequence == 0
+                    || sequence > i64::MAX as u64
+                    || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This lifecycle notice is not available on the current workspace. The original notice remains in Attention.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let activation = LifecycleActivation {
+                    id,
+                    sequence,
+                    generation: self.notification_ui.activation_generation,
+                    registry: self.workspace_model.identity,
+                    host,
+                    backend: lifecycle_backend(),
+                    workspace: Arc::downgrade(&self.durable),
+                };
+                self.notification_ui.lifecycle_activation = Some(activation.clone());
+                cosmic::task::future(async move {
+                    let generation = activation.generation;
+                    let result = tokio::task::spawn_blocking(move || read_lifecycle(&activation))
+                        .await
+                        .unwrap_or(Err(()));
+                    Message::NotificationUi(Action::LifecycleResolved { generation, result })
+                })
+            }
+            Action::LifecycleResolved { generation, result } => {
+                let Some(activation) = self
+                    .notification_ui
+                    .lifecycle_activation
+                    .as_ref()
+                    .filter(|current| current.generation == generation)
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                self.notification_ui.lifecycle_activation = None;
+                if activation.registry != self.workspace_model.identity
+                    || self.notification_ui.host.as_ref() != Some(&activation.host)
+                    || lifecycle_backend() != activation.backend
+                    || activation.workspace.as_ptr() != Arc::as_ptr(&self.durable)
+                    || !self.can_open_lifecycle_notice()
+                {
+                    return Task::none();
+                }
+                if !self.automation_ui.show_lifecycle_receipt(
+                    activation.id,
+                    activation.sequence,
+                    result,
+                ) {
+                    return Task::none();
+                }
+                // Reading a historical receipt is not run attention retirement
+                // or a claim that this system condition still holds now.
+                let open = self.open_utility_card(CardKind::Automations);
+                Task::batch([open, self.activate_main_window(None)])
+            }
             Action::Snapshot(snapshot) => {
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
                     && let Some(diagnostic) = &snapshot.diagnostic
@@ -3176,6 +3342,217 @@ mod tests {
             count,
             "missing targets cannot invent replacement sessions"
         );
+    }
+    fn lifecycle_notice_fixture() -> (Cagents, uuid::Uuid, u64, uuid::Uuid) {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("lifecycle-fixture"),
+            boot_id: crate::model::BootId::new("lifecycle-fixture"),
+            host_incarnation: crate::model::HostIncarnation::new("lifecycle-fixture"),
+        };
+        drop(app.update_notifications(Action::HostBound(proof)));
+        let id = uuid::Uuid::new_v4();
+        let sequence = 42;
+        let notice = uuid::Uuid::new_v4();
+        app.notification_ui
+            .snapshot
+            .notices
+            .push(crate::notifications::Notice {
+                id: notice,
+                delivered: true,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event {
+                    target: Target::Automation { id, sequence },
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: None,
+                    content: None,
+                    evidence: crate::notifications::Evidence {
+                        key: format!("automation:{id}:lifecycle:{sequence}"),
+                        kind: crate::notifications::Kind::AutomationBlocked,
+                    },
+                },
+            });
+        (app, id, sequence, notice)
+    }
+
+    fn exact_notice_page(id: uuid::Uuid, sequence: u64) -> crate::automations::LifecyclePage {
+        crate::automations::LifecyclePage {
+            events: vec![crate::automations::LifecycleEvent {
+                automation: id,
+                sequence,
+                revision: 3,
+                occurred_ms: 600,
+                cause: crate::automations::LifecycleCause::PrecheckInterrupted,
+                actor: crate::automations::LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: None,
+            }],
+            next: None,
+            earlier_events_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn no_run_notice_opens_only_exact_read_only_receipt_and_keeps_unavailable_attention() {
+        for available in [true, false] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            let original = app.durable.cards.clone();
+            // Drop, never poll, the real Task: these are typed completion and
+            // routing tests, not daemon/RPC/native execution evidence.
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            assert_eq!(
+                app.durable.cards, original,
+                "read happens before utility/state opening"
+            );
+            let generation = app
+                .notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation;
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation,
+                result: if available {
+                    Ok(exact_notice_page(id, sequence))
+                } else {
+                    Err(())
+                },
+            }));
+            assert!(
+                app.durable
+                    .cards
+                    .iter()
+                    .any(|card| card.kind == CardKind::Automations && card.existence.is_open())
+            );
+            assert!(matches!(
+                app.card_state(app.workspace.focused().unwrap())
+                    .unwrap()
+                    .kind,
+                CardKind::Automations
+            ));
+            assert!(app.notification_ui.lifecycle_activation.is_none());
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+            assert_eq!(app.notification_ui.snapshot.notices.len(), 1);
+            assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+            assert_eq!(
+                app.durable
+                    .cards
+                    .iter()
+                    .filter(|c| matches!(c.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                    .count(),
+                original
+                    .iter()
+                    .filter(|c| matches!(c.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                    .count()
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_notice_does_not_open_over_dirty_modal_or_changed_backend_and_old_generation() {
+        for changed in [
+            "modal",
+            "draft",
+            "registry",
+            "host",
+            "workspace",
+            "update",
+            "close",
+        ] {
+            let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+            drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+            let generation = app
+                .notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation;
+            match changed {
+                "modal" => app.settings_reset_confirm = true,
+                "draft" => {
+                    drop(app.update_automation_ui(crate::automation_ui::Action::New));
+                }
+                "registry" => app.workspace_model.identity = uuid::Uuid::new_v4(),
+                "host" => {
+                    let mut proof = app.notification_ui.host.clone().unwrap();
+                    proof.host_incarnation = crate::model::HostIncarnation::new("replacement");
+                    drop(app.update_notifications(Action::HostBound(proof)));
+                }
+                "workspace" => {
+                    let mut workspace = (*app.durable).clone();
+                    workspace.generation += 1;
+                    app.durable = Arc::new(workspace);
+                }
+                "update" => app.update_prepared = true,
+                "close" => {
+                    app.workspace
+                        .request_close(app.workspace.focused().unwrap())
+                        .unwrap();
+                    assert!(app.workspace.pending_close().is_some());
+                }
+                _ => unreachable!(),
+            }
+            let cards = app.durable.cards.clone();
+            let focused = app.workspace.focused();
+            drop(app.update_notifications(Action::LifecycleResolved {
+                generation,
+                result: Ok(exact_notice_page(id, sequence)),
+            }));
+            assert_eq!(
+                app.durable.cards, cards,
+                "late reply mounted a utility after {changed}"
+            );
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(!app.notification_ui.acknowledged_for_test(notice));
+            if changed == "draft" {
+                assert!(app.automation_ui.has_draft());
+            }
+        }
+        let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+        app.settings_reset_confirm = true;
+        let cards = app.durable.cards.clone();
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert_eq!(app.durable.cards, cards);
+        app.settings_reset_confirm = false;
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let first = app
+            .notification_ui
+            .lifecycle_activation
+            .as_ref()
+            .unwrap()
+            .generation;
+        drop(
+            app.update_notifications(Action::Activated(Target::Automation {
+                id,
+                sequence: sequence + 1,
+            })),
+        );
+        let current = app
+            .notification_ui
+            .lifecycle_activation
+            .as_ref()
+            .unwrap()
+            .generation;
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert_eq!(
+            app.notification_ui
+                .lifecycle_activation
+                .as_ref()
+                .unwrap()
+                .generation,
+            current
+        );
+        assert_eq!(app.durable.cards, cards);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
 }
 
