@@ -194,6 +194,9 @@ struct Unresolved {
 #[derive(Debug)]
 pub(super) struct State {
     generation: RemovalGeneration,
+    // One outstanding client read, independent of desired review changes.
+    // Its completion does not prove a timed-out backend inspection stopped.
+    inspection: Option<RemovalGeneration>,
     operation: Option<Operation>,
     unresolved: Vec<Unresolved>,
     viewing_unresolved: Option<Uuid>,
@@ -206,6 +209,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             generation: Uuid::new_v4(),
+            inspection: None,
             operation: None,
             unresolved: Vec::new(),
             viewing_unresolved: None,
@@ -248,6 +252,47 @@ impl State {
         }
     }
 
+    /// A deferred read has not started. Pane/watch
+    /// replacement requires a fresh explicit inspection instead of replaying it.
+    /// Already issued reads retain their original completion custody.
+    pub(super) fn retire_waiting_inspection(&mut self) {
+        self.refuse_waiting_inspection("The pending inspection was not started because this view changed. Inspect the original worktree again to continue.");
+    }
+
+    fn refuse_waiting_inspection(&mut self, reason: &str) {
+        if let Some(operation) = self.operation.as_mut()
+            && operation.phase == Phase::Planning
+            && self.inspection != Some(self.generation)
+        {
+            operation.phase = if operation.recovering || self.viewing_unresolved.is_some() {
+                Phase::Uncertain
+            } else {
+                Phase::Refused
+            };
+            operation.message = Some(reason.into());
+            self.rotate();
+        }
+    }
+
+    fn start_inspection(&mut self) -> Option<Effect> {
+        if self.inspection.is_some() {
+            return None;
+        }
+        let operation = self.operation.as_ref()?;
+        if operation.phase != Phase::Planning {
+            return None;
+        }
+        self.inspection = Some(self.generation);
+        Some(Effect::Plan {
+            generation: self.generation,
+            subject: operation.subject.clone(),
+            backend: operation
+                .prepared
+                .as_ref()
+                .map(|prepared| prepared.backend.clone()),
+        })
+    }
+
     pub(super) fn subject(&self) -> Option<&RemovalSubject> {
         self.operation.as_ref().map(|operation| &operation.subject)
     }
@@ -260,6 +305,31 @@ impl State {
     /// `current` means the board still names this exact non-primary worktree,
     /// not merely a branch whose replacement happens to share its CardRef.
     pub(super) fn update(&mut self, action: Action, current: bool) -> Option<Effect> {
+        if let Action::Planned { generation, result } = &action {
+            if self.inspection != Some(*generation) {
+                return None;
+            }
+            // Release the actual call even when its desired review was replaced.
+            // A duplicate old completion cannot release a successor's slot.
+            self.inspection = None;
+            if *generation != self.generation {
+                if result.is_err() {
+                    // A client timeout/error does not cancel the backend work.
+                    // Do not automatically add a second inspection behind it.
+                    self.refuse_waiting_inspection("The earlier inspection did not return a plan. Inspect this worktree again to continue.");
+                    return None;
+                }
+                if !current
+                    && self
+                        .operation
+                        .as_ref()
+                        .is_some_and(|op| op.prepared.is_none())
+                {
+                    self.retire_waiting_inspection();
+                }
+                return self.start_inspection();
+            }
+        }
         if action.generation() != self.generation {
             return None;
         }
@@ -330,11 +400,7 @@ impl State {
                 removed: None,
                 submitted: None,
             });
-            return Some(Effect::Plan {
-                generation: self.generation,
-                subject,
-                backend: None,
-            });
+            return self.start_inspection();
         }
         let readonly = self.viewing_unresolved.is_some();
         let operation = self.operation.as_mut()?;
@@ -490,22 +556,13 @@ impl State {
                     Phase::Review | Phase::Refused | Phase::Uncertain
                 ) =>
             {
-                let backend = operation
-                    .prepared
-                    .as_ref()
-                    .map(|prepared| prepared.backend.clone());
                 operation.recovering = operation.phase == Phase::Uncertain;
                 operation.phase = Phase::Planning;
                 operation.keep = None;
                 operation.delete_branch = false;
                 operation.message = None;
-                let subject = operation.subject.clone();
                 self.rotate();
-                return Some(Effect::Plan {
-                    generation: self.generation,
-                    subject,
-                    backend,
-                });
+                return self.start_inspection();
             }
             Action::Dismiss { .. }
                 if !readonly
@@ -719,6 +776,7 @@ impl State {
             content = content.push(design::body(bounded(message)));
         }
         content = match operation.phase {
+            Phase::Planning if self.inspection != Some(generation) => content.push(design::body("Waiting for the earlier inspection before inspecting this worktree… Nothing new has been sent.")),
             Phase::Planning if operation.recovering => content.push(design::body("Inspecting the original worktree… The previous removal result is still unconfirmed.")),
             Phase::Planning => content.push(design::body("Inspecting the original worktree… Nothing is being removed.")),
             Phase::Pending => content.push(design::body("Removing this worktree… Closing the pane does not cancel the request.")),
@@ -1280,14 +1338,26 @@ mod tests {
         let a = subject("/work/a");
         let a_generation = open(&mut state, a.clone());
         let b = subject("/work/b");
-        let b_generation = open(&mut state, b.clone());
-        state.update(
+        assert!(
+            state
+                .update(
+                    Action::Open {
+                        generation: state.generation(),
+                        subject: b.clone(),
+                    },
+                    true
+                )
+                .is_none(),
+            "B waits for A's real inspection to finish"
+        );
+        let b_generation = state.generation();
+        assert!(matches!(state.update(
             Action::Planned {
                 generation: a_generation,
                 result: Ok(prepared(&a, Verdict::Landed)),
             },
             true,
-        );
+        ), Some(Effect::Plan { generation, subject, backend: None }) if generation == b_generation && subject == b));
         assert_eq!(state.subject(), Some(&b));
         assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Planning);
         state.update(
@@ -1298,6 +1368,327 @@ mod tests {
             true,
         );
         assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Review);
+    }
+
+    #[test]
+    fn inspection_churn_keeps_one_physical_flight_and_only_the_latest_desired_review() {
+        let mut state = State::default();
+        let first = distinct_subject(0);
+        let first_token = open(&mut state, first.clone());
+        let mut latest = first.clone();
+        for number in 1..=64 {
+            latest = distinct_subject(number);
+            assert!(
+                state
+                    .update(
+                        Action::Open {
+                            generation: state.generation(),
+                            subject: latest.clone(),
+                        },
+                        true
+                    )
+                    .is_none(),
+                "no second physical inspection during churn"
+            );
+            assert_eq!(state.inspection, Some(first_token));
+            assert_eq!(state.subject(), Some(&latest));
+        }
+        let desired = state.generation();
+        assert!(
+            outline(&state)
+                .iter()
+                .any(|text| text.contains("Waiting for the earlier inspection"))
+        );
+        assert!(
+            state
+                .update(
+                    Action::Planned {
+                        generation: desired,
+                        result: Ok(prepared(&latest, Verdict::Landed)),
+                    },
+                    true
+                )
+                .is_none(),
+            "an unissued desired token is not a physical completion"
+        );
+        assert_eq!(state.inspection, Some(first_token));
+        let Some(Effect::Plan {
+            generation,
+            subject,
+            backend: None,
+        }) = state.update(
+            Action::Planned {
+                generation: first_token,
+                result: Ok(prepared(&first, Verdict::Landed)),
+            },
+            true,
+        )
+        else {
+            panic!("only the newest desired inspection starts")
+        };
+        assert_eq!(generation, desired);
+        assert_eq!(subject, latest);
+        for stale in [first_token, Uuid::new_v4()] {
+            assert!(
+                state
+                    .update(
+                        Action::Planned {
+                            generation: stale,
+                            result: Ok(prepared(&first, Verdict::Landed)),
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                state.inspection,
+                Some(desired),
+                "old duplicates cannot release the successor"
+            );
+        }
+        assert!(
+            state
+                .update(
+                    Action::Planned {
+                        generation: desired,
+                        result: Ok(prepared(&latest, Verdict::Landed)),
+                    },
+                    true
+                )
+                .is_none(),
+            "finishing inspection never sends Remove"
+        );
+        assert_eq!(state.inspection, None);
+        assert_eq!(state.subject(), Some(&latest));
+        assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Review);
+        assert!(
+            matches!(state.update(Action::Confirm { generation: state.generation() }, true),
+            Some(Effect::Remove { subject, .. }) if subject == latest)
+        );
+    }
+
+    #[test]
+    fn dismissing_or_retiring_desired_inspection_never_replays_it_after_settlement() {
+        // Client failure may precede backend settlement, so no automatic successor.
+        let mut failed = State::default();
+        let original = distinct_subject(0);
+        let physical = open(&mut failed, original);
+        let desired = distinct_subject(1);
+        assert!(
+            failed
+                .update(
+                    Action::Open {
+                        generation: failed.generation(),
+                        subject: desired.clone(),
+                    },
+                    true
+                )
+                .is_none()
+        );
+        assert!(
+            failed
+                .update(
+                    Action::Planned {
+                        generation: physical,
+                        result: Err("client deadline expired".into()),
+                    },
+                    true
+                )
+                .is_none()
+        );
+        assert_eq!(failed.inspection, None);
+        assert_eq!(failed.subject(), Some(&desired));
+        assert_eq!(failed.operation.as_ref().unwrap().phase, Phase::Refused);
+        assert!(matches!(failed.update(Action::Reinspect {
+            generation: failed.generation(),
+        }, true), Some(Effect::Plan { subject, .. }) if subject == desired));
+
+        for retire in [false, true] {
+            let mut state = State::default();
+            let first = distinct_subject(0);
+            let token = open(&mut state, first);
+            let desired = distinct_subject(1);
+            assert!(
+                state
+                    .update(
+                        Action::Open {
+                            generation: state.generation(),
+                            subject: desired.clone(),
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            if retire {
+                state.retire_waiting_inspection();
+                assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Refused);
+            } else {
+                assert!(
+                    state
+                        .update(
+                            Action::Dismiss {
+                                generation: state.generation()
+                            },
+                            true
+                        )
+                        .is_none()
+                );
+                assert!(state.subject().is_none());
+            }
+            assert_eq!(state.inspection, Some(token));
+            assert!(
+                state
+                    .update(
+                        Action::Planned {
+                            generation: token,
+                            result: Err("finished".into())
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            assert_eq!(state.inspection, None);
+            if retire {
+                let Some(Effect::Plan {
+                    generation,
+                    subject,
+                    backend: None,
+                }) = state.update(
+                    Action::Reinspect {
+                        generation: state.generation(),
+                    },
+                    true,
+                )
+                else {
+                    panic!("fresh explicit inspection remains available")
+                };
+                assert_eq!(subject, desired);
+                assert!(
+                    state
+                        .update(
+                            Action::Planned {
+                                generation: token,
+                                result: Err("duplicate".into())
+                            },
+                            true
+                        )
+                        .is_none()
+                );
+                assert_eq!(state.inspection, Some(generation));
+                state.update(
+                    Action::Planned {
+                        generation,
+                        result: Err("current failure".into()),
+                    },
+                    true,
+                );
+                assert_eq!(state.inspection, None);
+                assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Refused);
+            } else {
+                assert!(
+                    state.subject().is_none(),
+                    "physical completion cannot reopen a dismissed review"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_original_inspection_keeps_backend_and_unknown_custody() {
+        for retire in [false, true] {
+            let mut state = State::default();
+            let original = distinct_subject(0);
+            uncertain(&mut state, original.clone());
+            let id = keep_unresolved(&mut state);
+            let submitted = state.unresolved[0].operation.submitted.clone().unwrap();
+            let other = distinct_subject(1);
+            let physical = open(&mut state, other.clone());
+            state.update(
+                Action::Dismiss {
+                    generation: state.generation(),
+                },
+                true,
+            );
+            return_unresolved(&mut state, id);
+            assert!(
+                state
+                    .update(
+                        Action::Reinspect {
+                            generation: state.generation()
+                        },
+                        false
+                    )
+                    .is_none()
+            );
+            let waiting = state.generation();
+            assert_eq!(state.inspection, Some(physical));
+            assert!(!state.can_open());
+            if retire {
+                state.retire_waiting_inspection();
+                assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Uncertain);
+                assert!(
+                    state
+                        .update(
+                            Action::Planned {
+                                generation: physical,
+                                result: Err("settled".into())
+                            },
+                            false
+                        )
+                        .is_none()
+                );
+                assert_eq!(state.inspection, None);
+            } else {
+                let Some(Effect::Plan {
+                    generation,
+                    subject,
+                    backend: Some(backend),
+                }) = state.update(
+                    Action::Planned {
+                        generation: physical,
+                        result: Ok(prepared(&other, Verdict::Landed)),
+                    },
+                    false,
+                )
+                else {
+                    panic!("exact original-host read is allowed despite a missing board subject")
+                };
+                assert_eq!(generation, waiting);
+                assert_eq!(subject, original);
+                assert_eq!(backend, submitted.prepared.backend);
+                let mut replacement = prepared(&original, Verdict::Landed);
+                replacement.backend.proof.host_incarnation = HostIncarnation::new("replacement");
+                assert!(
+                    state
+                        .update(
+                            Action::Planned {
+                                generation,
+                                result: Ok(replacement)
+                            },
+                            false
+                        )
+                        .is_none()
+                );
+                assert_eq!(state.operation.as_ref().unwrap().phase, Phase::Uncertain);
+                assert_eq!(state.inspection, None);
+            }
+            assert!(
+                state
+                    .update(
+                        Action::Confirm {
+                            generation: state.generation()
+                        },
+                        true
+                    )
+                    .is_none()
+            );
+            assert_eq!(state.unresolved.len(), 1);
+            let retained = state.unresolved[0].operation.submitted.as_ref().unwrap();
+            assert_eq!(retained.subject, submitted.subject);
+            assert_eq!(retained.prepared.backend, submitted.prepared.backend);
+            assert_eq!(retained.request, submitted.request);
+            assert_eq!(retained.diagnostic, submitted.diagnostic);
+        }
     }
 
     #[test]

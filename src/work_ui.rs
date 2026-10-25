@@ -316,6 +316,7 @@ impl State {
         let layout = self.layout;
         // Closing a pane retires unsubmitted review input, not an accepted
         // request. Keep its exact host, token, receipt and in-flight generation.
+        self.removal.retire_waiting_inspection();
         self.removal.retire_review_input();
         let removal = std::mem::take(&mut self.removal);
         *self = Self {
@@ -373,6 +374,7 @@ impl State {
                 // arrive before the answer; the newer one stands.
                 if first || revision > self.revision {
                     if first {
+                        self.removal.retire_waiting_inspection();
                         // A new watch connection owns a fresh callback lifetime.
                         // This neither cancels nor resends earlier server work.
                         self.pins = Pins::default();
@@ -414,6 +416,7 @@ impl State {
                 None
             }
             Action::Watched(Watch::Lost(error)) => {
+                self.removal.retire_waiting_inspection();
                 self.pins = Pins::default();
                 self.lost = Some(error);
                 None
@@ -3387,6 +3390,125 @@ mod tests {
             }.into()),
             Some(Effect::Removal(RemovalEffect::Remove { subject: removed, .. })) if removed == subject
         ));
+    }
+
+    #[test]
+    fn deferred_inspection_requires_the_current_pane_watch_and_exact_subject() {
+        for transition in ["refresh", "reset", "lost", "reconnect", "replaced", "error"] {
+            let mut state = State::default();
+            let first = removable("/work/a");
+            let mut latest = removable("/work/b");
+            latest.key = ItemKey::Worktree("/work/b".into());
+            connected(&mut state, 1, board(vec![first.clone(), latest.clone()]));
+            let first_subject = RemovalSubject::of(&first).unwrap();
+            let desired = RemovalSubject::of(&latest).unwrap();
+            let Some(Effect::Removal(RemovalEffect::Plan {
+                generation: physical,
+                ..
+            })) = state.update(
+                RemovalAction::Open {
+                    generation: state.removal.generation(),
+                    subject: first_subject.clone(),
+                }
+                .into(),
+            )
+            else {
+                panic!("one actual first inspection")
+            };
+            assert!(
+                state
+                    .update(
+                        RemovalAction::Open {
+                            generation: state.removal.generation(),
+                            subject: desired.clone(),
+                        }
+                        .into()
+                    )
+                    .is_none()
+            );
+            let waiting = state.removal.generation();
+            match transition {
+                "refresh" | "error" => watched(&mut state, 2, board(vec![first, latest.clone()])),
+                "reset" => {
+                    state.reset();
+                    connected(&mut state, 1, board(vec![latest.clone()]));
+                }
+                "lost" => {
+                    state.update(Action::Watched(Watch::Lost("disconnected".into())));
+                }
+                "reconnect" => connected(&mut state, 1, board(vec![latest.clone()])),
+                "replaced" => {
+                    let mut replacement = latest.clone();
+                    replacement.worktree.as_mut().unwrap().path = "/work/recreated".into();
+                    watched(&mut state, 2, board(vec![replacement]));
+                }
+                _ => unreachable!(),
+            }
+            let completion: Action = RemovalAction::Planned {
+                generation: physical,
+                result: if transition == "error" {
+                    Err("client inspection deadline expired".into())
+                } else {
+                    Ok(prepared_removal(&first_subject))
+                },
+            }
+            .into();
+            assert!(completion.background());
+            let effect = state.update(completion);
+            if transition == "refresh" {
+                assert!(matches!(effect, Some(Effect::Removal(RemovalEffect::Plan {
+                    generation, subject, backend: None,
+                })) if generation == waiting && subject == desired));
+                assert!(
+                    state
+                        .update(
+                            RemovalAction::Planned {
+                                generation: physical,
+                                result: Err("duplicate".into()),
+                            }
+                            .into()
+                        )
+                        .is_none(),
+                    "a stale completion cannot release the new physical read"
+                );
+                assert!(
+                    state
+                        .update(
+                            RemovalAction::Planned {
+                                generation: waiting,
+                                result: Ok(prepared_removal(&desired)),
+                            }
+                            .into()
+                        )
+                        .is_none()
+                );
+                assert!(matches!(state.update(RemovalAction::Confirm {
+                    generation: state.removal.generation(),
+                }.into()), Some(Effect::Removal(RemovalEffect::Remove { subject, .. })) if subject == desired));
+            } else {
+                assert!(effect.is_none(), "no hidden inspection after {transition}");
+                assert!(
+                    state
+                        .update(
+                            RemovalAction::Confirm {
+                                generation: state.removal.generation(),
+                            }
+                            .into()
+                        )
+                        .is_none()
+                );
+                assert_eq!(state.removal.subject(), Some(&desired));
+                connected(&mut state, 3, board(vec![latest]));
+                assert!(
+                    matches!(state.update(RemovalAction::Reinspect {
+                    generation: state.removal.generation(),
+                }.into()), Some(Effect::Removal(RemovalEffect::Plan {
+                    subject, backend: None, ..
+                })) if subject == desired),
+                    "a fresh explicit read remains available"
+                );
+            }
+        }
     }
 
     #[test]
