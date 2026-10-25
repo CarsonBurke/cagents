@@ -185,7 +185,9 @@ use crate::{
 /// with an explicit durable placement_epoch. Matched executables are required;
 /// old saved actor requests are refused without rebasing their captured intent.
 /// Known private account experiments use 117 and 118 and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 119;
+/// Version 121 adds exact actor-ordered account handoff admission and typed
+/// pre-effect refusal. All three executables must match.
+pub const PROTOCOL_VERSION: u16 = 121;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -334,6 +336,9 @@ pub enum ClientRequest {
         #[serde(default)]
         idle_generation: Option<u64>,
         execution_environment: ChatExecutionEnvironment,
+        /// User-selected handoff, including explicitly pinned source accounts.
+        #[serde(default)]
+        explicit: bool,
     },
     ChatAttach {
         session: crate::chat::Session,
@@ -538,6 +543,10 @@ pub enum ClientRequest {
     ChannelWork {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
+    },
+    /// Read-only actor barrier. The generation is a fence, never authority.
+    ChatAccountSwitchGeneration {
+        source: crate::chat::Session,
     },
 }
 
@@ -871,6 +880,9 @@ pub enum ServerResponse {
     },
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
+    ChatAccountSwitchGeneration {
+        generation: Option<u64>,
+    },
 }
 
 /// Maximum compact inventory rows in one capacity response.
@@ -1010,6 +1022,8 @@ pub enum ProtocolErrorCode {
     Internal,
     ViewConflict,
     ChatCapacity,
+    AccountSwitchBusy,
+    AccountSwitchUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

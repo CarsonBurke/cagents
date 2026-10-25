@@ -1846,6 +1846,9 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn account_switch_ready(&self) -> bool {
+        self.controls.is_empty()
+    }
     fn prepared_launch_identity(&self) -> Option<PreparedIdentity> {
         self.prepared_identity.clone()
     }

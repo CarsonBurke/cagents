@@ -941,6 +941,18 @@ impl ControlClient {
         }
     }
 
+    /// Read-only actor-ordered readiness. This never closes an actor or
+    /// authorizes mutation; the subsequent handoff revalidates exact ownership.
+    pub(crate) fn account_switch_generation(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<Option<u64>, ControlError> {
+        match self.request_strict(ClientRequest::ChatAccountSwitchGeneration { source })? {
+            ServerResponse::ChatAccountSwitchGeneration { generation } => Ok(generation),
+            response => Err(unexpected_response("account-switch readiness", &response)),
+        }
+    }
+
     pub fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, ControlError> {
         match self.request_strict(ClientRequest::ChatList)? {
             ServerResponse::ChatListed { sessions } => Ok(sessions),
@@ -1977,6 +1989,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatCapacity { .. } => "chat_capacity",
+        ServerResponse::ChatAccountSwitchGeneration { .. } => "chat_account_switch_generation",
         ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
         ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
@@ -5291,6 +5304,76 @@ mod tests {
             vec![newer.to_string(), older.to_string()],
             "and names them under the field name `channel list` uses"
         );
+    }
+
+    #[test]
+    fn account_readiness_query_is_read_only_exact_and_correlated() {
+        let pinned = proof("session", "boot", "account-query");
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: Some(pinned.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+                recipe: LaunchRecipe {
+                    program: "fixture-not-executed".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let expected = source.clone();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(hello.request_id, 1);
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            write_frame(
+                &mut peer,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            for generation in [None, Some(57)] {
+                let asked: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(asked.proof, Some(pinned.clone()));
+                assert_eq!(
+                    asked.request,
+                    ClientRequest::ChatAccountSwitchGeneration {
+                        source: expected.clone()
+                    }
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(asked.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatAccountSwitchGeneration { generation },
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "query never sends close, copy, or a provider command"
+            );
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        assert_eq!(
+            client.account_switch_generation(source.clone()).unwrap(),
+            None
+        );
+        assert_eq!(client.account_switch_generation(source).unwrap(), Some(57));
+        drop(client);
+        server.join().unwrap();
     }
 
     /// A registry holding one project and the channels named in it.

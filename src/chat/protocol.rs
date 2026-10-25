@@ -332,6 +332,11 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// All previously admitted model/permission controls have settled. Unknown
+    /// adapter contracts cannot authorize a seamless account handoff.
+    fn account_switch_ready(&self) -> bool {
+        false
+    }
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {

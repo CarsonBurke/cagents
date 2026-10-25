@@ -584,10 +584,7 @@ pub(super) fn process_request(
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
             | ClientRequest::ChatRelease { dry_run: false, .. }
-            | ClientRequest::ChatRecoverAccount {
-                idle_generation: Some(_),
-                ..
-            }
+            | ClientRequest::ChatRecoverAccount { .. }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
@@ -951,6 +948,7 @@ pub(super) fn process_request(
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }
         | ClientRequest::ChatRecoverAccount { .. }
+        | ClientRequest::ChatAccountSwitchGeneration { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }
         | ClientRequest::ChatStartSelected { .. }
