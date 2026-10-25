@@ -1,6 +1,6 @@
 //! Explicit verification of one import-owned pending home. This never requests
 //! a thread, turn, model, quota, execution policy, or command execution.
-use super::{Cache, Session, SpawnOwner, TIMEOUT, command, current_search_path, find_executable};
+use super::{Cache, Session, SpawnOwner, TIMEOUT, command_with_path, current_search_path, find_executable};
 use crate::{
     account::{Account, AccountHome, Identity, import::PhysicalIdentity},
     agent::Provider,
@@ -97,7 +97,7 @@ pub(crate) async fn verify(
     let program = find_executable(Provider::Codex.executable(), search.as_deref())
         .ok_or(Error::ProviderMissing)?;
     let executable = executable_stamp(&program).ok_or(Error::ProviderMissing)?;
-    let mut process = command(&account, &program);
+    let mut process = command_with_path(&account, &program, search.as_deref());
     process.arg("app-server").current_dir(&home);
     let mut session = tokio::time::timeout(TIMEOUT, Session::spawn_owned(process, owner))
         .await

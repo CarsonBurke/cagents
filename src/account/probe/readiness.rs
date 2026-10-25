@@ -1,6 +1,6 @@
 //! Model-free measurements through the official Codex app server. No command
 //! in this module requests a policy override, thread, turn, or unsandboxed API.
-use super::{Cache, Session, TIMEOUT, command, current_search_path, find_executable, now_ms};
+use super::{Cache, Session, TIMEOUT, command_with_path, current_search_path, find_executable, now_ms};
 use crate::{
     account::{Account, Identity, UsageStatus, readiness::*},
     agent::Provider,
@@ -149,7 +149,7 @@ pub(crate) async fn run(
         }
     };
     report.provider_executable = Some(executable.clone());
-    let mut process = command(&account, &program);
+    let mut process = command_with_path(&account, &program, path.as_deref());
     process
         .arg("app-server")
         .current_dir(&workspace)
