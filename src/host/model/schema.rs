@@ -225,12 +225,16 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static FOURTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static FIFTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static SIXTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static SEVENTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static EIGHTEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
         14 => &FOURTEEN,
         15 => &FIFTEEN,
         16 => &SIXTEEN,
+        17 => &SEVENTEEN,
+        18 => &EIGHTEEN,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -446,6 +450,9 @@ mod tests {
             tx.execute("INSERT INTO channels(id,repository,title,ordinal,title_source) VALUES(?1,'/kept','My channel',5,1)", [channel.to_string()]).unwrap();
         } else {
             tx.execute("INSERT INTO channels(id,repository,title,ordinal) VALUES(?1,'/kept','My channel',5)", [channel.to_string()]).unwrap();
+        }
+        if version >= 17 {
+            super::super::channel_work::created_in(&tx, channel).unwrap();
         }
         tx.pragma_update(None, "user_version", version).unwrap();
         tx.commit().unwrap();
@@ -709,6 +716,24 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (17, "DROP TABLE channel_work_operations;"),
+            (17, "DROP TABLE channel_work_entries;"),
+            (17, "DROP TABLE channel_work_homes;"),
+            (18, "DROP TABLE channel_work_placement_epochs;"),
+            (18, "DROP TABLE channel_work_placement_clock;"),
+            (
+                18,
+                "ALTER TABLE channel_work_placement_clock RENAME COLUMN last_epoch TO changed_epoch;",
+            ),
+            (
+                18,
+                "ALTER TABLE channel_work_placement_epochs RENAME COLUMN epoch TO changed_epoch;",
+            ),
+            (17, "DROP INDEX channel_work_entries_order;"),
+            (
+                17,
+                "ALTER TABLE channel_work_entries RENAME COLUMN bucket TO wrong_bucket;",
+            ),
             (
                 15,
                 "ALTER TABLE native_actor_ownerships ADD COLUMN foreign_payload TEXT;",
@@ -749,7 +774,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16] {
+        for version in [13, 14, 15, 16, 17] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -843,6 +868,91 @@ mod tests {
     }
 
     #[test]
+    fn published_sixteen_channel_work_upgrade_preserves_home_without_inferring_prs() {
+        use super::super::channel_work::TrustedResolvedOrigin;
+        use crate::channel_work::{Change, Home, Mutation, Origin, Page, Role, Target};
+        use crate::github_identity::{GitHubRepoKey, PullRequestKey};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("channel-work16.sqlite3");
+        let (identity, channel) = legacy(&path, 16);
+        // A historical title mentioning a PR is metadata, never work intent.
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE channels SET title='Review github.com/owner/repo/pull/7' WHERE id=?1",
+            [channel.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let mut registry = Registry::at(&path).unwrap();
+        let before = registry.model().unwrap();
+        assert_eq!(before.identity.to_string(), identity);
+        assert_eq!(before.sequence, 7);
+        assert_eq!(before.channel(channel).unwrap().ordinal, 5);
+        assert_eq!(
+            before.channel(channel).unwrap().title,
+            "Review github.com/owner/repo/pull/7"
+        );
+        let home = Home {
+            registry: before.identity,
+            channel,
+            creation_ordinal: 5,
+        };
+        let empty = registry.read_channel_work(&home, Page::default()).unwrap();
+        assert_eq!(empty.revision, 0);
+        assert!(empty.entries.is_empty() && empty.history.is_empty());
+        let operations: u64 = registry
+            .db
+            .query_row("SELECT count(*) FROM channel_work_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            operations, 0,
+            "migration does not invent an attribution receipt"
+        );
+        let request = Mutation {
+            home,
+            expected_revision: 0,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Claim {
+                target: Target::PullRequest(
+                    PullRequestKey::new(
+                        GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+                        7,
+                    )
+                    .unwrap(),
+                ),
+                role: Role::Steward,
+            },
+        };
+        let reply = registry
+            .apply_channel_work(
+                &TrustedResolvedOrigin {
+                    origin: Origin::User,
+                    proof: None,
+                },
+                &request,
+            )
+            .unwrap();
+        assert!(reply.receipt.changed);
+        assert_eq!(reply.snapshot.entries.len(), 1);
+        assert_eq!(registry.model().unwrap().sequence, 8);
+        let after = registry.model().unwrap();
+        assert_eq!(after.channels, before.channels);
+        assert_eq!(after.projects, before.projects);
+        assert_eq!(after.views, before.views);
+        assert_eq!(after.agents, before.agents);
+        drop(registry);
+        let reopened = Registry::at(&path).unwrap();
+        assert_eq!(reopened.model().unwrap(), after);
+        assert_eq!(
+            reopened.read_channel_work(&home, Page::default()).unwrap(),
+            reply.snapshot
+        );
+    }
+
+    #[test]
     fn legacy_view_conversion_preserves_consumed_rows_and_rejects_unknown_shapes() {
         let _clear = Clear;
         // Synthesized compatibility fixture for the actual version-eight
@@ -856,7 +966,7 @@ mod tests {
             CREATE TABLE workspace_view_edits(operation TEXT PRIMARY KEY,channel TEXT NOT NULL REFERENCES workspace_views(channel)) STRICT;
             PRAGMA user_version=7;").unwrap();
         db.execute(
-            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"kept\"]')",
+            "INSERT INTO workspace_views VALUES(?1,9,'[]','[\"00000000-0000-4000-8000-000000000071\"]')",
             [channel.to_string()],
         )
         .unwrap();
@@ -890,7 +1000,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(view, (9, "[]".into(), "[\"kept\"]".into()));
+        assert_eq!(
+            view,
+            (
+                9,
+                "[]".into(),
+                "[\"00000000-0000-4000-8000-000000000071\"]".into()
+            )
+        );
         for (table, column, value) in [
             ("shared_view_panes", "id", "pane"),
             ("shared_view_edits", "operation", "edit"),
@@ -962,7 +1079,7 @@ mod tests {
     #[test]
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
-        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+        for step in [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
