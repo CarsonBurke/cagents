@@ -1131,7 +1131,18 @@ mod tests {
     #[test]
     fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
         for manual in [false, true] {
-            let (mut registry, _directory, channel, _) = setup();
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            // Default titles are manual/legacy names. This case must own a
+            // genuinely inferred channel before testing automatic clearing.
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Initial inferred title".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                })
+                .unwrap();
             let mut original = live_source_pane();
             let CardKind::Terminal(terminal) = original.kind else {
                 unreachable!()
@@ -1163,6 +1174,15 @@ mod tests {
                     }
                 })
                 .unwrap();
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                if manual {
+                    "User chosen"
+                } else {
+                    "Provider chosen"
+                },
+                "establish the naming source before replacing the primary thread"
+            );
             let mut successor = original.clone();
             let CardKind::Chat(chat) = &mut successor.kind else {
                 unreachable!()
