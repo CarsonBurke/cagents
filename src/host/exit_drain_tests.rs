@@ -485,6 +485,7 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     let lease = HostLease::acquire(&paths, &proof).unwrap();
     let mut state = HostState::new(proof);
     state.enable_holder_recovery();
+    state.install_model(model::Registry::open().unwrap());
     let host = Arc::new(state::HostLock::new(state));
     let (peer, server) = UnixStream::pair().unwrap();
     let serve_host = host.clone();
@@ -553,4 +554,5 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     drop(lease);
 }
 
+pub(super) mod lifecycle_retention_tests;
 mod startup_recovery_tests;

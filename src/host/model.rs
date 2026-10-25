@@ -42,9 +42,10 @@ pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetire
 mod navigation;
 mod schema;
 mod terminal_owners;
+mod terminal_retention;
 mod views;
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -630,6 +631,10 @@ fn migrate_through(
     if version < 18 && target >= 18 {
         channel_work::placement::migrate(tx)?;
         schema::migration_checkpoint(18)?;
+    }
+    if version < 19 && target >= 19 {
+        terminal_retention::migrate(tx)?;
+        schema::migration_checkpoint(19)?;
     }
     Ok(())
 }

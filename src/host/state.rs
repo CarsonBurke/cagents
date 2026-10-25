@@ -1,6 +1,8 @@
 #[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 mod presentation;
+mod retention;
+pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
@@ -74,6 +76,7 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
+    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -253,6 +256,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
@@ -416,6 +420,7 @@ impl HostState {
             worktree_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
             startup_recovery: None,
@@ -707,6 +712,7 @@ impl HostState {
         origin: ClientId,
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ProtocolError> {
+        self.ensure_view_retention_available(&edit)?;
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
@@ -938,6 +944,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.ensure_retention_available(&[terminal_id])?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -1432,6 +1439,7 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
+                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -1817,6 +1825,9 @@ impl HostState {
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
+        if !self.terminal_retirements.is_empty() {
+            return Err("Terminal retirement is not confirmed; retry after cleanup settles or explicitly close the retained result".into());
+        }
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1947,6 +1958,11 @@ impl HostState {
         self.ordinary_exit_cleanup_pending
     }
 
+    pub(super) fn terminal_close_admission_open(&self) -> bool {
+        !self.ordinary_exit_registration_closed
+            && (!self.shutting_down || self.ordinary_exit_cleanup_pending)
+    }
+
     /// Called only after the exit caller holds the core's sealed absence
     /// proof. Includes clients registered during the pending cleanup interval.
     pub(super) fn close_ordinary_exit_registration(&mut self) -> Vec<Arc<DeliveryQueue>> {
@@ -1982,7 +1998,9 @@ impl HostState {
     }
 
     pub(super) fn ordinary_exit_cleanup_blocked(&self) -> bool {
-        self.startup_blocks_shutdown() || !self.checked_close_replies.is_empty()
+        self.startup_blocks_shutdown()
+            || !self.checked_close_replies.is_empty()
+            || !self.terminal_retirements.is_empty()
     }
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {

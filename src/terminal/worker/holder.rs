@@ -707,6 +707,11 @@ pub(super) struct Holder {
 }
 
 impl Holder {
+    /// The already-authenticated original holder, never a new PID lookup.
+    pub(super) fn original_process_descriptor(&self) -> io::Result<Option<File>> {
+        self.pidfd.as_ref().map(File::try_clone).transpose()
+    }
+
     pub(super) fn original_role(&self) -> Option<&crate::daemon::holder_registry::OriginalRole> {
         self.original_role.as_ref()
     }

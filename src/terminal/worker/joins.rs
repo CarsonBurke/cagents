@@ -59,6 +59,18 @@ pub(super) struct JoinOwner {
     changed: Condvar,
 }
 impl JoinOwner {
+    pub(super) fn retirement_ready(&self) -> Result<bool, &'static str> {
+        let p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        if p.panicked {
+            return Err("The original terminal worker or holder release panicked");
+        }
+        Ok(p.release_required
+            && p.joined
+            && p.released
+            && p.native_settled
+            && p.reservation.is_none())
+    }
+
     pub(super) fn new(published: Arc<PublishedState>, reservation: Reservation) -> Arc<Self> {
         Self::make(published, Some(reservation))
     }
@@ -276,6 +288,9 @@ fn finish(owner: &Arc<JoinOwner>) {
     // Stop can arrive after the join's first release decision. Both transitions
     // serialize under progress; either this dispatch or Stop's dispatch sees it.
     dispatch(owner);
+    // Lifecycle observes the same original join result without polling. Never
+    // call into the host while a progress or worker mutex is held.
+    crate::daemon::wake();
 }
 
 /// Only actual join and a settled native obligation release admission. Pure
@@ -307,6 +322,8 @@ pub(super) fn settled(owner: &JoinOwner) {
     let mut p = owner.progress.lock().unwrap_or_else(|p| p.into_inner());
     settle(owner, &mut p);
     owner.changed.notify_all();
+    drop(p);
+    crate::daemon::wake();
 }
 
 /// Handoffs retain their existing wait-for-actual-join policy; ordinary Stop

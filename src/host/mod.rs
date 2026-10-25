@@ -10,6 +10,7 @@ mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
+mod lifecycle;
 mod lock;
 mod model;
 mod notifications;
@@ -403,6 +404,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
     let mut ordinary_cleanup_started = false;
     let mut sealed_deliveries = None;
+    let mut lifecycle = lifecycle::Lifecycle::new();
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
@@ -464,6 +466,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             continue;
         }
 
+        let deadline =
+            lifecycle.maintain(&host, client_capacity.active.load(Ordering::Acquire) != 0);
+        if ordinary_exit_drain.is_none()
+            && host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_shutting_down()
+        {
+            #[cfg(all(test, target_os = "linux"))]
+            exit_drain_tests::lifecycle_retention_tests::observe_lifecycle_idle_shutdown();
+            // Lifecycle idle uses the same begin/seal path as requested exit.
+            // A pending drain must keep accepting inspection and checked Close.
+            continue;
+        }
         let fatal = match listener.accept() {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
@@ -501,10 +517,11 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 None
             }
             // Nothing is pending. Park until a peer connects, a client thread
-            // exits, or a signal arrives; an idle daemon blocks here indefinitely
-            // instead of waking on a timer.
+            // exits, a holder exits, a signal arrives, or a real retention/development
+            // idle deadline expires. There is no periodic polling timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                daemon::wait_for_activity(&listener).err()
+                daemon::wait_for_activity_until(&listener, deadline, lifecycle.waiting_holders())
+                    .err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,
             Err(error) => Some(error),
