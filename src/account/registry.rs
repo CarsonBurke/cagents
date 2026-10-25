@@ -2134,6 +2134,42 @@ mod cache_import {
         Ok(())
     }
 
+    fn require_verifiable(
+        registry: &Registry,
+        operation: Uuid,
+        expected_email: &str,
+    ) -> io::Result<()> {
+        if registry.is_newer()
+            || operation.is_nil()
+            || !super::super::import::expected_email_is_valid(expected_email)
+        {
+            return Err(refuse(
+                "The original import verification identity is invalid",
+            ));
+        }
+        if registry.accounts.iter().any(|row| row.key == operation) {
+            let matches: Vec<_> = registry
+                .accounts
+                .iter()
+                .filter(|row| row.key == operation)
+                .collect();
+            if matches.len() != 1
+                || registry.pending.iter().any(|row| row.key == operation)
+                || registry.is_archived(operation)
+                || matches[0].provider != Provider::Codex
+                || matches[0].linked_home.is_some()
+                || !matches[0]
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+            {
+                return Err(refuse("The original imported registration changed"));
+            }
+            return Ok(());
+        }
+        require_pending(registry, operation)
+    }
+
     fn registry_directory(store: &Store) -> io::Result<Root> {
         let root = Root::open(&store.directory)
             .map_err(|_| refuse("The import registry directory is unavailable"))?;
@@ -2330,14 +2366,22 @@ mod cache_import {
             homes: &Homes,
             operation: Uuid,
             expected_home: PhysicalIdentity,
+            expected_email: &str,
             command: &std::process::Command,
         ) -> io::Result<ImportLaunchLease> {
-            self.import_launch(homes, operation, expected_home, command, |registry| {
-                reservation
-                    .verify_import_home(operation, expected_home)
-                    .map_err(io::Error::other)?;
-                require_pending(registry, operation)
-            })
+            self.import_launch(
+                homes,
+                operation,
+                expected_home,
+                expected_email,
+                command,
+                |_registry| {
+                    reservation
+                        .verify_import_home(operation, expected_home)
+                        .map_err(io::Error::other)?;
+                    Ok(())
+                },
+            )
         }
 
         fn import_launch(
@@ -2345,6 +2389,7 @@ mod cache_import {
             homes: &Homes,
             operation: Uuid,
             expected_home: PhysicalIdentity,
+            expected_email: &str,
             command: &std::process::Command,
             validate: impl FnOnce(&Registry) -> io::Result<()>,
         ) -> io::Result<ImportLaunchLease> {
@@ -2352,7 +2397,7 @@ mod cache_import {
             let lock = self.try_lock()?;
             let registry = read(&self.path())?;
             validate(&registry)?;
-            require_pending(&registry, operation)?;
+            require_verifiable(&registry, operation, expected_email)?;
             independent_home(&registry, homes, operation)?;
             let _home = current_home(homes, operation, expected_home)?;
             check_command(command, homes, operation)?;
@@ -2629,19 +2674,40 @@ mod cache_import {
             probe.env("OPENAI_API_KEY", "synthetic-not-a-credential");
             assert!(
                 store
-                    .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                    .import_launch(
+                        &homes,
+                        key,
+                        stamp(&home),
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
                     .is_err()
             );
             probe.env_remove("OPENAI_API_KEY");
             probe.env("CODEX_HOME", home.parent().unwrap());
             assert!(
                 store
-                    .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                    .import_launch(
+                        &homes,
+                        key,
+                        stamp(&home),
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
                     .is_err()
             );
             probe.env("CODEX_HOME", &home);
             let lease = store
-                .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                .import_launch(
+                    &homes,
+                    key,
+                    stamp(&home),
+                    "fixture@example.test",
+                    &probe,
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert!(
                 store.try_lock().is_err(),
@@ -2729,6 +2795,114 @@ mod cache_import {
             assert!(result.is_err());
             assert!(store.load().unwrap().is_import_pending(other));
             assert_eq!(fs::read(store.path()).unwrap(), before_duplicate);
+        }
+
+        #[test]
+        fn explicit_verification_can_reconcile_registered_store_with_a_lost_journal_ack() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(31);
+            let home = prepare(&store, &homes, key);
+            let physical = stamp(&home);
+            let probe = command(&home);
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            // Simulate only the Store side of an acknowledged registration. The
+            // host must still hold the original Published journal record and run
+            // a fresh identity probe before marking that journal Registered.
+            let registered = store.load().unwrap();
+            let bytes = fs::read(store.path()).unwrap();
+            let lease = store
+                .import_launch(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    &probe,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(store.try_lock().is_err());
+            drop(lease);
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
+            let mut wrong_email = registered.clone();
+            wrong_email.accounts[0].email = Some("other@example.test".into());
+            let mut linked = registered.clone();
+            linked.accounts[0].linked_home = Some(home.clone());
+            let mut archived = registered.clone();
+            archived.archived.push(key);
+            let mut pending = registered.clone();
+            pending.pending.push(Pending {
+                key,
+                provider: Provider::Codex,
+                started_at: 1,
+                origin: PendingOrigin::CacheImport { operation: key },
+            });
+            let mut wrong_key = registered.clone();
+            wrong_key.accounts[0].key = Uuid::from_u128(32);
+            let mut ambiguous = registered.clone();
+            ambiguous.accounts.push(ambiguous.accounts[0].clone());
+            for invalid in [wrong_email, linked, archived, pending, wrong_key, ambiguous] {
+                write(&store.directory, &store.path(), &invalid).unwrap();
+                let before = fs::read(store.path()).unwrap();
+                assert!(
+                    store
+                        .import_launch(
+                            &homes,
+                            key,
+                            physical,
+                            "fixture@example.test",
+                            &probe,
+                            |_| Ok(())
+                        )
+                        .is_err()
+                );
+                assert_eq!(fs::read(store.path()).unwrap(), before);
+            }
+            write(&store.directory, &store.path(), &registered).unwrap();
+            assert!(
+                store
+                    .import_launch(&homes, key, physical, "wrong@example.test", &probe, |_| Ok(
+                        ()
+                    ))
+                    .is_err()
+            );
+            let mut wrong_home = physical;
+            wrong_home.inode += 1;
+            assert!(
+                store
+                    .import_launch(
+                        &homes,
+                        key,
+                        wrong_home,
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
         }
 
         #[test]
