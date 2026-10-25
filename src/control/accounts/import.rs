@@ -10,10 +10,12 @@ use crate::{
     device_service::{Operation, Reply},
     model::HostSessionProof,
 };
-use std::{fs::Metadata, os::unix::fs::MetadataExt, path::Component};
+use std::{collections::HashSet, fs::Metadata, os::unix::fs::MetadataExt, path::Component};
 use uuid::Uuid;
 
 const REQUEST_BYTES: u64 = 64 * 1024;
+// The bounded retained-operation metadata contract, including registered rows.
+const MAX_LIST_RECORDS: usize = 16;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -23,6 +25,8 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ImportCommand {
+    /// List retained import metadata without checking, retrying or advancing any stage.
+    List,
     /// Inspect one explicitly staged auth.json on the selected device; no import is prepared.
     Inspect {
         /// Absolute staged-file path on that device, or quoted '~/path'.
@@ -94,6 +98,7 @@ fn parse_path(value: &str) -> Result<PathBuf, String> {
 }
 
 enum Prepared {
+    List,
     Inspect(PathBuf),
     Prepare(ImportPlan),
     Status(Uuid),
@@ -103,6 +108,7 @@ enum Prepared {
 impl Prepared {
     fn new(args: Args) -> Result<Self, AppError> {
         Ok(match args.command {
+            ImportCommand::List => Self::List,
             ImportCommand::Inspect { path } => Self::Inspect(
                 parse_path(
                     path.to_str()
@@ -148,6 +154,7 @@ fn execute_with(
         ));
     }
     let (command, operation, request) = match &prepared {
+        Prepared::List => ("account.import.list", None, ImportOperation::List),
         Prepared::Inspect(path) => (
             "account.import.inspect",
             None,
@@ -195,6 +202,20 @@ fn execute_with(
         };
     };
     match (prepared, *reply) {
+        (Prepared::List, ImportReply::Listed(statuses)) => {
+            let mut seen = HashSet::with_capacity(statuses.len().min(MAX_LIST_RECORDS));
+            if statuses.len() > MAX_LIST_RECORDS
+                || statuses.iter().any(|status| {
+                    !valid_status(status, &proof, status.plan.operation)
+                        || !seen.insert(status.plan.operation)
+                })
+            {
+                return Err(invalid(
+                    "The retained import list is inconsistent or exceeds its bound; no stage was advanced",
+                ));
+            }
+            list_output(statuses)
+        }
         (Prepared::Inspect(path), ImportReply::Inspected(inspection)) => {
             if inspection.destination != proof
                 || inspection.observation.validate().is_err()
@@ -265,6 +286,37 @@ fn valid_status(status: &ImportStatus, proof: &HostSessionProof, operation: Uuid
         }
 }
 
+fn stage_label(stage: ImportStage) -> &'static str {
+    match stage {
+        ImportStage::Reserved => "reserved",
+        ImportStage::Prepared => "prepared",
+        ImportStage::Published => "published",
+        ImportStage::Registered => "registered",
+    }
+}
+
+fn list_output(statuses: Vec<ImportStatus>) -> Result<CommandOutput, AppError> {
+    let mut lines = vec!["Import\tStage\tExpected identity\tUncertain".to_owned()];
+    for status in &statuses {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}",
+            status.plan.operation,
+            stage_label(status.stage),
+            status.plan.expected_email,
+            status.uncertain
+        ));
+    }
+    if statuses.is_empty() {
+        lines.push("No retained import records were reported".into());
+    }
+    lines.push("Metadata only; authentication and task readiness are not measured. Use the original UUID for explicit Status or Verify; no stage was advanced or retried.".into());
+    Ok(CommandOutput {
+        command: "account.import.list",
+        human: lines.join("\n"),
+        data: json!({"imports":statuses,"authentication":"not_checked_by_list","execution_readiness":"not_measured"}),
+    })
+}
+
 fn inspection_output(inspection: ImportInspection) -> Result<CommandOutput, AppError> {
     // Deliberately incomplete. The user supplies a durable UUID, expected email
     // and both acknowledgements; preview never generates intent or consent.
@@ -290,12 +342,7 @@ fn inspection_output(inspection: ImportInspection) -> Result<CommandOutput, AppE
 
 fn status_output(command: &'static str, status: ImportStatus) -> Result<CommandOutput, AppError> {
     let registered = status.registered.is_some() && status.stage == ImportStage::Registered;
-    let stage = match status.stage {
-        ImportStage::Reserved => "reserved",
-        ImportStage::Prepared => "prepared",
-        ImportStage::Published => "published",
-        ImportStage::Registered => "registered",
-    };
+    let stage = stage_label(status.stage);
     let publication = match status.publication {
         ImportPublication::Missing => "missing",
         ImportPublication::Present => "present",
@@ -354,6 +401,10 @@ fn safe_plan_file(metadata: &Metadata) -> bool {
 }
 
 fn load_plan(path: &Path) -> Result<ImportPlan, AppError> {
+    load_plan_with(path, || {})
+}
+
+fn load_plan_with(path: &Path, after_open: impl FnOnce()) -> Result<ImportPlan, AppError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -369,6 +420,23 @@ fn load_plan(path: &Path) -> Result<ImportPlan, AppError> {
     let (parent, name) = crate::fs_safety::open_parent_beneath(&root, relative).map_err(|_| {
         invalid("The metadata request path must not contain symbolic links or parent traversal")
     })?;
+    let parent_identity = parent
+        .metadata()
+        .map_err(|_| invalid("The metadata request parent could not be inspected"))?;
+    let current_parent = || {
+        let (current, current_name) = crate::fs_safety::open_parent_beneath(&root, relative)
+            .map_err(|_| invalid("The metadata request parent changed"))?;
+        let actual = current
+            .metadata()
+            .map_err(|_| invalid("The metadata request parent could not be inspected"))?;
+        if current_name != name
+            || (actual.dev(), actual.ino()) != (parent_identity.dev(), parent_identity.ino())
+        {
+            return Err(invalid("The metadata request parent changed"));
+        }
+        Ok(current)
+    };
+    current_parent()?;
     let mut file = crate::fs_safety::open_beneath(&parent, Path::new(&name))
         .map_err(|_| invalid("The metadata request could not be opened"))?;
     let before = file
@@ -379,12 +447,15 @@ fn load_plan(path: &Path) -> Result<ImportPlan, AppError> {
             "Use an owned private singly linked regular metadata request of at most 64 KiB",
         ));
     }
+    after_open();
     let bytes = crate::fs_safety::read_bounded(&mut file, REQUEST_BYTES)
         .map_err(|_| invalid("The metadata request could not be read"))?;
     let after = file
         .metadata()
         .map_err(|_| invalid("The metadata request could not be inspected"))?;
-    let named = crate::fs_safety::metadata_beneath(&parent, Path::new(&name))
+    // A retained old parent cannot authenticate the current selected path.
+    let named_parent = current_parent()?;
+    let named = crate::fs_safety::metadata_beneath(&named_parent, Path::new(&name))
         .map_err(|_| invalid("The metadata request changed"))?;
     let stamp = |m: &Metadata| {
         (
@@ -514,6 +585,8 @@ mod tests {
 
     #[test]
     fn staged_import_grammar_exposes_only_explicit_metadata_stages_and_keeps_device_paths() {
+        assert!(Cli::try_parse_from(["cagents", "account", "import", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["cagents", "account", "import", "list", "extra"]).is_err());
         let cli = Cli::try_parse_from([
             "cagents",
             "--device",
@@ -652,6 +725,35 @@ mod tests {
         assert!(load_plan(&path).is_err());
         assert_eq!(fs::metadata(&path).unwrap().len(), REQUEST_BYTES + 1);
         assert!(load_plan(directory.path()).is_err());
+        for replace in [false, true] {
+            let selected_parent = directory.path().join(if replace {
+                "selected-replaced"
+            } else {
+                "selected-renamed"
+            });
+            fs::create_dir(&selected_parent).unwrap();
+            let selected = selected_parent.join("plan.json");
+            fs::write(&selected, &bytes).unwrap();
+            fs::set_permissions(&selected, fs::Permissions::from_mode(0o600)).unwrap();
+            let retained = selected_parent.with_extension("retained");
+            assert!(
+                load_plan_with(&selected, || {
+                    fs::rename(&selected_parent, &retained).unwrap();
+                    if replace {
+                        fs::create_dir(&selected_parent).unwrap();
+                        fs::write(&selected, &bytes).unwrap();
+                        fs::set_permissions(&selected, fs::Permissions::from_mode(0o600)).unwrap();
+                    }
+                })
+                .is_err(),
+                "an old retained parent must not authenticate the current path"
+            );
+            assert_eq!(fs::read(retained.join("plan.json")).unwrap(), bytes);
+            assert_eq!(load_plan(&retained.join("plan.json")).unwrap(), original);
+            if replace {
+                assert_eq!(fs::read(&selected).unwrap(), bytes);
+            }
+        }
         let fifo = directory.path().join("pipe");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
@@ -660,6 +762,12 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum Case {
+        List,
+        EmptyList,
+        DuplicateList,
+        OverfullList,
+        ForeignList,
+        InvalidList,
         Inspect,
         Prepare,
         Status,
@@ -713,7 +821,17 @@ mod tests {
                 | Case::UnexpectedProfile
                 | Case::WrongRegisteredStage
         );
+        let is_list = matches!(
+            case,
+            Case::List
+                | Case::EmptyList
+                | Case::DuplicateList
+                | Case::OverfullList
+                | Case::ForeignList
+                | Case::InvalidList
+        );
         let prepared = match case {
+            _ if is_list => Prepared::List,
             Case::Inspect => Prepared::Inspect(original.observation.path().into()),
             Case::Status | Case::StatusProfile => Prepared::Status(original.operation),
             _ if is_verify => Prepared::Verify(original.operation),
@@ -754,6 +872,7 @@ mod tests {
                         },
                     ) => {
                         match case {
+                            _ if is_list => assert_eq!(request, ImportOperation::List),
                             Case::Inspect => assert_eq!(
                                 request,
                                 ImportOperation::Inspect {
@@ -784,7 +903,34 @@ mod tests {
                             peer.shutdown(Shutdown::Write).unwrap();
                             break;
                         }
-                        let reply = if matches!(case, Case::Inspect) {
+                        let reply = if is_list {
+                            let mut second = original.clone();
+                            second.operation = Uuid::from_u128(2);
+                            second.destination.host_incarnation =
+                                HostIncarnation::new("recorded-old-daemon");
+                            let mut rows =
+                                vec![status(original.clone(), false), status(second, false)];
+                            match case {
+                                Case::EmptyList => rows.clear(),
+                                Case::DuplicateList => rows[1] = rows[0].clone(),
+                                Case::OverfullList => {
+                                    rows = (1..=MAX_LIST_RECORDS + 1)
+                                        .map(|id| {
+                                            let mut plan = original.clone();
+                                            plan.operation = Uuid::from_u128(id as u128);
+                                            status(plan, false)
+                                        })
+                                        .collect()
+                                }
+                                Case::ForeignList => {
+                                    rows[1].observed_destination.host_incarnation =
+                                        HostIncarnation::new("foreign-list-daemon")
+                                }
+                                Case::InvalidList => rows[1].plan.operation = Uuid::nil(),
+                                _ => {}
+                            }
+                            ImportReply::Listed(rows)
+                        } else if matches!(case, Case::Inspect) {
                             ImportReply::Inspected(ImportInspection {
                                 destination: host.clone(),
                                 observation: original.observation.clone(),
@@ -890,6 +1036,19 @@ mod tests {
     #[test]
     fn framed_import_routes_exact_original_intent_and_current_verify_proof_without_readiness_claims()
      {
+        let listed = exercise(Case::List).unwrap();
+        assert_eq!(listed.command, "account.import.list");
+        assert_eq!(listed.data["imports"].as_array().unwrap().len(), 2);
+        assert_eq!(listed.data["execution_readiness"], "not_measured");
+        assert!(listed.human.contains("Expected identity"));
+        assert!(listed.human.contains("fixture@example.test"));
+        assert!(listed.human.contains(&plan().operation.to_string()));
+        assert!(
+            exercise(Case::EmptyList).unwrap().data["imports"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let inspection = exercise(Case::Inspect).unwrap();
         assert_eq!(inspection.command, "account.import.inspect");
         assert_eq!(
@@ -971,7 +1130,14 @@ mod tests {
             assert!(!output.human.contains(SECRET));
             assert!(!output.data.to_string().contains(SECRET));
         }
-        for case in [Case::AuthRefused, Case::OldPlan] {
+        for case in [
+            Case::AuthRefused,
+            Case::OldPlan,
+            Case::DuplicateList,
+            Case::OverfullList,
+            Case::ForeignList,
+            Case::InvalidList,
+        ] {
             let error = exercise(case).err().unwrap();
             assert!(!error.message.contains(SECRET));
         }
