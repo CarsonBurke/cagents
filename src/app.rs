@@ -8392,6 +8392,7 @@ impl Cagents {
         if self
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
+            || self.pane_close_owned(card)
             || self.chat_start_pending(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
