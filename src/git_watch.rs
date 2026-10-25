@@ -164,6 +164,28 @@ impl Project {
         previous: Option<&Self>,
         changed: &BTreeSet<WorktreeId>,
     ) -> Result<Self, String> {
+        Self::read_changed_with_failed_status(
+            id,
+            common_dir,
+            records,
+            cancellation,
+            previous,
+            changed,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Preserve only known failed rows' last watcher census; their status
+    /// error remains authoritative. Healthy siblings still rebuild normally.
+    pub(crate) fn read_changed_with_failed_status(
+        id: ProjectId,
+        common_dir: PathBuf,
+        records: &[WorktreeRecord],
+        cancellation: &CancellationToken,
+        previous: Option<&Self>,
+        changed: &BTreeSet<WorktreeId>,
+        failed: &BTreeSet<WorktreeId>,
+    ) -> Result<Self, String> {
         let git = RepositoryService::system("git");
         let mut worktrees = Vec::new();
         let polling = network_filesystem(&common_dir)
@@ -171,6 +193,7 @@ impl Project {
             .then(|| "network or FUSE filesystem may omit native change events".to_owned());
         for record in records.iter().filter(|record| !record.bare) {
             if !changed.contains(&record.id)
+                && !failed.contains(&record.id)
                 && let Some(old) = previous.and_then(|previous| {
                     previous
                         .worktrees
@@ -193,6 +216,30 @@ impl Project {
             let git_dir = git
                 .git_dir(&record.path, cancellation)
                 .map_err(|error| error.to_string())?;
+            if failed.contains(&record.id) {
+                // Validate live metadata before retaining a previous census.
+                // A different row/root/repository must never inherit it.
+                let old = previous
+                    .filter(|old| old.id == id && old.common_dir == common_dir)
+                    .and_then(|old| {
+                        old.worktrees.iter().find(|old| {
+                            old.id == record.id && old.root == record.path && old.git_dir == git_dir
+                        })
+                    });
+                worktrees.push(match old {
+                    Some(old) => old.clone(),
+                    None => Worktree {
+                        id: record.id,
+                        root: record.path.clone(),
+                        git_dir,
+                        census: Arc::new(Census::new([], false)?),
+                        polling: Some(
+                            "unavailable index requires a periodic local Git check".into(),
+                        ),
+                    },
+                });
+                continue;
+            }
             let census = {
                 let index = git
                     .index_paths(&record.path, cancellation)
@@ -957,6 +1004,219 @@ pub(crate) mod tests {
         assert_eq!(main.tracks(&first.join("vendor")), Some(Tracked::Directory));
         assert!(submodule.polling.is_some());
         assert!(worktree(&submodule, &linked).polling.is_none());
+    }
+
+    #[test]
+    fn failed_index_retains_its_census_without_blocking_healthy_membership_or_removal() {
+        const TEST: &str = "git_watch::tests::failed_index_retains_its_census_without_blocking_healthy_membership_or_removal";
+        if !fixture_isolated(TEST) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let linked = directory.path().join("linked");
+        let removed = directory.path().join("removed");
+        std::fs::create_dir_all(first.join("src")).unwrap();
+        std::fs::write(first.join("src/original"), "original\n").unwrap();
+        git(&first, &["init", "-q"]);
+        git(&first, &["add", "."]);
+        git(&first, &["commit", "-qm", "fixture"]);
+        git(
+            &first,
+            &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
+        );
+        git(
+            &first,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "removed",
+                removed.to_str().unwrap(),
+            ],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let common = service.common_dir(&first, &cancellation).unwrap();
+        let records = service.list_worktrees(&first, &cancellation).unwrap();
+        let project = ProjectId::new();
+        let changed = records.iter().map(|record| record.id).collect();
+        let original = Project::read_changed(
+            project,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &changed,
+        )
+        .unwrap();
+        let linked_original = original
+            .worktrees
+            .iter()
+            .find(|row| row.root == linked)
+            .unwrap();
+        let failed = BTreeSet::from([linked_original.id]);
+        let private = service.git_dir(&linked, &cancellation).unwrap();
+        let index = std::fs::read(private.join("index")).unwrap();
+        std::fs::write(private.join("index"), "broken index\n").unwrap();
+        std::fs::create_dir(first.join("fresh")).unwrap();
+        std::fs::write(first.join("fresh/new"), "new tracked path\n").unwrap();
+        git(&first, &["add", "fresh/new"]);
+        git(&first, &["worktree", "remove", removed.to_str().unwrap()]);
+        let records = service.list_worktrees(&first, &cancellation).unwrap();
+        let changed = records.iter().map(|record| record.id).collect();
+        // Without an observed status failure, index-read errors stay strict.
+        assert!(
+            Project::read_changed(
+                project,
+                common.clone(),
+                &records,
+                &cancellation,
+                Some(&original),
+                &changed,
+            )
+            .is_err()
+        );
+        let retained = Project::read_changed_with_failed_status(
+            project,
+            common.clone(),
+            &records,
+            &cancellation,
+            Some(&original),
+            &changed,
+            &failed,
+        )
+        .unwrap();
+        let linked_retained = retained
+            .worktrees
+            .iter()
+            .find(|row| row.root == linked)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &linked_retained.census,
+            &linked_original.census
+        ));
+        assert_eq!(linked_retained.git_dir, linked_original.git_dir);
+        assert_eq!(
+            linked_retained.tracks(&linked.join("src/original")),
+            Some(Tracked::File)
+        );
+        assert_eq!(
+            retained
+                .worktrees
+                .iter()
+                .find(|row| row.root == first)
+                .unwrap()
+                .tracks(&first.join("fresh/new")),
+            Some(Tracked::File)
+        );
+        assert!(!retained.worktrees.iter().any(|row| row.root == removed));
+        let registrations = Registrations::within(
+            &BTreeMap::from([(project, Arc::new(retained.clone()))]),
+            usize::MAX,
+        );
+        assert!(registrations.desired.contains_key(&first.join("fresh")));
+        assert!(!registrations.desired.contains_key(&removed));
+        // A new failed row gets honest metadata-only coverage, never a
+        // successful empty index census borrowed from a different owner.
+        let cold = Project::read_changed_with_failed_status(
+            project,
+            common.clone(),
+            &records,
+            &cancellation,
+            None,
+            &changed,
+            &failed,
+        )
+        .unwrap();
+        let cold_linked = cold
+            .worktrees
+            .iter()
+            .find(|row| row.root == linked)
+            .unwrap();
+        assert_eq!(cold_linked.tracks(&linked.join("src/original")), None);
+        assert_eq!(cold_linked.tracks(&linked), Some(Tracked::Directory));
+        assert!(cold.polling.is_some());
+        assert!(cold.metadata_paths().contains_key(&private));
+        let cold_registrations = Registrations::within(
+            &BTreeMap::from([(project, Arc::new(cold.clone()))]),
+            usize::MAX,
+        );
+        assert!(
+            cold_registrations
+                .desired
+                .contains_key(&first.join("fresh"))
+        );
+        assert!(cold_registrations.desired.contains_key(&private));
+        assert!(cold_registrations.failures.contains_key(&project));
+        // Known failure never excuses a different repository at the row path.
+        let foreign = directory.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        git(&foreign, &["init", "-q"]);
+        let mut replaced = records.clone();
+        replaced
+            .iter_mut()
+            .find(|row| row.id == linked_original.id)
+            .unwrap()
+            .path = foreign;
+        assert!(
+            Project::read_changed_with_failed_status(
+                project,
+                common.clone(),
+                &replaced,
+                &cancellation,
+                Some(&original),
+                &changed,
+                &failed,
+            )
+            .is_err()
+        );
+        // Nor does it mask an unrelated healthy row's unreadable index.
+        let first_index = std::fs::read(common.join("index")).unwrap();
+        std::fs::write(common.join("index"), "another broken index\n").unwrap();
+        assert!(
+            Project::read_changed_with_failed_status(
+                project,
+                common.clone(),
+                &records,
+                &cancellation,
+                Some(&original),
+                &changed,
+                &failed,
+            )
+            .is_err()
+        );
+        std::fs::write(common.join("index"), first_index).unwrap();
+        std::fs::write(private.join("index"), index).unwrap();
+        let repaired = Project::read_changed_with_failed_status(
+            project,
+            common,
+            &records,
+            &cancellation,
+            Some(&retained),
+            &changed,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(repaired.polling.is_none());
+        assert_eq!(
+            repaired
+                .worktrees
+                .iter()
+                .find(|row| row.root == first)
+                .unwrap()
+                .tracks(&first.join("fresh/new")),
+            Some(Tracked::File)
+        );
+        assert_eq!(
+            repaired
+                .worktrees
+                .iter()
+                .find(|row| row.root == linked)
+                .unwrap()
+                .tracks(&linked.join("src/original")),
+            Some(Tracked::File)
+        );
     }
 
     fn modified(path: PathBuf) -> Event {

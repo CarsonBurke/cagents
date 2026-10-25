@@ -781,6 +781,9 @@ impl Cagents {
                         project,
                         git_watch::Change {
                             worktrees: failed,
+                            // Recover the selected rows' full membership even
+                            // when the event that changed it was missed.
+                            membership: true,
                             ..Default::default()
                         },
                     ));
@@ -1217,7 +1220,7 @@ fn read_local_with_plan(
     snapshot.heads.retain(|id, _| retained.contains(id));
     let plan = (change.membership || change.topology || !vanished.is_empty())
         .then(|| {
-            git_watch::Project::read_changed(
+            git_watch::Project::read_changed_with_failed_status(
                 project,
                 snapshot.repository.common_dir.clone(),
                 &snapshot
@@ -1228,6 +1231,7 @@ fn read_local_with_plan(
                 &cancellation,
                 previous_plan,
                 &change.worktrees,
+                &snapshot.status_errors.keys().copied().collect(),
             )
         })
         .transpose()?;
