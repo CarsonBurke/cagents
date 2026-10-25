@@ -9,6 +9,9 @@ use std::{
 };
 
 const EXITED_RETENTION: Duration = Duration::from_secs(10 * 60);
+// Match the existing five-second durable-notification retry cadence. Only an
+// uncertain expired pin census arms this deadline; it grants no cleanup.
+const RETENTION_RETRY: Duration = Duration::from_secs(5);
 
 pub(super) struct Lifecycle {
     retention: Duration,
@@ -255,7 +258,10 @@ impl Lifecycle {
                     tracing::warn!(%error, "Completed terminal retention is deferred; pane ownership is unknown");
                     self.retention_error_reported = true;
                 }
-                return None;
+                // No holder retirement has started, so there is no pidfd edge
+                // to wake a quiet listener after the pin census recovers. Keep
+                // exact ownership and retry on a real future deadline instead.
+                return Some(Instant::now() + RETENTION_RETRY);
             }
         };
         let handles = {
@@ -885,6 +891,133 @@ mod tests {
         };
         drop(retired); // fixture owner settles outside HostState, after proof
         assert!(host.lock().unwrap().list(1).is_empty());
+    }
+
+    #[test]
+    fn failed_pin_census_schedules_quiet_listener_retry_and_keeps_original_until_recovery() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        let (host, _lease, paths, db_path) = fixture_host();
+        let proof = host.lock().unwrap().proof().clone();
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    "printf 'retained-lifecycle-result'; exit 7".into(),
+                ],
+                working_directory: paths.directory.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = TerminalHandle::spawn(
+            source.clone(),
+            TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_until(|| handle.is_completed());
+        let original = handle.holder_identity().unwrap().clone();
+        let registry = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(source.id).unwrap();
+            state
+                .finish_spawn(1, source.clone(), handle.clone(), false)
+                .unwrap();
+            let registry = state.execution_registry.clone().unwrap();
+            drop(state.unregister_client(1));
+            registry
+        };
+        let fault = rusqlite::Connection::open(&db_path).unwrap();
+        let published_version: u32 = fault
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        fault
+            .pragma_update(None, "user_version", published_version + 1)
+            .unwrap();
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .pinned_terminals(&BTreeSet::from([source.id]))
+                .is_err()
+        );
+        let mut lifecycle = Lifecycle::testing(Duration::ZERO);
+        let before = Instant::now();
+        let retry = lifecycle
+            .maintain(&host, false)
+            .expect("an uncertain expired census must not leave a quiet listener parked forever");
+        let after = Instant::now();
+        assert!(retry >= before + RETENTION_RETRY);
+        assert!(retry <= after + RETENTION_RETRY);
+        assert!(lifecycle.waiting_holders().is_empty());
+        {
+            let state = host.lock().unwrap();
+            assert!(state.clients.is_empty());
+            assert_eq!(state.list(1).len(), 1);
+            assert!(state.terminals[&source.id].handle.same_worker(&handle));
+            assert!(state.terminal_retirements.is_empty());
+            assert!(!state.development_idle());
+            assert!(!state.is_shutting_down());
+        }
+        assert!(original.holder.is_current());
+
+        // The scheduled deadline, not another client or holder event, gives
+        // the listener a next maintenance turn. Repair the real census and
+        // exercise that turn directly; no sleep or fake cleanup authorization.
+        fault
+            .pragma_update(None, "user_version", published_version)
+            .unwrap();
+        drop(fault);
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .pinned_terminals(&BTreeSet::from([source.id]))
+                .unwrap()
+                .is_empty()
+        );
+        lifecycle.maintain(&host, false);
+        {
+            let state = host.lock().unwrap();
+            let retirement = state.terminal_retirements.get(&source.id).unwrap();
+            assert!(retirement.handle.same_worker(&handle));
+            assert!(!retirement.explicit_close);
+            assert!(retirement.failure.is_none());
+        }
+        wait_until(|| {
+            lifecycle.maintain(&host, false);
+            host.lock().unwrap().list(1).is_empty()
+        });
+        assert!(host.lock().unwrap().terminal_retirements.is_empty());
+        assert!(!original.root.is_current());
+        wait_until(|| !original.holder.is_current());
+        assert!(crate::terminal::holder::cleanup::confirmed(&source, &original, &proof).unwrap());
     }
 
     #[test]
