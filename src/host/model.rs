@@ -44,7 +44,7 @@ mod schema;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -623,6 +623,10 @@ fn migrate_through(
     if version < 17 && target >= 17 {
         channel_work::migrate(tx)?;
         schema::migration_checkpoint(17)?;
+    }
+    if version < 18 && target >= 18 {
+        channel_work::placement::migrate(tx)?;
+        schema::migration_checkpoint(18)?;
     }
     Ok(())
 }
