@@ -33,7 +33,7 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -97,6 +97,33 @@ pub struct Pending {
     /// Unix milliseconds.
     #[serde(default)]
     pub started_at: u64,
+    #[serde(default, skip_serializing_if = "PendingOrigin::is_sign_in")]
+    pub origin: PendingOrigin,
+}
+
+/// Import-owned pending homes require the dedicated expected-identity path.
+/// Legacy entries remain ordinary sign-ins; writing an import requires format6
+/// so old managed-home launch authorization refuses the newer registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PendingOrigin {
+    #[default]
+    SignIn,
+    CacheImport {
+        operation: Uuid,
+    },
+}
+
+impl PendingOrigin {
+    pub fn is_sign_in(&self) -> bool {
+        matches!(self, Self::SignIn)
+    }
+}
+
+impl Pending {
+    pub fn is_import(&self) -> bool {
+        !self.origin.is_sign_in()
+    }
 }
 
 /// The whole registry.
@@ -590,8 +617,48 @@ impl Registry {
                 key,
                 provider,
                 started_at,
+                origin: PendingOrigin::SignIn,
             });
         }
+    }
+
+    /// True only for the exact import operation and its original managed key.
+    pub(crate) fn is_import_pending(&self, operation: Uuid) -> bool {
+        !operation.is_nil()
+            && self.find(operation).is_none()
+            && !self.is_archived(operation)
+            && self
+                .pending
+                .iter()
+                .filter(|pending| pending.key == operation)
+                .count()
+                == 1
+            && self.pending.iter().any(|pending| {
+                pending.key == operation
+                    && pending.provider == Provider::Codex
+                    && pending.origin == PendingOrigin::CacheImport { operation }
+            })
+    }
+
+    fn import_key_referenced(&self, key: Uuid) -> bool {
+        self.defaults
+            .values()
+            .chain(self.project_defaults.values().flat_map(|v| v.values()))
+            .any(|value| Uuid::parse_str(value).ok() == Some(key))
+    }
+
+    fn require_fresh_import_key(&self, key: Uuid) -> io::Result<()> {
+        if key.is_nil()
+            || self.find(key).is_some()
+            || self.pending.iter().any(|pending| pending.key == key)
+            || self.is_archived(key)
+            || self.import_key_referenced(key)
+        {
+            return Err(io::Error::other(
+                "The import destination key is already used or referenced",
+            ));
+        }
+        Ok(())
     }
 
     /// Sign-ins that have not finished, oldest first.
@@ -848,6 +915,16 @@ impl Store {
             )));
         }
         for (provider, key) in selected {
+            if registry
+                .pending
+                .iter()
+                .any(|pending| pending.key == key && pending.is_import())
+            {
+                return Err(LaunchAccountError::Unreadable(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "The imported cache requires explicit identity verification before this account can launch",
+                )));
+            }
             if !registry.contains_managed_home(homes, provider, key) {
                 return Err(LaunchAccountError::Removed { provider, key });
             }
@@ -1033,6 +1110,16 @@ impl Store {
         self.update_checked_with_mode(
             |registry| {
                 validate(registry)?;
+                if registry
+                    .pending
+                    .iter()
+                    .any(|pending| pending.key == account.key && pending.is_import())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Use the imported cache's explicit expected-identity verification",
+                    ));
+                }
                 if registry.find(account.key).is_some_and(|existing| {
                     existing.provider == account.provider && existing.linked_home.is_none()
                 }) {
@@ -1909,6 +1996,812 @@ mod tests {
         fs::write(&target, "").unwrap();
         std::os::unix::fs::symlink(&target, directory.path().join(FILE_NAME)).unwrap();
         assert!(Store::at(directory.path()).load().is_err());
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) use cache_import::ImportLaunchLease;
+
+#[cfg(feature = "host")]
+mod cache_import {
+    use super::*;
+    use crate::{account::import::PhysicalIdentity, fs_safety::Root};
+    use std::{ffi::OsStr, os::unix::fs::MetadataExt};
+
+    /// Held only across the actual identity-probe spawn, never across its I/O.
+    /// Both locks come from the real Store; metadata DTOs cannot mint this lease.
+    pub(crate) struct ImportLaunchLease {
+        _lifecycle: crate::instance::OwnedLock,
+        _registry: crate::instance::OwnedLock,
+    }
+
+    fn refuse(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn current_home(
+        homes: &Homes,
+        operation: Uuid,
+        expected: PhysicalIdentity,
+    ) -> io::Result<Root> {
+        let path = homes.path(Provider::Codex, operation);
+        crate::secure_file::reject_symlink_components(&path)
+            .map_err(|_| refuse("The imported account home changed"))?;
+        let root =
+            Root::open(&path).map_err(|_| refuse("The imported account home is unavailable"))?;
+        let metadata = root
+            .metadata()
+            .map_err(|_| refuse("The imported account home is unavailable"))?;
+        if metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() == 0
+        {
+            return Err(refuse("The imported account home changed"));
+        }
+        Ok(root)
+    }
+
+    /// Resolve missing suffixes without treating a dangling link as absence.
+    /// Existing roots come from the bounded Registry/System metadata census.
+    fn potential_home(path: &Path) -> io::Result<PathBuf> {
+        if !path.is_absolute()
+            || path.as_os_str().as_bytes().len() > 16 * 1024
+            || path.components().count() > 128
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(refuse("Account home independence could not be confirmed"));
+        }
+        let mut ancestor = path;
+        let mut suffix = Vec::new();
+        loop {
+            match ancestor.canonicalize() {
+                Ok(mut base) => {
+                    for part in suffix.iter().rev() {
+                        base.push(part);
+                    }
+                    return Ok(base);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(ancestor) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        _ => {
+                            return Err(refuse("Account home independence could not be confirmed"));
+                        }
+                    }
+                    let name = ancestor.file_name().ok_or_else(|| {
+                        refuse("Account home independence could not be confirmed")
+                    })?;
+                    suffix.push(name.to_os_string());
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        refuse("Account home independence could not be confirmed")
+                    })?;
+                }
+                Err(_) => return Err(refuse("Account home independence could not be confirmed")),
+            }
+        }
+    }
+
+    fn independent_home(registry: &Registry, homes: &Homes, operation: Uuid) -> io::Result<()> {
+        if registry.accounts.len() + registry.pending.len() > 128 {
+            return Err(refuse(
+                "Too many account homes to confirm import independence",
+            ));
+        }
+        let destination = potential_home(&homes.path(Provider::Codex, operation))?;
+        let known = registry
+            .accounts
+            .iter()
+            .filter(|row| row.key != operation)
+            .map(|row| {
+                row.linked_home
+                    .clone()
+                    .unwrap_or_else(|| homes.path(row.provider, row.key))
+            })
+            .chain(
+                registry
+                    .pending
+                    .iter()
+                    .filter(|row| row.key != operation)
+                    .map(|row| homes.path(row.provider, row.key)),
+            )
+            .chain(
+                Account::system_accounts()
+                    .into_iter()
+                    .filter_map(|account| account.resolved_home()),
+            );
+        for operand in known {
+            let other = potential_home(&operand)?;
+            if destination.starts_with(&other) || other.starts_with(&destination) {
+                return Err(refuse("Another account refers to the import destination"));
+            }
+        }
+        Ok(())
+    }
+
+    fn require_pending(registry: &Registry, operation: Uuid) -> io::Result<()> {
+        if registry.is_newer() || !registry.is_import_pending(operation) {
+            return Err(refuse("The original import-owned pending account changed"));
+        }
+        if registry.import_key_referenced(operation) {
+            return Err(refuse(
+                "The import destination was selected as a default before registration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn registry_directory(store: &Store) -> io::Result<Root> {
+        let root = Root::open(&store.directory)
+            .map_err(|_| refuse("The import registry directory is unavailable"))?;
+        let metadata = root
+            .metadata()
+            .map_err(|_| refuse("The import registry directory is unavailable"))?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() == 0
+        {
+            return Err(refuse("The import registry directory is not private"));
+        }
+        Ok(root)
+    }
+
+    fn sync_registry(store: &Store, root: &Root) -> io::Result<()> {
+        let uncertain = || {
+            refuse(
+                "The import registry acknowledgement is uncertain; inspect the original operation",
+            )
+        };
+        let original = root.metadata().map_err(|_| uncertain())?;
+        let same = || -> io::Result<bool> {
+            let named = registry_directory(store)?.metadata()?;
+            Ok((named.dev(), named.ino()) == (original.dev(), original.ino()))
+        };
+        if !same().map_err(|_| uncertain())? {
+            return Err(uncertain());
+        }
+        crate::fs_safety::sync_directory(root).map_err(|_| uncertain())?;
+        if !same().map_err(|_| uncertain())? {
+            return Err(uncertain());
+        }
+        Ok(())
+    }
+
+    fn check_command(
+        command: &std::process::Command,
+        homes: &Homes,
+        operation: Uuid,
+    ) -> io::Result<()> {
+        if !Path::new(command.get_program()).is_absolute()
+            || command.get_args().collect::<Vec<_>>() != [OsStr::new("app-server")]
+        {
+            return Err(refuse(
+                "Only the selected official identity-probe command is admitted",
+            ));
+        }
+        let expected = homes.path(Provider::Codex, operation);
+        let env: Vec<_> = command.get_envs().collect();
+        let selected = env
+            .iter()
+            .find(|(name, _)| *name == OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| *value);
+        if selected.map(Path::new) != Some(expected.as_path()) {
+            return Err(refuse(
+                "The identity probe must use the original imported account home",
+            ));
+        }
+        for name in super::super::credential_overrides(Provider::Codex) {
+            if !env
+                .iter()
+                .any(|(key, value)| *key == OsStr::new(name) && value.is_none())
+            {
+                return Err(refuse(
+                    "The identity probe must remove inherited provider credentials",
+                ));
+            }
+        }
+        if env
+            .iter()
+            .any(|(name, value)| *name == OsStr::new("CLAUDE_CONFIG_DIR") && value.is_some())
+        {
+            return Err(refuse(
+                "The identity probe cannot select another provider home",
+            ));
+        }
+        Ok(())
+    }
+
+    impl Store {
+        /// Read-only atomic-rename snapshot for Status, never an admission permit.
+        /// Missing metadata is empty; unsafe metadata is refused, not repaired.
+        pub(crate) fn read_import_metadata(&self) -> io::Result<Registry> {
+            let mut file =
+                match crate::secure_file::open_existing_private_file_readonly(&self.path()) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(Registry::default());
+                    }
+                    Err(_) => return Err(refuse("The import registry metadata is unavailable")),
+                };
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| refuse("The import registry metadata is unavailable"))?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err(refuse("The import registry metadata is too large"));
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| refuse("The import registry metadata is invalid"))?;
+            toml::from_str(text).map_err(|_| refuse("The import registry metadata is invalid"))
+        }
+
+        /// The create callback must use the reservation's actual fresh-home
+        /// initializer. It may persist the journal's prepared inode receipt,
+        /// but must never reenter Store. No credential link precedes this ACK.
+        pub(crate) fn try_create_import_pending_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            started_at: u64,
+            create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+        ) -> io::Result<(Uuid, PathBuf)> {
+            self.create_import_pending(homes, operation, started_at, create, |registry| {
+                reservation
+                    .verify_registry(registry)
+                    .map_err(io::Error::other)
+            })
+        }
+
+        fn create_import_pending(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            started_at: u64,
+            create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<(Uuid, PathBuf)> {
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let _lock = self.try_lock()?;
+            let registry_root = registry_directory(self)?;
+            let mut registry = read(&self.path())?;
+            if registry.is_newer() {
+                return Err(refuse("The account registry requires a newer cagents"));
+            }
+            validate(&registry)?;
+            registry.require_fresh_import_key(operation)?;
+            independent_home(&registry, homes, operation)?;
+            let revision = registry
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| refuse("Account registry revision exhausted"))?;
+            let (key, home) = create()?;
+            if key != operation || home != homes.path(Provider::Codex, operation) {
+                return Err(refuse(
+                    "The created home does not match the original import operation",
+                ));
+            }
+            // Recheck metadata aliases after mkdir; no named credential exists yet.
+            independent_home(&registry, homes, operation)?;
+            registry.pending.push(Pending {
+                key: operation,
+                provider: Provider::Codex,
+                started_at,
+                origin: PendingOrigin::CacheImport { operation },
+            });
+            registry.version = VERSION;
+            registry.revision = revision;
+            write(&self.directory, &self.path(), &registry)?;
+            sync_registry(self, &registry_root)?;
+            Ok((key, home))
+        }
+
+        /// Exact pending/physical admission at a short file publication boundary.
+        /// The effect may link/fsync one already-prepared auth inode, never Store.
+        pub(crate) fn try_with_import_pending_reserved<T>(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            effect: impl FnOnce() -> io::Result<T>,
+        ) -> io::Result<T> {
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let _lock = self.try_lock()?;
+            let registry = read(&self.path())?;
+            reservation
+                .verify_import_home(operation, expected_home)
+                .map_err(io::Error::other)?;
+            require_pending(&registry, operation)?;
+            independent_home(&registry, homes, operation)?;
+            let _home = current_home(homes, operation, expected_home)?;
+            effect()
+        }
+
+        /// Dedicated verification spawn only. The caller's SpawnOwner retains
+        /// process/cleanup custody; dropping an async waiter is not admission.
+        pub(crate) fn authorize_import_command_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            command: &std::process::Command,
+        ) -> io::Result<ImportLaunchLease> {
+            self.import_launch(homes, operation, expected_home, command, |registry| {
+                reservation
+                    .verify_import_home(operation, expected_home)
+                    .map_err(io::Error::other)?;
+                require_pending(registry, operation)
+            })
+        }
+
+        fn import_launch(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            command: &std::process::Command,
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<ImportLaunchLease> {
+            let lifecycle = homes.try_lifecycle_lock()?;
+            let lock = self.try_lock()?;
+            let registry = read(&self.path())?;
+            validate(&registry)?;
+            require_pending(&registry, operation)?;
+            independent_home(&registry, homes, operation)?;
+            let _home = current_home(homes, operation, expected_home)?;
+            check_command(command, homes, operation)?;
+            Ok(ImportLaunchLease {
+                _lifecycle: lifecycle,
+                _registry: lock,
+            })
+        }
+
+        /// A matching fresh provider result is required by the host before this
+        /// call. Repeat the expected-email/key/home checks under actual leases;
+        /// this method never probes System or selects a duplicate/default.
+        pub(crate) fn try_register_import_pending_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            account: Registered,
+            known_system: &[(Provider, Identity)],
+        ) -> io::Result<(Registry, Result<(), AccountId>)> {
+            self.register_import_pending(
+                homes,
+                operation,
+                expected_home,
+                expected_email,
+                account,
+                known_system,
+                |registry| {
+                    reservation
+                        .verify_import_home(operation, expected_home)
+                        .map_err(io::Error::other)?;
+                    if registry.find(operation).is_none() {
+                        require_pending(registry, operation)?;
+                    }
+                    Ok(())
+                },
+            )
+        }
+
+        fn register_import_pending(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            account: Registered,
+            known_system: &[(Provider, Identity)],
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<(Registry, Result<(), AccountId>)> {
+            if operation.is_nil()
+                || account.key != operation
+                || account.provider != Provider::Codex
+                || account.linked_home.is_some()
+                || !super::super::import::expected_email_is_valid(expected_email)
+                || !account
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+            {
+                return Err(refuse(
+                    "The verified ChatGPT identity does not match the original import",
+                ));
+            }
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let registry_root = registry_directory(self)?;
+            let result = self.update_checked_with_mode(
+                |registry| {
+                    validate(registry)?;
+                    let _home = current_home(homes, operation, expected_home)?;
+                    independent_home(registry, homes, operation)?;
+                    if let Some(existing) = registry.find(operation) {
+                        if registry
+                            .accounts
+                            .iter()
+                            .filter(|row| row.key == operation)
+                            .count()
+                            != 1
+                            || registry
+                                .pending
+                                .iter()
+                                .any(|pending| pending.key == operation)
+                            || existing.provider != Provider::Codex
+                            || existing.linked_home.is_some()
+                            || !existing
+                                .email
+                                .as_deref()
+                                .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+                        {
+                            return Err(refuse("The original imported registration changed"));
+                        }
+                        return Ok(Ok(()));
+                    }
+                    require_pending(registry, operation)?;
+                    Ok(registry.register(account, known_system))
+                },
+                true,
+            )?;
+            sync_registry(self, &registry_root)?;
+            Ok(result)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fixture() -> (tempfile::TempDir, Homes, Store) {
+            let root = tempfile::tempdir().unwrap();
+            let homes = Homes::at(root.path().join("homes"));
+            let store = Store::at(root.path().join("registry"));
+            (root, homes, store)
+        }
+
+        fn prepare(store: &Store, homes: &Homes, key: Uuid) -> PathBuf {
+            store
+                .create_import_pending(
+                    homes,
+                    key,
+                    1,
+                    || {
+                        homes.create_planned_with_config_initialized(
+                            Provider::Codex,
+                            key,
+                            None,
+                            super::super::super::home::CodexConfig::Shared,
+                            |_| Ok(()),
+                        )
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .1
+        }
+
+        fn stamp(home: &Path) -> PhysicalIdentity {
+            let metadata = fs::metadata(home).unwrap();
+            PhysicalIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        fn account(key: Uuid, email: &str) -> Registered {
+            Registered {
+                key,
+                provider: Provider::Codex,
+                linked_home: None,
+                label: None,
+                email: Some(email.into()),
+                organization: None,
+                added_at: 1,
+            }
+        }
+
+        fn command(home: &Path) -> std::process::Command {
+            let mut command = std::process::Command::new("/never-executed");
+            command.arg("app-server");
+            command.env("CODEX_HOME", home);
+            for name in super::super::super::credential_overrides(Provider::Codex) {
+                command.env_remove(name);
+            }
+            command
+        }
+
+        #[test]
+        fn status_metadata_does_not_create_storage_or_repair_existing_permissions() {
+            let (root, _homes, store) = fixture();
+            assert_eq!(store.read_import_metadata().unwrap(), Registry::default());
+            assert!(!store.directory.exists());
+            fs::create_dir(&store.directory).unwrap();
+            fs::write(store.path(), "version = 6\n").unwrap();
+            fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(store.read_import_metadata().is_err());
+            assert_eq!(fs::metadata(store.path()).unwrap().mode() & 0o777, 0o644);
+            assert!(!store.directory.join(LOCK_NAME).exists());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn old_pending_defaults_to_sign_in_but_import_publishes_format_six_without_seeding() {
+            let old: Registry = toml::from_str("version = 5\n[[pending]]\nkey = '00000000-0000-4000-8000-000000000001'\nprovider = 'codex'\nstarted_at = 1\n").unwrap();
+            assert!(!old.pending[0].is_import());
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(2);
+            let home = prepare(&store, &homes, key);
+            let registry = store.load().unwrap();
+            assert!(registry.is_import_pending(key));
+            assert_eq!(registry.version, 6);
+            assert!(
+                registry.version > 5,
+                "the old managed-home reader must refuse its future version"
+            );
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+            assert_eq!(
+                fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(store.load().unwrap(), registry);
+        }
+
+        #[test]
+        fn default_references_and_existing_keys_refuse_before_home_creation_without_changing_bytes()
+        {
+            for mode in 0..6 {
+                let (_root, homes, store) = fixture();
+                let key = Uuid::parse_str("00000000-0000-4000-8000-000000abcdef").unwrap();
+                store
+                    .update(|registry| match mode {
+                        0 => {
+                            registry
+                                .defaults
+                                .insert("codex".into(), key.to_string().to_uppercase());
+                        }
+                        1 => {
+                            registry.project_defaults.insert(
+                                "project".into(),
+                                BTreeMap::from([("codex".into(), key.to_string())]),
+                            );
+                        }
+                        2 => registry.accounts.push(account(key, "fixture@example.test")),
+                        3 => registry.begin(Provider::Codex, key, 1),
+                        4 => registry.archived.push(key),
+                        _ => {}
+                    })
+                    .unwrap();
+                let before = fs::read(store.path()).unwrap_or_default();
+                let mut called = false;
+                let chosen = if mode == 5 { Uuid::nil() } else { key };
+                assert!(
+                    store
+                        .create_import_pending(
+                            &homes,
+                            chosen,
+                            2,
+                            || {
+                                called = true;
+                                unreachable!()
+                            },
+                            |_| Ok(())
+                        )
+                        .is_err()
+                );
+                assert!(!called);
+                assert_eq!(fs::read(store.path()).unwrap_or_default(), before);
+                assert!(!homes.path(Provider::Codex, key).exists());
+            }
+        }
+
+        #[test]
+        fn generic_launch_and_registration_refuse_import_but_the_exact_probe_lease_is_scoped() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(4);
+            let home = prepare(&store, &homes, key);
+            let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+            recipe
+                .environment
+                .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+            assert!(
+                store
+                    .authorize_launch(&homes, &recipe, Some(Provider::Codex))
+                    .is_err()
+            );
+            let before = fs::read(store.path()).unwrap();
+            assert!(
+                store
+                    .try_register_pending(&homes, account(key, "fixture@example.test"), &[])
+                    .is_err()
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+            let mut probe = command(&home);
+            probe.env("OPENAI_API_KEY", "synthetic-not-a-credential");
+            assert!(
+                store
+                    .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                    .is_err()
+            );
+            probe.env_remove("OPENAI_API_KEY");
+            probe.env("CODEX_HOME", home.parent().unwrap());
+            assert!(
+                store
+                    .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                    .is_err()
+            );
+            probe.env("CODEX_HOME", &home);
+            let lease = store
+                .import_launch(&homes, key, stamp(&home), &probe, |_| Ok(()))
+                .unwrap();
+            assert!(
+                store.try_lock().is_err(),
+                "actual Store lease outlives validation through spawn"
+            );
+            assert!(homes.try_lifecycle_lock().is_err());
+            drop(lease);
+            assert!(store.try_lock().is_ok());
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+
+        #[test]
+        fn wrong_identity_and_duplicate_never_register_or_select_and_same_reply_is_idempotent() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(5);
+            let home = prepare(&store, &homes, key);
+            let physical = stamp(&home);
+            let before = fs::read(store.path()).unwrap();
+            assert!(
+                store
+                    .register_import_pending(
+                        &homes,
+                        key,
+                        physical,
+                        "fixture@example.test",
+                        account(key, "wrong@example.test"),
+                        &[],
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+            let (registered, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert!(!registered.is_import_pending(key));
+            store
+                .update(|registry| {
+                    registry.set_label(
+                        &Account::managed(Provider::Codex, key, home.clone()),
+                        Some("My label".into()),
+                    );
+                    registry.set_default(&Account::system(Provider::Claude));
+                })
+                .unwrap();
+            let current = store.load().unwrap();
+            let bytes = fs::read(store.path()).unwrap();
+            let (again, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert_eq!(again, current);
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
+            let other = Uuid::from_u128(6);
+            let other_home = prepare(&store, &homes, other);
+            let before_duplicate = fs::read(store.path()).unwrap();
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    other,
+                    stamp(&other_home),
+                    "fixture@example.test",
+                    account(other, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(result.is_err());
+            assert!(store.load().unwrap().is_import_pending(other));
+            assert_eq!(fs::read(store.path()).unwrap(), before_duplicate);
+        }
+
+        #[test]
+        fn pending_store_failure_retains_empty_home_without_a_durable_acknowledgement() {
+            let (root, homes, store) = fixture();
+            store
+                .update(|registry| registry.set_default(&Account::system(Provider::Claude)))
+                .unwrap();
+            let before = fs::read(store.path()).unwrap();
+            let moved = root.path().join("retained-registry");
+            let key = Uuid::from_u128(10);
+            let result = store.create_import_pending(
+                &homes,
+                key,
+                1,
+                || {
+                    let created = homes.create_planned_with_config_initialized(
+                        Provider::Codex,
+                        key,
+                        None,
+                        super::super::super::home::CodexConfig::Shared,
+                        |_| Ok(()),
+                    )?;
+                    fs::rename(&store.directory, &moved)?;
+                    Ok(created)
+                },
+                |_| Ok(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read(moved.join(FILE_NAME)).unwrap(), before);
+            assert!(!store.path().exists());
+            let home = homes.path(Provider::Codex, key);
+            assert!(home.is_dir());
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+            assert!(!home.join("auth.json").exists());
+        }
+
+        #[test]
+        fn dangling_link_to_the_new_home_is_not_activated() {
+            use std::os::unix::fs::symlink;
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(7);
+            let target = homes.path(Provider::Codex, key);
+            let alias = homes.path(Provider::Claude, Uuid::from_u128(8));
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            symlink(&target, &alias).unwrap();
+            store
+                .update(|registry| {
+                    let mut row = account(Uuid::from_u128(9), "other@example.test");
+                    row.linked_home = Some(alias);
+                    registry.accounts.push(row);
+                })
+                .unwrap();
+            let before = fs::read(store.path()).unwrap();
+            let mut created = false;
+            assert!(
+                store
+                    .create_import_pending(
+                        &homes,
+                        key,
+                        1,
+                        || {
+                            created = true;
+                            unreachable!()
+                        },
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            assert!(!created);
+            assert!(!target.exists());
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
     }
 }
 

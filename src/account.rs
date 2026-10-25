@@ -33,6 +33,7 @@ pub mod coding_config;
 pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
+pub mod import;
 pub mod info;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
