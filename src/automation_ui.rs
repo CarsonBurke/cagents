@@ -7208,10 +7208,34 @@ mod tests {
         };
         assert!(!selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
         assert_eq!(selecting.pending.unwrap().0, sequence);
-        selecting.update(Action::Received {
+        let owner_id = owner.id;
+        let Some(Effect::Request { sequence, request }) = selecting.update(Action::Received {
             sequence,
             result: std::sync::Arc::new(Ok(Response::Automation(owner))),
-        });
+        }) else {
+            panic!("selection must finish its foreground history request");
+        };
+        assert!(matches!(request, Request::History {
+            id: Some(actual), before: None, limit: PAGE,
+        } if actual == owner_id));
+        assert!(!selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
+        assert!(
+            matches!(selecting.pending, Some((actual, Pending::History { append: false })) if actual == sequence)
+        );
+        assert!(
+            selecting
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(
+                        crate::automations::HistoryPage {
+                            firings: Vec::new(),
+                            next: None,
+                        }
+                    ))),
+                })
+                .is_none()
+        );
+        assert!(selecting.pending.is_none());
         assert!(selecting.show_lifecycle_receipt(id, 42, Ok(notice_page(id, 42))));
         // Existing AgentRun navigation still leaves the historical-only panel.
         let run = crate::model::RunId::new();
