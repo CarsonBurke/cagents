@@ -893,6 +893,7 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
                 [id.to_string()],
             )
             .map_err(|error| error.to_string())?;
+            channel_work::renamed_in(db, *id)?;
         }
     }
     db.execute("INSERT INTO shared_views(scope, revision, panes, retired) VALUES (?1, ?2, ?3, ?4)
@@ -1124,6 +1125,97 @@ mod tests {
         Pane {
             kind: CardKind::Terminal(terminal),
             ..pane()
+        }
+    }
+
+    #[test]
+    fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
+        for manual in [false, true] {
+            let (mut registry, _directory, _, _) = setup();
+            let channel = ChannelId::new();
+            // Default titles are manual/legacy names. This case must own a
+            // genuinely inferred channel before testing automatic clearing.
+            registry
+                .apply(&ModelEdit::CreateChannel {
+                    id: channel,
+                    repository: "/repo".into(),
+                    title: "Initial inferred title".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
+                })
+                .unwrap();
+            let mut original = live_source_pane();
+            let CardKind::Terminal(terminal) = original.kind else {
+                unreachable!()
+            };
+            original.kind = CardKind::Chat(crate::chat::Session {
+                id: terminal.id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: terminal.launch.clone(),
+                    session_id: Some("first-thread".into()),
+                },
+                proof: terminal.continuity.live_proof(),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+            seed(&mut registry, channel, vec![original.clone()]);
+            registry
+                .apply(&if manual {
+                    ModelEdit::RetitleChannel {
+                        id: channel,
+                        title: "User chosen".into(),
+                    }
+                } else {
+                    ModelEdit::SuggestChannelTitle {
+                        id: channel,
+                        title: "Provider chosen".into(),
+                        source: crate::model::ChannelTitleSource::Provider,
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                registry.model().unwrap().channel(channel).unwrap().title,
+                if manual {
+                    "User chosen"
+                } else {
+                    "Provider chosen"
+                },
+                "establish the naming source before replacing the primary thread"
+            );
+            let mut successor = original.clone();
+            let CardKind::Chat(chat) = &mut successor.kind else {
+                unreachable!()
+            };
+            chat.launch.session_id = Some("replacement-thread".into());
+            let update = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: successor,
+                },
+            );
+            registry.apply(&update).unwrap();
+            let model = registry.model().unwrap();
+            let canonical = model.channel(channel).unwrap();
+            assert_eq!(canonical.title, if manual { "User chosen" } else { "" });
+            let title: String = registry
+                .db
+                .query_row(
+                    "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
+                    params![channel.to_string(), canonical.ordinal],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                title, canonical.title,
+                "retained title follows the exact current canonical incarnation"
+            );
+            assert!(
+                channel_work::renamed_in(&registry.db, channel).is_err(),
+                "title synchronization cannot escape the canonical transaction"
+            );
         }
     }
 
