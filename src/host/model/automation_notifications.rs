@@ -340,7 +340,8 @@ mod tests {
         Definition, DirectoryIdentity, Schedule, SchedulePattern, SessionMode,
     };
     use crate::host::model::{Registry, automation_audit};
-    use crate::workspace_model::{ModelEdit, ProjectKind};
+    use crate::model::ProjectKind;
+    use crate::workspace_model::ModelEdit;
 
     fn fixture() -> (Registry, tempfile::TempDir, Automation) {
         let directory = tempfile::tempdir().unwrap();
