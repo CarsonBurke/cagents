@@ -135,6 +135,7 @@ pub(super) struct State {
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
     lifecycle_activation: Option<LifecycleActivation>,
+    lifecycle_read: Option<u64>,
     host: Option<HostSessionProof>,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
@@ -162,6 +163,7 @@ impl Default for State {
             acknowledged: BTreeSet::new(),
             testing: false,
             lifecycle_activation: None,
+            lifecycle_read: None,
             host: None,
             inbox_activation: None,
             session_activation: None,
@@ -578,6 +580,14 @@ impl Cagents {
                 Task::none()
             }
             Action::Activated(Target::Automation { id, sequence }) => {
+                // Invalidating the desired target does not cancel blocking I/O.
+                // Keep one real read outstanding, including across host changes.
+                if self.notification_ui.lifecycle_read.is_some() {
+                    self.status = Some(TransientNotice::warning(
+                        "A lifecycle receipt is still being read. Open this notice again after that read finishes.",
+                    ));
+                    return self.activate_main_window(None);
+                }
                 if !self.can_open_lifecycle_notice() {
                     self.status = Some(TransientNotice::warning(
                         "Return to the workspace and finish any open edit or request, then open this lifecycle notice again.",
@@ -614,6 +624,7 @@ impl Cagents {
                     backend: lifecycle_backend(),
                     workspace: Arc::downgrade(&self.durable),
                 };
+                self.notification_ui.lifecycle_read = Some(activation.generation);
                 self.notification_ui.lifecycle_activation = Some(activation.clone());
                 cosmic::task::future(async move {
                     let generation = activation.generation;
@@ -624,6 +635,10 @@ impl Cagents {
                 })
             }
             Action::LifecycleResolved { generation, result } => {
+                if self.notification_ui.lifecycle_read != Some(generation) {
+                    return Task::none();
+                }
+                self.notification_ui.lifecycle_read = None;
                 let Some(activation) = self
                     .notification_ui
                     .lifecycle_activation
@@ -3533,25 +3548,80 @@ mod tests {
                 sequence: sequence + 1,
             })),
         );
-        let current = app
-            .notification_ui
-            .lifecycle_activation
-            .as_ref()
-            .unwrap()
-            .generation;
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
         drop(app.update_notifications(Action::LifecycleResolved {
             generation: first,
             result: Ok(exact_notice_page(id, sequence)),
         }));
+        assert!(app.notification_ui.lifecycle_activation.is_none());
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+    }
+    #[test]
+    fn lifecycle_activation_churn_keeps_one_actual_read_until_its_matching_completion() {
+        let (mut app, id, sequence, notice) = lifecycle_notice_fixture();
+        let cards = app.durable.cards.clone();
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let first = app.notification_ui.lifecycle_read.unwrap();
+        for offset in 0..64 {
+            drop(
+                app.update_notifications(Action::Activated(Target::Automation {
+                    id: if offset % 2 == 0 {
+                        id
+                    } else {
+                        uuid::Uuid::new_v4()
+                    },
+                    sequence: sequence + offset,
+                })),
+            );
+            assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+            assert!(app.notification_ui.lifecycle_activation.is_none());
+        }
+        let mut replacement = app.notification_ui.host.clone().unwrap();
+        replacement.host_incarnation = crate::model::HostIncarnation::new("new backend");
+        drop(app.update_notifications(Action::HostBound(replacement)));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first + 1,
+            result: Err(()),
+        }));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(first));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert_eq!(app.durable.cards, cards);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        drop(app.update_notifications(Action::Activated(Target::Automation { id, sequence })));
+        let retry = app.notification_ui.lifecycle_read.unwrap();
+        assert_ne!(retry, first);
         assert_eq!(
             app.notification_ui
                 .lifecycle_activation
                 .as_ref()
                 .unwrap()
                 .generation,
-            current
+            retry
         );
-        assert_eq!(app.durable.cards, cards);
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: first,
+            result: Err(()),
+        }));
+        assert_eq!(app.notification_ui.lifecycle_read, Some(retry));
+        drop(app.update_notifications(Action::LifecycleResolved {
+            generation: retry,
+            result: Ok(exact_notice_page(id, sequence)),
+        }));
+        assert!(app.notification_ui.lifecycle_read.is_none());
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .any(|card| card.kind == CardKind::Automations)
+        );
         assert!(!app.notification_ui.acknowledged_for_test(notice));
     }
 }
