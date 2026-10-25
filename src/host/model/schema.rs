@@ -720,6 +720,11 @@ mod tests {
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
             (18, "DROP TABLE channel_work_placement_epochs;"),
+            (18, "DROP TABLE channel_work_placement_clock;"),
+            (
+                18,
+                "ALTER TABLE channel_work_placement_clock RENAME COLUMN last_epoch TO changed_epoch;",
+            ),
             (
                 18,
                 "ALTER TABLE channel_work_placement_epochs RENAME COLUMN epoch TO changed_epoch;",
