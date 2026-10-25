@@ -14455,6 +14455,20 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                // Passive adoption names a canonical shared repository, not
+                // an arbitrary directory from which Git may find an ancestor.
+                // Explicit opens have no pending shared-model admission.
+                let result = result.and_then(|loaded| {
+                    if self.workspace_model_loads.get(&project_id).is_some_and(
+                        |(repository, expected)| {
+                            *expected == generation && repository != &loaded.project.repository
+                        },
+                    ) {
+                        Err("Shared project discovery resolved to a different repository.".into())
+                    } else {
+                        Ok(loaded)
+                    }
+                });
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,

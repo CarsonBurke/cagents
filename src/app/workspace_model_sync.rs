@@ -4085,4 +4085,145 @@ mod tests {
         );
         assert!(drain(&published).is_empty());
     }
+
+    #[test]
+    fn a_passive_shared_git_load_never_adopts_an_enclosing_repository() {
+        let parent = git_checkout().expect("the nested recovery fixture requires Git");
+        let nested = parent.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&nested)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let repository = canonical_repository(&nested.join(".git")).unwrap();
+        let ancestor = canonical_repository(&parent.path().join(".git")).unwrap();
+        let head = repository.join("HEAD");
+        let original_head = std::fs::read(&head).unwrap();
+        std::fs::write(&head, b"not a Git reference\n").unwrap();
+        let channel = ChannelId::new();
+        let model = WorkspaceModel {
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "nested shared checkout".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            }],
+            ..registry(vec![shared(channel, &repository, "retained channel", 1)])
+        };
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let published = intercept_publishes(&mut app);
+        let cards = app.durable.cards.clone();
+        let focused = app.workspace.focused();
+        assert!(focused.is_some(), "an unrelated card holds actual focus");
+        app.workspace_model = model.clone();
+        let Message::RepositoryLoaded {
+            project_id,
+            generation,
+            result: Ok(wrong),
+            ..
+        } = first_message(app.reconcile_workspace_model())
+            .expect("the nested passive load must actually discover Git")
+        else {
+            panic!("corrupt nested HEAD must expose the successful ancestor fallback");
+        };
+        assert_eq!(wrong.project.repository, ancestor);
+        assert_ne!(wrong.project.repository, repository);
+        let cancellation = app.repository_pr_cancellations[&project_id].clone();
+        let stale = wrong.clone();
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation: generation.wrapping_sub(1),
+            result: Ok(wrong.clone()),
+        }));
+        assert!(app.workspace_model_loads.contains_key(&project_id));
+        assert!(app.workspace_model_opens.contains(&repository));
+        let rejected = app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation,
+            result: Ok(wrong),
+        });
+        assert!(first_message(rejected).is_none(), "refusal cannot retry itself");
+        assert!(app.sidebar_model.projects.is_empty());
+        assert!(drain(&published).is_empty(), "the ancestor was never published");
+        assert!(!app.workspace_model_opens.contains(&repository));
+        assert!(!app.workspace_model_loads.contains_key(&project_id));
+        assert!(!app.repository_generations.contains_key(&project_id));
+        assert!(!app.github_availability.contains_key(&project_id));
+        assert!(!app.repository_pr_cancellations.contains_key(&project_id));
+        assert!(!app.refresh_ui.projects.contains_key(&project_id));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(app.workspace_model.channels, model.channels);
+        assert_eq!(app.durable.cards, cards);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, None);
+
+        // An explicit directory load still has Git's ordinary ancestor
+        // discovery semantics; only a captured passive model key is strict.
+        let mut explicit = super::super::tests::context_inspector_test_app(false);
+        let explicit_published = intercept_publishes(&mut explicit);
+        let explicit_result = first_message(explicit.repository_load_task(
+            repository.clone(),
+            None,
+            false,
+        ))
+        .expect("explicit discovery must still read the containing repository");
+        assert!(matches!(&explicit_result, Message::RepositoryLoaded {
+            result: Ok(loaded), ..
+        } if loaded.project.repository == ancestor));
+        drop(explicit.update(explicit_result));
+        assert!(explicit.project_for_repository(&ancestor).is_some());
+        assert!(drain(&explicit_published).iter().any(|edit| matches!(edit,
+            ModelEdit::OpenProject { repository, .. } if repository == &ancestor
+        )));
+        assert!(explicit.durable.cards.is_empty());
+
+        std::fs::write(&head, original_head).unwrap();
+        let retry = app.apply_workspace_model_update(ModelUpdate::Read(model.clone()));
+        let (&retry_id, (_, retry_generation)) = app.workspace_model_loads.iter().next().unwrap();
+        let retry_generation = *retry_generation;
+        assert_ne!(retry_id, project_id);
+        assert!(retry_generation > generation);
+        assert!(matches!(
+            app.open_shared_repository(&repository, Some(ProjectKind::Git)),
+            Adoption::Retained
+        ));
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation,
+            result: Ok(stale),
+        }));
+        assert_eq!(
+            app.workspace_model_loads[&retry_id],
+            (repository.clone(), retry_generation)
+        );
+        let repaired = first_message(retry).expect("the later model retries the repaired child");
+        assert!(matches!(&repaired, Message::RepositoryLoaded {
+            project_id, generation, result: Ok(loaded), ..
+        } if *project_id == retry_id && *generation == retry_generation
+            && loaded.project.repository == repository));
+        drop(app.update(repaired));
+        assert_eq!(app.sidebar_model.projects.len(), 1);
+        assert_eq!(app.sidebar_model.projects[0].repository, repository);
+        assert!(app.project_for_repository(&ancestor).is_none());
+        assert!(app.workspace_model_loads.is_empty());
+        let edits = drain(&published);
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::OpenProject { repository: opened, .. } if opened == &repository
+        )));
+        assert!(!edits.iter().any(|edit| matches!(edit,
+            ModelEdit::OpenProject { repository, .. }
+                | ModelEdit::ReopenProject { repository, .. } if repository == &ancestor
+        )));
+        let adopted = app.durable.channels.iter().find(|entry| entry.id == channel).unwrap();
+        assert_eq!(adopted.project_id, retry_id);
+        assert!(adopted.cards.is_empty());
+        assert_eq!(app.durable.cards, cards, "passive repair creates no actor");
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(app.active_workspace, None);
+    }
 }
