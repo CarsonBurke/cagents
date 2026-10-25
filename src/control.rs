@@ -111,11 +111,15 @@ pub enum TopCommand {
     /// Fixed local helper used inside the provider's default sandbox.
     #[command(hide = true)]
     InternalWorkspaceProbe {
+        /// Workspace directory selected for this capability probe.
         workspace: PathBuf,
+        /// Expected filesystem device ID of the workspace directory.
         #[arg(long)]
         device_id: u64,
+        /// Expected inode of the workspace directory.
         #[arg(long)]
         inode: u64,
+        /// Unique challenge binding the result and scratch path to this request.
         #[arg(long)]
         nonce: uuid::Uuid,
     },
