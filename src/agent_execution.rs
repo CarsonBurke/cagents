@@ -60,7 +60,13 @@ impl std::fmt::Debug for Authority {
 
 impl Authority {
     pub fn from_environment() -> Self {
-        Self(std::env::var(AUTHORITY_ENV).ok())
+        Self(match std::env::var(AUTHORITY_ENV) {
+            Ok(token) => Some(token),
+            Err(std::env::VarError::NotPresent) => None,
+            // Presence must not become User scope. Empty credentials already
+            // fail the normal authority parser without exposing the raw value.
+            Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+        })
     }
     pub(crate) fn session(token: String) -> Self {
         Self(Some(token))
@@ -732,3 +738,6 @@ mod tests {
         assert!(submit(&"x".repeat(65)).validate().is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+mod authority_environment_tests;
