@@ -12,7 +12,7 @@ use crate::{
 };
 use std::sync::Arc;
 
-fn fixture() -> (SharedHost, tempfile::TempDir, Home) {
+pub(super) fn fixture() -> (SharedHost, tempfile::TempDir, Home) {
     let directory = tempfile::tempdir().unwrap();
     let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
     let repository = directory.path().join("project");
@@ -66,7 +66,7 @@ fn mutation(home: Home) -> Mutation {
     }
 }
 
-fn wire(host: &SharedHost, authority: Authority, request: Request) -> Response {
+pub(super) fn wire(host: &SharedHost, authority: Authority, request: Request) -> Response {
     let (response, _, _) = crate::host::client::process_request(
         host,
         1,
@@ -107,6 +107,22 @@ fn public_handler_refuses_unknown_authority_instead_of_falling_back_to_user_and_
         },
         Request::Mutate {
             mutation: mutation(home),
+            caller: None,
+        },
+        Request::PrepareLocal {
+            home,
+            directory: "/must-not-be-opened".into(),
+            caller: None,
+        },
+        Request::ApplySelection {
+            selection: uuid::Uuid::new_v4(),
+            mutation: Mutation {
+                change: Change::Claim {
+                    target: Target::Local(uuid::Uuid::new_v4()),
+                    role: Role::Contribute,
+                },
+                ..mutation(home)
+            },
             caller: None,
         },
     ] {

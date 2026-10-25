@@ -663,11 +663,30 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ChannelWork { authority, request } => {
-            let response = if let crate::channel_work_api::Request::Refresh { home } = request {
-                drop(_shared);
-                super::channel_work::refresh(host, &authority, home)
-            } else {
-                super::channel_work::process(host, &authority, request)
+            let response = match request {
+                crate::channel_work_api::Request::Refresh { home } => {
+                    drop(_shared);
+                    super::channel_work::refresh(host, &authority, home)
+                }
+                crate::channel_work_api::Request::PrepareLocal {
+                    home,
+                    directory,
+                    caller,
+                } => {
+                    drop(_shared);
+                    super::channel_work::prepare_local(host, &authority, home, directory, caller)
+                }
+                crate::channel_work_api::Request::ApplySelection {
+                    selection,
+                    mutation,
+                    caller,
+                } => {
+                    drop(_shared);
+                    super::channel_work::apply_selection(
+                        host, &authority, selection, mutation, caller,
+                    )
+                }
+                request => super::channel_work::process(host, &authority, request),
             };
             Ok((ServerResponse::ChannelWork(response), Vec::new(), false))
         }
