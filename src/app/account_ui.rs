@@ -2003,6 +2003,12 @@ impl Cagents {
             return None;
         }
         let provider = account.provider;
+        // A fresh discovery already answered this question without starting
+        // the CLI. Do not repeatedly prepare missing-CLI probes or spend a
+        // manual attempt; explicit Refresh rediscovers before reaching here.
+        if self.account_ui.installed.get(&provider) == Some(&false) {
+            return None;
+        }
         let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
         // Figures from before a reset are wrong however recent they are, so
@@ -8707,6 +8713,60 @@ mod app_tests {
         }));
         assert_eq!(app.account_ui.installed.get(&Provider::Codex), Some(&true));
         assert!(app.account_ui.account(&id).unwrap().snapshot.is_none());
+
+        // Persisted writes have increasing Store revisions. A delayed startup
+        // snapshot must not restore the previous home or erase new pending work.
+        let homes = Homes::at(root.path().join("managed"));
+        let store = Store::at(root.path().join("registry"));
+        let old_registry = app.account_ui.registry.clone();
+        let (old_registry, ()) = store.update(|registry| *registry = old_registry).unwrap();
+        app.account_ui.homes = Some(homes.clone());
+        app.account_ui.set_registry(old_registry.clone());
+        let old_generation = app.account_ui.discovery_generation;
+        let newest_home = root.path().join("newest-home");
+        std::fs::create_dir(&newest_home).unwrap();
+        store
+            .update(|registry| {
+                registry.unregister(key);
+                registry
+                    .link(Provider::Codex, key, newest_home.clone(), None, None, 3)
+                    .unwrap();
+            })
+            .unwrap();
+        let (pending_key, _) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
+        let current_registry = store.load().unwrap();
+        assert!(current_registry.revision() > old_registry.revision());
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(
+            current_registry.clone(),
+        ))));
+        let current_owner = app.account_ui.account(&id).unwrap().owner;
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: old_generation,
+            registry: Ok(old_registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::from([(Provider::Codex, false)]),
+            provisional: false,
+        })));
+        assert_eq!(app.account_ui.registry, current_registry);
+        assert_eq!(app.account_ui.registry, store.load().unwrap());
+        assert_eq!(app.account_ui.account(&id).unwrap().owner, current_owner);
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().account.resolved_home(),
+            Some(newest_home)
+        );
+        assert!(
+            app.account_ui
+                .registry
+                .pending()
+                .iter()
+                .any(|pending| pending.key == pending_key)
+        );
+        assert_eq!(app.account_ui.installed.get(&Provider::Codex), Some(&true));
     }
 
     #[test]
@@ -8741,12 +8801,48 @@ mod app_tests {
         assert_eq!(state.snapshot.as_ref(), Some(&old));
         assert_eq!(state.failure.as_deref(), Some("Codex is not installed"));
         assert!(!state.schedule.in_flight(now_ms()));
-        let _ = app.locate_accounts();
+        let manual_before = state.schedule.manual_ready_at();
+        app.refresh_ui.focused = true;
+        for tick in 1..=3 {
+            let now = now_ms() + tick * schedule::REFRESH_INTERVAL;
+            assert!(app.probe_account(&id, Trigger::Tick, now).is_none());
+            assert!(app.probe_account(&id, Trigger::Focus, now).is_none());
+            assert!(app.probe_account(&id, Trigger::Manual, now).is_none());
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(!state.schedule.in_flight(now));
+            assert_eq!(state.schedule.manual_ready_at(), manual_before);
+        }
+        // An explicit request still refreshes discovery, but missing metadata
+        // does not start/abandon a probe or manufacture a manual debounce.
+        let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
+        finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, false)]));
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .manual_ready_at(),
+            manual_before
+        );
+        assert!(
+            !app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
         finish_discovery(&mut app, BTreeMap::from([(Provider::Codex, true)]));
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.present);
         assert!(state.failure.is_none());
         assert_eq!(state.snapshot.as_ref(), Some(&old));
+        assert!(
+            state.schedule.in_flight(now_ms()),
+            "reappearance continues the explicit manual request"
+        );
+        assert!(state.schedule.manual_ready_at().is_some());
+        assert!(!state.schedule.manual_ready(app.account_ui.now_ms));
         assert_eq!(
             state.owner, owner,
             "CLI detection does not replace account ownership"
