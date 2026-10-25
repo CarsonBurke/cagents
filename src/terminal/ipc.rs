@@ -187,7 +187,9 @@ use crate::{
 /// Known private account experiments use 117 and 118 and are not adopted here.
 /// Version 123 adds scoped User checkout selections and represents unchecked
 /// checkout dirtiness explicitly. Matched CLI, daemon and UI are required.
-pub const PROTOCOL_VERSION: u16 = 123;
+/// Version 124 appends Actor-owned checkout preparation from the original
+/// retained launch directory. Matched CLI, daemon and UI are required.
+pub const PROTOCOL_VERSION: u16 = 124;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
