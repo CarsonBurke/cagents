@@ -323,7 +323,7 @@ fn saturated_event_queue_retains_coalesced_rejection_without_blocking_shutdown_o
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(_, operation)| *operation == "send terminal input")
+            .is_some_and(|(_, operation, _)| *operation == "send terminal input")
         {
             break;
         }
@@ -514,5 +514,222 @@ fn proof_auth_and_wire_errors_cannot_be_reclassified_as_input_refusals() {
             .unwrap(),
         TerminalEvent::Error { .. }
     ));
+    mock.stop();
+}
+
+#[test]
+fn closed_input_admission_keeps_the_same_connection_for_actual_completion() {
+    for (message, retryable) in [
+        ("the terminal worker has closed", true),
+        ("terminal output has completed", false),
+    ] {
+        let mut mock = MockHost::begin(false);
+        mock.attach();
+        let key = KeyInput {
+            action: KeyAction::Release,
+            key: TerminalKey::Enter,
+            modifiers: KeyModifiers::default(),
+            text: None,
+            unshifted_codepoint: None,
+        };
+        mock.handle.key(key.clone()).unwrap();
+        let request = mock.request();
+        assert!(
+            matches!(request.request, ClientRequest::Key { terminal_id, input }
+            if terminal_id == mock.session.id && input == key)
+        );
+        mock.send(
+            Some(request.request_id),
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                message,
+                retryable,
+            )),
+        );
+        assert!(matches!(
+            mock.handle.events().recv_timeout(Duration::from_secs(2)).unwrap(),
+            TerminalEvent::InputRejected { operation: "send terminal key", message }
+                if message.contains("this input was not sent") && !message.contains("queue is full")
+        ));
+        mock.handle.wait_until_attached(Duration::ZERO).unwrap();
+        assert_eq!(mock.handle.proof(), Some(mock.proof.clone()));
+        mock.no_reconnect();
+        mock.event(
+            1,
+            WireTerminalEvent::Completed {
+                exit_code: 17,
+                signal: None,
+                intentional: false,
+            },
+        );
+        assert!(matches!(
+            mock.handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::Completed {
+                exit_code: 17,
+                signal: None,
+                intentional: false
+            }
+        ));
+        // A distinct observational control is the next request: the refused
+        // physical key is neither replayed nor silently acknowledged.
+        mock.handle.focus(false).unwrap();
+        let next = mock.request();
+        assert!(next.request_id > request.request_id);
+        assert!(
+            matches!(next.request, ClientRequest::Focus { terminal_id, focused: false }
+            if terminal_id == mock.session.id)
+        );
+        mock.response(next.request_id, ServerResponse::Accepted);
+        mock.no_reconnect();
+        mock.stop();
+    }
+}
+
+#[test]
+fn unavailable_refusals_require_the_exact_pre_effect_input_contract() {
+    for (kind, message, retryable) in [
+        ("input", "unknown partial input delivery", true),
+        ("input", "the terminal worker has closed", false),
+        ("input", "terminal output has completed", true),
+        ("attach", "the terminal worker has closed", true),
+        ("control", "the terminal worker has closed", true),
+        ("unsolicited", "the terminal worker has closed", true),
+        ("unknown", "the terminal worker has closed", true),
+        ("wrong-proof", "the terminal worker has closed", true),
+        ("wrong-version", "the terminal worker has closed", true),
+    ] {
+        let mut mock = MockHost::begin(false);
+        let request_id = if kind == "attach" {
+            Some(mock.attachment)
+        } else {
+            mock.attach();
+            match kind {
+                "input" | "wrong-proof" | "wrong-version" => {
+                    mock.handle.input(b"never replay".to_vec()).unwrap();
+                    Some(mock.request().request_id)
+                }
+                "control" => {
+                    mock.handle.focus(true).unwrap();
+                    Some(mock.request().request_id)
+                }
+                "unsolicited" => None,
+                "unknown" => Some(u64::MAX),
+                _ => unreachable!(),
+            }
+        };
+        write_frame(
+            &mut mock.stream,
+            &ServerEnvelope {
+                version: if kind == "wrong-version" {
+                    PROTOCOL_VERSION - 1
+                } else {
+                    PROTOCOL_VERSION
+                },
+                request_id,
+                proof: if kind == "wrong-proof" {
+                    proof("other-incarnation")
+                } else {
+                    mock.proof.clone()
+                },
+                message: ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    message,
+                    retryable,
+                )),
+            },
+        )
+        .unwrap();
+        if retryable {
+            let _next = mock.reconnect();
+        }
+        if matches!(kind, "unknown" | "wrong-proof" | "wrong-version") {
+            assert!(mock.handle.events().try_recv().is_err());
+        } else {
+            let first = mock.handle.events().recv_timeout(Duration::from_secs(2));
+            assert!(
+                matches!(first, Ok(TerminalEvent::Error { message: actual, .. }) if actual == message)
+            );
+        }
+        assert!(
+            mock.handle
+                .events()
+                .try_iter()
+                .all(|event| !matches!(event, TerminalEvent::InputRejected { .. }))
+        );
+        mock.stop();
+    }
+}
+
+#[test]
+fn full_event_inbox_preserves_mixed_pre_effect_refusals_and_completion() {
+    let mut mock = MockHost::begin(false);
+    mock.attach();
+    for sequence in 1..=EVENT_CAPACITY as u64 {
+        mock.event(sequence, WireTerminalEvent::Bell);
+    }
+    mock.handle.input(b"queue refused".to_vec()).unwrap();
+    let input = mock.request();
+    mock.refuse(Some(input.request_id), ProtocolErrorCode::QueueFull, true);
+    wait_for_rejection(&mock);
+    mock.handle.input(b"closed refused".to_vec()).unwrap();
+    let input = mock.request();
+    mock.send(
+        Some(input.request_id),
+        ServerMessage::Error(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "the terminal worker has closed",
+            true,
+        )),
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if mock
+            .handle
+            .inner
+            .published
+            .input_rejection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, _, reason)| *reason == InputRejectionReason::Coalesced)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed refusal must not block on the UI inbox"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let queued = mock.handle.events();
+    assert_eq!(
+        queued
+            .try_iter()
+            .filter(|event| matches!(event, TerminalEvent::Bell))
+            .count(),
+        EVENT_CAPACITY
+    );
+    assert!(matches!(mock.handle.events().try_recv().unwrap(),
+        TerminalEvent::InputRejected { operation: "send terminal input", message }
+        if message == "Terminal input was refused before it was sent."));
+    mock.event(
+        EVENT_CAPACITY as u64 + 1,
+        WireTerminalEvent::Completed {
+            exit_code: 19,
+            signal: None,
+            intentional: false,
+        },
+    );
+    assert!(matches!(
+        mock.handle
+            .events()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        TerminalEvent::Completed { exit_code: 19, .. }
+    ));
+    mock.no_reconnect();
     mock.stop();
 }
