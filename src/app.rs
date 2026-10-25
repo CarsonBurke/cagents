@@ -5131,6 +5131,8 @@ pub struct Cagents {
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
+    /// Exact passive reads, so an old failure cannot release a newer path's admission.
+    workspace_model_loads: HashMap<ProjectId, (PathBuf, u64)>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
@@ -13853,6 +13855,7 @@ impl Application for Cagents {
             shared_views,
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_loads: HashMap::new(),
             workspace_model_rx,
             workspace_model_tx,
             activation_rx,
@@ -14452,6 +14455,9 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                if result.is_ok() {
+                    self.finish_workspace_model_load(project_id, generation, false);
+                }
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -14799,6 +14805,7 @@ impl Application for Cagents {
                         self.status = Some(TransientNotice::error(error.clone()));
                         finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                         task = self.apply_closed_project_tombstones();
+                        self.finish_workspace_model_load(project_id, generation, true);
                     }
                 }
                 task
@@ -28352,6 +28359,7 @@ mod tests {
             shared_views: shared_views::State::default(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
+            workspace_model_loads: HashMap::new(),
             workspace_model_rx: async_channel::unbounded().1,
             // Unbounded and unread: a fixture publishes into a queue nobody
             // drains, which is what keeps a test off the daemon entirely.
