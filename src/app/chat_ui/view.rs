@@ -3445,9 +3445,12 @@ impl Runtime {
                 .spacing(space::XS)
                 .into()
             };
-            crate::interaction::keyboard_list(
-                widget::scrollable(content).height(Length::Shrink),
-                true,
+            crate::interaction::focused_escape(
+                crate::interaction::keyboard_list(
+                    widget::scrollable(content).height(Length::Shrink),
+                    true,
+                ),
+                move || action(Action::ComposerActions(target, false)),
             )
         });
         crate::interaction::composer_popover(
@@ -13568,6 +13571,74 @@ mod tests {
             "later layouts cannot reset newer widget scroll before its callback arrives"
         );
     }
+    #[test]
+    fn busy_actions_search_escape_dismisses_without_interrupting() {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        let mut renderer = crate::app::tests::headless_renderer();
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.busy = true;
+        runtime.composer_actions = true;
+        let target = runtime.target;
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        let element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            620.0,
+            Place {
+                name: "fixture".into(),
+                branch: None,
+                channel: None,
+            },
+            true,
+            None,
+            vec![],
+        );
+        let mut ui = UserInterface::build(
+            element,
+            iced::Size::new(620.0, 720.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        // Traverse the real overlay with the native operation; the search,
+        // rather than the editor underneath, owns this Escape.
+        ui.operate(
+            &renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+                target.card,
+                "chat-actions-search",
+            )),
+        );
+        let escape = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[escape],
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target)));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+        );
+    }
+
     #[test]
     fn busy_composer_escape_dismisses_actions_before_interrupting() {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
