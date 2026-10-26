@@ -219,13 +219,19 @@ async fn clean_reload_retains_caret_scroll_and_preview_mode() {
 #[tokio::test]
 async fn native_alias_parent_deduplicates_and_survives_other_owner_close() {
     let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join("real")).unwrap();
+    std::fs::create_dir_all(root.path().join("real/checkout")).unwrap();
     std::os::unix::fs::symlink("real", root.path().join("alias")).unwrap();
-    let real = root.path().join("real");
-    let alias = root.path().join("alias");
+    let real = root.path().join("real/checkout");
+    let alias = root.path().join("alias/checkout");
     std::fs::write(real.join("live.txt"), "first").unwrap();
     let (a, mut first) = opened(&real, "live.txt").await;
     let (b, mut second) = opened(&alias, "live.txt").await;
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        native_watch_count(&real),
+        1,
+        "two aliases must share one active native watch"
+    );
     std::fs::write(real.join("live.txt"), "both updated").unwrap();
     text(a, &mut first, "both updated").await;
     text(b, &mut second, "both updated").await;
@@ -238,6 +244,16 @@ async fn native_alias_parent_deduplicates_and_survives_other_owner_close() {
         .arm(vec![real.join("live.txt")]);
     std::fs::write(real.join("live.txt"), "still watched").unwrap();
     text(a, &mut first, "still watched").await;
+    drop(first);
+    let barrier_root = tempfile::tempdir().unwrap();
+    let barrier = DocumentWatch::new();
+    barrier.arm(vec![barrier_root.path().join("barrier.txt")]);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        native_watch_count(&real),
+        0,
+        "last document close must release its native watch"
+    );
 }
 #[tokio::test]
 async fn native_rapid_parent_recreation_and_atomic_write_bursts_converge() {
@@ -272,7 +288,7 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     let old_key = runtime.find_cache.clone();
     std::fs::write(&path, "needle erased").unwrap();
     text(card, &mut runtime, "needle erased").await;
-    assert_ne!(old_key, runtime.find_cache);
+    assert!(old_key != runtime.find_cache);
     assert_eq!(runtime.find_total, 1);
     assert!(runtime.take_restored_editor_focus(card).is_none());
 }
@@ -328,6 +344,12 @@ fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery()
         "explicit native rearm failed: {:?}",
         watch.error()
     );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        native_watch_count(root.path()),
+        1,
+        "recovery must install a real native watch"
+    );
     while watch.receiver().try_recv().is_ok() {}
     std::fs::write(&path, "after!").unwrap();
     runtime.block_on(async {
@@ -336,4 +358,24 @@ fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery()
             .expect("recovered real native watch did not deliver")
             .unwrap();
     });
+}
+
+#[cfg(target_os = "linux")]
+fn native_watch_count(path: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let inode = path.metadata().unwrap().ino();
+    std::fs::read_dir("/proc/self/fdinfo")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .flat_map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter(|line| {
+            line.starts_with("inotify wd:")
+                && line.split_whitespace().any(|part| {
+                    part.strip_prefix("ino:")
+                        .and_then(|value| u64::from_str_radix(value, 16).ok())
+                        == Some(inode)
+                })
+        })
+        .count()
 }
