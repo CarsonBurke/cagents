@@ -49,7 +49,9 @@ pub fn discover(path: &Path) -> Result<ProjectLocation, String> {
     if output.status.success() {
         let key = String::from_utf8(output.stdout)
             .map_err(|_| "git reported a repository path that is not valid UTF-8".to_owned())?;
-        let key = key.trim_end();
+        // Git writes one output newline; whitespace before it belongs to the
+        // directory name, including a newline at the end of that name.
+        let key = key.strip_suffix('\n').unwrap_or(&key);
         if key.is_empty() {
             return Err("git reported an empty repository path".into());
         }
@@ -183,10 +185,16 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
         // that directory names the shared one it borrows objects and refs from.
         // A marker that names nothing readable is skipped, not trusted.
         let content = fs::read_to_string(&marker).ok()?;
-        let private = ancestor.join(content.strip_prefix("gitdir:")?.trim());
+        let private = ancestor.join(
+            content
+                .strip_prefix("gitdir: ")?
+                .trim_end_matches(['\r', '\n']),
+        );
         let private = fs::canonicalize(private).ok()?;
         let common = match fs::read_to_string(private.join("commondir")) {
-            Ok(common) => fs::canonicalize(private.join(common.trim())).ok()?,
+            Ok(common) => {
+                fs::canonicalize(private.join(common.trim_end_matches(['\r', '\n']))).ok()?
+            }
             Err(_) => private,
         };
         Some((ancestor.to_path_buf(), common))
@@ -196,6 +204,136 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(directory: &Path, arguments: &[&std::ffi::OsStr]) {
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .args(arguments)
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_trailing_git_directory_whitespace() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["bare-space ", "bare-tab\t", "bare-newline\n"] {
+            let directory = root.path().join(name);
+            // A real decoy also catches silently adopting the trimmed path.
+            for path in [directory.as_path(), &root.path().join(name.trim_end())] {
+                git(
+                    root.path(),
+                    &[
+                        "init".as_ref(),
+                        "--quiet".as_ref(),
+                        "--bare".as_ref(),
+                        "--template=".as_ref(),
+                        path.as_os_str(),
+                    ],
+                );
+            }
+            assert_eq!(
+                discover(&directory).unwrap(),
+                ProjectLocation {
+                    key: directory.canonicalize().unwrap(),
+                    kind: ProjectKind::Git,
+                }
+            );
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn placement_preserves_git_marker_and_common_directory_whitespace() {
+        let root = tempfile::tempdir().unwrap();
+        for suffix in [" ", "\t"] {
+            let repository = root.path().join(format!("repository{suffix}"));
+            let metadata = root.path().join(format!("metadata{suffix}"));
+            git(
+                root.path(),
+                &[
+                    "init".as_ref(),
+                    "--quiet".as_ref(),
+                    "--template=".as_ref(),
+                    "--separate-git-dir".as_ref(),
+                    metadata.as_os_str(),
+                    repository.as_os_str(),
+                ],
+            );
+            let key = metadata.canonicalize().unwrap();
+            let mut model = crate::workspace_model::WorkspaceModel::default();
+            model.projects.push(crate::workspace_model::ModelProject {
+                repository: key.clone(),
+                name: "repository".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            });
+            assert_eq!(discover(&repository).unwrap().key, key);
+            assert_eq!(
+                place(&repository, &model),
+                Placement {
+                    worktree: Some(repository.canonicalize().unwrap()),
+                    project: Some(key.clone()),
+                }
+            );
+
+            git(
+                &repository,
+                &[
+                    "-c".as_ref(),
+                    "user.name=Fixture".as_ref(),
+                    "-c".as_ref(),
+                    "user.email=fixture@example.invalid".as_ref(),
+                    "commit".as_ref(),
+                    "--quiet".as_ref(),
+                    "--allow-empty".as_ref(),
+                    "-m".as_ref(),
+                    "root".as_ref(),
+                ],
+            );
+            let linked = root.path().join(format!("linked{suffix}"));
+            git(
+                &repository,
+                &[
+                    "worktree".as_ref(),
+                    "add".as_ref(),
+                    "--quiet".as_ref(),
+                    "--detach".as_ref(),
+                    linked.as_os_str(),
+                ],
+            );
+            let marker = fs::read_to_string(linked.join(".git")).unwrap();
+            let private = Path::new(
+                marker
+                    .strip_prefix("gitdir: ")
+                    .unwrap()
+                    .trim_end_matches(['\r', '\n']),
+            );
+            // Git accepts an absolute commondir, with CRLF as its terminator.
+            fs::write(private.join("commondir"), format!("{}\r\n", key.display())).unwrap();
+            assert_eq!(discover(&linked).unwrap().key, key);
+            assert_eq!(
+                place(&linked, &model),
+                Placement {
+                    worktree: Some(linked.canonicalize().unwrap()),
+                    project: Some(key),
+                }
+            );
+        }
+    }
 
     #[test]
     fn plain_folders_have_canonical_folder_identity() {
