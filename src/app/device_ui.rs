@@ -326,14 +326,18 @@ impl Cagents {
         if self.chat_ui.image_viewer.is_some() {
             return Task::none();
         }
+        let mut same_owner = Vec::new();
+        let mut marker = None;
         let target = if self.terminal_paste.is_some() {
             Some(widget::Id::new("terminal-paste-cancel"))
         } else {
             #[cfg(feature = "integrated-browser")]
             if self.browser_import.open() {
-                return iced::widget::operation::focus(widget::Id::new(
-                    "dialog.browser-import.cancel",
-                ))
+                return crate::interaction::guarded_focus(
+                    widget::Id::new("dialog.browser-import.cancel"),
+                    Vec::new(),
+                    None,
+                )
                 .map(cosmic::Action::App);
             }
             if self.session_recovery.open() {
@@ -346,11 +350,18 @@ impl Cagents {
                 return self.focus_terminal_close_after_cover();
             } else if self.settings_reset_confirm {
                 self.settings_reset_focus_confirm = false;
+                marker = Some(self.settings_reset_focus_marker());
+                same_owner.push(widget::Id::new("dialog.reset-settings.confirm"));
                 Some(widget::Id::new("dialog.reset-settings.cancel"))
             } else if self.sidebar_state.pending_discard().is_some() {
                 Some(sidebar::discard_cancel_id())
             } else if let Some(close) = &mut self.dirty_repository_close {
                 close.focused = DirtyCloseControl::Cancel;
+                marker = Some(dirty_close_focus_marker(close));
+                same_owner.extend([
+                    dirty_close_control_id(close.card, DirtyCloseControl::Save),
+                    dirty_close_control_id(close.card, DirtyCloseControl::Discard),
+                ]);
                 Some(dirty_close_control_id(
                     close.card,
                     DirtyCloseControl::Cancel,
@@ -375,8 +386,12 @@ impl Cagents {
                     .map(|card| self.card_keyboard_focus(card))
             }
         };
-        iced::widget::operation::focus(target.unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)))
-            .map(cosmic::Action::App)
+        crate::interaction::guarded_focus(
+            target.unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+            same_owner,
+            marker,
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
@@ -2015,6 +2030,112 @@ mod tests {
         assert!(!app.device_ui.open);
         assert_eq!(super::super::tests::focused(&app, task), Some(target));
         assert!(iced::runtime::task::into_stream(app.update_device(Action::Close)).is_none());
+    }
+
+    #[test]
+    fn delayed_device_close_restore_preserves_reopened_device_with_old_targets_still_mounted() {
+        for resume in [false, true] {
+            for retain_target in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(true);
+                app.context_inspector_open = false;
+                app.resume_ui.open = resume;
+                let old_target = if resume {
+                    resume_ui::focus_id()
+                } else {
+                    app.card_keyboard_focus(app.workspace.focused().unwrap())
+                };
+                app.device_ui.open = true;
+                let original_scope = app.device_ui.keyboard_scope.clone();
+                let delayed = app.update_device(Action::Close);
+                assert!(!app.device_ui.open);
+                app.device_ui.open = true;
+                assert_ne!(app.device_ui.keyboard_scope, original_scope);
+                let owner = widget::Id::new("device-tools.directory");
+                let mut children = vec![app.device_dialog()];
+                if retain_target {
+                    children.push(
+                        crate::ui_controls::field::text("Retained older target", "")
+                            .id(old_target)
+                            .on_input(|_| Message::CancelDialog)
+                            .into(),
+                    );
+                }
+                let effects = iced::widget::operation::focus(owner.clone())
+                    .map(cosmic::Action::App)
+                    .chain(delayed);
+                assert_eq!(
+                    super::super::tests::focused_element(
+                        widget::column::with_children(children).into(),
+                        effects
+                    ),
+                    Some(owner),
+                    "old restore cannot blur reopened Device files: resume={resume}, retained={retain_target}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn returning_to_settings_cancel_keeps_logical_and_native_focus_aligned() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_reset_confirm = true;
+        app.settings_reset_focus_confirm = true;
+        app.device_ui.open = true;
+        let delayed = app.update_device(Action::Close);
+        assert!(!app.device_ui.open);
+        assert!(!app.settings_reset_focus_confirm);
+        let cancel = widget::Id::new("dialog.reset-settings.cancel");
+        let confirm = widget::Id::new("dialog.reset-settings.confirm");
+        let effects = iced::widget::operation::focus(confirm)
+            .map(cosmic::Action::App)
+            .chain(delayed);
+        assert_eq!(
+            super::super::tests::focused_element(
+                cosmic::Application::dialog(&app).unwrap(),
+                effects
+            ),
+            Some(cancel.clone()),
+        );
+        let action = super::super::dialog_ui::tests::enter_control(
+            cosmic::Application::dialog(&app).unwrap(),
+            cancel,
+        );
+        assert!(matches!(action, Message::CancelResetSettings));
+        drop(app.update(action));
+        assert!(!app.settings_reset_confirm);
+    }
+
+    #[test]
+    fn delayed_settings_cancel_yields_to_newer_tab_and_reopened_confirmation() {
+        for reopen in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            drop(app.update(Message::ResetSettings));
+            app.device_ui.open = true;
+            let delayed = app.update_device(Action::Close);
+            let old_instance = app.settings_reset_focus_instance;
+            let newer = if reopen {
+                drop(app.update(Message::CancelResetSettings));
+                drop(app.update(Message::ResetSettings));
+                assert_ne!(app.settings_reset_focus_instance, old_instance);
+                iced::widget::operation::focus(widget::Id::new("dialog.reset-settings.confirm"))
+                    .map(cosmic::Action::App)
+            } else {
+                app.update(Message::KeyEvent {
+                    event: super::super::dialog_ui::tests::key_press(keyboard::key::Named::Tab),
+                    captured: false,
+                })
+            };
+            assert_eq!(app.settings_reset_focus_confirm, !reopen);
+            assert_eq!(
+                super::super::tests::focused_element(
+                    cosmic::Application::dialog(&app).unwrap(),
+                    newer.chain(delayed),
+                ),
+                Some(widget::Id::new("dialog.reset-settings.confirm")),
+                "old Cancel restore cannot override the newer settings owner: reopen={reopen}",
+            );
+            assert!(app.settings_reset_confirm);
+        }
     }
 
     #[test]
