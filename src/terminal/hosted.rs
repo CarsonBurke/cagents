@@ -182,6 +182,25 @@ struct RetainedFrame {
     expires: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputRejectionReason {
+    QueueFull,
+    WorkerClosed,
+    Coalesced,
+}
+
+impl InputRejectionReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::QueueFull => {
+                "The terminal input queue is full; input was not accepted. Retry when output drains."
+            }
+            Self::WorkerClosed => "The terminal is not accepting input; this input was not sent.",
+            Self::Coalesced => "Terminal input was refused before it was sent.",
+        }
+    }
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     /// The last grid a hibernated view showed.
@@ -216,7 +235,7 @@ struct HostedPublishedState {
     semantic_wake_pending: AtomicBool,
     // At most one coalesced local refusal outlives a full semantic inbox. No
     // input bytes, daemon error payload or unbounded per-request list is kept.
-    input_rejection: Mutex<Option<(Sender<TerminalEvent>, &'static str)>>,
+    input_rejection: Mutex<Option<(Sender<TerminalEvent>, &'static str, InputRejectionReason)>>,
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
@@ -472,11 +491,11 @@ impl HostedPublishedState {
             .input_rejection
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let full = if let Some((events, operation)) = pending.take() {
-            match events.try_send(Self::input_rejected(operation)) {
+        let full = if let Some((events, operation, reason)) = pending.take() {
+            match events.try_send(Self::input_rejected(operation, reason)) {
                 Ok(()) | Err(TrySendError::Disconnected(_)) => false,
                 Err(TrySendError::Full(_)) => {
-                    *pending = Some((events, operation));
+                    *pending = Some((events, operation, reason));
                     true
                 }
             }
@@ -491,26 +510,38 @@ impl HostedPublishedState {
         }
     }
 
-    fn input_rejected(operation: &'static str) -> TerminalEvent {
+    fn input_rejected(operation: &'static str, reason: InputRejectionReason) -> TerminalEvent {
         TerminalEvent::InputRejected {
             operation,
-            message: "The terminal input queue is full; input was not accepted. Retry when output drains.".into(),
+            message: reason.message().into(),
         }
     }
 
-    fn reject_input(&self, events: &Sender<TerminalEvent>, operation: &'static str) {
+    fn reject_input(
+        &self,
+        events: &Sender<TerminalEvent>,
+        operation: &'static str,
+        reason: InputRejectionReason,
+    ) {
         let mut pending = self
             .input_rejection
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let operation = if pending.is_some() {
-            "send terminal input"
+        let (operation, reason) = if let Some((_, _, previous)) = pending.as_ref() {
+            (
+                "send terminal input",
+                if *previous == reason {
+                    reason
+                } else {
+                    InputRejectionReason::Coalesced
+                },
+            )
         } else {
-            operation
+            (operation, reason)
         };
-        match events.try_send(Self::input_rejected(operation)) {
+        match events.try_send(Self::input_rejected(operation, reason)) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => *pending = None,
-            Err(TrySendError::Full(_)) => *pending = Some((events.clone(), operation)),
+            Err(TrySendError::Full(_)) => *pending = Some((events.clone(), operation, reason)),
         }
         drop(pending);
         // Never wait on the UI here: Stop and queued ShutdownTerminal must
@@ -2533,15 +2564,32 @@ fn serve_connection(
                     };
                 };
                 let request = pending.remove(&request_id);
-                if error.retryable
-                    && error.code == ProtocolErrorCode::QueueFull
-                    && let Some(PendingRequest::Input(operation)) = &request
-                {
-                    // Version, host proof and exact request correlation have
-                    // already passed. This input was refused before admission,
-                    // so retain this connection and never replay the command.
-                    published.reject_input(events, *operation);
-                    continue;
+                if let Some(PendingRequest::Input(operation)) = &request {
+                    let refusal = match (error.code, error.retryable, error.message.as_str()) {
+                        (ProtocolErrorCode::QueueFull, true, _) => {
+                            Some(InputRejectionReason::QueueFull)
+                        }
+                        // These exact host admission errors precede any input
+                        // effect. Completion can race its response; keep the
+                        // attachment to receive the actual Completed event.
+                        (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            true,
+                            "the terminal worker has closed",
+                        )
+                        | (
+                            ProtocolErrorCode::TerminalUnavailable,
+                            false,
+                            "terminal output has completed",
+                        ) => Some(InputRejectionReason::WorkerClosed),
+                        _ => None,
+                    };
+                    if let Some(reason) = refusal {
+                        // Version, proof and exact request correlation have
+                        // passed. Never replay this refused command.
+                        published.reject_input(events, *operation, reason);
+                        continue;
+                    }
                 }
                 let mut attachment_failed = false;
                 let operation = match request {

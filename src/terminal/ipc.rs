@@ -175,9 +175,21 @@ use crate::{
 /// Version 105 adds immutable image-reference metadata to Attachment and
 /// ItemContent::Image. These are positional postcard fields, so all three
 /// executables must be replaced together; JSON omission alone is compatible.
+/// Version 110 bounds channel-work projections with independent current/history
+/// cursors and adds exact-target and metadata-only home reads for safe recovery.
 /// Version 115 appends an explicit recoverable input notice. Older clients
 /// cannot decode this unsolicited event, so all three executables must match.
-pub const PROTOCOL_VERSION: u16 = 115;
+/// Version 116 combines channel-work requests/responses with recoverable input
+/// notices. Neither predecessor identifies this combined matched executable set.
+/// Version 119 replaces a channel-work caller's incidental whole-view revision
+/// with an explicit durable placement_epoch. Matched executables are required;
+/// old saved actor requests are refused without rebasing their captured intent.
+/// Known private account experiments use 117 and 118 and are not adopted here.
+/// Version 125 raises terminal history to an explicit byte budget (16 MiB by
+/// default, up to 1 GiB). Published protocol-119 hosts reject values above
+/// 1,000,000, so their unchanged positional field encoding is not sufficient
+/// compatibility: replace the matched daemon before sending the new budgets.
+pub const PROTOCOL_VERSION: u16 = 125;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -527,6 +539,10 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
+    ChannelWork {
+        authority: crate::agent_execution::Authority,
+        request: crate::channel_work_api::Request,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,7 +558,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty history page budget in bytes. The legacy JSON name also meant bytes.
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -554,7 +572,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -568,7 +586,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -858,6 +876,7 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
+    ChannelWork(crate::channel_work_api::Response),
 }
 
 /// Maximum compact inventory rows in one capacity response.
@@ -2065,6 +2084,57 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct LegacyOptions {
+            columns: u16,
+            rows: u16,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            max_scrollback: usize,
+            initially_visible: bool,
+            theme: TerminalTheme,
+        }
+        for budget in [
+            0,
+            10_000,
+            TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
+            TerminalConfig::MAX_SCROLLBACK_BYTES,
+        ] {
+            let legacy = LegacyOptions {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                max_scrollback: budget,
+                initially_visible: true,
+                theme: TerminalTheme::default(),
+            };
+            let decoded: TerminalSpawnOptions =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            assert_eq!(decoded.max_scrollback_bytes, budget);
+            let mut old_frame = Vec::new();
+            write_frame(&mut old_frame, &legacy).unwrap();
+            let mut new_frame = Vec::new();
+            write_frame(&mut new_frame, &decoded).unwrap();
+            assert_eq!(old_frame, new_frame);
+            assert_eq!(
+                read_frame::<TerminalSpawnOptions>(&mut Cursor::new(&old_frame)).unwrap(),
+                Some(decoded)
+            );
+            assert_eq!(
+                read_frame::<LegacyOptions>(&mut Cursor::new(&new_frame)).unwrap(),
+                Some(legacy)
+            );
+        }
+        let options = TerminalSpawnOptions::from(TerminalConfig::default());
+        assert_eq!(options.max_scrollback_bytes, 16 * 1024 * 1024);
+        let mut duplicate = serde_json::to_value(options).unwrap();
+        duplicate["max_scrollback"] = serde_json::json!(10_000);
+        assert!(serde_json::from_value::<TerminalSpawnOptions>(duplicate).is_err());
+    }
 
     #[test]
     fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {

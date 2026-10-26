@@ -38,6 +38,7 @@ enum ObservedInput {
     Connect,
     Paste(String),
     Input(Vec<u8>),
+    Key(crate::terminal::KeyInput),
 }
 
 struct Peer {
@@ -48,6 +49,7 @@ struct Peer {
     worker: Option<thread::JoinHandle<()>>,
     sequence: u64,
     reject_next_paste: Arc<AtomicBool>,
+    reject_next_key: Arc<std::sync::Mutex<Option<ProtocolError>>>,
     observed: crossbeam_channel::Receiver<ObservedInput>,
 }
 impl Peer {
@@ -66,6 +68,8 @@ impl Peer {
         let expected_proof = proof.clone();
         let reject_next_paste = Arc::new(AtomicBool::new(false));
         let reject_paste = Arc::clone(&reject_next_paste);
+        let reject_next_key = Arc::new(std::sync::Mutex::new(None));
+        let reject_key = Arc::clone(&reject_next_key);
         let (observe, observed) = crossbeam_channel::unbounded();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -125,6 +129,7 @@ impl Peer {
                     ClientRequest::Connect { .. } => Some(ObservedInput::Connect),
                     ClientRequest::Paste { text, .. } => Some(ObservedInput::Paste(text.clone())),
                     ClientRequest::Input { bytes, .. } => Some(ObservedInput::Input(bytes.clone())),
+                    ClientRequest::Key { input, .. } => Some(ObservedInput::Key(input.clone())),
                     _ => None,
                 };
                 let message = if !connected {
@@ -144,6 +149,10 @@ impl Peer {
                         "the terminal command queue is full",
                         true,
                     ))
+                } else if matches!(request.request, ClientRequest::Key { .. })
+                    && let Some(error) = reject_key.lock().unwrap().take()
+                {
+                    ServerMessage::Error(error)
                 } else if matches!(request.request, ClientRequest::CopyTerminalSelection { .. }) {
                     // Control errors carry the request ID. The hosted client
                     // restores the exact pending operation before UI delivery.
@@ -185,6 +194,7 @@ impl Peer {
             worker: Some(worker),
             sequence: 0,
             reject_next_paste,
+            reject_next_key,
             observed,
         };
         peer.handle
@@ -796,4 +806,148 @@ fn late_input_notice_cannot_replace_a_fatal_or_completed_original() {
                 .contains("late notice must not replace")
         }));
     }
+}
+
+#[test]
+fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() {
+    for (message, retryable) in [
+        ("the terminal worker has closed", true),
+        ("terminal output has completed", false),
+    ] {
+        let (mut app, card, mut peer) = fixture();
+        let proof = peer.handle.proof().unwrap();
+        let continuity = terminal_continuity(app.card_state(card)).unwrap().clone();
+        let uncertain = app.uncertain_terminal_proofs.clone();
+        let recovery_attempts = app.terminal_recovery_attempts.clone();
+        let mut observed = peer.observed.try_iter().collect::<Vec<_>>();
+        *peer.reject_next_key.lock().unwrap() = Some(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            message,
+            retryable,
+        ));
+        let key = crate::terminal::KeyInput {
+            action: crate::terminal::KeyAction::Release,
+            key: crate::terminal::TerminalKey::Enter,
+            modifiers: crate::terminal::KeyModifiers::default(),
+            text: None,
+            unshifted_codepoint: None,
+        };
+        peer.handle.key(key.clone()).unwrap();
+        loop {
+            let request = peer.observed.recv_timeout(Duration::from_secs(3)).unwrap();
+            let done = matches!(&request, ObservedInput::Key(actual) if *actual == key);
+            observed.push(request);
+            if done {
+                break;
+            }
+        }
+        let events = peer.handle.events();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while events.is_empty() {
+            assert!(Instant::now() < deadline, "actual correlated key refusal");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Force the refusal through App before any completion exists. A
+        // generic Error here used to replace the retained terminal surface.
+        let durable = Arc::clone(&app.durable);
+        drop(app.update(Message::TerminalWake {
+            card,
+            generation: peer.handle.generation(),
+        }));
+        assert!(Arc::ptr_eq(&durable, &app.durable));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
+        );
+        assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
+        assert!(
+            ended_terminal(app.card_state(card)).is_none(),
+            "a refusal is not an exit receipt"
+        );
+        assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
+        assert_eq!(app.uncertain_terminal_proofs, uncertain);
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.severity == NoticeSeverity::Warning
+                    && entry.notice.message.contains("this input was not sent"))
+        );
+        apply(
+            &mut app,
+            card,
+            &mut peer,
+            Some(WireTerminalEvent::Completed {
+                exit_code: 23,
+                signal: None,
+                intentional: false,
+            }),
+        );
+        assert!(matches!(
+            &ended_terminal(app.card_state(card)).unwrap().continuity,
+            TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
+                if exit.code == Some(23) && exit.signal.is_none()
+        ));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
+            if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().residency,
+            Residency::Hibernated
+        );
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.severity == NoticeSeverity::Error
+                    && entry.notice.message == "terminal exited with status 23")
+        );
+        observed.extend(peer.observed.try_iter());
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|r| matches!(r, ObservedInput::Connect))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|r| matches!(r, ObservedInput::Key(actual) if *actual == key))
+                .count(),
+            1,
+            "no reconnect or automatic replay of the refused physical key"
+        );
+        assert!(!peer.worker.as_ref().unwrap().is_finished());
+    }
+}
+
+#[test]
+fn worker_closed_wording_in_a_real_wire_error_remains_fatal() {
+    let (mut app, card, mut peer) = fixture();
+    apply(
+        &mut app,
+        card,
+        &mut peer,
+        Some(WireTerminalEvent::Error {
+            operation: "send terminal key".into(),
+            message: "the terminal worker has closed".into(),
+        }),
+    );
+    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.notices.entries.iter().any(|entry| {
+        entry.notice.severity == NoticeSeverity::Error
+            && entry
+                .notice
+                .message
+                .contains("the terminal worker has closed")
+    }));
+    assert!(
+        !app.notices
+            .entries
+            .iter()
+            .any(|entry| entry.notice.message.contains("Terminal input rejected"))
+    );
 }
