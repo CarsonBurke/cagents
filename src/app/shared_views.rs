@@ -1623,11 +1623,17 @@ impl Cagents {
             match existing {
                 Some(card) if card.existence.is_open() => {
                     if card.kind != pane.kind
-                        && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&pane.id)
+                        && runtime.blocks_navigation()
                     {
-                        self.status = Some(TransientNotice::warning(
-                            "Another client changed this pane. Save or discard its unsaved edits before adopting that change.",
-                        ));
+                        let message = if runtime.is_dirty() {
+                            "Another client changed this pane. Save or discard its unsaved edits before adopting that change."
+                        } else if runtime.is_saving() {
+                            "Another client changed this pane. Wait for its save to finish before adopting that change."
+                        } else {
+                            "Another client changed this pane. Resolve this editor's file recovery or durability warning before adopting that change."
+                        };
+                        self.status = Some(TransientNotice::warning(message));
                         continue;
                     }
                     if card.kind != pane.kind {
@@ -4192,6 +4198,16 @@ mod tests {
                 assert_eq!(current.has_durability_warning(), state == "warning");
                 assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
                 assert!(app.card_state(pane.id).unwrap().existence.is_open());
+                let notice = app.status.as_ref().unwrap().message.as_str();
+                match state {
+                    "dirty" => assert!(notice.contains("Save or discard its unsaved edits")),
+                    "saving" => assert!(notice.contains("Wait for its save to finish")),
+                    "warning" | "recovery" => {
+                        assert!(notice.contains("file recovery or durability warning"));
+                        assert!(!notice.contains("unsaved edits"));
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
     }
