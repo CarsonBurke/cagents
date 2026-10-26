@@ -10321,6 +10321,11 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if insertion == "/goal" {
+                    // Inspect through the same native panel as the footer.
+                    // A provider slash dispatcher must never receive /goal.
+                    return self.handle_chat_ui(Action::GoalPanel(target, true));
+                }
                 if kind == completion::Kind::Command
                     && (!runtime.snapshot.ready
                         || runtime.snapshot.busy
@@ -24750,6 +24755,111 @@ mod tests {
         let task = app.handle_chat_ui(Action::GoalPanel(target, false));
         assert!(!chat_runtime(&app, card).goal_open);
         assert_eq!(task_focuses(task, &composer), (false, true));
+    }
+
+    #[test]
+    fn plus_goal_inspects_native_support_without_sending_or_changing_the_draft() {
+        use iced::advanced::widget::Operation;
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        for provider in [Provider::Codex, Provider::Claude, Provider::Omp] {
+            for busy in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat_for_provider(&mut app, provider, Some("goal-menu-thread"));
+                app.workspace.focus(card).unwrap();
+                let target = chat_runtime(&app, card).target;
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.replace_draft(text_editor::Content::with_text("Keep 🦀 this draft"));
+                runtime.composer.perform(text_editor::Action::Move(
+                    text_editor::Motion::DocumentStart,
+                ));
+                runtime.attachments.push(Attachment::file("kept.txt"));
+                let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                snapshot.busy = busy;
+                if provider == Provider::Codex {
+                    snapshot.goal = Some(chat::goal::Snapshot {
+                        thread_id: "goal-menu-thread".into(),
+                        revision: 1,
+                        support: chat::goal::Support::Supported,
+                        read: chat::goal::ReadState::Known(None),
+                        pending: false,
+                        uncertain: false,
+                        last_result: None,
+                    });
+                }
+                runtime
+                    .handle()
+                    .unwrap()
+                    .replace_snapshot_for_test((*runtime.snapshot).clone());
+                let before = (
+                    runtime.composer.text(),
+                    runtime.composer.cursor(),
+                    runtime.attachments.clone(),
+                    runtime.revision,
+                    runtime.next_command,
+                );
+                drop(app.handle_chat_ui(Action::ComposerActions(target, true)));
+                assert!(
+                    chat_runtime(&app, card)
+                        .composer_action_candidates()
+                        .iter()
+                        .any(|candidate| { candidate.insertion == "/goal" })
+                );
+                let task = app.handle_chat_ui(Action::ComposerAction(target, "/goal".into()));
+                assert_eq!(
+                    task_focuses(task, &card_control_id(card, "chat-goal-close")),
+                    (true, false),
+                );
+                let runtime = chat_runtime(&app, card);
+                assert!(runtime.goal_open);
+                assert!(!runtime.composer_actions);
+                assert!(runtime.pending.is_none() && runtime.goal_pending.is_none());
+                assert!(runtime.queued.is_none() && runtime.followups.is_empty());
+                assert_eq!(
+                    (
+                        runtime.composer.text(),
+                        runtime.composer.cursor(),
+                        runtime.attachments.clone(),
+                        runtime.revision,
+                        runtime.next_command,
+                    ),
+                    before,
+                );
+                let mut renderer = crate::app::tests::headless_renderer();
+                let mut ui = iced::runtime::UserInterface::build(
+                    runtime.goal_panel().unwrap(),
+                    iced::Size::new(360.0, 650.0),
+                    iced::runtime::user_interface::Cache::new(),
+                    &mut renderer,
+                );
+                let mut text = Texts::default();
+                ui.operate(&renderer, &mut text);
+                assert_eq!(
+                    text.0
+                        .iter()
+                        .any(|text| text.contains("Native goal controls are not supported")),
+                    provider != Provider::Codex,
+                );
+                drop(ui);
+                drop(app.handle_chat_ui(Action::GoalPanel(target, false)));
+                let stale = Target {
+                    generation: target.generation + 1,
+                    ..target
+                };
+                drop(app.handle_chat_ui(Action::ComposerAction(stale, "/goal".into())));
+                assert!(!chat_runtime(&app, card).goal_open);
+                assert!(chat_runtime(&app, card).pending.is_none());
+                assert_eq!(chat_runtime(&app, card).next_command, before.4);
+            }
+        }
     }
 
     #[test]

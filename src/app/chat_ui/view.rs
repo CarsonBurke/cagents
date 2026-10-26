@@ -3384,7 +3384,10 @@ impl Runtime {
                 let first = candidates
                     .iter()
                     .find(|candidate| {
-                        available && (candidate.kind == completion::Kind::Skill || enabled)
+                        available
+                            && (candidate.kind == completion::Kind::Skill
+                                || candidate.insertion == "/goal"
+                                || enabled)
                     })
                     .map(|candidate| candidate.insertion.clone().into_owned());
                 let search = crate::interaction::keyboard_list_entry(
@@ -3432,12 +3435,16 @@ impl Runtime {
                         crate::interaction::tooltip(
                             crate::ui_controls::button::secondary(label)
                                 .width(Length::Fill)
-                                .on_press_maybe((available && (is_skill || enabled)).then(|| {
-                                    action(Action::ComposerAction(
-                                        target,
-                                        candidate.insertion.into_owned(),
-                                    ))
-                                })),
+                                .on_press_maybe(
+                                    (available
+                                        && (is_skill || candidate.insertion == "/goal" || enabled))
+                                        .then(|| {
+                                            action(Action::ComposerAction(
+                                                target,
+                                                candidate.insertion.into_owned(),
+                                            ))
+                                        }),
+                                ),
                             candidate.description,
                         ),
                     ));
