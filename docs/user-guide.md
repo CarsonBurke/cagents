@@ -957,8 +957,9 @@ browsing, and closing the viewer keep the draft, its caret or selection, and
 its attachments; browsing an image does not attach it to your message.
 
 Use the previous/next controls or thumbnail strip to browse available previews.
-**Fit** shows the whole image; **100%** shows it at actual size. Scroll or press
-`+` / `−` to zoom, and drag to pan. With the viewer focused, Left/Right browse,
+**Fit** shows the whole image; **100%** shows it at actual size. Scroll over the
+image to zoom, or click the image to focus it before pressing `+` / `−`. Drag to
+pan. With the viewer focused, Left/Right browse,
 `0` fits, `1` selects actual size, and Escape closes it. These viewer shortcuts
 stay with the viewer: typing and arrow keys in the composer continue to edit
 your draft. Use the close button to return to the transcript at any time.
@@ -1015,11 +1016,12 @@ and restores that message as an editable draft in the branched conversation.
 Its steering control chooses delivery between tool calls or after the current
 turn completes, using OMP's own interrupt mode.
 
-Child agent tabs use the agent's name and a status icon. Working agents appear
-first, followed by waiting, failed, and settled agents. **Choose subagent** opens
+Child agent tabs use the agent's name and a status icon. Tabs group reported
+statuses: working, waiting, failed or denied, then settled. **Choose subagent** opens
 the full searchable list, with filters for working agents or those needing
-attention. Selecting an agent opens its isolated transcript; choose **Main
-conversation** to return to the parent. Codex child approvals remain explicit and are labeled as child
+attention. Selecting an agent opens its isolated transcript; choose
+**Main conversation** to return to the parent. Codex child approvals remain
+explicit and are labeled as child
 requests. OMP child activity is read-only: its installed RPC API has no child
 messaging, stop, or restart command. Large optional child histories are omitted
 without disconnecting the parent, while live activity remains available.
