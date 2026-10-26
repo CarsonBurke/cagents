@@ -11,8 +11,9 @@
 
 The README's [Run from source](../README.md#run-from-source) section is the
 quick start; this page is the full reference. Repository tooling is shell
-(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
-is only a native build prerequisite of the full Servo dependency graph.
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust. Python 3
+is also required by the ceditor development/installation scripts, experimental
+hot runner, and the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -396,7 +397,18 @@ cargo test --locked --no-default-features --features host --test repository_scal
 The fixture retains its disk-backed private namespace, subprocess deadline and
 process-family cleanup checks. Its test count and workload are unchanged.
 
-Run `cargo fmt --check` after Rust edits. For UI changes, launch the real UI with
+Run `scripts/check-format` after Rust edits. It runs `cargo fmt --check` for
+Cargo roots and directly checks `src/modules.rs` and nested Rust-source
+`include!` fragments, which rustfmt does not discover through macro expansion.
+Both stages report their diagnostics and any failure makes the command fail;
+the check never rewrites source or formats vendored packages. When adding a
+Rust-source `include!`, update the explicit list in the script. Its lightweight
+regression is `python3 tests/check_format.py` (mocked command routing and bounded
+real-rustfmt fixtures, with no Cargo/application build). Set
+`CHECK_FORMAT_CARGO_FIXTURE=1` for the additional dependency-free temporary Cargo
+fixture; this still runs only `cargo fmt`, with no application build.
+
+For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
@@ -448,8 +460,9 @@ source visible alongside an error. Rendering is debounced, uses at most two
 workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
 
 The development runner uses an isolated application and settings identity.
-The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
-built executable.
+The editor runner and installer require Python 3 to read executable paths from
+Cargo's build output. This honors configured targets and output directories,
+including `build.target` in Cargo configuration and `CARGO_BUILD_TARGET`.
 
 Desktop alerts are sent through the notification portal under the daemon's
 application ID. When the portal accepts that ID, the daemon owns it on the session

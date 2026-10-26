@@ -101,10 +101,10 @@ use crate::{
     location::SanitizedLocation,
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
-        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
-        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceDestination,
-        WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, ChannelId, Existence, Exposure, HostSessionProof,
+        LaunchRecipe, ProjectId, ProjectKind, ProjectState, RepositoryView, Residency,
+        RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        WorkspaceDestination, WorkspaceState, WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -6060,10 +6060,8 @@ impl Cagents {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
             // width estimate. Use the window's current bounds until one mounts.
-            let sidebar = sidebar::effective_width(
-                self.projects_sidebar_mode(),
-                self.settings.sidebar_width,
-            );
+            let sidebar =
+                sidebar::effective_width(self.projects_sidebar_mode(), self.settings.sidebar_width);
             let inspector = if matches!(
                 self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
