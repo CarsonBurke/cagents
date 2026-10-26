@@ -41,6 +41,8 @@ mod fixture {
     const GUARDIAN: &str = "host::shutdown_tests::fixture::guardian";
     const BODY_CONTROL: &str = "host::shutdown_tests::fixture::body_control";
     const LIMIT: Duration = Duration::from_secs(30);
+    const CAPTURE_LIMIT: u64 = 256 * 1024;
+    const RECEIPT_LIMIT: u64 = 16 * 1024;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct Spec {
@@ -195,11 +197,8 @@ mod fixture {
     }
     impl Run {
         fn settlement(&self, root: &Path, test: &str) -> Result<Settlement, String> {
-            let bytes = fs::read(root.join("family-settled.json"))
-                .map_err(|error| format!("missing family settlement receipt: {error}"))?;
-            if bytes.len() > 16 * 1024 {
-                return Err("oversized family settlement receipt".into());
-            }
+            let bytes = read_bounded(root, "family-settled.json", RECEIPT_LIMIT)
+                .map_err(|error| format!("unreadable family settlement receipt: {error}"))?;
             let receipt: Receipt = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("invalid family settlement receipt: {error}"))?;
             if receipt.version != 1
@@ -253,15 +252,37 @@ mod fixture {
         }
     }
 
-    fn read_log(root: &Path, name: &str) -> Result<String, String> {
+    fn read_bounded(root: &Path, name: &str, limit: u64) -> Result<Vec<u8>, String> {
         let path = root.join(name);
-        // This bounds post-exit reading, not live disk growth. Full failure
-        // logs stay in the retained namespace and are never truncated here.
-        let metadata = fs::metadata(&path).map_err(|error| format!("missing {name}: {error}"))?;
-        if metadata.len() > 256 * 1024 {
-            return Err(format!("{name} exceeds the 256 KiB post-exit read limit"));
+        // Limit the actual read from one descriptor: a failed or uncertain
+        // family may keep appending after any metadata observation. The full
+        // captured file remains untouched, including overflow and invalid UTF-8.
+        // This is a read bound, not a bound on the writer's live disk growth.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|error| format!("unreadable {name}: {error}"))?;
+        if !file
+            .metadata()
+            .map_err(|error| format!("cannot inspect {name}: {error}"))?
+            .is_file()
+        {
+            return Err(format!("{name} is not a regular evidence file"));
         }
-        fs::read_to_string(&path).map_err(|error| format!("unreadable {name}: {error}"))
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("unreadable {name}: {error}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{name} exceeds its {limit}-byte read limit"));
+        }
+        Ok(bytes)
+    }
+
+    fn read_log(root: &Path, name: &str) -> Result<String, String> {
+        let bytes = read_bounded(root, name, CAPTURE_LIMIT)?;
+        String::from_utf8(bytes).map_err(|error| format!("invalid UTF-8 in {name}: {error}"))
     }
 
     fn run(
@@ -569,6 +590,13 @@ while original is not None and identity()==original:
             "late" => assert_eq!(unsafe { libc::atexit(start_late_writer) }, 0),
             "failure" => panic!("intentional private fixture body failure"),
             "missing-capture" => fs::remove_file(root.join("test.stderr")).unwrap(),
+            "oversized-capture" => io::stderr()
+                .write_all(&vec![b'x'; CAPTURE_LIMIT as usize + 4096])
+                .unwrap(),
+            "non-utf8-capture" => io::stderr().write_all(&[0xff, b'a']).unwrap(),
+            "limit-capture" => io::stderr()
+                .write_all(&vec![b'v'; CAPTURE_LIMIT as usize])
+                .unwrap(),
             "blocked" => loop {
                 thread::park();
             },
@@ -658,6 +686,58 @@ while original is not None and identity()==original:
     }
 
     #[test]
+    fn capture_read_limits_preserve_rejected_files_and_accept_the_exact_boundary() {
+        for (control, payload, error) in [
+            (
+                "oversized-capture",
+                vec![b'x'; CAPTURE_LIMIT as usize + 4096],
+                Some("exceeds its 262144-byte"),
+            ),
+            ("non-utf8-capture", vec![0xff, b'a'], Some("invalid UTF-8")),
+            ("limit-capture", vec![b'v'; CAPTURE_LIMIT as usize], None),
+        ] {
+            let (evidence, root) = directory();
+            let run = run(&root, BODY_CONTROL, Some(control), LIMIT, false);
+            let proof = run
+                .settlement(&root, BODY_CONTROL)
+                .expect("capture control must fully settle");
+            assert!(run.status.success() && proof.receipt.body_success && !proof.receipt.cancelled);
+            if let Some(error) = error {
+                assert!(run.success(&root, BODY_CONTROL).is_err());
+                assert!(
+                    run.capture_errors
+                        .iter()
+                        .any(|detail| detail.contains(error))
+                );
+            } else {
+                assert!(run.success(&root, BODY_CONTROL).is_ok());
+                assert_eq!(run.stderr.as_bytes(), payload);
+            }
+            let path = root.join("test.stderr");
+            assert_eq!(fs::metadata(&path).unwrap().len(), payload.len() as u64);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                payload,
+                "capture reading changed the original bytes"
+            );
+            drop(evidence);
+            assert!(
+                root.is_dir(),
+                "rejected captures must keep the original namespace"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                payload,
+                "retention changed the original bytes"
+            );
+            // All synthetic writers have exited under the genuine ECHILD
+            // proof. Remove only this passing meta-test's fresh control root.
+            EvidenceDirectory(Some(root.clone())).remove_after_assertions(&proof);
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
     fn missing_malformed_or_mismatched_receipts_and_bad_output_never_authorize_removal() {
         let (evidence, root) = directory();
         let mut run = run(&root, BODY_CONTROL, Some("success"), LIMIT, false);
@@ -668,6 +748,14 @@ while original is not None and identity()==original:
         assert!(run.success(&root, BODY_CONTROL).is_err());
         fs::write(&path, b"not JSON").unwrap();
         assert!(run.success(&root, BODY_CONTROL).is_err());
+        let oversized_receipt = vec![b'x'; RECEIPT_LIMIT as usize + 4096];
+        fs::write(&path, &oversized_receipt).unwrap();
+        assert!(run.success(&root, BODY_CONTROL).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            oversized_receipt,
+            "receipt reading changed oversized evidence"
+        );
         let mut wrong: Receipt = serde_json::from_slice(&original).unwrap();
         wrong.guardian += 1;
         fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
