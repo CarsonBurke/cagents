@@ -111,6 +111,8 @@ pub(super) struct Started {
 /// promote history to a draft and restart completion, as for an ordinary paste.
 pub(super) enum Applied {
     Measured(TextChange),
+    /// Native paste replaced identical text. No image/history edit is required.
+    Unchanged,
     Unmeasured,
 }
 pub(super) enum Finished {
@@ -380,9 +382,18 @@ fn insert(
             }
             Ok(Applied::Measured(change))
         }
+        Ok(None) => {
+            // Replacing a selection with identical text still moves the native
+            // caret. Its text delta is empty, so preserve a separately moved
+            // selection verbatim and leave unrelated image anchors untouched.
+            if current.cursor != bookmark.cursor {
+                attachment_draft::move_to(content, current.cursor);
+            }
+            Ok(Applied::Unchanged)
+        }
         // The native edit already ran. Never show a second insertion button
         // for text which is now in the draft; invalidate other pending anchors.
-        Err(()) | Ok(None) => Ok(Applied::Unmeasured),
+        Err(()) => Ok(Applied::Unmeasured),
     }
 }
 
@@ -726,6 +737,69 @@ mod tests {
         ));
         assert_eq!(state.error(), None);
         assert_eq!(content.text(), "safe");
+    }
+
+    #[test]
+    fn identical_replacement_preserves_moved_caret_or_disjoint_selection_without_image_edit() {
+        for current in [
+            cursor(0, 16),
+            Cursor {
+                position: Position {
+                    line: 0,
+                    column: 16,
+                },
+                selection: Some(Position {
+                    line: 0,
+                    column: 11,
+                }),
+            },
+        ] {
+            let target = target();
+            let mut content = Content::with_text("alpha beta gamma");
+            attachment_draft::move_to(
+                &mut content,
+                Cursor {
+                    position: Position {
+                        line: 0,
+                        column: 10,
+                    },
+                    selection: Some(Position { line: 0, column: 6 }),
+                },
+            );
+            let (mut state, ticket) = fixture(target, &content);
+            attachment_draft::move_to(&mut content, current);
+            assert!(matches!(
+                state.complete(target, &delivered(&ticket, "beta"), &mut content),
+                Finished::Applied(Applied::Unchanged)
+            ));
+            assert_eq!(content.text(), "alpha beta gamma");
+            assert_eq!(content.cursor(), current);
+        }
+    }
+
+    #[test]
+    fn cancel_then_retry_rejects_old_result_without_consuming_current_capture() {
+        let target = target();
+        let mut content = Content::with_text("draft");
+        attachment_draft::move_to(&mut content, cursor(0, 0));
+        let (mut state, first) = fixture(target, &content);
+        assert!(!state.cancel(Target {
+            generation: 99,
+            ..target
+        }));
+        assert!(state.cancel(target));
+        let (next, second) = fixture(target, &content);
+        state = next;
+        assert!(matches!(
+            state.complete(target, &delivered(&first, "stale"), &mut content),
+            Finished::Ignored
+        ));
+        assert!(state.has_bookmark());
+        assert!(matches!(
+            state.complete(target, &delivered(&second, "fresh"), &mut content),
+            Finished::Applied(_)
+        ));
+        assert_eq!(content.text(), "freshdraft");
     }
 
     #[test]
