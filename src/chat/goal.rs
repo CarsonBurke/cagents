@@ -71,6 +71,7 @@ pub enum Error {
     Busy,
     Unsupported,
     InvalidReply,
+    StaleObservation,
     Exhausted,
 }
 
@@ -86,6 +87,7 @@ impl std::fmt::Display for Error {
             Self::Busy => "The previous goal request is still awaiting its result",
             Self::Unsupported => "Native goals are unavailable for this conversation",
             Self::InvalidReply => "The goal reply did not match the original request",
+            Self::StaleObservation => "The goal changed; check its current state before acting",
             Self::Exhausted => "The goal request sequence is unavailable",
         })
     }
@@ -157,7 +159,7 @@ pub fn parse(input: &str) -> Option<Result<Operation, Error>> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Support {
     #[default]
     Unknown,
@@ -165,7 +167,7 @@ pub enum Support {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadState {
     #[default]
     Unknown,
@@ -183,6 +185,18 @@ pub enum Reply {
 pub enum Failure {
     Unsupported,
     Unavailable,
+}
+
+/// A bounded UI projection. Physical request IDs and admission tokens stay in
+/// the actor. The revision is local ordering, never a provider timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub thread_id: String,
+    pub revision: u64,
+    pub support: Support,
+    pub read: ReadState,
+    pub pending: bool,
+    pub uncertain: bool,
 }
 
 /// Opaque physical request identity. Only its matching completion releases the
@@ -248,6 +262,34 @@ impl State {
         self.pending.as_ref()
     }
 
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            thread_id: self.thread_id.clone(),
+            revision: self.observation,
+            support: self.support,
+            read: self.read.clone(),
+            pending: self.pending.is_some(),
+            uncertain: self.uncertain,
+        }
+    }
+
+    /// Recheck a control captured by a UI publication. The actor's owner must
+    /// additionally admit its original account, directory and connection.
+    pub fn begin_for(
+        &mut self,
+        thread_id: &str,
+        revision: u64,
+        operation: Operation,
+    ) -> Result<Request, Error> {
+        if thread_id != self.thread_id {
+            return Err(Error::ThreadMismatch);
+        }
+        if revision != self.observation {
+            return Err(Error::StaleObservation);
+        }
+        self.begin(operation)
+    }
+
     /// A changed owner/thread invalidates observations without pretending an
     /// already-issued request stopped. Actor teardown remains the owner's job.
     pub fn rebind(&mut self, thread_id: String) -> Result<(), Error> {
@@ -270,13 +312,15 @@ impl State {
             return Err(Error::Unsupported);
         }
         let id = self.next.checked_add(1).ok_or(Error::Exhausted)?;
+        let observation = self.observation.checked_add(1).ok_or(Error::Exhausted)?;
         let request = Request {
             id,
             thread_id: self.thread_id.clone(),
-            observation: self.observation,
+            observation,
             operation,
         };
         self.next = id;
+        self.observation = observation;
         self.pending = Some(request.clone());
         Ok(request)
     }
@@ -314,6 +358,11 @@ impl State {
         if request.thread_id != self.thread_id || request.observation != self.observation {
             return Ok(false);
         }
+        // A response or refusal changes the publication too. A queued control
+        // from before this request must not act on the newly observed goal,
+        // even when no provider notification accompanied the response.
+        self.uncertain = true;
+        self.observation = self.observation.checked_add(1).ok_or(Error::Exhausted)?;
         let reply = match result {
             Err(Failure::Unsupported) => {
                 self.support = Support::Unsupported;
@@ -373,6 +422,75 @@ mod tests {
             created_at: 50,
             updated_at: 60,
         }
+    }
+
+    #[test]
+    fn queued_controls_cannot_cross_a_response_only_goal_replacement() {
+        let mut state = State::new("original-thread".into()).unwrap();
+        state
+            .observe(
+                "original-thread",
+                Some(goal("original-thread", "old objective", Status::Paused)),
+            )
+            .unwrap();
+        let old = state.snapshot();
+        let request = state
+            .begin_for(
+                &old.thread_id,
+                old.revision,
+                Operation::SetObjective("replacement".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            state.begin_for(&old.thread_id, old.revision, Operation::Clear),
+            Err(Error::StaleObservation)
+        );
+        assert_eq!(state.pending(), Some(&request));
+        let replacement = goal("original-thread", "replacement", Status::Active);
+        state
+            .complete(&request, Ok(Reply::Updated(replacement.clone())))
+            .unwrap();
+        assert_eq!(
+            state.begin_for(&old.thread_id, old.revision, Operation::Clear),
+            Err(Error::StaleObservation)
+        );
+        let current = state.snapshot();
+        assert_eq!(current.read, ReadState::Known(Some(replacement)));
+        assert_eq!(
+            state.begin_for("another-thread", current.revision, Operation::Clear),
+            Err(Error::ThreadMismatch)
+        );
+        assert!(state.pending().is_none());
+        let clear = state
+            .begin_for(&current.thread_id, current.revision, Operation::Clear)
+            .unwrap();
+        state.complete(&clear, Ok(Reply::Cleared(true))).unwrap();
+        assert_eq!(state.read(), &ReadState::Known(None));
+    }
+
+    #[test]
+    fn projected_pending_state_roundtrips_without_exposing_a_physical_request() {
+        let mut state = State::new("original-thread".into()).unwrap();
+        let before = state.snapshot();
+        let request = state
+            .begin_for(&before.thread_id, before.revision, Operation::Get)
+            .unwrap();
+        let pending = state.snapshot();
+        assert!(pending.pending && pending.revision > before.revision);
+        let json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 6);
+        assert!(json.get("operation").is_none() && json.get("request").is_none());
+        assert_eq!(serde_json::from_value::<Snapshot>(json).unwrap(), pending);
+        let bytes = postcard::to_allocvec(&pending).unwrap();
+        assert_eq!(postcard::from_bytes::<Snapshot>(&bytes).unwrap(), pending);
+        state.complete(&request, Ok(Reply::Read(None))).unwrap();
+        let confirmed = state.snapshot();
+        assert!(!confirmed.pending && confirmed.revision > pending.revision);
+        assert_eq!(confirmed.read, ReadState::Known(None));
+        assert_eq!(
+            state.begin_for(&pending.thread_id, pending.revision, Operation::Resume),
+            Err(Error::StaleObservation)
+        );
     }
 
     #[test]
