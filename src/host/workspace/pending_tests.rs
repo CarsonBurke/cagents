@@ -205,6 +205,7 @@ fn pending_publication_serializes_a_new_recipe_without_blocking_host_reads() {
         boot_id: crate::daemon::read_boot_id().unwrap(),
         host_incarnation: HostIncarnation::new("pending-publication"),
     });
+    state.enable_holder_recovery();
     state.install_model(registry);
     state.register_client(1);
     state.register_client(2);
@@ -309,6 +310,46 @@ fn pending_publication_serializes_a_new_recipe_without_blocking_host_reads() {
     assert!(!completed.pending_terminal_start);
     assert!(matches!(&completed.kind,CardKind::Terminal(actual) if actual.launch==session.launch));
     let original = host.lock().unwrap().terminals[&session.id].handle.clone();
+    let (registered, proof) = {
+        let state = host.lock().unwrap();
+        (
+            state.terminals[&session.id].session.clone(),
+            state.proof().clone(),
+        )
+    };
+    // The holder control connection belongs to the live worker. Inspect is
+    // an orphan/successor protocol, so do not open a competing live connection.
+    let holder = original.holder_identity().expect("real pending holder");
+    assert_eq!(holder.terminal, session.id);
+    assert_eq!(holder.boot, proof.boot_id);
+    assert!(holder.root.is_current());
+    assert!(holder.holder.is_current());
+    assert_eq!(
+        host.lock()
+            .unwrap()
+            .descriptor(1, session.id)
+            .unwrap()
+            .session
+            .continuity
+            .live_proof(),
+        Some(proof.clone())
+    );
+    assert!(matches!(
+        registered.continuity,
+        TerminalContinuity::DetachedSameBoot { .. }
+    ));
+    assert_eq!(registered.continuity.live_proof(), Some(proof));
+    assert!(
+        crate::host::state::pending_worker_source(
+            &host.lock().unwrap(),
+            pane.id,
+            &session,
+            &original
+        )
+        .is_none(),
+        "a completed save must not retain a permissive relaunch-source alias"
+    );
+
     assert!(
         crate::host::client::process_request(
             &host,
@@ -488,6 +529,7 @@ fn failed_pending_commit_retries_the_same_original_without_relaunching_or_retarg
         boot_id: crate::daemon::read_boot_id().unwrap(),
         host_incarnation: HostIncarnation::new("pending-retry"),
     });
+    state.enable_holder_recovery();
     state.install_model(registry);
     state.register_client(1);
     let host = Arc::new(HostLock::new(state));
@@ -565,7 +607,173 @@ fn failed_pending_commit_retries_the_same_original_without_relaunching_or_retarg
             .panes,
         vec![pane.clone()]
     );
+    let (registered, proof) = {
+        let state = host.lock().unwrap();
+        let registered = state.terminals[&session.id].session.clone();
+        assert_eq!(
+            crate::host::state::pending_worker_source(&state, pane.id, &session, &original),
+            Some(registered.clone()),
+            "SQL failure must retain the exact accepted card/source for this worker"
+        );
+        assert!(
+            crate::host::state::pending_worker_source(&state, CardId::new(), &session, &original)
+                .is_none()
+        );
+        (registered, state.proof().clone())
+    };
+    // The actual worker retains its authenticated holder connection; inspect
+    // is only serviced after orphaning, not alongside this live connection.
+    let holder = original.holder_identity().expect("actual pending holder");
+    assert_eq!(holder.terminal, session.id);
+    assert_eq!(holder.boot, proof.boot_id);
+    assert_eq!(holder.root, original_process);
+    assert!(holder.holder.is_current());
+    assert!(matches!(
+        registered.continuity,
+        TerminalContinuity::DetachedSameBoot { .. }
+    ));
+    assert_eq!(registered.continuity.live_proof(), Some(proof.clone()));
+    assert_eq!(
+        host.lock()
+            .unwrap()
+            .descriptor(1, session.id)
+            .unwrap()
+            .session
+            .continuity
+            .live_proof(),
+        Some(proof.clone())
+    );
+    assert!(matches_pending_issued(&session, &registered, &proof));
+    for changed in 0..7 {
+        let mut foreign = registered.clone();
+        match changed {
+            0 => {
+                foreign.continuity = TerminalContinuity::DetachedSameBoot {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: HostIncarnation::new("foreign-pending-owner"),
+                }
+            }
+            1 => foreign
+                .launch
+                .arguments
+                .push("different-worker-recipe".into()),
+            2 => foreign.predecessor = Some(TerminalId::new()),
+            3 => foreign.recovery_origin = Some(TerminalId::new()),
+            4 => foreign.transcript_path = Some(root.join("different-transcript")),
+            5 => foreign.id = TerminalId::new(),
+            _ => {
+                foreign.continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: proof.host_incarnation.clone(),
+                }
+            }
+        }
+        assert!(
+            !matches_pending_issued(&session, &foreign, &proof),
+            "changed issued source {changed}"
+        );
+    }
+    // These are authoritative pane edits while the same real worker waits on
+    // its failed save. A proof, embedded recipe, historical exit or lineage
+    // change cannot borrow the retained original's accepted start intent.
+    for changed in 0..5 {
+        let model = snapshot(&host, None).unwrap();
+        let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+        let before = view
+            .panes
+            .iter()
+            .find(|item| item.id == pane.id)
+            .unwrap()
+            .clone();
+        let mut replacement = before.clone();
+        let CardKind::Terminal(source) = &mut replacement.kind else {
+            unreachable!()
+        };
+        match changed {
+            0 => {
+                source.continuity = TerminalContinuity::DetachedSameBoot {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: HostIncarnation::new("foreign-pending-owner"),
+                }
+            }
+            1 => {
+                let TerminalContinuity::RelaunchAvailable { recipe, .. } = &mut source.continuity
+                else {
+                    unreachable!()
+                };
+                recipe.arguments.push("changed-embedded-recipe".into());
+            }
+            2 => {
+                let TerminalContinuity::RelaunchAvailable { last_exit, .. } =
+                    &mut source.continuity
+                else {
+                    unreachable!()
+                };
+                *last_exit = Some(crate::model::TerminalExit {
+                    code: Some(23),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                });
+            }
+            3 => source.predecessor = Some(TerminalId::new()),
+            _ => source.recovery_origin = Some(TerminalId::new()),
+        }
+        edit(
+            &host,
+            1,
+            ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: before.clone(),
+                    pane: replacement.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let refusal = crate::host::client::process_request(&host, 1, request()).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::TerminalNotFound);
+        assert!(
+            host.lock().unwrap().terminals[&session.id]
+                .handle
+                .same_worker(&original)
+        );
+        assert!(original_process.is_current());
+        assert_eq!(fs::read_to_string(root.join("launches")).unwrap(), launches);
+        let model = snapshot(&host, None).unwrap();
+        let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+        assert_eq!(view.panes, vec![replacement.clone()]);
+        edit(
+            &host,
+            1,
+            ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: replacement,
+                    pane: before,
+                },
+            },
+        )
+        .unwrap();
+    }
     assert!(crate::host::client::process_request(&host, 1, request()).is_ok());
+    assert!(
+        crate::host::state::pending_worker_source(
+            &host.lock().unwrap(),
+            pane.id,
+            &session,
+            &original
+        )
+        .is_none(),
+        "successful retry must release only its captured pending intent"
+    );
+
     assert!(
         host.lock().unwrap().terminals[&session.id]
             .handle

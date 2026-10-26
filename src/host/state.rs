@@ -66,6 +66,8 @@ pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
+    /// Exact accepted automatic-start intent, retained only until its pane save succeeds.
+    pending_start_source: Option<(crate::model::CardId, TerminalSession)>,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     /// The actual validated worker command, independent of its issued pane.
     execution_recipe: Option<crate::model::LaunchRecipe>,
@@ -1436,6 +1438,7 @@ impl HostState {
                 screen_lost_after_crash: false,
                 session,
                 handle,
+                pending_start_source: None,
                 options: TerminalSpawnOptions::default(),
                 execution_environment,
                 execution_recipe,
@@ -3819,18 +3822,60 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
+/// Select only this already-published worker's exact accepted or issued source.
+/// A changed pane cannot borrow its proof to retarget the original process.
+pub(super) fn pending_worker_source(
+    state: &HostState,
+    pane: crate::model::CardId,
+    accepted: &TerminalSession,
+    original: &TerminalHandle,
+) -> Option<TerminalSession> {
+    let current = state.terminals.get(&accepted.id)?;
+    if !current.handle.same_worker(original) {
+        return None;
+    }
+    if super::workspace::matches_pending(accepted, &current.session) {
+        return Some(current.session.clone());
+    }
+    let published = state
+        .descriptor_as(
+            matches!(accepted.continuity, TerminalContinuity::Live { .. }),
+            accepted.id,
+        )
+        .ok()?;
+    if super::workspace::matches_pending(accepted, &published.session) {
+        return Some(published.session);
+    }
+    let (accepted_pane, intent) = current.pending_start_source.as_ref()?;
+    if *accepted_pane == pane
+        && super::workspace::matches_pending(accepted, intent)
+        && super::workspace::matches_pending_issued(intent, &current.session, state.proof())
+    {
+        return Some(current.session.clone());
+    }
+    None
+}
+
 fn finish_pending_terminal(
     shared: &SharedHost,
     registry: &mut super::model::Registry,
     reservation: super::workspace::PendingTerminal,
-    session: TerminalSession,
+    original: &TerminalHandle,
 ) -> Result<(), ProtocolError> {
-    super::workspace::complete_terminal(shared, registry, reservation, session)
+    let terminal_id = reservation.session.id;
+    super::workspace::complete_terminal(shared, registry, reservation, original)
         .map_err(|error| ProtocolError::new(
             ProtocolErrorCode::Internal,
             format!("The original terminal worker is retained, but its exact pane completion was not confirmed: {error}"),
             false,
-        ))
+        ))?;
+    let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(current) = state.terminals.get_mut(&terminal_id)
+        && current.handle.same_worker(original)
+    {
+        current.pending_start_source = None;
+    }
+    Ok(())
 }
 
 pub(super) fn spawn_pending_terminal(
@@ -4121,35 +4166,17 @@ fn start_terminal_view_owned_reserved(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(reservation) = reservation {
             if let Some(current) = state.terminals.get(&terminal_id) {
-                let published = state.descriptor_as(
-                    matches!(
-                        reservation.session.continuity,
-                        TerminalContinuity::Live { .. }
-                    ),
-                    terminal_id,
-                )?;
-                let current_session =
-                    if super::workspace::matches_pending(&reservation.session, &current.session) {
-                        current.session.clone()
-                    } else if super::workspace::matches_pending(
-                        &reservation.session,
-                        &published.session,
-                    ) {
-                        published.session
-                    } else {
-                        return Err(not_found(terminal_id));
-                    };
                 let handle = current.handle.clone();
+                if pending_worker_source(&state, reservation.pane.id, &reservation.session, &handle)
+                    .is_none()
+                {
+                    return Err(not_found(terminal_id));
+                }
                 let descriptor = state.attach(client_id, terminal_id)?;
                 drop(state);
                 // A retry never starts another worker. An earlier save failure
                 // is completed using this exact already-published original.
-                finish_pending_terminal(
-                    shared,
-                    registry.as_mut().unwrap(),
-                    reservation,
-                    current_session,
-                )?;
+                finish_pending_terminal(shared, registry.as_mut().unwrap(), reservation, &handle)?;
                 return Ok((descriptor, handle));
             }
             if !reservation.pane.pending_terminal_start
@@ -4212,6 +4239,13 @@ fn start_terminal_view_owned_reserved(
             }
         })
     };
+
+    // Fresh holders receive this exact daemon-issued source. Retain it after
+    // successful startup instead of the caller's proofless relaunch projection.
+    // Adoption keeps its independently installed previous source above.
+    let registered_session = holder_recovery
+        .as_ref()
+        .map_or_else(|| session.clone(), |recovery| recovery.source.clone());
 
     let agent_authority = if paired {
         match super::agent_execution::registry(shared) {
@@ -4451,7 +4485,7 @@ fn start_terminal_view_owned_reserved(
     if reservation.is_some() {
         super::workspace::pending_publication_test_hook();
     }
-    let (descriptor, pending_session) = {
+    let (descriptor, pending_worker) = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4468,6 +4502,11 @@ fn start_terminal_view_owned_reserved(
         let issued_hint = execution_recipe
             .as_ref()
             .map(|_| session.resume_hint.clone());
+        // Only a fresh original receives this in-memory publication intent.
+        // Recovery/adoption without it cannot normalize a saved projection.
+        let pending_start_source = pending_pane
+            .filter(|_| !adopting)
+            .map(|pane| (pane, session.clone()));
         let mut descriptor = if adopting {
             // Keep the independently installed original record and any error/
             // semantic edges already published while commit was in flight.
@@ -4499,7 +4538,7 @@ fn start_terminal_view_owned_reserved(
         } else {
             state.finish_spawn_with_execution(
                 client_id,
-                session,
+                registered_session,
                 handle,
                 options.initially_visible,
                 execution_recipe.clone(),
@@ -4515,8 +4554,14 @@ fn start_terminal_view_owned_reserved(
                 .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
-        let pending_session = (descriptor.is_ok() && pending_pane.is_some())
-            .then(|| state.terminals[&terminal_id].session.clone());
+        let pending_worker = (descriptor.is_ok() && pending_pane.is_some()).then(|| {
+            let record = state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished pending spawn");
+            record.pending_start_source = pending_start_source;
+            record.handle.clone()
+        });
         if descriptor.is_ok() {
             state
                 .terminals
@@ -4535,15 +4580,15 @@ fn start_terminal_view_owned_reserved(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        (descriptor, pending_session)
+        (descriptor, pending_worker)
     };
     let mut pending_error = None;
-    if let (Some(reservation), Some(session)) = (reservation, pending_session) {
+    if let (Some(reservation), Some(original)) = (reservation, pending_worker) {
         if let Err(error) = finish_pending_terminal(
             shared,
             pending_registry.as_mut().unwrap(),
             reservation,
-            session,
+            &original,
         ) {
             if adopting {
                 shared

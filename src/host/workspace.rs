@@ -187,19 +187,53 @@ pub(super) fn matches_pending(
     accepted == &current
 }
 
+/// A freshly published holder replaces only its accepted relaunch projection
+/// with this daemon's authenticated source. The caller separately binds both
+/// sessions to the same original worker and its captured pending intent.
+pub(super) fn matches_pending_issued(
+    accepted: &crate::model::TerminalSession,
+    issued: &crate::model::TerminalSession,
+    proof: &crate::model::HostSessionProof,
+) -> bool {
+    let crate::model::TerminalContinuity::RelaunchAvailable { recipe, .. } = &accepted.continuity
+    else {
+        return false;
+    };
+    if recipe != &accepted.launch
+        || !proof.is_complete()
+        || !matches!(
+            issued.continuity,
+            crate::model::TerminalContinuity::DetachedSameBoot { .. }
+        )
+        || issued.continuity.live_proof().as_ref() != Some(proof)
+    {
+        return false;
+    }
+    let mut projected = issued.clone();
+    projected.continuity = accepted.continuity.clone();
+    matches_pending(accepted, &projected)
+}
+
 /// Caller retains the same writer guard used for the authoritative reservation
 /// read and brief worker publication. No SQLite operation borrows HostState.
 pub(super) fn complete_terminal(
     host: &SharedHost,
     registry: &mut super::model::Registry,
     reservation: PendingTerminal,
-    session: crate::model::TerminalSession,
+    original: &crate::terminal::TerminalHandle,
 ) -> Result<(), String> {
+    let session = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        super::state::pending_worker_source(
+            &state,
+            reservation.pane.id,
+            &reservation.session,
+            original,
+        )
+        .ok_or("The automatic terminal source changed before completion")?
+    };
     if !reservation.pane.pending_terminal_start {
         return Ok(());
-    }
-    if !matches_pending(&reservation.session, &session) {
-        return Err("The automatic terminal source changed before completion".into());
     }
     let mut pane = reservation.pane.clone();
     pane.pending_terminal_start = false;
