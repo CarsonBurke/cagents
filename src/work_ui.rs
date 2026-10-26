@@ -1892,7 +1892,7 @@ mod tests {
         let original = state.board.as_ref().unwrap().clone();
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let mut ui = Ui::build(
-            state.board_view(800.0),
+            state.board_view(800.0, None),
             iced::Size::new(800.0, 420.0),
             iced::runtime::user_interface::Cache::new(),
             &mut renderer,
@@ -1967,13 +1967,13 @@ mod tests {
         let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let size = iced::Size::new(800.0, 420.0);
         let mut ui = Ui::build(
-            state.board_view(size.width),
+            state.board_view(size.width, None),
             size,
             iced::runtime::user_interface::Cache::new(),
             &mut renderer,
         );
         draw(&mut ui, &mut renderer);
-        let point = control_bounds(&ui, "Open task-00").center();
+        let point = control_bounds(&ui, "Actions for task-00").center();
         for delta in [
             iced::mouse::ScrollDelta::Lines { x: -1.0, y: 0.0 },
             iced::mouse::ScrollDelta::Pixels { x: -35.0, y: 0.0 },
@@ -2013,7 +2013,7 @@ mod tests {
             "real x wins rather than cancelling a diagonal trackpad gesture"
         );
         let cache = ui.into_cache();
-        let mut ui = Ui::build(state.board_view(size.width), size, cache, &mut renderer);
+        let mut ui = Ui::build(state.board_view(size.width, None), size, cache, &mut renderer);
         draw(&mut ui, &mut renderer);
         board_event(
             &mut ui,
@@ -2102,7 +2102,7 @@ mod tests {
         use iced::advanced::{Layout as NativeLayout, Shell, Widget, layout, widget::Tree};
         let state = wheel_board_state();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut element = state.board_view(800.0);
+        let mut element = state.board_view(800.0, None);
         let mut tree = Tree::new(&element);
         let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 420.0));
         let node = element.as_widget_mut().layout(
