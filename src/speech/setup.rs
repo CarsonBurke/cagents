@@ -100,20 +100,11 @@ pub fn prepare(
         cancel,
         lease.clone(),
     )
-    .map_err(|_| {
-        if cancel.is_cancelled() {
-            Error::Cancelled
-        } else {
-            Error::SetupIntegrity
-        }
-    })?;
-    let installation = model::Installation::from_extraction(extraction, cancel).map_err(|_| {
-        if cancel.is_cancelled() {
-            Error::Cancelled
-        } else {
-            Error::SetupIntegrity
-        }
-    })?;
+    .map_err(|error| provision::lifecycle_error(&error, cancel).unwrap_or(Error::SetupIntegrity))?;
+    let installation =
+        model::Installation::from_extraction(extraction, cancel).map_err(|error| {
+            provision::lifecycle_error(&error, cancel).unwrap_or(Error::SetupIntegrity)
+        })?;
     check_cancel(cancel)?;
     Ok(Prepared(Arc::new(installation)))
 }
@@ -232,12 +223,8 @@ fn publish(
         .as_file()
         .try_clone()
         .map_err(|_| Error::SetupStorage)?;
-    let verified = provision::verify_file(descriptor, archive, cancel).map_err(|_| {
-        if cancel.is_cancelled() {
-            Error::Cancelled
-        } else {
-            Error::SetupIntegrity
-        }
+    let verified = provision::verify_file(descriptor, archive, cancel).map_err(|error| {
+        provision::lifecycle_error(&error, cancel).unwrap_or(Error::SetupIntegrity)
     })?;
     pending
         .file

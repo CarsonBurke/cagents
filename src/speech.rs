@@ -128,21 +128,13 @@ impl Prepared {
     ) -> Result<Self, Error> {
         let lease = Arc::new(Lease::acquire()?);
         let installed = provision::install(root, runtime, model, cancellation, lease.clone())
-            .map_err(|_| {
-                if cancellation.is_cancelled() {
-                    Error::Cancelled
-                } else {
-                    Error::Unavailable
-                }
+            .map_err(|error| {
+                provision::lifecycle_error(&error, cancellation).unwrap_or(Error::Unavailable)
             })?;
         model::Installation::from_extraction(installed, cancellation)
             .map(|model| Self(Arc::new(model)))
-            .map_err(|_| {
-                if cancellation.is_cancelled() {
-                    Error::Cancelled
-                } else {
-                    Error::Unavailable
-                }
+            .map_err(|error| {
+                provision::lifecycle_error(&error, cancellation).unwrap_or(Error::Unavailable)
             })
     }
     pub fn start<T>(&self, ticket: Ticket<T>) -> Result<(Session<T>, Control), Error> {

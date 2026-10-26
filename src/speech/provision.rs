@@ -35,6 +35,37 @@ const MODEL_MEMBERS: [&str; 4] = [
     "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/joiner.int8.onnx",
     "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tokens.txt",
 ];
+#[derive(Debug)]
+struct ProcessFailure(speech_local::Failure);
+impl std::fmt::Display for ProcessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The owned speech setup process did not complete")
+    }
+}
+impl std::error::Error for ProcessFailure {}
+fn process_failure(failure: speech_local::Failure) -> io::Error {
+    io::Error::other(ProcessFailure(failure))
+}
+/// A bounded return can leave the sole reaper retaining the setup lease. Keep
+/// that stopping state visible even if the user also requested cancellation.
+pub(super) fn lifecycle_error(
+    error: &io::Error,
+    cancel: &CancellationToken,
+) -> Option<super::Error> {
+    let failure = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<ProcessFailure>());
+    if failure.is_some_and(|failure| failure.0 == speech_local::Failure::CleanupPending) {
+        Some(super::Error::CleanupPending)
+    } else if cancel.is_cancelled()
+        || error.kind() == io::ErrorKind::Interrupted
+        || failure.is_some_and(|failure| failure.0 == speech_local::Failure::Cancelled)
+    {
+        Some(super::Error::Cancelled)
+    } else {
+        None
+    }
+}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -182,8 +213,8 @@ fn extract(
         ])
         .arg("--")
         .args(members.iter().copied());
-    let output = speech_local::provision(&listing, cancel, lease.clone())
-        .map_err(|_| invalid("Could not inspect the pinned speech archive"))?;
+    let output =
+        speech_local::provision(&listing, cancel, lease.clone()).map_err(process_failure)?;
     regular_members(&output, members)?;
     check_cancel(cancel)?;
     let extracting = tar(archive)?
@@ -198,8 +229,7 @@ fn extract(
         .arg(directory.as_os_str())
         .arg("--")
         .args(members.iter().copied());
-    speech_local::provision(&extracting, cancel, lease)
-        .map_err(|_| invalid("Could not extract the pinned speech archive"))?;
+    speech_local::provision(&extracting, cancel, lease).map_err(process_failure)?;
     Ok(())
 }
 
@@ -320,6 +350,25 @@ pub(super) fn install_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_cleanup_owner_survives_error_conversion_and_concurrent_cancel() {
+        let cancel = CancellationToken::new();
+        let pending = process_failure(speech_local::Failure::CleanupPending);
+        assert_eq!(
+            lifecycle_error(&pending, &cancel),
+            Some(super::super::Error::CleanupPending)
+        );
+        cancel.cancel();
+        assert_eq!(
+            lifecycle_error(&pending, &cancel),
+            Some(super::super::Error::CleanupPending)
+        );
+        let cancelled = process_failure(speech_local::Failure::Cancelled);
+        assert_eq!(
+            lifecycle_error(&cancelled, &CancellationToken::new()),
+            Some(super::super::Error::Cancelled)
+        );
+    }
     #[test]
     fn archive_checks_reject_wrong_and_excess_bytes_before_extracting() {
         let expected = Archive {
