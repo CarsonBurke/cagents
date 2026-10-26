@@ -8041,9 +8041,20 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label.starts_with("Choose subagent:")
-                    && label.contains("Inspect repository")),
+                .any(|label| label.starts_with("Choose subagent:")),
             "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("native subagent · Scout ·")),
+            "{labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Inspect repository")),
+            "task descriptions must not replace reported agent names: {labels:?}"
         );
         assert!(
             labels.iter().any(|label| label.contains("# Review")),
@@ -9627,10 +9638,7 @@ mod tests {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label().is_some_and(|label| match step {
                             0 => label.starts_with("Choose subagent:"),
-                            1 => {
-                                label.contains("Inspect repository")
-                                    && label.ends_with(" · native-child")
-                            }
+                            1 => label.starts_with("Scout ·") && label.ends_with(" · native-child"),
                             _ => label == "Main conversation",
                         })
                 })
