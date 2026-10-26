@@ -1262,3 +1262,252 @@ fn restored_registered_audit_uncertainty_allows_a_separate_import_without_accoun
         assert_eq!(app.account_ui.registry, registry);
     }
 }
+
+#[test]
+fn lost_verify_existing_profile_preserves_original_intent_and_requires_an_explicit_current_account_check()
+ {
+    use crate::account::coding_config::{CreateReport, Outcome, Refusal};
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+
+    #[derive(Default)]
+    struct Texts(Vec<(String, iced::Rectangle)>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.0.push((text.to_owned(), bounds));
+        }
+    }
+
+    for network_access in [false, true] {
+        let mut state = inspected();
+        let owner = state.owner;
+        act(&mut state, Action::WorkspaceWrite(owner, true));
+        act(&mut state, Action::Network(owner, network_access));
+        let prepare = act(&mut state, Action::Prepare(owner)).unwrap();
+        let plan = state.plan.clone().unwrap();
+        assert_eq!(
+            plan.profile,
+            CodingProfile::WorkspaceWrite { network_access }
+        );
+        let published = status(&plan, ImportStage::Published);
+        let original_receipt = published.receipt.clone().unwrap();
+        finish(&mut state, &prepare, published.clone());
+
+        let mut app = context_inspector_test_app(false);
+        let previous_id = app.account_ui.add_managed_fixture(Provider::Codex, 7128);
+        let previous_account = app
+            .account_ui
+            .account(&previous_id)
+            .unwrap()
+            .account
+            .clone();
+        app.account_ui.registry.set_default(&previous_account);
+        let registry_before = app.account_ui.registry.clone();
+        app.account_ui.import = state;
+        // Only the existing explicit Verify reload is observable here. Its
+        // future is never polled and this path is never opened.
+        app.account_ui.store = Some(Store::at("/not-opened/import-profile-ui-fixture/registry"));
+
+        let verify = |app: &mut Cagents| {
+            let callbacks = click(view(app).unwrap(), "Verify identity");
+            assert!(
+                matches!(callbacks.as_slice(), [Message::AccountUi(super::super::Action::Import(Action::Verify(actual)))] if *actual == owner)
+            );
+            let Message::AccountUi(super::super::Action::Import(action)) =
+                callbacks.into_iter().next().unwrap()
+            else {
+                panic!("the rendered control emits only its Verify action")
+            };
+            let request = act(&mut app.account_ui.import, action).unwrap();
+            assert_eq!(
+                wire_operation(&request, &target().proof).unwrap(),
+                ImportOperation::Verify {
+                    operation: plan.operation,
+                    destination: target().proof,
+                }
+            );
+            request
+        };
+        let lost = verify(&mut app);
+        let task = app.update_account_import(Action::Finished {
+            sequence: lost.sequence,
+            result: Err(Failure::Unavailable),
+        });
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert!(app.account_ui.import.local_uncertain);
+        assert_eq!(app.account_ui.import.status.as_ref(), Some(&published));
+        assert!(!app.account_ui.import.can_new());
+        assert!(act(&mut app.account_ui.import, Action::Prepare(owner)).is_none());
+
+        let mut recovered = status(&plan, ImportStage::Registered);
+        let account = recovered.registered.clone().unwrap();
+        recovered.coding_profile = Some(CreateReport {
+            account: account.clone(),
+            host: target().proof,
+            home: crate::account::readiness::PhysicalIdentity {
+                device: original_receipt.home.device,
+                inode: original_receipt.home.inode,
+            },
+            network_access,
+            outcome: Outcome::NotCreated(Refusal::ExistingConfiguration),
+        });
+        // The report must remain bound even when the operation and registration
+        // fields look valid. A failed match cannot acknowledge a lost Verify.
+        for mismatch in 0..4 {
+            let request = verify(&mut app);
+            let mut wrong = recovered.clone();
+            let report = wrong.coding_profile.as_mut().unwrap();
+            match mismatch {
+                0 => report.home.inode += 1,
+                1 => {
+                    report.account = "codex/00000000-0000-4000-8000-000000007128"
+                        .parse()
+                        .unwrap()
+                }
+                2 => report.network_access = !network_access,
+                _ => report.host = proof("different-report-host"),
+            }
+            let task = app.update_account_import(Action::Finished {
+                sequence: request.sequence,
+                result: Ok(Response {
+                    target: target(),
+                    reply: ImportReply::Status(wrong),
+                }),
+            });
+            assert_eq!(task.units(), 0, "unbound reports cannot reload or check");
+            drop(task);
+            assert_eq!(app.account_ui.import.plan.as_ref(), Some(&plan));
+            assert_eq!(app.account_ui.import.status.as_ref(), Some(&published));
+            assert!(app.account_ui.import.local_uncertain && !app.account_ui.import.can_new());
+            assert!(app.account_ui.import.pending.is_none());
+            assert!(!app.account_ui.check.is_open());
+            assert_eq!(app.account_ui.registry, registry_before);
+        }
+
+        let request = verify(&mut app);
+        let task = app.update_account_import(Action::Finished {
+            sequence: request.sequence,
+            result: Ok(Response {
+                target: target(),
+                reply: ImportReply::Status(recovered.clone()),
+            }),
+        });
+        assert!(
+            task.units() > 0,
+            "a valid explicit Verify retains its registry reload"
+        );
+        drop(task); // Never run Store/provider work in this UI regression.
+        assert_eq!(app.account_ui.import.plan.as_ref(), Some(&plan));
+        let accepted = app.account_ui.import.status.as_ref().unwrap();
+        assert_eq!(accepted.stage, ImportStage::Registered);
+        assert_eq!(accepted.receipt.as_ref(), Some(&original_receipt));
+        assert_eq!(accepted.observed_destination, target().proof);
+        assert_eq!(accepted.registered.as_ref(), Some(&account));
+        assert_eq!(
+            accepted.coding_profile.as_ref().unwrap().network_access,
+            network_access
+        );
+        assert_eq!(
+            accepted.coding_profile.as_ref().unwrap().outcome,
+            Outcome::NotCreated(Refusal::ExistingConfiguration)
+        );
+        assert!(app.account_ui.import.pending.is_none() && !app.account_ui.import.local_uncertain);
+        assert!(
+            !app.account_ui.check.is_open(),
+            "registration never starts a coding check"
+        );
+        assert_eq!(app.account_ui.registry, registry_before);
+
+        let mut element = view(&app).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 2200.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        let preserved = "An existing configuration entry was preserved. Requested settings remain unverified; use Check coding access.";
+        let (_, bounds) = texts
+            .0
+            .iter()
+            .find(|(text, _)| text == preserved)
+            .expect("the actual narrow import view explains the preserved configuration entry");
+        assert!(
+            bounds.width > 0.0
+                && bounds.height > 0.0
+                && bounds.x >= 0.0
+                && bounds.x + bounds.width <= 360.0
+                && bounds.y + bounds.height <= 2200.0
+        );
+        assert!(
+            !texts
+                .0
+                .iter()
+                .any(|(text, _)| text.starts_with("Separate coding profile created."))
+        );
+        drop(element);
+        assert!(
+            app.account_ui
+                .import
+                .registered_account(&app.account_ui)
+                .is_none(),
+            "a bound report is metadata, not a current registered account"
+        );
+        assert!(click(view(&app).unwrap(), "Check coding access").is_empty());
+        let task = app.update_account_import(Action::Check(owner));
+        assert_eq!(task.units(), 0);
+        drop(task);
+        assert!(!app.account_ui.check.is_open());
+
+        // Supply a real current UI registry row, using the existing in-memory
+        // fixture path only. No Store, home, configuration or provider is used.
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .register(
+                crate::account::registry::Registered {
+                    key: plan.operation,
+                    provider: Provider::Codex,
+                    linked_home: None,
+                    label: None,
+                    email: Some(plan.expected_email.clone()),
+                    organization: None,
+                    added_at: 0,
+                },
+                &[],
+            )
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        assert_eq!(
+            app.account_ui.import.registered_account(&app.account_ui),
+            Some(account.clone())
+        );
+        assert!(app.account_ui.registry.is_default(&previous_account));
+        let registry = app.account_ui.registry.clone();
+        let callbacks = click(view(&app).unwrap(), "Check coding access");
+        assert!(
+            matches!(callbacks.as_slice(), [Message::AccountUi(super::super::Action::Import(Action::Check(actual)))] if *actual == owner)
+        );
+        let Message::AccountUi(super::super::Action::Import(action)) =
+            callbacks.into_iter().next().unwrap()
+        else {
+            panic!("explicit check only")
+        };
+        let task = app.update_account_import(action);
+        assert!(task.units() > 0);
+        drop(task); // Explicit Check opens its form; never poll its preparation.
+        assert!(app.account_ui.check.is_open() && !app.account_ui.import.visible);
+        assert_eq!(app.account_ui.import.plan.as_ref(), Some(&plan));
+        assert_eq!(app.account_ui.import.status.as_ref(), Some(&recovered));
+        assert_eq!(app.account_ui.registry, registry);
+    }
+}

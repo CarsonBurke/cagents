@@ -204,3 +204,268 @@ fn metadata_status_creates_no_storage_and_does_not_promote_an_unprepared_intent(
         before
     );
 }
+
+fn registered_profile_fixture() -> (tempfile::TempDir, SharedHost, Installation, ImportPlan) {
+    let (root, host, installation, mut plan) = fixture();
+    plan.profile = CodingProfile::WorkspaceWrite {
+        network_access: true,
+    };
+    prepare_at(&host, plan.clone(), &installation).unwrap();
+    let record = installation.original(plan.operation).unwrap();
+    let reservation = Reservation::for_import_at(
+        &host,
+        plan.operation,
+        false,
+        installation.store.clone(),
+        &installation.homes,
+    )
+    .unwrap();
+    // Arrange the already registered phase with actual private Store helpers.
+    // This fixture does not run or certify the provider identity exchange.
+    let (_, result) = installation
+        .store
+        .try_register_import_pending_reserved(
+            &reservation,
+            &installation.homes,
+            plan.operation,
+            record.receipt().unwrap().home(),
+            &plan.expected_email,
+            Registered {
+                key: plan.operation,
+                provider: Provider::Codex,
+                linked_home: None,
+                label: None,
+                email: Some(plan.expected_email.clone()),
+                organization: None,
+                added_at: 1,
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result, Ok(()));
+    drop(reservation);
+    installation.journal.mark_registered(&plan).unwrap();
+    (root, host, installation, plan)
+}
+
+fn profile_in_private_home(
+    host: &SharedHost,
+    status: ImportStatus,
+    home: &Path,
+    allow_create: bool,
+) -> ImportStatus {
+    use crate::account::coding_config::{self, CreateReport, Observation};
+    let root = Root::open(home).unwrap();
+    // Inject the selected-context observation, not a provider result. Exercise
+    // the production import branch with actual NOFOLLOW presence and publisher.
+    requested_profile_with(
+        status,
+        |request| {
+            let metadata = root.metadata().unwrap();
+            assert_eq!(request.expected_home.device, metadata.dev());
+            assert_eq!(request.expected_home.inode, metadata.ino());
+            Ok(Observation {
+                account: request.account,
+                host: proof(host),
+                home: request.expected_home,
+                expected_email: request.expected_email,
+                presence: coding_config::presence(&root),
+            })
+        },
+        |request| {
+            assert!(
+                allow_create,
+                "existing entries must never enter the publisher"
+            );
+            request.validate().unwrap();
+            let outcome = coding_config::prepare(&root, request.network_access)
+                .unwrap()
+                .publish(|| true);
+            Ok(CreateReport {
+                account: request.observation.account,
+                host: request.observation.host,
+                home: request.observation.home,
+                network_access: request.network_access,
+                outcome,
+            })
+        },
+    )
+}
+
+#[test]
+fn lost_profile_reply_retry_reports_preserved_unverified_without_repeating_publication() {
+    use crate::account::coding_config::{Outcome, Refusal};
+    let (_root, host, installation, plan) = registered_profile_fixture();
+    let home = installation.homes.path(Provider::Codex, plan.operation);
+    let registry = installation.store.load().unwrap();
+    let auth = fs::read(home.join("auth.json")).unwrap();
+    let initial = status_at(&host, &installation, plan.operation, false).unwrap();
+    let original = initial.clone();
+    let first = profile_in_private_home(&host, initial, &home, true);
+    assert_eq!(
+        first.coding_profile.as_ref().unwrap().outcome,
+        Outcome::Created
+    );
+    let config = fs::read(home.join("config.toml")).unwrap();
+    assert!(String::from_utf8_lossy(&config).contains("network_access = true"));
+    let inode = fs::metadata(home.join("config.toml")).unwrap().ino();
+    drop(first); // The client never received this publication result.
+    let before_retry = status_at(&host, &installation, plan.operation, false).unwrap();
+    assert_eq!(before_retry, original);
+    assert!(
+        list_at(&host, &installation).unwrap()[0]
+            .coding_profile
+            .is_none()
+    );
+    let repeated = profile_in_private_home(&host, before_retry, &home, false);
+    let report = repeated.coding_profile.as_ref().unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::NotCreated(Refusal::ExistingConfiguration)
+    );
+    assert_eq!(report.account, original.registered.clone().unwrap());
+    assert_eq!(report.host, original.observed_destination);
+    assert_eq!(
+        report.home.device,
+        original.receipt.as_ref().unwrap().home().device()
+    );
+    assert_eq!(
+        report.home.inode,
+        original.receipt.as_ref().unwrap().home().inode()
+    );
+    assert!(
+        report.network_access,
+        "the report retains request intent only"
+    );
+    assert_eq!(repeated.plan, plan);
+    assert_eq!(repeated.stage, ImportStage::Registered);
+    assert_eq!(repeated.registered, original.registered);
+    assert_eq!(fs::metadata(home.join("config.toml")).unwrap().ino(), inode);
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+    assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    assert_eq!(installation.store.load().unwrap(), registry);
+    assert_eq!(
+        status_at(&host, &installation, plan.operation, false).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn existing_profile_types_and_changed_settings_stay_unverified_and_untouched() {
+    use crate::account::coding_config::{Outcome, Refusal};
+    use std::os::unix::fs::symlink;
+    for kind in [
+        "opposite-network",
+        "changed",
+        "directory",
+        "symlink",
+        "dangling",
+        "hardlink",
+    ] {
+        let (_root, host, installation, plan) = registered_profile_fixture();
+        let home = installation.homes.path(Provider::Codex, plan.operation);
+        let target = home.join("config.toml");
+        let retained = home.join("retained-config");
+        fs::write(&retained, b"unrelated account settings").unwrap();
+        match kind {
+            "opposite-network" => {
+                fs::write(&target, b"sandbox_mode = \"workspace-write\"\n[sandbox_workspace_write]\nnetwork_access = false\n").unwrap();
+            }
+            "changed" => {
+                let root = Root::open(&home).unwrap();
+                assert_eq!(
+                    crate::account::coding_config::prepare(&root, true)
+                        .unwrap()
+                        .publish(|| true),
+                    Outcome::Created
+                );
+                let replacement = home.join("replacement");
+                fs::write(&replacement, b"changed after an earlier publication").unwrap();
+                fs::rename(replacement, &target).unwrap();
+            }
+            "directory" => fs::create_dir(&target).unwrap(),
+            "symlink" => symlink(&retained, &target).unwrap(),
+            "dangling" => symlink(home.join("missing-config"), &target).unwrap(),
+            "hardlink" => fs::hard_link(&retained, &target).unwrap(),
+            _ => unreachable!(),
+        }
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        let file = metadata.is_file().then(|| fs::read(&target).unwrap());
+        let link = metadata
+            .file_type()
+            .is_symlink()
+            .then(|| fs::read_link(&target).unwrap());
+        installation.journal.mark_uncertain(&plan).unwrap();
+        let original = status_at(&host, &installation, plan.operation, false).unwrap();
+        let current = profile_in_private_home(&host, original.clone(), &home, false);
+        assert_eq!(
+            current.coding_profile.as_ref().unwrap().outcome,
+            Outcome::NotCreated(Refusal::ExistingConfiguration)
+        );
+        assert!(current.coding_profile.as_ref().unwrap().network_access);
+        assert_eq!(current.plan, original.plan);
+        assert!(current.uncertain);
+        let after = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(
+            (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.nlink(),
+                after.len()
+            ),
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.nlink(),
+                metadata.len()
+            )
+        );
+        if let Some(file) = file {
+            assert_eq!(fs::read(&target).unwrap(), file);
+        }
+        if let Some(link) = link {
+            assert_eq!(fs::read_link(&target).unwrap(), link);
+        }
+        assert_eq!(fs::read(&retained).unwrap(), b"unrelated account settings");
+    }
+    let (_root, host, installation, plan) = registered_profile_fixture();
+    let original = status_at(&host, &installation, plan.operation, false).unwrap();
+    let mut unconfigured = original.clone();
+    unconfigured.plan.profile = CodingProfile::Unconfigured;
+    assert!(
+        requested_profile_with(
+            unconfigured,
+            |_| panic!("no implicit inspect"),
+            |_| panic!("no create")
+        )
+        .coding_profile
+        .is_none()
+    );
+    let mut unavailable = original.clone();
+    unavailable.registered = None;
+    assert!(
+        requested_profile_with(
+            unavailable,
+            |_| panic!("no inspect without registration"),
+            |_| panic!("no create")
+        )
+        .coding_profile
+        .is_none()
+    );
+    let unknown = requested_profile_with(
+        original.clone(),
+        |request| {
+            Ok(crate::account::coding_config::Observation {
+                account: request.account,
+                host: proof(&host),
+                home: request.expected_home,
+                expected_email: request.expected_email,
+                presence: Presence::Unknown,
+            })
+        },
+        |_| panic!("unknown presence never creates"),
+    );
+    assert_eq!(unknown, original);
+}

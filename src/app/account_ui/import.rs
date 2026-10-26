@@ -757,6 +757,7 @@ pub(super) fn view(app: &Cagents) -> Option<Element<'_, Message>> {
         if let Some(report) = &status.coding_profile {
             results.push(design::caption(match report.outcome {
                 crate::account::coding_config::Outcome::Created => "Separate coding profile created. Effective permissions still need an explicit check.",
+                crate::account::coding_config::Outcome::NotCreated(crate::account::coding_config::Refusal::ExistingConfiguration) => "An existing configuration entry was preserved. Requested settings remain unverified; use Check coding access.",
                 crate::account::coding_config::Outcome::NotCreated(_) => "Coding profile was not created; existing files were preserved.",
                 crate::account::coding_config::Outcome::CreationUncertain(_) => "Coding profile publication is uncertain; inspect before any further configuration.",
             }).wrapping(iced::widget::text::Wrapping::Word).into());

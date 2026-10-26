@@ -518,7 +518,23 @@ fn verify_identity(
     status_at(host, installation, operation, false)
 }
 
-fn requested_profile(host: &SharedHost, mut status: ImportStatus) -> ImportStatus {
+fn requested_profile(host: &SharedHost, status: ImportStatus) -> ImportStatus {
+    requested_profile_with(
+        status,
+        |request| super::coding_config::inspect(host, request),
+        |request| super::coding_config::create(host, request),
+    )
+}
+
+fn requested_profile_with(
+    mut status: ImportStatus,
+    inspect: impl FnOnce(
+        InspectRequest,
+    ) -> Result<crate::account::coding_config::Observation, ProtocolError>,
+    create: impl FnOnce(
+        CreateRequest,
+    ) -> Result<crate::account::coding_config::CreateReport, ProtocolError>,
+) -> ImportStatus {
     let CodingProfile::WorkspaceWrite { network_access } = status.plan.profile else {
         return status;
     };
@@ -534,17 +550,26 @@ fn requested_profile(host: &SharedHost, mut status: ImportStatus) -> ImportStatu
         },
         expected_email: status.plan.expected_email.clone(),
     };
-    if let Ok(observation) = super::coding_config::inspect(host, request)
-        && observation.presence == Presence::Absent
-    {
-        status.coding_profile = super::coding_config::create(
-            host,
-            CreateRequest {
+    if let Ok(observation) = inspect(request) {
+        status.coding_profile = match observation.presence {
+            Presence::Absent => create(CreateRequest {
                 observation,
                 network_access,
-            },
-        )
-        .ok();
+            })
+            .ok(),
+            Presence::Present => Some(crate::account::coding_config::CreateReport {
+                account: observation.account,
+                host: observation.host,
+                home: observation.home,
+                // This is the immutable request, not an observation of the
+                // existing file's contents or effective network permission.
+                network_access,
+                outcome: crate::account::coding_config::Outcome::NotCreated(
+                    crate::account::coding_config::Refusal::ExistingConfiguration,
+                ),
+            }),
+            Presence::Unknown => None,
+        };
     }
     status
 }

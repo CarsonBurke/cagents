@@ -356,6 +356,9 @@ fn status_output(command: &'static str, status: ImportStatus) -> Result<CommandO
                 format!("created workspace-write/on-request defaults; network {}", if report.network_access { "enabled" } else { "disabled" }),
                 Some("succeeded"),
             ),
+            crate::account::coding_config::Outcome::NotCreated(crate::account::coding_config::Refusal::ExistingConfiguration) => (
+                "an existing configuration entry was preserved; its requested settings and original creation are unverified. Use an explicit coding-access check".into(), Some("existing_configuration"),
+            ),
             crate::account::coding_config::Outcome::NotCreated(reason) => (
                 format!("not created: {}", reason.description()), Some("failed"),
             ),
@@ -367,7 +370,10 @@ fn status_output(command: &'static str, status: ImportStatus) -> Result<CommandO
     let outcome = if !registered || status.uncertain {
         "pending"
     } else if matches!(status.plan.profile, CodingProfile::WorkspaceWrite { .. }) {
-        profile_outcome.unwrap_or("pending")
+        match profile_outcome {
+            Some("existing_configuration") | None => "pending",
+            Some(outcome) => outcome,
+        }
     } else {
         "succeeded"
     };
@@ -782,6 +788,7 @@ mod tests {
         ProfileCreated,
         StatusProfile,
         ProfileRefused,
+        ProfileExisting,
         ProfileUncertain,
         ProfileWrongHost,
         ProfileWrongHome,
@@ -798,6 +805,7 @@ mod tests {
             Case::ProfileCreated
                 | Case::StatusProfile
                 | Case::ProfileRefused
+                | Case::ProfileExisting
                 | Case::ProfileUncertain
                 | Case::ProfileWrongHost
                 | Case::ProfileWrongHome
@@ -813,6 +821,7 @@ mod tests {
             Case::Verify
                 | Case::ProfileCreated
                 | Case::ProfileRefused
+                | Case::ProfileExisting
                 | Case::ProfileUncertain
                 | Case::ProfileWrongHost
                 | Case::ProfileWrongHome
@@ -948,7 +957,8 @@ mod tests {
                                     home: crate::account::readiness::PhysicalIdentity { device:2, inode:10 },
                                     network_access:true,
                                     outcome:match case {
-                                        Case::ProfileRefused => crate::account::coding_config::Outcome::NotCreated(crate::account::coding_config::Refusal::ExistingConfiguration),
+                                        Case::ProfileRefused => crate::account::coding_config::Outcome::NotCreated(crate::account::coding_config::Refusal::RegistryBusy),
+                                        Case::ProfileExisting => crate::account::coding_config::Outcome::NotCreated(crate::account::coding_config::Refusal::ExistingConfiguration),
                                         Case::ProfileUncertain => crate::account::coding_config::Outcome::CreationUncertain(crate::account::coding_config::Uncertainty::DirectorySyncFailed),
                                         _ => crate::account::coding_config::Outcome::Created,
                                     },
@@ -1099,6 +1109,31 @@ mod tests {
             assert_eq!(output.data["execution_readiness"], "not_measured");
             assert!(output.data["status"]["coding_profile"].is_object());
         }
+        let existing = exercise(Case::ProfileExisting).unwrap();
+        assert_eq!(existing.data["registration"], "registered");
+        assert_eq!(existing.data["outcome"], "pending");
+        assert_eq!(
+            existing.data["coding_profile_outcome"],
+            "existing_configuration"
+        );
+        assert_eq!(existing.exit_code(), ExitCode::from(3));
+        assert_eq!(existing.data["execution_readiness"], "not_measured");
+        assert_eq!(
+            existing.data["status"]["plan"]["profile"]["network_access"],
+            true
+        );
+        assert!(
+            existing
+                .human
+                .contains("existing configuration entry was preserved")
+        );
+        assert!(
+            existing
+                .human
+                .contains("requested settings and original creation are unverified")
+        );
+        assert!(!existing.human.contains("network enabled"));
+        assert!(!existing.human.contains("created workspace-write"));
         for output in [&inspection, &prepared, &status, &verified] {
             assert_eq!(output.data["execution_readiness"], "not_measured");
             assert!(!output.human.contains(SECRET));
