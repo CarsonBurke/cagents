@@ -60,6 +60,21 @@ pub fn focused_key<'a, Message: 'a>(
     .into()
 }
 
+/// Capture selected keys at a native surface boundary, including before any
+/// descendant has focus. Keys the callback declines retain native handling.
+pub fn key_listener<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyListener,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
 #[derive(Default)]
 struct ChildFocus(bool);
 
@@ -1241,6 +1256,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 enum Kind {
     KeyboardList(bool),
     FocusedKey,
+    KeyListener,
     ListRow,
     ListEntry,
     TabHistory(bool),
@@ -1302,6 +1318,7 @@ struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
+struct KeyListenerTag;
 struct KeyboardModalTag;
 struct ContextMenuTag;
 struct RevealWidthTag;
@@ -1351,6 +1368,7 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
             Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::KeyListener => tree::Tag::of::<KeyListenerTag>(),
             Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1461,6 +1479,30 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if matches!(self.kind, Kind::KeyListener) {
+            if shell.is_event_captured() {
+                return;
+            }
+            if let Event::Keyboard(event) = event
+                && let Some(on_key) = &self.on_focused_key
+                && let Some(message) = on_key(event)
+            {
+                shell.publish(message);
+                shell.capture_event();
+                return;
+            }
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
         if let Some(on_key) = &self.on_focused_key
             && let Event::Keyboard(event) = event
         {
