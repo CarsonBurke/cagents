@@ -14,6 +14,7 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    OpenNotice(NoticeActivation),
     HostBound(HostSessionProof),
     LifecycleResolved {
         generation: u64,
@@ -33,6 +34,29 @@ pub enum Action {
     Tested(Result<TestOutcome, String>),
     Failed(String),
 }
+
+/// A rendered incident, not permission to replay an arbitrary target.
+#[derive(Debug, Clone)]
+pub struct NoticeActivation {
+    notice: uuid::Uuid,
+    target: Target,
+    host: Option<HostSessionProof>,
+    registry: uuid::Uuid,
+    backend: Option<(String, String, String)>,
+    workspace: Weak<WorkspaceState>,
+}
+
+impl PartialEq for NoticeActivation {
+    fn eq(&self, other: &Self) -> bool {
+        self.notice == other.notice
+            && self.target == other.target
+            && self.host == other.host
+            && self.registry == other.registry
+            && self.backend == other.backend
+            && self.workspace.ptr_eq(&other.workspace)
+    }
+}
+impl Eq for NoticeActivation {}
 
 #[derive(Clone)]
 struct LifecycleActivation {
@@ -137,6 +161,10 @@ pub(super) struct State {
     lifecycle_activation: Option<LifecycleActivation>,
     lifecycle_read: Option<u64>,
     host: Option<HostSessionProof>,
+    // HostBound precedes its Snapshot on the one observer FIFO. Retained old
+    // snapshots may still inform existing chrome, but cannot authorize a click.
+    snapshot_host: Option<HostSessionProof>,
+    snapshot_backend: Option<(String, String, String)>,
     inbox_activation: Option<(crate::agent_execution::Lineage, uuid::Uuid)>,
     session_activation: Option<TerminalId>,
     activation_generation: u64,
@@ -165,6 +193,8 @@ impl Default for State {
             lifecycle_activation: None,
             lifecycle_read: None,
             host: None,
+            snapshot_host: None,
+            snapshot_backend: None,
             inbox_activation: None,
             session_activation: None,
             activation_generation: 0,
@@ -550,6 +580,59 @@ impl Cagents {
         self.sync_notification_presence();
     }
 
+    /// Stable notice IDs are rendered once. Conflicting coalesced targets for
+    /// one ID fail closed rather than choosing whichever row arrived last.
+    pub(super) fn attention_notices(&self) -> Vec<&crate::notifications::Notice> {
+        let mut seen = HashMap::new();
+        let mut conflicts = BTreeSet::new();
+        for notice in &self.notification_ui.snapshot.notices {
+            if let Some(target) =
+                seen.insert(notice.id, (&notice.event.target, notice.acknowledged))
+                && target != (&notice.event.target, notice.acknowledged)
+            {
+                conflicts.insert(notice.id);
+            }
+        }
+        let mut ids = BTreeSet::new();
+        self.notification_ui
+            .snapshot
+            .notices
+            .iter()
+            .filter(|notice| {
+                !notice.acknowledged && !conflicts.contains(&notice.id) && ids.insert(notice.id)
+            })
+            .collect()
+    }
+
+    pub(super) fn attention_backend_current(&self) -> bool {
+        self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+            && self
+                .notification_ui
+                .snapshot_host
+                .as_ref()
+                .is_some_and(|proof| proof.is_complete())
+            && self.notification_ui.snapshot_host == self.notification_ui.host
+            && self.notification_ui.snapshot_backend == lifecycle_backend()
+    }
+
+    pub(super) fn attention_notice_owner(
+        &self,
+        notice: &crate::notifications::Notice,
+    ) -> NoticeActivation {
+        NoticeActivation {
+            notice: notice.id,
+            target: notice.event.target.clone(),
+            host: self.notification_ui.snapshot_host.clone(),
+            registry: self.workspace_model.identity,
+            backend: self.notification_ui.snapshot_backend.clone(),
+            workspace: Arc::downgrade(&self.durable),
+        }
+    }
+
+    pub(super) fn attention_notice_action(&self, notice: &crate::notifications::Notice) -> Message {
+        Message::NotificationUi(Action::OpenNotice(self.attention_notice_owner(notice)))
+    }
+
     fn can_open_lifecycle_notice(&self) -> bool {
         !self.workspace_inputs_blocked()
             && !self.focused_repository_is_saving()
@@ -572,7 +655,47 @@ impl Cagents {
                 self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
+            Action::OpenNotice(clicked) => {
+                let current = self.attention_notices().into_iter().any(|notice| {
+                    notice.id == clicked.notice && notice.event.target == clicked.target
+                });
+                if !self.attention_is_open()
+                    || !current
+                    || clicked.notice.is_nil()
+                    || clicked.registry == crate::workspace_model::NO_REGISTRY
+                    || clicked.registry != self.workspace_model.identity
+                    || clicked.backend != lifecycle_backend()
+                    || clicked.backend != self.notification_ui.snapshot_backend
+                    || clicked.workspace.as_ptr() != Arc::as_ptr(&self.durable)
+                    || clicked
+                        .host
+                        .as_ref()
+                        .is_none_or(|proof| !proof.is_complete())
+                    || clicked.host != self.notification_ui.host
+                    || clicked.host != self.notification_ui.snapshot_host
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This attention entry changed or its backend is unavailable. Open Attention again to choose a current entry.",
+                    ));
+                    return Task::none();
+                }
+                if !self.with_attention_dismissed(|app| app.can_open_lifecycle_notice())
+                    || (matches!(clicked.target, Target::Automation { .. })
+                        && self.notification_ui.lifecycle_read.is_some())
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the current edit or request and return to the workspace, then choose this attention entry again.",
+                    ));
+                    return Task::none();
+                }
+                // Merely listing/reading Attention never acknowledges a notice.
+                // Explicit session actions keep their established semantics;
+                // historical automation activation remains read-only/no-ACK.
+                self.close_attention();
+                self.update_notifications(Action::Activated(clicked.target))
+            }
             Action::HostBound(proof) => {
+                self.notification_ui.snapshot_host = None;
                 if self.notification_ui.host.as_ref() != Some(&proof) {
                     self.notification_ui.lifecycle_activation = None;
                 }
@@ -670,6 +793,8 @@ impl Cagents {
                 Task::batch([open, self.activate_main_window(None)])
             }
             Action::Snapshot(snapshot) => {
+                self.notification_ui.snapshot_host = self.notification_ui.host.clone();
+                self.notification_ui.snapshot_backend = lifecycle_backend();
                 if snapshot.diagnostic != self.notification_ui.snapshot.diagnostic
                     && let Some(diagnostic) = &snapshot.diagnostic
                 {
@@ -3645,3 +3770,6 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Action> +
         |receiver| async move { receiver.recv().await.ok().map(|action| (action, receiver)) },
     ))
 }
+
+#[cfg(test)]
+mod journal_tests;
