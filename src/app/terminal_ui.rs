@@ -109,7 +109,10 @@ mod tests {
             Layout, Shell, clipboard, layout,
             widget::{Tree, operation},
         };
-        for named in [keyboard::key::Named::Enter, keyboard::key::Named::Space] {
+        for key in [
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::Key::Character(" ".into()),
+        ] {
             for release_before_dispatch in [false, true] {
                 let (mut app, card, _directory) =
                     super::super::tests::live_agent_app("review-menu-key-fixture");
@@ -147,20 +150,22 @@ mod tests {
                     &renderer,
                     &mut operation::focusable::focus::<()>(review_id(card)),
                 );
-                let physical_key =
-                    keyboard::key::Physical::Code(if named == keyboard::key::Named::Enter {
+                let physical_key = keyboard::key::Physical::Code(
+                    if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter)) {
                         keyboard::key::Code::NumpadEnter
                     } else {
                         keyboard::key::Code::Space
-                    });
-                let modifiers = if named == keyboard::key::Named::Enter {
+                    },
+                );
+                let modifiers = if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Enter))
+                {
                     keyboard::Modifiers::CTRL
                 } else {
                     keyboard::Modifiers::empty()
                 };
                 let initial = keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(named),
-                    modified_key: keyboard::Key::Named(named),
+                    key: key.clone(),
+                    modified_key: key.clone(),
                     physical_key,
                     location: keyboard::Location::Standard,
                     modifiers,
@@ -168,8 +173,8 @@ mod tests {
                     repeat: false,
                 };
                 let release = keyboard::Event::KeyReleased {
-                    key: keyboard::Key::Named(named),
-                    modified_key: keyboard::Key::Named(named),
+                    key: key.clone(),
+                    modified_key: key.clone(),
                     physical_key,
                     location: keyboard::Location::Standard,
                     modifiers,
@@ -177,6 +182,30 @@ mod tests {
                 let mut repeat = initial.clone();
                 if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeat {
                     *repeat = true;
+                }
+                if matches!(&key, keyboard::Key::Character(value) if value == " ") {
+                    let mut modified = initial.clone();
+                    if let keyboard::Event::KeyPressed { modifiers, .. } = &mut modified {
+                        *modifiers = keyboard::Modifiers::CTRL;
+                    }
+                    let mut blocked_messages = Vec::new();
+                    // This modified Space must not be promoted to a review command.
+                    menu.as_widget_mut().update(
+                        &mut tree,
+                        &iced::Event::Keyboard(modified),
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Unavailable,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut blocked_messages),
+                        &bounds,
+                    );
+                    assert!(
+                        !blocked_messages
+                            .iter()
+                            .any(|m| matches!(m, Message::TerminalFind(Action::Review(..))))
+                    );
+                    assert!(!barrier.owns_keyboard(&iced::Event::Keyboard(initial.clone())));
                 }
                 let mut dispatch = |event| {
                     let mut messages = Vec::new();
@@ -1131,15 +1160,26 @@ impl Cagents {
             .width(Length::Fill)
             .on_press(review.clone()),
             move |event| {
-                if matches!(event, keyboard::Event::KeyPressed { key, modifiers, repeat: false, .. }
-                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter))
-                        || (modifiers.is_empty() && matches!(key, keyboard::Key::Named(keyboard::key::Named::Space))))
+                if let keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    repeat: false,
+                    ..
+                } = event
                 {
-                    barrier.capture_activation(event);
-                    // COSMIC buttons activate Enter natively. Space is an
-                    // equivalent keyboard action for this contextual command.
-                    if matches!(event, keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Space), .. }) {
-                        return Some(review.clone());
+                    let space = modifiers.is_empty()
+                        && matches!(
+                            key.as_ref(),
+                            keyboard::Key::Named(keyboard::key::Named::Space)
+                                | keyboard::Key::Character(" ")
+                        );
+                    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Enter)) || space {
+                        barrier.capture_activation(event);
+                        // COSMIC buttons activate Enter natively. Space is an
+                        // equivalent command, including Linux character Space.
+                        if space {
+                            return Some(review.clone());
+                        }
                     }
                 }
                 None
