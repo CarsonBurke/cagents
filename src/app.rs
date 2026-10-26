@@ -24535,10 +24535,24 @@ mod tests {
         drop(app.initialize_runtimes());
         assert_eq!(
             app.terminal_starts_in_flight(),
-            0,
-            "ordinary offscreen lifecycle stays deferred"
+            1,
+            "the identified Omp agent already observes background metadata"
         );
+        assert!(app.terminal_start_in_flight(terminals[1].id));
+        assert!(!app.terminal_start_in_flight(terminals[0].id));
+        assert!(!app.terminal_start_in_flight(terminals[2].id));
         assert!(app.restored_agent_attaches.is_empty());
+        let CardKind::Terminal(omp) = &terminals[1].kind else {
+            unreachable!()
+        };
+        drop(app.update(Message::RestoredAgentAttached {
+            card: terminals[1].id,
+            terminal: omp.id,
+            result: Ok(None),
+        }));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        // An unavailable original remains unqualified; the explicit startup
+        // check then uses the same serial attach-only path for every owner.
         drop(app.qualify_startup_terminals());
         assert_eq!(app.terminal_starts_in_flight(), 1);
         assert_eq!(app.restored_agent_attaches.len(), 2);
