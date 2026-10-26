@@ -23,7 +23,24 @@ pub(crate) fn capture(
     keep_alive: KeepAlive,
     on_pcm: impl FnMut(),
 ) -> Result<Vec<u8>, Failure> {
-    if spec.program != Path::new("/usr/bin/pw-record") {
+    let expected = [
+        "--raw",
+        "--rate",
+        "16000",
+        "--channels",
+        "1",
+        "--format",
+        "s16",
+        "-",
+    ];
+    if spec.program != Path::new("/usr/bin/pw-record")
+        || spec.arguments.len() != expected.len()
+        || spec
+            .arguments
+            .iter()
+            .zip(expected)
+            .any(|(argument, expected)| argument.as_os_str() != std::ffi::OsStr::new(expected))
+    {
         return Err(Failure::Spawn);
     }
     if spec
@@ -554,7 +571,16 @@ else:
             transcribe(&CommandSpec::new("whisper"), &cancel, Arc::new(())),
             Err(Failure::Spawn)
         ));
-        let mut spec = CommandSpec::new("/usr/bin/pw-record");
+        let mut spec = CommandSpec::new("/usr/bin/pw-record").args([
+            "--raw",
+            "--rate",
+            "16000",
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-",
+        ]);
         spec.timeout = None;
         assert!(matches!(
             capture(&spec, &stop, &cancel, Arc::new(()), || {}),
