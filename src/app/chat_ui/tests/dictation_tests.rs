@@ -9,6 +9,27 @@ fn capture(app: &mut Cagents, target: Target) -> crate::speech::Ticket<Target> {
         .dictation
         .capture_for_test(target, runtime.revision, &runtime.composer)
 }
+fn start(app: &Cagents, target: Target) -> Action {
+    Action::Dictation(
+        target,
+        dictation::Action::Start {
+            epoch: chat_runtime(app, target.card).dictation.epoch(),
+            prepared: false,
+        },
+    )
+}
+fn install(app: &Cagents, target: Target) -> Action {
+    Action::Dictation(
+        target,
+        dictation::Action::Install(app.chat_ui.dictation_setup.presentation()),
+    )
+}
+fn dismiss(app: &Cagents, target: Target) -> Action {
+    Action::Dictation(
+        target,
+        dictation::Action::DismissSetup(app.chat_ui.dictation_setup.presentation()),
+    )
+}
 fn result(ticket: &crate::speech::Ticket<Target>, text: &str) -> Action {
     Action::Dictation(
         ticket.target,
@@ -28,7 +49,7 @@ fn microphone_discovery_requires_explicit_setup_and_preserves_draft() {
     let card = draft_chat(&mut app);
     write(&mut app, card, "keep this draft");
     let target = chat_runtime(&app, card).target;
-    drop(app.handle_chat_ui(Action::Dictation(target, dictation::Action::Start)));
+    drop(app.handle_chat_ui(start(&app, target)));
     assert!(app.chat_ui.dictation_setup.shown(target));
     assert!(
         app.chat_ui.dictation_setup.phase().is_none(),
@@ -38,7 +59,7 @@ fn microphone_discovery_requires_explicit_setup_and_preserves_draft() {
     assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
     assert!(chat_runtime(&app, card).dictation.phase().is_none());
     assert!(chat_runtime(&app, card).pending.is_none());
-    drop(app.handle_chat_ui(Action::Dictation(target, dictation::Action::DismissSetup)));
+    drop(app.handle_chat_ui(dismiss(&app, target)));
     assert!(!app.chat_ui.dictation_setup.shown(target));
 }
 
@@ -48,6 +69,7 @@ fn queued_start_and_install_cannot_reopen_hidden_or_parked_microphone_owner() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
         let target = chat_runtime(&app, card).target;
+        let queued_start = start(&app, target);
         app.chat_runtime_mut(target)
             .unwrap()
             .set_visible(false)
@@ -58,14 +80,14 @@ fn queued_start_and_install_cannot_reopen_hidden_or_parked_microphone_owner() {
             };
             app.chat_ui.parked.insert(card, runtime);
         }
-        drop(app.handle_chat_ui(Action::Dictation(target, dictation::Action::Start)));
+        drop(app.handle_chat_ui(queued_start));
         assert!(
             !app.chat_ui.dictation_setup.shown(target),
             "hidden queued Start must not even expose setup"
         );
         // A previously open setup panel can outlive its editor's visibility.
         app.chat_ui.dictation_setup.show(target);
-        let task = app.handle_chat_ui(Action::Dictation(target, dictation::Action::Install));
+        let task = app.handle_chat_ui(install(&app, target));
         assert!(iced::runtime::task::into_stream(task).is_none());
         assert!(app.chat_ui.dictation_setup.phase().is_none());
         assert!(app.chat_ui.dictation_setup.prepared().is_none());
@@ -256,7 +278,7 @@ fn dictation_control_native_escape_cancels_without_agent_interrupt() {
             messages
         };
         assert!(messages.iter().any(|message| matches!(message,
-            Message::ChatUi(Action::Dictation(actual, dictation::Action::Cancel)) if *actual == target)));
+            Message::ChatUi(Action::Dictation(actual, dictation::Action::Cancel(_))) if *actual == target)));
         assert!(
             !messages
                 .iter()
@@ -292,10 +314,152 @@ fn explicit_record_controls_do_not_return_focus_behind_modal_or_update_freeze() 
         }
         // Exercise the cleanup reducer directly as an already-admitted callback;
         // its focus guard must remain effective independently of modal routing.
-        let stopped = app.handle_dictation(target, dictation::Action::StopRecording);
+        let stopped =
+            app.handle_dictation(target, dictation::Action::StopRecording(ticket.clone()));
         assert!(iced::runtime::task::into_stream(stopped).is_none());
-        let cancelled = app.handle_dictation(target, dictation::Action::Cancel);
+        let cancelled = app.handle_dictation(target, dictation::Action::Cancel(ticket.clone()));
         assert!(iced::runtime::task::into_stream(cancelled).is_none());
         assert!(chat_runtime(&app, card).dictation.phase().is_none());
     }
+}
+
+#[test]
+fn stale_record_and_retained_controls_cannot_act_on_replacement_operation() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    write(&mut app, card, "base");
+    let target = chat_runtime(&app, card).target;
+    let first = capture(&mut app, target);
+    drop(app.handle_dictation(target, dictation::Action::Cancel(first.clone())));
+    let second = capture(&mut app, target);
+    app.chat_runtime_mut(target).unwrap().dictation.progress(
+        target,
+        &second,
+        crate::speech::Phase::Recording,
+        Instant::now(),
+    );
+    for stale in [
+        dictation::Action::StopRecording(first.clone()),
+        dictation::Action::Cancel(first.clone()),
+    ] {
+        let task = app.handle_chat_ui(Action::Dictation(target, stale));
+        assert!(
+            iced::runtime::task::into_stream(task).is_none(),
+            "stale controls cannot issue focus either"
+        );
+    }
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.dictation.ticket().unwrap().belongs_to(&second));
+    assert!(!runtime.dictation.stopping());
+    assert_eq!(
+        runtime.dictation.phase(),
+        Some(crate::speech::Phase::Recording)
+    );
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .dictation
+        .unmeasured_edit();
+    drop(app.handle_chat_ui(result(&second, "first retained")));
+    drop(app.handle_chat_ui(Action::Dictation(
+        target,
+        dictation::Action::DiscardRetained(second.clone()),
+    )));
+    let third = capture(&mut app, target);
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .dictation
+        .unmeasured_edit();
+    drop(app.handle_chat_ui(result(&third, "second retained")));
+    for stale in [
+        dictation::Action::InsertRetained(second.clone()),
+        dictation::Action::DiscardRetained(second),
+    ] {
+        let task = app.handle_chat_ui(Action::Dictation(target, stale));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+    }
+    assert!(
+        chat_runtime(&app, card)
+            .dictation
+            .retained_ticket()
+            .unwrap()
+            .belongs_to(&third)
+    );
+    assert_eq!(chat_runtime(&app, card).composer.text(), "base");
+}
+
+#[test]
+fn stale_setup_cancel_and_presentation_cannot_replace_current_job() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    app.chat_ui.dictation_setup.show(target);
+    let old_presentation = app.chat_ui.dictation_setup.presentation();
+    let (first, _) = app.chat_ui.dictation_setup.begin().unwrap();
+    app.chat_ui.dictation_setup.cancel(first);
+    let (second, second_cancel) = app.chat_ui.dictation_setup.begin().unwrap();
+    for stale in [
+        dictation::Action::CancelSetup(first),
+        dictation::Action::Install(old_presentation),
+        dictation::Action::DismissSetup(old_presentation),
+    ] {
+        let task = app.handle_chat_ui(Action::Dictation(target, stale));
+        assert!(iced::runtime::task::into_stream(task).is_none());
+    }
+    assert_eq!(app.chat_ui.dictation_setup.job_ticket(), Some(second));
+    assert!(!second_cancel.is_cancelled());
+    assert!(app.chat_ui.dictation_setup.shown(target));
+    drop(app.handle_chat_ui(Action::Dictation(
+        target,
+        dictation::Action::CancelSetup(second),
+    )));
+    assert!(second_cancel.is_cancelled());
+}
+
+#[test]
+fn palette_blocks_queued_dictation_start_setup_and_retained_insertion() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    write(&mut app, card, "base");
+    let target = chat_runtime(&app, card).target;
+    let queued_start = start(&app, target);
+    drop(app.update(Message::Palette(crate::app::palette_ui::Action::Open)));
+    drop(app.update(Message::ChatUi(queued_start)));
+    assert!(!app.chat_ui.dictation_setup.shown(target));
+    app.chat_ui.dictation_setup.show(target);
+    let queued_install = install(&app, target);
+    let task = app.update(Message::ChatUi(queued_install));
+    assert!(iced::runtime::task::into_stream(task).is_none());
+    assert!(app.chat_ui.dictation_setup.phase().is_none());
+    let ticket = capture(&mut app, target);
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .dictation
+        .unmeasured_edit();
+    drop(app.handle_chat_ui(result(&ticket, "retained")));
+    drop(app.update(Message::ChatUi(Action::Dictation(
+        target,
+        dictation::Action::InsertRetained(ticket.clone()),
+    ))));
+    assert_eq!(chat_runtime(&app, card).composer.text(), "base");
+    assert!(
+        chat_runtime(&app, card)
+            .dictation
+            .retained_ticket()
+            .unwrap()
+            .belongs_to(&ticket)
+    );
+}
+
+#[test]
+fn replaced_draft_rejects_queued_idle_start_epoch() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let queued = start(&app, target);
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::with_text("new draft"));
+    drop(app.handle_chat_ui(queued));
+    assert!(!app.chat_ui.dictation_setup.shown(target));
+    assert_eq!(chat_runtime(&app, card).composer.text(), "new draft");
 }

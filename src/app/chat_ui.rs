@@ -4402,7 +4402,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
-            self.dictation.cancel(self.target);
+            self.dictation.cancel_active(self.target);
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
             if let Some(queued) = &mut self.queued {

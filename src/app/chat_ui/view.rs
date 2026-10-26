@@ -2815,12 +2815,12 @@ impl Runtime {
                             Action::AcceptSuggestion(target, suggestion.clone()),
                         )));
                     }
-                    if self.dictation.phase().is_some()
+                    if let Some(ticket) = self.dictation.ticket()
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Dictation(
                             target,
-                            dictation::Action::Cancel,
+                            dictation::Action::Cancel(ticket.clone()),
                         ))));
                     }
                     if snapshot.busy

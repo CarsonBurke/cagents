@@ -18,14 +18,14 @@ const MAX_TEXT_BYTES: usize = 32 * 1024;
 /// completed dictation twice or print its text in diagnostic Debug output.
 #[derive(Clone)]
 pub(super) enum Action {
-    Start,
-    StopRecording,
-    Cancel,
-    InsertRetained,
-    DiscardRetained,
-    Install,
-    CancelSetup,
-    DismissSetup,
+    Start { epoch: Uuid, prepared: bool },
+    StopRecording(Ticket),
+    Cancel(Ticket),
+    InsertRetained(Ticket),
+    DiscardRetained(Ticket),
+    Install(Uuid),
+    CancelSetup(SetupTicket),
+    DismissSetup(Uuid),
     SetupProgress(SetupTicket, speech::setup::Progress),
     SetupFinished(SetupDelivery),
     Progress(Ticket, speech::Phase, Instant),
@@ -74,6 +74,7 @@ pub(super) enum HoldReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartError {
     Active,
+    Stale,
     RetainedText,
     Speech(speech::Error),
 }
@@ -108,11 +109,21 @@ struct Retained {
     reason: HoldReason,
 }
 
-#[derive(Default)]
 pub(super) struct State {
+    epoch: Uuid,
     active: Option<Active>,
     retained: Option<Retained>,
     error: Option<speech::Error>,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            epoch: Uuid::new_v4(),
+            active: None,
+            retained: None,
+            error: None,
+        }
+    }
 }
 pub(super) struct Started {
     pub ticket: Ticket,
@@ -136,10 +147,14 @@ impl State {
     pub fn begin(
         &mut self,
         target: Target,
+        epoch: Uuid,
         revision: u64,
         content: &Content,
         assets: &speech::Prepared,
     ) -> Result<Started, StartError> {
+        if self.epoch != epoch {
+            return Err(StartError::Stale);
+        }
         if self.active.is_some() {
             return Err(StartError::Active);
         }
@@ -152,6 +167,7 @@ impl State {
             .map_err(StartError::Speech)?;
         let ticket = tracking.ticket.clone();
         self.error = None;
+        self.epoch = Uuid::new_v4();
         self.active = Some(Active {
             tracking,
             control: Some(control),
@@ -170,6 +186,7 @@ impl State {
     ) -> Ticket {
         let tracking = Tracking::new(target, revision, content);
         let ticket = tracking.ticket.clone();
+        self.epoch = Uuid::new_v4();
         self.active = Some(Active {
             tracking,
             control: None,
@@ -178,6 +195,18 @@ impl State {
             recording_since: None,
         });
         ticket
+    }
+    pub fn epoch(&self) -> Uuid {
+        self.epoch
+    }
+    pub fn idle(&self, epoch: Uuid) -> bool {
+        self.epoch == epoch && self.active.is_none() && self.retained.is_none()
+    }
+    pub fn ticket(&self) -> Option<&Ticket> {
+        self.active.as_ref().map(|active| &active.tracking.ticket)
+    }
+    pub fn retained_ticket(&self) -> Option<&Ticket> {
+        self.retained.as_ref().map(|value| &value.ticket)
     }
     pub fn has_bookmark(&self) -> bool {
         self.active.is_some()
@@ -237,11 +266,11 @@ impl State {
         active.phase = phase;
         true
     }
-    pub fn stop(&mut self, current: Target) -> bool {
+    pub fn stop(&mut self, current: Target, ticket: &Ticket) -> bool {
         let Some(active) = &mut self.active else {
             return false;
         };
-        if active.tracking.ticket.target != current
+        if !active.tracking.accepts(current, ticket)
             || active.phase != speech::Phase::Recording
             || active.stopping
         {
@@ -253,7 +282,19 @@ impl State {
         active.stopping = true;
         true
     }
-    pub fn cancel(&mut self, current: Target) -> bool {
+    pub fn cancel(&mut self, current: Target, ticket: &Ticket) -> bool {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.tracking.accepts(current, ticket))
+        {
+            return false;
+        }
+        self.cancel_active(current)
+    }
+    /// Lifecycle cleanup addresses the currently owned capture, never a queued
+    /// UI command. Hidden panes keep recognized retained text with their draft.
+    pub fn cancel_active(&mut self, current: Target) -> bool {
         if self
             .active
             .as_ref()
@@ -268,6 +309,7 @@ impl State {
     /// Draft replacement/send or target retirement cancels the original owner.
     /// It cannot silently carry a fallback transcript into the replacement draft.
     pub fn retire(&mut self) {
+        self.epoch = Uuid::new_v4();
         self.active.take();
         self.retained.take();
         self.error = None;
@@ -334,11 +376,16 @@ impl State {
         }
     }
     /// Explicit user action only; async completion never chooses a new caret.
-    pub fn insert_retained(&mut self, current: Target, content: &mut Content) -> Finished {
+    pub fn insert_retained(
+        &mut self,
+        current: Target,
+        ticket: &Ticket,
+        content: &mut Content,
+    ) -> Finished {
         let Some(retained) = &self.retained else {
             return Finished::Ignored;
         };
-        if retained.ticket.target != current {
+        if retained.ticket.target != current || !retained.ticket.belongs_to(ticket) {
             return Finished::Ignored;
         }
         let bookmark = attachment_draft::Bookmark::capture(content);
@@ -354,12 +401,10 @@ impl State {
             Err(_) => Finished::Retained,
         }
     }
-    pub fn discard_retained(&mut self, current: Target) -> bool {
-        if self
-            .retained
-            .as_ref()
-            .is_some_and(|retained| retained.ticket.target == current)
-        {
+    pub fn discard_retained(&mut self, current: Target, ticket: &Ticket) -> bool {
+        if self.retained.as_ref().is_some_and(|retained| {
+            retained.ticket.target == current && retained.ticket.belongs_to(ticket)
+        }) {
             self.retained.take();
             true
         } else {
@@ -445,26 +490,38 @@ struct SetupJob {
 #[derive(Default)]
 pub(super) struct Setup {
     owner: Option<Target>,
+    presentation: Uuid,
     active: Option<SetupJob>,
     prepared: Option<Arc<speech::Prepared>>,
     error: Option<speech::Error>,
 }
 impl Setup {
     pub fn show(&mut self, target: Target) {
+        if self.owner != Some(target) {
+            self.presentation = Uuid::new_v4();
+        }
         self.owner = Some(target);
     }
     pub fn shown(&self, target: Target) -> bool {
         self.owner == Some(target)
     }
-    pub fn dismiss(&mut self, target: Target) {
-        if self.shown(target) && self.active.is_none() {
+    pub fn presentation(&self) -> Uuid {
+        self.presentation
+    }
+    pub fn job_ticket(&self) -> Option<SetupTicket> {
+        self.active.as_ref().map(|job| job.ticket)
+    }
+    pub fn dismiss(&mut self, target: Target, presentation: Uuid) {
+        if self.shown(target) && self.presentation == presentation && self.active.is_none() {
             self.owner = None;
+            self.presentation = Uuid::new_v4();
         }
     }
     pub fn begin(&mut self) -> Result<(SetupTicket, CancellationToken), speech::Error> {
         if self.active.is_some() {
             return Err(speech::Error::Busy);
         }
+        self.presentation = Uuid::new_v4();
         let ticket = SetupTicket(Uuid::new_v4());
         let cancel = CancellationToken::new();
         self.active = Some(SetupJob {
@@ -526,8 +583,15 @@ impl Setup {
         }
         true
     }
-    pub fn cancel(&mut self) -> bool {
+    pub fn cancel(&mut self, ticket: SetupTicket) -> bool {
+        if !self.active.as_ref().is_some_and(|job| job.ticket == ticket) {
+            return false;
+        }
+        self.cancel_active()
+    }
+    fn cancel_active(&mut self) -> bool {
         if let Some(job) = self.active.take() {
+            self.presentation = Uuid::new_v4();
             job.cancel.cancel();
             self.error = None;
             true
@@ -547,7 +611,7 @@ impl Setup {
 }
 impl Drop for Setup {
     fn drop(&mut self) {
-        self.cancel();
+        self.cancel_active();
     }
 }
 
@@ -623,10 +687,14 @@ impl super::Runtime {
                       action: Action,
                       enabled: bool|
          -> super::Element<'a, super::Message> {
-            let id = if matches!(action, Action::StopRecording) {
+            let id = if matches!(action, Action::StopRecording(_)) {
                 "chat-dictation-stop"
             } else {
                 "chat-dictation-cancel"
+            };
+            let cancel = match &action {
+                Action::StopRecording(ticket) | Action::Cancel(ticket) => ticket.clone(),
+                _ => unreachable!("active dictation control"),
             };
             crate::interaction::focused_escape(
                 crate::ui_controls::icon_button(icon, label)
@@ -635,21 +703,27 @@ impl super::Runtime {
                     .on_press_maybe(
                         enabled.then_some(super::action(ChatAction::Dictation(target, action))),
                     ),
-                move || super::action(ChatAction::Dictation(target, Action::Cancel)),
+                move || {
+                    super::action(ChatAction::Dictation(
+                        target,
+                        Action::Cancel(cancel.clone()),
+                    ))
+                },
             )
         };
+        let ticket = self.dictation.ticket().cloned();
         match self.dictation.phase() {
             Some(speech::Phase::Recording) => vec![
                 button(
                     Icon::Stop,
                     "Finish dictation recording and transcribe",
-                    Action::StopRecording,
+                    Action::StopRecording(ticket.clone().expect("active recording")),
                     !self.dictation.stopping(),
                 ),
                 button(
                     Icon::Cancel,
                     "Cancel dictation and discard recording (Esc)",
-                    Action::Cancel,
+                    Action::Cancel(ticket.clone().expect("active recording")),
                     true,
                 ),
             ],
@@ -659,7 +733,12 @@ impl super::Runtime {
                     super::design::muted_icon_color,
                 )
                 .into(),
-                button(Icon::Cancel, "Cancel dictation (Esc)", Action::Cancel, true),
+                button(
+                    Icon::Cancel,
+                    "Cancel dictation (Esc)",
+                    Action::Cancel(ticket.expect("active dictation")),
+                    true,
+                ),
             ],
             None => vec![
                 crate::ui_controls::icon_button(
@@ -676,8 +755,15 @@ impl super::Runtime {
                     "chat-dictation-microphone",
                 ))
                 .on_press_maybe(
-                    (available && self.dictation.retained_reason().is_none())
-                        .then(|| action(ChatAction::Dictation(target, Action::Start))),
+                    (available && self.dictation.retained_reason().is_none()).then(|| {
+                        action(ChatAction::Dictation(
+                            target,
+                            Action::Start {
+                                epoch: self.dictation.epoch(),
+                                prepared: setup.is_some_and(|setup| setup.prepared().is_some()),
+                            },
+                        ))
+                    }),
                 )
                 .into(),
             ],
@@ -728,7 +814,7 @@ impl super::Runtime {
                     .into(),
             );
         }
-        if self.dictation.retained_reason().is_some() {
+        if let Some(ticket) = self.dictation.retained_ticket() {
             rows.push(
                 design::caption(
                     "The draft changed. Insert the dictation at the current caret when ready.",
@@ -737,8 +823,12 @@ impl super::Runtime {
             );
             rows.push(
                 widget::flex_row(vec![
-                    button("Insert here", Action::InsertRetained, available),
-                    button("Discard", Action::DiscardRetained, true),
+                    button(
+                        "Insert here",
+                        Action::InsertRetained(ticket.clone()),
+                        available,
+                    ),
+                    button("Discard", Action::DiscardRetained(ticket.clone()), true),
                 ])
                 .spacing(super::step::GAP_XS as u16)
                 .into(),
@@ -747,7 +837,11 @@ impl super::Runtime {
         if let Some(setup) = setup.filter(|setup| setup.shown(target)) {
             let mut controls = Vec::new();
             let label = if let Some(phase) = setup.phase() {
-                controls.push(button("Cancel setup", Action::CancelSetup, true));
+                controls.push(button(
+                    "Cancel setup",
+                    Action::CancelSetup(setup.job_ticket().expect("active setup")),
+                    true,
+                ));
                 match phase {
                     SetupPhase::CheckingSaved => "Checking saved speech files…".to_owned(),
                     SetupPhase::Downloading { bytes } => format!(
@@ -758,7 +852,11 @@ impl super::Runtime {
                     SetupPhase::Extracting => "Preparing local speech runtime…".to_owned(),
                 }
             } else if setup.prepared().is_some() {
-                controls.push(button("Done", Action::DismissSetup, true));
+                controls.push(button(
+                    "Done",
+                    Action::DismissSetup(setup.presentation()),
+                    true,
+                ));
                 "Local dictation is ready. Press the microphone to record.".to_owned()
             } else {
                 controls.push(button(
@@ -767,10 +865,14 @@ impl super::Runtime {
                     } else {
                         "Download and set up"
                     },
-                    Action::Install,
+                    Action::Install(setup.presentation()),
                     available,
                 ));
-                controls.push(button("Close", Action::DismissSetup, true));
+                controls.push(button(
+                    "Close",
+                    Action::DismissSetup(setup.presentation()),
+                    true,
+                ));
                 format!(
                     "Local dictation runs on this computer. Optional speech download: {} MiB.",
                     speech::setup::DOWNLOAD_BYTES.div_ceil(1024 * 1024)
@@ -822,18 +924,26 @@ impl super::Cagents {
     ) -> super::Task<super::Message> {
         use super::{Action as ChatAction, Message, Task};
         use cosmic::iced::futures::StreamExt;
+        let cleanup = matches!(
+            &action,
+            Action::StopRecording(_) | Action::Cancel(_) | Action::CancelSetup(_)
+        );
+        if !action.asynchronous()
+            && !cleanup
+            && (self.update_prepared || self.workspace_inputs_blocked())
+        {
+            return Task::none();
+        }
         match action {
-            Action::Start => {
+            Action::Start { epoch, prepared } => {
                 // Validate the live editor before exposing setup or acquiring a
                 // microphone. A selected remote workspace never selects its mic.
                 let assets = self.chat_ui.dictation_setup.prepared.clone();
-                if assets.is_some() {
-                    self.chat_ui.dictation_setup.dismiss(target);
-                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
+                if !runtime.dictation.idle(epoch)
+                    || !runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
                     || runtime.closed_elsewhere
                     || runtime.disconnected
                     || runtime.snapshot.exited
@@ -842,12 +952,13 @@ impl super::Cagents {
                 {
                     return Task::none();
                 }
-                let Some(assets) = assets else {
+                let Some(assets) = assets.filter(|_| prepared) else {
                     self.chat_ui.dictation_setup.show(target);
                     return Task::none();
                 };
                 let started = match runtime.dictation.begin(
                     target,
+                    epoch,
                     runtime.revision,
                     &runtime.composer,
                     &assets,
@@ -857,8 +968,12 @@ impl super::Cagents {
                         runtime.dictation.error = Some(error);
                         return Task::none();
                     }
-                    Err(StartError::Active | StartError::RetainedText) => return Task::none(),
+                    Err(StartError::Active | StartError::Stale | StartError::RetainedText) => {
+                        return Task::none();
+                    }
                 };
+                let presentation = self.chat_ui.dictation_setup.presentation();
+                self.chat_ui.dictation_setup.dismiss(target, presentation);
                 let (sender, receiver) = async_channel::bounded(4);
                 let phases = cosmic::task::stream(
                     receiver
@@ -885,18 +1000,18 @@ impl super::Cagents {
                 });
                 return Task::batch([phases, result, self.focus_dictation_composer(target)]);
             }
-            Action::StopRecording => {
+            Action::StopRecording(ticket) => {
                 if self
                     .chat_runtime_mut(target)
-                    .is_some_and(|runtime| runtime.dictation.stop(target))
+                    .is_some_and(|runtime| runtime.dictation.stop(target, &ticket))
                 {
                     return self.focus_dictation_composer(target);
                 }
             }
-            Action::Cancel => {
+            Action::Cancel(ticket) => {
                 if self
                     .chat_runtime_mut(target)
-                    .is_some_and(|runtime| runtime.dictation.cancel(target))
+                    .is_some_and(|runtime| runtime.dictation.cancel(target, &ticket))
                 {
                     return self.focus_dictation_composer(target);
                 }
@@ -915,20 +1030,21 @@ impl super::Cagents {
                     runtime.dictation_applied(finished);
                 }
             }
-            Action::InsertRetained => {
+            Action::InsertRetained(ticket) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let finished = runtime
-                        .dictation
-                        .insert_retained(target, &mut runtime.composer);
+                    let finished =
+                        runtime
+                            .dictation
+                            .insert_retained(target, &ticket, &mut runtime.composer);
                     runtime.dictation_applied(finished);
                 }
             }
-            Action::DiscardRetained => {
+            Action::DiscardRetained(ticket) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.dictation.discard_retained(target);
+                    runtime.dictation.discard_retained(target, &ticket);
                 }
             }
-            Action::Install => {
+            Action::Install(presentation) => {
                 let eligible = self.chat_runtime_mut(target).is_some_and(|runtime| {
                     runtime.visible.load(std::sync::atomic::Ordering::Relaxed)
                         && !runtime.closed_elsewhere
@@ -937,7 +1053,10 @@ impl super::Cagents {
                         && runtime.pending.is_none()
                         && runtime.queued.is_none()
                 });
-                if !eligible || !self.chat_ui.dictation_setup.shown(target) {
+                if !eligible
+                    || !self.chat_ui.dictation_setup.shown(target)
+                    || self.chat_ui.dictation_setup.presentation() != presentation
+                {
                     return Task::none();
                 }
                 let Some(root) =
@@ -982,12 +1101,14 @@ impl super::Cagents {
                 self.chat_ui.dictation_setup.progress(ticket, phase);
             }
             Action::SetupFinished(delivery) => self.chat_ui.dictation_setup.delivered(delivery),
-            Action::CancelSetup => {
+            Action::CancelSetup(ticket) => {
                 if self.chat_ui.dictation_setup.shown(target) {
-                    self.chat_ui.dictation_setup.cancel();
+                    self.chat_ui.dictation_setup.cancel(ticket);
                 }
             }
-            Action::DismissSetup => self.chat_ui.dictation_setup.dismiss(target),
+            Action::DismissSetup(presentation) => {
+                self.chat_ui.dictation_setup.dismiss(target, presentation)
+            }
         }
         Task::none()
     }
@@ -1099,12 +1220,12 @@ mod tests {
             ..target
         };
         assert!(matches!(
-            state.insert_retained(late_target, &mut content),
+            state.insert_retained(late_target, &ticket, &mut content),
             Finished::Ignored
         ));
         attachment_draft::move_to(&mut content, cursor(0, 17));
         assert!(matches!(
-            state.insert_retained(target, &mut content),
+            state.insert_retained(target, &ticket, &mut content),
             Finished::Applied(_)
         ));
         assert_eq!(content.text(), "alpha be!ta gammaspoken");
@@ -1162,8 +1283,8 @@ mod tests {
             Finished::Ignored
         ));
         assert!(state.progress(target, &ticket, speech::Phase::Recording, now));
-        assert!(state.stop(target));
-        assert!(!state.stop(target));
+        assert!(state.stop(target, &ticket));
+        assert!(!state.stop(target, &ticket));
         assert!(state.progress(target, &ticket, speech::Phase::Transcribing, now));
         assert!(!state.progress(target, &ticket, speech::Phase::Recording, now));
         state.retire();
@@ -1215,7 +1336,7 @@ mod tests {
             state.complete(target, &delivered(&ticket, "retained"), &mut content),
             Finished::Retained
         ));
-        assert!(state.discard_retained(target));
+        assert!(state.discard_retained(target, &ticket));
         let (mut state, ticket) = fixture(target, &content);
         let cancelled = Delivery::new(ticket, Err(speech::Error::Cancelled));
         assert!(matches!(
@@ -1270,11 +1391,14 @@ mod tests {
         let mut content = Content::with_text("draft");
         attachment_draft::move_to(&mut content, cursor(0, 0));
         let (mut state, first) = fixture(target, &content);
-        assert!(!state.cancel(Target {
-            generation: 99,
-            ..target
-        }));
-        assert!(state.cancel(target));
+        assert!(!state.cancel(
+            Target {
+                generation: 99,
+                ..target
+            },
+            &first
+        ));
+        assert!(state.cancel(target, &first));
         let (next, second) = fixture(target, &content);
         state = next;
         assert!(matches!(
@@ -1299,7 +1423,7 @@ mod tests {
         assert!(!setup.progress(first, SetupPhase::Downloading { bytes: u64::MAX }));
         assert!(setup.progress(first, SetupPhase::Verifying));
         assert!(!setup.progress(first, SetupPhase::Downloading { bytes: 20 }));
-        assert!(setup.cancel());
+        assert!(setup.cancel(first));
         assert!(cancel.is_cancelled());
         let (second, _) = setup.begin().unwrap();
         assert!(!setup.complete(first, Err(speech::Error::Inference)));
