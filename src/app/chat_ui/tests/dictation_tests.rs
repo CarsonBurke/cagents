@@ -503,6 +503,173 @@ fn replaced_draft_rejects_queued_idle_start_epoch() {
 }
 
 #[test]
+fn native_microphone_click_preserves_selected_draft_and_pending_image_range() {
+    use iced::advanced::{clipboard, widget::Operation};
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    struct Bounds {
+        ids: [widget::Id; 2],
+        values: [Option<iced::Rectangle>; 2],
+    }
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            for (wanted, saved) in self.ids.iter().zip(&mut self.values) {
+                if id == Some(wanted) {
+                    *saved = Some(bounds);
+                }
+            }
+        }
+    }
+    let _admission = attachment_draft::test_admission();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    expose(&mut app, card);
+    write(&mut app, card, "alpha beta gamma");
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    attachment_draft::move_to(
+        &mut runtime.composer,
+        text_editor::Cursor {
+            position: text_editor::Position {
+                line: 0,
+                column: 10,
+            },
+            selection: Some(text_editor::Position { line: 0, column: 6 }),
+        },
+    );
+    let selected = runtime.composer.cursor();
+    let revision = runtime.revision;
+    let pending_image = runtime.try_attachment_insert().unwrap();
+    let attachment = Attachment::file("/tmp/dictation-mic-reference.txt");
+    runtime.merge_attachments([attachment.clone()]);
+    let Action::Dictation(_, start_action) = start(&app, target) else {
+        unreachable!()
+    };
+    let mut renderer = crate::app::tests::headless_renderer();
+    let viewport = iced::Size::new(620.0, 720.0);
+    let mut ui = UserInterface::build(app.chat_view(card), viewport, Cache::new(), &mut renderer);
+    let mut bounds = Bounds {
+        ids: [
+            card_control_id(card, "chat-composer"),
+            start_action.control_id(target),
+        ],
+        values: [None; 2],
+    };
+    ui.operate(&renderer, &mut bounds);
+    let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+    let button = nodes
+        .root()
+        .iter()
+        .chain(nodes.children())
+        .find(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some("Set up local dictation")
+                && !node.node().is_disabled()
+        })
+        .unwrap()
+        .node()
+        .bounds()
+        .unwrap();
+    assert!(
+        button.x0 >= 0.0
+            && button.y0 >= 0.0
+            && button.x1 <= f64::from(viewport.width)
+            && button.y1 <= f64::from(viewport.height)
+    );
+    let pointer = iced::Point::new(
+        ((button.x0 + button.x1) / 2.0) as f32,
+        ((button.y0 + button.y1) / 2.0) as f32,
+    );
+    assert!(bounds.values[1].unwrap().contains(pointer));
+    assert!(!bounds.values[0].unwrap().contains(pointer));
+    ui.operate(
+        &renderer,
+        &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+            card,
+            "chat-composer",
+        )),
+    );
+    let mut messages = Vec::new();
+    ui.update(
+        &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+            iced::mouse::Button::Left,
+        ))],
+        iced::mouse::Cursor::Available(pointer),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(
+        matches!(messages.as_slice(), [Message::ChatUi(Action::Composer(owner, text_editor::Action::ClearSelection))] if *owner == target)
+    );
+    let cache = ui.into_cache();
+    let Message::ChatUi(blur) = messages.pop().unwrap() else {
+        unreachable!()
+    };
+    assert_no_effects(app.handle_chat_ui(blur));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.composer.cursor(), selected);
+    assert_eq!(runtime.composer.selection().as_deref(), Some("beta"));
+    assert_eq!(runtime.composer.text(), "alpha beta gamma");
+    assert_eq!(runtime.revision, revision);
+    assert!(!app.chat_ui.dictation_setup.shown(target));
+    assert!(runtime.dictation.phase().is_none());
+    let mut ui = UserInterface::build(app.chat_view(card), viewport, cache, &mut renderer);
+    ui.update(
+        &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        ))],
+        iced::mouse::Cursor::Available(pointer),
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    assert!(
+        matches!(messages.as_slice(), [Message::ChatUi(Action::Dictation(owner, dictation::Action::Start { epoch, prepared: false }))]
+        if *owner == target && *epoch == chat_runtime(&app, card).dictation.epoch())
+    );
+    drop(ui);
+    let Message::ChatUi(start) = messages.pop().unwrap() else {
+        unreachable!()
+    };
+    drop(app.handle_chat_ui(start));
+    assert!(app.chat_ui.dictation_setup.shown(target));
+    assert!(app.chat_ui.dictation_setup.phase().is_none());
+    assert!(app.chat_ui.dictation_setup.prepared().is_none());
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.composer.cursor(), selected);
+    assert_eq!(runtime.attachments, vec![attachment.clone()]);
+    assert_eq!(
+        runtime.attachment_bookmarks[&pending_image.id].cursor,
+        selected
+    );
+    assert!(runtime.attachment_bookmarks[&pending_image.id].valid);
+    assert!(runtime.attachment_ticket(pending_image.id).is_some());
+    assert_eq!(runtime.revision, revision);
+    assert_eq!(runtime.next_command, 0);
+    assert!(runtime.pending.is_none());
+    assert!(runtime.queued.is_none());
+    // The selected range remains the actual capture insertion bookmark. This
+    // synthetic completion creates no audio, model, provider or download work.
+    drop(app.handle_chat_ui(dismiss(&app, target)));
+    let ticket = capture(&mut app, target);
+    drop(app.handle_chat_ui(result(&ticket, "voice")));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.composer.text(), "alpha voice gamma");
+    assert_eq!(runtime.attachments, vec![attachment]);
+    assert!(runtime.pending.is_none());
+    assert!(runtime.queued.is_none());
+    assert_eq!(runtime.next_command, 0);
+}
+
+#[test]
 fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_frame() {
     use iced::advanced::{
         clipboard,
@@ -567,6 +734,7 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
     }
     let mut renderer = crate::app::tests::headless_renderer();
     let viewport = iced::Size::new(620.0, 720.0);
+    let _admission = attachment_draft::test_admission();
     for stop in [true, false] {
         for replace in [true, false] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -581,6 +749,28 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
             let target = chat_runtime(&app, card).target;
             drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
             assert!(chat_runtime(&app, card).snapshot.ready);
+            write(&mut app, card, "alpha beta gamma");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            attachment_draft::move_to(
+                &mut runtime.composer,
+                text_editor::Cursor {
+                    position: text_editor::Position {
+                        line: 0,
+                        column: 10,
+                    },
+                    selection: Some(text_editor::Position { line: 0, column: 6 }),
+                },
+            );
+            let pending_image = runtime.try_attachment_insert().unwrap();
+            let attachment = Attachment::file("/tmp/dictation-held-reference.txt");
+            runtime.merge_attachments([attachment.clone()]);
+            let before = (
+                runtime.composer.cursor(),
+                runtime.attachment_bookmarks[&pending_image.id],
+                runtime.revision,
+                runtime.next_command,
+            );
+            assert_eq!(runtime.composer.selection().as_deref(), Some("beta"));
             let first = capture(&mut app, target);
             app.chat_runtime_mut(target).unwrap().dictation.progress(
                 target,
@@ -600,7 +790,7 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
             } else {
                 "Cancel dictation and discard recording (Esc)"
             };
-            let (cache, pointer) = {
+            let (cache, pointer, blur) = {
                 let mut ui = UserInterface::build(
                     app.chat_view(card),
                     viewport,
@@ -642,6 +832,22 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                     ((bounds.x0 + bounds.x1) / 2.0) as f32,
                     ((bounds.y0 + bounds.y1) / 2.0) as f32,
                 );
+                let actual = hit.bounds[if stop { 1 } else { 2 }].unwrap();
+                assert!(
+                    actual.contains(pointer),
+                    "AX center must hit the actual control: {bounds:?} versus {actual:?}"
+                );
+                assert!(
+                    !hit.bounds[0].unwrap().contains(pointer),
+                    "native editor and dictation controls must not overlap"
+                );
+                ui.operate(
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(card_control_id(card, "chat-composer")),
+                );
+                let mut focused = Focus::default();
+                ui.operate(&renderer, &mut focused);
+                assert_eq!(focused.0, Some(card_control_id(card, "chat-composer")));
                 let mut messages = Vec::new();
                 ui.update(
                     &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
@@ -653,20 +859,15 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                     &mut messages,
                 );
                 assert!(
-                    messages.is_empty(),
-                    "release owns the native control action; stop={stop} replace={replace} AX={bounds:?} pointer={pointer:?} actual[editor,record,cancel]={:?}; mouseDown emitted {:?}",
+                    matches!(messages.as_slice(), [Message::ChatUi(Action::Composer(owner, text_editor::Action::ClearSelection))] if *owner == target),
+                    "mouseDown may only unfocus this editor; release owns dictation: stop={stop} replace={replace} AX={bounds:?} pointer={pointer:?} actual[editor,record,cancel]={:?}; emitted {:?}",
                     hit.bounds,
                     messages.iter().map(safe_message_kind).collect::<Vec<_>>(),
                 );
-                let actual = hit.bounds[if stop { 1 } else { 2 }].unwrap();
-                assert!(
-                    actual.contains(pointer),
-                    "AX center must hit the actual control: {bounds:?} versus {actual:?}"
-                );
-                assert!(
-                    !hit.bounds[0].unwrap().contains(pointer),
-                    "native editor and dictation controls must not overlap"
-                );
+                let blur = messages.pop().unwrap();
+                let mut focused = Focus::default();
+                ui.operate(&renderer, &mut focused);
+                assert_ne!(focused.0, Some(card_control_id(card, "chat-composer")));
                 let id = control(first.clone()).control_id(target);
                 ui.operate(
                     &renderer,
@@ -675,8 +876,26 @@ fn native_record_press_and_focus_do_not_cross_operations_without_intermediate_fr
                 let mut focused = Focus::default();
                 ui.operate(&renderer, &mut focused);
                 assert_eq!(focused.0, Some(id));
-                (ui.into_cache(), pointer)
+                (ui.into_cache(), pointer, blur)
             };
+            let Message::ChatUi(blur) = blur else {
+                unreachable!()
+            };
+            assert_no_effects(app.handle_chat_ui(blur));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), "alpha beta gamma");
+            assert_eq!(runtime.composer.cursor(), before.0);
+            assert_eq!(runtime.composer.selection().as_deref(), Some("beta"));
+            assert_eq!(runtime.attachments, vec![attachment]);
+            assert!(runtime.attachment_ticket(pending_image.id).is_some());
+            let bookmark = runtime.attachment_bookmarks[&pending_image.id];
+            assert_eq!(bookmark.cursor, before.1.cursor);
+            assert_eq!(bookmark.valid, before.1.valid);
+            assert_eq!(runtime.revision, before.2);
+            assert_eq!(runtime.next_command, before.3);
+            assert!(runtime.dictation.ticket().unwrap().belongs_to(&first));
+            assert!(runtime.pending.is_none());
+            assert!(runtime.queued.is_none());
             let current = if replace {
                 drop(app.handle_dictation(target, dictation::Action::Cancel(first.clone())));
                 let second = capture(&mut app, target);

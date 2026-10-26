@@ -9515,6 +9515,14 @@ impl Cagents {
                 return task;
             }
             Action::Composer(target, action) => {
+                // The native editor sends ClearSelection when it loses focus.
+                // Keep the draft's insertion range for adjacent controls and
+                // late dictation/image results; the widget already unfocused
+                // itself. Explicit model deselection still uses Content or
+                // Runtime::composer_action directly.
+                if matches!(action, text_editor::Action::ClearSelection) {
+                    return Task::none();
+                }
                 let mut files = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
