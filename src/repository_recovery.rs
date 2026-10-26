@@ -342,6 +342,14 @@ pub struct RecoverableDiscard {
     pub recovery: DiscardRecovery,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutFilePolicy {
+    parent_identity: (u64, u64),
+    mode: u32,
+    access: SavedFileAccess,
+}
+type CheckoutPolicies = BTreeMap<RepoPath, Result<CheckoutFilePolicy, String>>;
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -404,6 +412,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let worktree_identity = (directory.dev(), directory.ino());
         let tracked = selection_pathspecs(&request.tracked);
+        // This is the intended restore source, captured BEFORE any worktree
+        // mutation. A later worktree read cannot establish what Git wrote:
+        // another editor may already have replaced those bytes.
+        let restore_index =
+            self.capture_restore_index(&request.worktree, &tracked, cancellation)?;
         let directories = parent_modes(&root, tracked.iter().chain(&request.untracked));
         let mut before = BTreeMap::new();
         let (captured, versions) =
@@ -414,6 +427,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             })?;
             before.insert(path, saved);
         }
+        let mut link_policies = BTreeMap::new();
+        for (path, saved) in &before {
+            if matches!(saved, SavedEntry::Symlink { .. }) {
+                let metadata = fs_safety::metadata_beneath(&root, path.as_path())
+                    .map_err(|error| ValidationError::Io(error.to_string()))?;
+                if versions.get(path) != Some(&Some(metadata_version(&metadata))) {
+                    return Err(ValidationError::Io(
+                        "The original symlink changed while capturing its access policy".into(),
+                    )
+                    .into());
+                }
+                link_policies.insert(
+                    path.clone(),
+                    (metadata.mode(), metadata.uid(), metadata.gid()),
+                );
+            }
+        }
+        let checkout_policies = self.capture_checkout_policies(&root, &restore_index, cancellation);
         let live_recovery = LiveDiscardRecovery::default();
         let mut native_batch = match native_trash::prepare(
             custody.source.retained_worktree_root(),
@@ -453,14 +484,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut entries = if matches!(outcome, MutationOutcome::NotApplied { .. }) {
             Vec::new()
         } else {
-            let (after, _) = self.capture_recovery_entries(
+            let (mut after, after_versions) = self.capture_recovery_entries(
                 &request.worktree,
                 &root,
                 &tracked,
                 false,
                 &CancellationToken::new(),
             );
-            changed_recovery_entries(&root, before, &after)
+            self.authenticate_restore_entries(
+                &request.worktree,
+                &before,
+                &restore_index,
+                &checkout_policies,
+                &root,
+                &link_policies,
+                &after_versions,
+                &mut after,
+                &CancellationToken::new(),
+            );
+            changed_recovery_entries(before, &after, &after_versions)
         };
         // The atomic Trash move itself preserves untracked contents and modes.
         // Its receipt pins the post-move inode/version, so no per-file Git hash
@@ -491,6 +533,199 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 expires_unix_ms: unix_ms().saturating_add(60_000),
             },
         })
+    }
+
+    fn capture_restore_index(
+        &self,
+        worktree: &Path,
+        paths: &[RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<BTreeMap<RepoPath, Vec<IndexEntry>>, RepositoryError> {
+        let mut entries = BTreeMap::new();
+        for batch in bounded_pathspec_batches(paths) {
+            let selected = batch.iter().collect::<HashSet<_>>();
+            for path in batch {
+                entries.entry(path.clone()).or_insert_with(Vec::new);
+            }
+            let command = self
+                .git_literal_read(worktree, ["ls-files", "-s", "-z", "--"])
+                .args(batch.iter().map(|path| path.as_os_str()));
+            let output = self.run_checked(&command, cancellation)?;
+            for entry in invalid_output(parse_index_entries(&output.stdout), output)? {
+                // Literal pathspecs still select descendants of a directory.
+                // Only an exact selected file can authorize its Undo.
+                if selected.contains(&entry.path) {
+                    entries.get_mut(&entry.path).unwrap().push(entry);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn authenticate_restore_entries(
+        &self,
+        worktree: &Path,
+        before: &BTreeMap<RepoPath, SavedEntry>,
+        expected: &BTreeMap<RepoPath, Vec<IndexEntry>>,
+        policies: &CheckoutPolicies,
+        root: &fs_safety::Root,
+        link_policies: &BTreeMap<RepoPath, (u32, u32, u32)>,
+        versions: &CaptureVersions,
+        after: &mut BTreeMap<RepoPath, Result<SavedEntry, String>>,
+        cancellation: &CancellationToken,
+    ) {
+        let paths = expected.keys().cloned().collect::<Vec<_>>();
+        let observed = self.capture_restore_index(worktree, &paths, cancellation);
+        let current_policies = self.capture_checkout_policies(root, expected, cancellation);
+        for (path, intended) in expected {
+            let verified = (|| {
+                let saved = after
+                    .get(path)
+                    .ok_or("The post-discard file was not captured")?
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                // An exact semantic no-op needs no Undo entry. Git can leave
+                // an already-indexed inode in place with its existing policy,
+                // instead of creating an inode with checkout creation policy.
+                if before.get(path) == Some(saved) {
+                    return Ok(());
+                }
+                if observed.as_ref().map_err(ToString::to_string)?.get(path) != Some(intended) {
+                    return Err("The selected index changed during discard".to_owned());
+                }
+                match (intended.as_slice(), before.get(path), saved) {
+                    // Rename expansion may name an old path that is no
+                    // longer in the index. Git did not restore it; a change
+                    // there cannot become an authorized Undo after-state.
+                    ([], Some(original), saved) if original == saved => Ok(()),
+                    (
+                        [entry],
+                        _,
+                        SavedEntry::Blob {
+                            oid, mode, access, ..
+                        },
+                    ) if entry.stage == 0 && matches!(entry.mode, 0o100644 | 0o100755) => {
+                        // Raw bytes, never a clean-filter hash: distinct newer
+                        // worktree contents can normalize to the same index OID.
+                        // Git creates a new file with 0666/0777 requested, not
+                        // with the discarded file's policy. The original-parent
+                        // anonymous probe sampled the actual kernel umask,
+                        // ownership and default ACL before any restore effect.
+                        let policy = policies
+                            .get(path)
+                            .ok_or("The original checkout creation policy is unavailable")?
+                            .as_ref()
+                            .map_err(Clone::clone)?;
+                        if current_policies
+                            .get(path)
+                            .and_then(|policy| policy.as_ref().ok())
+                            != Some(policy)
+                        {
+                            return Err("The original checkout parent or its effective creation policy changed".into());
+                        }
+                        if oid != &entry.oid || *mode != policy.mode || access != &policy.access {
+                            return Err("The restored bytes or access policy do not match the original indexed restore intent".into());
+                        }
+                        Ok(())
+                    }
+                    ([entry], Some(SavedEntry::Symlink { .. }), SavedEntry::Symlink { target })
+                        if entry.stage == 0 && entry.mode == SYMLINK_MODE =>
+                    {
+                        let metadata = fs_safety::metadata_beneath(root, path.as_path())
+                            .map_err(|error| error.to_string())?;
+                        if versions.get(path) != Some(&Some(metadata_version(&metadata)))
+                            || link_policies.get(path)
+                                != Some(&(metadata.mode(), metadata.uid(), metadata.gid()))
+                        {
+                            return Err("The restored symlink access policy changed or cannot be authenticated".into());
+                        }
+                        let output = self
+                            .run_checked(
+                                &self
+                                    .backup_object_command(
+                                        worktree,
+                                        ["hash-object", "--no-filters", "--stdin"],
+                                    )
+                                    .stdin(target.as_os_str().as_bytes().to_vec()),
+                                cancellation,
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let actual =
+                            Oid::parse_object(String::from_utf8_lossy(&output.stdout).trim())
+                                .map_err(|error| error.to_string())?;
+                        if actual != entry.oid {
+                            return Err("The restored symlink target differs from the original indexed restore intent".into());
+                        }
+                        Ok(())
+                    }
+                    // Unmerged entries, gitlinks, transformed checkout bytes,
+                    // symlinks without an original same-type policy have no
+                    // authenticated complete baseline here. Preserve the backup
+                    // and refuse Undo instead of adopting a posthoc snapshot.
+                    _ => Err(
+                        "The exact indexed post-discard file policy could not be authenticated"
+                            .into(),
+                    ),
+                }
+            })();
+            if let Err(reason) = verified {
+                after.insert(path.clone(), Err(format!(
+                    "{reason}; newer work was preserved and the original backup remains available"
+                )));
+            }
+        }
+    }
+
+    fn capture_checkout_policies(
+        &self,
+        root: &fs_safety::Root,
+        index: &BTreeMap<RepoPath, Vec<IndexEntry>>,
+        cancellation: &CancellationToken,
+    ) -> CheckoutPolicies {
+        let mut policies = BTreeMap::new();
+        let mut remaining_acl_bytes = MAX_CAPTURE_ACL_BYTES;
+        for (path, entries) in index {
+            let [entry] = entries.as_slice() else {
+                continue;
+            };
+            if entry.stage != 0 || !matches!(entry.mode, 0o100644 | 0o100755) {
+                continue;
+            }
+            let policy = (|| {
+                if cancellation.is_cancelled() {
+                    return Err("Checkout policy capture cancelled".to_owned());
+                }
+                let (parent, _) = fs_safety::open_parent_beneath(root, path.as_path())
+                    .map_err(|error| error.to_string())?;
+                let identity = parent.metadata().map_err(|error| error.to_string())?;
+                // Git 2.51 entry.c:create_file requests these creation bits;
+                // the kernel determines the actual result. Do not chmod the
+                // anonymous probe, emulate umask, or substitute a 0700 holding.
+                let requested = if entry.mode & 0o100 != 0 {
+                    0o777
+                } else {
+                    0o666
+                };
+                let probe = fs_safety::create_anonymous_in(&parent, requested)
+                    .map_err(|error| error.to_string())?;
+                let access = SavedFileAccess::capture(&probe)?;
+                let metadata = probe.metadata().map_err(|error| error.to_string())?;
+                let acl_bytes = access.acl.as_ref().map_or(0, |acl| acl.len());
+                if acl_bytes > remaining_acl_bytes {
+                    return Err("Checkout policy ACL capacity is exhausted".into());
+                }
+                remaining_acl_bytes -= acl_bytes;
+                Ok(CheckoutFilePolicy {
+                    parent_identity: (identity.dev(), identity.ino()),
+                    mode: metadata.mode() & 0o7777,
+                    access,
+                })
+                // The unnamed inode and parent FD close on every path. There
+                // is no target effect, cleanup name or per-file retained FD.
+            })();
+            policies.insert(path.clone(), policy);
+        }
+        policies
     }
 
     // Recovery backups must land in the ORIGINAL object database. Do not
@@ -1381,17 +1616,15 @@ fn recovery_parent(
 }
 
 fn changed_recovery_entries(
-    root: &fs_safety::Root,
     before: BTreeMap<RepoPath, SavedEntry>,
     after: &BTreeMap<RepoPath, Result<SavedEntry, String>>,
+    versions: &CaptureVersions,
 ) -> Vec<DiscardRecoveryEntry> {
     let mut entries = Vec::new();
     for (path, original) in before {
         match after.get(&path) {
             Some(Ok(after)) if *after != original => {
-                let after_version = fs_safety::metadata_beneath(&root, path.as_path())
-                    .ok()
-                    .map(|metadata| metadata_version(&metadata));
+                let after_version = versions.get(&path).copied().flatten();
                 entries.push(DiscardRecoveryEntry {
                     path,
                     before: original,
@@ -1502,6 +1735,365 @@ fn prune_empty_parents(root: &fs_safety::Root, path: &RepoPath) {
         match fs_safety::remove_empty_directory_beneath(root, directory) {
             Ok(true) => parent = directory.parent(),
             _ => break,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod restore_baseline_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PrivateUmask(libc::mode_t);
+    impl PrivateUmask {
+        fn new() -> Self {
+            // Only reached in each existing isolated same-ELF owning child.
+            // No parent or parallel test shares this process's mask.
+            Self(unsafe { libc::umask(0o077) })
+        }
+    }
+    impl Drop for PrivateUmask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+        let command = CommandSpec::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args.iter().copied())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(
+            output.success,
+            "Git fixture command failed: {:?}",
+            output.stderr
+        );
+        output.stdout
+    }
+
+    #[derive(Clone, Copy)]
+    enum Edit {
+        None,
+        Contents,
+        Permissions,
+        Index,
+        Symlink,
+    }
+
+    struct AfterRestore {
+        root: PathBuf,
+        edit: Edit,
+        reached: AtomicBool,
+    }
+    impl ProcessExecutor for AfterRestore {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(command, cancellation)?;
+            if output.success && command.arguments.iter().any(|arg| arg == "restore") {
+                assert!(!self.reached.swap(true, Ordering::SeqCst));
+                // Actual Git has already completed its writes. This is the
+                // real process-return -> receipt-capture boundary, not a mock
+                // restore result or a write after the receipt was published.
+                match self.edit {
+                    Edit::None => {}
+                    Edit::Contents => {
+                        fs::write(self.root.join("changed"), b"newer editor work\n").unwrap()
+                    }
+                    Edit::Permissions => {
+                        let path = self.root.join("changed");
+                        let mode = fs::metadata(&path).unwrap().mode() & 0o7777;
+                        fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o020))
+                            .unwrap();
+                    }
+                    Edit::Index => {
+                        fs::write(self.root.join("changed"), b"newer staged work\n").unwrap();
+                        git(&self.root, &["add", "--", "changed"]);
+                    }
+                    Edit::Symlink => {
+                        fs::remove_file(self.root.join("changed")).unwrap();
+                        std::os::unix::fs::symlink("newer-target", self.root.join("changed"))
+                            .unwrap();
+                    }
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    fn request(root: &Path, names: &[&str]) -> DiscardRequest {
+        DiscardRequest {
+            worktree: root.to_owned(),
+            tracked: names
+                .iter()
+                .map(|name| PathSelection::new(RepoPath::parse(name).unwrap()))
+                .collect(),
+            untracked: vec![],
+            confirmed: true,
+        }
+    }
+
+    #[test]
+    fn undo_does_not_adopt_competing_bytes_policy_or_index_after_actual_restore() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::undo_does_not_adopt_competing_bytes_policy_or_index_after_actual_restore"
+        )) {
+            return;
+        }
+        let _private_umask = PrivateUmask::new();
+        for edit in [Edit::None, Edit::Contents, Edit::Permissions, Edit::Index] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-q", "-b", "main"]);
+            for name in ["changed", "sibling"] {
+                fs::write(root.join(name), b"indexed base\n").unwrap();
+            }
+            git(root, &["add", "--all"]);
+            for name in ["changed", "sibling"] {
+                fs::write(root.join(name), b"discarded original\n").unwrap();
+                fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let executor = Arc::new(AfterRestore {
+                root: root.to_owned(),
+                edit,
+                reached: AtomicBool::new(false),
+            });
+            let service = RepositoryService::new("git", executor.clone())
+                .with_worktree_authority(WorktreeAuthority::capture(root).unwrap())
+                .unwrap();
+            let discarded = service
+                .discard_recoverable(
+                    &request(root, &["changed", "sibling"]),
+                    &CancellationToken::new(),
+                    &[],
+                )
+                .unwrap();
+            assert!(executor.reached.load(Ordering::SeqCst));
+            assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(discarded.recovery.remaining_paths(), 2);
+            let entry = discarded
+                .recovery
+                .entries
+                .iter()
+                .find(|entry| entry.path == RepoPath::parse("changed").unwrap())
+                .unwrap();
+            let SavedEntry::Blob { oid, .. } = &entry.before else {
+                panic!("original backup must remain held")
+            };
+            assert_eq!(
+                git(root, &["cat-file", "blob", oid.as_str()]),
+                b"discarded original\n"
+            );
+            let current = fs::read(root.join("changed")).unwrap();
+            let mode = fs::metadata(root.join("changed")).unwrap().mode();
+            let index = git(root, &["ls-files", "-s", "-z"]);
+            let undone = service
+                .undo_discard(&discarded.recovery, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                fs::read(root.join("sibling")).unwrap(),
+                b"discarded original\n"
+            );
+            if matches!(edit, Edit::None) {
+                assert!(!matches!(entry.after, SavedEntry::Unavailable { .. }));
+                assert!(matches!(undone, MutationOutcome::Applied { .. }));
+                assert_eq!(
+                    fs::read(root.join("changed")).unwrap(),
+                    b"discarded original\n"
+                );
+                assert_eq!(
+                    fs::metadata(root.join("changed")).unwrap().mode() & 0o7777,
+                    0o640
+                );
+                assert_eq!(discarded.recovery.remaining_paths(), 0);
+            } else {
+                assert!(matches!(entry.after, SavedEntry::Unavailable { .. }));
+                assert_eq!(fs::read(root.join("changed")).unwrap(), current);
+                assert_eq!(fs::metadata(root.join("changed")).unwrap().mode(), mode);
+                assert_eq!(discarded.recovery.remaining_paths(), 1);
+                // A second Undo cannot bless or overwrite the refused path.
+                service
+                    .undo_discard(&discarded.recovery, &CancellationToken::new())
+                    .unwrap();
+                assert_eq!(fs::read(root.join("changed")).unwrap(), current);
+                assert_eq!(fs::metadata(root.join("changed")).unwrap().mode(), mode);
+                assert_eq!(discarded.recovery.remaining_paths(), 1);
+            }
+            assert_eq!(git(root, &["ls-files", "-s", "-z"]), index);
+        }
+    }
+
+    #[test]
+    fn undo_authenticates_symlink_targets_and_refuses_unproven_checkout_policies() {
+        if crate::repository::test_fixture::isolated_fixture_case(concat!(
+            module_path!(),
+            "::undo_authenticates_symlink_targets_and_refuses_unproven_checkout_policies"
+        )) {
+            return;
+        }
+        let _private_umask = PrivateUmask::new();
+        for edit in [Edit::None, Edit::Symlink] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-q", "-b", "main"]);
+            std::os::unix::fs::symlink("indexed-target", root.join("changed")).unwrap();
+            git(root, &["add", "--all"]);
+            fs::remove_file(root.join("changed")).unwrap();
+            std::os::unix::fs::symlink("discarded-target", root.join("changed")).unwrap();
+            let executor = Arc::new(AfterRestore {
+                root: root.to_owned(),
+                edit,
+                reached: AtomicBool::new(false),
+            });
+            let service = RepositoryService::new("git", executor.clone())
+                .with_worktree_authority(WorktreeAuthority::capture(root).unwrap())
+                .unwrap();
+            let discarded = service
+                .discard_recoverable(&request(root, &["changed"]), &CancellationToken::new(), &[])
+                .unwrap();
+            assert!(executor.reached.load(Ordering::SeqCst));
+            assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(discarded.recovery.remaining_paths(), 1);
+            service
+                .undo_discard(&discarded.recovery, &CancellationToken::new())
+                .unwrap();
+            let expected = if matches!(edit, Edit::None) {
+                "discarded-target"
+            } else {
+                "newer-target"
+            };
+            assert_eq!(
+                fs::read_link(root.join("changed")).unwrap(),
+                PathBuf::from(expected)
+            );
+            assert_eq!(
+                discarded.recovery.remaining_paths(),
+                usize::from(matches!(edit, Edit::Symlink))
+            );
+        }
+        // A no-op keeps its preexisting policy, which need not equal a newly
+        // created checkout's private-umask policy. It must not mint a refused
+        // recovery obligation for an unchanged file.
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-q", "-b", "main"]);
+            fs::write(root.join("changed"), b"indexed base\n").unwrap();
+            fs::set_permissions(root.join("changed"), fs::Permissions::from_mode(0o640)).unwrap();
+            git(root, &["add", "--all"]);
+            let original = fs::metadata(root.join("changed")).unwrap();
+            let service = RepositoryService::system("git")
+                .with_worktree_authority(WorktreeAuthority::capture(root).unwrap())
+                .unwrap();
+            let discarded = service
+                .discard_recoverable(&request(root, &["changed"]), &CancellationToken::new(), &[])
+                .unwrap();
+            assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(fs::read(root.join("changed")).unwrap(), b"indexed base\n");
+            assert_eq!(
+                metadata_version(&fs::metadata(root.join("changed")).unwrap()),
+                metadata_version(&original)
+            );
+            assert!(discarded.recovery.entries.is_empty());
+            assert!(!discarded.recovery.can_undo());
+        }
+        for policy in ["deleted", "type-change", "crlf", "exec-reset"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-q", "-b", "main"]);
+            fs::write(root.join("changed"), b"indexed base\n").unwrap();
+            if policy == "exec-reset" {
+                fs::set_permissions(root.join("changed"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            git(root, &["add", "--all"]);
+            match policy {
+                "deleted" => fs::remove_file(root.join("changed")).unwrap(),
+                "type-change" => {
+                    fs::remove_file(root.join("changed")).unwrap();
+                    std::os::unix::fs::symlink("discarded-target", root.join("changed")).unwrap();
+                }
+                "crlf" => {
+                    git(root, &["config", "core.autocrlf", "true"]);
+                    fs::write(root.join("changed"), b"discarded original\n").unwrap();
+                }
+                "exec-reset" => {
+                    fs::set_permissions(root.join("changed"), fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    fs::write(root.join("changed"), b"discarded original\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let service = RepositoryService::system("git")
+                .with_worktree_authority(WorktreeAuthority::capture(root).unwrap())
+                .unwrap();
+            let discarded = service
+                .discard_recoverable(&request(root, &["changed"]), &CancellationToken::new(), &[])
+                .unwrap();
+            assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(discarded.recovery.remaining_paths(), 1);
+            assert_eq!(
+                matches!(
+                    discarded.recovery.entries[0].after,
+                    SavedEntry::Unavailable { .. }
+                ),
+                policy == "crlf",
+                "{policy}"
+            );
+            let current = fs::read(root.join("changed")).unwrap();
+            let metadata = fs::metadata(root.join("changed")).unwrap();
+            let undone = service
+                .undo_discard(&discarded.recovery, &CancellationToken::new())
+                .unwrap();
+            match policy {
+                "crlf" => {
+                    assert!(matches!(undone, MutationOutcome::NotApplied { .. }));
+                    assert_eq!(fs::read(root.join("changed")).unwrap(), current);
+                    assert_eq!(
+                        metadata_version(&fs::metadata(root.join("changed")).unwrap()),
+                        metadata_version(&metadata)
+                    );
+                    assert_eq!(discarded.recovery.remaining_paths(), 1);
+                }
+                "deleted" => {
+                    assert!(matches!(undone, MutationOutcome::Applied { .. }));
+                    assert!(
+                        fs::symlink_metadata(root.join("changed"))
+                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    );
+                    assert_eq!(discarded.recovery.remaining_paths(), 0);
+                }
+                "type-change" => {
+                    assert!(matches!(undone, MutationOutcome::Applied { .. }));
+                    assert_eq!(
+                        fs::read_link(root.join("changed")).unwrap(),
+                        PathBuf::from("discarded-target")
+                    );
+                    assert_eq!(discarded.recovery.remaining_paths(), 0);
+                }
+                "exec-reset" => {
+                    assert!(matches!(undone, MutationOutcome::Applied { .. }));
+                    assert_eq!(
+                        fs::read(root.join("changed")).unwrap(),
+                        b"discarded original\n"
+                    );
+                    assert_eq!(
+                        fs::metadata(root.join("changed")).unwrap().mode() & 0o7777,
+                        0o644
+                    );
+                    assert_eq!(discarded.recovery.remaining_paths(), 0);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }
