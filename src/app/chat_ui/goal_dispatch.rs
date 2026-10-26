@@ -481,7 +481,6 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.open_goal_panel();
         if let Err(error) = control.intent.operation.validate() {
             runtime.error = Some(error.to_string());
             return Task::none();
@@ -503,6 +502,9 @@ impl Cagents {
             runtime.error = Some("The goal control is stale or its conversation is unavailable. Check the current goal.".into());
             return Task::none();
         }
+        // An old callback must not dismiss a picker opened after it rendered.
+        // Presentation changes belong to the same validated native binding.
+        runtime.open_goal_panel();
         runtime.goal_pending = Some(Pending {
             operation: control.intent.operation,
             input: None,
@@ -1229,6 +1231,118 @@ mod tests {
                 .contains("different current goal objective")
         );
         assert!(runtime(&app, card).goal_pending.is_none());
+    }
+
+    #[test]
+    fn stale_goal_control_preserves_a_newer_model_picker_and_its_field_focus() {
+        use iced::advanced::widget::{Operation as WidgetOperation, operation};
+        use iced::futures::StreamExt;
+
+        struct Focused(Option<widget::Id>);
+        impl WidgetOperation for Focused {
+            fn traverse(&mut self, children: &mut dyn FnMut(&mut dyn WidgetOperation)) {
+                children(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+        let (mut app, card, target) = live();
+        write(&mut app, target, "keep the unsent draft");
+        let old = control(runtime(&app, card), Operation::Get);
+        let mut newer = (*runtime(&app, card).handle().unwrap().snapshot()).clone();
+        newer.goal.as_mut().unwrap().revision += 1;
+        publish(&mut app, card, newer);
+        let open = app.handle_chat_ui(Action::ModelPicker(target, true));
+        drop(app.handle_chat_ui(Action::ModelQuery(target, "selected query".into())));
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachments
+            .push(Attachment::file("retained-file.txt"));
+        let before = {
+            let rt = runtime(&app, card);
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision,
+            )
+        };
+        let search_id = card_control_id(card, "chat-model-search");
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let search = widget::text_input("Model", "selected query")
+            .id(search_id.clone())
+            .on_input(move |query| Message::ChatUi(Action::ModelQuery(target, query)));
+        let mut ui = iced::runtime::UserInterface::build(
+            search.into(),
+            iced::Size::new(360.0, 120.0),
+            iced::runtime::user_interface::Cache::new(),
+            &mut renderer,
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = iced::runtime::task::into_stream(open).unwrap();
+            while let Some(action) = stream.next().await {
+                match action {
+                    iced::runtime::Action::Widget(mut operation) => {
+                        ui.operate(&renderer, operation.as_mut());
+                    }
+                    _ => panic!("opening the model picker must only focus its search field"),
+                }
+            }
+        });
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id.clone()));
+
+        let rejected = app.handle_chat_ui(Action::GoalIntent(target, old));
+        assert_eq!(
+            rejected.units(),
+            0,
+            "a stale control cannot issue a focus or native task"
+        );
+        let rt = runtime(&app, card);
+        assert_eq!(rt.model_picker.as_deref(), Some("selected query"));
+        assert!(!rt.goal_open);
+        assert!(rt.goal_pending.is_none() && rt.pending.is_none());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(focused.0, Some(search_id));
+
+        // A current callback still opens its panel and submits the native read.
+        let fresh = control(runtime(&app, card), Operation::Get);
+        let accepted = app.handle_chat_ui(Action::GoalIntent(target, fresh));
+        assert!(accepted.units() > 0);
+        let rt = runtime(&app, card);
+        assert!(rt.goal_open && rt.model_picker.is_none());
+        assert!(rt.goal_pending.is_some() && rt.pending.is_some());
+        assert_eq!(
+            (
+                rt.composer.text(),
+                rt.composer.cursor(),
+                rt.attachments.clone(),
+                rt.revision
+            ),
+            before
+        );
     }
 
     #[test]
