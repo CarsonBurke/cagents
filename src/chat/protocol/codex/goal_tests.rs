@@ -609,3 +609,221 @@ fn unavailable_scope_unknown_or_unsupported_goal_never_falls_back_to_legacy_resu
         );
     }
 }
+
+#[test]
+fn disabled_native_goal_errors_preserve_uncertainty_and_explain_only_the_exact_signature() {
+    const DISABLED: &str = "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.";
+    for operation in [
+        Operation::Get,
+        Operation::SetObjective("Original objective kept".into()),
+        Operation::Clear,
+    ] {
+        let mut adapter = adapter();
+        let get = command(&mut adapter, Operation::Get);
+        adapter
+            .receive(json!({"id":get.writes[0]["id"], "result":{
+                "goal":raw_goal("thread-exact", "Original observed goal", "paused")
+            }}))
+            .unwrap();
+        let before = snapshot(&mut adapter);
+        let issued = command(&mut adapter, operation.clone());
+        assert_eq!(issued.writes.len(), 1);
+        assert_eq!(issued.writes[0]["params"]["threadId"], "thread-exact");
+        assert_eq!(
+            issued.writes[0]["method"],
+            match &operation {
+                Operation::Get => "thread/goal/get",
+                Operation::SetObjective(_) => "thread/goal/set",
+                Operation::Clear => "thread/goal/clear",
+                _ => unreachable!(),
+            }
+        );
+        if let Operation::SetObjective(objective) = &operation {
+            assert_eq!(issued.writes[0]["params"]["objective"], objective.as_str());
+        }
+        let resolved = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled","data":null
+            }}))
+            .unwrap();
+        let actual = published(&resolved);
+        assert!(!actual.pending && actual.uncertain);
+        assert_eq!(actual.read, before.read);
+        assert_eq!(actual.support, before.support);
+        assert_eq!(
+            actual.last_result,
+            Some(chat::goal::Completion {
+                revision: before.revision,
+                outcome: chat::goal::Outcome::Uncertain,
+            })
+        );
+        assert!(
+            resolved.writes.is_empty(),
+            "no retry, prompt or config mutation"
+        );
+        assert!(adapter.ready);
+        assert!(adapter.pending.is_empty());
+        let errors = resolved
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Error { message, fatal } => Some((message.as_str(), *fatal)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec![(DISABLED, false)]);
+        // The original RPC really resolved. Only a new explicit Check can
+        // claim the now-free slot; the diagnostic does not enqueue one.
+        let check = command(&mut adapter, Operation::Get);
+        assert_eq!(check.writes.len(), 1);
+        assert_eq!(check.writes[0]["method"], "thread/goal/get");
+    }
+    for (code, message, unsupported) in [
+        (-32600, "unrelated invalid request", false),
+        (-32600, "Goals feature is disabled", false),
+        (-32000, "goals feature is disabled", false),
+        (-32601, "goals feature is disabled", true),
+    ] {
+        let mut adapter = adapter();
+        let issued = command(&mut adapter, Operation::Get);
+        let resolved = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":code,"message":message
+            }}))
+            .unwrap();
+        let actual = published(&resolved);
+        assert!(!actual.pending);
+        assert_eq!(actual.support == Support::Unsupported, unsupported);
+        assert_eq!(actual.uncertain, !unsupported);
+        assert!(resolved.writes.is_empty());
+        assert!(
+            !resolved
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+}
+
+#[test]
+fn disabled_goal_diagnostics_cannot_cross_newer_observations_or_a_rebound_actor() {
+    for reconnect in [false, true] {
+        let mut adapter = adapter();
+        let issued = command(&mut adapter, Operation::Clear);
+        if reconnect {
+            let reattached = attach(&mut adapter);
+            assert!(published(&reattached).pending);
+            assert_eq!(published(&reattached).read, ReadState::Unknown);
+        } else {
+            let newer = adapter.receive(json!({"method":"thread/goal/updated", "params":{
+                "threadId":"thread-exact", "goal":raw_goal("thread-exact", "New observation", "blocked")
+            }})).unwrap();
+            assert!(published(&newer).pending);
+            assert!(!published(&newer).uncertain);
+        }
+        let current = snapshot(&mut adapter);
+        assert!(current.pending);
+        let released = adapter
+            .receive(json!({"id":issued.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled"
+            }}))
+            .unwrap();
+        let actual = published(&released);
+        assert!(
+            !actual.pending,
+            "old actual completion releases only its physical slot"
+        );
+        assert_eq!(actual.read, current.read);
+        assert_eq!(actual.support, current.support);
+        assert_eq!(actual.uncertain, current.uncertain);
+        if reconnect {
+            assert!(actual.last_result.is_none());
+        }
+        assert!(released.writes.is_empty());
+        assert!(
+            !released
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        // The suppression is observation-scoped, not a permanently muted
+        // connection: a fresh exact Check refusal must still explain itself.
+        let check = command(&mut adapter, Operation::Get);
+        let current = adapter
+            .receive(json!({"id":check.writes[0]["id"], "error":{
+                "code":-32600,"message":"goals feature is disabled"
+            }}))
+            .unwrap();
+        assert!(!published(&current).pending);
+        assert!(published(&current).uncertain);
+        assert_eq!(current.events.iter().filter(|event| matches!(event,
+            Event::Error { fatal: false, message } if message == "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept."
+        )).count(), 1);
+        assert!(current.writes.is_empty());
+    }
+}
+
+#[test]
+fn disabled_automatic_goal_probe_is_quiet_but_explicit_check_explains_and_chat_stays_usable() {
+    let mut adapter = adapter();
+    let attached = attach(&mut adapter);
+    let reads = attached
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "thread/goal/get")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1);
+    let automatic = adapter
+        .receive(json!({"id":reads[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&automatic).pending);
+    assert!(published(&automatic).uncertain);
+    assert_eq!(published(&automatic).read, ReadState::Unknown);
+    assert!(
+        automatic.writes.is_empty(),
+        "optional metadata failure does not retry or start work"
+    );
+    assert!(
+        !automatic
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+    assert!(adapter.ready && adapter.attached && adapter.direct_input);
+
+    let explicit = command(&mut adapter, Operation::Get);
+    assert_eq!(explicit.writes.len(), 1);
+    assert_eq!(explicit.writes[0]["method"], "thread/goal/get");
+    let checked = adapter
+        .receive(json!({"id":explicit.writes[0]["id"], "error":{
+            "code":-32600, "message":"goals feature is disabled"
+        }}))
+        .unwrap();
+    assert!(!published(&checked).pending);
+    assert!(published(&checked).uncertain);
+    assert_eq!(published(&checked).read, ReadState::Unknown);
+    assert_eq!(checked.events.iter().filter(|event| matches!(event,
+        Event::Error { fatal: false, message } if message == "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept."
+    )).count(), 1);
+    assert!(
+        !checked
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { fatal: true, .. }))
+    );
+    assert!(checked.writes.is_empty());
+    // This fixture has original-scope admission. The optional observation is
+    // not a global ordinary-chat policy or a synthesized absent Goal.
+    let ordinary = adapter
+        .command(Command::Prompt {
+            text: "Explicit ordinary chat remains ordinary".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    assert_eq!(ordinary.writes.len(), 1);
+    assert_eq!(ordinary.writes[0]["method"], "turn/start");
+    assert_eq!(ordinary.writes[0]["params"]["threadId"], "thread-exact");
+}

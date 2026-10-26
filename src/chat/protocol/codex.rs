@@ -489,6 +489,7 @@ fn create_inner(
 enum Pending {
     Goal {
         request: chat::goal::Request,
+        explicit: bool,
     },
     LoginRecovery {
         failure: String,
@@ -702,6 +703,7 @@ impl Codex {
         thread: &str,
         revision: u64,
         operation: chat::goal::Operation,
+        explicit: bool,
     ) -> Result<(), String> {
         if self.thread.as_deref() != Some(thread) {
             return Err("The goal control belongs to a different Codex thread".into());
@@ -716,7 +718,7 @@ impl Codex {
             .goal_state()?
             .begin_for(thread, revision, operation)
             .map_err(|error| error.to_string())?;
-        self.call(step, method, params, Pending::Goal { request })?;
+        self.call(step, method, params, Pending::Goal { request, explicit })?;
         self.publish_goal(step);
         Ok(())
     }
@@ -734,6 +736,7 @@ impl Codex {
             &snapshot.thread_id,
             snapshot.revision,
             chat::goal::Operation::Get,
+            false,
         )
     }
 
@@ -1875,7 +1878,7 @@ impl Adapter for Codex {
                 if matches!(operation, chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume) && !self.direct_input {
                     return Err("This Codex thread does not accept new goal work".into());
                 }
-                self.request_goal(&mut step, &thread_id, revision, operation)?;
+                self.request_goal(&mut step, &thread_id, revision, operation, true)?;
             }
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
@@ -2057,10 +2060,14 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
-            if let Pending::Goal { request } = pending {
+            if let Pending::Goal { request, explicit } = pending {
                 // The exact RPC resolved (including an invalid response). Only
                 // this request can release its slot; notification epochs decide
                 // whether its observation may still be adopted.
+                let disabled = frame.get("error").is_some_and(|error| {
+                    error["code"].as_i64() == Some(-32600)
+                        && error["message"].as_str() == Some("goals feature is disabled")
+                });
                 let result = if let Some(error) = frame.get("error") {
                     Err(if error["code"].as_i64() == Some(-32601) {
                         chat::goal::Failure::Unsupported
@@ -2076,12 +2083,22 @@ impl Adapter for Codex {
                                 .map_err(|_| chat::goal::Failure::Unavailable)
                         })
                 };
-                if let Some(state) = &mut self.goal {
+                let current = if let Some(state) = &mut self.goal {
                     state
                         .complete(&request, result)
-                        .map_err(|error| error.to_string())?;
-                }
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
                 self.publish_goal(&mut step);
+                // An optional attach probe is not a user Goal request. Keep
+                // its unconfirmed state without creating an unsolicited notice.
+                if current && explicit && disabled {
+                    step.events.push(Event::Error {
+                        message: "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.".into(),
+                        fatal: false,
+                    });
+                }
                 self.resume_after_goal_read(&mut step)?;
                 return Ok(step);
             }
