@@ -473,6 +473,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::host::descriptor_limit::inherit(&mut holder);
     unsafe {
         holder.pre_exec(move || {
             crate::daemon::seal_inherited_descriptors()?;
@@ -1837,6 +1838,7 @@ exec /bin/sleep 60
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+        let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
         let mut holder = spawn(spec.clone(), source.clone()).unwrap();
         assert!(
             context.outcome() == LaunchOutcome::Uncertain,
@@ -1850,6 +1852,9 @@ exec /bin/sleep 60
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        crate::host::descriptor_limit::tests::assert_process_limit(record.root.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_process_limit(record.holder.pid as u32, &limit);
+        crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
         crate::daemon::process_scope::tests::assert_separate(
             record.holder.pid as u32,
             record.root.pid as u32,
