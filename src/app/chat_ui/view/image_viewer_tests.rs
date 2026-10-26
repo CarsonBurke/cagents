@@ -124,7 +124,10 @@ fn gallery_and_the_existing_composer_keep_separate_keyboard_focus_and_geometry()
             assert!(
                 !messages.iter().any(|message| matches!(
                     message,
-                    Message::ChatUi(Action::ImageNext(_) | Action::CloseImage)
+                    Message::ChatUi(Action::ImageViewer(
+                        _,
+                        images::ViewerCommand::Next(_) | images::ViewerCommand::Close
+                    ))
                 )),
                 "composer arrows must edit the draft without browsing the gallery"
             );
@@ -164,9 +167,10 @@ fn gallery_and_the_existing_composer_keep_separate_keyboard_focus_and_geometry()
             &viewport,
         );
         assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::ChatUi(Action::ImageNext(true)))),
+            messages.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::ImageViewer(_, images::ViewerCommand::Next(true)))
+            )),
             "focused gallery owns image navigation"
         );
         assert_eq!(runtime.composer.text(), "Keep my draft");

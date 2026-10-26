@@ -285,6 +285,7 @@ pub enum Action {
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
     CloseImage,
+    ImageViewer(u64, images::ViewerCommand),
     ImageNext(bool),
     ImageFit,
     ImageActualSize,
@@ -450,6 +451,7 @@ impl Action {
                 | Self::Tick
                 | Self::AccountPicker(_, false)
                 | Self::CloseImage
+                | Self::ImageViewer(..)
                 | Self::ImageNext(_)
                 | Self::ImageFit
                 | Self::ImageActualSize
@@ -10718,6 +10720,23 @@ impl Cagents {
                     }
                 }
             }
+            Action::ImageViewer(identity, command) => {
+                let Some(gallery) = self.chat_ui.image_viewer.as_ref() else {
+                    return Task::none();
+                };
+                let runtime =
+                    gallery
+                        .target()
+                        .and_then(|target| match self.cards.get(&target.card) {
+                            Some(CardRuntime::Chat(runtime)) if runtime.target == target => {
+                                Some(runtime.as_ref())
+                            }
+                            _ => None,
+                        });
+                if gallery.accepts(identity, runtime) {
+                    return self.handle_chat_ui(command.action());
+                }
+            }
             Action::CloseImage => {
                 let target = self
                     .chat_ui
@@ -12039,7 +12058,11 @@ mod tests {
         assert!(app.chat_ui.image_viewer.is_some());
         assert!(!app.modal_is_open());
         assert!(app.dialog().is_none());
-        let handle_id = app.chat_runtime_mut(target).unwrap().cache["image"].image.as_ref().unwrap().id();
+        let handle_id = app.chat_runtime_mut(target).unwrap().cache["image"]
+            .image
+            .as_ref()
+            .unwrap()
+            .id();
         assert_eq!(
             handle_id,
             app.chat_ui
@@ -12048,6 +12071,55 @@ mod tests {
                 .unwrap()
                 .selected_handle_id()
         );
+        let stale: Vec<_> = [
+            images::ViewerCommand::Next(true),
+            images::ViewerCommand::Fit,
+            images::ViewerCommand::ActualSize,
+            images::ViewerCommand::Select(0),
+            images::ViewerCommand::External,
+            images::ViewerCommand::Close,
+        ]
+        .into_iter()
+        .map(|command| app.chat_ui.image_viewer.as_ref().unwrap().callback(command))
+        .collect();
+        // A redraw can install a replacement before callbacks from the old
+        // widget tree arrive. None may navigate, close, or externally open it.
+        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        for callback in stale {
+            let task = app.handle_chat_ui(callback);
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.chat_ui.image_viewer.as_ref().unwrap().reset, 0);
+        }
+        let stale_selection = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.chat_runtime_mut(target).unwrap().selected_subagent = Some("another-agent".into());
+        drop(app.handle_chat_ui(stale_selection));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "another agent cannot close the hidden gallery"
+        );
+        app.chat_runtime_mut(target).unwrap().selected_subagent = None;
+        let stale_generation = app
+            .chat_ui
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .callback(images::ViewerCommand::Close);
+        app.chat_runtime_mut(target).unwrap().target.generation += 1;
+        drop(app.handle_chat_ui(stale_generation));
+        assert!(
+            app.chat_ui.image_viewer.is_some(),
+            "another runtime generation cannot close the old gallery"
+        );
+        app.cards.get_mut(&target.card).map(|card| {
+            if let CardRuntime::Chat(runtime) = card {
+                runtime.target = target;
+            }
+        });
         assert!(Action::ImageNext(true).allowed_while_modal());
         assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
         drop(app.update(Message::ChatUi(Action::CloseImage)));

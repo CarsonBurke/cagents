@@ -846,7 +846,34 @@ struct Entry {
     label: String,
     handle: iced::widget::image::Handle,
 }
+#[derive(Clone, Copy)]
+pub(in crate::app) enum ViewerCommand {
+    Close,
+    Next(bool),
+    Fit,
+    ActualSize,
+    Select(usize),
+    External,
+}
+impl ViewerCommand {
+    pub(super) fn action(self) -> Action {
+        match self {
+            Self::Close => Action::CloseImage,
+            Self::Next(forward) => Action::ImageNext(forward),
+            Self::Fit => Action::ImageFit,
+            Self::ActualSize => Action::ImageActualSize,
+            Self::Select(index) => Action::ImageSelect(index),
+            Self::External => Action::ImageExternal,
+        }
+    }
+}
+fn next_gallery_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(in crate::app) struct Gallery {
+    identity: u64,
     entries: Vec<Entry>,
     selected: usize,
     remote: bool,
@@ -862,6 +889,7 @@ impl Gallery {
         handle: iced::widget::image::Handle,
     ) -> Self {
         Self {
+            identity: next_gallery_identity(),
             entries: vec![Entry {
                 id: "file".into(),
                 managed: false,
@@ -929,6 +957,7 @@ impl Gallery {
             .collect();
         let selected = entries.iter().position(|entry| entry.id == id)?;
         Some(Self {
+            identity: next_gallery_identity(),
             entries,
             selected,
             remote: crate::device::is_remote(),
@@ -940,6 +969,19 @@ impl Gallery {
     }
     /// Device-file previews retain their dialog; transcript previews belong to
     /// the exact runtime generation and agent that supplied the clicked image.
+    pub(super) fn callback(&self, command: ViewerCommand) -> Action {
+        Action::ImageViewer(self.identity, command)
+    }
+    fn message(&self, command: ViewerCommand) -> Message {
+        action(self.callback(command))
+    }
+    pub(super) fn accepts(&self, identity: u64, runtime: Option<&Runtime>) -> bool {
+        self.identity == identity
+            && (self.is_modal()
+                || runtime.is_some_and(|runtime| {
+                    self.belongs_to(runtime) && runtime.visible.load(Ordering::Relaxed)
+                }))
+    }
     pub(in crate::app) fn is_modal(&self) -> bool {
         self.target.is_none()
     }
@@ -994,34 +1036,39 @@ impl Gallery {
                     Icon::ChevronLeft,
                     "Previous image (Left)",
                     true,
-                    Action::ImageNext(false),
+                    self.callback(ViewerCommand::Next(false)),
                 ),
                 design::caption(format!("{} / {}", self.selected + 1, self.entries.len())).into(),
                 icon(
                     Icon::ChevronRight,
                     "Next image (Right)",
                     true,
-                    Action::ImageNext(true),
+                    self.callback(ViewerCommand::Next(true)),
                 ),
             ]);
         }
         controls.extend([
             crate::ui_controls::button::secondary("Fit")
-                .on_press(action(Action::ImageFit))
+                .on_press(self.message(ViewerCommand::Fit))
                 .into(),
             crate::ui_controls::button::secondary("100%")
-                .on_press(action(Action::ImageActualSize))
+                .on_press(self.message(ViewerCommand::ActualSize))
                 .into(),
             crate::interaction::tooltip(
                 crate::ui_controls::button::secondary("Open externally")
-                    .on_press_maybe(self.url().map(|_| action(Action::ImageExternal))),
+                    .on_press_maybe(self.url().map(|_| self.message(ViewerCommand::External))),
                 if self.url().is_some() {
                     "Open the original image in another application"
                 } else {
                     "The original image is unavailable to external applications on this device"
                 },
             ),
-            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
+            icon(
+                Icon::Close,
+                "Close image (Esc)",
+                true,
+                self.callback(ViewerCommand::Close),
+            ),
         ]);
         let toolbar = widget::flex_row(controls)
             .spacing(step::GAP_XS as u16)
@@ -1040,7 +1087,7 @@ impl Gallery {
         let mut content = vec![
             design::caption(entry.label.as_str()).into(),
             toolbar.into(),
-            canvas::resettable(self.reset, viewer),
+            canvas::identified(self.identity, self.reset, &entry.label, viewer),
         ];
         if self.entries.len() > 1 {
             // Reuse already admitted handles. Keep the strip small even if a
@@ -1074,7 +1121,7 @@ impl Gallery {
                         self.entries.len()
                     ))
                     .selected(index == self.selected)
-                    .on_press(action(Action::ImageSelect(index)))
+                    .on_press(self.message(ViewerCommand::Select(index)))
                     .into()
                 })
                 .collect::<Vec<Element<'_, Message>>>();
@@ -1112,25 +1159,25 @@ impl Gallery {
                 }
                 let command = match key {
                     iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                        Action::CloseImage
+                        ViewerCommand::Close
                     }
                     iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
-                        Action::ImageNext(false)
+                        ViewerCommand::Next(false)
                     }
                     iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
-                        Action::ImageNext(true)
+                        ViewerCommand::Next(true)
                     }
-                    iced::keyboard::Key::Character(key) if key == "0" => Action::ImageFit,
-                    iced::keyboard::Key::Character(key) if key == "1" => Action::ImageActualSize,
+                    iced::keyboard::Key::Character(key) if key == "0" => ViewerCommand::Fit,
+                    iced::keyboard::Key::Character(key) if key == "1" => ViewerCommand::ActualSize,
                     _ => return None,
                 };
-                Some(action(command))
+                Some(self.message(command))
             },
         );
         if self.is_modal() {
             dialog_ui::overlay(
                 dialog_ui::surface(surface, f32::MAX),
-                Some(action(Action::CloseImage)),
+                Some(self.message(ViewerCommand::Close)),
                 1.0,
             )
         } else {
@@ -1918,6 +1965,7 @@ mod tests {
             handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
         };
         let mut gallery = Gallery {
+            identity: next_gallery_identity(),
             entries: vec![entry("a"), entry("b")],
             selected: 0,
             remote: false,
