@@ -1739,7 +1739,26 @@ pub(super) fn process_request(
             drop(_shared);
             let close =
                 reserve_terminal_close(host, terminal_id, &handle, &source, paired.as_ref(), pin)?;
-            handle.shutdown().map_err(send_error)?;
+            // Explicit shutdown permits active work, but still needs the same
+            // inspected family cleanup proof as a checked close. A plain worker
+            // hangup/join cannot certify release of its original holder.
+            match handle.close_checked(true) {
+                crate::terminal_ipc::TerminalCloseResult::Closed => {}
+                crate::terminal_ipc::TerminalCloseResult::Active => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Terminal process cleanup remains unconfirmed; its original owner is retained",
+                        true,
+                    ));
+                }
+                crate::terminal_ipc::TerminalCloseResult::Unknown(detail) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        detail,
+                        true,
+                    ));
+                }
+            }
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .close_terminal_attention(terminal_id, Some(&handle));
