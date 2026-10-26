@@ -24,6 +24,8 @@ mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
 mod execution;
+#[cfg(test)]
+mod goal_tests;
 mod handle;
 pub use handle::Handle;
 #[cfg(test)]
@@ -239,7 +241,9 @@ impl LocalHandle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+        Self::start_with_scope(
+            spec, adapter, initial, store, session_id, None, None, notify,
+        )
     }
 
     /// Retain an actual native holder after closing the fixture's local actor.
@@ -260,7 +264,7 @@ impl LocalHandle {
     }
 
     pub(crate) fn start_owned(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -269,13 +273,21 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
-        Self::start_inner(
+        spec.remove_unset_environment();
+        let scope = crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider,
+            &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        )
+        .ok();
+        Self::start_with_scope(
             spec,
             adapter,
             initial,
             store,
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
+            scope,
             notify,
         )
     }
@@ -293,28 +305,17 @@ impl LocalHandle {
             .server_process
             .ok_or("Missing retained app-server process identity")?;
         spec.environment = recovery.execution_environment.0;
-        Self::start_inner(
+        // Private holder metadata is the only original account evidence here.
+        // Resolving the restored path would capture a replacement home.
+        Self::start_with_scope(
             spec,
             adapter,
             initial,
             store,
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
+            recovery.goal_account_scope,
             notify,
-        )
-    }
-
-    fn start_inner(
-        spec: ProcessSpec,
-        adapter: Box<dyn Adapter>,
-        initial: Step,
-        store: Store,
-        session_id: Option<String>,
-        ownership: Option<NativeOwnership>,
-        notify: impl Fn(Update) + Send + Sync + 'static,
-    ) -> Result<Self, String> {
-        Self::start_with_scope(
-            spec, adapter, initial, store, session_id, ownership, None, notify,
         )
     }
 
@@ -353,7 +354,7 @@ impl LocalHandle {
         initial: Step,
         store: Store,
         session_id: Option<String>,
-        ownership: Option<NativeOwnership>,
+        mut ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
@@ -403,11 +404,29 @@ impl LocalHandle {
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
+        // This is the original spawn FD (or the authenticated holder's FD),
+        // never a new open of the current working-directory spelling. Keep it
+        // separate from ExecutionContext: restored contexts retain run custody.
+        let goal_resume_requires_scope = matches!(&ownership, Some(NativeOwnership::New(..)))
+            || launch_account_scope
+                .as_ref()
+                .is_some_and(|scope| scope.provider == crate::agent::Provider::Codex);
+        let goal_directory = match &mut ownership {
+            Some(NativeOwnership::Adopted(holder, _)) => holder.pinned_launch_directory().ok(),
+            _ => spec
+                .execution
+                .as_ref()
+                .and_then(|context| context.pinned_launch_directory().ok()),
+        };
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
-                Some(super::native_holder::spawn(spec.clone(), source)?)
+                Some(super::native_holder::spawn_with_account_scope(
+                    spec.clone(),
+                    source,
+                    launch_account_scope.clone(),
+                )?)
             }
             Some(NativeOwnership::Adopted(holder, _)) => Some(holder),
             _ => None,
@@ -474,6 +493,8 @@ impl LocalHandle {
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
+                    goal_directory,
+                    goal_resume_requires_scope,
                     working_directory: spec.working_directory.clone(),
                     child: None,
                     native_holder,
@@ -1859,7 +1880,58 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     }
     Ok(())
 }
+type GoalDirectory = (
+    crate::agent_execution::DirectoryIdentity,
+    Arc<std::fs::File>,
+);
+
+/// Work-authorizing goal operations require both original physical pins. A
+/// retained pathname or a later account selection cannot replace either pin.
+fn validate_goal_work(
+    scope: Option<&crate::account::scope::LaunchAccountScope>,
+    context: Option<&super::protocol::ExecutionContext>,
+    directory: Option<&GoalDirectory>,
+    working_directory: &std::path::Path,
+) -> Result<(), String> {
+    let scope = scope.ok_or("The original goal account scope is unavailable")?;
+    if scope.provider != crate::agent::Provider::Codex {
+        return Err("Native goals require the original Codex account scope".into());
+    }
+    let context = context.ok_or("The original goal launch context is unavailable")?;
+    let (identity, directory) =
+        directory.ok_or("The original goal launch-directory descriptor is unavailable")?;
+    super::protocol::validate_launch_directory(directory, *identity)?;
+    if context.directory_identity()? != Some(*identity) {
+        return Err("The goal launch directory does not match its admitted context".into());
+    }
+    context.verify_directory(working_directory)?;
+    scope.revalidate()
+}
+
+/// Goal observations add a constraint; they never make a busy actor idle.
+fn goal_readiness(goal: Option<&super::goal::Snapshot>) -> Option<UpdateReadiness> {
+    use super::goal::{ReadState, Status, Support};
+    let goal = goal?;
+    if goal.pending || goal.uncertain {
+        return Some(UpdateReadiness::Unready);
+    }
+    match &goal.read {
+        ReadState::Known(Some(goal)) => match goal.status {
+            Status::Active | Status::Blocked | Status::UsageLimited | Status::BudgetLimited => {
+                Some(UpdateReadiness::Busy)
+            }
+            Status::Paused | Status::Complete => None,
+        },
+        ReadState::Unknown if goal.support != Support::Unsupported => {
+            Some(UpdateReadiness::Unready)
+        }
+        _ => None,
+    }
+}
+
 struct Actor {
+    goal_directory: Option<GoalDirectory>,
+    goal_resume_requires_scope: bool,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -2498,6 +2570,28 @@ impl Actor {
                     continue;
                 }
             }
+            // Read, pause and clear remain usable on this exact live actor
+            // after either pathname is lost. The adapter still fences thread
+            // and observation revision for every goal command.
+            let goal_work = matches!(
+                &command,
+                Command::Goal {
+                    operation: super::goal::Operation::SetObjective(_)
+                        | super::goal::Operation::Resume,
+                    ..
+                }
+            );
+            if goal_work
+                && let Err(error) = validate_goal_work(
+                    self.launch_account_scope.as_ref(),
+                    self.launch_context.as_deref(),
+                    self.goal_directory.as_ref(),
+                    &self.working_directory,
+                )
+            {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             let authorizes_work = match &command {
                 Command::Prompt { .. }
                 | Command::Compact
@@ -2520,6 +2614,9 @@ impl Actor {
             }
             if authorizes_work
                 && let Some(scope) = &self.launch_account_scope
+                // Codex capture adds goal authority, without changing the
+                // existing ordinary-prompt account-home policy.
+                && scope.provider != crate::agent::Provider::Codex
                 && let Err(error) = scope.revalidate()
             {
                 let _ = reply.send(Err(error));
@@ -2565,6 +2662,8 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
+        } else if let Some(readiness) = goal_readiness(state.goal.as_ref()) {
+            readiness
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
         } else {
@@ -2583,12 +2682,12 @@ impl Actor {
         }
     }
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
-        // An account report is not output of this conversation, so it does
-        // not mark an offscreen pane as having something new to read.
+        // Account and goal-control observations are not conversation output;
+        // checking their current state must not create offscreen unread text.
         let observed = step
             .events
             .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_)));
+            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::Goal(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -2660,15 +2759,56 @@ impl Actor {
                     .notification_preview = Arc::new(preview.clone());
             }
         }
-        // A new Codex thread is created asynchronously after initialize; check
-        // its RPC boundary too. Interrupts, denials and cleanup remain usable
-        // even if the approved directory disappears or is replaced.
-        if step
+        // Inspect the entire step before enqueueing any frame. A resume can
+        // restore autonomous work between ordinary turns. Fresh scoped actors
+        // and trusted holder restorations must retain both original pins.
+        // Legacy holders with no tuple and an unknown goal remain an explicit
+        // compatibility limitation: absence of metadata is not proof of idle.
+        let starts = step
             .writes
             .iter()
-            .any(|frame| frame["method"] == "thread/start")
-            && let Some(context) = &self.launch_context
-        {
+            .any(|frame| frame["method"] == "thread/start");
+        let resumes = step
+            .writes
+            .iter()
+            .any(|frame| frame["method"] == "thread/resume");
+        let goal_work = step.writes.iter().any(|frame| {
+            frame["method"] == "thread/goal/set"
+                && (frame["params"].get("objective").is_some()
+                    || frame["params"]["status"] == "active")
+        });
+        let goal_can_work = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .goal
+                .iter()
+                .chain(step.events.iter().filter_map(|event| match event {
+                    Event::Goal(goal)
+                        if state.session_id.as_deref() == Some(goal.thread_id.as_str()) =>
+                    {
+                        Some(goal)
+                    }
+                    _ => None,
+                }))
+                .any(|snapshot| match &snapshot.read {
+                    super::goal::ReadState::Known(Some(goal)) => matches!(
+                        goal.status,
+                        super::goal::Status::Active
+                            | super::goal::Status::Blocked
+                            | super::goal::Status::UsageLimited
+                            | super::goal::Status::BudgetLimited
+                    ),
+                    _ => false,
+                })
+        };
+        if goal_work || resumes && (self.goal_resume_requires_scope || goal_can_work) {
+            validate_goal_work(
+                self.launch_account_scope.as_ref(),
+                self.launch_context.as_deref(),
+                self.goal_directory.as_ref(),
+                &self.working_directory,
+            )?;
+        } else if starts && let Some(context) = &self.launch_context {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
@@ -2760,6 +2900,7 @@ impl Actor {
                     | Event::TurnFinished { .. }
                     | Event::Usage(_)
                     | Event::Session { .. }
+                    | Event::Goal(_)
             )
             .then(|| event.clone());
             let events = if frame_error.is_some() {
@@ -3173,7 +3314,15 @@ fn apply_projected_event(
         Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
         Event::BranchPoints(points) => state.branch_points = points,
         Event::Forked(id) => state.forked = Some(id),
+        Event::Goal(goal) => {
+            // Delayed observations for another thread cannot contaminate the
+            // current actor. Domain/adapter owns physical request sequencing.
+            if state.session_id.as_deref() == Some(goal.thread_id.as_str()) {
+                state.goal = Some(goal);
+            }
+        }
         Event::Reset { reason } => {
+            state.goal = None;
             state.finished_at = None;
             state.prompt_suggestion = None;
             state.branch_points.clear();
@@ -3203,6 +3352,7 @@ fn apply_projected_event(
         }
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
+                state.goal = None;
                 state.prompt_suggestion = None;
                 state.title = title;
             } else if title.is_some() {
