@@ -131,12 +131,91 @@ fn native_goal_controls_are_provider_confirmed_without_supplying_a_budget_or_an_
     let (mut window, chat) = start(&fixture);
     control(&mut window, &chat, Operation::Get);
     assert!(observed(&mut window, &chat, Option::is_none).is_none());
+    // A persisted Active goal is metadata, not proof the native runtime did
+    // work. Establish an actually completed initial turn before the sole Set.
+    let (baseline, baseline_requests) = until(
+        Duration::from_secs(30),
+        "the initial native no-tool response and turn completion",
+        || {
+            let snapshot = window.read(chat.id);
+            assert_eq!(snapshot.session_id, chat.launch.session_id);
+            assert!(
+                !snapshot.exited,
+                "the original actor exited before Goal Set"
+            );
+            let requests = fixture.model.requests().len();
+            let final_response = snapshot.items.iter().any(|item| {
+                item.role == cagents::chat::Role::Assistant
+                    && matches!(&item.content, cagents::chat::ItemContent::Text {
+                        text, phase: cagents::chat::Phase::Final, ..
+                    } if text.contains("GOAL_FIXTURE_OBSERVED_NO_TOOLS"))
+            });
+            (snapshot.ready
+                && !snapshot.busy
+                && snapshot.error.is_none()
+                && snapshot.requests.is_empty()
+                && snapshot.turn_generation > 0
+                && snapshot.finished_at.is_some()
+                && requests > 0
+                && final_response)
+                .then_some((snapshot, requests))
+        },
+    );
+    let baseline_items: BTreeSet<_> = baseline.items.iter().map(|item| item.id.clone()).collect();
     control(
         &mut window,
         &chat,
         Operation::SetObjective(OBJECTIVE.into()),
     );
     let active = observed(&mut window, &chat, |goal| is_status(goal, Status::Active)).unwrap();
+    // Between the baseline and this observation the only effectful request is
+    // that one Goal Set: no Prompt, turn/start or mutation retry can make a
+    // metadata-only implementation pass. The model counter alone also cannot
+    // pass (e.g. a prediction request is not an original-thread completed turn).
+    let (continued_turn, continued_requests) = until(
+        Duration::from_secs(30),
+        "Goal Set alone to produce a model response and complete a new native turn",
+        || {
+            let snapshot = window.read(chat.id);
+            assert_eq!(snapshot.session_id, baseline.session_id);
+            assert!(
+                !snapshot.exited,
+                "the original actor exited during native Goal work"
+            );
+            assert!(
+                !fixture
+                    .model
+                    .over_limit
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+            let requests = fixture.model.requests().len();
+            let new_final_response = snapshot.items.iter().any(|item| {
+                !baseline_items.contains(&item.id)
+                    && item.role == cagents::chat::Role::Assistant
+                    && matches!(&item.content, cagents::chat::ItemContent::Text {
+                        text, phase: cagents::chat::Phase::Final, ..
+                    } if text.contains("GOAL_FIXTURE_OBSERVED_NO_TOOLS"))
+            });
+            (requests > baseline_requests
+                && snapshot.turn_generation > baseline.turn_generation
+                && snapshot.finished_at.is_some()
+                && !snapshot.busy
+                && snapshot.error.is_none()
+                && snapshot.requests.is_empty()
+                && new_final_response)
+                .then_some((snapshot.turn_generation, requests))
+        },
+    );
+    eprintln!(
+        "NATIVE_GOAL_AUTONOMOUS_NO_TOOL_TURN {}",
+        json!({
+            "thread_id": chat.launch.session_id.as_deref(),
+            "baseline_turn": baseline.turn_generation,
+            "continued_turn": continued_turn,
+            "baseline_model_requests": baseline_requests,
+            "continued_model_requests": continued_requests
+        })
+    );
     // The operation has no budget field. A provider-returned default is an
     // observation, not proof this client supplied a budget.
     eprintln!("SDK-observed Goal budget: {:?}", active.token_budget);
