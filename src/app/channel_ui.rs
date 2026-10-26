@@ -882,11 +882,13 @@ impl Cagents {
         };
         if self.workspace_model.identity != attempt.registry
             || channel.project_id != attempt.project
-            || channel.cards.len() != attempt.members.len()
-            || attempt
-                .members
-                .iter()
-                .any(|card| !channel.cards.contains(card))
+            // Snapshotting any leaving scope prunes already-closed members
+            // from every channel, including later targets in one group. Those
+            // descriptors close nothing; missing originally-open panes still
+            // invalidate consent, as do new or reopened members.
+            || channel.cards.iter().any(|card| !attempt.members.contains(card))
+            || attempt.members.iter().any(|card|
+                !channel.cards.contains(card) && !attempt.inactive.contains(card))
             || attempt.inactive.iter().any(|card| {
                 self.card_state(*card)
                     .is_some_and(|state| state.existence.is_open())
@@ -1848,6 +1850,32 @@ mod tests {
         drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
         assert!(app.channel_ui.was_deleted(channel));
         assert!(!app.channel_ui.failed.contains_key(&channel));
+    }
+
+    #[test]
+    fn inactive_channel_delete_survives_unrelated_navigation_pruning_closed_members() {
+        let (mut app, channel, survivor, conversation) = channel_with_a_conversation();
+        drop(app.select_channel(survivor));
+        let mut closed = app.card_state(conversation).unwrap().clone();
+        closed.id = CardId::new();
+        closed.existence = super::super::project_ui::removed_existence("closed before deletion");
+        let durable = Arc::make_mut(&mut app.durable);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(closed.id);
+        durable.cards.push(closed);
+        drop(app.handle_channel_ui(Action::RequestDelete(channel)));
+        drop(app.handle_channel_ui(Action::ConfirmDelete));
+        let operation = app.channel_ui.close_operation(channel);
+        drop(app.select_worktree(PathBuf::from("/repo"), false));
+        drop(app.handle_channel_ui(Action::SessionsClosed(channel, operation, Ok(()))));
+        assert!(app.channel_ui.was_deleted(channel));
+        assert!(!app.channel_ui.failed.contains_key(&channel));
+        assert!(app.durable.channels.iter().any(|row| row.id == survivor));
     }
 
     #[test]

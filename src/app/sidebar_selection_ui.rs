@@ -304,6 +304,48 @@ mod tests {
     }
 
     #[test]
+    fn channel_group_and_project_delete_survive_other_targets_closed_member_cleanup() {
+        for project_scope in [false, true] {
+            let (mut app, _, ids) = fixture();
+            // Newest selected channel is first in visible/execution order.
+            drop(app.select_channel(ids[1]));
+            assert!(app.active_workspace.is_some());
+            let mut closed = app.durable.cards[0].clone();
+            closed.id = CardId::new();
+            closed.existence =
+                super::super::project_ui::removed_existence("closed before selection");
+            let durable = Arc::make_mut(&mut app.durable);
+            durable
+                .channels
+                .iter_mut()
+                .find(|row| row.id == ids[0])
+                .unwrap()
+                .cards
+                .push(closed.id);
+            durable.cards.push(closed);
+            if project_scope {
+                drop(app.delete_channels(vec![ids[1], ids[0]]));
+            } else {
+                select(&mut app, &ids[..2]);
+                drop(app.begin_sidebar_group_delete());
+                assert_eq!(
+                    app.sidebar_selection_ui.dialog.as_ref().unwrap().targets[0].row,
+                    SelectionRow::Channel(ids[1])
+                );
+                drop(app.update_sidebar_selection(Action::Confirm));
+            }
+            assert!(
+                ids[..2]
+                    .iter()
+                    .all(|id| !app.durable.channels.iter().any(|row| row.id == *id)),
+                "own scope cleanup must not silently delete only part of the confirmed group"
+            );
+            assert!(app.durable.channels.iter().any(|row| row.id == ids[2]));
+            assert!(!app.channel_ui.deletion_running());
+        }
+    }
+
+    #[test]
     fn changed_target_aborts_the_entire_confirmed_group_before_deletion() {
         let (mut app, _, ids) = fixture();
         select(&mut app, &ids[..2]);
