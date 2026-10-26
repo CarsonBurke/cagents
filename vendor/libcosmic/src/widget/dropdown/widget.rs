@@ -735,7 +735,6 @@ pub fn update<
 
     if state.open_operation {
         state.open_operation = false;
-        state.is_open.store(true, Ordering::SeqCst);
         if (refresh && is_open) || (!refresh && !is_open) {
             open(shell, state, on_selected.clone());
         }
@@ -764,8 +763,8 @@ pub fn update<
             }
             shell.capture_event();
         }
-        Event::Keyboard(keyboard::Event::KeyReleased { key, .. })
-            if state.focused && menu::activation_key(key) =>
+        Event::Keyboard(keyboard::Event::KeyReleased { key, modifiers, .. })
+            if state.focused && modifiers.is_empty() && menu::activation_key(key) =>
         {
             shell.capture_event()
         }
@@ -786,7 +785,7 @@ pub fn update<
                 }
                 shell.capture_event();
             } else if cursor.is_over(layout.bounds()) {
-                state.focused = true;
+                state.focused = !selections.is_empty();
                 open(shell, state, on_selected);
                 shell.capture_event();
             }

@@ -359,6 +359,31 @@ fn dropdown_keyboard_focus_commit_abort_and_tab_use_real_retained_overlay() {
         mouse::Cursor::Unavailable,
     );
     assert!(fixture.open(), "Linux Character-space opens");
+    assert_eq!(
+        fixture.event(
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key: keyboard::Key::Character(" ".into()),
+                modified_key: keyboard::Key::Character(" ".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Space),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            }),
+            mouse::Cursor::Unavailable
+        ),
+        (Vec::new(), event::Status::Captured)
+    );
+    assert_eq!(
+        fixture.event(
+            press(
+                keyboard::Key::Named(Named::Enter),
+                keyboard::Modifiers::CTRL,
+                false
+            ),
+            mouse::Cursor::Unavailable
+        ),
+        (Vec::new(), event::Status::Ignored)
+    );
+
     fixture.key(Named::Home);
     assert_eq!(fixture.key(Named::Enter).0, [Message::Selected(0)]);
     fixture.key(Named::Enter);

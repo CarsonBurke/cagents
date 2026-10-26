@@ -638,8 +638,7 @@ where
             {
                 use keyboard::key::Named;
                 if matches!(key, keyboard::Key::Named(Named::Tab))
-                    && !modifiers.command()
-                    && !modifiers.alt()
+                    && (modifiers.is_empty() || *modifiers == keyboard::Modifiers::SHIFT)
                 {
                     keyboard.open.store(false, Ordering::SeqCst);
                     keyboard.retired.store(true, Ordering::SeqCst);
@@ -698,7 +697,7 @@ where
                     }
                 }
             }
-            if matches!(event, Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if activation_key(key))
+            if matches!(event, Event::Keyboard(keyboard::Event::KeyReleased { key, modifiers, .. }) if modifiers.is_empty() && activation_key(key))
             {
                 shell.capture_event();
                 return;
