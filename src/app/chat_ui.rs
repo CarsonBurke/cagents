@@ -2912,9 +2912,10 @@ impl Runtime {
             if text.is_empty() {
                 text = first.to_owned();
             } else {
-                text = format!("{}\n{text}", first.trim_end());
+                text = format!("{first}\n{text}");
             }
-            for image in &queued.attachments {
+            let later = std::mem::take(&mut images);
+            for image in queued.attachments.iter().chain(later.iter()) {
                 if image.reference.is_some() && !images.contains(image) {
                     images.push(image.clone());
                 }
@@ -3185,7 +3186,7 @@ impl Runtime {
         let text = if written.trim().is_empty() {
             queued.source.text().to_owned()
         } else {
-            format!("{}\n{written}", queued.source.text().trim_end())
+            format!("{}\n{written}", queued.source.text())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
         let written = self.replace_attachments(queued.attachments);
@@ -6639,16 +6640,7 @@ impl Cagents {
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
         self.chat_ui.capacity_offers.remove(&card);
-        if let Some(pending) = self.chat_ui.draft_checkpoints.remove(&card) {
-            self.chat_ui.canceled_draft_starts.insert(
-                card,
-                DraftStartIdentity {
-                    source: pending.source,
-                    candidate: pending.candidate,
-                    writer: pending.writer,
-                },
-            );
-        }
+        self.release_draft_start_capture(card);
         // The runtime is about to be dropped, so its unsent text is captured
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
@@ -6667,6 +6659,21 @@ impl Cagents {
         }
         self.chat_ui.phases.remove(&card);
         self.observe_agent_activity_for_card(card, None);
+    }
+
+    /// Completed saves that cannot start an actor need only their exact
+    /// identity projection. Release obsolete prompt/image captures at once.
+    fn release_draft_start_capture(&mut self, card: CardId) {
+        if let Some(pending) = self.chat_ui.draft_checkpoints.remove(&card) {
+            self.chat_ui.canceled_draft_starts.insert(
+                card,
+                DraftStartIdentity {
+                    source: pending.source,
+                    candidate: pending.candidate,
+                    writer: pending.writer,
+                },
+            );
+        }
     }
     /// Forgets a chat runtime whose card is going away for good.
     ///
@@ -7749,15 +7756,18 @@ impl Cagents {
         });
         self.chat_ui.phases.remove(&target.card);
         if !source_matches || !context_matches {
+            self.release_draft_start_capture(target.card);
             return Task::none();
         }
         if !message_matches || self.modal_is_open() {
+            self.release_draft_start_capture(target.card);
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("The draft or its workspace changed while saving. Nothing was started; review it and send again.".into());
             }
             return Task::none();
         }
         if let Err(error) = result {
+            self.release_draft_start_capture(target.card);
             tracing::warn!(card = %target.card, %error, "First conversation checkpoint did not complete");
             if let Some(runtime) = self.chat_card_runtime_mut(target) {
                 runtime.error = Some("The conversation could not be saved, so nothing was started. Your draft is retained; check the workspace save notice before trying again.".into());
@@ -17081,6 +17091,25 @@ mod tests {
 
     /// Sends what the composer of `card` holds.
     fn submit(app: &mut Cagents, card: CardId) {
+        let target = chat_runtime(app, card).target;
+        submit_target(app, target);
+    }
+
+    fn settle_first_start_checkpoint(app: &mut Cagents, card: CardId, task: Task<Message>) {
+        if matches!(
+            app.chat_ui.phases.get(&card),
+            Some(Phase::SavingDraft { .. })
+        ) {
+            let (target, attempt, result) = super::first_start_checkpoint_tests::checkpoint(task);
+            assert!(
+                result.is_ok(),
+                "real first-start fixture checkpoint: {result:?}"
+            );
+            drop(app.draft_start_checkpointed(target, attempt, result));
+        }
+    }
+
+    fn submit_target(app: &mut Cagents, target: Target) {
         // Existing start/Ready tests exercise the provider boundary, not a
         // fabricated save receipt. Supply and drive the real writer barrier
         // first, while never polling the returned provider-start Task.
@@ -17093,19 +17122,8 @@ mod tests {
             .unwrap();
             app.session = Some(writer);
         }
-        let target = chat_runtime(app, card).target;
         let task = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
-        if matches!(
-            app.chat_ui.phases.get(&card),
-            Some(Phase::SavingDraft { .. })
-        ) {
-            let (target, attempt, result) = super::first_start_checkpoint_tests::checkpoint(task);
-            assert!(
-                result.is_ok(),
-                "real first-start fixture checkpoint: {result:?}"
-            );
-            drop(app.draft_start_checkpointed(target, attempt, result));
-        }
+        settle_first_start_checkpoint(app, target.card, task);
         if directory.is_some() {
             drop(app.session.take());
         }
@@ -18236,12 +18254,21 @@ mod tests {
     fn main_work_refuses_queued_native_composer_edits_and_submit_but_conversations_accepts_them() {
         let renderer = crate::app::tests::headless_renderer();
         for started in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = if started {
                 live_chat(&mut app, Some(KNOWN_THREAD))
             } else {
                 draft_chat(&mut app)
             };
+            if !started {
+                let (writer, _) = crate::session::SessionRuntime::open(
+                    directory.path().join("widget-first-start.sqlite3"),
+                    crate::model::BootId::new("widget-first-start"),
+                )
+                .unwrap();
+                app.session = Some(writer);
+            }
             write(&mut app, card, "unsent");
             let character = || keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character("x".into()),
@@ -18282,7 +18309,8 @@ mod tests {
             }
             assert_eq!(chat_runtime(&app, card).composer.text(), "unsentx");
             for message in queued_composer_key(&app, card, enter(), &renderer) {
-                drop(app.update(message));
+                let task = app.update(message);
+                settle_first_start_checkpoint(&mut app, card, task);
             }
             if started {
                 assert!(
@@ -23108,7 +23136,7 @@ mod tests {
             "{labels:?}"
         );
         let retry = runtime.target;
-        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        submit_target(&mut app, retry);
         let attempt = chat_runtime_attempt(&app, card);
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.capacity_refused);
@@ -23116,7 +23144,7 @@ mod tests {
         assert!(runtime.composer.text().is_empty());
         // A second press while that attempt owns the card cannot enqueue or
         // create another start, even with the old rendered target.
-        drop(app.handle_chat_ui(Action::Submit(retry, PromptMode::Send)));
+        submit_target(&mut app, retry);
         assert_eq!(chat_runtime_attempt(&app, card), attempt);
         assert_eq!(
             chat_runtime(&app, card)

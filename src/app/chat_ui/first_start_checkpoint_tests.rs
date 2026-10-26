@@ -58,25 +58,31 @@ fn fixture() -> (Cagents, tempfile::TempDir, CardId, Target) {
 /// below are deliberately not polled against a user's daemon or executable.
 pub(super) fn checkpoint(task: Task<Message>) -> (Target, uuid::Uuid, Result<(), String>) {
     use cosmic::iced::futures::StreamExt;
-    let executor = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    executor.block_on(async {
-        let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("save Task");
-        while let Some(action) = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("real writer must settle")
-        {
-            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
-                Action::DraftStartCheckpointed(target, attempt, result),
-            ))) = action
+    // Some existing UI parents run inside Tokio. An owned joined thread
+    // keeps this save-only executor independent of that caller's runtime.
+    std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("save Task");
+            while let Some(action) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("real writer must settle")
             {
-                return (target, attempt, result);
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::ChatUi(Action::DraftStartCheckpointed(target, attempt, result)),
+                )) = action
+                {
+                    return (target, attempt, result);
+                }
             }
-        }
-        panic!("save Task did not return its checkpoint result")
+            panic!("save Task did not return its checkpoint result")
+        })
     })
+    .join()
+    .expect("save-only fixture executor must finish")
 }
 
 fn stored(app: &Cagents, card: CardId) -> chat::Session {
@@ -261,6 +267,10 @@ fn refused_or_unavailable_first_start_checkpoint_preserves_draft_and_never_start
         assert!(result.is_err());
         drop(app.draft_start_checkpointed(target, attempt, result));
         no_starter(&app, card);
+        assert!(
+            app.chat_ui.draft_checkpoints.is_empty(),
+            "completed failed captures are released"
+        );
         assert_eq!(runtime(&app, card).session, source);
         assert_eq!(
             runtime(&app, card).composer.text(),
@@ -392,7 +402,7 @@ fn changed_draft_or_source_and_stale_checkpoint_cannot_authorize_first_start() {
             assert!(runtime(&app, card).handle().is_none());
             assert!(runtime(&app, card).queued.is_none());
         }
-        if change == "closed" {
+        if change != "nonce" {
             assert!(app.chat_ui.draft_checkpoints.is_empty());
             assert_eq!(
                 app.chat_ui.canceled_draft_starts[&card].candidate.id,
@@ -596,4 +606,92 @@ fn old_writer_candidate_is_never_projected_into_a_replacement_store() {
         assert!(matches!(&old.kind, CardKind::Chat(session) if session == &candidate));
         no_starter(&app, card);
     }
+}
+
+#[test]
+fn saved_first_prompt_keeps_exact_whitespace_and_original_images_before_later_edits() {
+    let (mut app, directory, card, target) = fixture();
+    let first = "  original first prompt\t \n\n";
+    match app.cards.get_mut(&card).unwrap() {
+        CardRuntime::Chat(runtime) => runtime.replace_draft(text_editor::Content::with_text(first)),
+        _ => unreachable!(),
+    }
+    let original_image = runtime(&app, card).attachments[0].clone();
+    let save = app.start_chat_draft(target);
+    let (target, attempt, result) = checkpoint(save);
+    assert!(result.is_ok());
+    let starter = app.draft_start_checkpointed(target, attempt, result);
+    let later = "independent later text\t  \n";
+    let later_image = Attachment {
+        path: directory.path().join("later-image.png"),
+        reference: Some(chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 2,
+            device: uuid::Uuid::new_v4(),
+            name: "later-image.png".into(),
+            sha256: "b".repeat(64),
+            extension: "png".into(),
+        }),
+    };
+    match app.cards.get_mut(&card).unwrap() {
+        CardRuntime::Chat(runtime) => {
+            runtime.replace_draft(text_editor::Content::with_text(later));
+            runtime.attachments.push(later_image.clone());
+            runtime.attachments.push(original_image.clone());
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        first
+    );
+    assert_eq!(runtime(&app, card).composer.text(), later);
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let store = app.session.as_ref().unwrap().operation_store();
+    let restored = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+    assert_eq!(restored.chat_drafts[&card], format!("{first}\n{later}"));
+    assert_eq!(
+        restored.chat_draft_attachments[&card],
+        vec![original_image, later_image]
+    );
+    // Loading this field is recovery data, not a provider submission, and
+    // preparing the snapshot has not changed either independent source.
+    assert_eq!(
+        runtime(&app, card).queued.as_ref().unwrap().source.text(),
+        first
+    );
+    assert_eq!(runtime(&app, card).composer.text(), later);
+    drop(starter);
+    let started = app.chat_ui.attempt(card).unwrap().target;
+    drop(app.handle_chat_ui(Action::Ready(
+        started,
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "fixture refused before accepting a user item",
+        )))))),
+    )));
+    assert_eq!(
+        runtime(&app, card).composer.text(),
+        format!("{first}\n{later}")
+    );
+    assert_eq!(
+        runtime(&app, card).attachments,
+        restored.chat_draft_attachments[&card]
+    );
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    let failed = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+    assert_eq!(failed.chat_drafts[&card], format!("{first}\n{later}"));
+    assert_eq!(
+        failed.chat_draft_attachments[&card],
+        restored.chat_draft_attachments[&card]
+    );
 }
