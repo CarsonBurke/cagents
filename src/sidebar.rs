@@ -2810,6 +2810,7 @@ struct AttentionProjection {
     owners: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     source: std::sync::Weak<crate::model::WorkspaceState>,
     inventory: Vec<(ProjectId, Vec<(WorktreeId, PathBuf)>)>,
+    folders: BTreeSet<ProjectId>,
     projects: BTreeMap<ProjectId, AttentionSummary>,
     worktrees: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
 }
@@ -2818,6 +2819,7 @@ impl PartialEq for AttentionProjection {
         self.dirty == other.dirty
             && self.owners == other.owners
             && self.inventory == other.inventory
+            && self.folders == other.folders
             && self.projects == other.projects
             && self.worktrees == other.worktrees
     }
@@ -3062,7 +3064,18 @@ impl SidebarState {
             return;
         }
         let rows = owner
-            .map(|(project, worktree)| SelectionRow::Worktree(project, worktree))
+            .map(|(project, worktree)| {
+                if worktree == WorktreeId::from_uuid(project.as_uuid())
+                    && self
+                        .attention_projection
+                        .as_ref()
+                        .is_some_and(|projection| projection.folders.contains(&project))
+                {
+                    SelectionRow::Project(project)
+                } else {
+                    SelectionRow::Worktree(project, worktree)
+                }
+            })
             .into_iter()
             .chain(
                 placement
@@ -3106,6 +3119,11 @@ impl SidebarState {
                             .worktrees
                             .iter()
                             .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id)),
+                    )
+                    .chain(
+                        project
+                            .folder_key()
+                            .map(|_| SelectionRow::Project(project.id)),
                     )
             })
             .collect();
@@ -3163,6 +3181,28 @@ impl SidebarState {
         match self.kept_in_attention(SelectionRow::Worktree(project, worktree)) {
             Some(kept) if !self.worktree_needs_attention(project, worktree) => kept,
             _ => Listing::Live,
+        }
+    }
+
+    /// A Folder's directory is drawn by its Project row, not a child worktree.
+    fn folder_listing(&self, project: &SidebarProject) -> Listing {
+        let Some(key) = project.folder_key() else {
+            return Listing::Live;
+        };
+        match self.kept_in_attention(SelectionRow::Project(project.id)) {
+            Some(kept) if !self.worktree_needs_attention(project.id, key.worktree_id) => kept,
+            _ => Listing::Live,
+        }
+    }
+
+    /// Collapsed and compact headers speak for the whole project, including
+    /// channels whose outstanding news must not be dimmed by a read root.
+    fn folder_aggregate_listing(&self, project: &SidebarProject) -> Listing {
+        let attention = self.project_attention(project.id);
+        if attention.unread != 0 || attention.waiting != 0 {
+            Listing::Live
+        } else {
+            self.folder_listing(project)
         }
     }
 
@@ -3460,6 +3500,7 @@ impl SidebarState {
                     .zip(projects)
                     .all(|((id, roots), project)| {
                         *id == project.id
+                            && cache.folders.contains(id) == (project.kind == ProjectKind::Folder)
                             && roots
                                 .iter()
                                 .map(|(id, path)| (*id, path.as_path()))
@@ -3596,6 +3637,10 @@ impl SidebarState {
             owners,
             source: Arc::downgrade(durable),
             inventory,
+            folders: projects
+                .iter()
+                .filter_map(|project| (project.kind == ProjectKind::Folder).then_some(project.id))
+                .collect(),
             projects: summaries,
             worktrees,
         });
@@ -5036,10 +5081,11 @@ fn project_list<'a>(
 /// there and has not needed attention since.
 fn lists_kept_attention_rows(projects: &[FilteredProject<'_>]) -> bool {
     projects.iter().any(|project| {
-        project
-            .channels
-            .iter()
-            .any(|channel| project.state.channel_listing(channel) != Listing::Live)
+        project.state.folder_listing(project.project) != Listing::Live
+            || project
+                .channels
+                .iter()
+                .any(|channel| project.state.channel_listing(channel) != Listing::Live)
             || project.worktrees.iter().any(|worktree| {
                 project
                     .state
@@ -5388,6 +5434,7 @@ fn project_header_row<'a>(
 /// `RowInteraction::actions`, which narrows it only while they are on screen,
 /// so a long project name reads in full until the moment it would run under
 /// them.
+#[cfg(test)]
 fn project_identity_row<'a>(
     project: &'a SidebarProject,
     selected: bool,
@@ -5397,9 +5444,32 @@ fn project_identity_row<'a>(
     query: &str,
     activity: Option<crate::agent::ActivityState>,
 ) -> Element<'static, SidebarAction> {
+    project_identity_row_listed(
+        project,
+        selected,
+        modal_open,
+        compact,
+        review_mode,
+        query,
+        activity,
+        Listing::Live,
+    )
+}
+
+fn project_identity_row_listed<'a>(
+    project: &'a SidebarProject,
+    selected: bool,
+    modal_open: bool,
+    compact: bool,
+    review_mode: bool,
+    query: &str,
+    activity: Option<crate::agent::ActivityState>,
+    listing: Listing,
+) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let label = (!compact).then(|| project_name_label(project, query));
+    let label =
+        (!compact).then(|| project_name_label_ink(project, query, RowInk::Full.listed(listing)));
     let mut name = if review_mode && project.github_ready {
         format!("Browse pull requests in {}", project.name)
     } else if compact {
@@ -5412,6 +5482,7 @@ fn project_identity_row<'a>(
         Some(crate::agent::ActivityState::Working) => name.push_str(", agent working"),
         _ => {}
     }
+    name.push_str(listing.accessible_suffix());
     let control = grid
         .control(
             grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
@@ -5471,11 +5542,19 @@ pub(crate) fn project_primary_action(
 /// The project's name, on one line, ellipsized rather than wrapped so a long
 /// name cannot change a header's height.
 fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static, SidebarAction> {
+    project_name_label_ink(project, query, RowInk::Full)
+}
+
+fn project_name_label_ink(
+    project: &SidebarProject,
+    query: &str,
+    ink: RowInk,
+) -> Element<'static, SidebarAction> {
     search_label(
         &project.name,
         query,
         design::TEXT_HEADING,
-        theme::Text::Default,
+        ink.text_class(),
         true,
     )
 }
@@ -5784,20 +5863,38 @@ fn project_view<'a>(
 
     let worktree_count = project.worktrees.len();
     let has_children = worktree_count > 0 || !project.channels.is_empty();
-    let collapsed_activity = (!expanded)
-        .then(|| project.state.project_attention(project_id).activity())
-        .flatten();
-    let project_identity = project_identity_row(
+    // Folder roots are their own destination: there is no child worktree row
+    // to display their activity. Expanded roots show only that root's news;
+    // collapsed headers keep the existing aggregate over all children.
+    let header_attention = if expanded {
+        entity
+            .folder_key()
+            .map_or_else(AttentionSummary::default, |key| {
+                project
+                    .state
+                    .worktree_attention(project_id, key.worktree_id)
+            })
+    } else {
+        project.state.project_attention(project_id)
+    };
+    let project_identity = project_identity_row_listed(
         entity,
         selection == Some(SidebarSelection::Project(project_id)),
         modal_open,
         false,
         project.state.filter == SidebarFilter::PullRequests,
         &project.state.query,
-        if project.state.filter == SidebarFilter::Attention {
-            collapsed_activity
+        if project.state.filter == SidebarFilter::Attention
+            || (expanded && entity.kind == ProjectKind::Folder)
+        {
+            header_attention.activity()
         } else {
             None
+        },
+        if expanded {
+            project.state.folder_listing(entity)
+        } else {
+            project.state.folder_aggregate_listing(entity)
         },
     );
 
@@ -5843,12 +5940,10 @@ fn project_view<'a>(
     let mut identity = widget::row::with_children(vec![project_identity])
         .align_y(Alignment::Center)
         .width(Length::Fill);
+    if let Some(indicator) = attention_indicator(header_attention, false) {
+        identity = identity.push(indicator);
+    }
     if !expanded {
-        if let Some(indicator) =
-            attention_indicator(project.state.project_attention(project_id), false)
-        {
-            identity = identity.push(indicator);
-        }
         identity = identity.push(design::caption(
             (entity.channels.len() + entity.worktrees.len()).to_string(),
         ));
@@ -6044,6 +6139,8 @@ fn compact_project_identity(
     modal_open: bool,
     state: &SidebarState,
 ) -> Element<'static, SidebarAction> {
+    let listing = state.folder_aggregate_listing(project);
+    let muted = listing != Listing::Live;
     let (initials, color) = project_identity(&project.name);
     let identity: Element<'static, SidebarAction> = if project.avatar.is_some() {
         project_icon(project, ROW_ICON_WIDTH as u16)
@@ -6055,10 +6152,14 @@ fn compact_project_identity(
     let chip = widget::container(identity)
         .center_x(ROW_ICON_WIDTH)
         .center_y(24.0)
-        .class(theme::Container::custom(move |_theme| {
+        .class(theme::Container::custom(move |theme| {
             cosmic::iced::widget::container::Style {
-                background: Some(color.into()),
-                text_color: Some(cosmic::iced::Color::WHITE),
+                background: Some((if muted { color.scale_alpha(0.5) } else { color }).into()),
+                text_color: Some(if muted {
+                    design::muted_icon_color(theme)
+                } else {
+                    cosmic::iced::Color::WHITE
+                }),
                 border: cosmic::iced::Border {
                     color: if selected {
                         cosmic::iced::Color::WHITE
@@ -6114,6 +6215,7 @@ fn compact_project_identity(
     if activity == Some(crate::agent::ActivityState::Waiting) {
         description.push_str("\nAn agent is waiting for input");
     }
+    description.push_str(listing.accessible_suffix());
     let grid = RowGrid::child(true);
     let control = grid
         .control(
@@ -10617,7 +10719,16 @@ fn filtered_projects<'a>(
                 SidebarFilter::PullRequests => {
                     (project_matches && project.github_ready) || !worktrees.is_empty()
                 }
-                SidebarFilter::Attention => !worktrees.is_empty() || !channels.is_empty(),
+                SidebarFilter::Attention => {
+                    !worktrees.is_empty()
+                        || !channels.is_empty()
+                        || (project_matches
+                            && project.folder_key().is_some_and(|key| {
+                                state.worktree_needs_attention(project.id, key.worktree_id)
+                                    || state
+                                        .retained_in_attention(SelectionRow::Project(project.id))
+                            }))
+                }
             };
             visible.then_some(FilteredProject {
                 project,
@@ -15025,6 +15136,62 @@ pub(crate) mod tests {
             }
         }
 
+        fn attention_frame(&mut self) -> (Vec<(String, [f64; 4])>, Vec<u8>) {
+            use cosmic::iced::{
+                Color,
+                advanced::{
+                    clipboard, mouse,
+                    renderer::{Headless, Style},
+                },
+            };
+            let mut ui = interface(
+                &self.model,
+                &self.state,
+                &self.navigation,
+                self.bounds,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            let mut messages = Vec::new();
+            ui.update(
+                &[],
+                mouse::Cursor::Unavailable,
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            ui.draw(
+                &mut self.renderer,
+                &cosmic::Theme::light(),
+                &Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let buttons = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter_map(|node| {
+                    let label = node.node().label()?;
+                    let bounds = node.node().bounds()?;
+                    (!node.node().is_hidden() && !node.node().is_disabled()).then(|| {
+                        (
+                            label.to_owned(),
+                            [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                        )
+                    })
+                })
+                .collect();
+            self.cache = ui.into_cache();
+            let image = self.renderer.screenshot(
+                Size::new(self.bounds.width as u32, self.bounds.height as u32),
+                1.0,
+                Color::BLACK,
+            );
+            (buttons, image)
+        }
+
         fn feed(
             &mut self,
             events: &[cosmic::iced::Event],
@@ -16932,6 +17099,759 @@ pub(crate) mod tests {
             .chain(nodes.children())
             .filter_map(|node| node.node().label().map(ToOwned::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn read_folder_root_does_not_dim_outstanding_channel_attention_in_aggregate_headers() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut sidebar = Sidebar::roomy();
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let root = compact_attention_terminal(CardId::new());
+        let child = compact_attention_terminal(CardId::new());
+        let channel = crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: folder.id,
+            title: "Waiting child".into(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![child.id],
+            focused: None,
+        };
+        let channel_row = |state, unread| {
+            SidebarChannel::new(
+                channel.id,
+                channel.title.clone(),
+                false,
+                Some(state),
+                unread,
+                1,
+                true,
+                1,
+            )
+            .with_attention(AttentionSummary::card(Some(state), unread, false))
+        };
+        folder
+            .channels
+            .push(channel_row(ActivityState::Waiting, true));
+        let durable = Arc::new(crate::model::WorkspaceState {
+            cards: vec![root.clone(), child.clone()],
+            channels: vec![channel.clone()],
+            card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
+            ..Default::default()
+        });
+        sidebar.model.projects = vec![folder.clone()];
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        for (card, state) in [
+            (root.id, ActivityState::Working),
+            (child.id, ActivityState::Waiting),
+        ] {
+            sidebar.state.observe_card_update(card);
+            sidebar.state.set_card_activity(
+                card,
+                Activity {
+                    provider: Provider::Omp,
+                    state,
+                },
+            );
+        }
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        read(&mut sidebar.state, &sidebar.model, root.id, Vec::new());
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(sidebar.state.folder_listing(&folder), Listing::Read);
+        assert_eq!(
+            sidebar.state.folder_aggregate_listing(&folder),
+            Listing::Live
+        );
+        let root_read = format!("Open project {}, agent working, read", folder.name);
+        let aggregate_waiting = format!("Open project {}, agent needs input", folder.name);
+        let (rows, _) = sidebar.attention_frame();
+        assert!(rows.iter().any(|(name, _)| name == &root_read));
+        assert_eq!(
+            rows.iter().filter(|(name, _)| name == "1").count(),
+            1,
+            "only the child still has unread news"
+        );
+        sidebar
+            .state
+            .apply(&SidebarAction::ToggleProject(folder.id));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(rows.iter().any(|(name, _)| name == &aggregate_waiting));
+        assert!(
+            !rows
+                .iter()
+                .any(|(name, _)| name.starts_with("Open project ") && name.ends_with(", read"))
+        );
+        let compact = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(compact.iter().any(|name| name.starts_with(&folder.name)
+            && name.contains("An agent is waiting for input")
+            && !name.ends_with(", read")));
+
+        // Reading the child alone leaves its wait outstanding. Only the real
+        // Waiting -> Working transition permits the aggregate to recede too.
+        sidebar
+            .state
+            .apply(&SidebarAction::ToggleProject(folder.id));
+        read(
+            &mut sidebar.state,
+            &sidebar.model,
+            child.id,
+            vec![channel.id],
+        );
+        sidebar.model.projects[0].channels[0] = channel_row(ActivityState::Waiting, false);
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar.state.folder_aggregate_listing(&folder),
+            Listing::Live
+        );
+        let listed = visible_selection_rows(&sidebar.model, &sidebar.state, false);
+        sidebar.state.settle_waiting_agent(
+            child.id,
+            &AttentionPlacement {
+                channels: vec![channel.id],
+                listed: &listed,
+            },
+        );
+        sidebar.state.set_card_activity(
+            child.id,
+            Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            },
+        );
+        sidebar.model.projects[0].channels[0] = channel_row(ActivityState::Working, false);
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar.state.folder_aggregate_listing(&folder),
+            Listing::Read
+        );
+        assert_eq!(sidebar.state.project_attention(folder.id).unread, 0);
+        sidebar
+            .state
+            .apply(&SidebarAction::ToggleProject(folder.id));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(rows.iter().any(|(name, _)| name == &root_read));
+        let compact = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(
+            compact
+                .iter()
+                .any(|name| name.starts_with(&folder.name) && name.ends_with(", read"))
+        );
+    }
+
+    #[test]
+    fn folder_root_attention_keeps_actual_read_and_handled_rows_until_hidden() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        use cosmic::iced::{Point, advanced::mouse};
+        let mut sidebar = Sidebar::roomy();
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let key = folder.folder_key().unwrap();
+        let card = compact_attention_terminal(CardId::new());
+        let durable = Arc::new(crate::model::WorkspaceState {
+            cards: vec![card.clone()],
+            card_scopes: std::collections::HashMap::from([(card.id, folder.repository.clone())]),
+            ..Default::default()
+        });
+        sidebar.model.projects = vec![folder.clone()];
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        sidebar.state.observe_card_update(card.id);
+        let activity = |state| Activity {
+            provider: Provider::Omp,
+            state,
+        };
+        sidebar
+            .state
+            .set_card_activity(card.id, activity(ActivityState::Working));
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar
+                .state
+                .attention_projection
+                .as_ref()
+                .unwrap()
+                .owners
+                .get(&card.id),
+            Some(&Some((folder.id, key.worktree_id)))
+        );
+        let listed = visible_selection_rows(&sidebar.model, &sidebar.state, false);
+        assert_eq!(listed, vec![SelectionRow::Project(folder.id)]);
+        let working = format!("Open project {}, agent working", folder.name);
+        let (rows, _) = sidebar.attention_frame();
+        let bounds = rows.iter().find(|(name, _)| name == &working).unwrap().1;
+        assert!(bounds[2] > bounds[0] && bounds[3] > bounds[1]);
+        assert!(
+            sidebar
+                .click(
+                    mouse::Button::Left,
+                    Point::new(
+                        ((bounds[0] + bounds[2]) / 2.0) as f32,
+                        ((bounds[1] + bounds[3]) / 2.0) as f32,
+                    )
+                )
+                .contains(&SidebarAction::OpenRepository {
+                    project_id: folder.id,
+                    repository: folder.repository.clone(),
+                })
+        );
+        // The real Folder callback reads the card with the list's Project row.
+        read(&mut sidebar.state, &sidebar.model, card.id, Vec::new());
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert!(!sidebar.state.has_card_update(card.id));
+        assert_eq!(sidebar.state.folder_listing(&folder), Listing::Read);
+        assert_eq!(sidebar.state.retained_attention.len(), 1);
+        assert_eq!(
+            visible_selection_rows(&sidebar.model, &sidebar.state, false),
+            listed
+        );
+        let (read_rows, read_image) = sidebar.attention_frame();
+        let read_bounds = read_rows
+            .iter()
+            .find(|(name, _)| name == &format!("{working}, read"))
+            .unwrap()
+            .1;
+        assert!(
+            read_rows
+                .iter()
+                .any(|(name, _)| name == "Hide read and handled rows")
+        );
+        let compact = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(
+            compact
+                .iter()
+                .any(|name| name.starts_with(&folder.name) && name.ends_with(", read"))
+        );
+
+        // Compare the actual button's painted pixels, independent of the filter controls.
+        let mut live_state = sidebar.state.clone();
+        live_state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+        std::mem::swap(&mut sidebar.state, &mut live_state);
+        let (live_rows, live_image) = sidebar.attention_frame();
+        let live_bounds = live_rows
+            .iter()
+            .find(|(name, _)| name == &working)
+            .unwrap()
+            .1;
+        std::mem::swap(&mut sidebar.state, &mut live_state);
+        let crop = |image: &[u8], bounds: [f64; 4]| {
+            let width = sidebar.bounds.width as usize;
+            let x0 = bounds[0].floor() as usize;
+            let x1 = bounds[2].ceil() as usize;
+            let y0 = bounds[1].floor() as usize;
+            let y1 = bounds[3].ceil() as usize;
+            (y0..y1)
+                .flat_map(|y| {
+                    image[(y * width + x0) * 4..(y * width + x1) * 4]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            crop(&read_image, read_bounds) != crop(&live_image, live_bounds),
+            "reading must dim the real Folder button"
+        );
+        let hide = frame_enter_presses(
+            &sidebar.renderer,
+            project_list(&sidebar.model, &sidebar.state, false, false),
+        )
+        .into_iter()
+        .find(|action| *action == SidebarAction::HideReadAttention)
+        .unwrap();
+        sidebar.state.apply(&hide);
+        assert!(
+            filtered_projects(&sidebar.model, &sidebar.state, false).is_empty(),
+            "spontaneous Working alone stays excluded"
+        );
+
+        sidebar
+            .state
+            .set_card_activity(card.id, activity(ActivityState::Waiting));
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            visible_selection_rows(&sidebar.model, &sidebar.state, false),
+            listed
+        );
+        settle(&mut sidebar.state, &sidebar.model, card.id);
+        sidebar
+            .state
+            .set_card_activity(card.id, activity(ActivityState::Working));
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(sidebar.state.folder_listing(&folder), Listing::Handled);
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("{working}, handled"))
+        );
+        sidebar.state.observe_card_update(card.id);
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar.state.folder_listing(&folder),
+            Listing::Live,
+            "new unread is not dimmed"
+        );
+        read(&mut sidebar.state, &sidebar.model, card.id, Vec::new());
+        sidebar
+            .state
+            .set_card_activity(card.id, activity(ActivityState::Waiting));
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        settle(&mut sidebar.state, &sidebar.model, card.id);
+        sidebar
+            .state
+            .set_card_activity(card.id, activity(ActivityState::Idle));
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar.state.folder_listing(&folder),
+            Listing::Read,
+            "a read outranks later handled waits"
+        );
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("Open project {}, read", folder.name))
+        );
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::All));
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        assert!(sidebar.state.retained_attention.is_empty());
+        assert!(filtered_projects(&sidebar.model, &sidebar.state, false).is_empty());
+    }
+
+    #[test]
+    fn folder_read_retention_requires_current_folder_identity_and_listed_root() {
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let key = folder.folder_key().unwrap();
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![folder.clone()]);
+        let terminal = compact_attention_terminal(CardId::new());
+        let card = terminal.id;
+        let durable = Arc::new(crate::model::WorkspaceState {
+            cards: vec![terminal],
+            ..Default::default()
+        });
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.observe_agent_update(card, folder.id, key.worktree_id);
+        state.refresh_attention_projection(&durable, &model.projects);
+        let rebuilt = state.attention_projection_rebuilds;
+        state.refresh_attention_projection(&durable, &model.projects);
+        assert_eq!(state.attention_projection_rebuilds, rebuilt);
+        // Even a genuine Folder owner cannot retain a Project row not drawn now.
+        state.acknowledge_agent_update(card, &AttentionPlacement::default());
+        assert!(state.retained_attention.is_empty());
+        state.observe_agent_update(card, folder.id, key.worktree_id);
+        state.refresh_attention_projection(&durable, &model.projects);
+        read(&mut state, &model, card, Vec::new());
+        assert_eq!(
+            state
+                .retained_attention
+                .get(&SelectionRow::Project(folder.id)),
+            Some(&Listing::Read)
+        );
+        state.refresh_attention_projection(&durable, &model.projects);
+        let folder_inventory = state
+            .attention_projection
+            .as_ref()
+            .unwrap()
+            .inventory
+            .clone();
+        let clean_rebuilt = state.attention_projection_rebuilds;
+
+        // Identical ordered root inventory, but now a real Git worktree whose UUID
+        // collides with the Folder synthetic identity: kind must invalidate the cache.
+        let mut git = folder.clone().with_kind(ProjectKind::Git);
+        let mut root = worktree(999, "main", false);
+        root.id = key.worktree_id;
+        root.path = folder.repository.clone();
+        git.worktrees = vec![root];
+        model.projects = vec![git];
+        state.refresh_attention_projection(&durable, &model.projects);
+        assert_eq!(state.attention_projection_rebuilds, clean_rebuilt + 1);
+        assert_eq!(
+            state.attention_projection.as_ref().unwrap().inventory,
+            folder_inventory
+        );
+        assert!(
+            !state
+                .attention_projection
+                .as_ref()
+                .unwrap()
+                .folders
+                .contains(&folder.id)
+        );
+        state.prune_retained_attention(&model);
+        assert!(
+            state.retained_attention.is_empty(),
+            "Folder-to-Git replacement drops the kept header"
+        );
+        state.observe_agent_update(card, folder.id, key.worktree_id);
+        state.refresh_attention_projection(&durable, &model.projects);
+        read(&mut state, &model, card, Vec::new());
+        assert_eq!(
+            state
+                .retained_attention
+                .get(&SelectionRow::Worktree(folder.id, key.worktree_id)),
+            Some(&Listing::Read)
+        );
+        assert!(
+            !state
+                .retained_attention
+                .contains_key(&SelectionRow::Project(folder.id))
+        );
+        state.refresh_attention_projection(&durable, &model.projects);
+        let rebuilt = state.attention_projection_rebuilds;
+
+        model.projects = vec![folder.clone()];
+        state.refresh_attention_projection(&durable, &model.projects);
+        assert!(state.attention_projection_rebuilds > rebuilt);
+        state.prune_retained_attention(&model);
+        assert!(state.retained_attention.is_empty());
+        state.observe_agent_update(card, folder.id, key.worktree_id);
+        state.refresh_attention_projection(&durable, &model.projects);
+        read(&mut state, &model, card, Vec::new());
+        assert_eq!(
+            state
+                .retained_attention
+                .get(&SelectionRow::Project(folder.id)),
+            Some(&Listing::Read)
+        );
+        state.refresh_attention_projection(&durable, &model.projects);
+        let rebuilt = state.attention_projection_rebuilds;
+        model.projects[0].repository = PathBuf::from("/different-folder-root");
+        state.refresh_attention_projection(&durable, &model.projects);
+        assert_eq!(
+            state.attention_projection_rebuilds,
+            rebuilt + 1,
+            "root inventory changes also invalidate typed projection"
+        );
+        model.projects.clear();
+        state.prune_retained_attention(&model);
+        assert!(
+            state.retained_attention.is_empty(),
+            "removing the Folder removes its kept row"
+        );
+    }
+
+    #[test]
+    fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        use cosmic::iced::{Point, advanced::mouse};
+        let mut sidebar = Sidebar::roomy();
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let key = folder.folder_key().unwrap();
+        let plain = format!("Open project {}", folder.name);
+        let open = SidebarAction::OpenRepository {
+            project_id: folder.id,
+            repository: folder.repository.clone(),
+        };
+        sidebar.model.projects = vec![folder];
+        let (quiet_rows, quiet_image) = sidebar.attention_frame();
+        assert_eq!(
+            quiet_rows.iter().filter(|(name, _)| name == &plain).count(),
+            1
+        );
+        assert!(
+            !quiet_rows
+                .iter()
+                .any(|(name, _)| name.starts_with("Collapse project "))
+        );
+        let card = CardId::new();
+        sidebar
+            .state
+            .observe_agent_update(card, key.project_id, key.worktree_id);
+        let (unread_rows, unread_image) = sidebar.attention_frame();
+        assert!(unread_rows.iter().any(|(name, _)| name == &plain));
+        assert_eq!(
+            unread_rows.iter().filter(|(name, _)| name == "1").count(),
+            1,
+            "the rendered Folder root has exactly one unread count"
+        );
+        assert_ne!(
+            quiet_image, unread_image,
+            "the actual expanded Folder frame must paint its unread indicator"
+        );
+        sidebar.state.set_agent_activity(
+            card,
+            key.project_id,
+            key.worktree_id,
+            Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            },
+        );
+        let working = format!("{plain}, agent working");
+        let (rows, _) = sidebar.attention_frame();
+        assert_eq!(rows.iter().filter(|(name, _)| name == &working).count(), 1);
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter().any(|(name, _)| name == &working),
+            "root unread retains the actual Folder button in Attention"
+        );
+        sidebar
+            .state
+            .acknowledge_agent_update(card, &AttentionPlacement::default());
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            !rows.iter().any(|(name, _)| name.starts_with(&plain)),
+            "Working alone preserves the existing Attention exclusion"
+        );
+        sidebar.state.set_agent_activity(
+            card,
+            key.project_id,
+            key.worktree_id,
+            Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Waiting,
+            },
+        );
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("{plain}, agent needs input"))
+        );
+        let compact_names = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(
+            compact_names
+                .iter()
+                .any(|name| name.starts_with(&sidebar.model.projects[0].name)
+                    && name.contains("An agent is waiting for input")),
+            "the shared Attention filter also admits the real compact Folder control"
+        );
+        sidebar.state.apply(&SidebarAction::ToggleControls);
+        sidebar
+            .state
+            .apply(&SidebarAction::SearchChanged("no-matching-folder".into()));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            !rows.iter().any(|(name, _)| name.starts_with(&plain)),
+            "root attention does not bypass search"
+        );
+        let compact_names = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(
+            !compact_names
+                .iter()
+                .any(|name| name.starts_with(&sidebar.model.projects[0].name)),
+            "an available compact search still filters the Folder root"
+        );
+        sidebar.state.apply(&SidebarAction::ToggleControls);
+        sidebar.state.forget_card_attention(card);
+        let (rows, _) = sidebar.attention_frame();
+        assert!(!rows.iter().any(|(name, _)| name.starts_with(&plain)));
+        let compact_names = accessible_names(
+            &sidebar.renderer,
+            body(&sidebar.model, &sidebar.state, true, false),
+        );
+        assert!(
+            !compact_names
+                .iter()
+                .any(|name| name.starts_with(&sidebar.model.projects[0].name)),
+            "quiet Folder roots stay out of compact Attention too"
+        );
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::All));
+        let (rows, _) = sidebar.attention_frame();
+        let (_, bounds) = rows.iter().find(|(name, _)| name == &plain).unwrap();
+        assert!(
+            bounds[0] >= 0.0
+                && bounds[1] >= 0.0
+                && bounds[2] > bounds[0]
+                && bounds[3] > bounds[1]
+                && bounds[2] <= f64::from(sidebar.bounds.width)
+                && bounds[3] <= f64::from(sidebar.bounds.height)
+        );
+        let actions = sidebar.click(
+            mouse::Button::Left,
+            Point::new(
+                ((bounds[0] + bounds[2]) / 2.0) as f32,
+                ((bounds[1] + bounds[3]) / 2.0) as f32,
+            ),
+        );
+        assert!(
+            actions.contains(&open),
+            "the unchanged actual Folder control still opens its exact destination"
+        );
+    }
+
+    #[test]
+    fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut sidebar = Sidebar::roomy();
+        let mut folder = project().with_kind(ProjectKind::Folder);
+        folder.worktrees.clear();
+        let key = folder.folder_key().unwrap();
+        let root = compact_attention_terminal(CardId::new());
+        let child = compact_attention_terminal(CardId::new());
+        let channel = crate::model::ProjectChannel {
+            title_source: Default::default(),
+            id: ChannelId::new(),
+            project_id: folder.id,
+            title: "Child work".into(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![child.id],
+            focused: None,
+        };
+        folder.channels.push(
+            SidebarChannel::new(
+                channel.id,
+                channel.title.clone(),
+                false,
+                Some(ActivityState::Waiting),
+                true,
+                1,
+                true,
+                1,
+            )
+            .with_attention(AttentionSummary::card(
+                Some(ActivityState::Waiting),
+                true,
+                false,
+            )),
+        );
+        let durable = Arc::new(crate::model::WorkspaceState {
+            cards: vec![root.clone(), child.clone()],
+            channels: vec![channel],
+            card_scopes: std::collections::HashMap::from([(root.id, folder.repository.clone())]),
+            ..Default::default()
+        });
+        sidebar.model.projects = vec![folder.clone()];
+        sidebar.state.observe_card_update(root.id);
+        sidebar.state.observe_card_update(child.id);
+        sidebar.state.set_card_activity(
+            root.id,
+            Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            },
+        );
+        sidebar.state.set_card_activity(
+            child.id,
+            Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Waiting,
+            },
+        );
+        sidebar
+            .state
+            .refresh_attention_projection(&durable, &sidebar.model.projects);
+        assert_eq!(
+            sidebar.state.worktree_attention(folder.id, key.worktree_id),
+            AttentionSummary::card(Some(ActivityState::Working), true, false)
+        );
+        assert_eq!(
+            sidebar.state.project_attention(folder.id),
+            AttentionSummary {
+                unread: 2,
+                working: 1,
+                waiting: 1,
+                failed: 0,
+            }
+        );
+        let plain = format!("Open project {}", folder.name);
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("{plain}, agent working"))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(name, _)| name == &format!("{plain}, agent needs input")),
+            "expanded root does not repeat the child's aggregate wait"
+        );
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name.starts_with("Open channel Child work"))
+        );
+        assert_eq!(
+            rows.iter().filter(|(name, _)| name == "1").count(),
+            2,
+            "expanded Folder root and channel each render only their own unread count"
+        );
+        assert!(
+            !rows.iter().any(|(name, _)| name == "2"),
+            "the project aggregate is not repeated above its expanded children"
+        );
+        sidebar
+            .state
+            .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        sidebar
+            .state
+            .apply(&SidebarAction::ToggleProject(folder.id));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("{plain}, agent needs input")),
+            "collapsed header retains the existing full-project aggregate"
+        );
+        // The same header policy for Git is unchanged: expanded worktree rows
+        // own the news, while a collapsed Attention header aggregates it.
+        sidebar.model.projects[0].kind = ProjectKind::Git;
+        let (rows, _) = sidebar.attention_frame();
+        assert!(
+            rows.iter()
+                .any(|(name, _)| name == &format!("{plain}, agent needs input"))
+        );
+        sidebar
+            .state
+            .apply(&SidebarAction::ToggleProject(folder.id));
+        let (rows, _) = sidebar.attention_frame();
+        assert!(rows.iter().any(|(name, _)| name == &plain));
+        assert!(
+            !rows
+                .iter()
+                .any(|(name, _)| name == &format!("{plain}, agent working"))
+        );
     }
 
     /// A project whose checkout could not be read is still a row, and that row
