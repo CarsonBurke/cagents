@@ -189,6 +189,10 @@ use crate::{
 /// checkout dirtiness explicitly. Matched CLI, daemon and UI are required.
 /// Version 124 appends Actor-owned checkout preparation from the original
 /// retained launch directory. Matched CLI, daemon and UI are required.
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
 /// Version 125 raises terminal history to an explicit byte budget (16 MiB by
 /// default, up to 1 GiB). Published protocol-119 hosts reject values above
 /// 1,000,000, so their unchanged positional field encoding is not sufficient
@@ -196,7 +200,12 @@ use crate::{
 /// Version 129 combines scoped User/Actor checkout capture with the version-125
 /// terminal byte budgets. Neither predecessor represents this combined ABI;
 /// matched CLI, daemon and UI executables are required.
-pub const PROTOCOL_VERSION: u16 = 129;
+/// Version 127 combines both contracts in the matched set. Version 126 is
+/// reserved for the separate native Goal integration and is not adopted here.
+/// Version 131 combines scoped User/Actor checkout capture with no-run
+/// automation notification identity and terminal byte budgets. All three
+/// executables must match; native Goal and history experiments remain separate.
+pub const PROTOCOL_VERSION: u16 = 131;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

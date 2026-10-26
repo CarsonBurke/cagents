@@ -46,6 +46,7 @@ pub(super) struct State {
     pub(super) workspace_switcher_rows: Vec<WorkspaceSwitcherRow>,
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
+    attention_page: usize,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
     /// two would each move focus on one key press, and whichever landed last
@@ -185,6 +186,71 @@ mod tests {
         assert!(app.channel_home().is_none());
         assert!(!app.workspace_surfaces_visible());
         assert_eq!(app.chrome_ui.popup, None);
+    }
+
+    #[test]
+    fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        drop(app.update_chrome(Action::ToggleAttention));
+        assert!(app.attention_is_open());
+        assert_eq!(app.popup_focus_ring(Popup::Attention), ["attention.close"]);
+        let target = crate::model::TerminalId::new();
+        for index in 0..21 {
+            app.notification_ui
+                .snapshot
+                .notices
+                .push(crate::notifications::Notice {
+                    id: uuid::Uuid::new_v4(),
+                    event: crate::notifications::Event::session(
+                        target,
+                        crate::agent::Provider::Codex,
+                        "/tmp/toy".into(),
+                        crate::notifications::Evidence {
+                            key: format!("incident-{index}"),
+                            kind: crate::notifications::Kind::Succeeded,
+                        },
+                    ),
+                    delivered: false,
+                    acknowledged: false,
+                    window: None,
+                });
+        }
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("attention-pages"),
+            boot_id: crate::model::BootId::new("attention-pages"),
+            host_incarnation: crate::model::HostIncarnation::new("attention-pages"),
+        };
+        drop(app.update_notifications(notification_ui::Action::HostBound(proof)));
+        let snapshot = app.notification_ui.snapshot.clone();
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        let duplicate = app.notification_ui.snapshot.notices[0].clone();
+        app.notification_ui.snapshot.notices.push(duplicate);
+        let first = app.popup_focus_ring(Popup::Attention);
+        assert_eq!(first.len(), 22, "close, twenty incident actions, more");
+        assert_eq!(
+            first
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            first.len()
+        );
+        assert_eq!(first.last().unwrap(), "attention.next");
+        drop(app.update_chrome(Action::AttentionPage(1)));
+        let last = app.popup_focus_ring(Popup::Attention);
+        assert_eq!(last.len(), 3, "close, last incident, previous");
+        assert_eq!(last.last().unwrap(), "attention.previous");
+        app.notification_ui.snapshot.notices.clear();
+        assert_eq!(app.popup_focus_ring(Popup::Attention), ["attention.close"]);
+        drop(app.update_chrome(Action::Close));
+        assert!(!app.attention_is_open());
+        app.settings_reset_confirm = true;
+        drop(app.update_chrome(Action::ToggleAttention));
+        assert!(
+            !app.attention_is_open(),
+            "a modal keeps its existing keyboard owner"
+        );
     }
 
     #[test]
@@ -1404,6 +1470,7 @@ impl State {
 enum Popup {
     NewTab,
     Notices,
+    Attention,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1465,6 +1532,8 @@ pub enum Action {
     ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
+    ToggleAttention,
+    AttentionPage(usize),
     ShowNoticesFor(CardId),
     Close,
     TabsScrolled(f32),
@@ -1758,6 +1827,32 @@ impl Cagents {
                 .iter()
                 .map(|(_, _, _, id)| Cow::Borrowed(*id))
                 .collect(),
+            Popup::Attention => {
+                let mut ring = vec![Cow::Borrowed("attention.close")];
+                let notices = if self.attention_backend_current() {
+                    self.attention_notices()
+                } else {
+                    Vec::new()
+                };
+                let page = self
+                    .chrome_ui
+                    .attention_page
+                    .min(notices.len().saturating_sub(1) / 20);
+                ring.extend(
+                    notices
+                        .iter()
+                        .skip(page * 20)
+                        .take(20)
+                        .map(|notice| Cow::Owned(format!("attention.open.{}", notice.id))),
+                );
+                if page > 0 {
+                    ring.push(Cow::Borrowed("attention.previous"));
+                }
+                if (page + 1) * 20 < notices.len() {
+                    ring.push(Cow::Borrowed("attention.next"));
+                }
+                ring
+            }
             Popup::Notices => {
                 let mut ring = Vec::new();
                 if !self.notices.is_empty() {
@@ -1846,6 +1941,11 @@ impl Cagents {
                     .chrome_ui
                     .popup
                     .is_some_and(|popup| popup != Popup::Notices))
+        {
+            return Task::none();
+        }
+        if matches!(action, Action::ToggleAttention | Action::AttentionPage(_))
+            && self.focused_repository_is_saving()
         {
             return Task::none();
         }
@@ -2023,9 +2123,23 @@ impl Cagents {
                 self.persist();
                 self.sync_context_overlay_state()
             }
-            Action::ToggleNewTab | Action::ToggleNotices | Action::ShowNoticesFor(_) => {
+            Action::AttentionPage(page) => {
+                if !self.attention_is_open() || !self.attention_backend_current() {
+                    return Task::none();
+                }
+                self.chrome_ui.attention_page =
+                    page.min(self.attention_notices().len().saturating_sub(1) / 20);
+                self.chrome_ui.focus_index = 0;
+                self.focus_popup_control(self.popup_focus_ring(Popup::Attention))
+            }
+            Action::ToggleNewTab
+            | Action::ToggleNotices
+            | Action::ToggleAttention
+            | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
+                } else if matches!(action, Action::ToggleAttention) {
+                    Popup::Attention
                 } else {
                     Popup::Notices
                 };
@@ -2035,12 +2149,15 @@ impl Cagents {
                     }
                     return self.update_chrome(Action::Close);
                 }
+                if popup == Popup::Attention {
+                    self.chrome_ui.attention_page = 0;
+                }
                 self.chrome_ui.popup = Some(popup);
                 // The notices popup opens on its close control, which is not
                 // the first stop when "Dismiss all" precedes it.
                 let ring = self.popup_focus_ring(popup);
                 self.chrome_ui.focus_index = match popup {
-                    Popup::NewTab => 0,
+                    Popup::NewTab | Popup::Attention => 0,
                     Popup::Notices => ring
                         .iter()
                         .position(|id| id == NOTICES_CLOSE_ID)
@@ -2050,10 +2167,18 @@ impl Cagents {
             }
             Action::Close => {
                 let popup = self.chrome_ui.popup.take();
+                if popup == Some(Popup::Attention)
+                    && (self.modal_is_open() || self.focused_repository_is_saving())
+                {
+                    // A queued outside-close cannot unfocus a dialog/editor
+                    // that acquired the keyboard after this overlay was drawn.
+                    return Task::none();
+                }
                 popup.map_or_else(Task::none, |popup| {
                     iced::widget::operation::focus(widget::Id::new(match popup {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
                         Popup::Notices => NOTICES_CONTROL_ID,
+                        Popup::Attention => "attention.control",
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -2263,6 +2388,172 @@ impl Cagents {
         // `None` and fall back to a warning glyph for an error.
         let recorded_severity = self.notices.severity().max(health_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
+    }
+
+    pub(super) fn attention_is_open(&self) -> bool {
+        self.chrome_ui.popup == Some(Popup::Attention)
+    }
+
+    /// The journal's own keyboard layer must not veto its explicit action.
+    /// Inspect the unchanged navigation predicate with only that popup absent;
+    /// restore it immediately, without focus operations or event processing.
+    pub(super) fn with_attention_dismissed(&mut self, allowed: impl FnOnce(&Self) -> bool) -> bool {
+        if !self.attention_is_open() {
+            return false;
+        }
+        let popup = self.chrome_ui.popup.take();
+        let admitted = allowed(self);
+        self.chrome_ui.popup = popup;
+        admitted
+    }
+
+    pub(super) fn close_attention(&mut self) {
+        if self.attention_is_open() {
+            self.chrome_ui.close();
+        }
+    }
+
+    fn attention_and_notice_controls(&self) -> Element<'_, Message> {
+        widget::row::with_children(
+            std::iter::once(self.attention_control()).chain(self.notice_control()),
+        )
+        .spacing(space::XXS)
+        .into()
+    }
+
+    fn attention_control(&self) -> Element<'_, Message> {
+        let control = crate::ui_controls::icon_button(Icon::NotificationSettings, "Attention")
+            .id(widget::Id::new("attention.control"))
+            .selected(self.attention_is_open())
+            .on_press_maybe(
+                (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleAttention)),
+            );
+        let content =
+            (self.attention_is_open() && !self.modal_is_open()).then(|| self.attention_journal());
+        crate::ui_controls::popover(
+            control,
+            content,
+            widget::popover::Position::Bottom,
+            Message::ChromeUi(Action::Close),
+        )
+    }
+
+    pub(super) fn attention_journal(&self) -> Element<'_, Message> {
+        let notices = if self.attention_backend_current() {
+            self.attention_notices()
+        } else {
+            Vec::new()
+        };
+        let page = self
+            .chrome_ui
+            .attention_page
+            .min(notices.len().saturating_sub(1) / 20);
+        let mut entries = Vec::new();
+        if !self.attention_backend_current() {
+            entries.push(design::caption("The notification backend is not connected. Retained entries cannot be opened until it reconnects.")
+                .width(Length::Fill).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into());
+        } else if notices.is_empty() {
+            entries.push(
+                design::caption("No attention entries.")
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+            );
+        }
+        for (index, notice) in notices.iter().skip(page * 20).take(20).enumerate() {
+            let message = crate::notifications::presentation::message(
+                &notice.event,
+                self.settings.notifications.message_previews,
+            );
+            let mut paragraphs = vec![
+                design::heading(message.title.clone())
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .into(),
+            ];
+            if !message.body.is_empty() && message.body != message.title {
+                paragraphs.push(
+                    design::body(message.body)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into(),
+                );
+            }
+            paragraphs.push(
+                crate::ui_controls::button::quiet(message.action)
+                    .id(widget::Id::new(format!("attention.open.{}", notice.id)))
+                    .name(format!(
+                        "{} — {} — entry {}",
+                        message.action,
+                        message.title,
+                        page * 20 + index + 1
+                    ))
+                    .on_press(self.attention_notice_action(notice))
+                    .into(),
+            );
+            let body = widget::column::with_children(paragraphs)
+                .spacing(space::XS)
+                .width(Length::Fill);
+            entries.push(crate::ui_controls::owned(
+                self.attention_notice_owner(notice),
+                widget::container(body)
+                    .padding(space::S)
+                    .width(Length::Fill),
+            ));
+        }
+        let mut navigation = Vec::new();
+        if page > 0 {
+            navigation.push(
+                crate::ui_controls::button::quiet("Previous entries")
+                    .id(widget::Id::new("attention.previous"))
+                    .on_press(Message::ChromeUi(Action::AttentionPage(page - 1)))
+                    .into(),
+            );
+        }
+        if (page + 1) * 20 < notices.len() {
+            navigation.push(
+                crate::ui_controls::button::quiet("More entries")
+                    .id(widget::Id::new("attention.next"))
+                    .on_press(Message::ChromeUi(Action::AttentionPage(page + 1)))
+                    .into(),
+            );
+        }
+        let header = widget::row::with_children(vec![
+            design::heading("Attention").width(Length::Fill).into(),
+            command(
+                Icon::Close,
+                "Close Attention",
+                widget::Id::new("attention.close"),
+                Some(Message::ChromeUi(Action::Close)),
+            ),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space::S);
+        widget::container(
+            widget::column::with_children(vec![
+                header.into(),
+                // Shrink children are measured in order. Reserve the page
+                // controls before the list can consume the remaining height.
+                widget::row::with_children(navigation)
+                    .spacing(space::S)
+                    .into(),
+                widget::scrollable(
+                    widget::column::with_children(entries)
+                        .spacing(space::XS)
+                        .padding(design::with_vertical_rail(iced::Padding::new(0.0))),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink)
+                .into(),
+            ])
+            .spacing(space::S),
+        )
+        .padding(space::S)
+        .width((self.window_width - 16.0).clamp(160.0, 420.0))
+        .max_height(408)
+        .into()
     }
 
     fn notice_control(&self) -> Option<Element<'_, Message>> {
@@ -2498,7 +2789,12 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + 16.0;
+        let attention = if !self.context_inspector_visible() {
+            design::PRIMARY_CONTROL_SIZE + 2.0
+        } else {
+            0.0
+        };
+        let width = navigator + controls + update + notice + attention + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -2802,9 +3098,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into(),
             widget::row::with_children(
-                (!panel_owns_shared_controls)
-                    .then(|| self.notice_control())
-                    .flatten(),
+                (!panel_owns_shared_controls).then(|| self.attention_and_notice_controls()),
             )
             .into(),
             widget::row::with_children(
@@ -3189,7 +3483,7 @@ impl Cagents {
     ) -> Element<'_, Message> {
         if !self.channel_work_is_main() && self.channel_work.view.is_open() {
             let end = widget::row::with_children(vec![
-                widget::row::with_children(self.notice_control()).into(),
+                self.attention_and_notice_controls(),
                 widget::row::with_children(self.update_control()).into(),
             ])
             .spacing(space::XXS)
@@ -3282,7 +3576,7 @@ impl Cagents {
         // including a docked inspector: the workspace header must not also
         // show the update or the icon stays on the far side of the window.
         let end = widget::row::with_children(vec![
-            widget::row::with_children(self.notice_control()).into(),
+            self.attention_and_notice_controls(),
             widget::row::with_children(self.update_control()).into(),
         ])
         .spacing(space::XXS)
