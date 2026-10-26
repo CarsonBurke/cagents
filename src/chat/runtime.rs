@@ -498,6 +498,7 @@ impl LocalHandle {
                     offset: 0,
                     queued: 0,
                     stderr: VecDeque::new(),
+                    stderr_capture: None,
                     indices: BTreeMap::new(),
                     retained: 0,
                     history_error: None,
@@ -594,6 +595,7 @@ impl LocalHandle {
                         message,
                         fatal: true,
                     });
+                    actor.retain_exit_diagnostic();
                     // Publish the bounded diagnosis before attention samples
                     // it, while keeping retained native outcomes unconfirmed.
                     if let Some(evidence) = attention {
@@ -970,12 +972,27 @@ impl LocalHandle {
         offset: u64,
     ) -> Result<super::TextCopyPage, String> {
         match &source.scope {
-            super::TextCopyScope::Conversation => self
-                .0
-                .store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .text_copy(source, offset),
+            super::TextCopyScope::Conversation => {
+                let prepared = {
+                    let store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+                    match store.issued_exit_copy(source)? {
+                        Some(prepared) => prepared,
+                        None => return store.text_copy(source, offset),
+                    }
+                };
+                // Actual file IO is bounded to one page, outside the Store
+                // mutex and provider event loop. The owned lease survives a
+                // concurrent row replacement; the next page revalidates token.
+                let (text, next) = prepared
+                    .read(offset)
+                    .map_err(|_| "Retained provider diagnostic is unavailable".to_owned())?;
+                Ok(super::TextCopyPage {
+                    source: source.clone(),
+                    offset,
+                    text,
+                    done: next.is_none(),
+                })
+            }
             super::TextCopyScope::Subagent { .. } => child_text_copy::read(
                 &self.0.state.lock().unwrap_or_else(|p| p.into_inner()),
                 source,
@@ -1888,6 +1905,7 @@ struct Actor {
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
+    stderr_capture: Option<super::stderr_log::Recorder>,
     indices: BTreeMap<String, usize>,
     retained: usize,
     /// Only the active error published by the most recent history failure.
@@ -1972,6 +1990,61 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn retain_exit_diagnostic(&mut self) {
+        use super::stderr_log::PreparationSource;
+        let source = if let Some(capture) = self.stderr_capture.take() {
+            if capture.offered_bytes() == 0 {
+                return;
+            }
+            Some(PreparationSource::Finishing(capture.finish()))
+        } else {
+            // Optional diagnostics must not add a private RPC to the existing
+            // critical Release path. Native acquisition is honestly unavailable
+            // here until an explicitly admitted lifecycle exchange supplies it.
+            None
+        };
+        let Some(source) = source else {
+            if self.stderr.is_empty() {
+                return;
+            }
+            let _ = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .append_exit_unavailable();
+            return;
+        };
+        let weak_store = Arc::downgrade(&self.store);
+        let weak_state = Arc::downgrade(&self.state);
+        let notify = self.notify.clone();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let queued = store.queue_exit_report(source, move || {
+            let (Some(store), Some(state)) = (weak_store.upgrade(), weak_state.upgrade()) else {
+                return;
+            };
+            // Only a small locally issued report/token is installed here; all
+            // log IO/conversion already finished off actor. Normal lock order.
+            let mut store = store.lock().unwrap_or_else(|poison| poison.into_inner());
+            match store.finish_exit_report() {
+                Ok(true) => {
+                    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                    state.generation = state.generation.wrapping_add(1);
+                    drop(state);
+                    drop(store);
+                    notify(Update::Presentation);
+                }
+                Ok(false) => {}
+                Err(_) => eprintln!("Provider stderr report is unavailable"),
+            }
+        });
+        if queued.is_err() {
+            let _ = store.append_exit_unavailable();
+        }
+    }
+
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2034,231 +2107,256 @@ impl Actor {
             .stderr
             .take()
             .ok_or("Provider stderr unavailable")?;
+        self.stderr_capture = super::stderr_log::Recorder::start().ok();
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
-        self.step(initial)?;
-        let mut stdout_eof = false;
-        let mut stderr_eof = false;
-        let mut closing = None;
-        let mut partial_started = None;
-        let mut interrupt_sent = false;
-        let mut interrupt_error = String::new();
-        loop {
-            if self.stop.load(Ordering::Acquire) {
-                if closing.is_none() {
-                    closing = Some(Instant::now());
-                }
-                let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
-                if busy && !interrupt_sent && self.pending.is_empty() {
-                    match self.adapter.command(Command::Interrupt) {
-                        Ok(step) => {
-                            self.step(step)?;
-                            interrupt_sent = true;
-                        }
-                        // A just-submitted turn may not have its provider ID yet.
-                        // Continue draining until it can be interrupted or the deadline expires.
-                        Err(error) => interrupt_error = error,
-                    }
-                }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
-                    return Ok(());
-                }
-                if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
-                    return Err(format!(
-                        "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
-                    ));
-                }
-            }
-            self.drain_commands(closing.is_some())?;
-            // Parse every frame that already arrived. Gating this on an empty stdin
-            // queue froze streaming for a whole turn against any provider that reads
-            // stdin only between turns, then killed the session by blaming its
-            // framing; a stalled write has its own `write_started` deadline below.
-            let mut frames_ready = false;
-            let mut parsed = 0usize;
+        let result = (|| {
+            self.step(initial)?;
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            let mut closing = None;
+            let mut partial_started = None;
+            let mut interrupt_sent = false;
+            let mut interrupt_error = String::new();
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
-                    break;
-                };
-                if newline == 0 {
-                    self.output.drain(..1);
-                    self.scanned = 0;
-                    continue;
-                }
-                if parsed == FRAMES_PER_POLL {
-                    frames_ready = true;
-                    break;
-                }
-                let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
-                    format!("Unsupported provider stdout (expected JSON-lines): {error}")
-                })?;
-                self.output.drain(..=newline);
-                self.scanned = 0;
-                partial_started = None;
-                parsed += 1;
-                self.first_frame = true;
-                let step = self.adapter.receive(frame)?;
-                self.provider_step(step)?;
-            }
-            if self.output.len() > FRAME_LIMIT {
-                return Err("Provider stdout frame exceeds 32 MiB".into());
-            }
-            // Only a genuinely incomplete line is on the framing deadline.
-            if frames_ready || self.output.is_empty() {
-                partial_started = None;
-            } else {
-                let since = partial_started.get_or_insert_with(Instant::now);
-                if since.elapsed() > IO_TIMEOUT {
-                    return Err(
-                        "Provider JSON frame remained incomplete or blocked for 30 seconds".into(),
-                    );
-                }
-            }
-            if stdout_eof && self.pending.is_empty() {
-                if !self.output.is_empty() {
-                    return Err("Provider ended with an incomplete JSON line".into());
-                }
-                if let Some(status) = self
-                    .child
-                    .as_mut()
-                    .ok_or("Provider process unavailable")?
-                    .observe_exit_within(PROTOCOL_EXIT_GRACE)
-                    .map_err(|error| error.to_string())?
-                {
-                    if status.success() {
+                if self.stop.load(Ordering::Acquire) {
+                    if closing.is_none() {
+                        closing = Some(Instant::now());
+                    }
+                    let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                    if busy && !interrupt_sent && self.pending.is_empty() {
+                        match self.adapter.command(Command::Interrupt) {
+                            Ok(step) => {
+                                self.step(step)?;
+                                interrupt_sent = true;
+                            }
+                            // A just-submitted turn may not have its provider ID yet.
+                            // Continue draining until it can be interrupted or the deadline expires.
+                            Err(error) => interrupt_error = error,
+                        }
+                    }
+                    if self.pending.is_empty()
+                        && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
+                    {
                         return Ok(());
                     }
-                    return Err(format!("Provider exited with {status}"));
+                    if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                        return Err(format!(
+                            "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
+                        ));
+                    }
                 }
-                return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
-            }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
-            }
-            if self
-                .write_started
-                .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
-            {
-                return Err("Provider stdin stalled for 30 seconds".into());
-            }
-            if self.dirty
-                && self.visible.load(Ordering::Acquire)
-                && self.last_present.elapsed() >= PRESENT_INTERVAL
-            {
-                self.dirty = false;
-                self.last_present = Instant::now();
-                (self.notify)(Update::Presentation);
-            }
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.wake.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
-                        -1
-                    } else {
-                        stdout.as_raw_fd()
-                    },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if self.pending.is_empty() {
-                        -1
-                    } else {
-                        stdin.as_raw_fd()
-                    },
-                    events: libc::POLLOUT,
-                    revents: 0,
-                },
-            ];
-            let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
-            {
-                0
-            } else if self.dirty && self.visible.load(Ordering::Acquire) {
-                50
-            } else if !self.first_frame
-                || !self.output.is_empty()
-                || self.write_started.is_some()
-                || closing.is_some()
-            {
-                250
-            } else {
-                -1
-            };
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error.to_string());
+                self.drain_commands(closing.is_some())?;
+                // Parse every frame that already arrived. Gating this on an empty stdin
+                // queue froze streaming for a whole turn against any provider that reads
+                // stdin only between turns, then killed the session by blaming its
+                // framing; a stalled write has its own `write_started` deadline below.
+                let mut frames_ready = false;
+                let mut parsed = 0usize;
+                loop {
+                    let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                        break;
+                    };
+                    if newline == 0 {
+                        self.output.drain(..1);
+                        self.scanned = 0;
+                        continue;
+                    }
+                    if parsed == FRAMES_PER_POLL {
+                        frames_ready = true;
+                        break;
+                    }
+                    let frame =
+                        serde_json::from_slice(&self.output[..newline]).map_err(|error| {
+                            format!("Unsupported provider stdout (expected JSON-lines): {error}")
+                        })?;
+                    self.output.drain(..=newline);
+                    self.scanned = 0;
+                    partial_started = None;
+                    parsed += 1;
+                    self.first_frame = true;
+                    let step = self.adapter.receive(frame)?;
+                    self.provider_step(step)?;
                 }
-            }
-            let mut buffer = [0u8; 8192];
-            if fds[0].revents != 0 {
-                while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
-            }
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
-                    match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
+                if self.output.len() > FRAME_LIMIT {
+                    return Err("Provider stdout frame exceeds 32 MiB".into());
+                }
+                // Only a genuinely incomplete line is on the framing deadline.
+                if frames_ready || self.output.is_empty() {
+                    partial_started = None;
+                } else {
+                    let since = partial_started.get_or_insert_with(Instant::now);
+                    if since.elapsed() > IO_TIMEOUT {
+                        return Err(
+                            "Provider JSON frame remained incomplete or blocked for 30 seconds"
+                                .into(),
+                        );
+                    }
+                }
+                if stdout_eof && self.pending.is_empty() {
+                    if !self.output.is_empty() {
+                        return Err("Provider ended with an incomplete JSON line".into());
+                    }
+                    if let Some(status) = self
+                        .child
+                        .as_mut()
+                        .ok_or("Provider process unavailable")?
+                        .observe_exit_within(PROTOCOL_EXIT_GRACE)
+                        .map_err(|error| error.to_string())?
+                    {
+                        if status.success() {
+                            return Ok(());
+                        }
+                        return Err(format!("Provider exited with {status}"));
+                    }
+                    return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
+                }
+                if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
+                    return Err(
+                        "Provider initialization timed out without a JSON protocol frame".into(),
+                    );
+                }
+                if self
+                    .write_started
+                    .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
+                {
+                    return Err("Provider stdin stalled for 30 seconds".into());
+                }
+                if self.dirty
+                    && self.visible.load(Ordering::Acquire)
+                    && self.last_present.elapsed() >= PRESENT_INTERVAL
+                {
+                    self.dirty = false;
+                    self.last_present = Instant::now();
+                    (self.notify)(Update::Presentation);
+                }
+                let mut fds = [
+                    libc::pollfd {
+                        fd: self.wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
+                            -1
+                        } else {
+                            stdout.as_raw_fd()
+                        },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if self.pending.is_empty() {
+                            -1
+                        } else {
+                            stdin.as_raw_fd()
+                        },
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                ];
+                let timeout = if frames_ready
+                    || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+                {
+                    0
+                } else if self.dirty && self.visible.load(Ordering::Acquire) {
+                    50
+                } else if !self.first_frame
+                    || !self.output.is_empty()
+                    || self.write_started.is_some()
+                    || closing.is_some()
+                {
+                    250
+                } else {
+                    -1
+                };
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error.to_string());
+                    }
+                }
+                let mut buffer = [0u8; 8192];
+                if fds[0].revents != 0 {
+                    while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+                }
+                if fds[3].revents != 0 {
+                    if let Some(line) = self.pending.front() {
+                        match stdin.write(&line[self.offset..]) {
+                            Ok(0) => return Err("Provider closed stdin".into()),
+                            Ok(n) => {
+                                self.offset += n;
+                                self.queued -= n;
+                                if self.offset == line.len() {
+                                    self.pending.pop_front();
+                                    self.offset = 0;
+                                    self.write_started = if self.pending.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Instant::now())
+                                    };
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(format!("Provider stdin: {e}")),
+                        }
+                    }
+                }
+                if fds[1].revents != 0 {
+                    let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
+                    match stdout.read(&mut buffer[..available]) {
+                        Ok(0) => stdout_eof = true,
                         Ok(n) => {
-                            self.offset += n;
-                            self.queued -= n;
-                            if self.offset == line.len() {
-                                self.pending.pop_front();
-                                self.offset = 0;
-                                self.write_started = if self.pending.is_empty() {
-                                    None
-                                } else {
-                                    Some(Instant::now())
-                                };
+                            reserve_frame(&mut self.output, n)?;
+                            self.output.extend_from_slice(&buffer[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(format!("Provider stdout: {e}")),
+                    }
+                }
+                if fds[2].revents != 0 {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => stderr_eof = true,
+                        Ok(n) => {
+                            if let Some(capture) = &mut self.stderr_capture {
+                                let _ = capture.push(&buffer[..n]);
+                            }
+                            for byte in &buffer[..n] {
+                                if self.stderr.len() == 16384 {
+                                    self.stderr.pop_front();
+                                }
+                                self.stderr.push_back(*byte);
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(format!("Provider stdin: {e}")),
+                        Err(e) => return Err(format!("Provider stderr: {e}")),
                     }
                 }
             }
-            if fds[1].revents != 0 {
-                let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
-                match stdout.read(&mut buffer[..available]) {
-                    Ok(0) => stdout_eof = true,
-                    Ok(n) => {
-                        reserve_frame(&mut self.output, n)?;
-                        self.output.extend_from_slice(&buffer[..n]);
+        })();
+        // Preserve the existing result/tail exactly. A closed stdout or bad
+        // frame can leave stderr already buffered; retain only its bounded
+        // immediately-readable remainder, without waiting for a descendant.
+        if let Some(capture) = &mut self.stderr_capture {
+            let mut bytes = [0; 8192];
+            for _ in 0..(super::stderr_log::MAX_BYTES as usize / bytes.len()) {
+                match stderr.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = capture.push(&bytes[..count]);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stdout: {e}")),
-                }
-            }
-            if fds[2].revents != 0 {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => stderr_eof = true,
-                    Ok(n) => {
-                        for byte in &buffer[..n] {
-                            if self.stderr.len() == 16384 {
-                                self.stderr.pop_front();
-                            }
-                            self.stderr.push_back(*byte);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stderr: {e}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
         }
+        result
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
@@ -6100,6 +6198,138 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn real_child_stderr_exit_keeps_bounded_error_and_locally_owned_full_copy() {
+        let _serial = super::super::stderr_log::test_process_service_guard();
+        let root = tempfile::tempdir().unwrap();
+        let expected = format!(
+            "original stderr\n{}final raw line\n",
+            "diagnostic line\n".repeat(20_000)
+        );
+        let path = root.path().join("stderr.bin");
+        std::fs::write(&path, expected.as_bytes()).unwrap();
+        let spec = ProcessSpec {
+            execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; /bin/cat \"$1\" >&2; printf '%s\\n' '{\"text\":\"after stderr\"}'; exit 3".into(), "stderr-fixture".into(), path.to_string_lossy().into_owned()],
+            working_directory: root.path().into(), environment: Default::default(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            snapshot.exited
+                && snapshot
+                    .text_copy_sources
+                    .conversation
+                    .iter()
+                    .flatten()
+                    .any(|source| source.bytes == expected.len() as u64)
+        });
+        let error = snapshot.error.as_ref().unwrap();
+        assert!(error.contains("Provider exited with"));
+        assert!(
+            error.len() < 17 * 1024,
+            "raw full output must not become Error/Snapshot text"
+        );
+        let source = snapshot
+            .text_copy_sources
+            .conversation
+            .iter()
+            .flatten()
+            .find(|source| source.bytes == expected.len() as u64)
+            .unwrap();
+        let report = snapshot
+            .items
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.content,
+                    ItemContent::Delivery {
+                        kind: super::super::DeliveryKind::Report,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let ItemContent::Delivery { body, .. } = &report.content else {
+            unreachable!()
+        };
+        assert!(body.len() < 8192);
+        let mut copied = String::new();
+        loop {
+            let page = handle.text_copy(source, copied.len() as u64).unwrap();
+            assert!(page.text.len() <= super::super::TEXT_COPY_PAGE_BYTES);
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied, expected);
+        handle.close().unwrap();
+        assert!(
+            handle.failure().is_some(),
+            "diagnostic retention must not invent a healthy provider result"
+        );
+    }
+
+    #[test]
+    fn stalled_diagnostic_file_service_does_not_block_real_provider_frames_refresh_or_close() {
+        let _serial = super::super::stderr_log::test_process_service_guard();
+        use super::super::stderr_log::{Preparation, PreparationSource, PreparedStatus, Recorder};
+        let mut raw = Recorder::start().unwrap();
+        assert!(raw.push(b"stall source"));
+        let (entered, entry) = crossbeam_channel::bounded(1);
+        let (release, resume) = crossbeam_channel::bounded(1);
+        struct Release(crossbeam_channel::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let _release_on_failure = Release(release.clone());
+        let mut pending =
+            Preparation::start_notified(PreparationSource::Finishing(raw.finish()), move || {
+                let _ = entered.try_send(());
+                let _ = resume.recv();
+            })
+            .unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap(); // actual sole file worker is now blocked
+        let root = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into(),
+            ],
+            working_directory: root.path().into(),
+            environment: Default::default(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| {
+            snapshot.items.iter().any(
+                |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "hello"),
+            )
+        });
+        handle.command(Command::Refresh).unwrap();
+        let snapshot = until(&handle, |snapshot| {
+            snapshot.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "hello world"))
+        });
+        assert!(!snapshot.exited && snapshot.error.is_none());
+        handle.close().unwrap(); // no wait for diagnostic writer/queued Finish
+        assert!(handle.snapshot(None).unwrap().exited);
+        release.send(()).unwrap();
+        assert!(matches!(pending.poll(), PreparedStatus::Ready(_)));
     }
 
     #[test]

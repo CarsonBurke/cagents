@@ -44,11 +44,18 @@ pub(super) struct Window {
     pub has_earlier: bool,
     pub has_later: bool,
 }
+struct IssuedExitCopy {
+    source: crate::chat::TextCopySource,
+    prepared: crate::chat::stderr_log::Prepared,
+}
+
 pub(crate) struct Store {
     db: Connection,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
+    issued_exit_copies: std::collections::HashMap<String, IssuedExitCopy>,
+    pending_exit_report: Option<crate::chat::stderr_log::Preparation>,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -79,6 +86,163 @@ pub(crate) struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
 impl Store {
+    pub(super) fn queue_exit_report(
+        &mut self,
+        source: crate::chat::stderr_log::PreparationSource,
+        notify: impl FnOnce() + Send + 'static,
+    ) -> Result<(), String> {
+        if self.pending_exit_report.is_some() {
+            return Err("Provider diagnostic preparation is occupied".into());
+        }
+        self.pending_exit_report = Some(
+            crate::chat::stderr_log::Preparation::start_notified(source, notify)
+                .map_err(|_| "Provider diagnostic preparation is unavailable")?,
+        );
+        Ok(())
+    }
+
+    pub(super) fn finish_exit_report(&mut self) -> Result<bool, String> {
+        use crate::chat::stderr_log::PreparedStatus;
+        let Some(preparation) = self.pending_exit_report.as_mut() else {
+            return Ok(false);
+        };
+        match preparation.poll() {
+            PreparedStatus::Pending => Ok(false),
+            PreparedStatus::Ready(prepared) => {
+                self.pending_exit_report.take();
+                let info = prepared.raw_info();
+                if info.bytes == 0 && info.omitted == 0 && !info.write_failed && !info.queue_full {
+                    return Ok(false); // no stderr was observed; preserve ordinary error-only history
+                }
+                if prepared.bytes() == 0 {
+                    self.append_exit_unavailable()?;
+                } else {
+                    self.append_exit_report(prepared)?;
+                }
+                Ok(true)
+            }
+            PreparedStatus::Unavailable => {
+                self.pending_exit_report.take();
+                self.append_exit_unavailable()?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub(super) fn append_exit_unavailable(&mut self) -> Result<(), String> {
+        self.put(Item {
+            id: format!("provider-stderr:{}", uuid::Uuid::new_v4()),
+            role: Role::System, at: None, started_at: None,
+            content: ItemContent::Delivery {
+                kind: crate::chat::DeliveryKind::Report, from: "Provider stderr".into(),
+                sender: String::new(), summary: "Provider diagnostic source unavailable".into(),
+                body: "Full retained stderr is unavailable. The existing provider error and its bounded stderr tail are unchanged.".into(),
+            },
+        }, false)?;
+        Ok(())
+    }
+
+    /// Only an owned, actually prepared file can issue this authority. Provider
+    /// Item/Delivery values never call this path, even if every visible field
+    /// or the item ID is copied from a previously published local report.
+    pub(super) fn append_exit_report(
+        &mut self,
+        prepared: crate::chat::stderr_log::Prepared,
+    ) -> Result<String, String> {
+        if self.issued_exit_copies.len() >= 1024 {
+            return Err("Retained provider diagnostic capacity is occupied".into());
+        }
+        let id = format!("provider-stderr:{}", uuid::Uuid::new_v4());
+        let info = prepared.raw_info();
+        let mut body = format!(
+            "Preview of captured stderr (up to4KiB).\n{}\nRetained raw prefix: {} bytes; omitted received bytes: {}.\n",
+            prepared.encoding_label(),
+            info.bytes,
+            info.omitted
+        );
+        if info.queue_full {
+            body.push_str("Capture admission filled; only its contiguous prefix was retained.\n");
+        }
+        if info.write_failed {
+            body.push_str("Capture writing failed; only its observed prefix was retained.\n");
+        }
+        body.push_str(prepared.preview());
+        self.put(
+            Item {
+                id: id.clone(),
+                role: Role::System,
+                at: None,
+                started_at: None,
+                content: ItemContent::Delivery {
+                    kind: crate::chat::DeliveryKind::Report,
+                    from: "Provider stderr".into(),
+                    sender: String::new(),
+                    summary: "Captured provider diagnostics".into(),
+                    body,
+                },
+            },
+            false,
+        )?;
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        Self::copy_parent_put(&transaction, &id, Some(prepared.bytes() as usize), false)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        let source = self
+            .copy_parent_source(&id)?
+            .ok_or("Provider diagnostic copy source is unavailable")?;
+        self.issued_exit_copies
+            .insert(id.clone(), IssuedExitCopy { source, prepared });
+        self.changed(&id);
+        self.dirty = true;
+        Ok(id)
+    }
+
+    /// Clone only the immutable owned lease while locked. The caller reads its
+    /// bounded file page AFTER releasing this Store mutex. Normal transcript
+    /// sources continue through the existing text_copy path unchanged.
+    pub(super) fn issued_exit_copy(
+        &self,
+        source: &crate::chat::TextCopySource,
+    ) -> Result<Option<crate::chat::stderr_log::Prepared>, String> {
+        if source.cache != self.copy_cache
+            || source.scope != crate::chat::TextCopyScope::Conversation
+        {
+            return Ok(None);
+        }
+        let id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT item FROM copy_sources WHERE token=?1",
+                [source.token],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(issued) = id.as_ref().and_then(|id| self.issued_exit_copies.get(id)) else {
+            return Ok(None);
+        };
+        if issued.source != *source || source.bytes != issued.prepared.bytes() {
+            return Err(
+                "Provider diagnostic changed or is unavailable; copy its current source again"
+                    .into(),
+            );
+        }
+        Ok(Some(issued.prepared.clone()))
+    }
+
+    fn revoke_exit_copy(&mut self, id: &str) -> Result<(), String> {
+        if !self.issued_exit_copies.contains_key(id) {
+            return Ok(());
+        }
+        self.db
+            .execute("DELETE FROM copy_sources WHERE item=?1", [id])
+            .map_err(|error| error.to_string())?;
+        self.issued_exit_copies.remove(id);
+        self.copy_revision = self.copy_revision.wrapping_add(1);
+        self.changed(id);
+        self.dirty = true;
+        Ok(())
+    }
+
     pub(super) fn directory(&self) -> &std::path::Path {
         &self.directory
     }
@@ -132,6 +296,8 @@ impl Store {
         // Child sidecars are independent sources. Parent rows alone cannot
         // establish that their transcript and edit index can be recovered.
         if self.child_files_seen
+            || !self.issued_exit_copies.is_empty()
+            || self.pending_exit_report.is_some()
             || self.file_index_incomplete
             || !self.presented_children.is_empty()
         {
@@ -238,6 +404,8 @@ impl Store {
                 copy_cache: uuid::Uuid::new_v4(),
                 copy_revision: 0,
                 copy_projection: Default::default(),
+                issued_exit_copies: Default::default(),
+                pending_exit_report: None,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -294,6 +462,7 @@ impl Store {
         older: bool,
         assigned: Option<i64>,
     ) -> Result<Option<String>, String> {
+        self.revoke_exit_copy(&item.id)?;
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -752,6 +921,9 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if let Event::TextDelta { id, .. } | Event::OutputDelta { id, .. } = &event {
+            self.revoke_exit_copy(id)?;
+        }
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -899,6 +1071,7 @@ impl Store {
                 self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
+                    self.issued_exit_copies.remove(&id);
                     transaction
                         .execute("DELETE FROM items WHERE id=?1", [id])
                         .map_err(|e| e.to_string())?;
@@ -914,6 +1087,8 @@ impl Store {
                 self.copy_cache = uuid::Uuid::new_v4();
                 self.copy_revision = self.copy_revision.wrapping_add(1);
                 self.copy_projection.clear();
+                self.issued_exit_copies.clear();
+                self.pending_exit_report.take();
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -1247,7 +1422,9 @@ impl Store {
                 {
                     break 'records;
                 }
-                let copy_source = if matches!(base.content, ItemContent::Text { .. }) {
+                let copy_source = if matches!(base.content, ItemContent::Text { .. })
+                    || self.issued_exit_copies.contains_key(&id)
+                {
                     self.copy_parent_source(&id)?
                 } else {
                     None
@@ -1632,6 +1809,187 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
+    fn prepared_stderr(bytes: &[u8]) -> crate::chat::stderr_log::Prepared {
+        let _serial = crate::chat::stderr_log::test_process_service_guard();
+        use crate::chat::stderr_log::{Preparation, PreparationSource, PreparedStatus, Recorder};
+        let mut recorder = Recorder::start().unwrap();
+        for chunk in bytes.chunks(8192) {
+            assert!(recorder.push(chunk));
+        }
+        let mut preparation =
+            Preparation::start(PreparationSource::Finishing(recorder.finish())).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match preparation.poll() {
+                PreparedStatus::Ready(prepared) => return prepared,
+                PreparedStatus::Unavailable => panic!("actual private stderr preparation failed"),
+                PreparedStatus::Pending => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "actual private stderr preparation timed out"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+    fn diagnostic_source(store: &mut Store, id: &str) -> crate::chat::TextCopySource {
+        let window = store.window().unwrap();
+        let index = window.items.iter().position(|item| item.id == id).unwrap();
+        store.copy_projection[index].clone().unwrap()
+    }
+    fn owned_diagnostic_text(prepared: &crate::chat::stderr_log::Prepared) -> String {
+        let mut all = String::new();
+        let mut offset = 0;
+        loop {
+            let (page, next) = prepared.read(offset).unwrap();
+            assert!(page.len() <= crate::chat::TEXT_COPY_PAGE_BYTES);
+            all.push_str(&page);
+            if let Some(next) = next {
+                offset = next;
+            } else {
+                break;
+            }
+        }
+        all
+    }
+    #[test]
+    fn locally_issued_exit_report_keeps_only_preview_in_store_and_copies_actual_full_source() {
+        let expected = format!("{}🦀end", "provider stderr line\n".repeat(15_000));
+        let prepared = prepared_stderr(expected.as_bytes());
+        let mut store = Store::new().unwrap();
+        let id = store.append_exit_report(prepared).unwrap();
+        let source = diagnostic_source(&mut store, &id);
+        assert_eq!(source.bytes, expected.len() as u64);
+        let stored: usize = store
+            .db
+            .query_row(
+                "SELECT sum(length(data)) FROM chunks WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored < 8192,
+            "full diagnostic must not be imported under the Store mutex"
+        );
+        let item = store
+            .window()
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        let ItemContent::Delivery { kind, body, .. } = &item.content else {
+            panic!("missing report")
+        };
+        assert_eq!(*kind, crate::chat::DeliveryKind::Report);
+        assert!(body.starts_with("Preview of captured stderr"));
+        assert!(body.len() < 8192);
+        let lease = store.issued_exit_copy(&source).unwrap().unwrap();
+        assert_eq!(owned_diagnostic_text(&lease), expected);
+    }
+    #[test]
+    fn report_tuple_or_prefix_never_issues_capture_authority_and_same_row_replacement_revokes_it() {
+        let prepared = prepared_stderr(b"the real owned stderr");
+        let mut store = Store::new().unwrap();
+        let id = store.append_exit_report(prepared).unwrap();
+        let source = diagnostic_source(&mut store, &id);
+        let original = store
+            .window()
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        let held = store.issued_exit_copy(&source).unwrap().unwrap();
+        let mut generic_reload = Store::new().unwrap();
+        generic_reload
+            .apply(Event::Item((*original).clone()))
+            .unwrap();
+        assert!(
+            !store.is_covered_by(&generic_reload).unwrap(),
+            "matching generic report/preview cannot cover the independent owned full source"
+        );
+        let mut forged = (*original).clone();
+        forged.id = "provider-stderr:forged-provider-id".into();
+        store.apply(Event::Item(forged.clone())).unwrap();
+        let window = store.window().unwrap();
+        let index = window
+            .items
+            .iter()
+            .position(|item| item.id == forged.id)
+            .unwrap();
+        assert!(
+            store.copy_projection[index].is_none(),
+            "provider Report tuple/prefix cannot issue a file source"
+        );
+        store.apply(Event::Item((*original).clone())).unwrap(); // exact same ID/body is still a generic put
+        assert!(store.issued_exit_copy(&source).unwrap().is_none());
+        assert!(
+            store.text_copy(&source, 0).is_err(),
+            "must not fall back to pretending the preview is the full source"
+        );
+        assert_eq!(
+            owned_diagnostic_text(&held),
+            "the real owned stderr",
+            "already cloned immutable lease survives replacement safely"
+        );
+        let window = store.window().unwrap();
+        let index = window.items.iter().position(|item| item.id == id).unwrap();
+        assert!(store.copy_projection[index].is_none());
+    }
+    #[test]
+    fn issued_exit_copy_validates_cache_revision_and_exact_bytes_then_remove_and_reset_revoke() {
+        let mut store = Store::new().unwrap();
+        let id = store
+            .append_exit_report(prepared_stderr(b"first original"))
+            .unwrap();
+        let source = diagnostic_source(&mut store, &id);
+        let other = Store::new().unwrap();
+        assert!(other.issued_exit_copy(&source).unwrap().is_none());
+        assert!(other.text_copy(&source, 0).is_err());
+        let mut changed = source.clone();
+        changed.revision += 1;
+        assert!(store.issued_exit_copy(&changed).is_err());
+        changed = source.clone();
+        changed.bytes -= 1;
+        assert!(store.issued_exit_copy(&changed).is_err());
+        store.apply(Event::ItemsRemoved { ids: vec![id] }).unwrap();
+        assert!(store.issued_exit_copy(&source).unwrap().is_none());
+        assert!(store.text_copy(&source, 0).is_err());
+        let id = store
+            .append_exit_report(prepared_stderr(b"second original"))
+            .unwrap();
+        let source = diagnostic_source(&mut store, &id);
+        store
+            .apply(Event::Reset {
+                reason: "provider reload".into(),
+            })
+            .unwrap();
+        assert!(store.issued_exit_copies.is_empty());
+        assert!(store.issued_exit_copy(&source).unwrap().is_none());
+        assert!(store.text_copy(&source, 0).is_err());
+    }
+    #[test]
+    fn parent_delta_revokes_issued_exit_authority_without_granting_it_to_a_provider_suffix() {
+        let mut store = Store::new().unwrap();
+        let id = store
+            .append_exit_report(prepared_stderr(b"owned original"))
+            .unwrap();
+        let source = diagnostic_source(&mut store, &id);
+        store
+            .apply(Event::TextDelta {
+                id,
+                role: Role::System,
+                thinking: false,
+                delta: "provider supplied suffix".into(),
+            })
+            .unwrap();
+        assert!(store.issued_exit_copy(&source).unwrap().is_none());
+        assert!(store.text_copy(&source, 0).is_err());
+    }
 
     #[test]
     fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {

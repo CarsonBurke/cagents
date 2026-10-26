@@ -4665,14 +4665,22 @@ impl Runtime {
             ))
             .class(crate::ui_controls::control_style(false, None))
             .on_press(action(Action::Toggle(self.target, item.id.clone())));
-            let copy = widget::button::custom(design::caption("Copy report"))
-                .name(format!("Copy original report: {heading}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .on_press(action(Action::Copy(
-                    self.target,
-                    item.id.clone(),
-                    CopyPart::Text,
-                )));
+            let copy_source = self.message_copy_source(item);
+            let copy = widget::button::custom(design::caption(if copy_source.is_some() {
+                "Copy retained text"
+            } else {
+                "Copy report"
+            }))
+            .name(if copy_source.is_some() {
+                format!("Copy retained diagnostic text: {heading}")
+            } else {
+                format!("Copy original report: {heading}")
+            })
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(action(match copy_source {
+                Some(source) => Action::CopyMessage(self.target, item.id.clone(), Some(source)),
+                None => Action::Copy(self.target, item.id.clone(), CopyPart::Text),
+            }));
             let mut rows = vec![
                 widget::row::with_children(vec![
                     glyph(Icon::Chat),
@@ -5658,6 +5666,126 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_copy_uses_only_published_log_source_and_preserves_ordinary_report_copy() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let item = chat::Item {
+            id: "captured-report".into(),
+            role: chat::Role::System,
+            at: None,
+            started_at: None,
+            content: ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: "Provider stderr".into(),
+                sender: String::new(),
+                summary: "Captured provider diagnostics".into(),
+                body:
+                    "Preview only; UTF-8 replacement-decoded text. quota exceeded is quoted output."
+                        .into(),
+            },
+        };
+        for issued in [false, true] {
+            let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+            let source = chat::TextCopySource {
+                cache: uuid::Uuid::new_v4(),
+                scope: chat::TextCopyScope::Conversation,
+                token: 17,
+                revision: 3,
+                bytes: 300_000,
+            };
+            if issued {
+                let mut snapshot = runtime.snapshot.as_ref().clone();
+                snapshot.generation += 1;
+                snapshot.text_copy_sources.conversation = vec![Some(source.clone())];
+                handle.publish_snapshot_for_test(snapshot);
+                runtime.refresh();
+            }
+            assert!(
+                runtime.failure_ui.incidents.is_empty(),
+                "report prose must not create an account failure"
+            );
+            let renderer = crate::app::tests::headless_renderer();
+            let item = runtime.active_item("captured-report").unwrap();
+            let heading = if let ItemContent::Delivery {
+                kind,
+                from,
+                sender,
+                summary,
+                ..
+            } = &item.content
+            {
+                chat::delivery_heading(*kind, from, sender, summary)
+            } else {
+                unreachable!()
+            };
+            let label = if issued {
+                format!("Copy retained diagnostic text: {heading}")
+            } else {
+                format!("Copy original report: {heading}")
+            };
+            let mut element = runtime.delivery_view(
+                item,
+                &runtime.presentation_cache()[&item.id],
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(420.0, 1200.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let buttons = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some(label.as_str())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), 1);
+            let bounds = buttons[0].node().bounds().unwrap();
+            let cursor = iced::mouse::Cursor::Available(iced::Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ));
+            let mut messages = Vec::new();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(420.0, 1200.0));
+            for event in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(messages.len(), 1);
+            if issued {
+                assert!(
+                    matches!(&messages[0], Message::ChatUi(Action::CopyMessage(target, id, Some(actual)))
+                    if *target==runtime.target && id==&item.id && actual==&source)
+                );
+            } else {
+                assert!(
+                    matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text))
+                    if *target==runtime.target && id==&item.id)
+                );
+            }
+        }
+    }
 
     #[test]
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {

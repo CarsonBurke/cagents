@@ -26,6 +26,8 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
