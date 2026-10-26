@@ -39,12 +39,25 @@ pub(super) struct State {
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
+    /// Once the reader uses the arrows, retain that exact conversation even
+    /// when it is the first row. Until then, show the newest arrival first.
+    selected_by_reader: bool,
     /// What earlier openings read, so reopening reads only what changed.
     cache: Arc<catalog::Cache>,
     indexer: Option<iced::task::Handle>,
     /// Tells the indexer's thread to stop reading, which aborting its
     /// listing alone leaves to the next batch.
     cancel: Arc<AtomicBool>,
+}
+
+impl State {
+    fn reader_selection(&self) -> Option<CardId> {
+        self.selected_by_reader
+            .then(|| self.visible.get(self.selected))
+            .flatten()
+            .and_then(|&index| self.rows.get(index))
+            .map(|row| row.card)
+    }
 }
 
 /// A conversation as the picker lists it.
@@ -299,6 +312,9 @@ fn index(
 /// Reveal against the scrollable's current layout, including short or scaled windows.
 struct RevealSelection {
     selected: usize,
+    /// Indexing follows a moved selection only while its old row was visible.
+    /// A reader who scrolled elsewhere keeps their own viewport.
+    previous: Option<usize>,
 }
 impl iced::advanced::widget::Operation<Message> for RevealSelection {
     fn traverse(
@@ -317,6 +333,12 @@ impl iced::advanced::widget::Operation<Message> for RevealSelection {
     ) {
         if id != Some(&widget::Id::new("conversation-resume.results")) {
             return;
+        }
+        if let Some(previous) = self.previous {
+            let top = previous as f32 * (ROW_HEIGHT + ROW_SPACING);
+            if top + ROW_HEIGHT <= translation.y || top >= translation.y + bounds.height {
+                return;
+            }
         }
         let y =
             resume_selection_offset(self.selected, bounds.height, content.height, translation.y);
@@ -365,11 +387,13 @@ impl Cagents {
         match key {
             keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
                 let count = self.resume_ui.visible.len().min(self.resume_ui.limit);
+                self.resume_ui.selected_by_reader = count > 0;
                 self.resume_ui.selected =
                     (self.resume_ui.selected + 1).min(count.saturating_sub(1));
                 Some(self.reveal_resume_selection())
             }
             keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                self.resume_ui.selected_by_reader = !self.resume_ui.visible.is_empty();
                 self.resume_ui.selected = self.resume_ui.selected.saturating_sub(1);
                 Some(self.reveal_resume_selection())
             }
@@ -380,6 +404,7 @@ impl Cagents {
     fn reveal_resume_selection(&self) -> Task<Message> {
         iced::advanced::widget::operate(RevealSelection {
             selected: self.resume_ui.selected,
+            previous: None,
         })
         .map(cosmic::Action::App)
     }
@@ -454,6 +479,7 @@ impl Cagents {
         state.indexing = Some((0, 0));
         state.limit = PAGE;
         state.selected = 0;
+        state.selected_by_reader = false;
         let generation = state.generation;
         let cache = state.cache.clone();
         state.cancel = Arc::default();
@@ -563,8 +589,21 @@ impl Cagents {
                 if !self.resume_ui.open || generation != self.resume_ui.generation {
                     return Task::none();
                 }
+                let previous = self.resume_ui.selected;
+                let selected = self.resume_ui.reader_selection();
                 self.resume_indexed(progress);
-                Task::none()
+                if selected.is_some()
+                    && selected == self.resume_ui.reader_selection()
+                    && previous != self.resume_ui.selected
+                {
+                    iced::advanced::widget::operate(RevealSelection {
+                        selected: self.resume_ui.selected,
+                        previous: Some(previous),
+                    })
+                    .map(cosmic::Action::App)
+                } else {
+                    Task::none()
+                }
             }
             Action::Resume(card) => {
                 if !self.resume_ui.open || self.resume_ui.loading {
@@ -691,25 +730,20 @@ impl Cagents {
         let state = &mut self.resume_ui;
         // A row the reader moved to stays selected wherever more rows land;
         // otherwise the newest stays first.
-        let selected = state
-            .visible
-            .get(state.selected)
-            .filter(|_| state.selected > 0)
-            .and_then(|&index| state.rows.get(index))
-            .map(|row| row.card);
+        let selected = state.reader_selection();
         // Stable, so rows already listed keep their order among equals.
         state
             .rows
             .sort_by_key(|row| std::cmp::Reverse(row.updated_at_unix_ms));
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
-        state.selected = selected
-            .and_then(|card| {
-                state
-                    .visible
-                    .iter()
-                    .position(|&index| state.rows[index].card == card)
-            })
-            .unwrap_or(0);
+        let retained = selected.and_then(|card| {
+            state
+                .visible
+                .iter()
+                .position(|&index| state.rows[index].card == card)
+        });
+        state.selected = retained.unwrap_or(0);
+        state.selected_by_reader = retained.is_some();
         // Newer rows landing above it never page the selection out of view.
         state.limit = state.limit.max((state.selected + 1).next_multiple_of(PAGE));
     }
@@ -719,6 +753,7 @@ impl Cagents {
         let state = &mut self.resume_ui;
         state.limit = PAGE;
         state.selected = 0;
+        state.selected_by_reader = false;
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
@@ -837,6 +872,7 @@ impl Cagents {
     fn close_resume(&mut self) {
         let state = &mut self.resume_ui;
         state.open = false;
+        state.selected_by_reader = false;
         state.indexing = None;
         state.replace = None;
         state.cancel.store(true, Ordering::Relaxed);
@@ -1183,6 +1219,262 @@ mod tests {
         assert_eq!(resume_selection_offset(3, 420.0, 1040.0, 0.0), 0.0);
         assert_eq!(resume_selection_offset(0, 160.0, 1040.0, 248.0), 0.0);
         assert_eq!(resume_selection_offset(9, 160.0, 1040.0, 248.0), 872.0);
+    }
+
+    fn arrow(app: &mut Cagents, key: keyboard::key::Named) -> Task<Message> {
+        app.resume_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn indexed_arrivals_reveal_a_moved_selection_only_while_its_old_row_is_visible() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        #[derive(Default)]
+        struct Viewport {
+            height: f32,
+            top: f32,
+        }
+        impl Operation for Viewport {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: iced::Rectangle,
+                translation: iced::Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&widget::Id::new("conversation-resume.results")) {
+                    self.height = bounds.height;
+                    self.top = translation.y;
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        for size in [
+            iced::Size::new(1100.0, 900.0),
+            iced::Size::new(880.0, 480.0),
+        ] {
+            for manually_scrolled in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                app.resume_ui.open = true;
+                app.resume_ui.limit = PAGE;
+                let generation = app.resume_ui.generation;
+                list(
+                    &mut app,
+                    generation,
+                    (0..24).map(|_| saved(directory.path())).collect(),
+                );
+                drop(arrow(&mut app, keyboard::key::Named::ArrowDown));
+                let selected = app.resume_ui.reader_selection().unwrap();
+                let mut before = app.resume_dialog().unwrap();
+                let mut tree = Tree::new(before.as_widget());
+                let limits = layout::Limits::new(iced::Size::ZERO, size);
+                let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut scroll = operation::scrollable::scroll_to::<()>(
+                    widget::Id::new("conversation-resume.results"),
+                    iced::widget::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(if manually_scrolled { 1500.0 } else { 0.0 }),
+                    },
+                );
+                before.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut scroll,
+                );
+                let mut old = Viewport::default();
+                before
+                    .as_widget_mut()
+                    .operate(&mut tree, Layout::new(&node), &renderer, &mut old);
+                drop(before);
+
+                let task = app.update_resume(Action::Indexed(
+                    generation,
+                    Progress::Saved {
+                        entries: (0..PAGE)
+                            .map(|_| {
+                                let mut entry = saved(directory.path());
+                                entry.updated_at_unix_ms = 2;
+                                entry
+                            })
+                            .collect(),
+                        seeds: Arc::from([]),
+                        error: None,
+                    },
+                ));
+                assert_eq!(app.resume_ui.reader_selection(), Some(selected));
+                assert_eq!(app.resume_ui.selected, PAGE + 1);
+                let mut after = app.resume_dialog().unwrap();
+                tree.diff(after.as_widget_mut());
+                let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                iced::futures::executor::block_on(async {
+                    let mut effects = iced::runtime::task::into_stream(task)
+                        .expect("a moved reader selection returns its reveal operation");
+                    let Some(iced::runtime::Action::Widget(mut operation)) = effects.next().await
+                    else {
+                        panic!("indexing must reveal through the actual native widget operation");
+                    };
+                    after.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        operation.as_mut(),
+                    );
+                });
+                let mut current = Viewport::default();
+                after.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut current,
+                );
+                if manually_scrolled {
+                    assert_eq!(current.top, old.top, "indexing respects manual scrolling");
+                } else {
+                    let row_top = app.resume_ui.selected as f32 * (ROW_HEIGHT + ROW_SPACING);
+                    assert!(row_top >= current.top);
+                    assert!(row_top + ROW_HEIGHT <= current.top + current.height + 0.1);
+                }
+                drop(after);
+                let unchanged =
+                    app.update_resume(Action::Indexed(generation, Progress::Counted(512)));
+                assert!(
+                    iced::runtime::task::into_stream(unchanged).is_none(),
+                    "indexing progress without row movement must not scroll"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deliberate_first_row_navigation_retains_identity_but_empty_navigation_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        for (count, keys) in [
+            (1, vec![keyboard::key::Named::ArrowDown]),
+            (2, vec![keyboard::key::Named::ArrowUp]),
+            (
+                2,
+                vec![
+                    keyboard::key::Named::ArrowDown,
+                    keyboard::key::Named::ArrowUp,
+                ],
+            ),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.resume_ui.open = true;
+            app.resume_ui.limit = PAGE;
+            let generation = app.resume_ui.generation;
+            list(
+                &mut app,
+                generation,
+                (0..count).map(|_| saved(directory.path())).collect(),
+            );
+            for key in keys {
+                drop(arrow(&mut app, key));
+            }
+            let selected = app.resume_ui.reader_selection().unwrap();
+            assert_eq!(app.resume_ui.selected, 0);
+            let mut newer = saved(directory.path());
+            newer.updated_at_unix_ms = 2;
+            list(&mut app, generation, vec![newer]);
+            assert_eq!(app.resume_ui.reader_selection(), Some(selected));
+            assert_eq!(app.resume_ui.selected, 1);
+            drop(app.update_resume(Action::Query(String::new())));
+            assert!(app.resume_ui.reader_selection().is_none());
+            assert_eq!(app.resume_ui.selected, 0);
+            drop(arrow(&mut app, keyboard::key::Named::ArrowDown));
+            drop(app.update_resume(Action::Unscope));
+            assert!(app.resume_ui.reader_selection().is_none());
+            drop(arrow(&mut app, keyboard::key::Named::ArrowUp));
+            drop(app.update_resume(Action::Close));
+            assert!(app.resume_ui.reader_selection().is_none());
+        }
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        drop(arrow(&mut app, keyboard::key::Named::ArrowDown));
+        assert!(!app.resume_ui.selected_by_reader);
+        let generation = app.resume_ui.generation;
+        let older = saved(directory.path());
+        list(&mut app, generation, vec![older]);
+        let mut newer = saved(directory.path());
+        newer.updated_at_unix_ms = 2;
+        let newest = newer.card;
+        list(&mut app, generation, vec![newer]);
+        assert_eq!(app.resume_ui.rows[app.resume_ui.visible[0]].card, newest);
+        assert!(app.resume_ui.reader_selection().is_none());
+    }
+
+    #[test]
+    fn indexed_title_changes_release_a_selection_that_no_longer_matches_the_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        let chosen = saved(directory.path());
+        let chosen_card = chosen.card;
+        list(&mut app, generation, vec![chosen, saved(directory.path())]);
+        drop(app.update_resume(Action::Query("peripheral".into())));
+        drop(arrow(&mut app, keyboard::key::Named::ArrowUp));
+        assert_eq!(app.resume_ui.reader_selection(), Some(chosen_card));
+        let task = app.update_resume(Action::Indexed(
+            generation,
+            Progress::Found {
+                conversations: Vec::new(),
+                titles: vec![(chosen_card, "An unrelated conversation".into())],
+                read: 1,
+            },
+        ));
+        assert_eq!(app.resume_ui.visible.len(), 1);
+        assert_ne!(
+            app.resume_ui.rows[app.resume_ui.visible[0]].card,
+            chosen_card
+        );
+        assert!(app.resume_ui.reader_selection().is_none());
+        assert_eq!(app.resume_ui.selected, 0);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+    }
+
+    #[test]
+    fn submitting_after_indexed_arrivals_activates_the_original_selected_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chosen = saved(directory.path());
+        drop(app.resume_saved_conversation(chosen.clone()));
+        let original = app.workspace.focused().unwrap();
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        list(&mut app, generation, vec![chosen]);
+        drop(arrow(&mut app, keyboard::key::Named::ArrowUp));
+        let mut newer = saved(directory.path());
+        newer.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        newer.updated_at_unix_ms = 2;
+        list(&mut app, generation, vec![newer]);
+        assert_eq!(app.resume_ui.selected, 1);
+        drop(app.update_resume(Action::Submit));
+        assert_eq!(app.workspace.focused(), Some(original));
+        assert_eq!(app.durable.cards.len(), 1);
+        assert!(!app.resume_ui.open);
     }
 
     #[test]
