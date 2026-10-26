@@ -185,11 +185,17 @@ use crate::{
 /// with an explicit durable placement_epoch. Matched executables are required;
 /// old saved actor requests are refused without rebasing their captured intent.
 /// Known private account experiments use 117 and 118 and are not adopted here.
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
 /// Version 125 raises terminal history to an explicit byte budget (16 MiB by
 /// default, up to 1 GiB). Published protocol-119 hosts reject values above
 /// 1,000,000, so their unchanged positional field encoding is not sufficient
 /// compatibility: replace the matched daemon before sending the new budgets.
-pub const PROTOCOL_VERSION: u16 = 125;
+/// Version 127 combines both contracts in the matched set. Version 126 is
+/// reserved for the separate native Goal integration and is not adopted here.
+pub const PROTOCOL_VERSION: u16 = 127;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
