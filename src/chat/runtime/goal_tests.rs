@@ -647,3 +647,81 @@ fn goal_resume_advisory_refreshes_on_real_actor_command_and_receive() {
     );
     handle.close().unwrap();
 }
+
+#[test]
+fn admitted_fresh_goal_requires_the_exact_spawn_fd_and_preserves_unknown_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("work");
+    let home = root.path().join("codex");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    let source = crate::chat::Session {
+        id: crate::model::TerminalId::new(),
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Codex,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: cwd.clone(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        },
+        proof: None,
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    };
+    let context = crate::chat::protocol::ExecutionContext::new(None);
+    let original = scope(&home);
+    let server = identity(&home);
+    assert!(
+        validate_goal_work(Some(&original), Some(&server), Some(&context), None, &cwd).is_err()
+    );
+    // Synthetic boundary control: runtime production obtains this FD from the
+    // authenticated holder getter, never by reopening the current pathname.
+    let directory = Arc::new(std::fs::File::open(&cwd).unwrap());
+    context.admit_fresh_native_directory(&source).unwrap();
+    assert!(context.claim_fresh_native_spawn(&source).unwrap());
+    context
+        .retain_fresh_spawn_directory(&source, directory.clone())
+        .unwrap();
+    let pin = context.pinned_launch_directory().unwrap();
+    assert!(Arc::ptr_eq(&pin.1, &directory));
+    assert!(
+        validate_goal_work(
+            Some(&original),
+            Some(&server),
+            Some(&context),
+            Some(&pin),
+            &cwd
+        )
+        .is_ok()
+    );
+    let unknown = crate::chat::protocol::ExecutionContext::new(None);
+    assert!(
+        validate_goal_work(
+            Some(&original),
+            Some(&server),
+            Some(&unknown),
+            Some(&pin),
+            &cwd
+        )
+        .is_err()
+    );
+    std::fs::rename(&cwd, root.path().join("moved-work")).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    assert_eq!(context.pinned_launch_directory().unwrap().0, pin.0);
+    assert!(
+        validate_goal_work(
+            Some(&original),
+            Some(&server),
+            Some(&context),
+            Some(&pin),
+            &cwd
+        )
+        .is_err()
+    );
+    assert!(context.claim_fresh_native_spawn(&source).is_err());
+}
