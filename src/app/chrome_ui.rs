@@ -67,6 +67,127 @@ pub(super) struct State {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn saved_changes_remains_reachable_without_a_current_channel_and_respects_modals() {
+        use iced::advanced::widget::{Tree, operation::Focusable};
+        use iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Operation};
+        use iced::{Event, Rectangle, Size};
+
+        struct SavedBounds(Option<Rectangle>);
+        impl Operation for SavedBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(&widget::Id::new("channel-work.saved")) {
+                    self.0 = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                self.container(id, bounds);
+            }
+        }
+
+        let renderer = super::super::tests::headless_renderer();
+        for width in [280.0, 420.0, 700.0] {
+            for modal in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                Arc::make_mut(&mut app.durable).active_channel = None;
+                app.settings_reset_confirm = modal;
+                assert_eq!(app.modal_is_open(), modal);
+                let mut element = app.context_panel(None, width);
+                let mut tree = Tree::new(element.as_widget());
+                let viewport = Rectangle::with_size(Size::new(width, 800.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(viewport.size(), viewport.size()),
+                );
+                let mut bounds = SavedBounds(None);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut bounds,
+                );
+                let bounds = bounds
+                    .0
+                    .expect("the native Saved changes control stays mounted");
+                assert!(bounds.width > 0.0 && bounds.height > 0.0);
+                assert!(bounds.x >= -0.1 && bounds.x + bounds.width <= width + 0.1);
+                assert!(bounds.y >= -0.1 && bounds.y + bounds.height <= 800.1);
+                let mut messages = Vec::new();
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(bounds.center()),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                        &viewport,
+                    );
+                }
+                if modal {
+                    assert!(messages.is_empty(), "a modal owns input: {messages:?}");
+                } else {
+                    assert!(
+                        matches!(
+                            messages.as_slice(),
+                            [Message::ChannelWork(
+                                crate::channel_work_ui::Action::ShowSaved
+                            )]
+                        ),
+                        "the actual button must open Saved changes: {messages:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_changes_global_entry_opens_without_projects_panes_or_current_home() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.clear();
+        durable.channels.clear();
+        durable.focused = None;
+        durable.active_channel = None;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.cards.clear();
+        app.sidebar_model.projects.clear();
+        assert!(!app.context_inspector_visible());
+        assert!(app.channel_home().is_none());
+
+        // The window's ordinary New tab control remains mounted in this empty
+        // state; the contextual rail cannot supply the only recovery entry.
+        drop(app.update(Message::ChromeUi(Action::ToggleNewTab)));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::NewTab));
+        assert!(
+            app.popup_focus_ring(Popup::NewTab)
+                .iter()
+                .any(|id| { id.as_ref() == "chrome.new-tab.saved-changes" })
+        );
+        // Do not execute its asynchronous task: opening recovery may discover
+        // disk records, but cannot check or send any request on its own.
+        drop(app.update(Message::ChromeUi(Action::Launch(NewTab::SavedChanges))));
+        assert!(app.channel_work.view.saved_is_shown());
+        assert!(app.channel_work_is_main());
+        assert!(app.channel_home().is_none());
+        assert!(!app.workspace_surfaces_visible());
+        assert_eq!(app.chrome_ui.popup, None);
+    }
+
+    #[test]
     fn narrow_header_mounts_four_complete_tabs() {
         use iced::advanced::{
             Layout, layout,
@@ -1291,10 +1412,11 @@ pub enum NewTab {
     Thread,
     Resume,
     Browser,
+    SavedChanges,
 }
 
 // Threads choose their model in the composer; backend details are automatic.
-const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
+const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 5] = [
     (
         "New thread",
         "Choose a model and start a conversation",
@@ -1318,6 +1440,12 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
         "Open a browser tab",
         NewTab::Browser,
         "chrome.new-tab.browser",
+    ),
+    (
+        "Saved channel changes",
+        "Check original requests after an interruption",
+        NewTab::SavedChanges,
+        "chrome.new-tab.saved-changes",
     ),
 ];
 
@@ -1937,6 +2065,9 @@ impl Cagents {
                     NewTab::Thread => self.new_native_thread(),
                     NewTab::Resume => self.update_resume(resume_ui::Action::Open),
                     NewTab::Browser => cosmic::task::message(Message::NewBrowser),
+                    NewTab::SavedChanges => {
+                        self.update_channel_work(crate::channel_work_ui::Action::ShowSaved)
+                    }
                 }
             }
             Action::TabsScrolled(offset) => {
@@ -1972,6 +2103,7 @@ impl Cagents {
                         NewTab::Terminal => Icon::Terminal.handle(),
                         NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
                         NewTab::Browser => Icon::Browser.handle(),
+                        NewTab::SavedChanges => Icon::History.handle(),
                     };
                     let tooltip = match kind {
                         NewTab::Thread => workspace_widget::shortcut_tooltip(
@@ -1982,7 +2114,9 @@ impl Cagents {
                             workspace_widget::GlobalShortcut::NewTerminal,
                             &self.settings.keyboard_shortcuts,
                         ),
-                        NewTab::Browser | NewTab::Resume => description.to_owned(),
+                        NewTab::Browser | NewTab::Resume | NewTab::SavedChanges => {
+                            description.to_owned()
+                        }
                     };
                     crate::interaction::tooltip(
                         crate::ui_controls::popover_item(
@@ -1992,7 +2126,11 @@ impl Cagents {
                             Message::ChromeUi(Action::Launch(kind)),
                         )
                         .id(widget::Id::new(id))
-                        .name(format!("New {label} tab")),
+                        .name(if matches!(kind, NewTab::SavedChanges) {
+                            "Saved channel changes".to_owned()
+                        } else {
+                            format!("New {label} tab")
+                        }),
                         tooltip,
                     )
                     .into()
@@ -3151,8 +3289,9 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        let tabs = widget::row::with_children(vec![
-            tabs.into(),
+        // Recovery belongs to the window, so it remains reachable even when
+        // the original channel has closed or no current channel is selected.
+        let work_controls = vec![
             crate::ui_controls::button::secondary("Channel work")
                 .name("Open current channel work")
                 .on_press_maybe(
@@ -3162,12 +3301,44 @@ impl Cagents {
                         .map(Message::OpenChannelWork),
                 )
                 .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::XS);
+            crate::ui_controls::button::quiet("Saved changes")
+                .id(widget::Id::new("channel-work.saved"))
+                .name("Show saved channel changes")
+                .on_press_maybe((!self.modal_is_open()).then_some(Message::ChannelWork(
+                    crate::channel_work_ui::Action::ShowSaved,
+                )))
+                .into(),
+        ];
+        let work_controls: Element<'_, Message> = if width < 360.0 {
+            widget::column::with_children(work_controls)
+                .spacing(space::XXS)
+                .into()
+        } else {
+            widget::row::with_children(work_controls)
+                .spacing(space::XXS)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let tabs: Element<'_, Message> = if width < 520.0 {
+            widget::column::with_children(vec![tabs.into(), work_controls])
+                .spacing(space::XXS)
+                .into()
+        } else {
+            widget::row::with_children(vec![tabs.into(), work_controls])
+                .spacing(space::XS)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let rows = if width < 360.0 {
+            3.0
+        } else if width < 520.0 {
+            2.0
+        } else {
+            1.0
+        };
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
-            .center_y(design::HEADER_CONTENT_HEIGHT)
+            .center_y(design::HEADER_CONTENT_HEIGHT * rows + space::XXS * (rows - 1.0))
             .width(Length::Fill);
         let body = match self.context_tab {
             ContextTab::Files | ContextTab::Changes if crate::device::is_remote() => {
