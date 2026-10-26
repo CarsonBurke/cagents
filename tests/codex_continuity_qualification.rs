@@ -33,6 +33,9 @@
 #[path = "support/hosted_agent_cleanup.rs"]
 mod hosted_agent_cleanup;
 
+#[path = "codex_continuity_qualification/goal.rs"]
+mod goal;
+
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
     model::{HostSessionProof, TerminalId},
@@ -80,24 +83,38 @@ struct ModelRequest {
 /// A scripted Responses API. It answers a prompt with the tool call its
 /// scenario names, and a tool output with either the next call or a final
 /// message, so the provider's own turn loop does the rest.
+#[derive(Clone, Copy)]
+enum ModelMode {
+    Continuity,
+    Goal,
+}
+
 struct Model {
     port: u16,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
+    over_limit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Model {
-    fn start() -> Self {
+    fn start(mode: ModelMode) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let over_limit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rejected = over_limit.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let seen = seen.clone();
-                thread::spawn(move || serve(stream, &seen));
+                let rejected = rejected.clone();
+                thread::spawn(move || serve(stream, &seen, mode, &rejected));
             }
         });
-        Self { port, requests }
+        Self {
+            port,
+            requests,
+            over_limit,
+        }
     }
 
     fn requests(&self) -> Vec<ModelRequest> {
@@ -105,7 +122,20 @@ impl Model {
     }
 }
 
-fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
+fn serve(
+    stream: TcpStream,
+    seen: &Mutex<Vec<ModelRequest>>,
+    mode: ModelMode,
+    over_limit: &std::sync::atomic::AtomicBool,
+) {
+    if matches!(mode, ModelMode::Goal) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+    }
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
@@ -137,6 +167,12 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             let mut size = String::new();
             reader.read_line(&mut size).unwrap();
             let size = usize::from_str_radix(size.trim(), 16).unwrap();
+            if matches!(mode, ModelMode::Goal) {
+                assert!(
+                    body.len().saturating_add(size) <= 2 * 1024 * 1024,
+                    "Goal model request exceeded fixture bound"
+                );
+            }
             let mut chunk = vec![0; size + 2];
             reader.read_exact(&mut chunk).unwrap();
             if size == 0 {
@@ -145,6 +181,12 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             body.extend_from_slice(&chunk[..size]);
         }
     } else {
+        if matches!(mode, ModelMode::Goal) {
+            assert!(
+                length <= 2 * 1024 * 1024,
+                "Goal model request exceeded fixture bound"
+            );
+        }
         body.resize(length, 0);
         reader.read_exact(&mut body).unwrap();
     }
@@ -182,6 +224,13 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
         });
     let number = {
         let mut seen = seen.lock().unwrap();
+        // Goal controls may trigger native continuation. Answer no tools, and
+        // refuse beyond this finite fixture bound rather than feeding a loop.
+        if matches!(mode, ModelMode::Goal) && seen.len() >= 8 {
+            over_limit.store(true, std::sync::atomic::Ordering::Release);
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
         seen.push(ModelRequest {
             prompts: prompts.clone(),
             output: output.clone(),
@@ -200,6 +249,10 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
     };
     let scenario = prompts.last().map(String::as_str).unwrap_or_default();
     let item = match &output {
+        _ if matches!(mode, ModelMode::Goal) => json!({
+            "type":"message", "role":"assistant", "id":format!("message-{number}"),
+            "content":[{"type":"output_text", "text":"GOAL_FIXTURE_OBSERVED_NO_TOOLS"}]
+        }),
         Some(output) if last["call_id"] == "yield-start" => {
             // The command yielded; poll it the way a model does, with a wait
             // that outlasts it.
@@ -422,6 +475,10 @@ impl Fixture {
     }
 
     fn new() -> Self {
+        Self::with_model_mode(ModelMode::Continuity)
+    }
+
+    fn with_model_mode(mode: ModelMode) -> Self {
         let codex = std::env::var_os(CODEX).unwrap_or_else(|| {
             panic!("set {CODEX} to the native Codex executable this run qualifies")
         });
@@ -455,7 +512,7 @@ impl Fixture {
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&codex, root.path().join("bin/codex")).unwrap();
-        let model = Model::start();
+        let model = Model::start(mode);
         // No sandbox, so a command's fate depends only on the approval policy
         // each scenario asks for; no retries, so a resent request is visible
         // as a request rather than absorbed.
