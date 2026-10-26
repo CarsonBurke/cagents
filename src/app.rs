@@ -16823,6 +16823,11 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if matches!(&event, keyboard::Event::KeyReleased { .. } | keyboard::Event::KeyPressed { repeat: true, .. })
+                    && self.terminal_review_input.consume_keyboard(&event)
+                {
+                    return Task::none();
+                }
                 if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {

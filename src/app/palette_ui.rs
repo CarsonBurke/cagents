@@ -1975,6 +1975,79 @@ mod tests {
         }
     }
 
+    fn open_copy_release_approval(app: &mut Cagents) {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Origin, Spec, Surface, Target},
+            automations::{
+                Definition, DirectoryIdentity, Proposal, ProposalState, Schedule, SchedulePattern,
+                SessionMode,
+            },
+        };
+        app.active_workspace = Some(
+            app.sidebar_state
+                .active_worktree()
+                .unwrap()
+                .canonical_path
+                .clone(),
+        );
+        let definition = Definition {
+            name: "Copy release fixture".into(),
+            prompt: "Review only the approved fixture".into(),
+            agent: Spec {
+                provider: Provider::Codex,
+                account: Some("codex/system".parse().unwrap()),
+                target: Target {
+                    repository: app.sidebar_model.projects[0].repository.clone(),
+                    directory: app.active_workspace.clone().unwrap(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: Some("offline".into()),
+                reasoning_effort: Some("low".into()),
+                permission_mode: None,
+            },
+            schedule: Schedule {
+                timezone: "America/Vancouver".into(),
+                pattern: SchedulePattern::Weekdays {
+                    hour: 9,
+                    minute: 30,
+                },
+            },
+            session_mode: SessionMode::Fresh,
+            precheck: None,
+        };
+        let proposal = Proposal {
+            id: uuid::Uuid::new_v4(),
+            revision: 1,
+            owner: Origin::User,
+            requested: definition.clone(),
+            definition,
+            target_identity: DirectoryIdentity {
+                device: 1,
+                inode: 2,
+            },
+            channel_title: None,
+            created_ms: 1,
+            state: ProposalState::Pending,
+        };
+        // Existing local reducers install and open the immutable proposal;
+        // no daemon read, decision or provider task is polled.
+        drop(
+            app.update_automation_approval(automation_approval::Action::Read {
+                generation: 0,
+                result: Arc::new(Ok(vec![proposal.clone()])),
+            }),
+        );
+        drop(
+            app.update_automation_approval(automation_approval::Action::Open {
+                id: proposal.id,
+                revision: proposal.revision,
+            }),
+        );
+        assert!(app.automation_approval_open());
+    }
+
     #[test]
     fn closed_copy_palette_retires_activation_without_a_terminal_before_fresh_terminal_input() {
         use iced::advanced::{
@@ -2000,7 +2073,10 @@ mod tests {
         };
         // listen_with delivers releases whether another native control
         // captured them or left them ignored. Neither status may pin a key.
-        for captured in [false, true] {
+        for (captured, cover) in [false, true]
+            .into_iter()
+            .flat_map(|captured| ["none", "approval", "image"].map(|cover| (captured, cover)))
+        {
             let mut app = branch_palette_fixture();
             assert!(
                 app.cards
@@ -2016,6 +2092,32 @@ mod tests {
             assert!(
                 app.terminal_review_input
                     .owns_keyboard(&Event::Keyboard(press.clone()))
+            );
+            match cover {
+                "approval" => open_copy_release_approval(&mut app),
+                "image" => {
+                    app.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                        "/copy-release-fixture.png".into(),
+                        None,
+                        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+                    ));
+                }
+                _ => {}
+            }
+            let focus = app.workspace.focused();
+            let review_revision = app.terminal_review_revision;
+            let mut unrelated_release = release.clone();
+            if let keyboard::Event::KeyReleased { physical_key, .. } = &mut unrelated_release {
+                *physical_key = keyboard::key::Physical::Code(keyboard::key::Code::NumpadEnter);
+            }
+            drop(app.update(Message::KeyEvent {
+                event: unrelated_release,
+                captured,
+            }));
+            assert!(
+                app.terminal_review_input
+                    .owns_keyboard(&Event::Keyboard(press.clone())),
+                "logically equal but physically different key-up cannot retire Enter"
             );
             let mut repeat = press.clone();
             if let keyboard::Event::KeyPressed { repeat, .. } = &mut repeat {
@@ -2036,8 +2138,34 @@ mod tests {
             assert!(
                 !app.terminal_review_input
                     .owns_keyboard(&Event::Keyboard(press.clone())),
-                "actual App routing must clean key-up after the palette already closed"
+                "actual App routing must clean key-up after the palette closed under {cover}"
             );
+            assert_eq!(app.workspace.focused(), focus);
+            assert_eq!(app.terminal_review_revision, review_revision);
+            assert!(!app.palette.is_open());
+            match cover {
+                "approval" => {
+                    assert!(
+                        app.automation_approval_open(),
+                        "owned repeat cannot dismiss approval"
+                    );
+                    // A genuine new press still belongs to the approval. Its
+                    // first button dismisses locally; nothing approves work.
+                    drop(app.update(Message::KeyEvent {
+                        event: press.clone(),
+                        captured: false,
+                    }));
+                    assert!(
+                        !app.automation_approval_open(),
+                        "fresh Enter must reach the top owner"
+                    );
+                }
+                "image" => {
+                    assert!(app.chat_ui.image_viewer.is_some());
+                    app.chat_ui.image_viewer = None;
+                }
+                _ => {}
+            }
             assert!(
                 app.palette_key_event(&press).is_none(),
                 "a fresh closed-palette Enter is not consumed"
