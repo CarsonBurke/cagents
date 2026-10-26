@@ -881,6 +881,10 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
     use crate::app::workspace_model_sync::ModelUpdate;
     let daemon = ScriptedDaemon::start();
     let (mut app, active, hidden, pane, identity) = cached_chat();
+    // This parent exercises a live publisher waiting for its seed ACK. The
+    // default headless sender has no receiver and correctly means Closed.
+    let (publisher, _requests) = async_channel::unbounded();
+    app.workspace_model_tx = publisher;
     let startup = app.initialize_runtimes();
     settle(&mut app, startup);
     assert_eq!(app.startup_pane_check(), Ok(false));
@@ -1747,7 +1751,12 @@ fn refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_st
             &**runtime as *const chat_ui::Runtime as usize, allocation,
             "retain the Content owner and its caret"
         );
-        assert_eq!(runtime.target, target);
+        let current_target = runtime.target;
+        assert_eq!(current_target.card, target.card);
+        assert!(
+            current_target.generation > target.generation,
+            "canonical reattachment must fence callbacks issued to the inert runtime"
+        );
         assert_eq!(runtime.session, source);
         let saved = app.persistent_workspace();
         assert_eq!(
@@ -1768,6 +1777,44 @@ fn refused_seed_has_finite_failure_and_exact_retry_reopens_saved_chat_without_st
             saved.active_channel,
             Some(active),
             "offscreen recovery does not steal selection"
+        );
+        let stale_cursor = app.handle_chat_ui(chat_ui::Action::ComposerCursor(
+            target,
+            cosmic::iced::widget::text_editor::Cursor {
+                position: cosmic::iced::widget::text_editor::Position { line: 0, column: 0 },
+                selection: None,
+            },
+        ));
+        settle(&mut app, stale_cursor);
+        let stale_edit = app.handle_chat_ui(chat_ui::Action::Composer(
+            target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("OLD".into())),
+            ),
+        ));
+        settle(&mut app, stale_edit);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some(draft),
+            "an old UI callback cannot edit the recovered conversation"
+        );
+        let current_edit = app.handle_chat_ui(chat_ui::Action::Composer(
+            current_target,
+            cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(Arc::new("X".into())),
+            ),
+        ));
+        settle(&mut app, current_edit);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&pane.id)
+                .map(String::as_str),
+            Some("UnseXnt source text  "),
+            "the current callback must use the preserved pre-admission caret; stale cursor movement is ignored"
         );
         apply_seed_updates(&mut app, vec![old_started, old_refused]);
         let stale = app.retry_shared_chat_admission(retry);
