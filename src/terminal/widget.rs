@@ -1576,6 +1576,12 @@ impl<Message> TerminalWidget<Message> {
                 a11y.selection = None;
             }
         }
+        // A temporary overlay can remove native/model focus without ending
+        // this card's authoritative review owner. Restore it when uncovered;
+        // a locally requested exit still wins over a delayed true model view.
+        if self.model_focused && self.review_active && state.requested_review != Some(false) {
+            state.a11y.borrow_mut().review = true;
+        }
     }
     fn publish_review(
         &self,

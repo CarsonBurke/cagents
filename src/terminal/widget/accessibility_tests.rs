@@ -1310,3 +1310,77 @@ fn palette_activation_keeps_original_physical_repeat_and_release_out_of_terminal
         );
     }
 }
+
+#[test]
+fn temporary_palette_cover_restores_same_revision_review_owner_without_typing() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "covered-review",
+        ReviewInputBarrier::default(),
+        true,
+        true,
+    );
+    widget.on_shortcut = None;
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let node = layout::Node::new(Size::new(640.0, 320.0));
+    widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(reviewing(&tree));
+    let revision = widget.review_revision;
+    widget.model_focused = false;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    dispatch(
+        &mut widget,
+        &mut tree,
+        &renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())),
+    );
+    assert!(
+        !reviewing(&tree),
+        "covered terminal is not the current text focus"
+    );
+    widget.model_focused = true;
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert_eq!(
+        widget.review_revision, revision,
+        "closing a palette need not change review owner"
+    );
+    assert!(
+        reviewing(&tree),
+        "same authoritative owner resumes review when uncovered"
+    );
+    let nodes = widget.a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    assert!(
+        nodes.root()[0]
+            .node()
+            .description()
+            .unwrap()
+            .contains("Review mode; typing is blocked")
+    );
+    for down in [true, false] {
+        assert!(
+            dispatch(
+                &mut widget,
+                &mut tree,
+                &renderer,
+                key(
+                    keyboard::key::Named::Enter,
+                    keyboard::key::Code::Enter,
+                    down
+                )
+            )
+            .is_empty()
+        );
+    }
+    assert_no_pty_input(&peer.fence());
+    assert_eq!(
+        click_review(&mut widget, &mut tree, &renderer),
+        vec![Message::Review(false)]
+    );
+    tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
+    assert!(
+        !reviewing(&tree),
+        "an explicit pending local exit still wins over a true model view"
+    );
+}
